@@ -32,7 +32,7 @@ pub struct DfsPendingMaintenanceWork {
     pub next_time_based_maintenance_unix_nanos: Option<u64>,
     pub deferred_work_count: usize,
     pub pending_namespace_job_count: usize,
-    pub actionable_conflict_count: usize,
+
     pub actionable_placement_reconciliation_count: usize,
     pub metadata_replica_lag_count: usize,
     pub pending_local_membership_handoff_count: usize,
@@ -62,7 +62,6 @@ impl DfsPendingMaintenanceWork {
         self.pending_write_count > 0
             || self.pending_repair_count > 0
             || self.pending_namespace_job_count > 0
-            || self.actionable_conflict_count > 0
             || self.actionable_placement_reconciliation_count > 0
             || self.metadata_replica_lag_count > 0
             || self.pending_local_membership_handoff_count > 0
@@ -77,7 +76,6 @@ impl DfsPendingMaintenanceWork {
         // publisher lanes own those durable cursors and connectivity wakes.
         self.pending_write_count > 0
             || self.pending_namespace_job_count > 0
-            || self.actionable_conflict_count > 0
             || self.actionable_placement_reconciliation_count > 0
             || self.pending_local_membership_handoff_count > 0
             || self.completed_local_primary_handoff_rebind_count > 0
@@ -146,7 +144,6 @@ pub fn dfs_maintenance_report_reached_limit(report: &DfsMaintenanceTickReport) -
                             .deleted_orphan_count
                             .saturating_add(gc.deleted_stale_orphan_observation_count)
                             .saturating_add(gc.persisted_orphan_observation_count)
-                            .saturating_add(gc.compacted_packed_segment_count)
                             > 0
             })
             || lifecycle
@@ -288,6 +285,36 @@ pub fn dfs_offline_node_ids(
     cluster_paths: &ClusterPaths,
     state: &sinomo_core::ClusterBootstrapState,
 ) -> BTreeSet<NodeId> {
+    dfs_offline_node_ids_with_transport_availability(cluster_paths, state, &|_| {
+        sinomo_core::network::RoutedAvailability::Unknown
+    })
+}
+
+/// Route capability can resolve only an unknown reachability hint. Actual
+/// membership state, explicit Offline, policy/storage and effect guards remain
+/// independent; Candidate never becomes Online or a healthy graph edge.
+pub(crate) fn dfs_transport_candidate_can_relax_unknown_route(
+    availability: &ClusterNodeAvailability,
+    member: &sinomo_core::ClusterMemberRecord,
+    transport: sinomo_core::network::RoutedAvailability,
+) -> bool {
+    *availability == ClusterNodeAvailability::Unknown
+        && matches!(
+            member.state,
+            sinomo_core::ClusterMemberState::Learner | sinomo_core::ClusterMemberState::Voter
+        )
+        && matches!(
+            transport,
+            sinomo_core::network::RoutedAvailability::Candidate
+                | sinomo_core::network::RoutedAvailability::Connected
+        )
+}
+
+pub(crate) fn dfs_offline_node_ids_with_transport_availability(
+    cluster_paths: &ClusterPaths,
+    state: &sinomo_core::ClusterBootstrapState,
+    transport: &dyn Fn(&NodeId) -> sinomo_core::network::RoutedAvailability,
+) -> BTreeSet<NodeId> {
     let connectivity = ClusterConnectivityGraph::read_for_local(cluster_paths, state);
     sinomo_core::cluster::cluster_health_rows_with_probe(
         cluster_paths,
@@ -299,12 +326,21 @@ pub fn dfs_offline_node_ids(
     .unwrap_or_default()
     .into_iter()
     .filter_map(|row| {
-        dfs_node_is_offline_for_maintenance(
+        (dfs_node_is_offline_for_maintenance(
             &row.availability,
             &connectivity,
             &state.local_node_id,
             &row.member.node_id,
-        )
+        ) && !(row.availability == ClusterNodeAvailability::Unknown
+            && matches!(
+                row.member.state,
+                sinomo_core::ClusterMemberState::Learner | sinomo_core::ClusterMemberState::Voter
+            )
+            && dfs_transport_candidate_can_relax_unknown_route(
+                &row.availability,
+                &row.member,
+                transport(&row.member.node_id),
+            )))
         .then_some(row.member.node_id)
     })
     .collect()
@@ -357,13 +393,13 @@ pub(crate) fn dfs_placement_reconciliation_job_can_advance(
     };
     runnable
         || (job.state == crate::DfsPlacementReconciliationState::Repairing
-            && current_config
-                .zip(job.accepted_config.as_ref())
-                .is_some_and(|(current, accepted)| {
-                    !crate::placement::placement_config_remains_authoritative_for_job(
-                        accepted, current, job,
-                    )
-                }))
+            && current_config.is_some_and(|current| {
+                !crate::placement::placement_config_remains_authoritative_for_job(
+                    &job.accepted_config,
+                    current,
+                    job,
+                )
+            }))
 }
 
 /// Count completed local-primary handoffs whose durable router generation has
@@ -584,7 +620,6 @@ pub fn dfs_events_should_wake_repair_maintenance(events: &[NetworkedDfsServiceEv
         match outcome {
             NetworkedDfsWriteOutcome::Pending { .. } => true,
             NetworkedDfsWriteOutcome::Committed { repair_jobs, .. } => !repair_jobs.is_empty(),
-            NetworkedDfsWriteOutcome::Conflict { .. } => false,
         }
     })
 }
@@ -906,7 +941,10 @@ where
     let mut metadata_publisher_host = LocalDfsMetadataJournalPublisherHost::new(data_dir.clone());
     let mut metadata_transport = AsyncDfsMetadataNodeTransport::new(
         peer_node_ids,
-        async_dfs_metadata_journal_batch_sender_from_peer_transport(Arc::clone(&peer_transport)),
+        async_dfs_metadata_journal_batch_sender_from_peer_transport(
+            &data_dir,
+            Arc::clone(&peer_transport),
+        ),
         async_dfs_metadata_snapshot_install_sender_from_peer_transport(peer_transport),
     );
     run_dfs_maintenance_tick_with_async_host_and_execution_exclusions(
@@ -941,10 +979,11 @@ pub async fn run_cluster_dfs_reactive_maintenance_tick_with_reusable_service<T>(
     state: sinomo_core::ClusterBootstrapState,
     authoritative_prefix: crate::DfsAuthoritativePrefixProjection,
     peer_transport: Arc<dyn AsyncDfsPeerTransport>,
+    peer_node_ids: Vec<NodeId>,
     execution_exclusions: DfsMaintenanceExecutionExclusions,
     committed_work_tracker: DfsCommittedWorkTracker,
     options: DfsMaintenanceTickOptions,
-) -> Result<DfsMaintenanceTickReport, DfsError>
+) -> Result<Option<DfsMaintenanceTickReport>, DfsError>
 where
     T: AsyncDfsMessageTransport + DfsTransportIdentity + DfsMessageTransport,
 {
@@ -967,16 +1006,18 @@ where
             authoritative_prefix.clone(),
         )?;
     let metadata_shards = authoritative_topology.metadata_shards(&file_system.file_system_id)?;
-    let peer_node_ids = discovered_cluster_dfs_peer_node_ids(&cluster_paths, &state)?;
     let mut maintenance_host = LocalDfsMaintenanceHost::new(data_dir.clone());
     let mut metadata_publisher_host = LocalDfsMetadataJournalPublisherHost::new(data_dir.clone());
     let mut metadata_transport = AsyncDfsMetadataNodeTransport::new(
         peer_node_ids,
-        async_dfs_metadata_journal_batch_sender_from_peer_transport(Arc::clone(&peer_transport)),
+        async_dfs_metadata_journal_batch_sender_from_peer_transport(
+            &data_dir,
+            Arc::clone(&peer_transport),
+        ),
         async_dfs_metadata_snapshot_install_sender_from_peer_transport(peer_transport),
     );
 
-    run_dfs_maintenance_tick_with_async_host_and_execution_exclusions(
+    let result = run_dfs_maintenance_tick_with_async_host_and_execution_exclusions(
         service,
         &mut maintenance_host,
         &data_dir,
@@ -989,7 +1030,21 @@ where
         Some(authoritative_prefix),
         options,
     )
-    .await
+    .await;
+    if result.is_err()
+        && let Some(
+            crate::repair_queue_store::DfsRepairQueuePageReconcileOutcome::GenerationChanged {
+                current_head_sequence,
+            },
+        ) = maintenance_host.repair_page_generation_change
+    {
+        // The failed exact checkpoint did not publish this pass's private calls.
+        // Defer to a fresh actual page; no scan/completion count is fabricated.
+        tracing::debug!(target: "sinomo.dfs.maintenance", current_head_sequence,
+            "DFS maintenance deferred after its observed repair queue generation changed");
+        return Ok(None);
+    }
+    result.map(Some)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1081,7 +1136,10 @@ async fn run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_optional
     let mut metadata_publisher_host = LocalDfsMetadataJournalPublisherHost::new(data_dir.clone());
     let mut metadata_transport = AsyncDfsMetadataNodeTransport::new(
         peer_node_ids,
-        async_dfs_metadata_journal_batch_sender_from_peer_transport(Arc::clone(&peer_transport)),
+        async_dfs_metadata_journal_batch_sender_from_peer_transport(
+            &data_dir,
+            Arc::clone(&peer_transport),
+        ),
         async_dfs_metadata_snapshot_install_sender_from_peer_transport(peer_transport),
     );
     run_dfs_maintenance_tick_with_async_host_and_execution_exclusions(
@@ -1135,7 +1193,10 @@ pub fn run_cluster_dfs_maintenance_tick_with_peer_transport(
         data_dir,
         cluster_paths,
         dfs_message_sender_from_peer_transport(Arc::clone(&peer_transport)),
-        dfs_metadata_journal_batch_sender_from_peer_transport(Arc::clone(&peer_transport)),
+        dfs_metadata_journal_batch_sender_from_peer_transport(
+            data_dir,
+            Arc::clone(&peer_transport),
+        ),
         dfs_metadata_snapshot_install_sender_from_peer_transport(peer_transport),
         control_plane,
         options,
@@ -1271,7 +1332,7 @@ pub const DEFAULT_DFS_MAINTENANCE_ANTI_ENTROPY_MAX_OBJECTS: usize = 1024;
 pub const DEFAULT_DFS_MAINTENANCE_ANTI_ENTROPY_MAX_ISSUES: usize = 64;
 pub const DEFAULT_DFS_NAMESPACE_JOB_MAINTENANCE_MAX_JOBS: usize = 16;
 pub const DEFAULT_DFS_NAMESPACE_JOB_MAINTENANCE_MAX_STEPS_PER_JOB: usize = 1024;
-pub const DEFAULT_DFS_CONFLICT_MAINTENANCE_MAX_RECORDS: usize = 128;
+
 pub const DEFAULT_DFS_WRITE_INTENT_MAINTENANCE_MAX_RECORDS: usize = 256;
 pub const DEFAULT_DFS_PLACEMENT_RECONCILIATION_MAX_OBJECTS: usize = 256;
 pub const DEFAULT_DFS_STALE_WRITE_INTENT_MIN_AGE: Duration = Duration::from_secs(24 * 60 * 60);
@@ -1308,15 +1369,8 @@ pub struct DfsAntiEntropyCursorRecord {
 
 pub use sinomo_api::dfs::maintenance::DfsRepairAttemptRecord;
 
-const DFS_REPAIR_EXECUTION_BLOCKED_BY_CONNECTIVITY: &str =
+pub(crate) const DFS_REPAIR_EXECUTION_BLOCKED_BY_CONNECTIVITY: &str =
     "repair execution blocked: target has no currently usable cluster route";
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct DfsConflictMaintenanceReport {
-    pub scanned_open_conflict_count: usize,
-    pub resolved_conflict_count: usize,
-    pub superseded_conflict_count: usize,
-}
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DfsWriteIntentMaintenanceReport {
@@ -1361,6 +1415,9 @@ pub struct LocalDfsMaintenanceHost {
     repair_queue_store: crate::repair_queue_store::LocalDfsRepairQueueStore,
     repair_queue_observation: Option<crate::repair_queue_store::DfsRepairQueueObservation>,
     repair_page_observation: Option<crate::repair_queue_store::DfsRepairQueuePageObservation>,
+    // Actual owner result only; it cannot acknowledge records or grant dispatch.
+    repair_page_generation_change:
+        Option<crate::repair_queue_store::DfsRepairQueuePageReconcileOutcome>,
 }
 
 impl LocalDfsMaintenanceHost {
@@ -1373,6 +1430,7 @@ impl LocalDfsMaintenanceHost {
             repair_queue_store,
             repair_queue_observation: None,
             repair_page_observation: None,
+            repair_page_generation_change: None,
         }
     }
 
@@ -1382,9 +1440,6 @@ impl LocalDfsMaintenanceHost {
 }
 
 impl DfsMaintenanceHost for LocalDfsMaintenanceHost {
-    fn supports_repair_maintenance_pages(&self) -> bool {
-        true
-    }
     fn load_anti_entropy_cursor(
         &mut self,
         file_system_id: &DfsFileSystemId,
@@ -1443,6 +1498,7 @@ impl DfsMaintenanceHost for LocalDfsMaintenanceHost {
         desired: &[DfsRepairAttemptRecord],
         retired: &[DfsRepairAttemptRecord],
     ) -> Result<DfsRepairMaintenancePageCheckpoint, DfsError> {
+        self.repair_page_generation_change = None;
         let expected = self
             .repair_page_observation
             .as_ref()
@@ -1498,13 +1554,16 @@ impl DfsMaintenanceHost for LocalDfsMaintenanceHost {
                     has_more,
                 })
             }
-            crate::repair_queue_store::DfsRepairQueuePageReconcileOutcome::GenerationChanged {
+            outcome @ crate::repair_queue_store::DfsRepairQueuePageReconcileOutcome::GenerationChanged {
                 current_head_sequence,
-            } => Err(DfsError::Metadata {
-                message: format!(
-                    "repair queue generation changed at page checkpoint (head {current_head_sequence})"
-                ),
-            }),
+            } => {
+                self.repair_page_generation_change = Some(outcome);
+                Err(DfsError::Metadata {
+                    message: format!(
+                        "repair queue generation changed at page checkpoint (head {current_head_sequence})"
+                    ),
+                })
+            }
         }
     }
 
@@ -1665,10 +1724,6 @@ pub fn put_local_dfs_metadata_replication_suppression(
     write_dfs_metadata_replication_suppression_snapshot(&path, &snapshot)
 }
 
-pub fn legacy_dfs_anti_entropy_cursor_path(path: &Path) -> PathBuf {
-    path.with_extension("json")
-}
-
 pub fn read_dfs_anti_entropy_cursor(
     path: &Path,
 ) -> Result<Option<DfsAntiEntropyCursorRecord>, DfsError> {
@@ -1681,36 +1736,10 @@ pub fn read_dfs_anti_entropy_cursor(
                     path.display()
                 ),
             }),
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-            read_legacy_dfs_anti_entropy_cursor(&legacy_dfs_anti_entropy_cursor_path(path))
-        }
-        Err(source) => Err(DfsError::Metadata {
-            message: format!(
-                "could not read DFS anti-entropy cursor {}: {source}",
-                path.display()
-            ),
-        }),
-    }
-}
-
-fn read_legacy_dfs_anti_entropy_cursor(
-    path: &Path,
-) -> Result<Option<DfsAntiEntropyCursorRecord>, DfsError> {
-    match std::fs::read(path) {
-        Ok(bytes) => {
-            serde_json::from_slice(&bytes)
-                .map(Some)
-                .map_err(|source| DfsError::Serialization {
-                    message: format!(
-                        "DFS anti-entropy legacy cursor JSON error at {}: {source}",
-                        path.display()
-                    ),
-                })
-        }
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(source) => Err(DfsError::Metadata {
             message: format!(
-                "could not read DFS anti-entropy legacy cursor {}: {source}",
+                "could not read DFS anti-entropy cursor {}: {source}",
                 path.display()
             ),
         }),
@@ -1743,112 +1772,11 @@ pub fn write_dfs_anti_entropy_cursor(
             path.display()
         ),
     })?;
-    clear_dfs_cursor_file(&legacy_dfs_anti_entropy_cursor_path(path))
+    Ok(())
 }
 
 pub fn clear_dfs_anti_entropy_cursor(path: &Path) -> Result<(), DfsError> {
-    clear_dfs_cursor_file(path)?;
-    clear_dfs_cursor_file(&legacy_dfs_anti_entropy_cursor_path(path))
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct LegacyDfsMetadataReplicationCursor {
-    pub target_node_id: NodeId,
-    pub shard_id: DfsMetadataShardId,
-    pub next_after_sequence: u64,
-}
-
-pub fn migrate_legacy_dfs_metadata_replication_cursor(
-    backend: &mut dyn DfsMetadataBackend,
-    data_dir: &SinomoDataDir,
-    target_node_id: &NodeId,
-    shard_id: &DfsMetadataShardId,
-) -> Result<u64, DfsError> {
-    let mut after_sequence = backend.metadata_replication_cursor(target_node_id, shard_id)?;
-    let legacy_path =
-        legacy_dfs_metadata_replication_cursor_path(data_dir, target_node_id, shard_id);
-    let Some(legacy_cursor) = read_legacy_dfs_metadata_replication_cursor(&legacy_path)? else {
-        return Ok(after_sequence);
-    };
-    if legacy_cursor.target_node_id != *target_node_id || legacy_cursor.shard_id != *shard_id {
-        return Err(DfsError::Metadata {
-            message: format!(
-                "legacy DFS metadata replication cursor {} does not match target {target_node_id} shard {}",
-                legacy_path.display(),
-                shard_id.0,
-            ),
-        });
-    }
-    let legacy_after_sequence = legacy_cursor.next_after_sequence;
-    if legacy_after_sequence > after_sequence {
-        backend.put_metadata_replication_cursor(target_node_id, shard_id, legacy_after_sequence)?;
-        after_sequence = legacy_after_sequence;
-    }
-    clear_dfs_cursor_file(&legacy_path)?;
-    Ok(after_sequence)
-}
-
-pub fn legacy_dfs_metadata_replication_cursor_path(
-    data_dir: &SinomoDataDir,
-    target_node_id: &NodeId,
-    shard_id: &DfsMetadataShardId,
-) -> PathBuf {
-    data_dir
-        .dfs_dir()
-        .join("metadata-replication-cursors")
-        .join(dfs_path_safe_segment(&target_node_id.to_string()))
-        .join(format!("{}.json", dfs_path_safe_segment(&shard_id.0)))
-}
-
-fn read_legacy_dfs_metadata_replication_cursor(
-    path: &Path,
-) -> Result<Option<LegacyDfsMetadataReplicationCursor>, DfsError> {
-    match std::fs::read(path) {
-        Ok(bytes) => {
-            serde_json::from_slice(&bytes)
-                .map(Some)
-                .map_err(|source| DfsError::Serialization {
-                    message: format!(
-                        "DFS metadata replication legacy cursor JSON error at {}: {source}",
-                        path.display()
-                    ),
-                })
-        }
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(source) => Err(DfsError::Metadata {
-            message: format!(
-                "could not read DFS metadata replication legacy cursor {}: {source}",
-                path.display()
-            ),
-        }),
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn write_legacy_dfs_metadata_replication_cursor(
-    path: &Path,
-    cursor: &LegacyDfsMetadataReplicationCursor,
-) -> Result<(), DfsError> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|source| DfsError::Metadata {
-            message: format!(
-                "could not create DFS metadata replication legacy cursor directory {}: {source}",
-                parent.display()
-            ),
-        })?;
-    }
-    let bytes = serde_json::to_vec_pretty(cursor).map_err(|source| DfsError::Serialization {
-        message: format!(
-            "DFS metadata replication legacy cursor JSON error at {}: {source}",
-            path.display()
-        ),
-    })?;
-    std::fs::write(path, bytes).map_err(|source| DfsError::Metadata {
-        message: format!(
-            "could not write DFS metadata replication legacy cursor {}: {source}",
-            path.display()
-        ),
-    })
+    clear_dfs_cursor_file(path)
 }
 
 fn clear_dfs_cursor_file(path: &Path) -> Result<(), DfsError> {
@@ -1925,10 +1853,6 @@ impl Default for DfsMaintenanceRunOptions {
 }
 
 pub trait DfsMaintenanceHost: Send {
-    fn supports_repair_maintenance_pages(&self) -> bool {
-        false
-    }
-
     fn load_anti_entropy_cursor(
         &mut self,
         file_system_id: &DfsFileSystemId,
@@ -1947,38 +1871,14 @@ pub trait DfsMaintenanceHost: Send {
     fn load_repair_maintenance_page(
         &mut self,
         _max_records: usize,
-    ) -> Result<crate::DfsRepairQueueMaintenancePage, DfsError> {
-        // Compatibility for embedded/test hosts which own a complete snapshot.
-        // The production local host overrides this with bounded observed pages.
-        let records = self.load_repair_attempt_records()?;
-        Ok(crate::DfsRepairQueueMaintenancePage {
-            total_record_count: records.len(),
-            records,
-            enrollment_records: Vec::new(),
-            has_more: false,
-        })
-    }
+    ) -> Result<crate::DfsRepairQueueMaintenancePage, DfsError>;
 
     fn enroll_repair_maintenance_page(
         &mut self,
         page: &crate::DfsRepairQueueMaintenancePage,
         _max_records: usize,
         captured: &[DfsRepairAttemptRecord],
-    ) -> Result<crate::DfsRepairQueueMaintenancePage, DfsError> {
-        let mut page = page.clone();
-        for record in captured {
-            if let Some(existing) = page.records.iter().find(|existing| {
-                existing.intent_id == record.intent_id
-                    && existing.missing_replica_node_id == record.missing_replica_node_id
-            }) {
-                page.enrollment_records.push(existing.clone());
-            } else {
-                page.records.push(record.clone());
-                page.enrollment_records.push(record.clone());
-            }
-        }
-        Ok(page)
-    }
+    ) -> Result<crate::DfsRepairQueueMaintenancePage, DfsError>;
 
     fn checkpoint_repair_maintenance_page(
         &mut self,
@@ -1986,11 +1886,7 @@ pub trait DfsMaintenanceHost: Send {
         _examined: &BTreeSet<(String, NodeId)>,
         _desired: &[DfsRepairAttemptRecord],
         _retired: &[DfsRepairAttemptRecord],
-    ) -> Result<DfsRepairMaintenancePageCheckpoint, DfsError> {
-        Err(DfsError::Metadata {
-            message: "this maintenance host owns a legacy whole repair snapshot".into(),
-        })
-    }
+    ) -> Result<DfsRepairMaintenancePageCheckpoint, DfsError>;
 
     fn load_repair_attempt_records(&mut self) -> Result<Vec<DfsRepairAttemptRecord>, DfsError> {
         Ok(Vec::new())
@@ -2320,7 +2216,7 @@ fn run_dfs_content_gc_without_catalog<T: DfsMessageTransport>(
 pub struct DfsMaintenanceTickOptions {
     pub namespace_job_max_jobs: usize,
     pub namespace_job_max_steps_per_job: usize,
-    pub conflict_max_records: usize,
+
     pub write_intent_max_records: usize,
     pub stale_write_intent_min_age: Duration,
     pub placement_reconciliation_max_objects: usize,
@@ -2384,6 +2280,8 @@ fn mark_connectivity_blocked_dfs_repair_attempt_records(
     for record in records {
         if !execution_exclusions.contains(&record.missing_replica_node_id)
             || record.next_retry_unix_nanos == u64::MAX
+            || record.in_flight
+            || record.transfer_request_id.is_some()
         {
             continue;
         }
@@ -2453,7 +2351,7 @@ impl Default for DfsMaintenanceTickOptions {
             namespace_job_max_jobs: DEFAULT_DFS_NAMESPACE_JOB_MAINTENANCE_MAX_JOBS,
             namespace_job_max_steps_per_job:
                 DEFAULT_DFS_NAMESPACE_JOB_MAINTENANCE_MAX_STEPS_PER_JOB,
-            conflict_max_records: DEFAULT_DFS_CONFLICT_MAINTENANCE_MAX_RECORDS,
+
             write_intent_max_records: DEFAULT_DFS_WRITE_INTENT_MAINTENANCE_MAX_RECORDS,
             stale_write_intent_min_age: DEFAULT_DFS_STALE_WRITE_INTENT_MIN_AGE,
             placement_reconciliation_max_objects: DEFAULT_DFS_PLACEMENT_RECONCILIATION_MAX_OBJECTS,
@@ -2478,7 +2376,6 @@ pub struct DfsRepairMaintenancePageCheckpoint {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DfsMaintenanceTickReport {
     pub namespace_jobs: DfsNamespaceJobMaintenanceReport,
-    pub conflicts: DfsConflictMaintenanceReport,
     pub write_intents: DfsWriteIntentMaintenanceReport,
     pub placement_reconciliation: Option<DfsPlacementReconciliationJob>,
     pub lifecycle_reports: Vec<DfsLifecycleMaintenanceReport>,
@@ -2509,7 +2406,6 @@ pub fn dfs_maintenance_tick_observations(
     report: &DfsMaintenanceTickReport,
 ) -> DfsMaintenanceTickObservations {
     let mut notice_lines = dfs_namespace_job_maintenance_notice_lines(&report.namespace_jobs);
-    notice_lines.extend(dfs_conflict_maintenance_notice_lines(&report.conflicts));
     notice_lines.extend(dfs_write_intent_maintenance_notice_lines(
         &report.write_intents,
     ));
@@ -2537,18 +2433,6 @@ pub fn dfs_maintenance_tick_observations(
         repair_attempt_suppressed_count: repair_attempt_summary.suppressed,
         notice_lines,
     }
-}
-
-pub fn dfs_conflict_maintenance_notice_lines(report: &DfsConflictMaintenanceReport) -> Vec<String> {
-    if report.resolved_conflict_count == 0 && report.superseded_conflict_count == 0 {
-        return Vec::new();
-    }
-    vec![format!(
-        "DFS conflicts: scanned_open={}, resolved={}, superseded={}",
-        report.scanned_open_conflict_count,
-        report.resolved_conflict_count,
-        report.superseded_conflict_count
-    )]
 }
 
 pub fn dfs_write_intent_maintenance_notice_lines(
@@ -2652,23 +2536,19 @@ pub fn dfs_lifecycle_maintenance_notice_lines(
             && (metadata_gc.applied_record_count() > 0 || metadata_gc.max_removals_reached)
         {
             lines.push(format!(
-                "DFS metadata history GC: applied={} versions={} replica_receipts={} intent_bodies={} intent_receipts={} conflicts={} visible_commits={} namespace_bodies={} namespace_receipts={} dry_run={} max_removals_reached={}",
+                "DFS metadata history GC: applied={} versions={} replica_receipts={} intent_bodies={} intent_receipts={} prepared_operations={} namespace_bodies={} namespace_receipts={} dry_run={} max_removals_reached={}",
                 metadata_gc.applied_record_count(),
                 metadata_gc.removed_version_count,
                 metadata_gc.removed_receipt_count,
                 metadata_gc.compacted_intent_count,
                 metadata_gc.removed_intent_receipt_count,
-                metadata_gc.removed_conflict_count,
-                metadata_gc.removed_visible_commit_count,
+                metadata_gc.removed_prepared_operation_count,
                 metadata_gc
                     .compacted_namespace_job_count
-                    .saturating_add(metadata_gc.compacted_namespace_transaction_count)
-                    .saturating_add(metadata_gc.compacted_namespace_prepare_count)
                     .saturating_add(metadata_gc.compacted_namespace_request_count),
                 metadata_gc
                     .removed_namespace_job_receipt_count
                     .saturating_add(metadata_gc.removed_namespace_transaction_receipt_count)
-                    .saturating_add(metadata_gc.removed_namespace_prepare_receipt_count)
                     .saturating_add(metadata_gc.removed_namespace_request_receipt_count),
                 metadata_gc.dry_run,
                 metadata_gc.max_removals_reached,
@@ -2898,6 +2778,11 @@ pub fn run_dfs_maintenance_tick_with_host<T: DfsMessageTransport>(
     let _namespace_requests = service.recover_pending_namespace_requests_bounded(
         crate::service_routed_namespace::DFS_NAMESPACE_REQUEST_RECOVERY_BATCH_LIMIT,
     )?;
+    if service.remote_namespace_phase.is_some() {
+        return Err(DfsError::Metadata {
+            message: "owned namespace recovery requires its asynchronous host continuation".into(),
+        });
+    }
     let namespace_jobs = service
         .posix_resume_namespace_jobs_bounded(
             namespace_job_max_jobs,
@@ -2906,7 +2791,6 @@ pub fn run_dfs_maintenance_tick_with_host<T: DfsMessageTransport>(
         .map_err(|error| DfsError::Metadata {
             message: error.to_string(),
         })?;
-    let conflicts = service.reconcile_stale_conflicts_bounded(options.conflict_max_records)?;
     let write_intents = service.reconcile_stale_write_intents_bounded(
         options.write_intent_max_records,
         options.stale_write_intent_min_age,
@@ -2971,7 +2855,6 @@ pub fn run_dfs_maintenance_tick_with_host<T: DfsMessageTransport>(
     };
     Ok(DfsMaintenanceTickReport {
         namespace_jobs,
-        conflicts,
         write_intents,
         placement_reconciliation,
         lifecycle_reports,
@@ -3034,7 +2917,7 @@ where
 {
     // Reuse the existing committed-work capture without clearing earlier
     // owner handoffs. Queue-driven maintenance never snapshots all old jobs.
-    if maintenance_host.supports_repair_maintenance_pages() {
+    {
         service.coordinator.ensure_message_repair_job_capture();
     }
     let authoritative_topology = authoritative_prefix
@@ -3062,6 +2945,11 @@ where
     let _namespace_requests = service.recover_pending_namespace_requests_bounded(
         crate::service_routed_namespace::DFS_NAMESPACE_REQUEST_RECOVERY_BATCH_LIMIT,
     )?;
+    if service.remote_namespace_phase.is_some() {
+        return Err(DfsError::Metadata {
+            message: "owned namespace recovery requires its asynchronous host continuation".into(),
+        });
+    }
     tokio::task::yield_now().await;
     let namespace_jobs = service
         .posix_resume_namespace_jobs_bounded(
@@ -3072,21 +2960,18 @@ where
             message: error.to_string(),
         })?;
     tokio::task::yield_now().await;
-    let conflicts = service.reconcile_stale_conflicts_bounded(options.conflict_max_records)?;
     tokio::task::yield_now().await;
     let write_intents = service.reconcile_stale_write_intents_bounded(
         options.write_intent_max_records,
         options.stale_write_intent_min_age,
     )?;
     tokio::task::yield_now().await;
-    // Reuse this exact owner snapshot after placement/lifecycle; a cooperative
-    // yield cannot admit a competing mutation while global service admission
-    // remains held. External queue updates cause fail-closed GenerationChanged
-    // rejection before checkpointed dispatch, preserving the newer queue state.
+    // Placement eligibility needs only the current queue cardinality. Its
+    // own durable repair births can advance the queue before enrollment.
     let repair_page_limit = options
         .repair_max_jobs
         .min(crate::service_repair::DFS_REPAIR_EXAMINED_RECORDS_PER_PAGE);
-    let initial_repair_page = maintenance_host.load_repair_maintenance_page(repair_page_limit)?;
+    let initial_repair_page = maintenance_host.load_repair_maintenance_page(0)?;
     tokio::task::yield_now().await;
     let placement_reconciliation = if options.placement_reconciliation_max_objects == 0 {
         None
@@ -3095,6 +2980,7 @@ where
             .run_placement_reconciliation_bounded_async_with_pending_repairs(
                 options.placement_reconciliation_max_objects,
                 initial_repair_page.total_record_count,
+                &metadata_shards,
             )
             .await?
     };
@@ -3136,18 +3022,43 @@ where
     }
     // Capture work authored by earlier phases even when the observed queue
     // was empty. The same queue observation governs enrollment and retirement.
-    let captures = if maintenance_host.supports_repair_maintenance_pages() {
+    let captures = {
         let captures = service.take_message_committed_repair_queue_records();
         service.coordinator.ensure_message_repair_job_capture();
         captures
-    } else {
-        service.durable_repair_queue_records()
     };
+    // Observe the bounded execution page after placement/lifecycle publication.
+    // External changes after this cut still fail the unchanged enrollment CAS.
+    let current_repair_page = maintenance_host.load_repair_maintenance_page(repair_page_limit)?;
     let mut page = maintenance_host.enroll_repair_maintenance_page(
-        &initial_repair_page,
+        &current_repair_page,
         repair_page_limit,
         &captures,
     )?;
+    // Own scheduling Set changes the durable queue generation. Capture a
+    // current SAME bounded page before executing it, rather than retaining the
+    // pre-wake observation and rejecting our own later checkpoint as stale.
+    let mut removed_wake_keys = BTreeSet::new();
+    if let Some(removed) =
+        service.wake_connectivity_blocked_repair_records(&page.records, execution_exclusions)?
+    {
+        removed_wake_keys = removed;
+        let captures = page
+            .enrollment_records
+            .iter()
+            .filter(|row| {
+                !removed_wake_keys
+                    .contains(&(row.intent_id.clone(), row.missing_replica_node_id.clone()))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let current_page = maintenance_host.load_repair_maintenance_page(repair_page_limit)?;
+        page = maintenance_host.enroll_repair_maintenance_page(
+            &current_page,
+            repair_page_limit,
+            &captures,
+        )?;
+    }
     let (
         scheduled_repairs,
         followup_events,
@@ -3155,7 +3066,7 @@ where
         repair_attempts_after,
         repair_budget_exhausted,
         repair_page_checkpoint,
-    ) = if maintenance_host.supports_repair_maintenance_pages() {
+    ) = {
         let repair_execution_exclusions =
             execution_exclusions.allowing_unattempted_repairs(&page.records);
         let mut scoped_targets = BTreeSet::new();
@@ -3179,6 +3090,7 @@ where
                 &eligible,
                 &repair_execution_exclusions,
                 Some(&scoped_targets),
+                Some(&removed_wake_keys),
                 true,
             )
             .await?;
@@ -3191,7 +3103,14 @@ where
         // Replacement/stage completion may author new repair identities while
         // processing this page. Enroll that exact capture in the SAME observed
         // checkpoint before cancellation can destroy the service generation.
-        let repair_captures = service.take_message_committed_repair_queue_records();
+        let repair_captures = service
+            .take_message_committed_repair_queue_records()
+            .into_iter()
+            .filter(|row| {
+                !removed_wake_keys
+                    .contains(&(row.intent_id.clone(), row.missing_replica_node_id.clone()))
+            })
+            .collect::<Vec<_>>();
         service.coordinator.ensure_message_repair_job_capture();
         if !repair_captures.is_empty() {
             let mut captures = page.enrollment_records.clone();
@@ -3302,56 +3221,6 @@ where
             repair_budget_exhausted,
             repair_page_checkpoint,
         )
-    } else {
-        let repair_execution_exclusions =
-            execution_exclusions.allowing_unattempted_repairs(&page.records);
-        // Legacy hosts own a complete snapshot. Restore the entire snapshot
-        // before the complete pass so unvisited/parked keys cannot disappear.
-        let scheduled_repairs = service
-            .retry_pending_repairs_async_bounded_with_attempts_and_execution_exclusions(
-                options.repair_max_jobs,
-                &page.records,
-                &repair_execution_exclusions,
-            )
-            .await?;
-        let followup_events = service.process_incoming_async_until_quiescent().await?;
-        service.observe_repair_maintenance_events(&followup_events);
-        let mut durable_after = service.durable_repair_queue_records();
-        let mut repair_attempts_after = service.active_repair_attempt_records();
-        mark_connectivity_blocked_dfs_repair_attempt_records(
-            &mut durable_after,
-            execution_exclusions,
-        );
-        mark_connectivity_blocked_dfs_repair_attempt_records(
-            &mut repair_attempts_after,
-            execution_exclusions,
-        );
-        let repair_budget_exhausted = dfs_repair_maintenance_budget_exhausted(
-            options.repair_max_jobs,
-            page.records.len(),
-            scheduled_repairs.len(),
-            &durable_after,
-            dfs_now_unix_nanos(),
-        );
-        let repair_attempts_before = page
-            .records
-            .into_iter()
-            .filter(|record| record.attempts > 0)
-            .collect();
-        maintenance_host.store_repair_attempt_records(&durable_after)?;
-        service
-            .transport
-            .checkpoint_background_replica_dispatch()
-            .map_err(DfsError::from_network)?;
-        tokio::task::yield_now().await;
-        (
-            scheduled_repairs,
-            followup_events,
-            repair_attempts_before,
-            repair_attempts_after,
-            repair_budget_exhausted,
-            DfsRepairMaintenancePageCheckpoint::default(),
-        )
     };
     let metadata_replication = if options.publish_metadata {
         crate::publish_dfs_metadata_journal_with_async_host_and_execution_exclusions(
@@ -3372,7 +3241,6 @@ where
     };
     Ok(DfsMaintenanceTickReport {
         namespace_jobs,
-        conflicts,
         write_intents,
         placement_reconciliation,
         lifecycle_reports,
@@ -3403,6 +3271,9 @@ mod causal_time_tests {
         attempts: u32,
     ) -> DfsRepairAttemptRecord {
         DfsRepairAttemptRecord {
+            transfer_delivery_state: None,
+            completed_transfer_request_id: None,
+            transfer_kind: None,
             intent_id: "intent-reactive-connectivity".to_string(),
             object_id: DfsObjectId::from_legacy_named("object-reactive-connectivity")
                 .expect("object id"),
@@ -3511,43 +3382,23 @@ mod causal_time_tests {
 
     #[test]
     fn delayed_catalog_install_cannot_reject_a_reservation_renewed_after_its_root_cut() {
-        let root = sinomo_testdir::TestDir::new("dfs-delayed-catalog-reservation-race");
-        let node = NodeId::from_legacy_named("node_delayed_catalog_primary").unwrap();
-        let file_system = DfsFileSystemConfig {
-            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
-            retention_policies: Default::default(),
-            module_metadata: Default::default(),
-            file_system_id: crate::sifs_file_system_id(),
-            display_name: "Delayed catalog filesystem".into(),
-            owner_node_id: node.clone(),
-            subtree_policies: Vec::new(),
-        };
-        let shard = DfsMetadataShardConfig {
-            file_system_id: file_system.file_system_id.clone(),
-            shard_id: "root".into(),
-            primary_node_id: node.clone(),
-            replica_node_ids: Vec::new(),
-            epoch: 1,
-            assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
-            default_policy: DfsObjectPolicy::ReplicatedEventual,
-        };
-        let mut primary = crate::LocalSobjMetadataBackend::new(
-            DfsMetadataShardId::new("root"),
-            root.join("primary-metadata"),
-        )
-        .expect("primary metadata");
-        primary
-            .put_file_system(&crate::DfsFileSystem::from(file_system.clone()))
-            .expect("filesystem metadata");
-        let content_root = root.join("content");
-        let content = crate::LocalContentStore::new(&content_root).expect("content store");
-        let object_id = DfsObjectId::from_legacy_named("object_delayed_catalog_current").unwrap();
-        let version = DfsVersion::from_legacy_named("version_delayed_catalog_current").unwrap();
+        let node =
+            crate::test_runtime::DfsTestRuntime::ordered_node_ids("native-delayed-catalog", 1)
+                .remove(0);
+        let mut runtime =
+            crate::test_runtime::DfsTestRuntime::new("native-delayed-catalog", node.clone())
+                .unwrap();
+        runtime.start_nodes().unwrap();
+        let shard = runtime.root_shard().unwrap();
+        let file_system = DfsFileSystemConfig::from(&runtime.file_system());
+        let content_root = runtime.data_dir(&node).dfs_dir().join("content");
+        let content = crate::LocalContentStore::new(&content_root).unwrap();
+        let mut service = runtime.client(&node).unwrap();
+        let object_id = DfsObjectId::generate();
+        let version = DfsVersion::generate();
         let manifest = content
             .put_object_version(object_id.as_str(), version.as_str(), b"current bytes")
-            .expect("requester stages its exact durable local binding");
-
+            .unwrap();
         // A real primary page is captured after staging, but before the write
         // reaches canonical metadata. Hold it as an in-flight catalog reply.
         let topology_digest = dfs_content_root_catalog_topology_digest_with_file_systems(
@@ -3565,7 +3416,9 @@ mod causal_time_tests {
             max_entries: 256,
         };
         let scan_cut = content.begin_content_root_catalog_scan().unwrap();
-        let page = primary
+        let page = service
+            .metadata_backend_mut()
+            .unwrap()
             .content_root_catalog_page(&request)
             .expect("capture primary root cut");
         let captured_at = page.generated_at_unix_nanos;
@@ -3577,43 +3430,21 @@ mod causal_time_tests {
             vec![fragment],
         )
         .unwrap();
-        assert!(captured.protected_version_pairs().unwrap().is_empty());
-
-        primary
-            .put_object(&crate::DfsObjectMetadata {
-                object_id: object_id.clone(),
-                file_system_id: file_system.file_system_id.clone(),
-                path: "/delayed-catalog-current.txt".into(),
-                kind: crate::DfsObjectKind::File,
-                tombstone_provenance: None,
-                owner_node_id: node.clone(),
-                current_locations: vec![node],
-                content_hash: Some(manifest.content_hash.clone()),
-                content_size_bytes: Some(manifest.size_bytes),
-                link_target_object_id: None,
-                mode: 0o600,
-                uid: 0,
-                gid: 0,
-                accessed_at_unix_nanos: 0,
-                modified_at_unix_nanos: 0,
-                created_at_unix_nanos: 0,
-                changed_at_unix_nanos: 0,
-                version: version.clone(),
-                policy: DfsObjectPolicy::ReplicatedEventual,
-                created_by_event_id: None,
-                last_modified_by_event_id: None,
-            })
-            .expect("canonical metadata now protects the current version");
         assert!(
-            primary
-                .metadata_content_protection()
+            !captured
+                .protected_version_pairs()
                 .unwrap()
-                .versions
-                .contains(&crate::DfsMetadataVersionIdentity::new(
-                    object_id.clone(),
-                    version.clone()
-                ))
+                .contains(&(object_id.to_string(), version.to_string()))
         );
+
+        // A normal committed write advances metadata after this captured cut.
+        service
+            .posix_write_file(
+                "/delayed-catalog-current.txt",
+                b"current bytes",
+                crate::DfsWriteOptions::replicated_eventual(vec![node.clone()]),
+            )
+            .unwrap();
         // Keep the existing generic completion renewal. This regression does
         // not depend on any proposed reservation no-op optimization.
         content
@@ -3624,7 +3455,16 @@ mod causal_time_tests {
                 manifest.size_bytes,
             )
             .expect("generic completion renewal");
-        let renewed = content.content_reservation_roots().unwrap().reservations[0].clone();
+        let renewed = content
+            .content_reservation_roots()
+            .unwrap()
+            .reservations
+            .into_iter()
+            .find(|row| {
+                row.identity.object_id == object_id.as_str()
+                    && row.identity.version == version.as_str()
+            })
+            .unwrap();
         assert!(renewed.reserved_at_unix_nanos > captured_at);
         let installed_at = renewed.reserved_at_unix_nanos + 1;
         LocalDfsContentRootCatalogStore::new(&content_root)
@@ -3674,13 +3514,18 @@ mod causal_time_tests {
             report.released_rejected_count, 0,
             "installing an older root cut after completion must not make it newer evidence than the renewed reservation"
         );
-        assert_eq!(
+        assert!(
             content
                 .content_reservation_roots()
                 .unwrap()
-                .reservation_count,
-            1
+                .reservations
+                .iter()
+                .any(|row| row.identity.object_id == object_id.as_str()
+                    && row.identity.version == version.as_str())
         );
+        drop(content);
+        drop(service);
+        runtime.close().unwrap();
     }
 
     #[test]
@@ -3696,11 +3541,10 @@ mod causal_time_tests {
             replica_node_ids: Vec::new(),
             epoch: 4,
             assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
+
             default_policy: DfsObjectPolicy::ReplicatedConfirmed,
         };
         let file_system = DfsFileSystemConfig {
-            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id,

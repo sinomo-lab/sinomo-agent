@@ -275,10 +275,48 @@ pub fn metadata_replica_context_matches_authority_entries(
         &context.shard.file_system_id,
         &DfsMetadataShardId::new(context.shard.shard_id.clone()),
     )?;
-    Ok(projected.is_some_and(|projected| {
-        projected.shard == context.shard
-            && projected.pending_membership_handoff == context.pending_membership_handoff
-    }))
+    let current = projected.as_ref();
+    let shard_matches = current.is_some_and(|current| current.shard == context.shard);
+    let handoff_matches = current.is_some_and(|current| {
+        current.pending_membership_handoff == context.pending_membership_handoff
+    });
+    let matches = shard_matches && handoff_matches;
+    if !matches && tracing::enabled!(target: "sinomo.dfs.perf", tracing::Level::TRACE) {
+        // Observe the contexts already decoded for this exact comparison. The
+        // fixed field set omits member arrays, paths, and storage-import payloads.
+        // No new projection read, authorization decision, or authority cache is
+        // introduced by these diagnostics.
+        let expected_handoff = context.pending_membership_handoff.as_ref();
+        let current_handoff =
+            current.and_then(|current| current.pending_membership_handoff.as_ref());
+        tracing::trace!(target: "sinomo.dfs.perf",
+            current_context_present = current.is_some(), shard_matches, handoff_matches,
+            expected_epoch = context.shard.epoch,
+            current_epoch = ?current.map(|current| current.shard.epoch),
+            expected_primary = %context.shard.primary_node_id,
+            current_primary = ?current.map(|current| &current.shard.primary_node_id),
+            file_system_matches = current.is_some_and(|current| current.shard.file_system_id == context.shard.file_system_id),
+            shard_id_matches = current.is_some_and(|current| current.shard.shard_id == context.shard.shard_id),
+            replica_node_ids_match = current.is_some_and(|current| current.shard.replica_node_ids == context.shard.replica_node_ids),
+            expected_replica_count = context.shard.replica_node_ids.len(),
+            current_replica_count = ?current.map(|current| current.shard.replica_node_ids.len()),
+            assignment_matches = current.is_some_and(|current| current.shard.assignment == context.shard.assignment),
+            default_policy_matches = current.is_some_and(|current| current.shard.default_policy == context.shard.default_policy),
+            expected_handoff_id = ?expected_handoff.map(|handoff| &handoff.handoff_id),
+            current_handoff_id = ?current_handoff.map(|handoff| &handoff.handoff_id),
+            handoff_cause_matches = expected_handoff.map(|handoff| &handoff.cause) == current_handoff.map(|handoff| &handoff.cause),
+            retiring_shard_matches = expected_handoff.map(|handoff| &handoff.retiring_shard) == current_handoff.map(|handoff| &handoff.retiring_shard),
+            desired_shard_matches = expected_handoff.map(|handoff| &handoff.desired_shard) == current_handoff.map(|handoff| &handoff.desired_shard),
+            expected_required_sequence = ?expected_handoff.map(|handoff| handoff.required_prepared_sequence),
+            current_required_sequence = ?current_handoff.map(|handoff| handoff.required_prepared_sequence),
+            required_watermark_matches = expected_handoff.map(|handoff| &handoff.required_head_watermark) == current_handoff.map(|handoff| &handoff.required_head_watermark),
+            retiring_fence_matches = expected_handoff.map(|handoff| &handoff.retiring_primary_fence) == current_handoff.map(|handoff| &handoff.retiring_primary_fence),
+            expected_fence_sequence = ?expected_handoff.and_then(|handoff| handoff.retiring_primary_fence.as_ref()).map(|fence| fence.journal_sequence),
+            current_fence_sequence = ?current_handoff.and_then(|handoff| handoff.retiring_primary_fence.as_ref()).map(|fence| fence.journal_sequence),
+            "DFS retained replica context comparison differs"
+        );
+    }
+    Ok(matches)
 }
 
 pub fn metadata_replica_context_from_authority_projection(

@@ -38,7 +38,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         certified_shards: &[DfsMetadataShardConfig],
     ) -> Result<Option<VerifiedDfsBlobFetch>, DfsError> {
         let Some(intent) = backend.get_intent(&command.object_id, &command.intent_id)? else {
-            return Ok(None); // Preserve legacy unknown-intent behavior globally.
+            return Ok(None);
         };
         let Some(object) = backend
             .get_object(&command.object_id)?
@@ -562,13 +562,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         content_hash: String,
         size_bytes: u64,
     ) -> Result<NetworkedDfsServiceEvent, DfsError> {
-        self.record_fetched_pending_write_size(
-            &intent_id,
-            &object_id,
-            &version,
-            &content_hash,
-            size_bytes,
-        )?;
+        if let Some(pending) = self.writes.pending_writes.get_mut(&intent_id)
+            && pending.size_bytes == 0
+        {
+            pending.size_bytes = size_bytes;
+        }
         self.record_local_pending_write_receipt_if_desired(
             &intent_id,
             &object_id,
@@ -583,30 +581,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             source_node_id,
             content_hash,
         })
-    }
-
-    fn record_fetched_pending_write_size(
-        &mut self,
-        intent_id: &str,
-        object_id: &DfsObjectId,
-        version: &DfsVersion,
-        content_hash: &str,
-        size_bytes: u64,
-    ) -> Result<(), DfsError> {
-        if let Some(pending) = self.writes.pending_writes.get_mut(intent_id)
-            && pending.size_bytes == 0
-        {
-            pending.size_bytes = size_bytes;
-        }
-        if let Some(backend) = self.metadata_backend.as_mut()
-            && let Some(mut version_record) = backend.get_version(object_id, version)?
-            && version_record.content_hash.as_deref() == Some(content_hash)
-            && version_record.size_bytes != Some(size_bytes)
-        {
-            version_record.size_bytes = Some(size_bytes);
-            backend.put_version(&version_record)?;
-        }
-        Ok(())
     }
 
     pub(crate) fn record_local_pending_write_receipt_if_desired(

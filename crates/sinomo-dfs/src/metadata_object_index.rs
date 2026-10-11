@@ -28,48 +28,6 @@ pub(crate) fn object_index_table_ops_at(
     ops
 }
 
-pub(crate) fn object_indexes_are_materialized(
-    tables: &DfsMetadataTables,
-    object: &DfsObjectMetadata,
-) -> bool {
-    if tables.compacted_tombstone_matches(object) {
-        return true;
-    }
-    let path_record = path_record_for_object(object);
-    if tables.objects.get(&object.object_id).cloned() != Some(normalized_object_metadata(object)) {
-        return false;
-    }
-    if !tables
-        .inodes
-        .contains_key(&object_inode_id(&object.object_id))
-    {
-        return false;
-    }
-    if !tables
-        .file_system_objects
-        .contains_key(&(object.file_system_id.clone(), object.object_id.clone()))
-    {
-        return false;
-    }
-    if !tables
-        .paths
-        .contains_key(&(object.file_system_id.clone(), path_record.path.clone()))
-    {
-        return false;
-    }
-    if object.kind == DfsObjectKind::Tombstone {
-        return true;
-    }
-    tables
-        .dentries
-        .get(&dentry_key(&path_record))
-        .is_some_and(|record| {
-            record.object_id == object.object_id
-                && record.file_system_id == object.file_system_id
-                && record.path == path_record.path
-        })
-}
-
 pub(crate) fn object_index_table_ops_with_previous(
     tables: &DfsMetadataTables,
     object: &DfsObjectMetadata,
@@ -389,18 +347,6 @@ mod tests {
                 DfsMetadataTableOp::PutDirFragment { .. },
             ]
         ));
-    }
-
-    #[test]
-    fn object_index_materialized_check_requires_dentry_for_live_file() {
-        let object = object("/docs/readme.md");
-        let mut tables = DfsMetadataTables::default();
-        apply_object_indexes(&mut tables, &object, None);
-
-        assert!(object_indexes_are_materialized(&tables, &object));
-        let path_record = path_record_for_object(&object);
-        tables.dentries.remove(&dentry_key(&path_record));
-        assert!(!object_indexes_are_materialized(&tables, &object));
     }
 
     #[test]

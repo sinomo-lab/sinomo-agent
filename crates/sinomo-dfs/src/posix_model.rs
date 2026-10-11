@@ -5,8 +5,8 @@ use crate::metadata_error::MetadataBackendError;
 use crate::metadata_records::{DfsDirectoryPageCursor, DfsNamespaceJobKind};
 use crate::protocol::DfsNamespacePosixError;
 use crate::{
-    DfsConflictReadView, DfsError, DfsFileSystemId, DfsObjectId, DfsObjectKind,
-    DfsReplicationPolicy, DfsVerifiedReadStream, DfsVersion,
+    DfsError, DfsFileSystemId, DfsObjectId, DfsObjectKind, DfsReplicationPolicy,
+    DfsVerifiedReadStream, DfsVersion,
 };
 use serde::{Deserialize, Serialize};
 use sinomo_core::DfsObjectPolicy;
@@ -473,16 +473,4 @@ pub(crate) fn posix_error_for_namespace_rejection(
         Some(DfsNamespacePosixError::Busy { path }) => DfsPosixError::Dfs(DfsError::Busy { path }),
         None => DfsPosixError::Dfs(DfsError::Distributed { message: reason }),
     }
-}
-
-pub(crate) fn read_conflict_error(
-    path: String,
-    conflicts: Vec<DfsConflictReadView>,
-) -> DfsPosixError {
-    let reason = conflicts
-        .into_iter()
-        .map(|conflict| conflict.reason)
-        .next()
-        .unwrap_or_else(|| "object has an open DFS conflict".to_string());
-    DfsPosixError::Conflict { path, reason }
 }

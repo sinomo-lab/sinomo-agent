@@ -8,18 +8,6 @@ use sinomo_core::events::EventId;
 use sinomo_core::node::NodeId;
 use time::OffsetDateTime;
 
-/// Record field presence while decoding the field's actual wire type. SOBJ
-/// encodes a map or string directly here, rather than an Option wrapper; a
-/// missing field is supplied by serde's default and remains None.
-#[doc(hidden)]
-pub fn deserialize_present_value<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: serde::Deserialize<'de>,
-{
-    T::deserialize(deserializer).map(Some)
-}
-
 /// Stable identifier for a DFS metadata shard.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq, Ord, PartialOrd)]
 pub struct DfsMetadataShardId(pub String);
@@ -65,11 +53,6 @@ pub struct DfsMetadataReplayCursorStatus {
 /// Content replication grant, independent of metadata generations.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsContentDurability {
-    /// Set only when legacy content received a fresh grant under the current
-    /// filesystem policy. Absence denotes recovered/original write evidence.
-    /// This is audit provenance; the replica set and W/N govern durability.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub current_policy_granted_at_unix_nanos: Option<u64>,
     /// Data-write generation; metadata-only successors may outlive this row.
     pub source_version: DfsVersion,
     pub coordinator_node_id: NodeId,
@@ -282,21 +265,11 @@ pub struct DfsRevisionRetentionState {
     pub grant: Option<Box<DfsRevisionRetentionGrant>>,
 }
 
-/// Encoding provenance survives replay, exact digests and snapshots.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum DfsRevisionMetadataFormat {
-    Legacy,
-    #[default]
-    NamespacedV6,
-}
-
 /// Metadata for one immutable object revision. Product-specific preservation
 /// payloads are namespaced; core collection and repair use generic grants.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(try_from = "DfsObjectVersionWire")]
 pub struct DfsObjectVersionRecord {
-    #[serde(skip)]
-    pub metadata_format: DfsRevisionMetadataFormat,
     pub file_system_id: DfsFileSystemId,
     pub object_id: DfsObjectId,
     pub version: DfsVersion,
@@ -311,80 +284,14 @@ pub struct DfsObjectVersionRecord {
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
     pub visible: bool,
-    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub retention: std::collections::BTreeMap<String, DfsRevisionRetentionState>,
-    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub module_metadata: std::collections::BTreeMap<String, DfsModuleMetadataValue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_durability: Option<Box<DfsContentDurability>>,
 }
 
-#[derive(Serialize)]
-struct DfsObjectVersionRef<'a> {
-    file_system_id: &'a DfsFileSystemId,
-    object_id: &'a DfsObjectId,
-    version: &'a DfsVersion,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    content_hash: &'a Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    size_bytes: &'a Option<u64>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    locations: &'a Vec<NodeId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    created_by_event_id: &'a Option<EventId>,
-    #[serde(with = "time::serde::rfc3339")]
-    created_at: &'a OffsetDateTime,
-    visible: &'a bool,
-    // Presence also distinguishes a cleared V6 row from an older writer's
-    // omitted extension state. Preserve it even after the last namespace clears.
-    retention: &'a std::collections::BTreeMap<String, DfsRevisionRetentionState>,
-    module_metadata: &'a std::collections::BTreeMap<String, DfsModuleMetadataValue>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    content_durability: &'a Option<Box<DfsContentDurability>>,
-}
-
-impl Serialize for DfsObjectVersionRecord {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        if self.metadata_format == DfsRevisionMetadataFormat::Legacy {
-            return crate::dfs::file_history::serialize_legacy_version(self, serializer);
-        }
-        DfsObjectVersionRef {
-            file_system_id: &self.file_system_id,
-            object_id: &self.object_id,
-            version: &self.version,
-            content_hash: &self.content_hash,
-            size_bytes: &self.size_bytes,
-            locations: &self.locations,
-            created_by_event_id: &self.created_by_event_id,
-            created_at: &self.created_at,
-            visible: &self.visible,
-            retention: &self.retention,
-            module_metadata: &self.module_metadata,
-            content_durability: &self.content_durability,
-        }
-        .serialize(serializer)
-    }
-}
-
-impl PartialEq for DfsObjectVersionRecord {
-    fn eq(&self, other: &Self) -> bool {
-        self.file_system_id == other.file_system_id
-            && self.object_id == other.object_id
-            && self.version == other.version
-            && self.content_hash == other.content_hash
-            && self.size_bytes == other.size_bytes
-            && self.locations == other.locations
-            && self.created_by_event_id == other.created_by_event_id
-            && self.created_at == other.created_at
-            && self.visible == other.visible
-            && self.retention == other.retention
-            && self.module_metadata == other.module_metadata
-            && self.content_durability == other.content_durability
-    }
-}
-impl Eq for DfsObjectVersionRecord {}
-
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DfsObjectVersionWire {
     pub file_system_id: DfsFileSystemId,
     pub object_id: DfsObjectId,
@@ -400,14 +307,8 @@ struct DfsObjectVersionWire {
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
     pub visible: bool,
-    #[serde(default, deserialize_with = "deserialize_present_value")]
-    retention: Option<std::collections::BTreeMap<String, DfsRevisionRetentionState>>,
-    #[serde(default, deserialize_with = "deserialize_present_value")]
-    module_metadata: Option<std::collections::BTreeMap<String, DfsModuleMetadataValue>>,
-    #[serde(default)]
-    history_order: u64,
-    #[serde(default)]
-    retained: Option<Box<DfsRetainedFileVersion>>,
+    retention: std::collections::BTreeMap<String, DfsRevisionRetentionState>,
+    module_metadata: std::collections::BTreeMap<String, DfsModuleMetadataValue>,
     #[serde(default)]
     content_durability: Option<Box<DfsContentDurability>>,
 }
@@ -416,13 +317,7 @@ impl TryFrom<DfsObjectVersionWire> for DfsObjectVersionRecord {
     type Error = String;
 
     fn try_from(wire: DfsObjectVersionWire) -> Result<Self, Self::Error> {
-        let metadata_format = if wire.retention.is_some() || wire.module_metadata.is_some() {
-            DfsRevisionMetadataFormat::NamespacedV6
-        } else {
-            DfsRevisionMetadataFormat::Legacy
-        };
-        let mut record = Self {
-            metadata_format,
+        let record = Self {
             file_system_id: wire.file_system_id,
             object_id: wire.object_id,
             version: wire.version,
@@ -432,17 +327,10 @@ impl TryFrom<DfsObjectVersionWire> for DfsObjectVersionRecord {
             created_by_event_id: wire.created_by_event_id,
             created_at: wire.created_at,
             visible: wire.visible,
-            retention: wire.retention.unwrap_or_default(),
-            module_metadata: wire.module_metadata.unwrap_or_default(),
+            retention: wire.retention,
+            module_metadata: wire.module_metadata,
             content_durability: wire.content_durability,
         };
-        // Compatibility is isolated here: authored records never emit legacy
-        // fields, and the packed-v6 gate owns admission of this representation.
-        crate::dfs::file_history::migrate_legacy_version_metadata(
-            &mut record,
-            wire.history_order,
-            wire.retained,
-        )?;
         record.validate_extension_metadata()?;
         Ok(record)
     }
@@ -553,7 +441,6 @@ pub struct DfsReplicaReceiptRecord {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsWriteIntentRecord {
-    #[serde(default, skip_serializing_if = "DfsWritePublication::is_current")]
     pub publication: DfsWritePublication,
     pub intent_id: String,
     pub file_system_id: DfsFileSystemId,
@@ -566,7 +453,6 @@ pub struct DfsWriteIntentRecord {
     pub operation_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation_order_token: Option<String>,
-    #[serde(default)]
     pub owner_epoch: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub desired_replica_node_ids: Vec<NodeId>,
@@ -578,9 +464,7 @@ pub struct DfsWriteIntentRecord {
     pub object_metadata: Option<DfsObjectMetadata>,
     /// Whether committing this intent makes a previously invisible directory
     /// entry visible and therefore owes the parent directory a POSIX mtime /
-    /// version update. Older intent records predate this obligation and
-    /// deserialize to `false`.
-    #[serde(default)]
+    /// version update.
     pub touch_parent_on_create: bool,
     /// Exact tombstone object occupying this path when a new transient object
     /// was created. Recovery may replace only this predecessor; a different
@@ -601,41 +485,8 @@ pub enum DfsWriteIntentStatus {
     ReceiptsPending,
     Committed,
     Rejected,
-    Conflict,
+
     Aborted,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct DfsConflictRecord {
-    pub conflict_id: String,
-    pub file_system_id: DfsFileSystemId,
-    pub object_id: DfsObjectId,
-    pub path: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub base_version: Option<DfsVersion>,
-    pub local_version: DfsVersion,
-    pub remote_version: DfsVersion,
-    pub detected_by_node_id: NodeId,
-    pub reason: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub local_content_hash: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub remote_content_hash: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub created_by_intent_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub strategy: Option<String>,
-    pub status: DfsConflictStatus,
-    #[serde(with = "time::serde::rfc3339")]
-    pub detected_at: OffsetDateTime,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "kebab-case")]
-pub enum DfsConflictStatus {
-    Open,
-    Resolved,
-    Superseded,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -655,71 +506,39 @@ mod retention_metadata_tests {
     use super::*;
     use serde_json::json;
 
-    fn legacy_version() -> serde_json::Value {
+    fn current_version() -> DfsObjectVersionRecord {
         let fs = DfsFileSystemId::generate();
         let object_id = DfsObjectId::generate();
         let version = DfsVersion::generate();
         let node = NodeId::generate();
-        json!({
-            "file_system_id":fs,"object_id":object_id,"version":version,
-            "content_hash":"blake3:retained-content","size_bytes":7,
-            "locations":[node],"created_at":"2026-10-03T00:00:00Z","visible":false,
-            "history_order":3,
-            "retained":{
-                "object":{"file_system_id":fs,"object_id":object_id,"version":version,
-                    "path":"/services/report","kind":"file","owner_node_id":node,
-                    "content_hash":"blake3:retained-content","content_size_bytes":7,
-                    "policy":"replicated-eventual"},
-                "captured_at_unix_nanos":42,"source":{"kind":"retention-rule"},
-                "policy_capture":{"order":3,"captured_at_unix_nanos":42,
-                    "retention":{"keep_last":2,"keep_for_seconds":60}}
-            }
-        })
+        serde_json::from_value(json!({
+            "file_system_id": fs, "object_id": object_id, "version": version,
+            "content_hash": "blake3:retained-content", "size_bytes": 7,
+            "locations": [node], "created_at": "2026-10-03T00:00:00Z", "visible": false,
+            "retention": {"module.dfs.history": {"order": 3, "grant": {
+                "object": {"file_system_id": fs, "object_id": object_id, "version": version,
+                    "path": "/services/report", "kind": "file", "owner_node_id": node,
+                    "content_hash": "blake3:retained-content", "content_size_bytes": 7,
+                    "policy": "replicated-eventual"},
+                "granted_at_unix_nanos": 42, "origin": "rule",
+                "minimum": {"order": 3, "granted_at_unix_nanos": 42,
+                    "minimum": {"keep_last": 2, "keep_for_seconds": 60}}
+            }}},
+            "module_metadata": {}
+        }))
+        .unwrap()
     }
 
     #[test]
-    fn legacy_capture_migrates_without_losing_minimum_or_module_provenance() {
-        let mut version: DfsObjectVersionRecord = serde_json::from_value(legacy_version()).unwrap();
-        assert_eq!(version.metadata_format, DfsRevisionMetadataFormat::Legacy);
-        assert!(
-            serde_json::to_value(&version)
-                .unwrap()
-                .get("retained")
-                .is_some()
-        );
-        let state = &version.retention[DFS_HISTORY_METADATA_NAMESPACE];
-        assert_eq!(state.order, 3);
-        let minimum = state.grant.as_ref().unwrap().minimum.as_ref().unwrap();
-        assert_eq!(minimum.minimum.keep_last, 2);
-        assert_eq!(minimum.minimum.keep_for_seconds, 60);
-        assert_eq!(minimum.granted_at_unix_nanos, 42);
-        version.metadata_format = DfsRevisionMetadataFormat::NamespacedV6;
-        let encoded = serde_json::to_value(&version).unwrap();
-        assert!(encoded.get("retained").is_none());
-        assert!(encoded.get("history_order").is_none());
-        assert_eq!(
-            serde_json::from_value::<DfsObjectVersionRecord>(encoded).unwrap(),
-            version
-        );
-    }
-
-    #[test]
-    fn unknown_module_payload_round_trips_and_obeys_bounds() {
-        let mut version: DfsObjectVersionRecord = serde_json::from_value(legacy_version()).unwrap();
+    fn opaque_module_payload_round_trips_and_obeys_bounds() {
+        let mut version = current_version();
         version.module_metadata.insert(
             "vendor.research".into(),
             DfsModuleMetadataValue {
                 schema_version: 17,
-                payload: json!({"graph":{"nodes":[1,2],"relationship":"derived"}}),
+                payload: json!({"graph": {"nodes": [1, 2], "relationship": "derived"}}),
             },
         );
-        assert!(
-            serde_json::to_vec(&version)
-                .unwrap_err()
-                .to_string()
-                .contains("foreign")
-        );
-        version.metadata_format = DfsRevisionMetadataFormat::NamespacedV6;
         let encoded = serde_json::to_vec(&version).unwrap();
         assert_eq!(
             serde_json::from_slice::<DfsObjectVersionRecord>(&encoded).unwrap(),
@@ -736,25 +555,17 @@ mod retention_metadata_tests {
                 .unwrap_err()
                 .contains("64 KiB")
         );
-    }
-
-    #[test]
-    fn contradictory_legacy_and_generic_grants_are_rejected() {
-        let mut wire = legacy_version();
-        let migrated: DfsObjectVersionRecord = serde_json::from_value(wire.clone()).unwrap();
-        wire["retention"] = serde_json::to_value(migrated.retention).unwrap();
-        wire["retention"][DFS_HISTORY_METADATA_NAMESPACE]["order"] = json!(99);
         assert!(
-            serde_json::from_value::<DfsObjectVersionRecord>(wire)
-                .unwrap_err()
-                .to_string()
-                .contains("conflicts")
+            serde_json::from_value::<DfsObjectVersionRecord>(
+                serde_json::to_value(version).unwrap()
+            )
+            .is_err()
         );
     }
 
     #[test]
     fn generic_grant_cannot_substitute_foreign_content_identity() {
-        let mut version: DfsObjectVersionRecord = serde_json::from_value(legacy_version()).unwrap();
+        let mut version = current_version();
         version
             .retention
             .get_mut(DFS_HISTORY_METADATA_NAMESPACE)
@@ -773,122 +584,44 @@ mod retention_metadata_tests {
     }
 
     #[test]
-    fn direct_sobj_namespaced_maps_round_trip_without_option_wrappers() {
+    fn current_sobj_maps_and_explicit_clears_survive_round_trip() {
         use sinomo_core::object::{LengthMode, serde_ext};
-        let mut version: DfsObjectVersionRecord = serde_json::from_value(legacy_version()).unwrap();
-        version.metadata_format = DfsRevisionMetadataFormat::NamespacedV6;
-        version.module_metadata.insert(
-            "org.example.opaque".into(),
-            DfsModuleMetadataValue {
-                schema_version: 9,
-                payload: json!([1, "text", true, null]),
-            },
-        );
-        let bytes = serde_ext::to_bytes(&version, 6, LengthMode::U32).unwrap();
-        assert_eq!(
-            serde_ext::from_bytes::<DfsObjectVersionRecord>(&bytes).unwrap(),
-            version
-        );
-        let fs = DfsFileSystem {
-            metadata_format: DfsRevisionMetadataFormat::NamespacedV6,
-            file_system_id: version.file_system_id.clone(),
-            display_name: "retention".into(),
-            owner_node_id: version.locations[0].clone(),
-            subtree_policies: Vec::new(),
-            retention_policies: std::collections::BTreeMap::from([(
-                "org.example.rule".into(),
-                DfsRetentionPolicy {
-                    rules: vec![DfsRetentionRule {
-                        path: "/services".into(),
-                        minimum: DfsRetentionMinimum {
-                            keep_last: 2,
-                            keep_for_seconds: 60,
-                        },
-                    }],
-                },
-            )]),
-            module_metadata: version.module_metadata.clone(),
-        };
-        let bytes = serde_ext::to_bytes(&fs, 6, LengthMode::U32).unwrap();
-        assert_eq!(serde_ext::from_bytes::<DfsFileSystem>(&bytes).unwrap(), fs);
-        let config = DfsFileSystemConfig::from(&fs);
-        let bytes = serde_ext::to_bytes(&config, 6, LengthMode::U32).unwrap();
-        assert_eq!(
-            serde_ext::from_bytes::<DfsFileSystemConfig>(&bytes).unwrap(),
-            config
-        );
-        // Legacy serializers and their byte identities stay unchanged.
-        let legacy: DfsObjectVersionRecord = serde_json::from_value(legacy_version()).unwrap();
-        let bytes = serde_ext::to_bytes(&legacy, 3, LengthMode::U32).unwrap();
-        let decoded: DfsObjectVersionRecord = serde_ext::from_bytes(&bytes).unwrap();
-        assert_eq!(
-            serde_ext::to_bytes(&decoded, 3, LengthMode::U32).unwrap(),
-            bytes
-        );
+        let mut version = current_version();
+        for clear in [false, true] {
+            if clear {
+                version.retention.clear();
+                version.module_metadata.clear();
+            }
+            let json = serde_json::to_value(&version).unwrap();
+            assert!(json.get("retention").is_some() && json.get("module_metadata").is_some());
+            let bytes = serde_ext::to_bytes(&version, 7, LengthMode::U32).unwrap();
+            assert_eq!(
+                serde_ext::from_bytes::<DfsObjectVersionRecord>(&bytes).unwrap(),
+                version
+            );
+            let fs = DfsFileSystem {
+                file_system_id: version.file_system_id.clone(),
+                display_name: "current".into(),
+                owner_node_id: version.locations[0].clone(),
+                subtree_policies: vec![],
+                retention_policies: Default::default(),
+                module_metadata: version.module_metadata.clone(),
+            };
+            let bytes = serde_ext::to_bytes(&fs, 7, LengthMode::U32).unwrap();
+            assert_eq!(serde_ext::from_bytes::<DfsFileSystem>(&bytes).unwrap(), fs);
+            let config = DfsFileSystemConfig::from(&fs);
+            let bytes = serde_ext::to_bytes(&config, 7, LengthMode::U32).unwrap();
+            assert_eq!(
+                serde_ext::from_bytes::<DfsFileSystemConfig>(&bytes).unwrap(),
+                config
+            );
+        }
     }
 
     #[test]
-    fn cleared_namespaced_records_preserve_empty_state_and_encoding_provenance() {
-        use sinomo_core::object::{LengthMode, serde_ext};
-        let mut version: DfsObjectVersionRecord = serde_json::from_value(legacy_version()).unwrap();
-        version.metadata_format = DfsRevisionMetadataFormat::NamespacedV6;
-        version.retention.clear();
-        version.module_metadata.clear();
-        let json = serde_json::to_value(&version).unwrap();
-        assert_eq!(json["retention"], json!({}));
-        assert_eq!(json["module_metadata"], json!({}));
-        let decoded: DfsObjectVersionRecord = serde_json::from_value(json).unwrap();
-        assert_eq!(
-            decoded.metadata_format,
-            DfsRevisionMetadataFormat::NamespacedV6
-        );
-        let decoded: DfsObjectVersionRecord =
-            serde_ext::from_value(&serde_ext::to_value(&version).unwrap()).unwrap();
-        assert_eq!(
-            decoded.metadata_format,
-            DfsRevisionMetadataFormat::NamespacedV6
-        );
-        let bytes = serde_ext::to_bytes(&version, 6, LengthMode::U32).unwrap();
-        let decoded: DfsObjectVersionRecord = serde_ext::from_bytes(&bytes).unwrap();
-        assert_eq!(
-            decoded.metadata_format,
-            DfsRevisionMetadataFormat::NamespacedV6
-        );
-        assert!(decoded.retention.is_empty() && decoded.module_metadata.is_empty());
-
-        let fs = DfsFileSystem {
-            metadata_format: DfsRevisionMetadataFormat::NamespacedV6,
-            file_system_id: version.file_system_id.clone(),
-            display_name: "cleared".into(),
-            owner_node_id: version.locations[0].clone(),
-            subtree_policies: Vec::new(),
-            retention_policies: Default::default(),
-            module_metadata: Default::default(),
-        };
-        let decoded: DfsFileSystem =
-            serde_json::from_value(serde_json::to_value(&fs).unwrap()).unwrap();
-        assert_eq!(
-            decoded.metadata_format,
-            DfsRevisionMetadataFormat::NamespacedV6
-        );
-        let bytes = serde_ext::to_bytes(&fs, 6, LengthMode::U32).unwrap();
-        let decoded: DfsFileSystem = serde_ext::from_bytes(&bytes).unwrap();
-        assert_eq!(
-            decoded.metadata_format,
-            DfsRevisionMetadataFormat::NamespacedV6
-        );
-        let config = DfsFileSystemConfig::from(&fs);
-        let decoded: DfsFileSystemConfig =
-            serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
-        assert_eq!(
-            decoded.metadata_format,
-            DfsRevisionMetadataFormat::NamespacedV6
-        );
-        let bytes = serde_ext::to_bytes(&config, 6, LengthMode::U32).unwrap();
-        let decoded: DfsFileSystemConfig = serde_ext::from_bytes(&bytes).unwrap();
-        assert_eq!(
-            decoded.metadata_format,
-            DfsRevisionMetadataFormat::NamespacedV6
-        );
+    fn current_records_reject_obsolete_wire_fields() {
+        let mut wire = serde_json::to_value(current_version()).unwrap();
+        wire["history_order"] = json!(3);
+        assert!(serde_json::from_value::<DfsObjectVersionRecord>(wire).is_err());
     }
 }

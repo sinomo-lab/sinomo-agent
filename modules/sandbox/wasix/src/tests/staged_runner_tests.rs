@@ -1705,13 +1705,12 @@ fn local_staged_wasix_toolchain_command_searches_pinned_bin_for_child() {
 fn sifs_staged_runner_executes_directly_on_sifs_and_persists_records() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-staged-runner-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-staged-runner-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_staged_runner").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_runner_executes_directly_on_sifs_and_persists_records",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id = SandboxId::from_legacy_named("sandbox_sifs_staged_runner").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
     let _manifest = sifs_store
@@ -1777,6 +1776,9 @@ fn sifs_staged_runner_executes_directly_on_sifs_and_persists_records() {
     );
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -1784,13 +1786,12 @@ fn sifs_staged_runner_executes_directly_on_sifs_and_persists_records() {
 fn sifs_staged_wasix_path_link_preserves_symlink_object() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-link-symlink-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-link-symlink-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_link_symlink").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_path_link_preserves_symlink_object",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_link_symlink").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -1853,6 +1854,9 @@ fn sifs_staged_wasix_path_link_preserves_symlink_object() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -1860,13 +1864,12 @@ fn sifs_staged_wasix_path_link_preserves_symlink_object() {
 fn sifs_staged_wasix_path_link_follow_symlink_links_target_object() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-link-follow-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-link-follow-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_link_follow").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_path_link_follow_symlink_links_target_object",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_link_follow").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -1926,6 +1929,9 @@ fn sifs_staged_wasix_path_link_follow_symlink_links_target_object() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -1933,13 +1939,12 @@ fn sifs_staged_wasix_path_link_follow_symlink_links_target_object() {
 fn sifs_staged_wasix_path_filestat_follow_symlink_reports_target_inode() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-stat-follow-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-stat-follow-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_stat_follow").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_path_filestat_follow_symlink_reports_target_inode",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_stat_follow").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -1989,6 +1994,9 @@ fn sifs_staged_wasix_path_filestat_follow_symlink_reports_target_inode() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(outcome.dfs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -1996,13 +2004,12 @@ fn sifs_staged_wasix_path_filestat_follow_symlink_reports_target_inode() {
 fn sifs_staged_wasix_path_link_across_mount_boundary_is_atomic_failure() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-link-cross-mount-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-link-cross-mount-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_link_cross_mount").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_path_link_across_mount_boundary_is_atomic_failure",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let shared_dir = "/services/shared/wasix-link-cross-mount";
     let shared_file = "/services/shared/wasix-link-cross-mount/source.txt";
     dfs.posix_mkdir_all(shared_dir).expect("shared dir");
@@ -2065,6 +2072,9 @@ fn sifs_staged_wasix_path_link_across_mount_boundary_is_atomic_failure() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(dfs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -2072,13 +2082,12 @@ fn sifs_staged_wasix_path_link_across_mount_boundary_is_atomic_failure() {
 fn sifs_staged_wasix_readlink_and_lstat_work_on_hardlinked_symlink() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-readlink-symlink-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-readlink-symlink-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_readlink_symlink").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_readlink_and_lstat_work_on_hardlinked_symlink",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_readlink_symlink").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -2159,6 +2168,9 @@ fn sifs_staged_wasix_readlink_and_lstat_work_on_hardlinked_symlink() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -2166,13 +2178,12 @@ fn sifs_staged_wasix_readlink_and_lstat_work_on_hardlinked_symlink() {
 fn sifs_staged_wasix_filestat_reports_sifs_hardlink_count() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-filestat-nlink-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-filestat-nlink-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_filestat_nlink").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_filestat_reports_sifs_hardlink_count",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_filestat_nlink").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -2219,6 +2230,9 @@ fn sifs_staged_wasix_filestat_reports_sifs_hardlink_count() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(outcome.dfs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -2226,13 +2240,12 @@ fn sifs_staged_wasix_filestat_reports_sifs_hardlink_count() {
 fn sifs_staged_wasix_fd_filestat_reports_sifs_hardlink_identity() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-fd-filestat-nlink-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-fd-filestat-nlink-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_fd_filestat_nlink").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_fd_filestat_reports_sifs_hardlink_identity",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_fd_filestat_nlink").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -2283,6 +2296,9 @@ fn sifs_staged_wasix_fd_filestat_reports_sifs_hardlink_identity() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(outcome.dfs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -2290,13 +2306,12 @@ fn sifs_staged_wasix_fd_filestat_reports_sifs_hardlink_identity() {
 fn sifs_staged_wasix_fd_filestat_reports_sifs_ctime() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-fd-filestat-ctime-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-fd-filestat-ctime-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_fd_filestat_ctime").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_fd_filestat_reports_sifs_ctime",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_fd_filestat_ctime").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -2344,6 +2359,9 @@ fn sifs_staged_wasix_fd_filestat_reports_sifs_ctime() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(outcome.dfs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -2351,13 +2369,12 @@ fn sifs_staged_wasix_fd_filestat_reports_sifs_ctime() {
 fn sifs_staged_wasix_fd_filestat_reports_link_added_after_open() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-fd-link-added-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-fd-link-added-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_fd_link_added").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_fd_filestat_reports_link_added_after_open",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_fd_link_added").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -2438,6 +2455,9 @@ fn sifs_staged_wasix_fd_filestat_reports_link_added_after_open() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -2445,13 +2465,12 @@ fn sifs_staged_wasix_fd_filestat_reports_link_added_after_open() {
 fn sifs_staged_wasix_relative_hardlink_between_directory_fds_updates_sifs() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-relative-hardlink-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-relative-hardlink-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_relative_hardlink").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_relative_hardlink_between_directory_fds_updates_sifs",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_relative_hardlink").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -2547,6 +2566,9 @@ fn sifs_staged_wasix_relative_hardlink_between_directory_fds_updates_sifs() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -2554,13 +2576,12 @@ fn sifs_staged_wasix_relative_hardlink_between_directory_fds_updates_sifs() {
 fn sifs_staged_wasix_fd_filestat_refreshes_size_after_alias_write() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-fd-size-refresh-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-fd-size-refresh-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_fd_size_refresh").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_fd_filestat_refreshes_size_after_alias_write",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_fd_size_refresh").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -2613,6 +2634,9 @@ fn sifs_staged_wasix_fd_filestat_refreshes_size_after_alias_write() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -2620,13 +2644,12 @@ fn sifs_staged_wasix_fd_filestat_refreshes_size_after_alias_write() {
 fn sifs_staged_wasix_write_through_hardlink_updates_shared_sifs_object() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-hardlink-write-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-hardlink-write-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_hardlink_write").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_write_through_hardlink_updates_shared_sifs_object",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_hardlink_write").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -2689,6 +2712,9 @@ fn sifs_staged_wasix_write_through_hardlink_updates_shared_sifs_object() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -2696,13 +2722,12 @@ fn sifs_staged_wasix_write_through_hardlink_updates_shared_sifs_object() {
 fn sifs_staged_wasix_resource_failure_preserves_live_hardlink_write() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-resource-hardlink-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-resource-hardlink-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_resource_hardlink").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_resource_failure_preserves_live_hardlink_write",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_resource_hardlink").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -2769,6 +2794,9 @@ fn sifs_staged_wasix_resource_failure_preserves_live_hardlink_write() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -2776,13 +2804,12 @@ fn sifs_staged_wasix_resource_failure_preserves_live_hardlink_write() {
 fn sifs_staged_wasix_resource_failure_preserves_created_directories() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-resource-dir-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-resource-dir-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_resource_dir").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_resource_failure_preserves_created_directories",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_resource_dir").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -2850,6 +2877,9 @@ fn sifs_staged_wasix_resource_failure_preserves_created_directories() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -2857,13 +2887,12 @@ fn sifs_staged_wasix_resource_failure_preserves_created_directories() {
 fn sifs_staged_wasix_resource_failure_preserves_replaced_directory() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-resource-type-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-resource-type-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_resource_type").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_resource_failure_preserves_replaced_directory",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_resource_type").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -2927,6 +2956,9 @@ fn sifs_staged_wasix_resource_failure_preserves_replaced_directory() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -2934,13 +2966,12 @@ fn sifs_staged_wasix_resource_failure_preserves_replaced_directory() {
 fn sifs_staged_wasix_startup_failure_is_recorded_in_command_history() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-startup-failure-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-startup-failure-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_startup_failure").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_startup_failure_is_recorded_in_command_history",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_startup_failure").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -2991,6 +3022,9 @@ fn sifs_staged_wasix_startup_failure_is_recorded_in_command_history() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -3114,13 +3148,12 @@ fn sifs_staged_wasix_hardlink_write_replicates_shared_object_to_candidate_node()
 fn sifs_staged_wasix_append_through_hardlink_preserves_existing_shared_content() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-hardlink-append-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-hardlink-append-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_hardlink_append").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_append_through_hardlink_preserves_existing_shared_content",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_hardlink_append").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -3179,6 +3212,9 @@ fn sifs_staged_wasix_append_through_hardlink_preserves_existing_shared_content()
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -3186,13 +3222,12 @@ fn sifs_staged_wasix_append_through_hardlink_preserves_existing_shared_content()
 fn sifs_staged_wasix_metadata_changes_through_hardlink_update_shared_object() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-hardlink-metadata-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-hardlink-metadata-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_hardlink_metadata").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_metadata_changes_through_hardlink_update_shared_object",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_hardlink_metadata").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -3265,6 +3300,9 @@ fn sifs_staged_wasix_metadata_changes_through_hardlink_update_shared_object() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -3380,13 +3418,12 @@ fn sifs_staged_wasix_metadata_changes_replicate_to_candidate_node() {
 fn sifs_staged_wasix_chmod_read_only_file_denies_write() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-chmod-read-only-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-chmod-read-only-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_chmod_read_only").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_chmod_read_only_file_denies_write",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_chmod_read_only").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -3436,6 +3473,9 @@ fn sifs_staged_wasix_chmod_read_only_file_denies_write() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -3443,13 +3483,12 @@ fn sifs_staged_wasix_chmod_read_only_file_denies_write() {
 fn sifs_staged_wasix_write_only_file_allows_write() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-write-only-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-write-only-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_write_only").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_write_only_file_allows_write",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_write_only").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -3501,6 +3540,9 @@ fn sifs_staged_wasix_write_only_file_allows_write() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -3508,13 +3550,12 @@ fn sifs_staged_wasix_write_only_file_allows_write() {
 fn sifs_staged_wasix_write_only_file_allows_append() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-write-only-append-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-write-only-append-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_write_only_append").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_write_only_file_allows_append",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_write_only_append").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -3566,6 +3607,9 @@ fn sifs_staged_wasix_write_only_file_allows_append() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -3573,13 +3617,12 @@ fn sifs_staged_wasix_write_only_file_allows_append() {
 fn sifs_staged_wasix_seek_end_observes_second_descriptor_append() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-seek-end-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-seek-end-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_seek_end").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_seek_end_observes_second_descriptor_append",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id = SandboxId::from_legacy_named("sandbox_sifs_wasix_seek_end").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
     let manifest = sifs_store
@@ -3624,6 +3667,9 @@ fn sifs_staged_wasix_seek_end_observes_second_descriptor_append() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -3631,13 +3677,12 @@ fn sifs_staged_wasix_seek_end_observes_second_descriptor_append() {
 fn sifs_staged_wasix_append_tell_uses_current_backing_size() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-append-tell-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-append-tell-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_append_tell").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_append_tell_uses_current_backing_size",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_append_tell").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -3683,6 +3728,9 @@ fn sifs_staged_wasix_append_tell_uses_current_backing_size() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -3690,13 +3738,12 @@ fn sifs_staged_wasix_append_tell_uses_current_backing_size() {
 fn sifs_staged_wasix_open_descriptor_keeps_write_right_after_chmod() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-open-chmod-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-open-chmod-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_open_chmod").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_open_descriptor_keeps_write_right_after_chmod",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_open_chmod").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -3742,6 +3789,9 @@ fn sifs_staged_wasix_open_descriptor_keeps_write_right_after_chmod() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -3749,13 +3799,12 @@ fn sifs_staged_wasix_open_descriptor_keeps_write_right_after_chmod() {
 fn sifs_staged_wasix_open_descriptor_keeps_read_right_after_chmod() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-open-read-chmod-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-open-read-chmod-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_open_read_chmod").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_open_descriptor_keeps_read_right_after_chmod",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_open_read_chmod").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -3800,6 +3849,9 @@ fn sifs_staged_wasix_open_descriptor_keeps_read_right_after_chmod() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -3807,13 +3859,12 @@ fn sifs_staged_wasix_open_descriptor_keeps_read_right_after_chmod() {
 fn sifs_staged_wasix_chmod_read_only_directory_denies_create() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-chmod-dir-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-chmod-dir-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_chmod_dir").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_chmod_read_only_directory_denies_create",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id = SandboxId::from_legacy_named("sandbox_sifs_wasix_chmod_dir").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
     let manifest = sifs_store
@@ -3863,6 +3914,9 @@ fn sifs_staged_wasix_chmod_read_only_directory_denies_create() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -3870,13 +3924,12 @@ fn sifs_staged_wasix_chmod_read_only_directory_denies_create() {
 fn sifs_staged_wasix_directory_without_execute_denies_child_open() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-noexec-dir-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-noexec-dir-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_noexec_dir").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_directory_without_execute_denies_child_open",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_noexec_dir").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -3931,6 +3984,9 @@ fn sifs_staged_wasix_directory_without_execute_denies_child_open() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -3938,13 +3994,12 @@ fn sifs_staged_wasix_directory_without_execute_denies_child_open() {
 fn sifs_staged_wasix_fd_read_updates_sifs_atime() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-read-atime-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-read-atime-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_read_atime").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_fd_read_updates_sifs_atime",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_read_atime").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -3992,6 +4047,9 @@ fn sifs_staged_wasix_fd_read_updates_sifs_atime() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -3999,13 +4057,12 @@ fn sifs_staged_wasix_fd_read_updates_sifs_atime() {
 fn sifs_staged_wasix_path_set_times_without_flags_is_noop() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-path-times-noop-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-path-times-noop-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_path_times_noop").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_path_set_times_without_flags_is_noop",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_path_times_noop").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -4062,6 +4119,9 @@ fn sifs_staged_wasix_path_set_times_without_flags_is_noop() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -4069,13 +4129,12 @@ fn sifs_staged_wasix_path_set_times_without_flags_is_noop() {
 fn sifs_staged_wasix_fd_set_times_without_flags_is_noop() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-fd-times-noop-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-fd-times-noop-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_fd_times_noop").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_fd_set_times_without_flags_is_noop",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_fd_times_noop").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -4127,6 +4186,9 @@ fn sifs_staged_wasix_fd_set_times_without_flags_is_noop() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -4134,13 +4196,12 @@ fn sifs_staged_wasix_fd_set_times_without_flags_is_noop() {
 fn sifs_staged_wasix_create_updates_parent_directory_mtime() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-parent-mtime-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-parent-mtime-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_parent_mtime").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_create_updates_parent_directory_mtime",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_parent_mtime").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -4185,6 +4246,9 @@ fn sifs_staged_wasix_create_updates_parent_directory_mtime() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -4192,13 +4256,12 @@ fn sifs_staged_wasix_create_updates_parent_directory_mtime() {
 fn sifs_staged_wasix_readdir_updates_sifs_atime() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-readdir-atime-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-readdir-atime-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_readdir_atime").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_readdir_updates_sifs_atime",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_readdir_atime").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -4247,6 +4310,9 @@ fn sifs_staged_wasix_readdir_updates_sifs_atime() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -4254,13 +4320,12 @@ fn sifs_staged_wasix_readdir_updates_sifs_atime() {
 fn sifs_staged_wasix_readdir_reports_sifs_entry_inodes() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-readdir-inodes-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-readdir-inodes-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_readdir_inodes").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_readdir_reports_sifs_entry_inodes",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_readdir_inodes").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -4305,6 +4370,9 @@ fn sifs_staged_wasix_readdir_reports_sifs_entry_inodes() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(outcome.dfs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -4312,13 +4380,12 @@ fn sifs_staged_wasix_readdir_reports_sifs_entry_inodes() {
 fn sifs_staged_wasix_readdir_does_not_report_unlinked_cached_child() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-readdir-unlink-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-readdir-unlink-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_readdir_unlink").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_readdir_does_not_report_unlinked_cached_child",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_readdir_unlink").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -4372,6 +4439,9 @@ fn sifs_staged_wasix_readdir_does_not_report_unlinked_cached_child() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -4379,13 +4449,12 @@ fn sifs_staged_wasix_readdir_does_not_report_unlinked_cached_child() {
 fn sifs_staged_wasix_unlinks_file_through_nested_manifest_mount() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-unlink-nested-mount-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-unlink-nested-mount-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_unlink_nested_mount").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_unlinks_file_through_nested_manifest_mount",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_unlink_nested_mount").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -4447,6 +4516,9 @@ fn sifs_staged_wasix_unlinks_file_through_nested_manifest_mount() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -4454,13 +4526,12 @@ fn sifs_staged_wasix_unlinks_file_through_nested_manifest_mount() {
 fn sifs_staged_wasix_renames_file_through_nested_manifest_mount() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-rename-nested-mount-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-rename-nested-mount-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_rename_nested_mount").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_renames_file_through_nested_manifest_mount",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_rename_nested_mount").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -4529,6 +4600,9 @@ fn sifs_staged_wasix_renames_file_through_nested_manifest_mount() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -4536,13 +4610,12 @@ fn sifs_staged_wasix_renames_file_through_nested_manifest_mount() {
 fn sifs_staged_wasix_hardlinks_file_through_nested_manifest_mount() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-link-nested-mount-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-link-nested-mount-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_link_nested_mount").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_hardlinks_file_through_nested_manifest_mount",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_link_nested_mount").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -4608,6 +4681,9 @@ fn sifs_staged_wasix_hardlinks_file_through_nested_manifest_mount() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -4615,13 +4691,12 @@ fn sifs_staged_wasix_hardlinks_file_through_nested_manifest_mount() {
 fn sifs_staged_wasix_creates_directory_through_nested_manifest_mount() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-mkdir-nested-mount-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-mkdir-nested-mount-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_mkdir_nested_mount").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_creates_directory_through_nested_manifest_mount",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_mkdir_nested_mount").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -4678,6 +4753,9 @@ fn sifs_staged_wasix_creates_directory_through_nested_manifest_mount() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -4685,13 +4763,12 @@ fn sifs_staged_wasix_creates_directory_through_nested_manifest_mount() {
 fn sifs_staged_wasix_removes_directory_through_nested_manifest_mount() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-rmdir-nested-mount-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-rmdir-nested-mount-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_rmdir_nested_mount").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_removes_directory_through_nested_manifest_mount",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_rmdir_nested_mount").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -4748,6 +4825,9 @@ fn sifs_staged_wasix_removes_directory_through_nested_manifest_mount() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -4755,13 +4835,12 @@ fn sifs_staged_wasix_removes_directory_through_nested_manifest_mount() {
 fn sifs_staged_wasix_updates_metadata_through_nested_manifest_mount() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-metadata-nested-mount-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-metadata-nested-mount-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_metadata_nested_mount").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_updates_metadata_through_nested_manifest_mount",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_metadata_nested_mount").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -4832,6 +4911,9 @@ fn sifs_staged_wasix_updates_metadata_through_nested_manifest_mount() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -4839,13 +4921,12 @@ fn sifs_staged_wasix_updates_metadata_through_nested_manifest_mount() {
 fn sifs_staged_wasix_symlink_and_readlink_through_nested_manifest_mount() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-symlink-nested-mount-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-symlink-nested-mount-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_symlink_nested_mount").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_symlink_and_readlink_through_nested_manifest_mount",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_symlink_nested_mount").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -4925,6 +5006,9 @@ fn sifs_staged_wasix_symlink_and_readlink_through_nested_manifest_mount() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -4932,13 +5016,12 @@ fn sifs_staged_wasix_symlink_and_readlink_through_nested_manifest_mount() {
 fn sifs_staged_wasix_fd_filestat_refreshes_open_directory_after_mkdir() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-dir-fd-stat-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-dir-fd-stat-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_dir_fd_stat").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_fd_filestat_refreshes_open_directory_after_mkdir",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_dir_fd_stat").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -4990,6 +5073,9 @@ fn sifs_staged_wasix_fd_filestat_refreshes_open_directory_after_mkdir() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -4997,13 +5083,12 @@ fn sifs_staged_wasix_fd_filestat_refreshes_open_directory_after_mkdir() {
 fn sifs_staged_wasix_readdir_sees_nested_mount_under_default_system_parent() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-nested-opt-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-nested-opt-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_nested_opt").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_readdir_sees_nested_mount_under_default_system_parent",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     dfs.posix_mkdir_all("/services/sandbox/toolchains/pkg")
         .expect("mount source");
     dfs.posix_write_file(
@@ -5056,6 +5141,9 @@ fn sifs_staged_wasix_readdir_sees_nested_mount_under_default_system_parent() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(outcome.dfs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -5063,13 +5151,12 @@ fn sifs_staged_wasix_readdir_sees_nested_mount_under_default_system_parent() {
 fn sifs_staged_wasix_root_readdir_merges_sifs_root_and_system_mounts() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-root-readdir-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-root-readdir-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_root_readdir").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_root_readdir_merges_sifs_root_and_system_mounts",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     dfs.posix_mkdir_all("/services/sandbox/toolchains/pkg")
         .expect("mount source");
     let sandbox_id =
@@ -5119,6 +5206,9 @@ fn sifs_staged_wasix_root_readdir_merges_sifs_root_and_system_mounts() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(outcome.dfs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -5126,13 +5216,12 @@ fn sifs_staged_wasix_root_readdir_merges_sifs_root_and_system_mounts() {
 fn sifs_staged_wasix_nested_system_mount_keeps_read_only_mode() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-nested-opt-ro-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-nested-opt-ro-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_nested_opt_ro").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_nested_system_mount_keeps_read_only_mode",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     dfs.posix_mkdir_all("/services/sandbox/toolchains/pkg")
         .expect("mount source");
     dfs.posix_write_file(
@@ -5188,6 +5277,9 @@ fn sifs_staged_wasix_nested_system_mount_keeps_read_only_mode() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(outcome.dfs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -5195,13 +5287,12 @@ fn sifs_staged_wasix_nested_system_mount_keeps_read_only_mode() {
 fn sifs_staged_wasix_readdir_reports_sifs_dot_and_parent_inodes() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-readdir-dot-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-readdir-dot-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_readdir_dot").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_readdir_reports_sifs_dot_and_parent_inodes",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_readdir_dot").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -5244,6 +5335,9 @@ fn sifs_staged_wasix_readdir_reports_sifs_dot_and_parent_inodes() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(outcome.dfs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -5251,13 +5345,12 @@ fn sifs_staged_wasix_readdir_reports_sifs_dot_and_parent_inodes() {
 fn sifs_staged_wasix_directory_without_read_denies_readdir() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-noread-dir-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-noread-dir-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_noread_dir").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_directory_without_read_denies_readdir",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_noread_dir").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -5312,6 +5405,9 @@ fn sifs_staged_wasix_directory_without_read_denies_readdir() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -5319,13 +5415,12 @@ fn sifs_staged_wasix_directory_without_read_denies_readdir() {
 fn sifs_staged_wasix_unlink_canonical_hardlink_promotes_remaining_alias() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-hardlink-unlink-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-hardlink-unlink-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_hardlink_unlink").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_unlink_canonical_hardlink_promotes_remaining_alias",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_hardlink_unlink").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -5411,6 +5506,9 @@ fn sifs_staged_wasix_unlink_canonical_hardlink_promotes_remaining_alias() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -5418,13 +5516,12 @@ fn sifs_staged_wasix_unlink_canonical_hardlink_promotes_remaining_alias() {
 fn sifs_staged_wasix_rename_hardlink_alias_over_canonical_preserves_target() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-hardlink-rename-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-hardlink-rename-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_hardlink_rename").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_rename_hardlink_alias_over_canonical_preserves_target",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_hardlink_rename").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -5486,6 +5583,9 @@ fn sifs_staged_wasix_rename_hardlink_alias_over_canonical_preserves_target() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -5493,13 +5593,12 @@ fn sifs_staged_wasix_rename_hardlink_alias_over_canonical_preserves_target() {
 fn sifs_staged_wasix_rename_hardlink_over_other_canonical_preserves_both_targets() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-hardlink-rename-other-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-hardlink-rename-other-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_hardlink_rename_other").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_rename_hardlink_over_other_canonical_preserves_both_targets",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_hardlink_rename_other").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -5571,6 +5670,9 @@ fn sifs_staged_wasix_rename_hardlink_over_other_canonical_preserves_both_targets
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -5578,13 +5680,12 @@ fn sifs_staged_wasix_rename_hardlink_over_other_canonical_preserves_both_targets
 fn sifs_staged_wasix_rename_over_existing_file_survives_sifs_reload() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-rename-over-file-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-rename-over-file-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_rename_over_file").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_rename_over_existing_file_survives_sifs_reload",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_rename_over_file").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -5636,6 +5737,9 @@ fn sifs_staged_wasix_rename_over_existing_file_survives_sifs_reload() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -5643,13 +5747,12 @@ fn sifs_staged_wasix_rename_over_existing_file_survives_sifs_reload() {
 fn sifs_staged_wasix_open_descriptor_write_follows_rename() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-open-rename-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-open-rename-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_open_rename").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_open_descriptor_write_follows_rename",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_open_rename").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -5701,6 +5804,9 @@ fn sifs_staged_wasix_open_descriptor_write_follows_rename() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -5708,13 +5814,12 @@ fn sifs_staged_wasix_open_descriptor_write_follows_rename() {
 fn sifs_staged_wasix_open_replaced_destination_reads_original_file() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-open-replace-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-open-replace-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_open_replace").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_open_replaced_destination_reads_original_file",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_open_replace").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -5779,6 +5884,9 @@ fn sifs_staged_wasix_open_replaced_destination_reads_original_file() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -5786,13 +5894,12 @@ fn sifs_staged_wasix_open_replaced_destination_reads_original_file() {
 fn sifs_staged_wasix_fd_set_times_after_replacement_does_not_touch_new_path() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-fd-times-replace-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-fd-times-replace-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_fd_times_replace").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_fd_set_times_after_replacement_does_not_touch_new_path",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_fd_times_replace").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -5850,6 +5957,9 @@ fn sifs_staged_wasix_fd_set_times_after_replacement_does_not_touch_new_path() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -5857,13 +5967,12 @@ fn sifs_staged_wasix_fd_set_times_after_replacement_does_not_touch_new_path() {
 fn sifs_staged_wasix_fd_touch_after_replacement_does_not_touch_new_path() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-fd-touch-replace-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-fd-touch-replace-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_fd_touch_replace").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_fd_touch_after_replacement_does_not_touch_new_path",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_fd_touch_replace").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -5922,6 +6031,9 @@ fn sifs_staged_wasix_fd_touch_after_replacement_does_not_touch_new_path() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -5929,13 +6041,12 @@ fn sifs_staged_wasix_fd_touch_after_replacement_does_not_touch_new_path() {
 fn sifs_staged_wasix_fd_filestat_reports_zero_links_after_replacement() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-fd-stat-replace-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-fd-stat-replace-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_fd_stat_replace").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_fd_filestat_reports_zero_links_after_replacement",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_fd_stat_replace").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -5985,6 +6096,9 @@ fn sifs_staged_wasix_fd_filestat_reports_zero_links_after_replacement() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(outcome.dfs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -5992,13 +6106,12 @@ fn sifs_staged_wasix_fd_filestat_reports_zero_links_after_replacement() {
 fn sifs_staged_wasix_fd_chmod_chown_after_replacement_do_not_touch_new_path() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-fd-meta-replace-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-fd-meta-replace-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_fd_meta_replace").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_fd_chmod_chown_after_replacement_do_not_touch_new_path",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_fd_meta_replace").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -6055,6 +6168,9 @@ fn sifs_staged_wasix_fd_chmod_chown_after_replacement_do_not_touch_new_path() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -6289,13 +6405,12 @@ fn sifs_staged_wasix_hardlink_rename_replacement_replicates_to_candidate_node() 
 fn sifs_staged_wasix_truncate_through_hardlink_updates_shared_sifs_object() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-hardlink-truncate-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-hardlink-truncate-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_hardlink_truncate").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_truncate_through_hardlink_updates_shared_sifs_object",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_hardlink_truncate").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -6351,6 +6466,9 @@ fn sifs_staged_wasix_truncate_through_hardlink_updates_shared_sifs_object() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -6358,13 +6476,12 @@ fn sifs_staged_wasix_truncate_through_hardlink_updates_shared_sifs_object() {
 fn sifs_staged_wasix_open_file_survives_unlink_without_resurrection() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-open-unlink-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-open-unlink-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_open_unlink").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_open_file_survives_unlink_without_resurrection",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_open_unlink").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -6414,6 +6531,9 @@ fn sifs_staged_wasix_open_file_survives_unlink_without_resurrection() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -6421,13 +6541,12 @@ fn sifs_staged_wasix_open_file_survives_unlink_without_resurrection() {
 fn sifs_staged_wasix_fd_filestat_reports_zero_links_after_unlink() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-fd-stat-unlink-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-fd-stat-unlink-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_fd_stat_unlink").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_fd_filestat_reports_zero_links_after_unlink",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_fd_stat_unlink").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -6468,6 +6587,9 @@ fn sifs_staged_wasix_fd_filestat_reports_zero_links_after_unlink() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(outcome.dfs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -6475,13 +6597,12 @@ fn sifs_staged_wasix_fd_filestat_reports_zero_links_after_unlink() {
 fn sifs_staged_wasix_open_file_survives_unlink_and_recreate() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-open-recreate-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-open-recreate-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_open_recreate").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_open_file_survives_unlink_and_recreate",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_open_recreate").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -6526,6 +6647,9 @@ fn sifs_staged_wasix_open_file_survives_unlink_and_recreate() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -6533,13 +6657,12 @@ fn sifs_staged_wasix_open_file_survives_unlink_and_recreate() {
 fn sifs_staged_wasix_path_unlink_removes_symlink_from_sifs() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-unlink-symlink-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-unlink-symlink-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_unlink_symlink").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_path_unlink_removes_symlink_from_sifs",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_unlink_symlink").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -6598,6 +6721,9 @@ fn sifs_staged_wasix_path_unlink_removes_symlink_from_sifs() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -6605,13 +6731,12 @@ fn sifs_staged_wasix_path_unlink_removes_symlink_from_sifs() {
 fn sifs_staged_wasix_path_symlink_creates_sifs_symlink() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-create-symlink-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-create-symlink-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_create_symlink").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_path_symlink_creates_sifs_symlink",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_create_symlink").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -6667,6 +6792,9 @@ fn sifs_staged_wasix_path_symlink_creates_sifs_symlink() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -6674,13 +6802,12 @@ fn sifs_staged_wasix_path_symlink_creates_sifs_symlink() {
 fn sifs_staged_wasix_exclusive_create_rejects_existing_symlink() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-excl-symlink-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-excl-symlink-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_excl_symlink").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_exclusive_create_rejects_existing_symlink",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_excl_symlink").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -6728,6 +6855,9 @@ fn sifs_staged_wasix_exclusive_create_rejects_existing_symlink() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -6735,13 +6865,12 @@ fn sifs_staged_wasix_exclusive_create_rejects_existing_symlink() {
 fn sifs_staged_wasix_exclusive_create_rejects_dangling_symlink() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-excl-dangling-symlink-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-excl-dangling-symlink-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_excl_dangling_symlink").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_exclusive_create_rejects_dangling_symlink",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_excl_dangling_symlink").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -6795,6 +6924,9 @@ fn sifs_staged_wasix_exclusive_create_rejects_dangling_symlink() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -6802,13 +6934,12 @@ fn sifs_staged_wasix_exclusive_create_rejects_dangling_symlink() {
 fn sifs_staged_wasix_link_operations_do_not_create_missing_parents() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-link-missing-parent-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-link-missing-parent-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_link_missing_parent").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_link_operations_do_not_create_missing_parents",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_link_missing_parent").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -6888,6 +7019,9 @@ fn sifs_staged_wasix_link_operations_do_not_create_missing_parents() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -6895,13 +7029,12 @@ fn sifs_staged_wasix_link_operations_do_not_create_missing_parents() {
 fn sifs_staged_wasix_link_file_with_trailing_slash_is_atomic_failure() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-link-trailing-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-link-trailing-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_link_trailing").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_link_file_with_trailing_slash_is_atomic_failure",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_link_trailing").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -6951,6 +7084,9 @@ fn sifs_staged_wasix_link_file_with_trailing_slash_is_atomic_failure() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -6958,13 +7094,12 @@ fn sifs_staged_wasix_link_file_with_trailing_slash_is_atomic_failure() {
 fn sifs_staged_wasix_link_target_with_trailing_slash_is_atomic_failure() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-link-target-trailing-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-link-target-trailing-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_link_target_trailing").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_link_target_with_trailing_slash_is_atomic_failure",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_link_target_trailing").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -7014,6 +7149,9 @@ fn sifs_staged_wasix_link_target_with_trailing_slash_is_atomic_failure() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -7021,13 +7159,12 @@ fn sifs_staged_wasix_link_target_with_trailing_slash_is_atomic_failure() {
 fn sifs_staged_wasix_symlink_with_trailing_destination_is_atomic_failure() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-symlink-trailing-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-symlink-trailing-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_symlink_trailing").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_symlink_with_trailing_destination_is_atomic_failure",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_symlink_trailing").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -7071,6 +7208,9 @@ fn sifs_staged_wasix_symlink_with_trailing_destination_is_atomic_failure() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -7078,13 +7218,12 @@ fn sifs_staged_wasix_symlink_with_trailing_destination_is_atomic_failure() {
 fn sifs_staged_wasix_unlink_file_with_trailing_slash_is_atomic_failure() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-unlink-trailing-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-unlink-trailing-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_unlink_trailing").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_unlink_file_with_trailing_slash_is_atomic_failure",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_unlink_trailing").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -7129,6 +7268,9 @@ fn sifs_staged_wasix_unlink_file_with_trailing_slash_is_atomic_failure() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -7136,13 +7278,12 @@ fn sifs_staged_wasix_unlink_file_with_trailing_slash_is_atomic_failure() {
 fn sifs_staged_wasix_readlink_symlink_with_trailing_slash_fails() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-readlink-trailing-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-readlink-trailing-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_readlink_trailing").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_readlink_symlink_with_trailing_slash_fails",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_readlink_trailing").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -7192,6 +7333,9 @@ fn sifs_staged_wasix_readlink_symlink_with_trailing_slash_fails() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -7199,13 +7343,12 @@ fn sifs_staged_wasix_readlink_symlink_with_trailing_slash_fails() {
 fn sifs_staged_wasix_lstat_file_with_trailing_slash_fails() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-lstat-trailing-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-lstat-trailing-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_lstat_trailing").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_lstat_file_with_trailing_slash_fails",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_lstat_trailing").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -7250,6 +7393,9 @@ fn sifs_staged_wasix_lstat_file_with_trailing_slash_fails() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -7257,14 +7403,13 @@ fn sifs_staged_wasix_lstat_file_with_trailing_slash_fails() {
 fn sifs_staged_wasix_lstat_symlink_to_directory_with_trailing_slash_reports_directory() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-lstat-link-dir-trailing-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-lstat-link-dir-trailing-local");
-    let network = InProcessNetwork::new();
     let node_id =
         NodeId::from_legacy_named("node_sifs_wasix_lstat_link_dir_trailing").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_lstat_symlink_to_directory_with_trailing_slash_reports_directory",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id = SandboxId::from_legacy_named("sandbox_sifs_wasix_lstat_link_dir_trailing")
         .expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -7305,6 +7450,9 @@ fn sifs_staged_wasix_lstat_symlink_to_directory_with_trailing_slash_reports_dire
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(outcome.dfs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -7312,13 +7460,12 @@ fn sifs_staged_wasix_lstat_symlink_to_directory_with_trailing_slash_reports_dire
 fn sifs_staged_wasix_set_times_file_with_trailing_slash_is_atomic_failure() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-set-times-trailing-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-set-times-trailing-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_set_times_trailing").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_set_times_file_with_trailing_slash_is_atomic_failure",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_set_times_trailing").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -7367,6 +7514,9 @@ fn sifs_staged_wasix_set_times_file_with_trailing_slash_is_atomic_failure() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -7374,13 +7524,12 @@ fn sifs_staged_wasix_set_times_file_with_trailing_slash_is_atomic_failure() {
 fn sifs_staged_wasix_chmod_file_with_trailing_slash_is_atomic_failure() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-chmod-trailing-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-chmod-trailing-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_chmod_trailing").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_chmod_file_with_trailing_slash_is_atomic_failure",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_chmod_trailing").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -7428,6 +7577,9 @@ fn sifs_staged_wasix_chmod_file_with_trailing_slash_is_atomic_failure() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -7435,14 +7587,13 @@ fn sifs_staged_wasix_chmod_file_with_trailing_slash_is_atomic_failure() {
 fn sifs_staged_wasix_chmod_symlink_to_directory_with_trailing_slash_updates_target() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-chmod-link-dir-trailing-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-chmod-link-dir-trailing-local");
-    let network = InProcessNetwork::new();
     let node_id =
         NodeId::from_legacy_named("node_sifs_wasix_chmod_link_dir_trailing").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_chmod_symlink_to_directory_with_trailing_slash_updates_target",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id = SandboxId::from_legacy_named("sandbox_sifs_wasix_chmod_link_dir_trailing")
         .expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -7495,6 +7646,9 @@ fn sifs_staged_wasix_chmod_symlink_to_directory_with_trailing_slash_updates_targ
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -7502,13 +7656,12 @@ fn sifs_staged_wasix_chmod_symlink_to_directory_with_trailing_slash_updates_targ
 fn sifs_staged_wasix_chown_file_with_trailing_slash_is_atomic_failure() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-chown-trailing-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-chown-trailing-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_chown_trailing").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_chown_file_with_trailing_slash_is_atomic_failure",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_chown_trailing").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -7557,6 +7710,9 @@ fn sifs_staged_wasix_chown_file_with_trailing_slash_is_atomic_failure() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -7564,14 +7720,13 @@ fn sifs_staged_wasix_chown_file_with_trailing_slash_is_atomic_failure() {
 fn sifs_staged_wasix_chown_symlink_to_directory_with_trailing_slash_updates_target() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-chown-link-dir-trailing-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-chown-link-dir-trailing-local");
-    let network = InProcessNetwork::new();
     let node_id =
         NodeId::from_legacy_named("node_sifs_wasix_chown_link_dir_trailing").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_chown_symlink_to_directory_with_trailing_slash_updates_target",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id = SandboxId::from_legacy_named("sandbox_sifs_wasix_chown_link_dir_trailing")
         .expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -7629,6 +7784,9 @@ fn sifs_staged_wasix_chown_symlink_to_directory_with_trailing_slash_updates_targ
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -7636,13 +7794,12 @@ fn sifs_staged_wasix_chown_symlink_to_directory_with_trailing_slash_updates_targ
 fn sifs_staged_wasix_touch_file_with_trailing_slash_is_atomic_failure() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-touch-trailing-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-touch-trailing-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_touch_trailing").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_touch_file_with_trailing_slash_is_atomic_failure",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_touch_trailing").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -7691,6 +7848,9 @@ fn sifs_staged_wasix_touch_file_with_trailing_slash_is_atomic_failure() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -7698,14 +7858,13 @@ fn sifs_staged_wasix_touch_file_with_trailing_slash_is_atomic_failure() {
 fn sifs_staged_wasix_touch_symlink_to_directory_with_trailing_slash_updates_target() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-touch-link-dir-trailing-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-touch-link-dir-trailing-local");
-    let network = InProcessNetwork::new();
     let node_id =
         NodeId::from_legacy_named("node_sifs_wasix_touch_link_dir_trailing").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_touch_symlink_to_directory_with_trailing_slash_updates_target",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id = SandboxId::from_legacy_named("sandbox_sifs_wasix_touch_link_dir_trailing")
         .expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -7763,6 +7922,9 @@ fn sifs_staged_wasix_touch_symlink_to_directory_with_trailing_slash_updates_targ
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -7770,13 +7932,12 @@ fn sifs_staged_wasix_touch_symlink_to_directory_with_trailing_slash_updates_targ
 fn sifs_staged_wasix_mkdir_file_with_trailing_slash_reports_not_directory() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-mkdir-file-trailing-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-mkdir-file-trailing-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_mkdir_file_trailing").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_mkdir_file_with_trailing_slash_reports_not_directory",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_mkdir_file_trailing").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -7818,6 +7979,9 @@ fn sifs_staged_wasix_mkdir_file_with_trailing_slash_reports_not_directory() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -7825,13 +7989,12 @@ fn sifs_staged_wasix_mkdir_file_with_trailing_slash_reports_not_directory() {
 fn sifs_staged_wasix_open_file_with_trailing_slash_reports_not_directory() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-open-file-trailing-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-open-file-trailing-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_open_file_trailing").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_open_file_with_trailing_slash_reports_not_directory",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_open_file_trailing").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -7868,6 +8031,9 @@ fn sifs_staged_wasix_open_file_with_trailing_slash_reports_not_directory() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(outcome.dfs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -7875,13 +8041,12 @@ fn sifs_staged_wasix_open_file_with_trailing_slash_reports_not_directory() {
 fn sifs_staged_wasix_create_file_with_trailing_slash_reports_is_directory() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-create-file-trailing-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-create-file-trailing-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_create_file_trailing").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_create_file_with_trailing_slash_reports_is_directory",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_create_file_trailing").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -7923,6 +8088,9 @@ fn sifs_staged_wasix_create_file_with_trailing_slash_reports_is_directory() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -7930,14 +8098,13 @@ fn sifs_staged_wasix_create_file_with_trailing_slash_reports_is_directory() {
 fn sifs_staged_wasix_mkdir_symlink_to_directory_with_trailing_slash_reports_exists() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-mkdir-symlink-trailing-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-mkdir-symlink-trailing-local");
-    let network = InProcessNetwork::new();
     let node_id =
         NodeId::from_legacy_named("node_sifs_wasix_mkdir_symlink_trailing").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_mkdir_symlink_to_directory_with_trailing_slash_reports_exists",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_mkdir_symlink_trailing").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -7987,6 +8154,9 @@ fn sifs_staged_wasix_mkdir_symlink_to_directory_with_trailing_slash_reports_exis
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -7994,14 +8164,13 @@ fn sifs_staged_wasix_mkdir_symlink_to_directory_with_trailing_slash_reports_exis
 fn sifs_staged_wasix_set_times_symlink_to_directory_with_trailing_slash_updates_target() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-times-link-dir-trailing-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-times-link-dir-trailing-local");
-    let network = InProcessNetwork::new();
     let node_id =
         NodeId::from_legacy_named("node_sifs_wasix_times_link_dir_trailing").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_set_times_symlink_to_directory_with_trailing_slash_updates_target",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id = SandboxId::from_legacy_named("sandbox_sifs_wasix_times_link_dir_trailing")
         .expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -8059,6 +8228,9 @@ fn sifs_staged_wasix_set_times_symlink_to_directory_with_trailing_slash_updates_
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -8066,13 +8238,12 @@ fn sifs_staged_wasix_set_times_symlink_to_directory_with_trailing_slash_updates_
 fn sifs_staged_wasix_path_set_times_without_follow_updates_symlink_metadata() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-symlink-times-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-symlink-times-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_symlink_times").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_path_set_times_without_follow_updates_symlink_metadata",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_symlink_times").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -8127,6 +8298,9 @@ fn sifs_staged_wasix_path_set_times_without_follow_updates_symlink_metadata() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -8134,13 +8308,12 @@ fn sifs_staged_wasix_path_set_times_without_follow_updates_symlink_metadata() {
 fn sifs_staged_wasix_path_symlink_relative_to_directory_fd_creates_sifs_symlink() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-relative-symlink-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-relative-symlink-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_relative_symlink").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_path_symlink_relative_to_directory_fd_creates_sifs_symlink",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_relative_symlink").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -8196,6 +8369,9 @@ fn sifs_staged_wasix_path_symlink_relative_to_directory_fd_creates_sifs_symlink(
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -8203,13 +8379,12 @@ fn sifs_staged_wasix_path_symlink_relative_to_directory_fd_creates_sifs_symlink(
 fn sifs_staged_wasix_relative_file_namespace_ops_use_directory_fd() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-relative-file-ops-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-relative-file-ops-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_relative_file_ops").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_relative_file_namespace_ops_use_directory_fd",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_relative_file_ops").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -8278,6 +8453,9 @@ fn sifs_staged_wasix_relative_file_namespace_ops_use_directory_fd() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -8285,13 +8463,12 @@ fn sifs_staged_wasix_relative_file_namespace_ops_use_directory_fd() {
 fn sifs_staged_wasix_relative_directory_namespace_ops_use_directory_fd() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-relative-dir-ops-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-relative-dir-ops-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_relative_dir_ops").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_relative_directory_namespace_ops_use_directory_fd",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_relative_dir_ops").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -8351,6 +8528,9 @@ fn sifs_staged_wasix_relative_directory_namespace_ops_use_directory_fd() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -8870,13 +9050,12 @@ fn sifs_staged_wasix_sparse_pwrite_replicates_to_candidate_node() {
 fn sifs_staged_wasix_ftruncate_preserves_fd_offset_for_sparse_write() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-ftruncate-offset-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-ftruncate-offset-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_ftruncate_offset").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_ftruncate_preserves_fd_offset_for_sparse_write",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_ftruncate_offset").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -8928,6 +9107,9 @@ fn sifs_staged_wasix_ftruncate_preserves_fd_offset_for_sparse_write() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -8935,13 +9117,12 @@ fn sifs_staged_wasix_ftruncate_preserves_fd_offset_for_sparse_write() {
 fn sifs_staged_wasix_fd_allocate_inside_file_does_not_shrink() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-allocate-no-shrink-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-allocate-no-shrink-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_allocate_no_shrink").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_fd_allocate_inside_file_does_not_shrink",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_allocate_no_shrink").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -8988,6 +9169,9 @@ fn sifs_staged_wasix_fd_allocate_inside_file_does_not_shrink() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -8995,13 +9179,12 @@ fn sifs_staged_wasix_fd_allocate_inside_file_does_not_shrink() {
 fn sifs_staged_wasix_fd_allocate_beyond_eof_extends_with_zeroes() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-allocate-extend-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-allocate-extend-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_allocate_extend").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_fd_allocate_beyond_eof_extends_with_zeroes",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_allocate_extend").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -9048,6 +9231,9 @@ fn sifs_staged_wasix_fd_allocate_beyond_eof_extends_with_zeroes() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -9055,13 +9241,12 @@ fn sifs_staged_wasix_fd_allocate_beyond_eof_extends_with_zeroes() {
 fn sifs_staged_wasix_fd_allocate_refreshes_stale_handle_before_no_shrink_check() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-allocate-stale-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-allocate-stale-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_allocate_stale").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_fd_allocate_refreshes_stale_handle_before_no_shrink_check",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_allocate_stale").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -9114,6 +9299,9 @@ fn sifs_staged_wasix_fd_allocate_refreshes_stale_handle_before_no_shrink_check()
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -9330,13 +9518,12 @@ fn sifs_staged_wasix_rmdir_replicates_to_candidate_node() {
 fn sifs_staged_wasix_rmdir_rejects_non_empty_directory() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-rmdir-not-empty-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-rmdir-not-empty-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_rmdir_not_empty").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_rmdir_rejects_non_empty_directory",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_rmdir_not_empty").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -9399,6 +9586,9 @@ fn sifs_staged_wasix_rmdir_rejects_non_empty_directory() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -9406,13 +9596,12 @@ fn sifs_staged_wasix_rmdir_rejects_non_empty_directory() {
 fn sifs_staged_wasix_rename_directory_over_non_empty_directory_is_atomic_failure() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-rename-non-empty-dir-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-rename-non-empty-dir-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_rename_non_empty_dir").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_rename_directory_over_non_empty_directory_is_atomic_failure",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_rename_non_empty_dir").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -9499,6 +9688,9 @@ fn sifs_staged_wasix_rename_directory_over_non_empty_directory_is_atomic_failure
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -9506,13 +9698,12 @@ fn sifs_staged_wasix_rename_directory_over_non_empty_directory_is_atomic_failure
 fn sifs_staged_wasix_rename_across_mount_boundary_is_atomic_failure() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-rename-cross-mount-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-rename-cross-mount-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_rename_cross_mount").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_rename_across_mount_boundary_is_atomic_failure",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let shared_dir = "/services/shared/wasix-rename-cross-mount";
     dfs.posix_mkdir_all(shared_dir).expect("shared dir");
     let sandbox_id =
@@ -9575,6 +9766,9 @@ fn sifs_staged_wasix_rename_across_mount_boundary_is_atomic_failure() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -9582,13 +9776,12 @@ fn sifs_staged_wasix_rename_across_mount_boundary_is_atomic_failure() {
 fn sifs_staged_wasix_rename_file_over_directory_is_atomic_failure() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-rename-file-over-dir-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-rename-file-over-dir-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_rename_file_over_dir").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_rename_file_over_directory_is_atomic_failure",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_rename_file_over_dir").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -9645,6 +9838,9 @@ fn sifs_staged_wasix_rename_file_over_directory_is_atomic_failure() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -9652,13 +9848,12 @@ fn sifs_staged_wasix_rename_file_over_directory_is_atomic_failure() {
 fn sifs_staged_wasix_rename_directory_over_file_is_atomic_failure() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-rename-dir-over-file-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-rename-dir-over-file-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_rename_dir_over_file").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_rename_directory_over_file_is_atomic_failure",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_rename_dir_over_file").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -9730,6 +9925,9 @@ fn sifs_staged_wasix_rename_directory_over_file_is_atomic_failure() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -9737,13 +9935,12 @@ fn sifs_staged_wasix_rename_directory_over_file_is_atomic_failure() {
 fn sifs_staged_wasix_path_rename_preserves_symlink_object() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-rename-symlink-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-rename-symlink-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_rename_symlink").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_path_rename_preserves_symlink_object",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_rename_symlink").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -9809,6 +10006,9 @@ fn sifs_staged_wasix_path_rename_preserves_symlink_object() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -9816,13 +10016,12 @@ fn sifs_staged_wasix_path_rename_preserves_symlink_object() {
 fn sifs_staged_wasix_rename_file_with_trailing_slash_is_atomic_failure() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-rename-trailing-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-rename-trailing-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_rename_trailing").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_rename_file_with_trailing_slash_is_atomic_failure",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_rename_trailing").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -9872,6 +10071,9 @@ fn sifs_staged_wasix_rename_file_with_trailing_slash_is_atomic_failure() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -9879,13 +10081,12 @@ fn sifs_staged_wasix_rename_file_with_trailing_slash_is_atomic_failure() {
 fn sifs_staged_wasix_rmdir_rejects_symlink_to_directory() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-rmdir-symlink-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-rmdir-symlink-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_rmdir_symlink").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_rmdir_rejects_symlink_to_directory",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_rmdir_symlink").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -9942,6 +10143,9 @@ fn sifs_staged_wasix_rmdir_rejects_symlink_to_directory() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -9949,13 +10153,12 @@ fn sifs_staged_wasix_rmdir_rejects_symlink_to_directory() {
 fn sifs_staged_wasix_readdir_follows_symlink_to_directory() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-readdir-symlink-dir-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-readdir-symlink-dir-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_readdir_symlink_dir").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_readdir_follows_symlink_to_directory",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_readdir_symlink_dir").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -10005,6 +10208,9 @@ fn sifs_staged_wasix_readdir_follows_symlink_to_directory() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -10012,13 +10218,12 @@ fn sifs_staged_wasix_readdir_follows_symlink_to_directory() {
 fn sifs_staged_wasix_var_is_sifs_backed_workspace() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-var-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-var-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_var").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_var_is_sifs_backed_workspace",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id = SandboxId::from_legacy_named("sandbox_sifs_wasix_var").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
     let manifest = sifs_store
@@ -10065,6 +10270,9 @@ fn sifs_staged_wasix_var_is_sifs_backed_workspace() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -10072,13 +10280,12 @@ fn sifs_staged_wasix_var_is_sifs_backed_workspace() {
 fn sifs_staged_toolchain_command_requires_wasix_runtime_feature() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-staged-artifacts-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-staged-artifacts-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_staged_artifacts").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_toolchain_command_requires_wasix_runtime_feature",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_staged_artifacts").expect("sandbox");
     let toolchain_id =
@@ -10135,6 +10342,8 @@ fn sifs_staged_toolchain_command_requires_wasix_runtime_feature() {
     );
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -10142,13 +10351,12 @@ fn sifs_staged_toolchain_command_requires_wasix_runtime_feature() {
 fn sifs_staged_direct_module_requires_wasix_runtime_feature() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-direct-wasix-required-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-direct-wasix-required-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_direct_wasix_required").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_direct_module_requires_wasix_runtime_feature",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_direct_wasix_required").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -10188,6 +10396,8 @@ fn sifs_staged_direct_module_requires_wasix_runtime_feature() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -10195,13 +10405,12 @@ fn sifs_staged_direct_module_requires_wasix_runtime_feature() {
 fn sifs_staged_wasix_toolchain_reads_support_artifact_from_virtual_preopen() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-artifacts-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-artifacts-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_artifacts").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_toolchain_reads_support_artifact_from_virtual_preopen",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id = SandboxId::from_legacy_named("sandbox_sifs_wasix_artifacts").expect("sandbox");
     let toolchain_id =
         SandboxToolchainId::from_legacy_named("toolchain_wasix_artifacts").expect("toolchain");
@@ -10256,6 +10465,9 @@ fn sifs_staged_wasix_toolchain_reads_support_artifact_from_virtual_preopen() {
     assert_eq!(command.stdout, b"support");
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(outcome.dfs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -10263,13 +10475,12 @@ fn sifs_staged_wasix_toolchain_reads_support_artifact_from_virtual_preopen() {
 fn sifs_staged_wasix_toolchain_does_not_create_local_staging_instance() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-no-staging-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-no-staging-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_no_staging").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_toolchain_does_not_create_local_staging_instance",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_no_staging").expect("sandbox");
     let toolchain_id =
@@ -10340,6 +10551,9 @@ fn sifs_staged_wasix_toolchain_does_not_create_local_staging_instance() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -10347,13 +10561,12 @@ fn sifs_staged_wasix_toolchain_does_not_create_local_staging_instance() {
 fn sifs_staged_wasix_toolchain_command_spawns_pinned_bin_child() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-wasix-spawn-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-spawn-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_spawn").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id.clone()),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_wasix_toolchain_command_spawns_pinned_bin_child",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id = SandboxId::from_legacy_named("sandbox_sifs_wasix_spawn").expect("sandbox");
     let toolchain_id =
         SandboxToolchainId::from_legacy_named("toolchain_wasix_spawn").expect("toolchain");
@@ -10428,6 +10641,9 @@ fn sifs_staged_wasix_toolchain_command_spawns_pinned_bin_child() {
     );
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(outcome.dfs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -10435,13 +10651,12 @@ fn sifs_staged_wasix_toolchain_command_spawns_pinned_bin_child() {
 fn sifs_staged_toolchain_command_preserves_wasix_target_abi() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-staged-wasix-abi-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-staged-wasix-abi-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_staged_wasix_abi").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id.clone()),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_toolchain_command_preserves_wasix_target_abi",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_staged_wasix_abi").expect("sandbox");
     let toolchain_id = SandboxToolchainId::from_legacy_named("toolchain_wasix").expect("toolchain");
@@ -10497,6 +10712,9 @@ fn sifs_staged_toolchain_command_preserves_wasix_target_abi() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(outcome.dfs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -10674,15 +10892,13 @@ fn sifs_staged_runner_executes_process_plan_and_syncs_command_history() {
 #[cfg(feature = "wasix-runtime")]
 #[test]
 fn sifs_staged_runner_executes_wasix_process_plan_with_concurrent_fd_pipe() {
-    let runtime_root = unique_test_dir("sinomo-sandbox-sifs-wasix-process-plan-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-process-plan-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_process_plan").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id.clone()),
-        LocalContentStore::new(runtime_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_runner_executes_wasix_process_plan_with_concurrent_fd_pipe",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_wasix_process_plan").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -10783,22 +10999,22 @@ fn sifs_staged_runner_executes_wasix_process_plan_with_concurrent_fd_pipe() {
             .exists(),
         "SIFS WASIX process-plan fast path should run through SIFS virtual preopens instead of materializing a local sandbox toolchain"
     );
-    fs::remove_dir_all(runtime_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[cfg(feature = "wasix-runtime")]
 #[test]
 fn sifs_staged_runner_executes_wasix_process_plan_with_concurrent_fd_pipe_and_mount() {
-    let runtime_root = unique_test_dir("sinomo-sandbox-sifs-wasix-process-plan-mount-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-wasix-process-plan-mount-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_wasix_process_plan_mount").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id.clone()),
-        LocalContentStore::new(runtime_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_runner_executes_wasix_process_plan_with_concurrent_fd_pipe_and_mount",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     dfs.posix_mkdir_all("/services/sandbox-shared")
         .expect("mount source");
     dfs.posix_write_file(
@@ -10893,21 +11109,22 @@ fn sifs_staged_runner_executes_wasix_process_plan_with_concurrent_fd_pipe_and_mo
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
     assert_eq!(manifest.command_history.len(), 2);
-    fs::remove_dir_all(runtime_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_store);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
 fn sifs_staged_runner_preflights_process_plan_policy_before_first_step() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-process-plan-late-policy-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-process-plan-late-policy-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_process_plan_late_policy").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_runner_preflights_process_plan_policy_before_first_step",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_process_plan_late_policy").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -10996,19 +11213,20 @@ fn sifs_staged_runner_preflights_process_plan_policy_before_first_step() {
     );
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
 fn sifs_staged_runner_preflights_process_plan_explicit_stdin_before_first_step() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-process-plan-late-stdin-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-process-plan-late-stdin-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_process_plan_late_stdin").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_runner_preflights_process_plan_explicit_stdin_before_first_step",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_process_plan_late_stdin").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -11094,19 +11312,19 @@ fn sifs_staged_runner_preflights_process_plan_explicit_stdin_before_first_step()
     );
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
 fn sifs_staged_runner_process_plan_piped_stdout_obeys_receiver_input_limit() {
-    let runtime_root = unique_test_dir("sinomo-sandbox-sifs-process-plan-input-limit-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-process-plan-input-limit-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_process_plan_input_limit").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id.clone()),
-        LocalContentStore::new(runtime_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_runner_process_plan_piped_stdout_obeys_receiver_input_limit",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_process_plan_input_limit").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -11194,21 +11412,22 @@ fn sifs_staged_runner_process_plan_piped_stdout_obeys_receiver_input_limit() {
         0,
         "WASIX SIFS process plans reject oversized piped input before committing per-step command records"
     );
-    fs::remove_dir_all(runtime_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_store);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
 fn sifs_staged_runner_process_plan_step_overrides_cwd_and_env() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-process-plan-overrides-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-process-plan-overrides-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_process_plan_overrides").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_runner_process_plan_step_overrides_cwd_and_env",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_process_plan_overrides").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -11325,19 +11544,21 @@ fn sifs_staged_runner_process_plan_step_overrides_cwd_and_env() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
 fn sifs_staged_runner_preflights_process_plan_cwd_before_first_step() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-process-plan-bad-cwd-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-process-plan-bad-cwd-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_process_plan_bad_cwd").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_runner_preflights_process_plan_cwd_before_first_step",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_process_plan_bad_cwd").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -11415,19 +11636,20 @@ fn sifs_staged_runner_preflights_process_plan_cwd_before_first_step() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
 fn sifs_staged_runner_rejects_process_plan_argv0_mismatch() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-process-plan-argv0-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-process-plan-argv0-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_process_plan_argv0").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_runner_rejects_process_plan_argv0_mismatch",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_process_plan_argv0").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -11473,19 +11695,20 @@ fn sifs_staged_runner_rejects_process_plan_argv0_mismatch() {
     assert!(!local_store.layout(&sandbox_id).root.exists());
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
 fn sifs_staged_runner_rejects_process_plan_ambiguous_piped_stdin() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-process-plan-piped-stdin-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-process-plan-piped-stdin-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_process_plan_piped_stdin").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_runner_rejects_process_plan_ambiguous_piped_stdin",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_process_plan_piped_stdin").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -11541,6 +11764,8 @@ fn sifs_staged_runner_rejects_process_plan_ambiguous_piped_stdin() {
     assert!(!local_store.layout(&sandbox_id).root.exists());
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -11657,13 +11882,12 @@ fn sifs_staged_runner_command_progress_resumes_from_replica_node() {
 fn sifs_staged_runner_writes_live_read_write_sifs_mounts() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-staged-mount-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-staged-mount-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_mount").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_runner_writes_live_read_write_sifs_mounts",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     dfs.posix_mkdir_all("/services/sandbox/shared")
         .expect("mount source");
     dfs.posix_mkdir_all("/services/sandbox/shared/target")
@@ -11720,19 +11944,21 @@ fn sifs_staged_runner_writes_live_read_write_sifs_mounts() {
     );
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(outcome.dfs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
 fn sifs_staged_runner_preserves_rw_mount_write_on_resource_failure() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-staged-mount-quota-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-staged-mount-quota-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_mount_quota").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_runner_preserves_rw_mount_write_on_resource_failure",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     dfs.posix_mkdir_all("/services/sandbox/shared")
         .expect("mount source");
     dfs.posix_mkdir_all("/services/sandbox/shared/target")
@@ -11784,6 +12010,9 @@ fn sifs_staged_runner_preserves_rw_mount_write_on_resource_failure() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(outcome.dfs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -11889,13 +12118,12 @@ fn sifs_staged_runner_replicates_live_rw_mount_write_to_candidate_node() {
 fn sifs_staged_runner_keeps_read_only_mounts_read_only() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-staged-ro-mount-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-staged-ro-mount-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_ro_mount").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_runner_keeps_read_only_mounts_read_only",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     dfs.posix_mkdir_all("/services/sandbox/shared")
         .expect("mount source");
     dfs.posix_mkdir_all("/services/sandbox/shared/target")
@@ -11943,19 +12171,21 @@ fn sifs_staged_runner_keeps_read_only_mounts_read_only() {
     ));
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(outcome.dfs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
 fn sifs_staged_runner_denies_mkdir_in_read_only_mount() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-staged-ro-mkdir-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-staged-ro-mkdir-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_ro_mkdir").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_runner_denies_mkdir_in_read_only_mount",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     dfs.posix_mkdir_all("/services/sandbox/shared/target")
         .expect("mount target");
     let sandbox_id = SandboxId::from_legacy_named("sandbox_sifs_ro_mkdir").expect("sandbox");
@@ -11995,6 +12225,9 @@ fn sifs_staged_runner_denies_mkdir_in_read_only_mount() {
     ));
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(outcome.dfs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -12002,13 +12235,12 @@ fn sifs_staged_runner_denies_mkdir_in_read_only_mount() {
 fn sifs_staged_runner_denies_timestamp_update_in_read_only_mount() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-staged-ro-times-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-staged-ro-times-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_ro_times").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_runner_denies_timestamp_update_in_read_only_mount",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     dfs.posix_mkdir_all("/services/sandbox/shared/target")
         .expect("mount target");
     dfs.posix_write_file(
@@ -12064,6 +12296,9 @@ fn sifs_staged_runner_denies_timestamp_update_in_read_only_mount() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(outcome.dfs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -12071,13 +12306,12 @@ fn sifs_staged_runner_denies_timestamp_update_in_read_only_mount() {
 fn sifs_staged_runner_denies_fd_timestamp_update_in_read_only_mount() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-staged-ro-fd-times-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-staged-ro-fd-times-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_ro_fd_times").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_runner_denies_fd_timestamp_update_in_read_only_mount",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     dfs.posix_mkdir_all("/services/sandbox/shared/target")
         .expect("mount target");
     dfs.posix_write_file(
@@ -12133,6 +12367,9 @@ fn sifs_staged_runner_denies_fd_timestamp_update_in_read_only_mount() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(outcome.dfs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -12140,13 +12377,12 @@ fn sifs_staged_runner_denies_fd_timestamp_update_in_read_only_mount() {
 fn sifs_staged_runner_denies_touch_in_read_only_mount() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-staged-ro-touch-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-staged-ro-touch-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_ro_touch").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_runner_denies_touch_in_read_only_mount",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     dfs.posix_mkdir_all("/services/sandbox/shared/target")
         .expect("mount target");
     dfs.posix_write_file(
@@ -12202,19 +12438,21 @@ fn sifs_staged_runner_denies_touch_in_read_only_mount() {
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    drop(outcome.dfs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
 fn sifs_staged_runner_policy_denial_blocks_staging() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-staged-policy-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-staged-policy-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_policy").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_runner_policy_denial_blocks_staging",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id = SandboxId::from_legacy_named("sandbox_sifs_staged_policy").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
     let mut manifest = sifs_store
@@ -12254,20 +12492,21 @@ fn sifs_staged_runner_policy_denial_blocks_staging() {
     assert!(!local_store.layout(&sandbox_id).root.exists());
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
 fn sifs_staged_runner_denies_remote_local_owned_mount_before_staging() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-staged-local-owned-policy-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-staged-local-owned-policy-local");
-    let network = InProcessNetwork::new();
     let execution_node = NodeId::from_legacy_named("node_sifs_local_owned_exec").expect("node");
     let owner_node = NodeId::from_legacy_named("node_sifs_local_owned_owner").expect("owner");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(execution_node.clone()),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_runner_denies_remote_local_owned_mount_before_staging",
+        execution_node.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_local_owned_policy").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -12312,19 +12551,20 @@ fn sifs_staged_runner_denies_remote_local_owned_mount_before_staging() {
     );
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
 fn sifs_staged_runner_validates_sifs_toolchain_command_policy() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-toolchain-policy-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-toolchain-policy-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_toolchain_policy").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(sifs_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_staged_runner_validates_sifs_toolchain_command_policy",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id =
         SandboxId::from_legacy_named("sandbox_sifs_toolchain_policy").expect("sandbox");
     let toolchain_id =
@@ -12378,6 +12618,8 @@ fn sifs_staged_runner_validates_sifs_toolchain_command_policy() {
     assert!(!local_store.layout(&sandbox_id).root.exists());
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
+
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[cfg(feature = "wasix-runtime")]

@@ -13,8 +13,8 @@ ring = "r1"
 
 [features]
 default = []
-test-support = []
-migration-bench = []
+test-support = ["dep:sinomo-testdir", "dep:tracing-subscriber", "sinomo-core/cluster-test-support", "sinomo-core/network-test-support"]
+storage-conversion = []
 
 [dependencies]
 base64.workspace = true
@@ -35,6 +35,8 @@ sinomo-core = { path = "../sinomo-core" }
 sinomo-config = { path = "../sinomo-config" }
 sinomo-device = { path = "../sinomo-device" }
 sinomo-module = { path = "../sinomo-module" }
+sinomo-testdir = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = [
@@ -47,9 +49,8 @@ windows-sys = { workspace = true, features = [
 ] }
 
 [dev-dependencies]
-sinomo-dfs-history.workspace = true
 sinomo-core = { path = "../sinomo-core", features = ["cluster-test-support", "network-test-support"] }
-sinomo-testdir = { path = "../sinomo-testdir" }
+sinomo-testdir.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
 tracing-subscriber.workspace = true
 
@@ -57,7 +58,22 @@ tracing-subscriber.workspace = true
 name = "scale"
 harness = false
 
-[[bench]]
-name = "storage_migration"
-harness = false
-required-features = ["migration-bench"]
+[[test]]
+name = "networked_dfs"
+required-features = ["test-support"]
+
+[[test]]
+name = "publication_consistency"
+required-features = ["test-support"]
+
+[[test]]
+name = "data_consistency_failures"
+required-features = ["test-support"]
+
+[[test]]
+name = "lazy_file_sync"
+required-features = ["test-support"]
+
+[[test]]
+name = "posix_regressions"
+required-features = ["test-support"]

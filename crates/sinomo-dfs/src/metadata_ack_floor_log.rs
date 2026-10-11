@@ -1,6 +1,6 @@
 //! Local acknowledgement evidence, independent of the canonical journal.
 //!
-//! The legacy sidecar becomes a mandatory format pointer. Hot updates append
+//! A mandatory current format pointer names the checksummed append log. Updates append
 //! one checksummed record to an established file instead of replacing a file
 //! and dirtying its directory for every ACK. Every mutation reopens and syncs
 //! the log, including idempotent retries: readable bytes after a failed sync
@@ -9,7 +9,7 @@
 //! Recovery uses the shared append-log crash contract: a successfully synced
 //! record survives a process/power loss, while its unfinished successor may
 //! leave an incomplete EOF frame. Complete invalid records and missing
-//! migrated logs fail closed. This is not a certificate against arbitrary
+//! initialized logs fail closed. This is not a certificate against arbitrary
 //! subsequent deletion or truncation of already-synced storage bytes.
 
 use std::fs::{self, File, OpenOptions};
@@ -77,7 +77,7 @@ struct Record {
 
 struct Loaded<T> {
     floor: Option<T>,
-    migrated: bool,
+    initialized: bool,
     records: usize,
     complete_len: u64,
     file_len: u64,
@@ -149,7 +149,7 @@ fn parse_record<T: AckFloor>(bytes: &[u8], shard: &DfsMetadataShardId) -> Result
 }
 
 // Floor writers already hold the metadata writer fence, which also excludes
-// legacy writers during migration. This additional lock lets readers observe
+// concurrent updates. This additional lock lets readers observe
 // a coherent append/rotation without materializing metadata tables.
 fn lock(path: &Path, exclusive: bool) -> Result<Option<File>> {
     let lock_path = path.with_extension("lock");
@@ -185,40 +185,28 @@ fn lock(path: &Path, exclusive: bool) -> Result<Option<File>> {
     skip_all, fields(stage = "dfs.metadata.ack_floor.read", kind = T::KIND,
     records = tracing::field::Empty, log_bytes = tracing::field::Empty, outcome = "error"))]
 fn load<T: AckFloor>(path: &Path, shard: &DfsMetadataShardId) -> Result<Loaded<T>> {
-    let mut migrated = false;
-    let mut legacy = None;
+    let mut initialized = false;
     if let Some(bytes) = read_optional(path)? {
-        match decode::<FormatPointer>(&bytes) {
-            Ok(pointer) => {
-                if pointer.ack_floor_log_format != FORMAT
-                    || pointer.kind != T::KIND
-                    || &pointer.shard_id != shard
-                {
-                    return Err(invalid(
-                        "unsupported metadata acknowledgement format pointer",
-                    ));
-                }
-                migrated = true;
-            }
-            Err(_) => {
-                let floor: T = decode(&bytes)?;
-                if floor.shard() != shard {
-                    return Err(invalid("legacy acknowledgement floor names another shard"));
-                }
-                floor.validate()?;
-                legacy = Some(floor);
-            }
+        let pointer: FormatPointer = decode(&bytes)?;
+        if pointer.ack_floor_log_format != FORMAT
+            || pointer.kind != T::KIND
+            || &pointer.shard_id != shard
+        {
+            return Err(invalid(
+                "unsupported current metadata acknowledgement format pointer",
+            ));
         }
+        initialized = true;
     }
     let log_path = path.with_extension("slog");
     let log = match File::open(&log_path) {
         Ok(file) => Some(file),
-        Err(error) if error.kind() == io::ErrorKind::NotFound && !migrated => None,
+        Err(error) if error.kind() == io::ErrorKind::NotFound && !initialized => None,
         Err(error) => return Err(io_error(&log_path, error)),
     };
     let mut loaded = Loaded {
         floor: None,
-        migrated,
+        initialized,
         records: 0,
         complete_len: 0,
         file_len: 0,
@@ -252,18 +240,10 @@ fn load<T: AckFloor>(path: &Path, shard: &DfsMetadataShardId) -> Result<Loaded<T
             }
         }
     }
-    if migrated && loaded.floor.is_none() {
+    if initialized && loaded.floor.is_none() {
         return Err(invalid(
-            "migrated metadata acknowledgement log has no complete floor",
+            "initialized metadata acknowledgement log has no complete floor",
         ));
-    }
-    // A process interrupted before pointer publication can leave a log while
-    // an older binary subsequently advances the still-legacy sidecar.
-    if let Some(legacy) = legacy {
-        loaded.floor = Some(match loaded.floor.as_ref() {
-            Some(current) => T::merge(current, &legacy)?,
-            None => legacy,
-        });
     }
     let span = tracing::Span::current();
     span.record("records", loaded.records);
@@ -295,7 +275,7 @@ pub(crate) fn put<T: AckFloor>(path: &Path, incoming: &T) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| invalid("acknowledgement path has no parent"))?;
-    if !loaded.migrated || loaded.records >= MAX_LOG_RECORDS {
+    if !loaded.initialized || loaded.records >= MAX_LOG_RECORDS {
         let bytes = record_bytes(&floor)?;
         let mut frame = Vec::with_capacity(bytes.len() + 4);
         frame.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
@@ -306,7 +286,7 @@ pub(crate) fn put<T: AckFloor>(path: &Path, incoming: &T) -> Result<()> {
             durable_file::DurableAtomicFileOptions::new("floor.slog", "checkpoint").sync_all(),
         )
         .map_err(metadata_durable_file_error)?;
-        if !loaded.migrated {
+        if !loaded.initialized {
             // First publication must also persist every newly-created ancestor
             // down to the already-owned metadata root (coordination/kind/shard).
             if let Some(coordination) = parent.parent() {
@@ -325,7 +305,7 @@ pub(crate) fn put<T: AckFloor>(path: &Path, incoming: &T) -> Result<()> {
             )?;
         }
     } else {
-        // Never create a missing migrated log: losing it is lost ACK evidence.
+        // Never create a missing initialized log: losing it is lost ACK evidence.
         let mut log = OpenOptions::new()
             .read(true)
             .append(true)
@@ -382,7 +362,11 @@ mod tests {
         DfsMetadataAuthorityAckFloor {
             shard_id: DfsMetadataShardId::new("floor-test"),
             journal_sequence: sequence,
-            durable_prefix_proof: None,
+            durable_prefix_proof: crate::DfsMetadataPrefixProof {
+                version: 2,
+                journal_sequence: sequence,
+                digest: format!("dfs-metadata-prefix-v2:blake3:{}", "a".repeat(64)),
+            },
         }
     }
 
@@ -422,26 +406,6 @@ mod tests {
         assert!(fs::metadata(path.with_extension("slog")).unwrap().len() > first_len);
         put(&path, &floor(1)).unwrap();
         assert_eq!(current(&path), floor(2));
-    }
-
-    #[test]
-    fn interrupted_migration_merges_a_newer_legacy_floor_before_fencing() {
-        let root = sinomo_testdir::TestDir::new("ack-floor-log-migration");
-        let path = sidecar(&root);
-        put(&path, &floor(1)).unwrap();
-        // Model the durable cut before pointer publication, then an old writer
-        // advancing its still-legacy sidecar after that process exits.
-        write_sobj_atomic(&path, &floor(3)).unwrap();
-        assert_eq!(current(&path), floor(3));
-        put(&path, &floor(2)).unwrap();
-        assert_eq!(current(&path), floor(3));
-        assert!(decode::<DfsMetadataAuthorityAckFloor>(&fs::read(&path).unwrap()).is_err());
-        assert_eq!(
-            load::<DfsMetadataAuthorityAckFloor>(&path, &floor(1).shard_id)
-                .unwrap()
-                .records,
-            1
-        );
     }
 
     #[test]
@@ -504,7 +468,7 @@ mod tests {
     }
 
     #[test]
-    fn migrated_log_loss_and_complete_record_corruption_never_fall_back() {
+    fn initialized_log_loss_and_complete_record_corruption_never_fall_back() {
         let root = sinomo_testdir::TestDir::new("ack-floor-log-corruption");
         let path = sidecar(&root);
         put(&path, &floor(1)).unwrap();
@@ -525,7 +489,7 @@ mod tests {
         fs::write(&log_path, []).unwrap();
         assert!(
             put(&path, &floor(3)).is_err(),
-            "empty migrated log is missing evidence"
+            "empty initialized log is missing evidence"
         );
     }
 
@@ -542,7 +506,7 @@ mod tests {
                 shard_id: floor(1).shard_id,
                 journal_sequence: 3,
                 state_fingerprint: "exact-fingerprint".into(),
-                durable_prefix_proof: None,
+                durable_prefix_proof: floor(3).durable_prefix_proof,
             },
         );
         assert!(put(&path, &floor(3)).is_err());

@@ -52,11 +52,42 @@ impl DaemonDfsDataPlaneHost {
     }
 }
 
+/// This comparison permits only a pre-execution retry, never execution under
+/// the earlier unfenced receiver observation.
+pub(super) fn replica_context_can_reselect_committed_fence(
+    previous: &sinomo_dfs::DfsMetadataReplicaShardContext,
+    current: &sinomo_dfs::DfsMetadataReplicaShardContext,
+) -> bool {
+    if previous.local_node_id != current.local_node_id || previous.shard != current.shard {
+        return false;
+    }
+    let (Some(previous), Some(current)) = (
+        previous.pending_membership_handoff.as_ref(),
+        current.pending_membership_handoff.as_ref(),
+    ) else {
+        return false;
+    };
+    let Some(fence) = current.retiring_primary_fence.as_ref() else {
+        return false;
+    };
+    if previous.retiring_primary_fence.is_some()
+        || fence.handoff_id != current.handoff_id
+        || fence.primary_node_id != current.retiring_shard.primary_node_id
+        || fence.journal_sequence < current.required_prepared_sequence
+        || fence.state_fingerprint.is_empty()
+    {
+        return false;
+    }
+    let mut same_handoff = previous.clone();
+    same_handoff.retiring_primary_fence = Some(fence.clone());
+    same_handoff == *current
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_daemon_dfs_resident_replica_operation<R, F>(
     paths: &DaemonPaths,
     data_dir: Arc<SinomoDataDir>,
-    expected_context: sinomo_dfs::DfsMetadataReplicaShardContext,
+    mut expected_context: sinomo_dfs::DfsMetadataReplicaShardContext,
     runtime: &tokio::runtime::Handle,
     preempt_maintenance: bool,
     materialize_after: bool,
@@ -65,11 +96,20 @@ pub(super) async fn handle_daemon_dfs_resident_replica_operation<R, F>(
 ) -> Result<DaemonDfsResidentReplicaOperation<R>, DaemonError>
 where
     R: Send + 'static,
-    F: FnOnce(&mut dyn DfsMetadataBackend) -> R + Send + 'static,
+    F: FnOnce(
+            &sinomo_dfs::ResidentLocalMetadataShardHandle,
+            &sinomo_dfs::DfsMetadataReplicaShardContext,
+        ) -> Result<R, sinomo_dfs::MetadataBackendError>
+        + Send
+        + 'static,
 {
     let data_owner_lock = require_daemon_dfs_data_owner_lock(paths)?;
     let cluster_paths = ClusterPaths::new(data_dir.as_ref());
-    let Some(peer_snapshot) = read_daemon_dfs_message_peer_snapshot(&cluster_paths)? else {
+    let peer_deadline = tokio::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    let Some(peer_snapshot) =
+        read_daemon_dfs_message_peer_snapshot_before(&cluster_paths, runtime, peer_deadline)
+            .await?
+    else {
         return Err(DaemonError::ClusterOrphan);
     };
     if peer_snapshot.local_node_id != expected_context.local_node_id {
@@ -80,12 +120,14 @@ where
             ),
         });
     }
-    let metadata_authority_preflight = warm_daemon_dfs_metadata_authority_for_peer_snapshot_async(
-        &cluster_paths,
-        &peer_snapshot,
-        runtime,
-    )
-    .await?;
+    let mut metadata_authority_preflight =
+        warm_daemon_dfs_metadata_authority_for_peer_snapshot_before(
+            &cluster_paths,
+            &peer_snapshot,
+            runtime,
+            peer_deadline,
+        )
+        .await?;
     let file_system_id = expected_context.shard.file_system_id.clone();
     let shard_id = DfsMetadataShardId::new(expected_context.shard.shard_id.clone());
     let exact_scope = DfsMessageExecutionScope::ExactShard {
@@ -96,7 +138,7 @@ where
     let traceparent = trace_enabled
         .then(crate::service_trace::current_dfs_traceparent)
         .flatten();
-    let admission_trace = DaemonDfsAdmissionTrace {
+    let mut admission_trace = DaemonDfsAdmissionTrace {
         label: "dfs-replica-admission",
         request: trace_request.0,
         kind: trace_request.1,
@@ -106,122 +148,168 @@ where
         enabled: trace_enabled,
     };
     let scheduler = daemon_dfs_mutation_scheduler(data_dir.as_ref())?;
-    let scheduler_started = admission_trace.start();
-    let admitted = tracing::Instrument::instrument(
-        admit_daemon_dfs_message(&scheduler, &exact_scope, preempt_maintenance),
-        admission_trace.span("initial-scheduler"),
-    )
-    .await;
-    admission_trace.record(
-        "initial-scheduler",
-        if admitted.is_ok() {
-            "admitted"
-        } else {
-            "error"
-        },
-        scheduler_started,
-        admitted.as_ref().ok(),
-    );
-    let mut admission = admitted?;
-    let cache_started = admission
-        .is_exact()
-        .then(|| admission_trace.start())
-        .flatten();
-    let cached = admission_trace.span("exact-cache").in_scope(|| {
-        Ok::<_, sinomo_dfs::DfsError>(if admission.is_exact() {
-            daemon_dfs_message_cache_exact_admission_handle_for_replica_context(
-                data_dir.as_ref(),
-                &cluster_paths,
-                &peer_snapshot,
-                &expected_context,
-                runtime,
-            )?
-        } else {
-            None
-        })
-    });
-    admission_trace.record(
-        "exact-cache",
-        match &cached {
-            Ok(Some(_)) => "eligible",
-            Ok(None) => "ineligible",
-            Err(_) => "error",
-        },
-        cache_started,
-        Some(&admission),
-    );
-    let mut shard = cached?;
-    if shard.is_none() {
-        if !admission.is_global() {
-            drop(admission);
-            let upgrade_started = admission_trace.start();
-            let upgraded = tracing::Instrument::instrument(
-                admit_daemon_dfs_message(
-                    &scheduler,
-                    &DfsMessageExecutionScope::GlobalExclusive,
-                    preempt_maintenance,
-                ),
-                admission_trace.span("global-upgrade"),
-            )
-            .await;
-            admission_trace.record(
-                "global-upgrade",
-                if upgraded.is_ok() {
-                    "admitted"
-                } else {
-                    "error"
-                },
-                upgrade_started,
-                upgraded.as_ref().ok(),
-            );
-            admission = upgraded?;
-        }
-        // Generation creation and rollover require the global fence. Once the
-        // resident generation is current, replica persistence checks out only
-        // the exact shard and bypasses the routed service shell entirely.
-        let resident_started = admission_trace.start();
-        let resident = admission_trace.span("resident-refresh").in_scope(|| {
-            daemon_dfs_resident_metadata_backend_after_preflight(
-                data_dir.as_ref(),
-                &cluster_paths,
-                &peer_snapshot,
-                &metadata_authority_preflight,
-                runtime,
-            )
-        });
+    let mut authority_refresh_retries = 0;
+    let (admission, shard) = loop {
+        admission_trace.attempt = authority_refresh_retries;
+        let scheduler_started = admission_trace.start();
+        let admitted = tracing::Instrument::instrument(
+            admit_daemon_dfs_message(&scheduler, &exact_scope, preempt_maintenance),
+            admission_trace.span("initial-scheduler"),
+        )
+        .await;
         admission_trace.record(
-            "resident-refresh",
-            match &resident {
-                Ok(Some(_)) => "resident",
-                Ok(None) => "unhosted",
-                Err(_) => "error",
+            "initial-scheduler",
+            if admitted.is_ok() {
+                "admitted"
+            } else {
+                "error"
             },
-            resident_started,
-            Some(&admission),
+            scheduler_started,
+            admitted.as_ref().ok(),
         );
-        let resident = resident?;
-        if resident.is_none() {
-            return Ok(DaemonDfsResidentReplicaOperation::Rejected {
-                reason: format!(
-                    "this node does not host filesystem {file_system_id} metadata shard {}",
-                    shard_id.0
-                ),
-            });
+        #[cfg(not(test))]
+        let mut admission = admitted?;
+        // Test observers borrow the actual guard's lifetime; they never acquire
+        // another scheduler permit or require unrelated work to be idle.
+        #[cfg(test)]
+        let mut admission = Arc::new(admitted?);
+        #[cfg(test)]
+        if let Some(hook) = daemon_dfs_pre_dispatch_test_hook(data_dir.as_ref()) {
+            hook(
+                DaemonDfsPreDispatchTestPoint::BeforeReplicaContextComparison,
+                None,
+                Some(&metadata_authority_preflight),
+            )?;
         }
-        let cache_started = admission_trace.start();
-        let cached = admission_trace
-            .span("exact-cache-after-refresh")
-            .in_scope(|| {
+        // A ready successor with different shard/handoff DATA is an authority
+        // rejection, not a retry grant. An incomplete successor is still handled
+        // by the typed preexecution refresh below. Both checks borrow the existing
+        // retained projection and perform no authority I/O under admission.
+        let context_span = tracing::trace_span!(target: "sinomo.perf",
+            "dfs.metadata.replica_context.compare", stage = "dfs.metadata.replica_context.compare",
+            request = trace_request.0, kind = trace_request.1, attempt = authority_refresh_retries,
+            traceparent = traceparent.as_deref().unwrap_or_default(), outcome = "error",
+            node = %expected_context.local_node_id, data_root = %data_dir.root().display(),
+            fs = %file_system_id, shard = %shard_id.0,
+            preflight_generation = metadata_authority_preflight.generation,
+            observed_generation = tracing::field::Empty, context_matches = tracing::field::Empty);
+        let (observed_generation, context_matches) = context_span.in_scope(|| {
+            metadata_authority_preflight
+                .authority
+                .replica_context_state(&expected_context)
+        })?;
+        context_span.record("observed_generation", observed_generation);
+        context_span.record("context_matches", context_matches);
+        context_span.record("outcome", "ok");
+        if !context_matches
+            && metadata_authority_preflight
+                .authority
+                .retained_complete_prefix_revision_for_generation(observed_generation)
+                .is_some()
+        {
+            let current = metadata_authority_preflight
+                .authority
+                .retained_complete_prefix_for_generation(observed_generation)
+                .map(|projection| {
+                    daemon_dfs_metadata_replica_context_from_authority_projection(
+                        &projection,
+                        &peer_snapshot.local_node_id,
+                        &file_system_id,
+                        &shard_id,
+                    )
+                })
+                .transpose()?
+                .flatten();
+            if !current.as_ref().is_some_and(|current| {
+                replica_context_can_reselect_committed_fence(&expected_context, current)
+            }) || authority_refresh_retries >= 2
+            {
+                return Ok(DaemonDfsResidentReplicaOperation::Rejected {
+                    reason: format!(
+                        "metadata replica authority context changed for filesystem {file_system_id} shard {}",
+                        shard_id.0
+                    ),
+                });
+            }
+            // This is a new receiver observation before the FnOnce operation,
+            // not permission to execute under the old unfenced context.
+            #[cfg(test)]
+            let previous_admission = Arc::downgrade(&admission);
+            drop(admission);
+            authority_refresh_retries += 1;
+            tracing::trace!(target: "sinomo.dfs.perf",
+                request = trace_request.0, kind = trace_request.1,
+                data_root = %data_dir.root().display(), node = %peer_snapshot.local_node_id,
+                fs = %file_system_id, shard = %shard_id.0,
+                attempt = authority_refresh_retries, observed_generation,
+                "DFS replica reselecting actual committed retirement fence before execution");
+            #[cfg(test)]
+            if let Some(hook) = daemon_dfs_pre_dispatch_test_hook(data_dir.as_ref()) {
+                hook(
+                    DaemonDfsPreDispatchTestPoint::ReplicaAdmissionReleased {
+                        released: previous_admission.upgrade().is_none(),
+                    },
+                    None,
+                    None,
+                )?;
+                hook(
+                    DaemonDfsPreDispatchTestPoint::BeforeAuthorityRefresh {
+                        owner: "replica",
+                        replan: authority_refresh_retries,
+                    },
+                    None,
+                    None,
+                )?;
+            }
+            metadata_authority_preflight =
+                warm_daemon_dfs_metadata_authority_for_peer_snapshot_async(
+                    &cluster_paths,
+                    &peer_snapshot,
+                    runtime,
+                )
+                .await?;
+            let projection = metadata_authority_preflight
+                .authority
+                .retained_complete_prefix_for_generation(metadata_authority_preflight.generation)
+                .ok_or_else(|| crate::DfsError::Metadata {
+                    message: "refreshed replica context has no complete retained projection".into(),
+                })?;
+            let refreshed = daemon_dfs_metadata_replica_context_from_authority_projection(
+                &projection,
+                &peer_snapshot.local_node_id,
+                &file_system_id,
+                &shard_id,
+            )?;
+            let Some(refreshed) = refreshed.filter(|context| {
+                replica_context_can_reselect_committed_fence(&expected_context, context)
+            }) else {
+                return Ok(DaemonDfsResidentReplicaOperation::Rejected {
+                    reason: "refreshed replica context changed its retiring handoff or shard"
+                        .into(),
+                });
+            };
+            expected_context = refreshed;
+            continue;
+        }
+        let cache_started = admission
+            .is_exact()
+            .then(|| admission_trace.start())
+            .flatten();
+        let cached = admission_trace.span("exact-cache").in_scope(|| {
+            Ok::<_, sinomo_dfs::DfsError>(if admission.is_exact() {
                 daemon_dfs_message_cache_exact_admission_handle_for_replica_context(
                     data_dir.as_ref(),
                     &cluster_paths,
                     &peer_snapshot,
                     &expected_context,
                     runtime,
-                )
-            });
+                )?
+            } else {
+                None
+            })
+        });
         admission_trace.record(
-            "exact-cache-after-refresh",
+            "exact-cache",
             match &cached {
                 Ok(Some(_)) => "eligible",
                 Ok(None) => "ineligible",
@@ -230,15 +318,152 @@ where
             cache_started,
             Some(&admission),
         );
-        shard = cached?;
-    }
-    let Some(shard) = shard else {
-        return Ok(DaemonDfsResidentReplicaOperation::Rejected {
-            reason: format!(
-                "metadata replica authority context is stale for filesystem {file_system_id} shard {}",
-                shard_id.0
-            ),
-        });
+        let mut shard = cached?;
+        if shard.is_none() {
+            if !admission.is_global() {
+                drop(admission);
+                let upgrade_started = admission_trace.start();
+                let upgraded = tracing::Instrument::instrument(
+                    admit_daemon_dfs_message(
+                        &scheduler,
+                        &DfsMessageExecutionScope::GlobalExclusive,
+                        preempt_maintenance,
+                    ),
+                    admission_trace.span("global-upgrade"),
+                )
+                .await;
+                admission_trace.record(
+                    "global-upgrade",
+                    if upgraded.is_ok() {
+                        "admitted"
+                    } else {
+                        "error"
+                    },
+                    upgrade_started,
+                    upgraded.as_ref().ok(),
+                );
+                #[cfg(not(test))]
+                {
+                    admission = upgraded?;
+                }
+                #[cfg(test)]
+                {
+                    admission = Arc::new(upgraded?);
+                }
+            }
+            // Generation creation and rollover require the global fence. Once the
+            // resident generation is current, replica persistence checks out only
+            // the exact shard and bypasses the routed service shell entirely.
+            let resident_started = admission_trace.start();
+            let resident = admission_trace.span("resident-refresh").in_scope(|| {
+                let preflight = metadata_authority_preflight.for_admission(&admission);
+                try_daemon_dfs_resident_metadata_backend_after_preflight(
+                    data_dir.as_ref(),
+                    &cluster_paths,
+                    &peer_snapshot,
+                    &preflight,
+                    runtime,
+                )
+            });
+            admission_trace.record(
+                "resident-refresh",
+                match &resident {
+                    Ok(Some(_)) => "resident",
+                    Ok(None) => "unhosted",
+                    Err(_) => "error",
+                },
+                resident_started,
+                Some(&admission),
+            );
+            let resident = match resident {
+                Ok(resident) => resident,
+                Err(DaemonDfsAuthorityPreExecutionError::AuthorityPreflightStale(stale)) => {
+                    // No journal/snapshot operation has been invoked. Release the
+                    // actual old admission before shared async proof refresh, then
+                    // acquire and validate the same command/context afresh.
+                    #[cfg(test)]
+                    let previous_admission = Arc::downgrade(&admission);
+                    drop(admission);
+                    #[cfg(test)]
+                    if let Some(hook) =
+                        super::message_host::daemon_dfs_pre_dispatch_test_hook(data_dir.as_ref())
+                    {
+                        use super::message_host::DaemonDfsPreDispatchTestPoint;
+                        hook(
+                            DaemonDfsPreDispatchTestPoint::ReplicaAdmissionReleased {
+                                released: previous_admission.upgrade().is_none(),
+                            },
+                            None,
+                            None,
+                        )?;
+                    }
+                    if authority_refresh_retries >= 2 {
+                        return Err(stale.into_dfs_error().into());
+                    }
+                    authority_refresh_retries += 1;
+                    daemon_dfs_record_authority_replan(
+                        data_dir.as_ref(),
+                        "replica",
+                        authority_refresh_retries,
+                        stale,
+                    )?;
+                    metadata_authority_preflight =
+                        warm_daemon_dfs_metadata_authority_for_peer_snapshot_async(
+                            &cluster_paths,
+                            &peer_snapshot,
+                            runtime,
+                        )
+                        .await?;
+                    continue;
+                }
+                Err(DaemonDfsAuthorityPreExecutionError::Failed(error)) => {
+                    return Err(error.into());
+                }
+            };
+            if resident.is_none() {
+                return Ok(DaemonDfsResidentReplicaOperation::Rejected {
+                    reason: format!(
+                        "this node does not host filesystem {file_system_id} metadata shard {}",
+                        shard_id.0
+                    ),
+                });
+            }
+            let cache_started = admission_trace.start();
+            let cached = admission_trace
+                .span("exact-cache-after-refresh")
+                .in_scope(|| {
+                    daemon_dfs_message_cache_exact_admission_handle_for_replica_context(
+                        data_dir.as_ref(),
+                        &cluster_paths,
+                        &peer_snapshot,
+                        &expected_context,
+                        runtime,
+                    )
+                });
+            admission_trace.record(
+                "exact-cache-after-refresh",
+                match &cached {
+                    Ok(Some(_)) => "eligible",
+                    Ok(None) => "ineligible",
+                    Err(_) => "error",
+                },
+                cache_started,
+                Some(&admission),
+            );
+            shard = cached?;
+        }
+        let Some(shard) = shard else {
+            return Ok(DaemonDfsResidentReplicaOperation::Rejected {
+                reason: format!(
+                    "metadata replica authority context is stale for filesystem {file_system_id} shard {}",
+                    shard_id.0
+                ),
+            });
+        };
+        #[cfg(test)]
+        let admission = Arc::try_unwrap(admission)
+            .expect("preflight observers never retain actual mutation admission");
+        break (admission, shard);
     };
     admission_trace.ready(&admission);
     let blocking_span = admission_trace.span("blocking");
@@ -277,21 +502,23 @@ where
         let checkout_started = blocking_trace
             .as_ref()
             .and_then(DaemonDfsAdmissionTrace::start);
-        let result = process_shard
-            .with_backend(|backend| {
-                if let Some(trace) = blocking_trace.as_ref() {
-                    trace.record(
-                        "backend-checkout",
-                        "acquired",
-                        checkout_started,
-                        Some(&admission),
-                    );
-                }
-                Ok::<R, sinomo_dfs::MetadataBackendError>(operation(
-                    backend as &mut dyn DfsMetadataBackend,
-                ))
-            })
-            .map_err(DaemonError::from)?;
+        if let Some(trace) = blocking_trace.as_ref() {
+            trace.record(
+                "backend-operation",
+                "started",
+                checkout_started,
+                Some(&admission),
+            );
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        let _native_boundary = crate::native_shard_trace::enter_resident_replica_boundary_context(
+            &process_data_dir.root(),
+            &process_data_owner_lock,
+            &process_shard,
+            &expected_context.local_node_id,
+            &admission,
+        );
+        let result = operation(&process_shard, &expected_context).map_err(DaemonError::from)?;
         if materialize_after {
             // Register the replay edge while still owning producer admission.
             // The worker can then claim all accepted inputs under that same
@@ -351,14 +578,18 @@ pub(super) async fn handle_daemon_dfs_inspection_async(
     // mutations use the same global scheduler owner as maintenance and
     // foreground traffic. Holding admission inside the blocking task preserves
     // cancellation safety.
-    let Some(preflight_peer_snapshot) = read_daemon_dfs_message_peer_snapshot(&cluster_paths)?
+    let peer_deadline = tokio::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    let Some(preflight_peer_snapshot) =
+        read_daemon_dfs_message_peer_snapshot_before(&cluster_paths, runtime, peer_deadline)
+            .await?
     else {
         return Err(DaemonError::ClusterOrphan);
     };
-    let metadata_authority_preflight = warm_daemon_dfs_metadata_authority_for_peer_snapshot_async(
+    let metadata_authority_preflight = warm_daemon_dfs_metadata_authority_for_peer_snapshot_before(
         &cluster_paths,
         &preflight_peer_snapshot,
         runtime,
+        peer_deadline,
     )
     .await?;
     let scheduler = daemon_dfs_mutation_scheduler(&data_dir)?;
@@ -369,9 +600,7 @@ pub(super) async fn handle_daemon_dfs_inspection_async(
     tokio::task::spawn_blocking(move || {
         let _admission = admission;
         let _data_owner_lock = data_owner_lock;
-        let Some(peer_snapshot) = read_daemon_dfs_message_peer_snapshot(&cluster_paths)? else {
-            return Err(DaemonError::ClusterOrphan);
-        };
+        let peer_snapshot = preflight_peer_snapshot;
         let (lane, _) = daemon_dfs_message_lane(
             &data_dir,
             &cluster_paths,
@@ -400,11 +629,7 @@ pub(super) async fn handle_daemon_dfs_inspection_async(
                 detail: "DFS mutation service lane has no metadata backend".to_string(),
             })
             .and_then(|metadata| {
-                let read_only = !matches!(
-                    &request,
-                    sinomo_dfs::DaemonDfsInspectionRequest::ResolveConflicts { .. }
-                        | sinomo_dfs::DaemonDfsInspectionRequest::UseConflictVersion { .. }
-                );
+                let read_only = true;
                 // The resident backend is also advanced by replica and
                 // foreground lanes. Refresh its tables once, then make every
                 // page in this inspection borrow that coherent generation.
@@ -594,15 +819,23 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
             let _data_owner = data_owner?;
             validation?;
             let cluster_paths = ClusterPaths::new(data_dir.as_ref());
-            let Some(peer_snapshot) = read_daemon_dfs_message_peer_snapshot(&cluster_paths)
-                .map_err(|source| DfsDataPlaneHostError::new(source.to_string()))?
+            let peer_deadline =
+                tokio::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+            let Some(peer_snapshot) = read_daemon_dfs_message_peer_snapshot_before(
+                &cluster_paths,
+                &runtime,
+                peer_deadline,
+            )
+            .await
+            .map_err(|source| DfsDataPlaneHostError::new(source.to_string()))?
             else {
                 return Ok(None);
             };
-            let preflight = warm_daemon_dfs_metadata_authority_for_peer_snapshot_async(
+            let preflight = warm_daemon_dfs_metadata_authority_for_peer_snapshot_before(
                 &cluster_paths,
                 &peer_snapshot,
                 &runtime,
+                peer_deadline,
             )
             .await
             .map_err(|source| DfsDataPlaneHostError::new(source.to_string()))?;
@@ -679,31 +912,13 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
                     ),
                 ));
             }
-            let namespace_changed = command
-                .batch
-                .entries
-                .iter()
-                .any(|entry| entry.mutation.changes_visible_object_placement());
-            let mut namespace_paths = command
-                .batch
-                .entries
-                .iter()
-                .flat_map(|entry| entry.mutation.visible_namespace_paths())
-                .map(str::to_string)
-                .collect::<BTreeSet<_>>();
-            if namespace_changed && namespace_paths.is_empty() {
-                namespace_paths.insert("/".to_string());
-            }
             let event_origin_node_id = context.local_node_id.clone();
-            let may_have_deferred_materialization = command.durable_replication.is_some()
-                || command
-                    .authority_probe
-                    .as_ref()
-                    .is_some_and(|probe| probe.durable_journal_ack);
+            let may_have_deferred_materialization =
+                command.durable_replication.is_some() || command.authority_probe.is_some();
             // Asynchronous publication must not cancel the maintenance which
             // authored it. It queues through the same exact-shard admission
             // and validation. Synchronous durability/handoff catch-up and
-            // legacy or mixed-purpose commands retain foreground preemption.
+            // foreground durability and authority commands retain preemption.
             let preempt_maintenance = !dfs_metadata_replication_can_wait_for_maintenance(
                 &command,
                 &authenticated_source_node_id,
@@ -721,20 +936,42 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
                 preempt_maintenance,
                 may_have_deferred_materialization,
                 (&rejection_request_id, "metadata-journal-batch"),
-                move |backend| {
-                    let response = sinomo_dfs::process_dfs_metadata_journal_batch(
-                        backend,
-                        Some(&context),
-                        command,
-                    );
-                    #[cfg(test)]
-                    wait_at_daemon_dfs_message_committed_edge_test_hook(&response.request_id);
-                    response
+                move |shard, context| {
+                    shard.with_backend(|backend| {
+                        let logical = if command.verify_prefix_only {
+                            Ok(command.batch.header())
+                        } else {
+                            command.batch.decoded()
+                        };
+                        let response = sinomo_dfs::process_dfs_metadata_journal_batch(
+                            backend,
+                            Some(context),
+                            command,
+                        );
+                        let namespace_paths = logical
+                            .map_err(crate::DfsError::from)
+                            .and_then(|batch| {
+                                crate::metadata_replication::committed_payloads_for_batch(
+                                    backend, &batch,
+                                )
+                            })
+                            .map(|payloads| {
+                                payloads
+                                    .iter()
+                                    .flat_map(|payload| {
+                                        crate::metadata_replication::payload_visible_paths(payload)
+                                    })
+                                    .collect::<BTreeSet<_>>()
+                            });
+                        #[cfg(test)]
+                        wait_at_daemon_dfs_message_committed_edge_test_hook(&response.request_id);
+                        Ok((response, namespace_paths))
+                    })
                 },
             )
             .await
             .map_err(daemon_dfs_data_plane_error)?;
-            let response = match operation {
+            let (response, namespace_paths) = match operation {
                 DaemonDfsResidentReplicaOperation::Completed { result } => result,
                 DaemonDfsResidentReplicaOperation::Rejected { reason } => {
                     return Ok(daemon_dfs_metadata_journal_rejection_for(
@@ -745,18 +982,32 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
                     ));
                 }
             };
-            if namespace_changed
-                && response.applied_entries > 0
+            if response.applied_entries > 0
                 && response.result == sinomo_dfs::DfsMetadataJournalBatchResult::Applied
                 && let Some(event_client) = event_client
             {
-                publish_dfs_namespace_change(
-                    &event_client,
-                    event_origin_node_id,
-                    "metadata-journal-applied",
-                    namespace_paths.into_iter().collect(),
-                )
-                .await;
+                match namespace_paths {
+                    Ok(paths) if !paths.is_empty() => {
+                        publish_dfs_namespace_change(
+                            &event_client,
+                            event_origin_node_id,
+                            "metadata-journal-applied",
+                            paths.into_iter().collect(),
+                        )
+                        .await
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!(target: "sinomo.dfs", %error, "committed namespace body unavailable; invalidating the observed scope");
+                        publish_dfs_namespace_change(
+                            &event_client,
+                            event_origin_node_id,
+                            "metadata-journal-rescan-required",
+                            vec!["/".into()],
+                        )
+                        .await;
+                    }
+                }
             }
             Ok(response)
         })
@@ -766,8 +1017,9 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
         &'a self,
         data_dir: Arc<SinomoDataDir>,
         authenticated_source_node_id: NodeId,
-        command: sinomo_dfs::DfsMetadataSnapshotInstallCommand,
+        mut command: sinomo_dfs::DfsMetadataSnapshotInstallCommand,
         context: Option<sinomo_dfs::DfsMetadataReplicaShardContext>,
+        body: sinomo_core::network::ObjectRpcIncomingBody,
     ) -> DfsDataPlaneHostFuture<'a, sinomo_dfs::DfsMetadataSnapshotInstallResponse> {
         let data_owner = self.require_data_owner();
         let validation = self.validate_data_dir(data_dir.as_ref());
@@ -802,6 +1054,21 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
                     "metadata snapshot command does not match the authorized shard identity",
                 ));
             }
+            let descriptor = crate::DfsRpcAttachmentDescriptor {
+                total_size_bytes: command.snapshot.total_size_bytes,
+                content_hash: None,
+            };
+            command.image = Some(
+                crate::runtime_message::ingest_native_snapshot_attachment(
+                    data_dir.root(),
+                    command.snapshot.clone(),
+                    crate::DfsInboundAttachment { descriptor, body },
+                    Arc::clone(&_data_owner),
+                    None,
+                )
+                .await
+                .map_err(|source| DfsDataPlaneHostError::new(source.to_string()))?,
+            );
             let rejection_request_id = command.request_id.clone();
             let rejection_shard_id = command.shard_id.clone();
             let rejection_next_after_sequence = command.next_after_sequence;
@@ -814,13 +1081,7 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
                 true,
                 false,
                 (&rejection_request_id, "metadata-snapshot-install"),
-                move |backend| {
-                    sinomo_dfs::process_dfs_metadata_snapshot_install(
-                        backend,
-                        Some(&context),
-                        command,
-                    )
-                },
+                move |shard, context| shard.install_replica_snapshot(context, command),
             )
             .await
             .map_err(daemon_dfs_data_plane_error)?;
@@ -917,27 +1178,6 @@ pub(super) fn with_daemon_dfs_control_plane_seeded_on_runtime<
     }
 }
 
-/// Attach a control plane which retains the main daemon's ownership proof for
-/// the complete service lifetime. Sandbox services can escape the blocking
-/// handler which creates them; ordinary cached/message services must use the
-/// weak-capability helper above.
-pub(crate) fn with_daemon_owned_dfs_control_plane_on_runtime<T: sinomo_dfs::DfsMessageTransport>(
-    service: NetworkedDfsService<T>,
-    cluster_paths: &ClusterPaths,
-    runtime: Option<&tokio::runtime::Handle>,
-) -> NetworkedDfsService<T> {
-    let Some(runtime) = runtime else {
-        return service;
-    };
-    if !cluster_paths.state.exists() {
-        return service;
-    }
-    let mut control_plane =
-        DaemonDfsControlPlaneKvClient::new_owned_on_runtime(cluster_paths, runtime);
-    let service = with_daemon_dfs_placement_environment(service, cluster_paths, &mut control_plane);
-    service.with_boxed_control_plane(Box::new(control_plane))
-}
-
 fn with_daemon_dfs_placement_environment<T: sinomo_dfs::DfsMessageTransport>(
     mut service: NetworkedDfsService<T>,
     cluster_paths: &ClusterPaths,
@@ -1009,6 +1249,26 @@ pub(crate) fn daemon_dfs_node_transport_on_runtime(
         peer_transport,
         async_peer_transport,
     )
+}
+
+pub(crate) fn daemon_dfs_client_node_transport(
+    local_node_id: NodeId,
+    peer_node_ids: impl IntoIterator<Item = NodeId>,
+    host: Arc<DfsRuntimeHost>,
+) -> DfsNodeTransport {
+    // This is the already registered component host supplied by the normal
+    // client opener. Core effect/genesis constructors do not bind these senders.
+    let peer = Arc::new(DaemonDfsPeerTransport { host });
+    let sync_peer: Arc<dyn DfsPeerTransport> = peer.clone();
+    let async_peer: Arc<dyn sinomo_dfs::AsyncDfsPeerTransport> = peer;
+    DfsNodeTransport::with_peer_transports_for_nodes(
+        local_node_id,
+        peer_node_ids,
+        sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+        sync_peer,
+        async_peer,
+    )
+    .with_registered_main_namespace_dispatch()
 }
 
 #[derive(Clone)]
@@ -1124,13 +1384,6 @@ pub(super) fn daemon_dfs_metadata_snapshot_install_sender() -> DfsMetadataSnapsh
 
 // DFS inspection request/response types live in `sinomo-dfs`; this module only
 // adapts them to daemon-local paths and metadata backends.
-
-pub(crate) fn open_daemon_dfs_metadata_backend(
-    data_dir: &SinomoDataDir,
-    cluster_paths: &ClusterPaths,
-) -> Result<Box<dyn DfsMetadataBackend>, DaemonError> {
-    sinomo_dfs::open_cluster_aware_dfs_metadata_backend(data_dir, cluster_paths).map_err(Into::into)
-}
 
 #[cfg(test)]
 mod peer_delivery_tests {

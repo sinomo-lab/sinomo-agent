@@ -321,6 +321,7 @@ fn shared_contracts_are_modules_and_do_not_depend_on_their_hosts() {
         "sinomo-daemon",
         "sinomo-dfs",
         "sinomo-dfs-history",
+        "sinomo-dfs-migration",
         "sinomo-dfs-attachments",
         "sinomo-module",
         "sinomo-observe",
@@ -398,6 +399,7 @@ fn desktop_client_profiles_exclude_daemon_implementations_transitively() {
                 "sinomo-daemon",
                 "sinomo-dfs",
                 "sinomo-dfs-history",
+                "sinomo-dfs-migration",
                 "sinomo-dfs-attachments",
                 "sinomo-dfs-nfs",
                 "sinomo-module",
@@ -460,6 +462,7 @@ fn daemon_has_no_production_dependency_on_product_components() {
         "sinomo-build",
         "sinomo-dfs",
         "sinomo-dfs-history",
+        "sinomo-dfs-migration",
         "sinomo-dfs-attachments",
         "sinomo-dfs-nfs",
         "sinomo-observe",
@@ -787,7 +790,11 @@ fn parse_sinomo_ring(manifest_text: &str) -> Option<String> {
 fn filesystem_core_has_no_production_dependency_on_feature_components() {
     let packages = read_workspace_packages();
     let core = &packages["sinomo-dfs"];
-    for feature in ["sinomo-dfs-history", "sinomo-dfs-attachments"] {
+    for feature in [
+        "sinomo-dfs-history",
+        "sinomo-dfs-attachments",
+        "sinomo-dfs-migration",
+    ] {
         assert!(
             !core
                 .dependencies

@@ -152,12 +152,11 @@ pub(crate) fn dfs_namespace_operation_trace_label(
         DfsNamespaceOperation::LookupPaths { .. } => "lookup-paths",
         DfsNamespaceOperation::CommitLocalEventualBatch { .. } => "commit-local-eventual-batch",
         DfsNamespaceOperation::ReconcilePlacement { .. } => "reconcile-placement",
+        DfsNamespaceOperation::AbortPendingWrite { .. } => "abort-pending-write",
         DfsNamespaceOperation::AdvisoryLock { .. } => "advisory-lock",
         DfsNamespaceOperation::FileSync { .. } => "file-sync",
         DfsNamespaceOperation::DirectorySync { .. } => "directory-sync",
-        DfsNamespaceOperation::AdvisoryLockMigrationPrepare { .. } => {
-            "advisory-lock-migration-prepare"
-        }
+
         DfsNamespaceOperation::AdoptObjectAtPath { .. } => "adopt-object-at-path",
         DfsNamespaceOperation::FinalizeObjectFamilyAdoption { .. } => {
             "finalize-object-family-adoption"
@@ -182,7 +181,6 @@ pub(crate) fn dfs_distributed_write_result_trace_label(
                     "committed-with-repair"
                 }
             }
-            NetworkedDfsWriteOutcome::Conflict { .. } => "conflict",
         },
     }
 }

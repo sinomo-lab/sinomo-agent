@@ -4,80 +4,33 @@ use super::*;
 
 #[test]
 fn clustered_w2_foreground_create_commits_the_exact_authorized_namespace_prepare() {
-    let root = temp_root("clustered-w2-foreground-exact-create-prepare");
-    let local = NodeId::from_legacy_named("node_clustered_w2_create_local").expect("local");
-    let remote = NodeId::from_legacy_named("node_clustered_w2_create_remote").expect("remote");
-    let stage_calls = Arc::new(Mutex::new(Vec::new()));
-    let stage_calls_for_sender = Arc::clone(&stage_calls);
-    let sender: DfsMessageSender = Arc::new(move |_target_node_id, command, _timeout| {
-        let DfsNetworkMessage::StageBlob(stage) = &command.routed_message.message else {
-            return Ok(DfsMessageResponse {
-                request_id: command.request_id.clone(),
-                outbound_messages: Vec::new(),
-            });
-        };
-        stage_calls_for_sender
-            .lock()
-            .expect("stage calls")
-            .push(stage.request_id.clone());
-        Ok(DfsMessageResponse {
-            request_id: command.request_id.clone(),
-            outbound_messages: vec![DfsRoutedMessage {
-                source_node_id: command.routed_message.target_node_id.clone(),
-                target_node_id: command.routed_message.source_node_id.clone(),
-                frame_id: 101,
-                message_id: 101,
-                message: DfsNetworkMessage::StageBlobResponse(DfsStageBlobResponse {
-                    request_id: stage.request_id.clone(),
-                    intent_id: stage.intent_id.clone(),
-                    file_system_id: stage.file_system_id.clone(),
-                    object_id: stage.object_id.clone(),
-                    version: stage.version.clone(),
-                    replica_node_id: command.routed_message.target_node_id.clone(),
-                    result: DfsBlobTransferResult::Durable {
-                        content_hash: stage.content_hash.clone(),
-                    },
-                }),
-            }],
+    let nodes = crate::test_runtime::DfsTestRuntime::ordered_node_ids("exact-create", 2);
+    let mut runtime = crate::test_runtime::DfsTestRuntime::new(
+        "clustered-w2-foreground-exact-create-prepare",
+        nodes[0].clone(),
+    )
+    .expect("normal runtime fixture");
+    for node in &nodes[1..] {
+        runtime.define_node(node.clone()).expect("native replica");
+    }
+    runtime.start_nodes().expect("normal native cluster");
+    let control = runtime
+        .shared_control_plane()
+        .expect("native control plane");
+    let configs = control
+        .with_client(|kv| {
+            DfsControlPlaneStore::new(kv.as_mut()).list_metadata_shards(&sifs_file_system_id())
         })
-    });
-    let transport = node_transport_with_canonical_message_peer(
-        local.clone(),
-        vec![remote.clone()],
-        Duration::from_millis(1),
-        sender,
-    );
-    let shared_kv = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
-    shared_kv.with_client(|kv| {
-        let mut control = DfsControlPlaneStore::new(kv);
-        control
-            .put_file_system_config(&DfsFileSystemConfig::from(&distributed_sifs(local.clone())))
-            .expect("filesystem config");
-        control
-            .put_metadata_shard(&DfsMetadataShardConfig {
-                file_system_id: sifs_file_system_id(),
-                shard_id: "root".to_string(),
-                primary_node_id: local.clone(),
-                replica_node_ids: Vec::new(),
-                epoch: 1,
-                assignment: DfsMetadataShardAssignment::Root,
-                namespace_prepare_codec: Default::default(),
-                default_policy: DfsObjectPolicy::ReplicatedEventual,
-            })
-            .expect("metadata shard");
-    });
-    let mut dfs = NetworkedDfsService::new(
-        transport,
-        LocalContentStore::new(root.join("content")).expect("content"),
-    )
-    .with_control_plane(shared_kv)
-    .with_metadata_backend(
-        open_root_local_metadata_backend(root.join("metadata")).expect("metadata"),
-    )
-    .expect("metadata backend");
-    dfs.bootstrap_distributed_sifs().expect("bootstrap SIFS");
-
-    let metadata_root = root.join("metadata");
+        .expect("actual assignments");
+    let services = configs
+        .iter()
+        .find(|shard| shard.shard_id == "services")
+        .expect("actual services assignment");
+    let local = services.primary_node_id.clone();
+    let remote = nodes.iter().find(|node| **node != local).unwrap().clone();
+    let mut dfs = runtime.client(&local).expect("normal primary client");
+    let metadata_root = default_dfs_metadata_shards_root(runtime.data_dir(&local));
+    let hook_configs = configs.clone();
     let observed_prepare = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let observed_from_hook = Arc::clone(&observed_prepare);
     let first_durable_created_at = Arc::new(Mutex::new(None));
@@ -92,11 +45,8 @@ fn clustered_w2_foreground_create_commits_the_exact_authorized_namespace_prepare
                 .iter()
                 .find(|object| object.kind == DfsObjectKind::File)
                 .unwrap();
-            let intent_id = prepare
-                .operation_id
-                .strip_prefix("namespace:create:")
-                .unwrap();
-            let backend = open_root_local_metadata_backend(metadata_root).unwrap();
+            let intent_id = prepare.operation_id.strip_prefix("write:").unwrap();
+            let backend = open_local_sharded_metadata_backend(metadata_root, hook_configs).unwrap();
             let pending = backend
                 .get_intent(&child.object_id, intent_id)
                 .unwrap()
@@ -122,7 +72,7 @@ fn clustered_w2_foreground_create_commits_the_exact_authorized_namespace_prepare
                     .unwrap()
                     .unwrap()
                     .retention_policies
-                    .get(sinomo_dfs_history::HISTORY_MODULE_ID)
+                    .get("module.dfs.history")
                     .is_none_or(|policy| policy.rules.is_empty())
             );
             drop(backend);
@@ -150,10 +100,9 @@ fn clustered_w2_foreground_create_commits_the_exact_authorized_namespace_prepare
     assert_eq!(
         crate::metadata_journal::journal_append_sync_calls_for_test(),
         2,
-        "public4KiB create must share one I/R/P sync and one C/T sync"
+        "public 4 KiB create must append one immutable prepare and one digest commit"
     );
 
-    assert_eq!(stage_calls.lock().expect("stage calls").len(), 1);
     let backend = dfs.metadata_backend.as_ref().expect("metadata backend");
     let intent = backend
         .all_intents()
@@ -167,39 +116,68 @@ fn clustered_w2_foreground_create_commits_the_exact_authorized_namespace_prepare
         *first_durable_created_at.lock().unwrap(),
         "service terminalization must adopt the first durable intent creation identity returned by preparation"
     );
-    let operation_id = format!("namespace:create:{}", intent.intent_id);
+    let operation_id = format!("write:{}", intent.intent_id);
+    let record = backend
+        .prepared_operation_record(&operation_id)
+        .expect("read retained create preparation")
+        .expect("sealed create body");
+    assert_eq!(record.status, DfsPreparedOperationStatus::Committed);
     assert!(
-        backend
-            .get_namespace_prepare(&operation_id)
-            .expect("read create prepare")
-            .is_none(),
-        "the committed create prepare must retain only compact retry evidence"
+        record.committed_entry.is_some(),
+        "exact retry retains its original result"
+    );
+    assert_eq!(
+        record.digest.payload_digest,
+        record.payload.canonical_digest().unwrap()
     );
     let journal = backend.journal_since(0).expect("create journal");
-    let prepare_entry = journal
+    let authored = journal
         .iter()
-        .find(|entry| {
-            matches!(
-                &entry.mutation,
-                DfsMetadataMutation::PutNamespacePrepare {
-                    operation_id: candidate,
-                    status: DfsNamespacePrepareStatus::Prepared,
-                    ..
-                } if candidate == &operation_id
-            )
+        .filter(|entry| match &entry.mutation {
+            DfsMetadataMutation::PrepareOperationV7 {
+                operation_id: candidate,
+                ..
+            }
+            | DfsMetadataMutation::CommitPreparedOperationV7 {
+                operation_id: candidate,
+                ..
+            } => candidate == &operation_id,
         })
-        .expect("authoritative create prepare entry");
-    let prepare = prepare_entry
-        .mutation
-        .namespace_prepare_payload()
-        .expect("decode create prepare")
-        .expect("create prepare payload")
-        .into_owned();
+        .collect::<Vec<_>>();
+    assert_eq!(authored.len(), 2, "one prepare and one digest-only commit");
+    let DfsMetadataMutation::PrepareOperationV7 {
+        record: prepared, ..
+    } = &authored[0].mutation
+    else {
+        panic!("first durable operation must prepare its full body");
+    };
+    assert_eq!(prepared.payload, record.payload);
+    let DfsMetadataMutation::CommitPreparedOperationV7 { digest, .. } = &authored[1].mutation
+    else {
+        panic!("second durable operation must commit only the digest");
+    };
+    assert_eq!(digest, &record.digest);
+    let prepare = &record.payload;
+    let remote_receipt = prepare
+        .content_receipts
+        .iter()
+        .find(|receipt| receipt.replica_node_id == remote)
+        .expect("actual remote durable receipt");
+    assert_eq!(remote_receipt.receipt.object_id, stat.object_id);
+    let remote_client = runtime.client(&remote).expect("normal remote client");
     assert_eq!(
-        prepare.operation_digest,
-        crate::service_replica::metadata_namespace_prepare_payload_digest(&prepare)
-            .expect("prepare digest")
+        remote_client
+            .content
+            .read_blob(
+                remote_receipt
+                    .content_hash
+                    .as_deref()
+                    .expect("receipt content hash")
+            )
+            .unwrap(),
+        vec![0x57; 4096]
     );
+    drop(remote_client);
     let visible_object = backend
         .get_object(&stat.object_id)
         .expect("read visible object")
@@ -268,7 +246,6 @@ fn clustered_w2_foreground_create_commits_the_exact_authorized_namespace_prepare
         ),
         "child-only first publication must commit: {child_only_outcome:?}"
     );
-    assert_eq!(stage_calls.lock().expect("stage calls").len(), 2);
     let backend = dfs.metadata_backend.as_ref().expect("metadata backend");
     let child_only_intent = backend
         .all_intents()
@@ -276,213 +253,139 @@ fn clustered_w2_foreground_create_commits_the_exact_authorized_namespace_prepare
         .into_iter()
         .find(|intent| intent.object_id == child_only_id)
         .expect("child-only create intent");
-    let child_only_operation_id = format!("namespace:create:{}", child_only_intent.intent_id);
-    assert!(
-        backend
-            .get_namespace_prepare(&child_only_operation_id)
-            .expect("read child-only prepare")
-            .is_none()
+    let child_only_operation_id = format!("write:{}", child_only_intent.intent_id);
+    let child_only_record = backend
+        .prepared_operation_record(&child_only_operation_id)
+        .expect("read child-only preparation")
+        .expect("sealed child-only body");
+    assert_eq!(
+        child_only_record.status,
+        DfsPreparedOperationStatus::Committed
     );
-    let child_only_journal = backend.journal_since(0).expect("child-only journal");
-    let child_only_prepare = child_only_journal
-        .iter()
-        .find(|entry| {
-            matches!(
-                &entry.mutation,
-                DfsMetadataMutation::PutNamespacePrepare {
-                    operation_id: candidate,
-                    status: DfsNamespacePrepareStatus::Prepared,
-                    ..
-                } if candidate == &child_only_operation_id
-            )
-        })
-        .expect("authoritative child-only prepare entry")
-        .mutation
-        .namespace_prepare_payload()
-        .expect("decode child-only prepare")
-        .expect("child-only prepare payload")
-        .into_owned();
     let child_only_visible = backend
         .get_object(&child_only_id)
         .expect("read child-only object")
         .expect("visible child-only object");
     assert_eq!(
-        child_only_prepare.status,
-        DfsNamespacePrepareStatus::Prepared
-    );
-    assert_eq!(
-        child_only_prepare.transaction.objects,
+        child_only_record.payload.transaction.objects,
         vec![child_only_visible]
     );
-
-    std::fs::remove_dir_all(root).ok();
+    assert!(
+        child_only_record
+            .payload
+            .content_receipts
+            .iter()
+            .any(|receipt| receipt.replica_node_id != dfs.node_id)
+    );
+    drop(dfs);
+    drop(control);
+    runtime.close().expect("native fixture shutdown");
 }
 
 #[test]
-fn concurrent_create_prepare_reuses_the_durable_winning_payload() {
-    for mismatched_permissions in [false, true] {
-        let root = temp_root("concurrent-exact-create-prepare");
-        let local = NodeId::from_legacy_named("node_clustered_w2_create_local").expect("local");
-        let remote = NodeId::from_legacy_named("node_clustered_w2_create_remote").expect("remote");
-        let stage_calls = Arc::new(Mutex::new(Vec::new()));
-        let stage_calls_for_sender = Arc::clone(&stage_calls);
-        let sender: DfsMessageSender = Arc::new(move |_target_node_id, command, _timeout| {
-            let DfsNetworkMessage::StageBlob(stage) = &command.routed_message.message else {
-                return Ok(DfsMessageResponse {
-                    request_id: command.request_id.clone(),
-                    outbound_messages: Vec::new(),
-                });
-            };
-            stage_calls_for_sender
-                .lock()
-                .expect("stage calls")
-                .push(stage.request_id.clone());
-            Ok(DfsMessageResponse {
-                request_id: command.request_id.clone(),
-                outbound_messages: vec![DfsRoutedMessage {
-                    source_node_id: command.routed_message.target_node_id.clone(),
-                    target_node_id: command.routed_message.source_node_id.clone(),
-                    frame_id: 101,
-                    message_id: 101,
-                    message: DfsNetworkMessage::StageBlobResponse(DfsStageBlobResponse {
-                        request_id: stage.request_id.clone(),
-                        intent_id: stage.intent_id.clone(),
-                        file_system_id: stage.file_system_id.clone(),
-                        object_id: stage.object_id.clone(),
-                        version: stage.version.clone(),
-                        replica_node_id: command.routed_message.target_node_id.clone(),
-                        result: DfsBlobTransferResult::Durable {
-                            content_hash: stage.content_hash.clone(),
-                        },
-                    }),
-                }],
-            })
-        });
-        let transport = node_transport_with_canonical_message_peer(
-            local.clone(),
-            vec![remote.clone()],
-            Duration::from_millis(1),
-            sender,
-        );
-        let shared_kv = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
-        shared_kv.with_client(|kv| {
-            let mut control = DfsControlPlaneStore::new(kv);
-            control
-                .put_file_system_config(&DfsFileSystemConfig::from(&distributed_sifs(
-                    local.clone(),
-                )))
-                .expect("filesystem config");
-            control
-                .put_metadata_shard(&DfsMetadataShardConfig {
-                    file_system_id: sifs_file_system_id(),
-                    shard_id: "root".to_string(),
-                    primary_node_id: local.clone(),
-                    replica_node_ids: Vec::new(),
-                    epoch: 1,
-                    assignment: DfsMetadataShardAssignment::Root,
-                    namespace_prepare_codec: Default::default(),
-                    default_policy: DfsObjectPolicy::ReplicatedEventual,
-                })
-                .expect("metadata shard");
-        });
-        let mut dfs = NetworkedDfsService::new(
-            transport,
-            LocalContentStore::new(root.join("content")).expect("content"),
-        )
-        .with_control_plane(shared_kv)
-        .with_metadata_backend(
-            open_root_local_metadata_backend(root.join("metadata")).expect("metadata"),
-        )
-        .expect("metadata backend");
-        dfs.bootstrap_distributed_sifs().expect("bootstrap SIFS");
-
-        let metadata_root = root.join("metadata");
-        let winner = Arc::new(Mutex::new(None));
-        let captured = winner.clone();
+fn concurrent_create_rejects_every_different_immutable_body_without_publication() {
+    for changed_permissions in [false, true] {
+        let nodes = crate::test_runtime::DfsTestRuntime::ordered_node_ids("raced-create", 2);
+        let mut runtime =
+            crate::test_runtime::DfsTestRuntime::new("raced-immutable-create", nodes[0].clone())
+                .unwrap();
+        runtime.define_node(nodes[1].clone()).unwrap();
+        runtime.start_nodes().unwrap();
+        let configs = runtime.metadata_shards().unwrap();
+        let services = configs
+            .iter()
+            .find(|shard| shard.shard_id == "services")
+            .unwrap();
+        let local = services.primary_node_id.clone();
+        let mut dfs = runtime.client(&local).unwrap();
+        let metadata_root = default_dfs_metadata_shards_root(runtime.data_dir(&local));
+        let captured = Arc::new(Mutex::new(None));
+        let captured_from_hook = captured.clone();
+        let recovery_fence = Arc::new(Mutex::new(None));
+        let fence_from_hook = recovery_fence.clone();
         crate::service_commit::BEFORE_CREATE_PREPARE.with(|hook| {
-            *hook.borrow_mut() = Some(Box::new(move |prepare| {
-                let mut raced = prepare.clone();
+            *hook.borrow_mut() = Some(Box::new(move |payload| {
+                let mut raced = payload.clone();
                 raced.transaction.created_at += time::Duration::nanoseconds(1);
-                if mismatched_permissions {
-                    raced.transaction.objects[0].mode ^= 0o100;
-                }
-                raced.operation_digest =
-                    crate::service_replica::metadata_namespace_prepare_payload_digest(&raced)
+                if changed_permissions {
+                    let child = raced
+                        .transaction
+                        .objects
+                        .iter_mut()
+                        .find(|object| object.kind == DfsObjectKind::File)
                         .unwrap();
-                open_root_local_metadata_backend(metadata_root)
-                    .unwrap()
-                    .prepare_namespace_transaction(&raced)
+                    child.mode ^= 0o100;
+                    raced.terminal_intent.as_mut().unwrap().object_metadata = Some(child.clone());
+                }
+                let mut backend =
+                    open_local_sharded_metadata_backend(metadata_root, configs).unwrap();
+                let scope = backend
+                    .publication_owner_scope(&raced.file_system_id, &raced.shard_id)
                     .unwrap();
-                *captured.lock().unwrap() = Some(raced);
+                *fence_from_hook.lock().unwrap() =
+                    Some(crate::publication_guard::shard_fence_guard(&scope));
+                // This actual writer authors only a hidden proposal. The
+                // retained physical fence prevents recovery publication during
+                // the foreground's immutable-body rejection.
+                backend.prepare_operation(raced.clone(), None).unwrap();
+                *captured_from_hook.lock().unwrap() = Some(raced);
             }));
         });
-        let result = dfs.posix_write_file(
-            "/services/raced-create.txt",
-            b"one stable create",
-            DfsWriteOptions {
-                policy: DfsReplicationPolicy::new(2, 2).unwrap(),
-                replica_candidates: vec![local, remote],
-                wait_for_commit: true,
-                foreground_replica_repair: true,
-            },
+        let error = dfs
+            .posix_write_file(
+                "/services/raced-create.txt",
+                b"one stable create",
+                DfsWriteOptions {
+                    policy: DfsReplicationPolicy::new(2, 2).unwrap(),
+                    replica_candidates: nodes.clone(),
+                    wait_for_commit: true,
+                    foreground_replica_repair: true,
+                },
+            )
+            .expect_err("a different timestamp or permissions cannot adopt another immutable body");
+        assert!(
+            matches!(error, DfsPosixError::Dfs(DfsError::Metadata { .. })),
+            "{error}"
         );
-        let winner = winner.lock().unwrap().clone().unwrap();
-        if mismatched_permissions {
-            let error = result.expect_err("same intent id must not adopt different permissions");
-            assert!(
-                error
-                    .to_string()
-                    .contains("target payload does not match recovered intent"),
-                "{error}"
-            );
-            assert!(
-                dfs.metadata_backend()
-                    .unwrap()
-                    .get_object(&winner.transaction.objects[0].object_id)
-                    .unwrap()
-                    .is_none()
-            );
-            continue;
-        }
-        let stat = result.expect(
-            "foreground must resume the exact prepare persisted by a racing recovery worker",
-        );
-        let durable = dfs
-            .metadata_backend()
-            .unwrap()
-            .get_object(&stat.object_id)
+        let raced = captured.lock().unwrap().clone().unwrap();
+        let child = raced
+            .transaction
+            .objects
+            .iter()
+            .find(|object| object.kind == DfsObjectKind::File)
+            .unwrap();
+        let backend = dfs.metadata_backend().unwrap();
+        assert!(backend.get_object(&child.object_id).unwrap().is_none());
+        let record = backend
+            .prepared_operation_record(&raced.operation_id)
             .unwrap()
             .unwrap();
-        assert_eq!(
-            &durable,
-            winner
-                .transaction
-                .objects
-                .iter()
-                .find(|o| o.object_id == stat.object_id)
-                .unwrap()
-        );
-        let prepares = dfs
-            .metadata_backend()
-            .unwrap()
+        assert_eq!(record.payload.as_ref(), &raced);
+        assert_eq!(record.status, DfsPreparedOperationStatus::Prepared);
+        let authored = backend
             .journal_since(0)
             .unwrap()
             .into_iter()
-            .filter_map(|entry| {
-                entry
-                    .mutation
-                    .namespace_prepare_payload()
-                    .ok()
-                    .flatten()
-                    .map(|p| p.into_owned())
+            .filter(|entry| match &entry.mutation {
+                DfsMetadataMutation::PrepareOperationV7 { record, .. } => {
+                    record.digest.operation_id == raced.operation_id
+                }
+                DfsMetadataMutation::CommitPreparedOperationV7 { digest, .. } => {
+                    digest.operation_id == raced.operation_id
+                }
             })
-            .filter(|prepare| prepare.operation_id == winner.operation_id)
             .collect::<Vec<_>>();
-        assert!(!prepares.is_empty());
-        assert!(
-            prepares
-                .iter()
-                .all(|p| p.operation_digest == winner.operation_digest)
+        assert_eq!(
+            authored.len(),
+            1,
+            "only the hidden racing prepare may exist"
         );
+        assert!(matches!(
+            authored[0].mutation,
+            DfsMetadataMutation::PrepareOperationV7 { .. }
+        ));
+        drop(recovery_fence.lock().unwrap().take());
+        drop(dfs);
+        runtime.close().unwrap();
     }
 }

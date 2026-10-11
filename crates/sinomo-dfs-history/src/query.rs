@@ -53,16 +53,6 @@ impl<T: DfsMessageTransport> DfsHistoryService<'_, T> {
                 _ => return Err(error("history cursor has an incomplete version identity")),
             };
         }
-        // A legacy shard cannot contain explicitly captured history. Its codec
-        // must be upgraded before the first capture can be admitted.
-        while index < shards.len()
-            && !shards[index]
-                .namespace_prepare_codec
-                .supports_file_history()
-        {
-            index += 1;
-            after = None;
-        }
         if index == shards.len() {
             return Ok(DfsFileHistoryListResponse {
                 entries: Vec::new(),
@@ -124,9 +114,6 @@ impl<T: DfsMessageTransport> DfsHistoryService<'_, T> {
             .core
             .metadata_shard_authorities(&identity.file_system_id)?
         {
-            if !shard.namespace_prepare_codec.supports_file_history() {
-                continue;
-            }
             let result = self.core.query_metadata_authority(
                 &shard,
                 DfsMetadataSelection::Version {

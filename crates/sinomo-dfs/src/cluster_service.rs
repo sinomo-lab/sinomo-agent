@@ -38,51 +38,49 @@ pub fn cluster_dfs_peer_node_ids(state: &ClusterBootstrapState) -> Vec<NodeId> {
 
 /// Resolves active DFS providers from the generic service-instance catalog.
 ///
-/// An empty catalog is treated as a rolling-upgrade/legacy cluster and keeps
-/// the membership-derived behavior. Once any service instances have been
-/// published, the catalog is authoritative: a node which does not advertise
-/// the DFS transfer capability is not a provider.
+/// Membership and an active advertisement of the sole current DFS protocol
+/// are required. Incompatible nodes must upgrade before participating.
 /// sinomo:kv-configuration: Discover configured DFS service providers; networking owns connection health and route selection.
 pub fn discovered_cluster_dfs_provider_node_ids(
     cluster_paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Result<Vec<NodeId>, DfsError> {
-    // Callers can hold the bootstrap identity checkpoint while membership
-    // advances in KV. Resolve protocol peers from the cluster-owned member
-    // projection, retaining the legacy bootstrap fallback only when absent.
     let kv_members = sinomo_core::cluster::read_cluster_members_from_kv(cluster_paths)
         .map_err(DfsError::from_network)?;
-    let members = if kv_members.is_empty() {
-        &state.members
-    } else {
-        &kv_members
-    };
     let entries = sinomo_core::kv::read_cluster_kv_prefix_entries(
         &cluster_paths.kv_paths(),
         sinomo_core::service::CLUSTER_SERVICES_KV_PREFIX,
     )
     .map_err(DfsError::from)?;
-    if entries.is_empty() {
-        return Ok(members
-            .iter()
-            .filter(|member| member.cluster_id == state.cluster_id && member.state.is_authorized())
-            .map(|member| member.node_id.clone())
-            .collect());
-    }
+    dfs_provider_node_ids_from_current_entries(state, &kv_members, &entries)
+}
+
+/// Filter already-read native configuration. Routes require both authorized
+/// membership and an actual capability offer; the input creates no authority.
+pub(crate) fn dfs_provider_node_ids_from_current_entries(
+    state: &ClusterBootstrapState,
+    kv_members: &[sinomo_core::ClusterMemberRecord],
+    entries: &[sinomo_core::kv::KvEntry],
+) -> Result<Vec<NodeId>, DfsError> {
     let instances =
-        sinomo_core::service::service_instances_from_entries(&entries).map_err(|source| {
+        sinomo_core::service::service_instances_from_entries(entries).map_err(|source| {
             DfsError::Metadata {
                 message: format!("cannot decode DFS service discovery records: {source}"),
             }
         })?;
+    let current_interface = format!("sinomo.object-rpc/{}", crate::DFS_RPC_CATEGORY);
     let provider_nodes = sinomo_core::service::service_instances_providing_capability(
         instances,
         "dfs.object.transfer",
     )
     .into_iter()
+    .filter(|instance| {
+        instance.interface_version == crate::DFS_PROTOCOL
+            && instance.interface_id == current_interface
+    })
     .map(|instance| instance.node_id)
     .collect::<BTreeSet<_>>();
-    let mut providers = members
+    let mut providers = kv_members
         .iter()
         .filter(|member| {
             member.cluster_id == state.cluster_id
@@ -136,32 +134,6 @@ pub(crate) fn open_cluster_dfs_service_with_message_sender(
         service = service.with_boxed_control_plane(control_plane);
     }
     service.with_boxed_metadata_backend(metadata)
-}
-
-pub(crate) fn open_cluster_dfs_service_with_message_sender_lazy(
-    data_dir: &SinomoDataDir,
-    cluster_paths: &ClusterPaths,
-    local_node_id: NodeId,
-    peer_node_ids: Vec<NodeId>,
-    message_sender: DfsMessageSender,
-    mut control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
-) -> Result<NetworkedDfsService<DfsNodeTransport>, DfsError> {
-    let metadata =
-        open_service_metadata_backend(data_dir, cluster_paths, &local_node_id, &mut control_plane)?;
-    let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
-    let mut service = NetworkedDfsService::new(
-        DfsNodeTransport::with_message_sender_for_nodes(
-            local_node_id,
-            peer_node_ids,
-            sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
-            message_sender,
-        ),
-        content,
-    );
-    if let Some(control_plane) = control_plane {
-        service = service.with_boxed_control_plane(control_plane);
-    }
-    service.with_boxed_metadata_backend_lazy(metadata)
 }
 
 pub(crate) fn open_cluster_dfs_service_with_peer_transports_for_nodes(
@@ -377,11 +349,7 @@ mod tests {
     use time::OffsetDateTime;
 
     #[test]
-    fn discovered_peers_exclude_authorized_members_without_dfs_service() {
-        let root = sinomo_testdir::TestDir::new("sinomo-dfs-discovered-peer-filter");
-        let data_dir = SinomoDataDir::new(&root);
-        data_dir.ensure_root_layout().expect("data root");
-        let cluster_paths = ClusterPaths::new(&data_dir);
+    fn provider_projection_excludes_authorized_members_without_current_dfs_service() {
         let now = OffsetDateTime::now_utc();
         let cluster_id =
             sinomo_core::node::ClusterId::from_legacy_named("cluster_dfs_discovered_peer_filter")
@@ -421,6 +389,8 @@ mod tests {
                     sinomo_core::service::ServiceInstanceRecord::new("dfs", provider.clone());
                 record.routes = vec![crate::DFS_STATUS_ROUTE.to_string()];
                 record.provider_capabilities = vec!["dfs.object.transfer".to_string()];
+                record.interface_id = format!("sinomo.object-rpc/{}", crate::DFS_RPC_CATEGORY);
+                record.interface_version = crate::DFS_PROTOCOL.into();
                 record.updated_at = now;
                 record
             },
@@ -448,28 +418,9 @@ mod tests {
             })
             .collect::<Vec<_>>();
         entries.sort_by(|left, right| left.key.cmp(&right.key));
-        sinomo_core::kv::write_cluster_kv_snapshot(
-            &cluster_paths.kv_paths(),
-            &KvSnapshot {
-                revision: KvRevision(1),
-                compacted_revision: KvRevision(0),
-                entries,
-                leases: Vec::new(),
-                events: Vec::new(),
-                committed_requests: Vec::new(),
-                expired_requests: Vec::new(),
-            },
-        )
-        .expect("write service catalog");
-
-        let peers = discovered_cluster_dfs_peer_node_ids(&cluster_paths, &state)
-            .expect("discover DFS peers");
-        let providers = discovered_cluster_dfs_provider_node_ids(&cluster_paths, &state)
-            .expect("discover DFS providers");
-
-        assert!(peers.contains(&local));
-        assert!(peers.contains(&provider));
-        assert_eq!(peers.len(), 2);
+        let providers =
+            dfs_provider_node_ids_from_current_entries(&state, &state.members, &entries)
+                .expect("normal provider projection from captured data");
         assert_eq!(providers, vec![provider]);
     }
 

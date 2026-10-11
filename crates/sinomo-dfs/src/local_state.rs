@@ -20,16 +20,15 @@ use crate::metadata_sharded_backend::{
     routing_topology_history_path,
 };
 use crate::{
-    DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsConflictRecord,
-    DfsControlPlaneKvClient, DfsError, DfsFileSystemConfig, DfsFileSystemId, DfsMetadataBackend,
-    DfsMetadataShardConfig, DfsMetadataShardHeadWatermark, DfsMetadataShardId,
-    DfsMetadataShardMembershipHandoff, DfsMetadataShardWriteFreeze, DfsMetadataSummary,
-    DfsObjectId, DfsOperatorFileSystemView, DfsOperatorInspector, DfsOperatorObjectView,
-    DfsOperatorRepairView, DfsOperatorStatus, DfsOperatorStatusOmission, DfsPinAddRequest,
-    DfsPinMode, DfsPinRecord, DfsPinStoreError, DfsRepairQueueBoundedStatus, LocalDfsPinStore,
-    LocalDfsRepairQueueStore, LocalShardedMetadataBackend, LocalSobjMetadataBackend,
-    MetadataBackendError, default_dfs_repair_attempt_snapshot_path, metadata_shards_prefix,
-    resolve_dfs_conflicts, sifs_file_system_id, use_dfs_conflict_version,
+    DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsControlPlaneKvClient, DfsError,
+    DfsFileSystemConfig, DfsFileSystemId, DfsMetadataBackend, DfsMetadataShardConfig,
+    DfsMetadataShardHeadWatermark, DfsMetadataShardId, DfsMetadataShardMembershipHandoff,
+    DfsMetadataShardWriteFreeze, DfsMetadataSummary, DfsObjectId, DfsOperatorFileSystemView,
+    DfsOperatorInspector, DfsOperatorObjectView, DfsOperatorRepairView, DfsOperatorStatus,
+    DfsOperatorStatusOmission, DfsPinAddRequest, DfsPinMode, DfsPinRecord, DfsPinStoreError,
+    DfsRepairQueueBoundedStatus, LocalDfsPinStore, LocalDfsRepairQueueStore,
+    LocalShardedMetadataBackend, LocalSobjMetadataBackend, MetadataBackendError,
+    default_dfs_repair_attempt_snapshot_path, metadata_shards_prefix, sifs_file_system_id,
 };
 
 const DFS_STATUS_REPAIR_ATTEMPT_SAMPLE_LIMIT: usize = 32;
@@ -233,7 +232,7 @@ fn metadata_inspection_cache_error(detail: impl Into<String>) -> DfsError {
     }
 }
 
-/// Metadata backend root for the legacy single-shard local store.
+/// Default root shard metadata path.
 pub fn default_dfs_metadata_root(data_dir: &SinomoDataDir) -> PathBuf {
     data_dir.dfs_dir().join("metadata").join("root")
 }
@@ -417,15 +416,6 @@ pub fn inspect_dfs_path(
 ) -> Result<Option<DfsOperatorObjectView>, MetadataBackendError> {
     let backend = open_root_local_metadata_backend(root)?;
     DfsOperatorInspector::new(&backend).object_by_path(file_system_id, path)
-}
-
-pub fn inspect_dfs_conflicts(
-    root: impl Into<PathBuf>,
-    file_system_id: Option<&DfsFileSystemId>,
-    object_id: Option<&DfsObjectId>,
-) -> Result<Vec<DfsConflictRecord>, MetadataBackendError> {
-    let backend = open_root_local_metadata_backend(root)?;
-    DfsOperatorInspector::new(&backend).conflicts(file_system_id, object_id)
 }
 
 pub fn inspect_dfs_repairs(
@@ -1222,7 +1212,6 @@ pub fn project_dfs_status_from_resident_snapshot(
         }
     }
     let mut status = DfsOperatorStatus {
-        storage_migrations: Vec::new(),
         incomplete_reasons,
         bounded_omissions,
         file_system_count: summary.file_system_count,
@@ -1231,7 +1220,7 @@ pub fn project_dfs_status_from_resident_snapshot(
         receipt_count: summary.receipt_count,
         intent_count: summary.intent_count,
         pending_write_count: summary.pending_write_count,
-        open_conflict_count: summary.open_conflict_count,
+
         pending_repair_count: summary.pending_repair_count,
         repair_attempt_count: 0,
         pending_namespace_job_count: summary.pending_namespace_job_count,
@@ -1239,6 +1228,7 @@ pub fn project_dfs_status_from_resident_snapshot(
         cross_shard_namespace_lock_count,
         metadata_shards,
         repair_attempts: Vec::new(),
+        storage_migrations: Vec::new(),
     };
     attach_primary_owned_operational_status(&mut status, &primary_summary);
     status
@@ -1326,7 +1316,7 @@ fn attach_primary_owned_operational_status(
     primary_summary: &DfsMetadataSummary,
 ) {
     status.pending_write_count = primary_summary.pending_write_count;
-    status.open_conflict_count = primary_summary.open_conflict_count;
+
     status.pending_repair_count = primary_summary.pending_repair_count;
     status.pending_namespace_job_count = primary_summary.pending_namespace_job_count;
     status.failed_namespace_job_count = primary_summary.failed_namespace_job_count;
@@ -1336,24 +1326,7 @@ fn attach_cluster_aware_dfs_maintenance_observations(
     status: &mut DfsOperatorStatus,
     data_dir: &SinomoDataDir,
 ) -> Result<(), DfsError> {
-    // One bounded progress record per already-known shard; no directory scan,
-    // backend hydration or migration admission occurs on this status path.
-    for shard in &status.metadata_shards {
-        let root = local_dfs_metadata_shard_path(data_dir, &shard.shard_id);
-        match crate::metadata_snapshot_migration::status(&root) {
-            Ok(Some(job)) => {
-                status
-                    .storage_migrations
-                    .retain(|previous| previous.identity.scope != job.identity.scope);
-                status.storage_migrations.push(job);
-            }
-            Ok(None) => {}
-            Err(error) => status.incomplete_reasons.push(format!(
-                "storage migration observation unavailable for {}: {error}",
-                shard.shard_id.0
-            )),
-        }
-    }
+    // Historical conversion inspection belongs to the migration component.
     match LocalDfsRepairQueueStore::new(default_dfs_repair_attempt_snapshot_path(data_dir))
         .bounded_status_view(DFS_STATUS_REPAIR_ATTEMPT_SAMPLE_LIMIT)
     {
@@ -1385,16 +1358,6 @@ pub fn inspect_cluster_aware_dfs(
     request: DaemonDfsInspectionRequest,
 ) -> Result<DaemonDfsInspectionResponse, DfsError> {
     match &request {
-        DaemonDfsInspectionRequest::ResolveConflicts { .. }
-        | DaemonDfsInspectionRequest::UseConflictVersion { .. } => {
-            let mut metadata = open_cluster_aware_dfs_metadata_backend(data_dir, cluster_paths)?;
-            inspect_cluster_aware_dfs_from_metadata(
-                data_dir,
-                cluster_paths,
-                metadata.as_mut(),
-                request,
-            )
-        }
         read_only_request => {
             with_cached_cluster_aware_dfs_metadata_inspection(data_dir, cluster_paths, |metadata| {
                 inspect_cluster_aware_dfs_read_only_from_metadata(
@@ -1418,25 +1381,6 @@ pub fn inspect_cluster_aware_dfs_from_metadata(
     request: DaemonDfsInspectionRequest,
 ) -> Result<DaemonDfsInspectionResponse, DfsError> {
     match request {
-        DaemonDfsInspectionRequest::ResolveConflicts {
-            file_system_id,
-            object_id,
-            conflict_ids,
-        } => Ok(DaemonDfsInspectionResponse::ResolveConflicts {
-            report: resolve_dfs_conflicts(
-                metadata,
-                file_system_id.as_ref(),
-                object_id.as_ref(),
-                &conflict_ids,
-            )?,
-        }),
-        DaemonDfsInspectionRequest::UseConflictVersion {
-            object_id,
-            version,
-            conflict_ids,
-        } => Ok(DaemonDfsInspectionResponse::UseConflictVersion {
-            report: use_dfs_conflict_version(metadata, &object_id, &version, &conflict_ids)?,
-        }),
         read_only_request => inspect_cluster_aware_dfs_read_only_from_metadata(
             data_dir,
             cluster_paths,
@@ -1471,29 +1415,7 @@ fn inspect_cluster_aware_dfs_read_only_from_metadata(
         DaemonDfsInspectionRequest::Object { object_id } => DaemonDfsInspectionResponse::Object {
             object: inspector.object(&object_id)?,
         },
-        DaemonDfsInspectionRequest::Conflicts {
-            file_system_id,
-            object_id,
-            limit,
-            cursor,
-        } => {
-            let page = inspector.conflicts_page(
-                file_system_id.as_ref(),
-                object_id.as_ref(),
-                limit,
-                cursor.as_ref(),
-            )?;
-            DaemonDfsInspectionResponse::Conflicts {
-                conflicts: page.conflicts,
-                next_cursor: page.next_cursor,
-            }
-        }
-        DaemonDfsInspectionRequest::ConflictVersions {
-            object_id,
-            conflict_ids,
-        } => DaemonDfsInspectionResponse::ConflictVersions {
-            report: inspector.conflict_versions(&object_id, &conflict_ids)?,
-        },
+
         DaemonDfsInspectionRequest::Repair {
             file_system_id,
             object_id,
@@ -1510,10 +1432,6 @@ fn inspect_cluster_aware_dfs_read_only_from_metadata(
                 repairs: page.repairs,
                 next_cursor: page.next_cursor,
             }
-        }
-        DaemonDfsInspectionRequest::ResolveConflicts { .. }
-        | DaemonDfsInspectionRequest::UseConflictVersion { .. } => {
-            unreachable!("writable inspection request reached the read-only backend")
         }
     })
 }
@@ -1532,7 +1450,6 @@ mod tests {
 
     fn empty_status() -> DfsOperatorStatus {
         DfsOperatorStatus {
-            storage_migrations: Vec::new(),
             incomplete_reasons: Vec::new(),
             bounded_omissions: Vec::new(),
             file_system_count: 1,
@@ -1541,7 +1458,7 @@ mod tests {
             receipt_count: 0,
             intent_count: 0,
             pending_write_count: 1,
-            open_conflict_count: 1,
+
             pending_repair_count: 1,
             repair_attempt_count: 0,
             pending_namespace_job_count: 1,
@@ -1549,6 +1466,7 @@ mod tests {
             cross_shard_namespace_lock_count: Some(0),
             metadata_shards: Vec::new(),
             repair_attempts: Vec::new(),
+            storage_migrations: Vec::new(),
         }
     }
 
@@ -1584,7 +1502,7 @@ mod tests {
                     },
                     primary_summary: DfsMetadataSummary::default(),
                     metadata_shards: Vec::new(),
-                    incomplete_reasons: vec![omission.legacy_reason()],
+                    incomplete_reasons: vec![omission.reason()],
                     bounded_omissions: vec![omission],
                 },
             )
@@ -1603,7 +1521,7 @@ mod tests {
                 summary: DfsMetadataSummary::default(),
                 primary_summary: DfsMetadataSummary::default(),
                 metadata_shards: Vec::new(),
-                incomplete_reasons: vec![zero_proof.legacy_reason()],
+                incomplete_reasons: vec![zero_proof.reason()],
                 bounded_omissions: vec![zero_proof],
             },
         )
@@ -1654,7 +1572,7 @@ mod tests {
             replica_node_ids: Vec::new(),
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
+
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         let kv_paths = cluster_paths.kv_paths();
@@ -1748,7 +1666,7 @@ mod tests {
             replica_node_ids: Vec::new(),
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
+
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         let key = crate::metadata_shard_key(&file_system_id, "root");
@@ -1841,7 +1759,7 @@ mod tests {
             replica_node_ids: Vec::new(),
             epoch,
             assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
+
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         let key = crate::metadata_shard_key(&file_system_id, "root");
@@ -1891,7 +1809,7 @@ mod tests {
             DfsOperatorStatusOmission::ResidentRepairQueueNotHydrated
         )));
         assert!(status.blocking_incomplete_reasons().is_empty());
-        assert_eq!(status.incomplete_reasons.len(), 1);
+        assert!(status.incomplete_reasons.is_empty());
     }
 
     #[test]
@@ -1919,61 +1837,40 @@ mod tests {
 
     #[test]
     fn cached_inspection_reuses_one_open_and_observes_external_table_suffix() {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-dfs-cached-inspection-{}-{}",
-            std::process::id(),
-            nanos
-        ));
-        let data_dir = SinomoDataDir::new(&root);
-        data_dir.ensure_root_layout().expect("root layout");
-        let metadata_root = default_dfs_metadata_root(&data_dir);
-        let mut writer =
-            open_root_local_metadata_backend(metadata_root.clone()).expect("writer backend");
-
-        crate::metadata_backend::reset_metadata_backend_open_calls();
-        let identity = DfsMetadataInspectionIdentity::Root { metadata_root };
-        let initial_count =
-            with_cached_dfs_metadata_inspection_identity(identity.clone(), |metadata| {
-                Ok(metadata.metadata_summary()?.file_system_count)
-            })
-            .expect("initial cached inspection");
-        assert_eq!(initial_count, 0);
-
-        let file_system = DfsFileSystem {
-            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
-            retention_policies: Default::default(),
-            module_metadata: Default::default(),
-            file_system_id: DfsFileSystemId::from_legacy_named("cached-inspection-fs")
-                .expect("filesystem id"),
-            display_name: "Cached inspection".to_string(),
-            owner_node_id: test_node("cached_inspection_owner"),
-            subtree_policies: Vec::new(),
+        let owner =
+            crate::test_runtime::DfsTestRuntime::ordered_node_ids("native-cached-inspection", 1)
+                .remove(0);
+        let mut runtime =
+            crate::test_runtime::DfsTestRuntime::new("native-cached-inspection", owner.clone())
+                .unwrap();
+        runtime.start_nodes().unwrap();
+        let shard = runtime.root_shard().unwrap();
+        let identity = DfsMetadataInspectionIdentity::ExactShard {
+            metadata_root: default_dfs_metadata_shards_root(runtime.data_dir(&owner))
+                .join(&shard.shard_id),
+            shard_id: DfsMetadataShardId::new(shard.shard_id.clone()),
         };
-        writer
-            .put_file_system(&file_system)
-            .expect("external writer append");
-
+        let original = with_cached_dfs_metadata_inspection_identity(identity.clone(), |metadata| {
+            Ok(metadata.get_file_system(&shard.file_system_id)?)
+        })
+        .unwrap()
+        .unwrap();
+        let mut changed = original.clone();
+        changed.display_name = "native changed configuration".into();
+        let mut writer = runtime.client(&owner).unwrap();
+        writer.add_file_system(changed.clone()).unwrap();
         for _ in 0..2 {
-            let refreshed_count =
+            let actual =
                 with_cached_dfs_metadata_inspection_identity(identity.clone(), |metadata| {
-                    Ok(metadata.metadata_summary()?.file_system_count)
+                    Ok(metadata.get_file_system(&shard.file_system_id)?)
                 })
-                .expect("refreshed cached inspection");
-            assert_eq!(refreshed_count, 1);
+                .unwrap()
+                .unwrap();
+            assert_eq!(actual, changed);
         }
-        assert_eq!(
-            crate::metadata_backend::metadata_backend_open_calls(),
-            1,
-            "warm inspection must refresh the retained backend instead of decoding again"
-        );
-
-        evict_cluster_aware_dfs_metadata_inspection_cache(&data_dir);
+        evict_cluster_aware_dfs_metadata_inspection_cache(runtime.data_dir(&owner));
         drop(writer);
-        std::fs::remove_dir_all(root).ok();
+        runtime.close().unwrap();
     }
 
     #[test]
@@ -1997,7 +1894,7 @@ mod tests {
             replica_node_ids: Vec::new(),
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
+
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         let metadata_root = default_dfs_metadata_shards_root(&data_dir);
@@ -2083,7 +1980,7 @@ mod tests {
             replica_node_ids: Vec::new(),
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
+
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         let metadata_root = default_dfs_metadata_shards_root(&data_dir);
@@ -2166,7 +2063,7 @@ mod tests {
             replica_node_ids: vec![remote.clone()],
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
+
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         let local_replica = DfsMetadataShardConfig {
@@ -2178,7 +2075,7 @@ mod tests {
             assignment: DfsMetadataShardAssignment::PathPrefix {
                 prefix: "/services".to_string(),
             },
-            namespace_prepare_codec: Default::default(),
+
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         let shards = vec![local_primary, local_replica];
@@ -2217,7 +2114,7 @@ mod tests {
         attach_primary_owned_operational_status(&mut status, &primary_summary);
 
         assert_eq!(status.pending_write_count, 0);
-        assert_eq!(status.open_conflict_count, 0);
+
         assert_eq!(status.pending_repair_count, 0);
         assert_eq!(status.pending_namespace_job_count, 0);
         assert_eq!(status.failed_namespace_job_count, 0);

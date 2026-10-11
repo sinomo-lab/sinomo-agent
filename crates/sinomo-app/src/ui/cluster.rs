@@ -4318,7 +4318,6 @@ mod tests {
                         (DashboardMetric::AgentActiveTurns, Some(2.0 + (index % 5.0))),
                         (DashboardMetric::AgentPendingTasks, Some(3.0 + index % 7.0)),
                         (DashboardMetric::AgentFailedTasks, Some(1.0)),
-                        (DashboardMetric::DfsConflicts, Some(0.0)),
                         (DashboardMetric::DfsPendingWrites, Some(index % 4.0)),
                         (DashboardMetric::CpuPercent, Some(55.0 + index % 20.0)),
                         (DashboardMetric::MemoryPercent, Some(68.0 + index % 5.0)),

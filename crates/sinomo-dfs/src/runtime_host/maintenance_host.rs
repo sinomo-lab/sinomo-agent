@@ -1,14 +1,26 @@
 use super::*;
 
-pub(crate) fn daemon_dfs_maintenance_notify() -> Arc<tokio::sync::Notify> {
-    Arc::clone(DAEMON_DFS_MAINTENANCE_NOTIFY.get_or_init(|| Arc::new(tokio::sync::Notify::new())))
+pub(crate) fn daemon_dfs_maintenance_notify(
+    data_dir: &SinomoDataDir,
+) -> Result<Arc<tokio::sync::Notify>, DaemonError> {
+    let host = dfs_runtime_host(data_dir)?;
+    Ok(Arc::clone(&host.maintenance_notify))
 }
 
-pub(crate) fn notify_daemon_dfs_maintenance_work() {
+pub(crate) fn notify_daemon_dfs_maintenance_work(data_dir: &SinomoDataDir) {
+    let Ok(notify) = daemon_dfs_maintenance_notify(data_dir) else {
+        return;
+    };
     metrics::counter!("sinomo.dfs.background.wakes", "worker" => "maintenance").increment(1);
     #[cfg(test)]
     DAEMON_DFS_MAINTENANCE_WAKE_COUNT.fetch_add(1, Ordering::Relaxed);
-    daemon_dfs_maintenance_notify().notify_one();
+    notify.notify_one();
+}
+
+pub(crate) fn notify_daemon_dfs_maintenance_work_for_paths(paths: &DaemonPaths) {
+    if let Ok(data_dir) = paths.data_dir() {
+        notify_daemon_dfs_maintenance_work(&data_dir);
+    }
 }
 
 static RECONCILIATION_COUNTERS: std::sync::OnceLock<Mutex<BTreeMap<PathBuf, u64>>> =
@@ -19,6 +31,137 @@ pub(super) struct DaemonDfsReconciliationRequest {
     generation: u64,
     reconciled_authority_generation: Option<u64>,
     compact_namespace_jobs: Vec<String>,
+    namespace_work: BTreeMap<String, Arc<NamespaceReconciliationWork>>,
+}
+
+struct NamespaceReconciliationWork {
+    owner: Arc<DfsDataOwnerLock>,
+    running: AtomicBool,
+    blocks_ordinary_maintenance_while_pending: bool,
+    action: Arc<dyn Fn() -> Result<bool, DfsRuntimeError> + Send + Sync>,
+}
+impl std::fmt::Debug for NamespaceReconciliationWork {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NamespaceReconciliationWork")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Retain bounded current namespace work in the existing maintenance request.
+/// This schedules work only; its action still needs normal effect authorization.
+pub fn queue_namespace_reconciliation_work(
+    data_dir: &SinomoDataDir,
+    owner: Arc<DfsDataOwnerLock>,
+    binding: String,
+    blocks_ordinary_maintenance_while_pending: bool,
+    action: Arc<dyn Fn() -> Result<bool, DfsRuntimeError> + Send + Sync>,
+) -> Result<(), DfsRuntimeError> {
+    let paths = DfsRuntimePaths::new(data_dir);
+    let current = require_daemon_dfs_data_owner_lock(&paths)?;
+    let host = registered_dfs_runtime_host(data_dir)?.ok_or_else(|| DfsRuntimeError::Parse {
+        detail: "namespace reconciliation has no registered runtime".into(),
+    })?;
+    if !Arc::ptr_eq(&current, &owner)
+        || host.shutting_down.load(Ordering::Acquire)
+        || binding.is_empty()
+        || binding.len() > 512
+    {
+        return Err(DfsRuntimeError::Parse {
+            detail: "namespace reconciliation does not own the current live scope".into(),
+        });
+    }
+    request_reconciliation(
+        &paths,
+        Vec::new(),
+        Some((
+            binding,
+            Arc::new(NamespaceReconciliationWork {
+                owner,
+                running: AtomicBool::new(false),
+                blocks_ordinary_maintenance_while_pending,
+                action,
+            }),
+        )),
+    )?;
+    Ok(())
+}
+
+/// Wake ordinary namespace maintenance after current durable job publication.
+/// A wake grants no effect permission and retains no fabricated task or vote.
+pub fn wake_namespace_reconciliation(
+    data_dir: &SinomoDataDir,
+    owner: &Arc<DfsDataOwnerLock>,
+) -> Result<(), DfsRuntimeError> {
+    let paths = DfsRuntimePaths::new(data_dir);
+    let current = require_daemon_dfs_data_owner_lock(&paths)?;
+    if !Arc::ptr_eq(&current, owner) {
+        return Err(DfsRuntimeError::Parse {
+            detail: "namespace wake lost its actual owner".into(),
+        });
+    }
+    request_daemon_dfs_maintenance_reconciliation(&paths)?;
+    Ok(())
+}
+
+pub(super) struct NamespaceReconciliationRun {
+    pub(super) complete: bool,
+    pub(super) blocks_ordinary_maintenance: bool,
+}
+pub(super) fn run_namespace_reconciliation_work(
+    paths: &DaemonPaths,
+) -> Result<NamespaceReconciliationRun, DaemonError> {
+    let root = daemon_dfs_maintenance_reconciliation_data_root(paths)?;
+    let work = DAEMON_DFS_MAINTENANCE_RECONCILIATION_REQUESTS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&root)
+        .map(|request| request.namespace_work.clone())
+        .unwrap_or_default();
+    let mut complete = true;
+    let mut blocks_ordinary_maintenance = false;
+    for (binding, work) in work {
+        let current = require_daemon_dfs_data_owner_lock(paths)?;
+        if !Arc::ptr_eq(&current, &work.owner) {
+            return Err(DaemonError::Parse {
+                detail: "namespace work lost actual storage custody".into(),
+            });
+        }
+        if work.running.swap(true, Ordering::AcqRel) {
+            blocks_ordinary_maintenance |= work.blocks_ordinary_maintenance_while_pending;
+            complete = false;
+            continue;
+        }
+        struct Running(Arc<NamespaceReconciliationWork>);
+        impl Drop for Running {
+            fn drop(&mut self) {
+                self.0.running.store(false, Ordering::Release);
+            }
+        }
+        let _running = Running(Arc::clone(&work));
+        let finished = (work.action)()?;
+        if finished {
+            let mut requests = DAEMON_DFS_MAINTENANCE_RECONCILIATION_REQUESTS
+                .get_or_init(Default::default)
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if let Some(request) = requests.get_mut(&root)
+                && request
+                    .namespace_work
+                    .get(&binding)
+                    .is_some_and(|current| Arc::ptr_eq(current, &work))
+            {
+                request.namespace_work.remove(&binding);
+            }
+        } else {
+            blocks_ordinary_maintenance |= work.blocks_ordinary_maintenance_while_pending;
+            complete = false;
+        }
+    }
+    Ok(NamespaceReconciliationRun {
+        complete,
+        blocks_ordinary_maintenance,
+    })
 }
 
 fn daemon_dfs_maintenance_reconciliation_data_root(
@@ -38,7 +181,15 @@ pub(crate) fn request_daemon_dfs_maintenance_reconciliation(
 
 pub(crate) fn request_daemon_dfs_maintenance_reconciliation_with_namespace_jobs(
     paths: &DaemonPaths,
+    compact_namespace_jobs: Vec<String>,
+) -> Result<u64, DaemonError> {
+    request_reconciliation(paths, compact_namespace_jobs, None)
+}
+
+fn request_reconciliation(
+    paths: &DaemonPaths,
     mut compact_namespace_jobs: Vec<String>,
+    work: Option<(String, Arc<NamespaceReconciliationWork>)>,
 ) -> Result<u64, DaemonError> {
     if compact_namespace_jobs.len() > 32
         || compact_namespace_jobs
@@ -57,8 +208,18 @@ pub(crate) fn request_daemon_dfs_maintenance_reconciliation_with_namespace_jobs(
             .get_or_init(|| Mutex::new(BTreeMap::new()))
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut namespace_work = BTreeMap::new();
         if let Some(previous) = requests.get(&data_root) {
             compact_namespace_jobs.extend(previous.compact_namespace_jobs.iter().cloned());
+            namespace_work = previous.namespace_work.clone();
+        }
+        if let Some((binding, work)) = work {
+            namespace_work.entry(binding).or_insert(work);
+            if namespace_work.len() > 32 {
+                return Err(DaemonError::Parse {
+                    detail: "too many retained namespace reconciliation requests".into(),
+                });
+            }
         }
         compact_namespace_jobs.sort();
         compact_namespace_jobs.dedup();
@@ -86,13 +247,14 @@ pub(crate) fn request_daemon_dfs_maintenance_reconciliation_with_namespace_jobs(
                 generation,
                 reconciled_authority_generation: None,
                 compact_namespace_jobs,
+                namespace_work,
             },
         );
         metrics::gauge!("sinomo.dfs.background.reconciliation_roots_pending")
             .set(requests.len() as f64);
         generation
     };
-    notify_daemon_dfs_maintenance_work();
+    notify_daemon_dfs_maintenance_work_for_paths(paths);
     Ok(generation)
 }
 
@@ -184,7 +346,9 @@ pub(super) fn complete_daemon_dfs_maintenance_reconciliation(
         let mut requests = requests
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if requests.get(&data_root).map(|request| request.generation) == Some(generation) {
+        if requests.get(&data_root).is_some_and(|request| {
+            request.generation == generation && request.namespace_work.is_empty()
+        }) {
             requests.remove(&data_root);
         }
         metrics::gauge!("sinomo.dfs.background.reconciliation_roots_pending")
@@ -324,14 +488,35 @@ pub(super) fn daemon_dfs_offline_node_ids(
     cluster_paths: &ClusterPaths,
     state: &sinomo_core::ClusterBootstrapState,
 ) -> BTreeSet<NodeId> {
-    sinomo_dfs::dfs_offline_node_ids(cluster_paths, state)
+    let host = cluster_paths
+        .root
+        .parent()
+        .and_then(|root| {
+            registered_dfs_runtime_host(&SinomoDataDir::new(root))
+                .ok()
+                .flatten()
+        })
+        .filter(|host| {
+            !host
+                .shutting_down
+                .load(std::sync::atomic::Ordering::Acquire)
+        });
+    sinomo_dfs::maintenance::dfs_offline_node_ids_with_transport_availability(
+        cluster_paths,
+        state,
+        &|target| {
+            host.as_ref()
+                .map(|host| host.object_rpc.availability(target))
+                .unwrap_or(sinomo_core::network::RoutedAvailability::Unknown)
+        },
+    )
 }
 
 pub(super) fn daemon_dfs_maintenance_execution_exclusions(
     cluster_paths: &ClusterPaths,
     state: &sinomo_core::ClusterBootstrapState,
 ) -> DfsMaintenanceExecutionExclusions {
-    sinomo_dfs::dfs_resident_maintenance_execution_exclusions(cluster_paths, state)
+    DfsMaintenanceExecutionExclusions::new(daemon_dfs_offline_node_ids(cluster_paths, state))
 }
 
 /// Add newly committed repair identities to the bounded durable queue.
@@ -467,7 +652,7 @@ impl sinomo_dfs::MountedSifsMutationHandoffHost for DaemonMountedSifsMutationHan
     }
 
     fn maintenance_needed(&self) {
-        notify_daemon_dfs_maintenance_work();
+        notify_daemon_dfs_maintenance_work(self.data_dir);
     }
 }
 
@@ -647,7 +832,7 @@ pub(crate) fn daemon_dfs_pending_maintenance_work(
         metadata_shard_statuses,
         write_intents,
         repair_views,
-        actionable_conflict_count,
+
         receipt_records,
         lookups,
     } = daemon_dfs_maintenance_metadata_observation(&data_dir, &cluster_paths)?;
@@ -717,7 +902,6 @@ pub(crate) fn daemon_dfs_pending_maintenance_work(
         summary.pending_write_count,
         summary.pending_repair_count,
         summary.pending_namespace_job_count,
-        actionable_conflict_count,
         actionable_placement_reconciliation_count,
         &write_intents,
         &receipt_records,

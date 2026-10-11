@@ -9,253 +9,7 @@ use crate::metadata_tables::DfsMetadataTables;
 use crate::*;
 use time::OffsetDateTime;
 
-pub(crate) use crate::service_restore_jobs::{
-    validate_content_copy_job as validate_file_restore_job,
-    validate_content_copy_job_receipt as validate_file_restore_job_receipt,
-};
-
-fn validate_file_restore_mutation(
-    tables: &DfsMetadataTables,
-    mutation: &DfsMetadataMutation,
-) -> Result<(), MetadataBackendError> {
-    match mutation {
-        DfsMetadataMutation::PutNamespaceJob { job: Some(job), .. } => {
-            crate::service_restore_jobs::validate_content_copy_job(job)?;
-            if let Some(previous) = tables.namespace_jobs.get(&job.job_id) {
-                crate::service_restore_jobs::validate_content_copy_job_transition(previous, job)?;
-            }
-            if job.kind == DfsNamespaceJobKind::ContentCopy
-                && tables
-                    .namespace_job_receipts
-                    .get(&job.job_id)
-                    .is_some_and(|receipt| !receipt.matches_terminal_job(job))
-            {
-                return Err(MetadataBackendError::Serde(
-                    "content copy job conflicts with its terminal receipt".into(),
-                ));
-            }
-            Ok(())
-        }
-        DfsMetadataMutation::PutNamespaceJobReceipt { receipt, .. } => {
-            crate::service_restore_jobs::validate_content_copy_job_receipt(receipt)
-        }
-        _ => Ok(()),
-    }
-}
-
-/// New retained bytes carry the same durable intent and W evidence as a
-/// canonical write, but the prepared transaction cannot publish any objects.
-pub(crate) fn validate_retained_content_prepare(
-    tables: &DfsMetadataTables,
-    prepare: &DfsNamespacePrepareRecord,
-) -> Result<bool, MetadataBackendError> {
-    let tx = &prepare.transaction;
-    let Some(intent_id) = tx.transaction_id.strip_prefix("file-history-content:") else {
-        if tx.objects.is_empty()
-            && tx.versions.iter().any(|version| {
-                version.has_retention_grant()
-                    && !tables
-                        .versions
-                        .contains_key(&(version.object_id.clone(), version.version.clone()))
-            })
-        {
-            return Err(MetadataBackendError::Serde(
-                "new retained content requires an explicit durable write intent".into(),
-            ));
-        }
-        return Ok(false);
-    };
-    let invalid = || {
-        MetadataBackendError::Serde(
-            "retained content prepare does not match its durable intent, pin, or W receipts".into(),
-        )
-    };
-    let [version] = tx.versions.as_slice() else {
-        return Err(invalid());
-    };
-    let pins = tx.file_version_pins.as_ref().ok_or_else(invalid)?;
-    let [pin] = pins.add.as_slice() else {
-        return Err(invalid());
-    };
-    if !tx.objects.is_empty()
-        || !tx.advisory_lock_states.is_empty()
-        || !pins.remove.is_empty()
-        || version.visible
-        || pin.object_id != version.object_id
-        || pin.version != version.version
-        || pin.file_system_id != version.file_system_id
-        || prepare.operation_id != format!("namespace:{}", tx.transaction_id)
-    {
-        return Err(invalid());
-    }
-    validate_file_version_record(version)?;
-    let already_published = tables.namespace_transactions.get(&tx.transaction_id) == Some(tx)
-        || tables
-            .namespace_transaction_receipts
-            .get(&tx.transaction_id)
-            .map(|receipt| receipt.matches_transaction(tx))
-            .transpose()
-            .map_err(|source| MetadataBackendError::Serde(source.to_string()))?
-            .unwrap_or(false);
-    if already_published {
-        return Ok(true);
-    }
-    let key = (version.object_id.clone(), intent_id.to_string());
-    let compacted;
-    let intent = if let Some(intent) = tables.intents.get(&key) {
-        intent
-    } else {
-        compacted = tables
-            .intent_receipts
-            .get(&key)
-            .ok_or_else(invalid)?
-            .to_intent_record();
-        &compacted
-    };
-    let DfsWritePublication::Retained { capture } = &intent.publication else {
-        return Err(invalid());
-    };
-    validate_replication_plan(&intent.desired_replica_node_ids, &intent.policy)
-        .map_err(|source| MetadataBackendError::Serde(source.to_string()))?;
-    if intent.file_system_id != tx.file_system_id
-        || intent.target_version != version.version
-        || intent.content_hash != version.content_hash
-        || version.retention_grant(&capture.namespace).is_none()
-        || version.module_metadata.get(&capture.namespace) != capture.metadata.as_ref()
-        || crate::lifecycle::content_reference_record_id(pin)
-            != crate::lifecycle::content_reference_storage_id(
-                &capture.namespace,
-                &capture.reference_id,
-            )
-        || !matches!(
-            intent.status,
-            DfsWriteIntentStatus::Staging
-                | DfsWriteIntentStatus::ReceiptsPending
-                | DfsWriteIntentStatus::Committed
-        )
-        || intent
-            .object_metadata
-            .as_ref()
-            .and_then(|object| object.content_size_bytes)
-            .is_some_and(|size| version.size_bytes != Some(size))
-    {
-        return Err(invalid());
-    }
-    let mut nodes = std::collections::BTreeSet::new();
-    for receipt in &prepare.content_receipts {
-        if receipt.receipt.object_id != version.object_id
-            || receipt.receipt.committed_version != version.version
-            || receipt.content_hash != version.content_hash
-            || !intent
-                .desired_replica_node_ids
-                .contains(&receipt.replica_node_id)
-            || !nodes.insert(&receipt.replica_node_id)
-            || !tables
-                .receipts
-                .get(&(
-                    version.object_id.clone(),
-                    version.version.clone(),
-                    receipt.replica_node_id.clone(),
-                ))
-                .is_some_and(|stored| {
-                    stored.receipt.file_system_id == tx.file_system_id
-                        && stored.content_hash == version.content_hash
-                })
-        {
-            return Err(invalid());
-        }
-    }
-    if nodes.len() < intent.policy.min_commit_replicas {
-        return Err(invalid());
-    }
-    Ok(true)
-}
-
-/// The effect of a durable operation cannot change on retry, replay, or
-/// compaction. In particular a failed current write cannot become a capture.
-pub(crate) fn validate_intent_publication_mutation(
-    tables: &DfsMetadataTables,
-    mutation: &DfsMetadataMutation,
-) -> Result<(), MetadataBackendError> {
-    validate_file_restore_mutation(tables, mutation)?;
-    if let DfsMetadataMutation::RemoveRetainedRepairOwner {
-        file_system_id,
-        object_id,
-        intent_id,
-    } = mutation
-    {
-        if tables
-            .intents
-            .get(&(object_id.clone(), intent_id.clone()))
-            .is_some_and(|record| {
-                !record.publication.is_retained_repair() || &record.file_system_id != file_system_id
-            })
-        {
-            return Err(MetadataBackendError::Serde(
-                "repair-owner collection cannot remove a user write".into(),
-            ));
-        }
-        return Ok(());
-    }
-    let receipt_intent;
-    let intent = match mutation {
-        DfsMetadataMutation::PutIntent {
-            intent: Some(intent),
-            ..
-        } => intent,
-        DfsMetadataMutation::PutIntentReceipt { receipt, .. } => {
-            if receipt.publication.is_retained_repair() {
-                return Err(MetadataBackendError::Serde(
-                    "a repair owner is not a user retry receipt".into(),
-                ));
-            }
-            receipt_intent = receipt.to_intent_record();
-            &receipt_intent
-        }
-        _ => return Ok(()),
-    };
-    validate_intent_publication(intent)?;
-    let key = (intent.object_id.clone(), intent.intent_id.clone());
-    let existing_publication = tables
-        .intents
-        .get(&key)
-        .map(|record| &record.publication)
-        .or_else(|| {
-            tables
-                .intent_receipts
-                .get(&key)
-                .map(|record| &record.publication)
-        });
-    if existing_publication.is_some_and(|publication| publication != &intent.publication) {
-        return Err(MetadataBackendError::Serde(
-            "write intent publication purpose cannot change".into(),
-        ));
-    }
-    if intent.publication.is_retained_repair()
-        && tables
-            .intents
-            .get(&key)
-            .is_some_and(|existing| !retained_repair_plan_matches(existing, intent))
-    {
-        return Err(MetadataBackendError::Serde(
-            "retained repair durability plan cannot change".into(),
-        ));
-    }
-    if !intent.publication.is_current()
-        && tables.intents.get(&key).is_some_and(|existing| {
-            existing.file_system_id != intent.file_system_id
-                || existing.target_version != intent.target_version
-                || existing.content_hash != intent.content_hash
-                || existing.base_version != intent.base_version
-        })
-    {
-        return Err(MetadataBackendError::Serde(
-            "retained content intent identity cannot change".into(),
-        ));
-    }
-    Ok(())
-}
-
+/// Validate the purpose and permitted scope of a current intent record.
 pub(crate) fn validate_intent_publication(
     intent: &DfsWriteIntentRecord,
 ) -> Result<(), MetadataBackendError> {
@@ -285,67 +39,6 @@ pub(crate) fn validate_intent_publication(
 
 /// Validate sparse intent transitions before any part of a replay batch is
 /// appended. Materialization validation alone runs after journal durability.
-pub(crate) fn validate_intent_publication_batch<'a>(
-    tables: &DfsMetadataTables,
-    mutations: impl IntoIterator<Item = &'a DfsMetadataMutation>,
-) -> Result<(), MetadataBackendError> {
-    use std::borrow::Cow;
-    let mut jobs = std::collections::BTreeMap::<&str, &DfsNamespaceJobRecord>::new();
-    let mut seen =
-        std::collections::BTreeMap::<(DfsObjectId, String), Cow<'a, DfsWriteIntentRecord>>::new();
-    for mutation in mutations {
-        validate_intent_publication_mutation(tables, mutation)?;
-        if let DfsMetadataMutation::RemoveRetainedRepairOwner {
-            file_system_id,
-            object_id,
-            intent_id,
-        } = mutation
-        {
-            let key = (object_id.clone(), intent_id.clone());
-            if seen.get(&key).is_some_and(|record| {
-                !record.publication.is_retained_repair() || &record.file_system_id != file_system_id
-            }) {
-                return Err(MetadataBackendError::Serde(
-                    "repair-owner collection cannot remove a user write".into(),
-                ));
-            }
-            continue;
-        }
-        if let DfsMetadataMutation::PutNamespaceJob { job: Some(job), .. } = mutation
-            && let Some(previous) = jobs.insert(&job.job_id, job)
-        {
-            crate::service_restore_jobs::validate_content_copy_job_transition(previous, job)?;
-        }
-        let intent = match mutation {
-            DfsMetadataMutation::PutIntent {
-                intent: Some(intent),
-                ..
-            } => Cow::Borrowed(intent),
-            DfsMetadataMutation::PutIntentReceipt { receipt, .. } => {
-                Cow::Owned(receipt.to_intent_record())
-            }
-            _ => continue,
-        };
-        let key = (intent.object_id.clone(), intent.intent_id.clone());
-        if seen.get(&key).is_some_and(|previous| {
-            previous.publication != intent.publication
-                || (intent.publication.is_retained_repair()
-                    && !retained_repair_plan_matches(previous, &intent))
-                || (!intent.publication.is_current()
-                    && (previous.file_system_id != intent.file_system_id
-                        || previous.target_version != intent.target_version
-                        || previous.content_hash != intent.content_hash
-                        || previous.base_version != intent.base_version))
-        }) {
-            return Err(MetadataBackendError::Serde(
-                "write intent changes its immutable publication identity within a journal batch"
-                    .into(),
-            ));
-        }
-        seen.insert(key, intent);
-    }
-    Ok(())
-}
 
 /// Capture outgoing bytes only under an explicit rule, when their authoritative
 /// namespace publication actually changes content or deletes/replaces the file.
@@ -397,7 +90,6 @@ fn version_for_object(
         .get(&(object.object_id.clone(), object.version.clone()))
         .cloned()
         .unwrap_or_else(|| DfsObjectVersionRecord {
-            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
             content_durability: None,
             file_system_id: object.file_system_id.clone(),
             object_id: object.object_id.clone(),
@@ -507,14 +199,6 @@ pub(crate) fn retained_version_is_live(
     retained_namespace_is_live(version, None, pinned, now, high_water)
 }
 
-pub(crate) fn publication_adds_retention_grant(
-    tables: &DfsMetadataTables,
-    next: &DfsObjectMetadata,
-) -> bool {
-    previous_objects(tables, next, None)
-        .any(|previous| !capture_retention(tables, previous, next).is_empty())
-}
-
 fn capture_retention(
     tables: &DfsMetadataTables,
     previous: &DfsObjectMetadata,
@@ -577,32 +261,6 @@ fn previous_objects<'a>(
         .filter(|path| path.object_id != next.object_id)
         .and_then(|path| tables.objects.get(&path.object_id));
     own.into_iter().chain(replaced)
-}
-
-/// Legacy bytes acquire a verified durability plan before accepting a grant.
-pub(crate) fn legacy_capture_candidates<'a>(
-    tables: &DfsMetadataTables,
-    objects: impl IntoIterator<Item = &'a DfsObjectMetadata>,
-) -> Vec<DfsObjectVersionRecord> {
-    let mut candidates = std::collections::BTreeMap::new();
-    for next in objects {
-        for previous in previous_objects(tables, next, None) {
-            if capture_retention(tables, previous, next).is_empty() {
-                continue;
-            }
-            if let Some(version) = tables
-                .versions
-                .get(&(previous.object_id.clone(), previous.version.clone()))
-                .filter(|version| version.content_durability.is_none())
-            {
-                candidates.insert(
-                    (version.object_id.clone(), version.version.clone()),
-                    version.clone(),
-                );
-            }
-        }
-    }
-    candidates.into_values().collect()
 }
 
 pub(crate) fn validate_file_history_transition(
@@ -700,7 +358,6 @@ pub(crate) fn policy_capture_table_ops(
             }
         }
         if changed {
-            version.metadata_format = DfsRevisionMetadataFormat::NamespacedV6;
             ops.push(DfsMetadataTableOp::PutVersion { version });
         }
     }
@@ -729,7 +386,6 @@ pub(crate) fn policy_capture_table_ops(
         && existing.is_none_or(|record| record.content_durability.is_none()))
     {
         let mut version = version_for_object(tables, next);
-        version.metadata_format = DfsRevisionMetadataFormat::NamespacedV6;
         for (namespace, order) in next_orders {
             let state = version.retention.entry(namespace).or_default();
             state.order = state.order.max(order);
@@ -797,13 +453,9 @@ pub(crate) fn retained_repair_intent(
             "repair ownership has unrelated content evidence".into(),
         ));
     }
-    let plan = version
-        .content_durability
-        .clone()
-        .or_else(|| source.map(crate::content_durability::from_record))
-        .ok_or_else(|| {
-            MetadataBackendError::Serde("retained version has no recorded durability plan".into())
-        })?;
+    let plan = version.content_durability.clone().ok_or_else(|| {
+        MetadataBackendError::Serde("retained version has no recorded durability plan".into())
+    })?;
     validate_replication_plan(&plan.desired_replica_node_ids, &plan.policy)
         .map_err(|error| MetadataBackendError::Serde(error.to_string()))?;
     let created_at =
@@ -943,7 +595,7 @@ pub(crate) fn capture_repair_owner_table_op(
     if existing_owner {
         return None;
     }
-    // Admission validates new captures. Malformed legacy rows cannot create
+    // Admission validates new captures. Malformed retained rows cannot create
     // executable maintenance work while a metadata image is being recovered.
     retained_repair_intent(version, None)
         .ok()
@@ -1043,26 +695,6 @@ fn validate_content_reference_source_liveness(
 
 /// Only fresh authoritative admission uses the current writer clock. Accepted
 /// prepared commits and replicated replay validate the persisted decision time.
-pub(crate) fn validate_fresh_content_reference_liveness(
-    tables: &DfsMetadataTables,
-    transaction: &DfsNamespaceTransaction,
-    now: u64,
-) -> crate::metadata_error::Result<()> {
-    if let Some(pins) = &transaction.file_version_pins {
-        for pin in &pins.add {
-            if pin.namespace.is_some()
-                && !tables.version_pins.contains_key(&(
-                    pin.object_id.clone(),
-                    pin.version.clone(),
-                    pin.pin_id.clone(),
-                ))
-            {
-                validate_content_reference_source_liveness(tables, transaction, pin, now)?;
-            }
-        }
-    }
-    Ok(())
-}
 
 pub(crate) fn validate_transaction_file_pins(
     tables: &DfsMetadataTables,
@@ -1075,19 +707,15 @@ pub(crate) fn validate_transaction_file_pins(
         .map_err(crate::MetadataBackendError::Serde)?;
     let error = |message: &str| crate::MetadataBackendError::Serde(message.into());
     let recorded = tables
-        .namespace_transactions
+        .namespace_transaction_receipts
         .get(&transaction.transaction_id)
-        .is_some_and(|existing| existing == transaction)
-        || tables
-            .namespace_transaction_receipts
-            .get(&transaction.transaction_id)
-            .map(|receipt| {
-                receipt
-                    .matches_transaction(transaction)
-                    .map_err(|error| MetadataBackendError::Serde(error.to_string()))
-            })
-            .transpose()?
-            .unwrap_or(false);
+        .map(|receipt| {
+            receipt
+                .matches_transaction(transaction)
+                .map_err(|error| MetadataBackendError::Serde(error.to_string()))
+        })
+        .transpose()?
+        .unwrap_or(false);
     let mut keys = std::collections::BTreeSet::new();
     let mut added_per_object = std::collections::BTreeMap::<DfsObjectId, usize>::new();
     for pin in pins.add.iter().chain(&pins.remove) {
@@ -1171,7 +799,7 @@ pub(crate) fn validate_transaction_file_pins(
             pin.version.clone(),
             pin.pin_id.clone(),
         ));
-        if pin.namespace.is_some() && new_reference && !recorded {
+        if new_reference && !recorded {
             // A live object may repin a structurally captured alternative
             // revision. A deleted source needs a genuine prior content root;
             // the proposed reference or grant cannot authorize itself.

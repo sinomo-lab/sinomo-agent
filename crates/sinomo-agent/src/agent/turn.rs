@@ -160,6 +160,21 @@ impl<M: InteractionModel> Agent<M> {
         }
         let items = &mut progress.items;
         items.extend(queued_agent_item);
+        // A continuation records the update it continues with, so the
+        // session's activity shows when detached work completed.
+        if let Some(update) = &input.async_update {
+            let update_item = AgentItem::AsyncTaskUpdate {
+                item_id: TaskId::generate(),
+                update: update.clone(),
+            };
+            self.trace(
+                &input.session.session_id,
+                AgentTraceRecordKind::Item {
+                    item: update_item.clone(),
+                },
+            )?;
+            items.push(update_item);
+        }
         if transient_system_context(input).is_none() {
             let initial_input = render_initial_agent_input(input)?;
             transcript.push(AgentTranscriptItem::user(0, initial_input.clone()));
@@ -634,8 +649,10 @@ impl<M: InteractionModel> Agent<M> {
             )
             .with_skill_plan(self.skill_plan());
             for (call_index, call) in decision.tool_calls.iter().enumerate() {
+                let tool_call_id = TaskId::generate();
                 let tool_call_item = AgentItem::ToolCall {
                     item_id: TaskId::generate(),
+                    tool_call_id: tool_call_id.clone(),
                     step_index,
                     call_index,
                     call: call.clone(),
@@ -647,6 +664,21 @@ impl<M: InteractionModel> Agent<M> {
                     },
                 )?;
                 items.push(tool_call_item);
+                let call_progress =
+                    progress_sink.for_tool_call(tool_call_id.clone(), step_index, call_index, call);
+                let detached = (!cancellation_token.is_cancelled())
+                    .then(|| {
+                        tool_orchestrator.detach(
+                            &self.tools,
+                            &input.session,
+                            &tool_plan,
+                            step_index,
+                            call_index,
+                            call,
+                            call_progress.clone(),
+                        )
+                    })
+                    .flatten();
                 let mut outcome = if cancellation_token.is_cancelled() {
                     cancelled_tool_outcome(
                         step_index,
@@ -654,6 +686,8 @@ impl<M: InteractionModel> Agent<M> {
                         call,
                         "turn cancellation requested before tool execution",
                     )
+                } else if let Some(detached) = detached {
+                    detached
                 } else {
                     tool_orchestrator.execute_with_cancellation_and_progress(
                         &self.tools,
@@ -663,9 +697,12 @@ impl<M: InteractionModel> Agent<M> {
                         call_index,
                         call,
                         cancellation_token.clone(),
-                        progress_sink.clone(),
+                        call_progress,
                     )
                 };
+                // Every outcome, including ones decided before execution,
+                // pairs with the recorded call.
+                outcome.call_id = tool_call_id;
                 let event = caused_by_latest_event(
                     agent_event(
                         &input.session,

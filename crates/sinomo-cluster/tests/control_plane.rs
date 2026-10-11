@@ -1318,14 +1318,14 @@ fn object_rpc_error_detail_maps_auth_denial() {
 #[test]
 fn object_rpc_error_detail_maps_service_error_with_route_context() {
     let response = ObjectRpcResponse::encode_error(
-        "/daemon/dfs/browser/read-file",
+        "/daemon/dfs/browser/read-file-v7",
         "not found: /services/example.json",
     )
     .expect("rpc error");
 
     match response.error_detail().expect_err("rpc error detail") {
         NetworkError::ObjectRpc { route, detail } => {
-            assert_eq!(route, "/daemon/dfs/browser/read-file");
+            assert_eq!(route, "/daemon/dfs/browser/read-file-v7");
             assert_eq!(detail, "not found: /services/example.json");
         }
         error => panic!("unexpected error: {error}"),

@@ -1,9 +1,99 @@
 //! Narrow fixtures and inspection hooks for tests in independent feature crates.
 //! This module is absent from ordinary production builds.
 
+mod native_trace_artifact;
+pub use native_trace_artifact::NativeShardTraceArtifactSession;
+
+pub use crate::native_shard_trace::{
+    NativeShardTraceCapture, NativeShardTraceRequest, NativeTraceArtifactBindingV1,
+    capture_native_shard_trace, request_native_shard_trace,
+};
+pub use crate::source_adoption_test::{
+    DfsSourcePausePoint as DfsTestSourcePausePoint,
+    DfsSourcePreparationCapture as DfsTestSourcePreparationCapture,
+};
+pub use crate::test_runtime::{
+    CapturedStageExchange as DfsTestCapturedStageExchange, CommitAckFault as DfsTestCommitAckFault,
+    DfsTestControlPlaneProbe, DfsTestMaintenanceObservation, DfsTestNativeConfigurationFault,
+    DfsTestNativeKvHookRegistration, DfsTestRuntime, FaultAction as DfsTestFaultAction,
+    FaultRule as DfsTestFaultRule, NativeNamespaceReadCapture as DfsTestNamespaceReadCapture,
+    RpcObservation as DfsTestRpcObservation, RpcOrigin as DfsTestRpcOrigin,
+    RpcPhase as DfsTestRpcPhase, SourceAdoptionFaultPhase as DfsTestSourceAdoptionFaultPhase,
+    StageExchangeCapture as DfsTestStageExchangeCapture,
+};
 use crate::*;
 use sinomo_core::DfsWriteRequest;
 use sinomo_core::node::NodeId;
+
+/// One ordinary hosted current metadata authority, retained with its real
+/// embedded runtime. Paths select actual committed assignments; this utility
+/// does not seed permissions, membership, acknowledgements or author guards.
+pub fn current_native_metadata_service(
+    name: &str,
+    node_count: usize,
+    path: &str,
+) -> Result<
+    (
+        DfsTestRuntime,
+        NetworkedDfsService<DfsNodeTransport>,
+        DfsMetadataShardConfig,
+    ),
+    String,
+> {
+    let nodes = DfsTestRuntime::ordered_node_ids(name, node_count);
+    let mut runtime = DfsTestRuntime::new(name, nodes[0].clone())?;
+    for node in &nodes[1..] {
+        runtime.define_node(node.clone())?;
+    }
+    runtime.start_nodes()?;
+    let fs = runtime.file_system().file_system_id;
+    let configs = runtime
+        .shared_control_plane()?
+        .with_client(|kv| DfsControlPlaneStore::new(kv.as_mut()).list_metadata_shards(&fs))
+        .map_err(|error| error.to_string())?;
+    let config = select_metadata_shard_config_for_path(&fs, &configs, path)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "normal runtime has no assignment for the fixture path".to_string())?;
+    let service = runtime.client(&config.primary_node_id)?;
+    Ok((runtime, service, config))
+}
+
+/// Publish a complete fixture body through the actual service-owned mint and
+/// guarded current kernel. The caller supplies its genuine receipts/read set.
+pub fn publish_current_payload<T: DfsMessageTransport>(
+    service: &mut NetworkedDfsService<T>,
+    payload: DfsPreparedOperationPayload,
+) -> Result<(), DfsError> {
+    service.publish_prepared_operation(payload).map(|_| ())
+}
+
+pub fn install_retention_grant(
+    record: &mut DfsObjectVersionRecord,
+    namespace: &str,
+    object: &DfsObjectMetadata,
+    granted_at_unix_nanos: u64,
+    minimum: Option<DfsOrderedRetentionGrant>,
+) {
+    record.retention.insert(
+        namespace.into(),
+        DfsRevisionRetentionState {
+            order: minimum.as_ref().map_or(0, |minimum| minimum.order),
+            grant: Some(Box::new(DfsRevisionRetentionGrant {
+                object: Box::new(object.clone()),
+                granted_at_unix_nanos,
+                origin: if minimum.is_some() {
+                    DfsRetentionGrantOrigin::Rule
+                } else {
+                    DfsRetentionGrantOrigin::ExplicitOperation
+                },
+                minimum,
+            })),
+        },
+    );
+    record
+        .validate_extension_metadata()
+        .expect("retention fixture");
+}
 
 pub fn object_version_record(
     object: &DfsObjectMetadata,
@@ -18,12 +108,7 @@ pub fn write_intent_record(
 ) -> DfsWriteIntentRecord {
     crate::intent::write_intent_record(intent, hash, object)
 }
-pub fn recover_content_durability(
-    version: &DfsObjectVersionRecord,
-    backend: &dyn DfsMetadataBackend,
-) -> Result<Option<Box<DfsContentDurability>>, MetadataBackendError> {
-    crate::content_durability::recover_from_backend(version, backend)
-}
+
 pub fn retained_repair_intent_id(version: &DfsObjectVersionRecord) -> String {
     crate::file_history::retained_repair_intent_id(version)
 }
@@ -43,12 +128,6 @@ pub fn now_unix_nanos() -> u64 {
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
-    pub fn test_coordinator_mut(&mut self) -> &mut DistributedEventualCoordinator {
-        &mut self.coordinator
-    }
-    pub fn test_transport_mut(&mut self) -> &mut T {
-        &mut self.transport
-    }
     pub fn test_pending_write_contains(&self, intent: &str) -> bool {
         self.writes.pending_writes.contains_key(intent)
     }
@@ -59,19 +138,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .map(|pending| pending.version.clone())
             .collect()
     }
-    pub fn test_seed_pending_write(
-        &mut self,
-        intent: String,
-        object: DfsObjectId,
-        version: DfsVersion,
-        hash: String,
-        size: u64,
-    ) {
-        self.writes.pending_writes.insert(
-            intent,
-            crate::transfer::PendingNetworkedWrite::new(object, version, hash, size),
-        );
-    }
+
     pub fn test_has_active_replica_stage(&self, object: &DfsObjectId) -> bool {
         self.writes.active_replica_stages.contains_key(object)
     }
@@ -103,7 +170,85 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         request: &DfsContentCopyRequest,
         options: &DfsWriteOptions,
     ) -> Result<DfsNamespaceJobRecord, DfsError> {
-        self.begin_content_copy_job(path, request, options)
+        self.check_operation_cancellation("restore file history")?;
+        if !self.is_distributed() {
+            return self.begin_content_copy_job(path, request, options);
+        }
+        let shard = self
+            .namespace_shards_for_exact_paths(&sifs_file_system_id(), [path])?
+            .into_iter()
+            .next()
+            .ok_or_else(|| DfsError::Metadata {
+                message: "content copy fixture has no actual destination authority".into(),
+            })?;
+        let result = self
+            .route_namespace_operation_to_metadata_primary_with_request_id_and_options(
+                crate::service_restore_jobs::begin_request_id(&self.node_id, &request.operation_id),
+                sifs_file_system_id(),
+                shard.primary_node_id,
+                DfsNamespaceOperation::BeginContentCopy {
+                    path: path.into(),
+                    request: request.clone(),
+                    options: options.clone(),
+                },
+                std::time::Duration::from_secs(60),
+                false,
+                false,
+            )?;
+        match (result.result, result.posix_coordination_result) {
+            (DfsNamespaceResult::Applied, Some(DfsPosixCoordinationResult::NamespaceJob(job))) => {
+                Ok(job)
+            }
+            (DfsNamespaceResult::Rejected { reason, .. }, _) => {
+                Err(DfsError::Metadata { message: reason })
+            }
+            _ => Err(DfsError::Metadata {
+                message: "actual content copy admission omitted its durable job".into(),
+            }),
+        }
+    }
+
+    pub fn test_resume_content_copy_job(
+        &mut self,
+        job: &DfsNamespaceJobRecord,
+        max_steps: usize,
+    ) -> Result<DfsNamespaceJobRecord, DfsError> {
+        self.check_operation_cancellation("namespace job resume")?;
+        if !self.is_distributed() {
+            return self.run_content_copy_job(job.clone(), max_steps);
+        }
+        let shard = self
+            .namespace_shards_for_exact_paths(&job.file_system_id, [job.root_path.as_str()])?
+            .into_iter()
+            .next()
+            .ok_or_else(|| DfsError::Metadata {
+                message: "content copy fixture has no actual continuation authority".into(),
+            })?;
+        let result = self.route_namespace_operation_to_metadata_primary_with_timeout_and_options(
+            job.file_system_id.clone(),
+            shard.primary_node_id,
+            DfsNamespaceOperation::ResumeNamespaceJobBounded {
+                job_id: job.job_id.clone(),
+                path: job.root_path.clone(),
+                max_steps: u64::try_from(max_steps).map_err(|_| DfsError::Metadata {
+                    message: "content copy fixture step count overflows u64".into(),
+                })?,
+            },
+            std::time::Duration::from_secs(60),
+            false,
+            false,
+        )?;
+        match (result.result, result.posix_coordination_result) {
+            (DfsNamespaceResult::Applied, Some(DfsPosixCoordinationResult::NamespaceJob(job))) => {
+                Ok(job)
+            }
+            (DfsNamespaceResult::Rejected { reason, .. }, _) => {
+                Err(DfsError::Metadata { message: reason })
+            }
+            _ => Err(DfsError::Metadata {
+                message: "actual content copy continuation omitted its durable job".into(),
+            }),
+        }
     }
     pub fn test_open_content_hash_stream(
         &self,
@@ -168,12 +313,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub fn test_take_message_committed_work(&mut self) -> DfsMessageCommittedWork {
         self.take_message_committed_work()
     }
-    pub fn test_reconcile_stale_conflicts_bounded(
-        &mut self,
-        max_records: usize,
-    ) -> Result<DfsConflictMaintenanceReport, DfsError> {
-        self.reconcile_stale_conflicts_bounded(max_records)
-    }
     pub fn test_take_message_committed_repair_queue_records(
         &mut self,
     ) -> Vec<DfsRepairAttemptRecord> {
@@ -202,35 +341,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<(), DfsError> {
         self.restore_pending_write_for_intent_if_missing(intent_id, object_id)
     }
-    pub fn test_put_metadata_receipt(
-        &mut self,
-        file_system_id: &DfsFileSystemId,
-        object_id: &DfsObjectId,
-        version: &DfsVersion,
-        replica_node_id: &NodeId,
-        content_hash: &str,
-    ) -> Result<bool, DfsError> {
-        self.put_metadata_receipt(
-            file_system_id,
-            object_id,
-            version,
-            replica_node_id,
-            content_hash,
-        )
-    }
-    pub fn test_put_visible_object_in_metadata_backend(
-        &mut self,
-        object: &DfsObjectMetadata,
-    ) -> Result<(), DfsError> {
-        self.put_visible_object_in_metadata_backend(object)
-    }
-    pub fn test_put_visible_object_and_version_in_metadata_backend(
-        &mut self,
-        object: &DfsObjectMetadata,
-        size_bytes: Option<u64>,
-    ) -> Result<(), DfsError> {
-        self.put_visible_object_and_version_in_metadata_backend(object, size_bytes)
-    }
+
     pub fn test_store_command_bytes(
         &self,
         object_id: &DfsObjectId,
@@ -350,4 +461,38 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub fn test_advance_repair_tick(&mut self, ticks: u64) {
         self.repair_retry_tick = self.repair_retry_tick.saturating_add(ticks);
     }
+}
+
+/// Encode manually supplied current rows for structural negative and wire
+/// fixtures. This helper creates no state, ingestion permit or acknowledgement.
+/// Healthy persistence fixtures read exact frames from their native backend.
+pub fn structural_journal_frame_batch(
+    batch: DfsMetadataJournalBatch,
+) -> Result<DfsMetadataJournalFrameBatch, MetadataBackendError> {
+    Ok(DfsMetadataJournalFrameBatch {
+        shard_id: batch.shard_id,
+        next_after_sequence: batch.next_after_sequence,
+        journal_frames: batch
+            .entries
+            .iter()
+            .map(crate::metadata_journal::encode_metadata_journal_frame_record)
+            .collect::<Result<_, _>>()?,
+    })
+}
+
+/// Construct the production replica command from actual source journal frames.
+/// This grants no authority and never supplies an acknowledgement.
+pub fn native_replica_journal_command(
+    source: &crate::DfsMetadataShardConfig,
+    target: &NodeId,
+    frames: crate::DfsMetadataJournalFrameBatch,
+) -> crate::DfsMetadataJournalBatchCommand {
+    crate::metadata_replication::dfs_metadata_durable_journal_batch_command(
+        &source.primary_node_id,
+        target,
+        &source.file_system_id,
+        source.epoch,
+        frames,
+        false,
+    )
 }

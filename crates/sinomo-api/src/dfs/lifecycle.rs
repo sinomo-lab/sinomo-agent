@@ -33,11 +33,9 @@ pub struct DfsContentCopyResponse {
 
 /// Publish immutable bytes and an owned reference without advancing a head.
 /// Provenance remains opaque; the feature module interprets its metadata.
-#[derive(Clone, Debug, Deserialize)]
-#[serde(try_from = "crate::dfs::file_history::RetainedContentPublicationWire")]
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(try_from = "RetainedContentPublicationWire")]
 pub struct DfsRetainedContentPublication {
-    #[serde(skip)]
-    pub metadata_format: super::DfsRevisionMetadataFormat,
     pub namespace: String,
     pub reference_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -65,20 +63,28 @@ impl DfsRetainedContentPublication {
     }
 }
 
-impl Serialize for DfsRetainedContentPublication {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        crate::dfs::file_history::serialize_retained_content_publication(self, serializer)
-    }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetainedContentPublicationWire {
+    namespace: String,
+    reference_id: String,
+    #[serde(default)]
+    metadata: Option<super::DfsModuleMetadataValue>,
 }
 
-impl PartialEq for DfsRetainedContentPublication {
-    fn eq(&self, other: &Self) -> bool {
-        self.namespace == other.namespace
-            && self.reference_id == other.reference_id
-            && self.metadata == other.metadata
+impl TryFrom<RetainedContentPublicationWire> for DfsRetainedContentPublication {
+    type Error = String;
+
+    fn try_from(wire: RetainedContentPublicationWire) -> Result<Self, Self::Error> {
+        let publication = Self {
+            namespace: wire.namespace,
+            reference_id: wire.reference_id,
+            metadata: wire.metadata,
+        };
+        publication.validate()?;
+        Ok(publication)
     }
 }
-impl Eq for DfsRetainedContentPublication {}
 
 /// Explicit caller-owned immutable bytes with an opaque, namespaced reference.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]

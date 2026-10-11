@@ -10,7 +10,7 @@ pub(super) enum DashboardMetric {
     AgentPendingTasks,
     AgentFailedTasks,
     DfsBacklog,
-    DfsConflicts,
+
     DfsPendingWrites,
     RpcRate,
     RpcErrorRate,
@@ -187,17 +187,6 @@ pub(super) const DEFAULT_DASHBOARD: DashboardSpec = DashboardSpec {
             ExplorerWindow::FifteenMinutes,
             "",
             "Pending repairs · highest node snapshot",
-        ),
-        panel(
-            DashboardMetric::DfsConflicts,
-            "DFS conflicts",
-            "sinomo.dfs.open_conflicts",
-            Group::Storage,
-            Read::Gauge,
-            ObserveMetricUnit::Count,
-            ExplorerWindow::FifteenMinutes,
-            "",
-            "Open conflicts · highest node snapshot",
         ),
         panel(
             DashboardMetric::DfsPendingWrites,
@@ -385,12 +374,11 @@ pub(super) const DEFAULT_DASHBOARD: DashboardSpec = DashboardSpec {
 };
 
 impl DashboardMetric {
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 20] = [
         Self::AgentActiveTurns,
         Self::AgentPendingTasks,
         Self::AgentFailedTasks,
         Self::DfsBacklog,
-        Self::DfsConflicts,
         Self::DfsPendingWrites,
         Self::RpcRate,
         Self::RpcErrorRate,
@@ -438,12 +426,7 @@ impl DashboardMetric {
             return SemanticTone::Neutral;
         };
         match self {
-            Self::DfsConflicts
-            | Self::DfsFailedJobs
-            | Self::ExporterErrors
-            | Self::RpcErrorRate
-                if value > 0.0 =>
-            {
+            Self::DfsFailedJobs | Self::ExporterErrors | Self::RpcErrorRate if value > 0.0 => {
                 SemanticTone::Danger
             }
             Self::AgentFailedTasks
@@ -1109,7 +1092,6 @@ fn page(shared: &Shared) -> WidgetPod {
         ("Queued tasks", Some(DashboardMetric::AgentPendingTasks)),
         ("Task failures", Some(DashboardMetric::AgentFailedTasks)),
         ("DFS repairs", Some(DashboardMetric::DfsBacklog)),
-        ("DFS conflicts", Some(DashboardMetric::DfsConflicts)),
         ("Nodes online", None),
     ] {
         summary.push_item(

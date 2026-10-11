@@ -1168,6 +1168,123 @@ impl ClusterObjectRpcRouteContext<'_> {
     }
 }
 
+#[derive(Clone, Copy)]
+enum RouteConnectorPreparation {
+    Dispatch,
+    ResidentCapability,
+}
+
+fn prepare_cluster_object_rpc_connector(
+    paths: &ClusterPaths,
+    directory: &Arc<dyn crate::ClusterDirectory>,
+    directory_identity: RouteDirectoryCacheIdentity,
+    state: &ClusterBootstrapState,
+    target_node_id: &NodeId,
+    health: NetworkHealthPolicy,
+    purpose: RouteConnectorPreparation,
+    route_snapshot_succeeded: &mut bool,
+) -> Result<(Arc<crate::MultiHopRoutedConnector>, u64, u64), NetworkError> {
+    for _ in 0..MAX_STABLE_ROUTE_CAPTURE_ATTEMPTS {
+        // The module registry is a process-local route-realization
+        // input, independent of the distributed directory revision.
+        // Fence it around both cache lookup and snapshot construction
+        // so a connector can never combine a pre-registry directory
+        // capture with post-registry planning.
+        let module_generation = crate::network_module_routing_generation();
+        let routing_version = directory.routing_version()?;
+        *route_snapshot_succeeded = true;
+        if crate::network_module_routing_generation() != module_generation {
+            continue;
+        }
+        let cache_generation = directory_identity.effective_generation(routing_version.0);
+        let initial_cache_key = PreparedRouteCacheKey {
+            cluster_root: paths.root.clone(),
+            local_node_id: state.local_node_id.clone(),
+            directory_identity,
+            directory_generation: cache_generation,
+            module_generation,
+            connect_timeout: health.connect_timeout,
+            no_progress_timeout: health.no_progress_timeout,
+        };
+        if let Some(connector) = prepared_route_cache_get(&initial_cache_key) {
+            if crate::network_module_routing_generation() == module_generation {
+                return Ok((connector, cache_generation, module_generation));
+            }
+            continue;
+        }
+
+        // A capability observation cannot create identities, providers or
+        // cold connectors. Dispatch retains the existing preparation path.
+        if matches!(purpose, RouteConnectorPreparation::ResidentCapability) {
+            return Err(NetworkError::Directory {
+                detail: "no current resident object-RPC route connector".into(),
+            });
+        }
+
+        let (directory_version, members, endpoints, directory_connectivity) =
+            directory.routing_records_snapshot()?.into_parts();
+        let captured_directory_generation =
+            directory_identity.effective_generation(directory_version.0);
+        let directory_snapshot =
+            crate::DirectorySnapshot::try_from_records(directory_version, members, endpoints)?;
+        if !directory_snapshot.is_authorized(&state.local_node_id) {
+            return Err(NetworkError::UnauthorizedNode {
+                node_id: state.local_node_id.clone(),
+            });
+        }
+        if !directory_snapshot.is_authorized(target_node_id) {
+            return Err(NetworkError::UnauthorizedNode {
+                node_id: target_node_id.clone(),
+            });
+        }
+        let connectivity = crate::connectivity_snapshot_from_directory_records(
+            &directory_snapshot,
+            crate::route_graph_read_model::read_cluster_connectivity_graph_for_routing_snapshot(
+                paths,
+                state,
+                &directory_snapshot,
+                directory_connectivity,
+            )?,
+            OffsetDateTime::now_utc(),
+        )?;
+        let connectivity = Arc::new(crate::ConnectivityTracker::new(connectivity));
+        let data_dir = cluster_paths_data_dir(Some(paths))?;
+        let identity: Arc<dyn crate::RoutedSessionIdentity> = Arc::new(
+            crate::DaemonRoutedSessionIdentity::new(state.local_node_id.clone(), data_dir)?,
+        );
+        let provider: Arc<dyn crate::LinkProvider> = Arc::new(crate::ClusterLinkProvider::new(
+            state.local_node_id.clone(),
+            Arc::clone(&identity),
+            health,
+        )?);
+        let connectivity_view: Arc<dyn crate::ConnectivityView> = connectivity.clone();
+        let failure_sink: Arc<dyn crate::ConnectivityFailureSink> = connectivity;
+        let connector = Arc::new(crate::MultiHopRoutedConnector::from_snapshot(
+            state.local_node_id.clone(),
+            directory_snapshot,
+            connectivity_view,
+            failure_sink,
+            provider,
+            identity,
+        )?);
+        if crate::network_module_routing_generation() != module_generation {
+            continue;
+        }
+        let cache_key = PreparedRouteCacheKey {
+            directory_generation: captured_directory_generation,
+            ..initial_cache_key
+        };
+        prepared_route_cache_insert(cache_key, Arc::clone(&connector));
+        if crate::network_module_routing_generation() == module_generation {
+            return Ok((connector, captured_directory_generation, module_generation));
+        }
+    }
+    Err(NetworkError::Directory {
+        detail: "network module registry changed repeatedly while capturing a routed connector"
+            .to_string(),
+    })
+}
+
 /// Cluster object-RPC client facade.
 ///
 /// `call_target` is the routed API: callers name a target node and
@@ -1179,6 +1296,40 @@ pub struct ClusterObjectRpcClient<'a, H> {
 }
 
 impl<'a, H: ClusterObjectRpcAsyncHost> ClusterObjectRpcClient<'a, H> {
+    /// Observe route capability using the same current resident connector as dispatch.
+    /// Missing or stale connectors remain Unknown. This never prepares a cold
+    /// connector, creates identity, connects, probes, or grants authority.
+    pub fn availability(
+        &self,
+        state: &ClusterBootstrapState,
+        target_node_id: &NodeId,
+        options: ClusterObjectRpcOptions,
+    ) -> crate::RoutedAvailability {
+        use crate::RoutedConnector;
+        if target_node_id == &state.local_node_id {
+            return crate::RoutedAvailability::Unknown;
+        }
+        let Some(context) = self.route_context.as_ref() else {
+            return crate::RoutedAvailability::Unknown;
+        };
+        let Ok((directory, identity)) = context.directory(state) else {
+            return crate::RoutedAvailability::Unknown;
+        };
+        let mut snapshot_succeeded = false;
+        prepare_cluster_object_rpc_connector(
+            context.paths,
+            &directory,
+            identity,
+            state,
+            target_node_id,
+            options.call_policy().health,
+            RouteConnectorPreparation::ResidentCapability,
+            &mut snapshot_succeeded,
+        )
+        .map(|(connector, _, _)| connector.availability(target_node_id))
+        .unwrap_or(crate::RoutedAvailability::Unknown)
+    }
+
     /// Build a client for a caller that intentionally has only a concrete endpoint.
     pub fn endpoint_only(host: &'a mut H) -> Self {
         Self {
@@ -1593,104 +1744,16 @@ where
             .map(|_| crate::network_timeline_monotonic_ns())
             .unwrap_or(0);
         let mut route_snapshot_succeeded = false;
-        let prepared = (|| {
-            for _ in 0..MAX_STABLE_ROUTE_CAPTURE_ATTEMPTS {
-                // The module registry is a process-local route-realization
-                // input, independent of the distributed directory revision.
-                // Fence it around both cache lookup and snapshot construction
-                // so a connector can never combine a pre-registry directory
-                // capture with post-registry planning.
-                let module_generation = crate::network_module_routing_generation();
-                let routing_version = directory.routing_version()?;
-                route_snapshot_succeeded = true;
-                if crate::network_module_routing_generation() != module_generation {
-                    continue;
-                }
-                let cache_generation = directory_identity.effective_generation(routing_version.0);
-                let initial_cache_key = PreparedRouteCacheKey {
-                    cluster_root: paths.root.clone(),
-                    local_node_id: state.local_node_id.clone(),
-                    directory_identity,
-                    directory_generation: cache_generation,
-                    module_generation,
-                    connect_timeout: policy.health.connect_timeout,
-                    no_progress_timeout: policy.health.no_progress_timeout,
-                };
-                if let Some(connector) = prepared_route_cache_get(&initial_cache_key) {
-                    if crate::network_module_routing_generation() == module_generation {
-                        return Ok((connector, cache_generation, module_generation));
-                    }
-                    continue;
-                }
-
-                let (directory_version, members, endpoints, directory_connectivity) =
-                    directory.routing_records_snapshot()?.into_parts();
-                let captured_directory_generation =
-                    directory_identity.effective_generation(directory_version.0);
-                let directory_snapshot = crate::DirectorySnapshot::try_from_records(
-                    directory_version,
-                    members,
-                    endpoints,
-                )?;
-                if !directory_snapshot.is_authorized(&state.local_node_id) {
-                    return Err(NetworkError::UnauthorizedNode {
-                        node_id: state.local_node_id.clone(),
-                    });
-                }
-                if !directory_snapshot.is_authorized(target_node_id) {
-                    return Err(NetworkError::UnauthorizedNode {
-                        node_id: target_node_id.clone(),
-                    });
-                }
-                let connectivity = crate::connectivity_snapshot_from_directory_records(
-                    &directory_snapshot,
-                    crate::route_graph_read_model::read_cluster_connectivity_graph_for_routing_snapshot(
-                        paths,
-                        state,
-                        &directory_snapshot,
-                        directory_connectivity,
-                    )?,
-                    OffsetDateTime::now_utc(),
-                )?;
-                let connectivity = Arc::new(crate::ConnectivityTracker::new(connectivity));
-                let data_dir = cluster_paths_data_dir(Some(paths))?;
-                let identity: Arc<dyn crate::RoutedSessionIdentity> = Arc::new(
-                    crate::DaemonRoutedSessionIdentity::new(state.local_node_id.clone(), data_dir)?,
-                );
-                let provider: Arc<dyn crate::LinkProvider> =
-                    Arc::new(crate::ClusterLinkProvider::new(
-                        state.local_node_id.clone(),
-                        Arc::clone(&identity),
-                        policy.health,
-                    )?);
-                let connectivity_view: Arc<dyn crate::ConnectivityView> = connectivity.clone();
-                let failure_sink: Arc<dyn crate::ConnectivityFailureSink> = connectivity;
-                let connector = Arc::new(crate::MultiHopRoutedConnector::from_snapshot(
-                    state.local_node_id.clone(),
-                    directory_snapshot,
-                    connectivity_view,
-                    failure_sink,
-                    provider,
-                    identity,
-                )?);
-                if crate::network_module_routing_generation() != module_generation {
-                    continue;
-                }
-                let cache_key = PreparedRouteCacheKey {
-                    directory_generation: captured_directory_generation,
-                    ..initial_cache_key
-                };
-                prepared_route_cache_insert(cache_key, Arc::clone(&connector));
-                if crate::network_module_routing_generation() == module_generation {
-                    return Ok((connector, captured_directory_generation, module_generation));
-                }
-            }
-            Err(NetworkError::Directory {
-                detail:
-                    "network module registry changed repeatedly while capturing a routed connector"
-                        .to_string(),
-            })
-        })();
+        let prepared = prepare_cluster_object_rpc_connector(
+            paths,
+            &directory,
+            directory_identity,
+            state,
+            target_node_id,
+            policy.health,
+            RouteConnectorPreparation::Dispatch,
+            &mut route_snapshot_succeeded,
+        );
         record_routed_rpc_timeline_stage(
             trace,
             crate::network_timeline_stage::ROUTE_SNAPSHOT,

@@ -1,5 +1,4 @@
 use super::*;
-use sinomo_core::network::{InProcessNetwork, InProcessTransport};
 use std::path::Path;
 
 fn content_hash(bytes: &[u8]) -> String {
@@ -10,18 +9,17 @@ fn temp_root(name: &str) -> sinomo_testdir::TestDir {
     sinomo_testdir::TestDir::new(&format!("sinomo-dfs-history-{name}"))
 }
 
-fn networked_sifs_with_backend(
-    root: &Path,
-    node_id: NodeId,
-) -> NetworkedDfsService<InProcessTransport> {
-    let network = InProcessNetwork::new();
-    let content = LocalContentStore::new(root.join("content")).unwrap();
-    let metadata = open_root_local_metadata_backend(root.join("metadata")).unwrap();
-    let mut dfs = NetworkedDfsService::new(network.add_node(node_id), content)
-        .with_metadata_backend(metadata)
-        .unwrap();
-    dfs.bootstrap_distributed_sifs().unwrap();
-    dfs
+fn native_history_service(
+    name: &str,
+    node: NodeId,
+) -> (
+    sinomo_dfs::test_support::DfsTestRuntime,
+    NetworkedDfsService<sinomo_dfs::DfsNodeTransport>,
+) {
+    let mut runtime = sinomo_dfs::test_support::DfsTestRuntime::new(name, node.clone()).unwrap();
+    runtime.start_nodes().unwrap();
+    let service = runtime.client(&node).unwrap();
+    (runtime, service)
 }
 
 fn history_identity(stat: &DfsStat) -> DfsFileVersionIdentity {
@@ -46,50 +44,14 @@ fn capture_history<T: DfsMessageTransport>(dfs: &mut NetworkedDfsService<T>, sta
 }
 
 #[test]
-fn legacy_reference_names_resembling_qualified_keys_stay_raw_in_history() {
-    let root = temp_root("legacy-qualified-looking-reference");
-    let owner = NodeId::generate();
-    let mut dfs = networked_sifs_with_backend(&root, owner.clone());
-    let saved = dfs
-        .posix_write_file(
-            "/services/legacy-reference-name",
-            b"saved",
-            DfsWriteOptions::replicated_eventual(vec![owner]),
-        )
-        .unwrap();
-    capture_history(&mut dfs, &saved);
-    let raw_name = format!("ref/{HISTORY_MODULE_ID}/legacy-leaf");
-    dfs.metadata_backend_mut()
-        .unwrap()
-        .put_version_pin(&DfsMetadataVersionPinRecord {
-            file_system_id: saved.file_system_id.clone(),
-            object_id: saved.object_id.clone(),
-            version: saved.version.clone(),
-            namespace: None,
-            pin_id: raw_name.clone(),
-            created_at: time::OffsetDateTime::now_utc(),
-        })
-        .unwrap();
-    let page = dfs
-        .list_file_history(DfsFileHistoryListRequest {
-            file_system_id: saved.file_system_id,
-            path: Some(saved.path),
-            object_id: Some(saved.object_id),
-            after: None,
-            limit: 128,
-        })
-        .unwrap();
-    assert_eq!(page.entries.len(), 1);
-    assert!(page.entries[0].pins.contains(&raw_name));
-    assert!(!page.entries[0].pins.iter().any(|pin| pin == "legacy-leaf"));
-}
-
-#[test]
 fn revision_metadata_preserves_live_object_repin_without_authorizing_reads() {
     let root = temp_root("metadata-only-repin");
     let owner = NodeId::generate();
-    let mut dfs = networked_sifs_with_backend(&root, owner.clone());
-    let options = DfsWriteOptions::replicated_eventual(vec![owner]);
+    let (mut runtime, mut dfs) = native_history_service(
+        "revision_metadata_preserves_live_object_repin_without_authorizing_reads",
+        owner.clone(),
+    );
+    let options = DfsWriteOptions::replicated_eventual(vec![owner.clone()]);
     let path = "/services/metadata-only-repin";
     let saved = dfs
         .posix_write_file(path, b"saved", options.clone())
@@ -163,14 +125,19 @@ fn revision_metadata_preserves_live_object_repin_without_authorizing_reads() {
             .unwrap()
             .is_empty()
     );
+    drop(dfs);
+    runtime.close().unwrap();
 }
 
 #[test]
 fn exact_version_reads_require_a_live_grant_and_matching_content_identity() {
     let root = temp_root("exact-version-authority");
     let owner = NodeId::generate();
-    let mut dfs = networked_sifs_with_backend(&root, owner.clone());
-    let options = DfsWriteOptions::replicated_eventual(vec![owner]);
+    let (mut runtime, mut dfs) = native_history_service(
+        "exact_version_reads_require_a_live_grant_and_matching_content_identity",
+        owner.clone(),
+    );
+    let options = DfsWriteOptions::replicated_eventual(vec![owner.clone()]);
     let original = dfs
         .posix_write_file("/services/granted-file", b"original", options.clone())
         .unwrap();
@@ -213,14 +180,19 @@ fn exact_version_reads_require_a_live_grant_and_matching_content_identity() {
             .is_err(),
         "leftover immutable bytes must not authorize a historical read"
     );
+    drop(dfs);
+    runtime.close().unwrap();
 }
 
 #[test]
 fn file_history_reads_restore_and_deleted_recovery_keep_one_current_view() {
     let root = temp_root("history-restore-and-recovery");
     let owner = NodeId::from_legacy_named("history-restore-owner").unwrap();
-    let mut dfs = networked_sifs_with_backend(&root, owner.clone());
-    let options = DfsWriteOptions::replicated_eventual(vec![owner]);
+    let (mut runtime, mut dfs) = native_history_service(
+        "file_history_reads_restore_and_deleted_recovery_keep_one_current_view",
+        owner.clone(),
+    );
+    let options = DfsWriteOptions::replicated_eventual(vec![owner.clone()]);
     let path = "/services/history-document";
     let original = dfs
         .posix_write_file(path, b"original\n", options.clone())
@@ -240,16 +212,17 @@ fn file_history_reads_restore_and_deleted_recovery_keep_one_current_view() {
     let edited = dfs
         .posix_write_file(path, b"edited\n", options.clone())
         .unwrap();
-    let page = dfs
-        .history()
-        .list_file_history(DfsFileHistoryListRequest {
+    let page = crate::core_integration_tests::next_history_entries_page(
+        &mut dfs,
+        DfsFileHistoryListRequest {
             file_system_id: identity.file_system_id.clone(),
             path: Some(path.into()),
             object_id: None,
             after: None,
             limit: 128,
-        })
-        .unwrap();
+        },
+    )
+    .unwrap();
     assert_eq!(page.entries.len(), 1);
     assert!(!page.entries[0].is_current);
     let read = dfs
@@ -317,19 +290,19 @@ fn file_history_reads_restore_and_deleted_recovery_keep_one_current_view() {
         "releasing an old version pin must not re-publish its deleted object's tombstone"
     );
     assert_eq!(dfs.posix_read_file(path).unwrap(), b"original\n");
-    assert!(
-        dfs.conflicts_for_object(&identity.object_id)
-            .unwrap()
-            .is_empty()
-    );
+    drop(dfs);
+    runtime.close().unwrap();
 }
 
 #[test]
 fn file_history_cursor_cannot_be_reused_for_another_query() {
     let root = temp_root("history-query-cursor");
     let owner = NodeId::from_legacy_named("history-cursor-owner").unwrap();
-    let mut dfs = networked_sifs_with_backend(&root, owner.clone());
-    let options = DfsWriteOptions::replicated_eventual(vec![owner]);
+    let (mut runtime, mut dfs) = native_history_service(
+        "file_history_cursor_cannot_be_reused_for_another_query",
+        owner.clone(),
+    );
+    let options = DfsWriteOptions::replicated_eventual(vec![owner.clone()]);
     for path in ["/services/history-a", "/services/history-b"] {
         let stat = dfs
             .posix_write_file(path, b"content", options.clone())
@@ -353,13 +326,18 @@ fn file_history_cursor_cannot_be_reused_for_another_query() {
             .to_string()
             .contains("another query")
     );
+    drop(dfs);
+    runtime.close().unwrap();
 }
 
 #[test]
 fn file_history_path_query_keeps_captured_current_reused_and_unlinked_families() {
     let root = temp_root("history-indexed-path-families");
     let owner = NodeId::from_legacy_named("history-indexed-owner").unwrap();
-    let mut dfs = networked_sifs_with_backend(&root, owner.clone());
+    let (mut runtime, mut dfs) = native_history_service(
+        "file_history_path_query_keeps_captured_current_reused_and_unlinked_families",
+        owner.clone(),
+    );
     let options = DfsWriteOptions::replicated_eventual(vec![owner.clone()]);
     let original_path = "/services/history-indexed-original";
     let moved_path = "/services/history-indexed-moved";
@@ -377,8 +355,10 @@ fn file_history_path_query_keeps_captured_current_reused_and_unlinked_families()
     capture_history(&mut dfs, &reused);
     dfs.posix_unlink(moved_path).unwrap();
     drop(dfs);
-    let mut dfs = networked_sifs_with_backend(&root, owner);
-    let list = |dfs: &mut NetworkedDfsService<InProcessTransport>, path: &str| {
+    runtime.stop_node(&owner).unwrap();
+    runtime.reopen_node(owner.clone()).unwrap();
+    let mut dfs = runtime.client(&owner).unwrap();
+    let list = |dfs: &mut NetworkedDfsService<sinomo_dfs::DfsNodeTransport>, path: &str| {
         let mut after = None;
         let mut entries = Vec::new();
         for _ in 0..8 {
@@ -435,4 +415,6 @@ fn file_history_path_query_keeps_captured_current_reused_and_unlinked_families()
         identities(list(&mut dfs, original_path)),
         std::collections::BTreeSet::from([replacement])
     );
+    drop(dfs);
+    runtime.close().unwrap();
 }

@@ -11,9 +11,7 @@ use crate::metadata_keys::{
     dentry_key, directory_inode_id, normalize_path, normalize_posix_path, parent_inode_id,
     path_record_for_object,
 };
-use crate::metadata_object_index::{
-    object_index_table_ops_with_previous, object_indexes_are_materialized,
-};
+use crate::metadata_object_index::object_index_table_ops_with_previous;
 use crate::metadata_pages::child_objects_for_directory_from_tables;
 use crate::metadata_records::{
     DfsInodeId, DfsMetadataTableOp, DfsNamespaceTransaction, DfsNamespaceTransactionReceipt,
@@ -26,6 +24,16 @@ type DirectoryOverlayKey = (DfsFileSystemId, String);
 type DirectoryParentKey = (DfsFileSystemId, DfsInodeId);
 type VisiblePathKey = (DfsFileSystemId, String);
 
+fn transaction_receipt_op(transaction: &DfsNamespaceTransaction) -> DfsMetadataTableOp {
+    DfsMetadataTableOp::PutNamespaceTransactionReceipt {
+        receipt: DfsNamespaceTransactionReceipt::from_transaction(
+            transaction,
+            transaction.created_at,
+        )
+        .expect("validated current transaction has a canonical receipt"),
+    }
+}
+
 struct NamespaceTransactionRecord {
     op: DfsMetadataTableOp,
     committed_at: time::OffsetDateTime,
@@ -34,7 +42,6 @@ struct NamespaceTransactionRecord {
 impl From<DfsMetadataTableOp> for NamespaceTransactionRecord {
     fn from(op: DfsMetadataTableOp) -> Self {
         let committed_at = match &op {
-            DfsMetadataTableOp::PutNamespaceTransaction { transaction } => transaction.created_at,
             DfsMetadataTableOp::PutNamespaceTransactionReceipt { receipt } => receipt.retained_at,
             _ => unreachable!("namespace materialization requires a transaction or receipt"),
         };
@@ -179,17 +186,7 @@ pub(crate) fn validate_namespace_transaction_preconditions(
     transaction
         .validate_content_reference_annotation()
         .map_err(MetadataBackendError::Serde)?;
-    let recorded = if let Some(existing) = tables
-        .namespace_transactions
-        .get(&transaction.transaction_id)
-    {
-        if existing != transaction {
-            return Err(MetadataBackendError::Serde(
-                "namespace transaction identity has another payload".into(),
-            ));
-        }
-        true
-    } else if let Some(receipt) = tables
+    let recorded = if let Some(receipt) = tables
         .namespace_transaction_receipts
         .get(&transaction.transaction_id)
     {
@@ -518,9 +515,7 @@ pub(crate) fn plan_namespace_transaction_table_ops_at(
     committed_at: time::OffsetDateTime,
 ) -> Vec<DfsMetadataTableOp> {
     let record = NamespaceTransactionRecord {
-        op: DfsMetadataTableOp::PutNamespaceTransaction {
-            transaction: transaction.clone(),
-        },
+        op: transaction_receipt_op(transaction),
         committed_at,
     };
     if transaction.objects.len() == 1 {
@@ -567,6 +562,7 @@ pub(crate) fn preapply_namespace_transaction_table_ops(
     );
 }
 
+#[cfg(test)]
 pub(crate) fn preapply_namespace_transaction_table_ops_at(
     tables: &mut DfsMetadataTables,
     transaction: &DfsNamespaceTransaction,
@@ -580,35 +576,9 @@ pub(crate) fn preapply_namespace_transaction_table_ops_at(
         tables,
         transaction,
         NamespaceTransactionRecord {
-            op: DfsMetadataTableOp::PutNamespaceTransaction {
-                transaction: transaction.clone(),
-            },
+            op: transaction_receipt_op(transaction),
             committed_at,
         },
-        &mut table_op_sink,
-        &mut rollback,
-    );
-}
-
-/// Preapply a transaction while retaining rollback state but not its derived
-/// operation list.
-///
-/// Compact semantic table commits persist only their fenced commit marker. The
-/// derived operations are needed to update the table image and rollback maps,
-/// but collecting a second copy can contain tens of thousands of operations
-/// for a bulk transaction.
-pub(crate) fn preapply_committed_namespace_transaction_table_state_with_rollback(
-    tables: &mut DfsMetadataTables,
-    transaction: &DfsNamespaceTransaction,
-    receipt: DfsNamespaceTransactionReceipt,
-    rollback: &mut DfsMetadataTableRollback,
-) {
-    let mut table_op_sink = None;
-    let mut rollback = Some(rollback);
-    plan_namespace_transaction_table_ops_in_place_with_record(
-        tables,
-        transaction,
-        DfsMetadataTableOp::PutNamespaceTransactionReceipt { receipt },
         &mut table_op_sink,
         &mut rollback,
     );
@@ -622,28 +592,11 @@ fn materialize_namespace_transaction_table_state(
     materialize_namespace_transaction_table_state_with_record(
         tables,
         transaction,
-        DfsMetadataTableOp::PutNamespaceTransaction {
-            transaction: transaction.clone(),
-        },
+        transaction_receipt_op(transaction),
     );
 }
 
-/// Materialize a committed prepare without retaining its full transaction a
-/// second time. The compact receipt is sufficient for exact retry because the
-/// canonical objects, versions, and indexes are installed by this same table
-/// transition.
-pub(crate) fn materialize_committed_namespace_transaction_table_state(
-    tables: &mut DfsMetadataTables,
-    transaction: &DfsNamespaceTransaction,
-    receipt: DfsNamespaceTransactionReceipt,
-) {
-    materialize_namespace_transaction_table_state_with_record(
-        tables,
-        transaction,
-        DfsMetadataTableOp::PutNamespaceTransactionReceipt { receipt },
-    );
-}
-
+#[cfg(test)]
 fn materialize_namespace_transaction_table_state_with_record(
     tables: &mut DfsMetadataTables,
     transaction: &DfsNamespaceTransaction,
@@ -669,9 +622,7 @@ fn plan_namespace_transaction_table_ops_in_place(
     plan_namespace_transaction_table_ops_in_place_with_record(
         tables,
         transaction,
-        DfsMetadataTableOp::PutNamespaceTransaction {
-            transaction: transaction.clone(),
-        },
+        transaction_receipt_op(transaction),
         table_ops,
         rollback,
     );
@@ -770,9 +721,7 @@ fn plan_single_object_namespace_transaction_table_ops(
     plan_single_object_namespace_transaction_table_ops_with_record(
         tables,
         transaction,
-        DfsMetadataTableOp::PutNamespaceTransaction {
-            transaction: transaction.clone(),
-        },
+        transaction_receipt_op(transaction),
     )
 }
 
@@ -810,196 +759,6 @@ fn plan_single_object_namespace_transaction_table_ops_with_record(
     }
     table_ops.extend(crate::file_history::transaction_file_pin_ops(transaction));
     table_ops
-}
-
-pub(crate) fn plan_namespace_transaction_recovery_table_ops(
-    tables: &DfsMetadataTables,
-    transaction: &DfsNamespaceTransaction,
-) -> Vec<DfsMetadataTableOp> {
-    let mut scratch = tables.clone();
-    let mut table_ops = Vec::new();
-    let mut transaction_authoritative_object_ids = BTreeSet::new();
-    let mut compacted_tombstone_fenced_object_ids = BTreeSet::new();
-    let transaction_object_ids = transaction
-        .objects
-        .iter()
-        .map(|object| object.object_id.clone())
-        .collect::<BTreeSet<_>>();
-    for object in transaction
-        .objects
-        .iter()
-        .filter(|object| object.kind == DfsObjectKind::Tombstone)
-    {
-        plan_object_index_recovery_ops(
-            &mut scratch,
-            &mut table_ops,
-            object,
-            &transaction_object_ids,
-            &mut transaction_authoritative_object_ids,
-            &mut compacted_tombstone_fenced_object_ids,
-        );
-    }
-    for object in transaction
-        .objects
-        .iter()
-        .filter(|object| object.kind != DfsObjectKind::Tombstone)
-    {
-        plan_object_index_recovery_ops(
-            &mut scratch,
-            &mut table_ops,
-            object,
-            &transaction_object_ids,
-            &mut transaction_authoritative_object_ids,
-            &mut compacted_tombstone_fenced_object_ids,
-        );
-    }
-    for version in &transaction.versions {
-        let version = normalized_version_record(version);
-        if compacted_tombstone_fenced_object_ids.contains(&version.object_id) {
-            continue;
-        }
-        // A present version record may have been enriched by later receipt or
-        // repair activity. Namespace recovery fills partial writes; it must
-        // never roll an existing same-key record back to the historical
-        // transaction payload.
-        if !scratch
-            .versions
-            .contains_key(&(version.object_id.clone(), version.version.clone()))
-        {
-            apply_planned_op(
-                &mut scratch,
-                &mut table_ops,
-                DfsMetadataTableOp::PutVersion { version },
-            );
-        }
-    }
-    for state in &transaction.advisory_lock_states {
-        if compacted_tombstone_fenced_object_ids.contains(&state.object_id) {
-            continue;
-        }
-        let existing = scratch.advisory_lock_states.get(&state.object_id);
-        let should_recover = match existing {
-            None => true,
-            Some(existing) if existing == state => false,
-            Some(existing) => {
-                transaction_authoritative_object_ids.contains(&state.object_id)
-                    && !advisory_lock_state_descends_from(existing, state)
-            }
-        };
-        if should_recover {
-            apply_planned_op(
-                &mut scratch,
-                &mut table_ops,
-                DfsMetadataTableOp::PutAdvisoryLockState {
-                    state: state.clone(),
-                },
-            );
-        }
-    }
-    table_ops
-}
-
-/// Return true when recovery planning is guaranteed to produce no table ops.
-///
-/// This mirrors the recovery planner's decisions without cloning the complete
-/// metadata table set. The check stops at the first missing materialization;
-/// callers must run the full scratch-table planner in that case because later
-/// operations in a multi-object transaction can depend on earlier repairs.
-pub(crate) fn namespace_transaction_recovery_is_complete(
-    tables: &DfsMetadataTables,
-    transaction: &DfsNamespaceTransaction,
-) -> bool {
-    let transaction_object_ids = transaction
-        .objects
-        .iter()
-        .map(|object| object.object_id.clone())
-        .collect::<BTreeSet<_>>();
-    let mut transaction_authoritative_object_ids = BTreeSet::new();
-    let mut compacted_tombstone_fenced_object_ids = BTreeSet::new();
-
-    for object in transaction
-        .objects
-        .iter()
-        .filter(|object| object.kind == DfsObjectKind::Tombstone)
-    {
-        if !namespace_transaction_object_recovery_is_complete(
-            tables,
-            object,
-            &transaction_object_ids,
-            &mut transaction_authoritative_object_ids,
-            &mut compacted_tombstone_fenced_object_ids,
-        ) {
-            return false;
-        }
-    }
-    for object in transaction
-        .objects
-        .iter()
-        .filter(|object| object.kind != DfsObjectKind::Tombstone)
-    {
-        if !namespace_transaction_object_recovery_is_complete(
-            tables,
-            object,
-            &transaction_object_ids,
-            &mut transaction_authoritative_object_ids,
-            &mut compacted_tombstone_fenced_object_ids,
-        ) {
-            return false;
-        }
-    }
-
-    if transaction.versions.iter().any(|version| {
-        let version = normalized_version_record(version);
-        !compacted_tombstone_fenced_object_ids.contains(&version.object_id)
-            && !tables
-                .versions
-                .contains_key(&(version.object_id, version.version))
-    }) {
-        return false;
-    }
-
-    transaction.advisory_lock_states.iter().all(|state| {
-        if compacted_tombstone_fenced_object_ids.contains(&state.object_id) {
-            return true;
-        }
-        match tables.advisory_lock_states.get(&state.object_id) {
-            None => false,
-            Some(existing) if existing == state => true,
-            Some(existing) => {
-                !transaction_authoritative_object_ids.contains(&state.object_id)
-                    || advisory_lock_state_descends_from(existing, state)
-            }
-        }
-    })
-}
-
-fn namespace_transaction_object_recovery_is_complete(
-    tables: &DfsMetadataTables,
-    transaction_object: &DfsObjectMetadata,
-    transaction_object_ids: &BTreeSet<DfsObjectId>,
-    transaction_authoritative_object_ids: &mut BTreeSet<DfsObjectId>,
-    compacted_tombstone_fenced_object_ids: &mut BTreeSet<DfsObjectId>,
-) -> bool {
-    if tables.compacted_tombstone_fences_namespace_recovery(transaction_object) {
-        compacted_tombstone_fenced_object_ids.insert(transaction_object.object_id.clone());
-        return true;
-    }
-    let current = tables.objects.get(&transaction_object.object_id);
-    let transaction_is_authoritative = current.is_none_or(|current| {
-        transaction_object_recovers_over_current(transaction_object, current)
-    });
-    let object = if transaction_is_authoritative {
-        transaction_object
-    } else {
-        current.expect("a non-authoritative transaction object has a current record")
-    };
-    if object_path_has_external_owner(tables, object, transaction_object_ids) {
-        return true;
-    }
-    if transaction_is_authoritative {
-        transaction_authoritative_object_ids.insert(transaction_object.object_id.clone());
-    }
-    object_indexes_are_materialized(tables, object)
 }
 
 fn validate_advisory_lock_state_preconditions(
@@ -1054,28 +813,6 @@ fn validate_advisory_lock_state_preconditions(
     Ok(())
 }
 
-pub(crate) fn object_path_has_external_owner(
-    tables: &DfsMetadataTables,
-    object: &DfsObjectMetadata,
-    transaction_object_ids: &BTreeSet<DfsObjectId>,
-) -> bool {
-    let path_record = path_record_for_object(object);
-    let owns_path = |object_id: &DfsObjectId| {
-        object_id == &object.object_id || transaction_object_ids.contains(object_id)
-    };
-    if tables
-        .paths
-        .get(&(object.file_system_id.clone(), path_record.path.clone()))
-        .is_some_and(|record| !owns_path(&record.object_id))
-    {
-        return true;
-    }
-    tables
-        .dentries
-        .get(&dentry_key(&path_record))
-        .is_some_and(|record| !owns_path(&record.object_id))
-}
-
 fn validate_directory_tombstone_has_no_children(
     before: &DfsMetadataTables,
     after: &DfsMetadataTables,
@@ -1114,72 +851,7 @@ fn plan_object_index_ops(
     }
 }
 
-fn plan_object_index_recovery_ops(
-    scratch: &mut DfsMetadataTables,
-    table_ops: &mut Vec<DfsMetadataTableOp>,
-    transaction_object: &DfsObjectMetadata,
-    transaction_object_ids: &BTreeSet<DfsObjectId>,
-    transaction_authoritative_object_ids: &mut BTreeSet<DfsObjectId>,
-    compacted_tombstone_fenced_object_ids: &mut BTreeSet<DfsObjectId>,
-) {
-    if scratch.compacted_tombstone_fences_namespace_recovery(transaction_object) {
-        compacted_tombstone_fenced_object_ids.insert(transaction_object.object_id.clone());
-        return;
-    }
-    let current = scratch.objects.get(&transaction_object.object_id).cloned();
-    let transaction_is_authoritative = current.as_ref().is_none_or(|current| {
-        transaction_object_recovers_over_current(transaction_object, current)
-    });
-    let object = if transaction_is_authoritative {
-        transaction_object
-    } else {
-        current
-            .as_ref()
-            .expect("a non-authoritative transaction object has a current record")
-    };
-    if object_path_has_external_owner(scratch, object, transaction_object_ids) {
-        return;
-    }
-    if transaction_is_authoritative {
-        transaction_authoritative_object_ids.insert(transaction_object.object_id.clone());
-    }
-    if object_indexes_are_materialized(scratch, object) {
-        return;
-    }
-    for op in object_index_table_ops_with_previous(scratch, object, current.as_ref()) {
-        apply_planned_op(scratch, table_ops, op);
-    }
-}
-
-fn transaction_object_recovers_over_current(
-    transaction_object: &DfsObjectMetadata,
-    current: &DfsObjectMetadata,
-) -> bool {
-    if transaction_object == current {
-        return true;
-    }
-    let transaction_generation = (
-        transaction_object.changed_at_unix_nanos,
-        &transaction_object.version,
-    );
-    let current_generation = (current.changed_at_unix_nanos, &current.version);
-    transaction_generation > current_generation
-        || (transaction_generation == current_generation
-            && transaction_object.kind != DfsObjectKind::Tombstone
-            && current.kind == DfsObjectKind::Tombstone)
-}
-
-fn advisory_lock_state_descends_from(
-    current: &crate::DfsAdvisoryLockStateRecord,
-    transaction_state: &crate::DfsAdvisoryLockStateRecord,
-) -> bool {
-    !transaction_state.migration_source_fingerprints.is_empty()
-        && transaction_state
-            .migration_source_fingerprints
-            .iter()
-            .all(|fingerprint| current.migration_source_fingerprints.contains(fingerprint))
-}
-
+#[cfg(test)]
 fn apply_planned_op(
     scratch: &mut DfsMetadataTables,
     table_ops: &mut Vec<DfsMetadataTableOp>,
@@ -1268,7 +940,6 @@ mod tests {
 
     fn version_record(object: &DfsObjectMetadata) -> DfsObjectVersionRecord {
         DfsObjectVersionRecord {
-            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
             content_durability: None,
             retention: Default::default(),
             module_metadata: Default::default(),
@@ -1300,9 +971,7 @@ mod tests {
         apply_planned_op(
             &mut scratch,
             &mut table_ops,
-            DfsMetadataTableOp::PutNamespaceTransaction {
-                transaction: transaction.clone(),
-            },
+            transaction_receipt_op(transaction),
         );
         for object in transaction
             .objects
@@ -1491,7 +1160,7 @@ mod tests {
 
         assert!(matches!(
             ops.first(),
-            Some(DfsMetadataTableOp::PutNamespaceTransaction { .. })
+            Some(DfsMetadataTableOp::PutNamespaceTransactionReceipt { .. })
         ));
         let tombstone_position = ops
             .iter()
@@ -1972,287 +1641,6 @@ mod tests {
     }
 
     #[test]
-    fn completed_transaction_skips_scratch_table_recovery_plan() {
-        let live = object(
-            object_id("obj_namespace_complete_live"),
-            "/docs/complete.md",
-            DfsObjectKind::File,
-        );
-        let tombstone = object(
-            object_id("obj_namespace_complete_tombstone"),
-            "/docs/replaced.md",
-            DfsObjectKind::Tombstone,
-        );
-        let transaction = DfsNamespaceTransaction {
-            content_reference_identity: None,
-            contribution_digest: None,
-            extension_expectations: Vec::new(),
-            file_version_pins: None,
-            transaction_id: "txn_namespace_complete".to_string(),
-            file_system_id: file_system_id(),
-            objects: vec![live.clone(), tombstone],
-            versions: vec![version_record(&live)],
-            advisory_lock_states: Vec::new(),
-            created_at: OffsetDateTime::UNIX_EPOCH,
-        };
-        let mut tables = DfsMetadataTables::default();
-        for op in plan_namespace_transaction_table_ops(&tables, &transaction) {
-            tables.apply(op);
-        }
-
-        assert!(namespace_transaction_recovery_is_complete(
-            &tables,
-            &transaction
-        ));
-        assert!(plan_namespace_transaction_recovery_table_ops(&tables, &transaction).is_empty());
-
-        let live_path = path_record_for_object(&live);
-        tables
-            .paths
-            .remove(&(live.file_system_id.clone(), live_path.path.clone()));
-        assert!(
-            !namespace_transaction_recovery_is_complete(&tables, &transaction),
-            "a missing object index must fall back to scratch-table recovery planning"
-        );
-        assert!(!plan_namespace_transaction_recovery_table_ops(&tables, &transaction).is_empty());
-    }
-
-    #[test]
-    fn newer_compacted_tombstone_fences_historical_live_transaction_recovery() {
-        let mut historical_live = object(
-            object_id("obj_namespace_compacted_fence"),
-            "/docs/compacted-fence.md",
-            DfsObjectKind::File,
-        );
-        historical_live.changed_at_unix_nanos = 20;
-        historical_live.version = version("version_namespace_compacted_live");
-        let historical_version = version_record(&historical_live);
-        let historical_lock = DfsAdvisoryLockStateRecord::empty(
-            historical_live.file_system_id.clone(),
-            historical_live.object_id.clone(),
-            7,
-        );
-        let transaction = DfsNamespaceTransaction {
-            content_reference_identity: None,
-            contribution_digest: None,
-            extension_expectations: Vec::new(),
-            file_version_pins: None,
-            transaction_id: "txn_namespace_compacted_fence".to_string(),
-            file_system_id: historical_live.file_system_id.clone(),
-            objects: vec![historical_live.clone()],
-            versions: vec![historical_version],
-            advisory_lock_states: vec![historical_lock],
-            created_at: OffsetDateTime::UNIX_EPOCH,
-        };
-
-        let mut compacted_tombstone = historical_live.clone();
-        compacted_tombstone.kind = DfsObjectKind::Tombstone;
-        compacted_tombstone.changed_at_unix_nanos = 30;
-        compacted_tombstone.version = version("version_namespace_compacted_tombstone");
-        let mut tables = DfsMetadataTables::default();
-        tables.apply(DfsMetadataTableOp::PutCompactedTombstone {
-            object: compacted_tombstone.clone(),
-        });
-
-        assert!(namespace_transaction_recovery_is_complete(
-            &tables,
-            &transaction
-        ));
-        assert!(
-            plan_namespace_transaction_recovery_table_ops(&tables, &transaction).is_empty(),
-            "recovery must not resurrect an object family superseded by a compacted tombstone"
-        );
-        assert_eq!(
-            tables
-                .compacted_tombstones
-                .get(&compacted_tombstone.object_id),
-            Some(&compacted_tombstone)
-        );
-        assert!(!tables.objects.contains_key(&historical_live.object_id));
-        assert!(tables.versions.is_empty());
-        assert!(tables.advisory_lock_states.is_empty());
-    }
-
-    #[test]
-    fn only_newer_same_namespace_compacted_tombstone_fences_live_recovery() {
-        let mut historical_live = object(
-            object_id("obj_namespace_compacted_non_fence"),
-            "/docs/compacted-non-fence.md",
-            DfsObjectKind::File,
-        );
-        historical_live.changed_at_unix_nanos = 30;
-        historical_live.version = version("version_namespace_compacted_current");
-        let transaction = DfsNamespaceTransaction {
-            content_reference_identity: None,
-            contribution_digest: None,
-            extension_expectations: Vec::new(),
-            file_version_pins: None,
-            transaction_id: "txn_namespace_compacted_non_fence".to_string(),
-            file_system_id: historical_live.file_system_id.clone(),
-            objects: vec![historical_live.clone()],
-            versions: Vec::new(),
-            advisory_lock_states: Vec::new(),
-            created_at: OffsetDateTime::UNIX_EPOCH,
-        };
-
-        let mut older = historical_live.clone();
-        older.kind = DfsObjectKind::Tombstone;
-        older.changed_at_unix_nanos = 20;
-        older.version = version("version_namespace_compacted_older");
-        let mut same_generation = historical_live.clone();
-        same_generation.kind = DfsObjectKind::Tombstone;
-        let mut different_path = historical_live.clone();
-        different_path.kind = DfsObjectKind::Tombstone;
-        different_path.path = "/archive/compacted-non-fence.md".to_string();
-        different_path.changed_at_unix_nanos = 40;
-        different_path.version = version("version_namespace_compacted_different_path");
-        let mut different_file_system = historical_live.clone();
-        different_file_system.kind = DfsObjectKind::Tombstone;
-        different_file_system.file_system_id =
-            DfsFileSystemId::from_legacy_named("fs_namespace_txn_other")
-                .expect("valid filesystem id");
-        different_file_system.changed_at_unix_nanos = 40;
-        different_file_system.version =
-            version("version_namespace_compacted_different_file_system");
-
-        for (label, compacted_tombstone) in [
-            ("older", older),
-            ("same generation", same_generation),
-            ("different path", different_path),
-            ("different filesystem", different_file_system),
-        ] {
-            let mut tables = DfsMetadataTables::default();
-            tables.apply(DfsMetadataTableOp::PutCompactedTombstone {
-                object: compacted_tombstone,
-            });
-
-            assert!(
-                !namespace_transaction_recovery_is_complete(&tables, &transaction),
-                "a {label} compacted tombstone must not suppress live-object recovery"
-            );
-            assert!(
-                plan_namespace_transaction_recovery_table_ops(&tables, &transaction)
-                    .iter()
-                    .any(|op| matches!(
-                        op,
-                        DfsMetadataTableOp::PutObject { object }
-                            if object == &historical_live
-                    )),
-                "a {label} compacted tombstone must be replaced by the authoritative live object"
-            );
-        }
-    }
-
-    #[test]
-    fn recovery_plan_skips_path_owned_outside_transaction() {
-        let existing = object(
-            object_id("obj_namespace_existing"),
-            "/docs/shared.md",
-            DfsObjectKind::File,
-        );
-        let recovering = object(
-            object_id("obj_namespace_recovering"),
-            "/docs/shared.md",
-            DfsObjectKind::File,
-        );
-        let existing_path = path_record_for_object(&existing);
-        let mut tables = DfsMetadataTables::default();
-        tables.apply(DfsMetadataTableOp::PutObject {
-            object: recovering.clone(),
-        });
-        tables.apply(DfsMetadataTableOp::PutPath {
-            path_record: existing_path.clone(),
-        });
-        tables.apply(DfsMetadataTableOp::PutDentry {
-            path_record: existing_path,
-        });
-        tables.apply(DfsMetadataTableOp::PutInode {
-            inode: DfsInodeRecord::from(&recovering),
-        });
-        let transaction = DfsNamespaceTransaction {
-            content_reference_identity: None,
-            contribution_digest: None,
-            extension_expectations: Vec::new(),
-            file_version_pins: None,
-            transaction_id: "txn_namespace_recovery_skip".to_string(),
-            file_system_id: file_system_id(),
-            objects: vec![recovering.clone()],
-            versions: Vec::new(),
-            advisory_lock_states: Vec::new(),
-            created_at: OffsetDateTime::UNIX_EPOCH,
-        };
-
-        let ops = plan_namespace_transaction_recovery_table_ops(&tables, &transaction);
-
-        assert!(ops.is_empty());
-        assert!(object_path_has_external_owner(
-            &tables,
-            &recovering,
-            &BTreeSet::from([recovering.object_id.clone()])
-        ));
-        assert!(
-            tables
-                .dentries
-                .contains_key(&dentry_key(&path_record_for_object(&existing)))
-        );
-    }
-
-    #[test]
-    fn recovery_plan_preserves_later_enrichment_of_existing_version() {
-        let mut file = object(
-            object_id("obj_namespace_enriched_version"),
-            "/docs/enriched.md",
-            DfsObjectKind::File,
-        );
-        file.current_locations = vec![node("node_a")];
-        let historical_version = version_record(&file);
-        let transaction = DfsNamespaceTransaction {
-            content_reference_identity: None,
-            contribution_digest: None,
-            extension_expectations: Vec::new(),
-            file_version_pins: None,
-            transaction_id: "txn_namespace_historical_version".to_string(),
-            file_system_id: file_system_id(),
-            objects: vec![file.clone()],
-            versions: vec![historical_version],
-            advisory_lock_states: Vec::new(),
-            created_at: OffsetDateTime::UNIX_EPOCH,
-        };
-        let mut enriched_version = version_record(&file);
-        enriched_version.locations.push(node("node_b"));
-        let mut tables = DfsMetadataTables::default();
-        for op in plan_namespace_transaction_table_ops(&tables, &transaction) {
-            tables.apply(op);
-        }
-        tables.apply(DfsMetadataTableOp::PutVersion {
-            version: enriched_version.clone(),
-        });
-
-        let ops = plan_namespace_transaction_recovery_table_ops(&tables, &transaction);
-
-        assert!(namespace_transaction_recovery_is_complete(
-            &tables,
-            &transaction
-        ));
-
-        assert!(
-            !ops.iter().any(|op| matches!(
-                op,
-                DfsMetadataTableOp::PutVersion { version }
-                    if version.object_id == file.object_id
-                        && version.version == file.version
-            )),
-            "recovery must not replace an existing same-key version with the historical transaction payload"
-        );
-        assert_eq!(
-            tables
-                .versions
-                .get(&(file.object_id.clone(), file.version.clone())),
-            Some(&enriched_version)
-        );
-    }
-
-    #[test]
     fn transaction_plan_installs_object_before_its_lock_aggregate() {
         let object = object(
             object_id("obj_namespace_lock_move"),
@@ -2338,170 +1726,5 @@ mod tests {
         assert!(ops.iter().any(
             |op| matches!(op, DfsMetadataTableOp::PutAdvisoryLockState { state } if state == &current_state)
         ));
-    }
-
-    #[test]
-    fn recovery_reclaims_older_tombstone_and_stale_lock_aggregate() {
-        let mut returned = object(
-            object_id("obj_namespace_recovery_lock_return"),
-            "/returned/recovery-lock.txt",
-            DfsObjectKind::File,
-        );
-        returned.changed_at_unix_nanos = 20;
-        returned.version = version("version_recovery_returned");
-
-        let mut departed = returned.clone();
-        departed.path = "/departed/recovery-lock.txt".to_string();
-        departed.kind = DfsObjectKind::Tombstone;
-        departed.changed_at_unix_nanos = 10;
-        departed.version = version("version_recovery_departed");
-
-        let stale_state = DfsAdvisoryLockStateRecord::empty(
-            returned.file_system_id.clone(),
-            returned.object_id.clone(),
-            3,
-        );
-        let source_state = DfsAdvisoryLockStateRecord::empty(
-            returned.file_system_id.clone(),
-            returned.object_id.clone(),
-            9,
-        );
-        let (returned_state, _) =
-            crate::advisory_lock::prepare_advisory_lock_state_for_migration(&source_state)
-                .expect("prepare returned lock aggregate");
-        let transaction = DfsNamespaceTransaction {
-            content_reference_identity: None,
-            contribution_digest: None,
-            extension_expectations: Vec::new(),
-            file_version_pins: None,
-            transaction_id: "txn_namespace_recovery_lock_return".to_string(),
-            file_system_id: returned.file_system_id.clone(),
-            objects: vec![returned.clone()],
-            versions: Vec::new(),
-            advisory_lock_states: vec![returned_state.clone()],
-            created_at: OffsetDateTime::UNIX_EPOCH,
-        };
-        let mut tables = DfsMetadataTables::default();
-        for op in object_index_table_ops_with_previous(&tables, &departed, None) {
-            tables.apply(op);
-        }
-        tables
-            .advisory_lock_states
-            .insert(stale_state.object_id.clone(), stale_state);
-
-        let ops = plan_namespace_transaction_recovery_table_ops(&tables, &transaction);
-        for op in ops {
-            tables.apply(op);
-        }
-
-        assert_eq!(tables.objects.get(&returned.object_id), Some(&returned));
-        let returned_path = path_record_for_object(&returned).path;
-        assert_eq!(
-            tables
-                .paths
-                .get(&(returned.file_system_id.clone(), returned_path))
-                .map(|record| &record.object_id),
-            Some(&returned.object_id)
-        );
-        assert_eq!(
-            tables.advisory_lock_states.get(&returned.object_id),
-            Some(&returned_state),
-            "an interrupted newer reclaim must replace the stale source-shard lock aggregate"
-        );
-    }
-
-    #[test]
-    fn recovery_preserves_later_tombstone_and_lock_transition() {
-        let mut transaction_object = object(
-            object_id("obj_namespace_recovery_later_state"),
-            "/returned/later-state.txt",
-            DfsObjectKind::File,
-        );
-        transaction_object.changed_at_unix_nanos = 20;
-        transaction_object.version = version("version_recovery_live");
-        let source_state = DfsAdvisoryLockStateRecord::empty(
-            transaction_object.file_system_id.clone(),
-            transaction_object.object_id.clone(),
-            9,
-        );
-        let (transaction_state, _) =
-            crate::advisory_lock::prepare_advisory_lock_state_for_migration(&source_state)
-                .expect("prepare transaction lock aggregate");
-        let transaction = DfsNamespaceTransaction {
-            content_reference_identity: None,
-            contribution_digest: None,
-            extension_expectations: Vec::new(),
-            file_version_pins: None,
-            transaction_id: "txn_namespace_recovery_later_state".to_string(),
-            file_system_id: transaction_object.file_system_id.clone(),
-            objects: vec![transaction_object.clone()],
-            versions: Vec::new(),
-            advisory_lock_states: vec![transaction_state.clone()],
-            created_at: OffsetDateTime::UNIX_EPOCH,
-        };
-
-        let mut later_state = transaction_state.clone();
-        later_state.authority_epoch = 40;
-        later_state.authority_rebind_required = false;
-        later_state.next_queue_sequence = later_state.next_queue_sequence.saturating_add(1);
-        let mut tables = DfsMetadataTables::default();
-        for op in plan_namespace_transaction_table_ops(&tables, &transaction) {
-            tables.apply(op);
-        }
-        tables
-            .advisory_lock_states
-            .insert(later_state.object_id.clone(), later_state.clone());
-
-        let ops = plan_namespace_transaction_recovery_table_ops(&tables, &transaction);
-        assert!(namespace_transaction_recovery_is_complete(
-            &tables,
-            &transaction
-        ));
-
-        assert!(!ops.iter().any(|op| matches!(
-            op,
-            DfsMetadataTableOp::PutAdvisoryLockState { state }
-                if state.object_id == transaction_object.object_id
-        )));
-        assert_eq!(
-            tables
-                .advisory_lock_states
-                .get(&transaction_object.object_id),
-            Some(&later_state),
-            "recovery must not roll a descendant lock transition back to its migration payload"
-        );
-
-        let mut later_tombstone = transaction_object.clone();
-        later_tombstone.kind = DfsObjectKind::Tombstone;
-        later_tombstone.changed_at_unix_nanos = 30;
-        later_tombstone.version = version("version_recovery_later_tombstone");
-        for op in object_index_table_ops_with_previous(
-            &tables,
-            &later_tombstone,
-            tables.objects.get(&later_tombstone.object_id),
-        ) {
-            tables.apply(op);
-        }
-
-        let ops = plan_namespace_transaction_recovery_table_ops(&tables, &transaction);
-        assert!(namespace_transaction_recovery_is_complete(
-            &tables,
-            &transaction
-        ));
-        for op in ops {
-            tables.apply(op);
-        }
-
-        assert_eq!(
-            tables.objects.get(&later_tombstone.object_id),
-            Some(&later_tombstone),
-            "recovery must preserve a tombstone that superseded the historical transaction"
-        );
-        assert_eq!(
-            tables
-                .advisory_lock_states
-                .get(&transaction_object.object_id),
-            Some(&later_state)
-        );
     }
 }

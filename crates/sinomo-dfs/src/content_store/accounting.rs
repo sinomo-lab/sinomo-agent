@@ -1,16 +1,15 @@
 use super::{
     CONTENT_STORE_STATS_FILE, CONTENT_STORE_STATS_LOCK_FILE, CONTENT_STORE_STATS_VERSION,
-    ContentManifest, ContentStoreError, LocalContentStore, Result, VersionManifestEntry,
-    decode_stats_snapshot, encode_stats_snapshot, ensure_bytes_match_hash, file_content_hash,
-    publish_file_as_blob, write_content_addressed_blob_bytes,
-    write_content_addressed_blob_bytes_prehashed_existing_parent,
+    ContentStoreError, LocalContentStore, Result, VersionManifestEntry, decode_stats_snapshot,
+    encode_stats_snapshot, ensure_bytes_match_hash, file_content_hash, publish_file_as_blob,
+    write_content_addressed_blob_bytes, write_content_addressed_blob_bytes_prehashed,
 };
+use crate::content_store::INLINE_BLOB_SMALL_LIMIT_BYTES;
 use crate::content_store::fs_ops::{
     file_len_if_exists, read_dir, read_file, recursive_file_count_and_bytes, remove_file,
     remove_file_if_exists, write_file_atomic,
 };
 use crate::content_store::inline_bindings::{InlineBindingView, InlineVersionState};
-use crate::content_store::packed::PACKED_BLOB_SMALL_LIMIT_BYTES;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -103,18 +102,6 @@ impl ContentStoreStatsDelta {
         Self {
             staging_file_count: file_count_delta(before_len, after_len),
             staging_bytes: file_bytes_delta(before_len, after_len),
-            ..Self::default()
-        }
-    }
-
-    pub(super) fn manifest_created(manifest: &ContentManifest, manifest_bytes: u64) -> Self {
-        let extent_manifest_count = if manifest.extents.is_empty() { 0 } else { 1 };
-        Self {
-            manifest_count: 1,
-            manifest_bytes: i128::from(manifest_bytes),
-            logical_object_bytes: i128::from(manifest.size_bytes),
-            extent_manifest_count,
-            extent_count: manifest.extents.len() as i128,
             ..Self::default()
         }
     }
@@ -226,7 +213,6 @@ impl LocalContentStore {
             staging_bytes,
             ..ContentStoreStats::default()
         };
-        self.collect_manifest_stats(&self.root.join("objects"), &mut stats, inline.as_ref())?;
         if let Some(view) = inline {
             for state in view.versions.values() {
                 if let InlineVersionState::Live(entry) = state {
@@ -238,86 +224,31 @@ impl LocalContentStore {
                     stats.logical_object_bytes = stats
                         .logical_object_bytes
                         .saturating_add(manifest.size_bytes);
+                    if !manifest.extents.is_empty() {
+                        stats.extent_manifest_count = stats.extent_manifest_count.saturating_add(1);
+                        stats.extent_count = stats
+                            .extent_count
+                            .saturating_add(manifest.extents.len() as u64);
+                    }
                 }
             }
         }
         Ok(stats)
     }
 
-    fn collect_manifest_stats(
-        &self,
-        path: &Path,
-        stats: &mut ContentStoreStats,
-        inline: Option<&InlineBindingView>,
-    ) -> Result<()> {
-        if !path.exists() {
-            return Ok(());
-        }
-        for entry in read_dir(path)? {
-            let entry_path = entry.path();
-            if entry_path.is_dir() {
-                self.collect_manifest_stats(&entry_path, stats, inline)?;
-                continue;
-            }
-            if entry_path.file_name().and_then(|name| name.to_str()) != Some("manifest.sobj") {
-                continue;
-            }
-            if let Some(version_dir) = entry_path.parent()
-                && let Some(object_dir) = version_dir.parent()
-                && let (Some(object), Some(version)) = (
-                    object_dir.file_name().and_then(|name| name.to_str()),
-                    version_dir.file_name().and_then(|name| name.to_str()),
-                )
-                && inline.is_some_and(|view| view.owns_version(object, version))
-            {
-                continue;
-            }
-            let manifest_bytes = read_file(&entry_path)?;
-            let manifest = super::decode_manifest_for_path(&manifest_bytes, &entry_path)?;
-            if let Some(view) = inline {
-                view.validate_legacy_manifest(&manifest)?;
-            }
-            stats.manifest_count = stats.manifest_count.saturating_add(1);
-            stats.manifest_bytes = stats
-                .manifest_bytes
-                .saturating_add(manifest_bytes.len() as u64);
-            stats.logical_object_bytes = stats
-                .logical_object_bytes
-                .saturating_add(manifest.size_bytes);
-            if !manifest.extents.is_empty() {
-                stats.extent_manifest_count = stats.extent_manifest_count.saturating_add(1);
-                stats.extent_count = stats
-                    .extent_count
-                    .saturating_add(manifest.extents.len() as u64);
-            }
-        }
-        Ok(())
-    }
-
     pub(super) fn scan_blob_stats(&self) -> Result<(u64, u64)> {
         let _owner = self.content_mutation_guard()?;
         let (loose_count, loose_bytes) = recursive_file_count_and_bytes(&self.root.join("blobs"))?;
-        let index = self.read_packed_blob_index_unlocked()?;
-        let packed_count = index.entries.len() as u64;
-        let packed_bytes = index
-            .entries
-            .values()
-            .map(|location| location.size_bytes)
-            .fold(0_u64, |total, size| total.saturating_add(size));
-        let mut count = loose_count.saturating_add(packed_count);
-        let mut bytes = loose_bytes.saturating_add(packed_bytes);
+        let mut count = loose_count;
+        let mut bytes = loose_bytes;
         if let Some(view) = self.inline_binding_view()? {
             for hash in view.blobs.keys().chain(view.deleted_blobs.iter()) {
-                // Like packed-index accounting, usage counts selected live
+                // Usage counts selected live
                 // payloads, not obsolete frame bytes or retired generations.
-                // An adopted inline hash shadows its old physical copies.
-                if let Some(legacy_bytes) = file_len_if_exists(&self.blob_path(hash)?)? {
+                // An inline hash shadows its duplicate loose copies.
+                if let Some(loose_bytes) = file_len_if_exists(&self.blob_path(hash)?)? {
                     count = count.saturating_sub(1);
-                    bytes = bytes.saturating_sub(legacy_bytes);
-                }
-                if let Some(legacy) = index.entries.get(hash) {
-                    count = count.saturating_sub(1);
-                    bytes = bytes.saturating_sub(legacy.size_bytes);
+                    bytes = bytes.saturating_sub(loose_bytes);
                 }
                 if let Some(entry) = view.blobs.get(hash) {
                     count = count.saturating_add(1);
@@ -407,7 +338,7 @@ impl LocalContentStore {
 
         // If no authoritative in-process quota snapshot exists, the mutation
         // has already happened. Scan the resulting durable state instead of
-        // applying its delta twice or trusting a legacy snapshot.
+        // applying its delta twice or trusting a stale snapshot.
         let stats = self.scan_stats()?;
         self.write_stats_snapshot_unlocked(&stats)?;
         self.quota_stats_initialized.store(true, Ordering::Release);
@@ -426,21 +357,6 @@ impl LocalContentStore {
     ) -> Result<()> {
         let _owner = self.content_mutation_guard()?;
         if self.try_restore_inline_blob(hash, bytes)? {
-            return Ok(());
-        }
-        if bytes.len() as u64 <= PACKED_BLOB_SMALL_LIMIT_BYTES {
-            if self.write_packed_blob(hash, bytes)? {
-                self.apply_stats_delta(ContentStoreStatsDelta {
-                    blob_count: 1,
-                    blob_bytes: bytes.len() as i128,
-                    ..ContentStoreStatsDelta::default()
-                })?;
-            }
-            if blob_path.is_file()
-                && !file_content_hash(blob_path).is_ok_and(|actual| actual == hash)
-            {
-                remove_file_if_exists(blob_path)?;
-            }
             return Ok(());
         }
         if !self.tracks_stats_deltas() {
@@ -464,16 +380,14 @@ impl LocalContentStore {
         if self.try_restore_inline_blob(hash, bytes)? {
             return Ok(());
         }
-        if bytes.len() as u64 <= PACKED_BLOB_SMALL_LIMIT_BYTES {
+        if bytes.len() as u64 <= INLINE_BLOB_SMALL_LIMIT_BYTES {
             return self.write_tracked_blob_bytes(hash, blob_path, bytes);
         }
         if !self.tracks_stats_deltas() {
-            return write_content_addressed_blob_bytes_prehashed_existing_parent(
-                hash, blob_path, bytes,
-            );
+            return write_content_addressed_blob_bytes_prehashed(hash, blob_path, bytes);
         }
         let before_len = file_len_if_exists(blob_path)?;
-        write_content_addressed_blob_bytes_prehashed_existing_parent(hash, blob_path, bytes)?;
+        write_content_addressed_blob_bytes_prehashed(hash, blob_path, bytes)?;
         let after_len = file_len_if_exists(blob_path)?;
         self.apply_stats_delta(ContentStoreStatsDelta::blob_file_change(
             before_len, after_len,
@@ -489,7 +403,7 @@ impl LocalContentStore {
     ) -> Result<()> {
         let _owner = self.content_mutation_guard()?;
         let source_len = file_len_if_exists(source_path)?.unwrap_or(0);
-        if source_len <= PACKED_BLOB_SMALL_LIMIT_BYTES {
+        if source_len <= INLINE_BLOB_SMALL_LIMIT_BYTES {
             let bytes = read_file(source_path)?;
             ensure_bytes_match_hash(hash, &bytes)?;
             if hash != expected_hash {
@@ -500,18 +414,6 @@ impl LocalContentStore {
             }
             if self.try_restore_inline_blob(hash, &bytes)? {
                 return Ok(());
-            }
-            if self.write_packed_blob(hash, &bytes)? {
-                self.apply_stats_delta(ContentStoreStatsDelta {
-                    blob_count: 1,
-                    blob_bytes: bytes.len() as i128,
-                    ..ContentStoreStatsDelta::default()
-                })?;
-            }
-            if blob_path.is_file()
-                && !file_content_hash(blob_path).is_ok_and(|actual| actual == hash)
-            {
-                remove_file_if_exists(blob_path)?;
             }
             return Ok(());
         }

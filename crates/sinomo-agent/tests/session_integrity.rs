@@ -347,7 +347,12 @@ impl AgentSessionStore for FailingStore {
             Ok(())
         }
     }
-    fn append_items(&self, _: &SessionId, _: &[AgentItem]) -> Result<(), AgentSessionStoreError> {
+    fn append_items(
+        &self,
+        _: &SessionId,
+        _: &AgentItemOrigin,
+        _: &[AgentItem],
+    ) -> Result<(), AgentSessionStoreError> {
         Ok(())
     }
     fn append_projection(
@@ -494,7 +499,12 @@ impl AgentSessionStore for SwitchableControlStore {
     fn save_session(&self, _: &AgentSession) -> Result<(), AgentSessionStoreError> {
         Ok(())
     }
-    fn append_items(&self, _: &SessionId, _: &[AgentItem]) -> Result<(), AgentSessionStoreError> {
+    fn append_items(
+        &self,
+        _: &SessionId,
+        _: &AgentItemOrigin,
+        _: &[AgentItem],
+    ) -> Result<(), AgentSessionStoreError> {
         Ok(())
     }
     fn append_projection(

@@ -11,7 +11,7 @@ impl LocalContentStore {
         version: &str,
         bytes: &[u8],
     ) -> Result<Option<ContentManifest>> {
-        if bytes.len() as u64 > PACKED_BLOB_SMALL_LIMIT_BYTES {
+        if bytes.len() as u64 > INLINE_BLOB_SMALL_LIMIT_BYTES {
             return Ok(None);
         }
         let _owner = self.content_mutation_guard()?;
@@ -59,14 +59,15 @@ impl LocalContentStore {
             content_hash: proposed.content_hash.clone(),
         };
         let prior_time = self
-            .reservation_copies_for_identity_unlocked(&identity)?
-            .iter()
-            .map(|record| record.reserved_at_unix_nanos)
-            .max();
+            .inline_reservation_state(&identity)?
+            .and_then(|state| match state {
+                InlineReservationState::Live(record) => Some(record.reserved_at_unix_nanos),
+                InlineReservationState::Released => None,
+            });
         let reservation = ContentStoreReservationRecord {
             identity: identity.clone(),
             reserved_at_unix_nanos: refreshed_reservation_timestamp(prior_time),
-            causal_stamp: Some(reservation_guard.sentinel.stamp()),
+            causal_stamp: reservation_guard.sentinel.stamp(),
         };
         let reuse_payload = self.inline_blob_entry(&proposed.content_hash)?.is_some();
         if reuse_payload && !self.has_blob(&proposed.content_hash)? {
@@ -124,7 +125,7 @@ impl LocalContentStore {
         hash: &str,
         size_bytes: u64,
     ) -> Result<Option<ContentManifest>> {
-        if size_bytes > PACKED_BLOB_SMALL_LIMIT_BYTES {
+        if size_bytes > INLINE_BLOB_SMALL_LIMIT_BYTES {
             return Ok(None);
         }
         let _owner = self.content_mutation_guard()?;
@@ -218,7 +219,7 @@ mod tests {
             panic!("one stage record");
         };
         assert_eq!(reservation.identity, identity(&staged));
-        assert_eq!(reservation.causal_stamp, Some(cut.stamp));
+        assert_eq!(reservation.causal_stamp, cut.stamp);
         assert_eq!(size_bytes, b"exact staged bytes".len() as u64);
         assert!(matches!(
             read_frame(&mut file, &path, frame_limits()).unwrap(),
@@ -473,6 +474,7 @@ mod tests {
             .put_object_version_patch("object", "v1", "v2", 1, b"B")
             .unwrap();
         assert!(!patch.extents.is_empty());
+        assert!(!store.blob_path(&patch.content_hash).unwrap().exists());
         assert_eq!(
             store
                 .put_object_version_blob_only("object", "v2", b"aBcdef")
@@ -485,6 +487,11 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        assert_eq!(
+            store.read_object_version("object", "v2").unwrap().1,
+            b"aBcdef"
+        );
+        assert!(!store.blob_path(&patch.content_hash).unwrap().exists());
         let before = sequence(&store);
         store
             .put_object_version_blob_only("empty", "v1", &[])
@@ -558,5 +565,35 @@ mod tests {
                     .any(|record| record.identity == identity(&staged))
             );
         }
+    }
+    #[test]
+    fn blob_only_extent_reuse_rejects_actual_payload_corruption_without_flattening() {
+        let (_root, _owner, store) = active_store("dfs-inline-blob-stage-corrupt-extent");
+        let mut expected = vec![b'a'; INLINE_BLOB_SMALL_LIMIT_BYTES as usize + 1];
+        let base = store.put_object_version("object", "v1", &expected).unwrap();
+        let patch = store
+            .put_object_version_patch("object", "v1", "v2", 1, b"B")
+            .unwrap();
+        expected[1] = b'B';
+        assert_eq!(patch.content_hash, content_hash(&expected));
+        assert!(!patch.extents.is_empty());
+        let base_path = store.blob_path(&base.content_hash).unwrap();
+        assert!(
+            base_path.is_file(),
+            "normal producer selected a loose extent payload"
+        );
+        write_file_atomic(&base_path, &vec![b'c'; expected.len()]).unwrap();
+        assert!(matches!(
+            store.put_object_version_blob_only("object", "v2", &expected),
+            Err(ContentStoreError::InvalidContentLayout { .. })
+        ));
+        assert_eq!(store.read_manifest("object", "v2").unwrap(), patch);
+        assert!(!store.blob_path(&patch.content_hash).unwrap().exists());
+        assert!(
+            store
+                .inline_blob_entry(&patch.content_hash)
+                .unwrap()
+                .is_none()
+        );
     }
 }

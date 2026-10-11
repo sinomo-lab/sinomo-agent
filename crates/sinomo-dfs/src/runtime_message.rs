@@ -1,6 +1,6 @@
 use crate::{
     DfsFileSystemId, DfsInboundAttachment, DfsMessageCommand, DfsMessageCommittedWork,
-    DfsMessageResponse, DfsMetadataShardId, DfsNetworkMessage, DfsNodeServedMessageTransport,
+    DfsMessageResponse, DfsMetadataShardId, DfsNetworkMessage, DfsNodeTransport,
     DfsOutboundAttachment, LocalContentStore, NetworkedDfsService,
     ResidentLocalMetadataShardHandle, ResidentLocalShardedMetadataBackend,
 };
@@ -19,26 +19,206 @@ use std::time::{Duration, Instant};
 
 pub(crate) const DFS_ATTACHMENT_INGEST_BUFFERED_CHUNKS: usize = 4;
 
-pub(crate) type DfsRuntimeMessageService = NetworkedDfsService<DfsNodeServedMessageTransport>;
+/// Checkpoint only the exact actual named transfer observed before dispatch.
+/// This is queue DATA reconciliation, not metadata receipt/effect authority.
+pub(crate) fn checkpoint_detached_replica_delivery(
+    data_dir: &sinomo_core::local::SinomoDataDir,
+    event: crate::node_transport::DfsBackgroundReplicaDeliveryEvent,
+) -> Result<Option<crate::DfsRepairAttemptRecord>, crate::DfsError> {
+    use crate::node_transport::DfsBackgroundReplicaDeliveryEvent;
+    use sinomo_api::dfs::maintenance::DfsRepairTransferKind;
+    use sinomo_core::network::NetworkDeliveryState;
+    let store = crate::repair_queue_store::LocalDfsRepairQueueStore::new(
+        crate::default_dfs_repair_attempt_snapshot_path(data_dir),
+    );
+    let matches = |message: &crate::DfsRoutedMessage, record: &crate::DfsRepairAttemptRecord| {
+        let DfsNetworkMessage::RepairReplica(command) = &message.message else {
+            return false;
+        };
+        command.background_repair
+            && record.transfer_kind == Some(DfsRepairTransferKind::Repair)
+            && record.transfer_request_id.as_ref() == Some(&command.request_id)
+            && record.completed_transfer_request_id.is_none()
+            && record.intent_id == command.intent_id
+            && record.object_id == command.object_id
+            && record.version == command.version
+            && record.content_hash == command.content_hash
+            && record.missing_replica_node_id == message.target_node_id
+    };
+    match event {
+        DfsBackgroundReplicaDeliveryEvent::BeforeDispatch { message } => {
+            let DfsNetworkMessage::RepairReplica(command) = &message.message else {
+                return Err(crate::DfsError::Distributed {
+                    message: "detached delivery observation requires its actual repair command"
+                        .into(),
+                });
+            };
+            let (records, _) = store.observe_transfer_targets(
+                &command.intent_id,
+                std::slice::from_ref(&message.target_node_id),
+            )?;
+            let Some(record) = records.into_iter().next() else {
+                return Ok(None);
+            };
+            if !matches(&message, &record) {
+                return Err(crate::DfsError::Distributed {
+                    message: "detached repair differs from its named durable custody".into(),
+                });
+            }
+            Ok(Some(record))
+        }
+        DfsBackgroundReplicaDeliveryEvent::Failed {
+            message,
+            before,
+            producer,
+            delivery_state,
+            last_error,
+        } => {
+            if !matches(&message, &before) {
+                return Err(crate::DfsError::Distributed {
+                    message: "detached repair outcome differs from its pre-dispatch custody".into(),
+                });
+            }
+            let mut desired = before.clone();
+            desired.transfer_delivery_state = if producer.retrying_unresolved_transfer {
+                crate::service_repair::join_transfer_delivery(
+                    producer.previous_transfer_delivery_state,
+                    delivery_state,
+                )
+            } else {
+                delivery_state
+            };
+            desired.in_flight = false;
+            if desired.transfer_delivery_state == Some(NetworkDeliveryState::DefinitelyNotSent) {
+                desired.transfer_request_id = None;
+            }
+            desired.last_error = Some(last_error);
+            let now = crate::dfs_now_unix_nanos();
+            desired.last_attempt_unix_nanos = now;
+            let ticks = crate::service_repair::repair_retry_delay_ticks_for_error(
+                desired.attempts,
+                desired.last_error.as_deref(),
+            );
+            desired.next_retry_unix_nanos =
+                now.saturating_add(crate::transfer::repair_retry_delay_nanos_for_ticks(ticks));
+            store.checkpoint_transfer_record(&before, &desired)?;
+            Ok(None)
+        }
+    }
+}
+
+pub(crate) type DfsRuntimeMessageService = NetworkedDfsService<DfsNodeTransport>;
 pub(crate) type DfsRuntimeTask = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
-static DFS_RUNTIME_MESSAGE_CACHE: OnceLock<Mutex<BTreeMap<PathBuf, DfsRuntimeMessageCacheEntry>>> =
-    OnceLock::new();
+static DFS_RUNTIME_MESSAGE_CACHE: OnceLock<DfsRuntimeMessageCache> = OnceLock::new();
+
+/// One cache with a short root registry lock. Store/lane generation ownership
+/// remains serialized by the selected actual data root, never by other roots.
+#[derive(Default)]
+pub(crate) struct DfsRuntimeMessageCache {
+    roots: Mutex<BTreeMap<PathBuf, Arc<Mutex<Option<DfsRuntimeMessageCacheEntry>>>>>,
+}
+
+impl DfsRuntimeMessageCache {
+    pub(crate) fn root(
+        &self,
+        root: &Path,
+    ) -> Result<Arc<Mutex<Option<DfsRuntimeMessageCacheEntry>>>, crate::DfsError> {
+        let root =
+            crate::runtime_host::dfs_runtime_message_cache_root(root, false).map_err(|error| {
+                crate::DfsError::Network {
+                    message: error.to_string(),
+                }
+            })?;
+        let root = root.as_path();
+        let mut roots = self.roots.lock().map_err(|_| Self::poisoned())?;
+        Ok(Arc::clone(
+            roots
+                .entry(root.to_path_buf())
+                .or_insert_with(|| Arc::new(Mutex::new(None))),
+        ))
+    }
+
+    pub(crate) fn existing_root(
+        &self,
+        root: &Path,
+    ) -> Result<Option<Arc<Mutex<Option<DfsRuntimeMessageCacheEntry>>>>, crate::DfsError> {
+        let root =
+            crate::runtime_host::dfs_runtime_message_cache_root(root, false).map_err(|error| {
+                crate::DfsError::Network {
+                    message: error.to_string(),
+                }
+            })?;
+        let root = root.as_path();
+        let roots = self.roots.lock().map_err(|_| Self::poisoned())?;
+        Ok(roots.get(root).cloned())
+    }
+
+    pub(crate) fn try_existing_root(
+        &self,
+        root: &Path,
+    ) -> Result<Option<Arc<Mutex<Option<DfsRuntimeMessageCacheEntry>>>>, crate::DfsError> {
+        let root =
+            crate::runtime_host::dfs_runtime_message_cache_root(root, true).map_err(|error| {
+                crate::DfsError::Network {
+                    message: error.to_string(),
+                }
+            })?;
+        let root = root.as_path();
+        let roots = match self.roots.try_lock() {
+            Ok(roots) => roots,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(crate::DfsError::Network {
+                    message: "bounded DFS status unavailable while the resident generation cache is being updated".into(),
+                });
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(Self::poisoned()),
+        };
+        Ok(roots.get(root).cloned())
+    }
+
+    pub(crate) fn evict(&self, root: &Path) -> Result<bool, crate::DfsError> {
+        let root =
+            crate::runtime_host::dfs_runtime_message_cache_root(root, false).map_err(|error| {
+                crate::DfsError::Network {
+                    message: error.to_string(),
+                }
+            })?;
+        let root = root.as_path();
+        let Some(slot) = self.existing_root(root)? else {
+            return Ok(false);
+        };
+        let mut entry = slot.lock().map_err(|_| Self::poisoned())?;
+        let removed = entry.take();
+        let was_present = removed.is_some();
+        // Drop all idle backend-bearing ownership before permitting another
+        // caller at this root to initialize its replacement.
+        drop(removed);
+        let mut roots = self.roots.lock().map_err(|_| Self::poisoned())?;
+        if roots
+            .get(root)
+            .is_some_and(|stored| Arc::ptr_eq(stored, &slot))
+            && Arc::strong_count(&slot) == 2
+        {
+            // No queued or active caller owns this empty slot. Root->registry
+            // is the only nested order; every lookup drops registry ownership
+            // before acquiring any root lock. Otherwise keep this SAME slot so
+            // an already-queued caller cannot create a parallel generation.
+            roots.remove(root);
+        }
+        Ok(was_present)
+    }
+
+    fn poisoned() -> crate::DfsError {
+        crate::DfsError::Network {
+            message: "daemon DFS message service cache lock poisoned".into(),
+        }
+    }
+}
 
 static DFS_DETACHED_SEND_RUNTIMES: OnceLock<
     Mutex<BTreeMap<DfsDetachedSendRuntimeKey, Arc<DfsDetachedSendRuntime>>>,
 > = OnceLock::new();
-
-static DFS_RUNTIME_PEER_DISCOVERY_CACHE: OnceLock<
-    Mutex<BTreeMap<PathBuf, DfsRuntimePeerDiscoveryCacheEntry>>,
-> = OnceLock::new();
-
-#[derive(Clone, Debug)]
-struct DfsRuntimePeerDiscoveryCacheEntry {
-    cluster_state: Arc<sinomo_core::ClusterBootstrapState>,
-    peer_node_ids: Vec<NodeId>,
-    validated_at: Instant,
-}
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct DfsDetachedSendRuntimeKey {
@@ -76,77 +256,6 @@ pub(crate) struct DfsRuntimeMessagePeerSnapshot {
 /// discovery projection. The local bootstrap checkpoint can omit members that
 /// have already joined through KV. This routing view does not grant mutation
 /// authority; transport and metadata admission retain their own checks.
-pub(crate) fn read_dfs_runtime_message_peer_snapshot(
-    cluster_paths: &ClusterPaths,
-    validation_lease: Duration,
-) -> Result<Option<DfsRuntimeMessagePeerSnapshot>, crate::DfsError> {
-    let state = match sinomo_core::cluster::read_cluster_state_cached_shared(cluster_paths) {
-        Ok(state) => state,
-        Err(sinomo_core::network::NetworkError::ClusterOrphan) => return Ok(None),
-        Err(error) => return Err(crate::DfsError::from_network(error)),
-    };
-    let cache_key = cluster_paths.root.clone();
-    let cached_peer_node_ids = DFS_RUNTIME_PEER_DISCOVERY_CACHE
-        .get_or_init(|| Mutex::new(BTreeMap::new()))
-        .lock()
-        .ok()
-        .and_then(|cache| cache.get(&cache_key).cloned())
-        .filter(|cached| {
-            Arc::ptr_eq(&cached.cluster_state, &state)
-                && cached.validated_at.elapsed() <= validation_lease
-        })
-        .map(|cached| cached.peer_node_ids);
-    let peer_node_ids = match cached_peer_node_ids {
-        Some(peer_node_ids) => peer_node_ids,
-        None => {
-            let peer_node_ids = crate::discovered_cluster_dfs_peer_node_ids(cluster_paths, &state)?;
-            if let Ok(mut cache) = DFS_RUNTIME_PEER_DISCOVERY_CACHE
-                .get_or_init(|| Mutex::new(BTreeMap::new()))
-                .lock()
-            {
-                cache.insert(
-                    cache_key,
-                    DfsRuntimePeerDiscoveryCacheEntry {
-                        cluster_state: Arc::clone(&state),
-                        peer_node_ids: peer_node_ids.clone(),
-                        validated_at: Instant::now(),
-                    },
-                );
-            }
-            peer_node_ids
-        }
-    };
-    Ok(Some(DfsRuntimeMessagePeerSnapshot {
-        cluster_id: state.cluster_id.clone(),
-        local_node_id: state.local_node_id.clone(),
-        peer_node_ids,
-    }))
-}
-
-#[cfg(test)]
-pub(crate) fn test_expire_dfs_runtime_peer_discovery_cache(
-    cluster_paths: &ClusterPaths,
-    validation_lease: Duration,
-) {
-    if let Ok(mut cache) = DFS_RUNTIME_PEER_DISCOVERY_CACHE
-        .get_or_init(|| Mutex::new(BTreeMap::new()))
-        .lock()
-        && let Some(entry) = cache.get_mut(&cluster_paths.root)
-        && let Some(validated_at) =
-            Instant::now().checked_sub(validation_lease.saturating_add(Duration::from_millis(1)))
-    {
-        entry.validated_at = validated_at;
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn test_clear_dfs_runtime_peer_discovery_cache(cluster_paths: &ClusterPaths) {
-    if let Some(cache) = DFS_RUNTIME_PEER_DISCOVERY_CACHE.get()
-        && let Ok(mut cache) = cache.lock()
-    {
-        cache.remove(&cluster_paths.root);
-    }
-}
 
 /// Process-resident durable-send state shared by every DFS message lane for
 /// one local cluster identity.
@@ -291,15 +400,18 @@ impl DfsDetachedSendRuntime {
                 break;
             };
             let mut attempt_worker = active_worker.clone();
-            let result =
-                match tokio::task::spawn_blocking(move || attempt_worker.drain_exclusive()).await {
-                    Ok(result) => result,
-                    Err(error) => {
-                        tracing::warn!("DFS deferred worker task failed: {error}");
-                        tokio::time::sleep(retry_delay).await;
-                        continue;
-                    }
-                };
+            let (result, background_retry) = match tokio::task::spawn_blocking(move || {
+                attempt_worker.drain_exclusive_with_retry_observation()
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    tracing::warn!("DFS deferred worker task failed: {error}");
+                    tokio::time::sleep(retry_delay).await;
+                    continue;
+                }
+            };
             if let Err(error) = result {
                 tracing::warn!("DFS deferred served-message work failed; retrying: {error}");
             }
@@ -319,7 +431,20 @@ impl DfsDetachedSendRuntime {
                     break;
                 }
             };
-            if ready || current_generation != observed_generation {
+            if current_generation != observed_generation {
+                continue;
+            }
+            if background_retry {
+                if let Err(error) = active_worker
+                    .wait_for_background_delivery_retry(outbox_generation, retry_delay)
+                    .await
+                {
+                    tracing::warn!("DFS deferred send wait failed: {error}");
+                    tokio::time::sleep(retry_delay).await;
+                }
+                continue;
+            }
+            if ready {
                 continue;
             }
             #[cfg(test)]
@@ -812,9 +937,8 @@ pub(crate) fn dfs_runtime_message_supports_exact_service_lane(command: &DfsMessa
     )
 }
 
-pub(crate) fn dfs_runtime_message_cache()
--> &'static Mutex<BTreeMap<PathBuf, DfsRuntimeMessageCacheEntry>> {
-    DFS_RUNTIME_MESSAGE_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
+pub(crate) fn dfs_runtime_message_cache() -> &'static DfsRuntimeMessageCache {
+    DFS_RUNTIME_MESSAGE_CACHE.get_or_init(DfsRuntimeMessageCache::default)
 }
 
 pub(crate) fn dfs_detached_send_runtime_for_identity(
@@ -880,6 +1004,10 @@ impl Deref for DfsRuntimeMessageServiceLaneHandle {
 
 #[derive(Debug)]
 pub(crate) struct DfsRuntimeMessageExecution {
+    pub remote_namespace_phase: Option<(
+        DfsMessageCommand,
+        Box<crate::source_adoption::RemoteNamespacePhase>,
+    )>,
     pub process_report: crate::DfsMessageProcessReport,
     pub committed_work: DfsMessageCommittedWork,
     pub replica_materialization_shard:
@@ -891,6 +1019,8 @@ pub(crate) struct DfsRuntimeMessageExecution {
         )>,
         crate::DfsError,
     >,
+    #[cfg(test)]
+    pub new_repair_records_unattempted: bool,
     pub repair_queue_record_count: usize,
     pub repair_queue_persistence: Result<usize, crate::DfsError>,
     pub exact_projection_release_error: Option<crate::DfsError>,
@@ -914,6 +1044,8 @@ pub(crate) fn execute_runtime_message_command_with_verified_fetch<F>(
     preingested_blob: Option<crate::ContentStoreQuarantinedBlob>,
     execution_scope: &crate::DfsMessageExecutionScope,
     verified_fetch: Option<crate::service_fetch_transfer::VerifiedDfsBlobFetch>,
+    publication_owners: Option<Arc<crate::publication_guard::DfsPublicationExecutionOwners>>,
+    completed_phase: Option<crate::source_adoption::CompletedRemoteNamespacePhase>,
     persist_repair_records: F,
 ) -> Result<DfsRuntimeMessageExecution, crate::DfsError>
 where
@@ -942,6 +1074,8 @@ where
                 .to_string(),
         });
     }
+    let _publication_scope =
+        publication_owners.map(|owners| service_lane.service.publication_execution.install(owners));
     service_lane.refresh_peer_targets(peer_node_ids);
     let resident_metadata_scope = service_lane.resident_metadata_scope.clone();
     let backend_checkout_started = std::time::Instant::now();
@@ -949,6 +1083,31 @@ where
         scope.attach(&mut service_lane.service)?;
     }
     let backend_checkout = backend_checkout_started.elapsed();
+    if let Some(completed) = completed_phase {
+        service_lane
+            .service
+            .complete_remote_namespace_phase(completed)?;
+    }
+    // Diagnostic DATA from the SAME decoded reply; no attachment or getter.
+    let repair_reply_observation = if tracing::enabled!(target: "sinomo.dfs.perf", tracing::Level::TRACE)
+        && let crate::DfsNetworkMessage::RepairReplicaResponse(response) =
+            &command.routed_message.message
+    {
+        Some((
+            command.routed_message.source_node_id.clone(),
+            command.routed_message.target_node_id.clone(),
+            command.routed_message.frame_id,
+            command.routed_message.message_id,
+            response.clone(),
+        ))
+    } else {
+        None
+    };
+    let resume_command = matches!(
+        &command.routed_message.message,
+        crate::DfsNetworkMessage::NamespaceRequest(_)
+    )
+    .then(|| command.clone());
     let process_started = std::time::Instant::now();
     let committed_work_tracker = crate::DfsCommittedWorkTracker::new();
     service_lane
@@ -962,6 +1121,28 @@ where
             .service
             .process_message_command_report_with_preingested_blob(command, preingested_blob),
     };
+    if let Some((source, target, frame_id, message_id, response)) = repair_reply_observation {
+        match &process_report.outcome {
+            Ok(result) => tracing::trace!(target: "sinomo.dfs.perf",
+                source = %source, target = %target, frame_id, message_id,
+                response = ?response, events = ?result.events,
+                "normal Main decoded repair reply and actual process events"),
+            Err(error) => tracing::trace!(target: "sinomo.dfs.perf",
+                source = %source, target = %target, frame_id, message_id,
+                response = ?response, error = %error,
+                "normal Main decoded repair reply execution failed"),
+        }
+    }
+    let remote_namespace_phase = service_lane
+        .service
+        .remote_namespace_phase
+        .take()
+        .map(|phase| {
+            (
+                resume_command.expect("only native namespace commands yield a remote phase"),
+                phase,
+            )
+        });
     let replica_materialization_shard = process_report
         .committed_work
         .metadata_materialization
@@ -1008,6 +1189,10 @@ where
     } else {
         std::mem::take(&mut process_report.committed_repair_records)
     };
+    #[cfg(test)]
+    let new_repair_records_unattempted = repair_queue_records
+        .iter()
+        .all(|record| record.attempts == 0 && !record.in_flight);
     let committed_work = committed_work_tracker.take();
     let repair_queue_record_count = repair_queue_records.len();
     let repair_queue_started = std::time::Instant::now();
@@ -1040,10 +1225,13 @@ where
     let process = process_started.elapsed();
     drop(service_lane);
     Ok(DfsRuntimeMessageExecution {
+        remote_namespace_phase,
         process_report,
         committed_work,
         replica_materialization_shard,
         deferred_work,
+        #[cfg(test)]
+        new_repair_records_unattempted,
         repair_queue_record_count,
         repair_queue_persistence,
         exact_projection_release_error,
@@ -1102,6 +1290,7 @@ pub(crate) async fn ingest_dfs_message_attachment(
 > {
     ingest_dfs_message_attachment_with_owner(
         content,
+        None,
         command,
         attachment,
         (),
@@ -1115,6 +1304,7 @@ pub(crate) async fn ingest_dfs_message_attachment(
 /// its worker still owns that capability through cleanup or finalization.
 pub(crate) async fn ingest_dfs_message_attachment_with_owner<G: Send + 'static>(
     content: Option<LocalContentStore>,
+    snapshot_root: Option<std::path::PathBuf>,
     mut command: DfsMessageCommand,
     attachment: Option<DfsInboundAttachment>,
     ingest_owner: G,
@@ -1129,6 +1319,24 @@ pub(crate) async fn ingest_dfs_message_attachment_with_owner<G: Send + 'static>(
     let Some(attachment) = attachment else {
         return Ok((command, None));
     };
+    if let DfsNetworkMessage::MetadataSnapshotInstall(snapshot) =
+        &mut command.routed_message.message
+    {
+        let root = snapshot_root.ok_or_else(|| crate::DfsError::Distributed {
+            message: "native snapshot receive has no actual owned root".into(),
+        })?;
+        snapshot.image = Some(
+            ingest_native_snapshot_attachment(
+                root,
+                snapshot.snapshot.clone(),
+                attachment,
+                ingest_owner,
+                traceparent,
+            )
+            .await?,
+        );
+        return Ok((command, None));
+    }
     let content = content.ok_or_else(|| crate::DfsError::Distributed {
         message: "streamed DFS attachment is missing its shared content store".to_string(),
     })?;
@@ -1222,6 +1430,65 @@ pub(crate) async fn ingest_dfs_message_attachment_with_owner<G: Send + 'static>(
     Ok((command, Some(blob)))
 }
 
+/// Stream the sole native record image through the SAME owned/chunk worker.
+/// It stages DATA only; the normal replica admission/permit path still owns
+/// installation and revalidates current source/config/handoff after this wait.
+pub(crate) async fn ingest_native_snapshot_attachment<G: Send + 'static>(
+    root: std::path::PathBuf,
+    descriptor: crate::DfsMetadataSnapshotImageDescriptor,
+    attachment: DfsInboundAttachment,
+    ingest_owner: G,
+    traceparent: Option<String>,
+) -> Result<crate::DfsMetadataSnapshotImage, crate::DfsError> {
+    descriptor.validate()?;
+    if attachment.descriptor.total_size_bytes != descriptor.total_size_bytes {
+        return Err(crate::DfsError::Distributed {
+            message: "native snapshot attachment/head length differs".into(),
+        });
+    }
+    crate::body_rpc::validate_incoming_attachment_length(
+        &attachment.descriptor,
+        &attachment.body,
+        "native snapshot",
+    )
+    .map_err(crate::DfsError::from_network)?;
+    let mut body = attachment.body;
+    let (sender, mut receiver) =
+        tokio::sync::mpsc::channel::<ObjectRpcBodyChunk>(DFS_ATTACHMENT_INGEST_BUFFERED_CHUNKS);
+    let worker = tokio::task::spawn_blocking(move || {
+        let result = crate::with_dfs_traceparent(traceparent.as_deref(), || {
+            let mut ingest = crate::DfsMetadataSnapshotImage::begin_received(&root, descriptor)?;
+            while let Some(chunk) = receiver.blocking_recv() {
+                ingest.write_chunk(chunk.as_ref())?;
+            }
+            ingest.finish()
+        });
+        // The actual root owner survives cancellation and image cleanup.
+        (result, ingest_owner)
+    });
+    let feed = loop {
+        match body.next_chunk().await {
+            Ok(Some(chunk)) => {
+                if sender.send(chunk).await.is_err() {
+                    break Ok(());
+                }
+            }
+            Ok(None) => break Ok(()),
+            Err(source) => {
+                break Err(crate::DfsError::Network {
+                    message: format!("read native snapshot image attachment: {source}"),
+                });
+            }
+        }
+    };
+    drop(sender);
+    let (result, _owner) = worker.await.map_err(|source| crate::DfsError::Network {
+        message: format!("native snapshot image task failed: {source}"),
+    })?;
+    feed?;
+    Ok(result?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1278,11 +1545,12 @@ mod tests {
                     message_id: 2,
                     message: DfsNetworkMessage::NamespaceResponse(DfsNamespaceResponse {
                         request_id: "reactive-event-namespace".to_string(),
+                        committed_work: Default::default(),
                         result,
                         synced_path_object: None,
                         synced_path_objects: Vec::new(),
                         metadata_journal_batches: Vec::new(),
-                        metadata_journal_has_more: Some(false),
+                        metadata_journal_has_more: false,
                         posix_coordination_result: None,
                     }),
                 }],
@@ -1313,5 +1581,44 @@ mod tests {
         assert!(!effects.replica_progress);
         assert!(!effects.repair_maintenance);
         assert!(effects.storage_environment);
+    }
+}
+
+#[cfg(test)]
+mod message_cache_registry_tests {
+    use super::*;
+
+    #[test]
+    fn empty_queued_root_slot_survives_eviction_without_a_parallel_cache() {
+        let cache = DfsRuntimeMessageCache::default();
+        let root = Path::new("pure-cache-root");
+        let current = cache.root(root).unwrap();
+        let queued = Arc::clone(&current);
+        assert!(current.lock().unwrap().is_none());
+        assert!(!cache.evict(root).unwrap());
+        let next = cache.root(root).unwrap();
+        assert!(Arc::ptr_eq(&queued, &next));
+        drop(next);
+        drop(queued);
+        drop(current);
+        assert!(!cache.evict(root).unwrap());
+        assert!(cache.existing_root(root).unwrap().is_none());
+    }
+
+    #[test]
+    fn empty_root_slot_poison_is_isolated_and_never_recovered_as_ready() {
+        let cache = DfsRuntimeMessageCache::default();
+        let first = cache.root(Path::new("pure-poisoned-root")).unwrap();
+        let doomed = Arc::clone(&first);
+        let panicked = std::thread::spawn(move || {
+            let _empty = doomed.lock().unwrap();
+            panic!("negative fault poisons only this empty DATA cache slot");
+        })
+        .join();
+        assert!(panicked.is_err());
+        assert!(first.lock().is_err());
+        assert!(cache.evict(Path::new("pure-poisoned-root")).is_err());
+        let other = cache.root(Path::new("pure-unrelated-root")).unwrap();
+        assert!(other.lock().unwrap().is_none());
     }
 }

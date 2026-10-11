@@ -614,14 +614,19 @@ mod tests {
         caller.abort();
         let _ = caller.await;
         release.send(()).unwrap();
+        let store = paths.kv_paths().raft_store();
+        let wal_paths = store.wal_paths(&local);
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                let node = paths.kv_paths().raft_store().open_node(&local).unwrap();
-                if node.hard_state().current_term == 8 {
-                    assert!(node.hard_state().leader_id.is_none());
+                // Observe durable state without repeatedly checking out the
+                // resident node needed by the send owner's try-admission worker.
+                let hard_state = wal_paths.read_persisted_hard_state().unwrap();
+                if hard_state.current_term == 8
+                    && store.pending_higher_term(&local).unwrap().is_none()
+                {
+                    assert!(hard_state.leader_id.is_none());
                     break;
                 }
-                drop(node);
                 tokio::task::yield_now().await;
             }
         })

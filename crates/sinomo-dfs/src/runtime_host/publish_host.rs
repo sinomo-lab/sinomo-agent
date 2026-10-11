@@ -243,6 +243,12 @@ pub(super) fn start_daemon_dfs_replica_materialization_on_runtime(
     // The accepted journal is durable. Keep producer admission through
     // registration, then retain only identity/data ownership while queued.
     // Replay resolves the current canonical generation after admission.
+    #[cfg(any(test, feature = "test-support"))]
+    let materialization_capture = materialization_test::capture(&data_dir, &shard);
+    #[cfg(any(test, feature = "test-support"))]
+    let materialization_observer = materialization_capture
+        .as_ref()
+        .map(|capture| capture.task_observer());
     drop(shard);
     let lane = Arc::new(DaemonDfsReplicaMaterializationLane {
         data_dir,
@@ -259,6 +265,8 @@ pub(super) fn start_daemon_dfs_replica_materialization_on_runtime(
     let report_shard_id = shard_id.clone();
     let error_file_system_id = file_system_id;
     let error_shard_id = shard_id;
+    #[cfg(any(test, feature = "test-support"))]
+    let materialization_capture = Arc::new(Mutex::new(materialization_capture));
     let (_, task) = crate::schedule_dfs_metadata_publish_async_on_runtime_owned(
         Arc::clone(&scheduler),
         runtime.clone(),
@@ -269,12 +277,27 @@ pub(super) fn start_daemon_dfs_replica_materialization_on_runtime(
         move || {
             let lane = Arc::clone(&lane);
             let scheduler = Arc::clone(&scheduler);
+            #[cfg(any(test, feature = "test-support"))]
+            let materialization_capture = materialization_capture
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take();
             async move {
+                #[cfg(any(test, feature = "test-support"))]
+                if let Some(capture) = materialization_capture {
+                    capture.wait().await;
+                }
                 use crate::DfsMetadataPublishPlanningAttempt::{Complete, WaitForResidentShard};
                 let mut observation = crate::background_observation::DfsBackgroundObservation::new(
                     "materialization",
                     "journal",
                 );
+                let task_owner = registered_dfs_runtime_host(&lane.data_dir)
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| {
+                        "DFS replica materialization has no registered runtime task owner"
+                            .to_string()
+                    })?;
                 let materialized = loop {
                     let cluster_paths = ClusterPaths::new(&lane.data_dir);
                     let peer_snapshot = ensure_daemon_dfs_metadata_publish_resident_generation(
@@ -291,7 +314,8 @@ pub(super) fn start_daemon_dfs_replica_materialization_on_runtime(
                     let attempt = sinomo_dfs::run_metadata_publish_lane_planning_with_admission(
                         Arc::clone(&lane.mutation_scheduler),
                         lane.lane.clone(),
-                        move || {
+                        task_owner.as_ref(),
+                        move |_admission| {
                             // This closure and the helper's admission move
                             // into the blocking task. Cancelling the scheduler
                             // cannot release either capability during replay.
@@ -317,9 +341,20 @@ pub(super) fn start_daemon_dfs_replica_materialization_on_runtime(
                             // Replay consumes every append accepted before this
                             // claim, including notifications coalesced while queued.
                             scheduler.claim_pending_requests();
-                            let materialized = materialize_lane
-                                .materialize(backend)
-                                .map_err(|error| error.to_string())?;
+                            let materialized = {
+                                #[cfg(any(test, feature = "test-support"))]
+                                let _native_boundary =
+                                    crate::native_shard_trace::enter_resident_replica_boundary_context(
+                                        &materialize_lane.data_dir.root(),
+                                        &materialize_lane._data_owner_lock,
+                                        &shard,
+                                        &peer_snapshot.local_node_id,
+                                        _admission,
+                                    );
+                                materialize_lane
+                                    .materialize(backend)
+                                    .map_err(|error| error.to_string())?
+                            };
                             Ok(Complete(Some(materialized)))
                         },
                     )
@@ -353,6 +388,10 @@ pub(super) fn start_daemon_dfs_replica_materialization_on_runtime(
             );
         },
     );
+    #[cfg(any(test, feature = "test-support"))]
+    if let (Some(observer), Some(task)) = (materialization_observer, task.as_ref()) {
+        observer.record(task);
+    }
     drop(admission);
     task
 }
@@ -369,14 +408,20 @@ pub(super) async fn daemon_dfs_metadata_publish_discovery_lanes_async(
     let state = sinomo_core::cluster::read_cluster_state_without_kv_async(runtime, cluster_paths)
         .await
         .map_err(|error| format!("DFS metadata lanes lack cluster state: {error}"))?;
-    let preflight = warm_daemon_dfs_metadata_authority_for_identity_async(
+    // The same bounded projection budget covers native authority and routing.
+    // No-primary nodes still roll their resident metadata generation forward;
+    // their route read must join the actual native owner outside DFS admission.
+    let deadline = tokio::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    let authority = daemon_dfs_metadata_authority_generation_for_identity(
         cluster_paths,
         &state.cluster_id,
         &state.local_node_id,
-        runtime,
+        Some(runtime),
     )
-    .await
     .map_err(|error| format!("DFS metadata lanes lack authority projection: {error}"))?;
+    let preflight = warm_daemon_dfs_metadata_authority_before_deadline(authority, deadline)
+        .await
+        .map_err(|error| format!("DFS metadata lanes lack authority projection: {error}"))?;
     let authoritative = preflight
         .authority
         .retained_complete_prefix_for_generation(preflight.generation)
@@ -389,9 +434,11 @@ pub(super) async fn daemon_dfs_metadata_publish_discovery_lanes_async(
     let lanes =
         sinomo_dfs::metadata_publish_lanes_from_authority(&state.local_node_id, &authoritative)?;
     if lanes.is_empty() {
-        let peer_snapshot = read_daemon_dfs_message_peer_snapshot(cluster_paths)
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| "DFS metadata lanes lack a cluster peer snapshot".to_string())?;
+        let peer_snapshot =
+            read_daemon_dfs_message_peer_snapshot_before(cluster_paths, runtime, deadline)
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "DFS metadata lanes lack a cluster peer snapshot".to_string())?;
         ensure_daemon_dfs_idle_resident_generation_after_preflight(
             data_dir.clone(),
             cluster_paths.clone(),
@@ -417,17 +464,25 @@ async fn ensure_daemon_dfs_idle_resident_generation_after_preflight(
     runtime: tokio::runtime::Handle,
 ) -> Result<(), String> {
     let already_current = {
-        let cache = daemon_dfs_message_service_cache()
-            .lock()
+        let slot = daemon_dfs_message_service_cache()
+            .existing_root(&data_dir.root())
+            .map_err(|error| error.to_string())?;
+        let cache = slot
+            .as_ref()
+            .map(|slot| slot.lock())
+            .transpose()
             .map_err(|_| "DFS metadata resident cache is poisoned".to_string())?;
-        cache.get(&data_dir.root()).is_some_and(|entry| {
-            entry.signature.cluster_id == peer_snapshot.cluster_id
-                && entry.signature.local_node_id == peer_snapshot.local_node_id
-                && entry.signature.metadata_authority_generation == preflight.generation
-                && Arc::ptr_eq(&entry.metadata_authority_generation, &preflight.authority)
-                && entry.resident_metadata_initialized
-                && entry.resident_metadata_backend.is_some()
-        })
+        cache
+            .as_ref()
+            .and_then(|entry| entry.as_ref())
+            .is_some_and(|entry| {
+                entry.signature.cluster_id == peer_snapshot.cluster_id
+                    && entry.signature.local_node_id == peer_snapshot.local_node_id
+                    && entry.signature.metadata_authority_generation == preflight.generation
+                    && Arc::ptr_eq(&entry.metadata_authority_generation, &preflight.authority)
+                    && entry.resident_metadata_initialized
+                    && entry.resident_metadata_backend.is_some()
+            })
     };
     if already_current {
         return Ok(());
@@ -531,6 +586,11 @@ pub(super) async fn prepare_daemon_dfs_metadata_publish_with_replanning(
     // Native reads, exact-lane waits and every owner handoff share the
     // caller's original projection budget; a replan cannot restart it.
     let deadline = tokio::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    let task_owner = registered_dfs_runtime_host(&data_dir)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| {
+            "DFS metadata publish planning has no registered runtime task owner".to_string()
+        })?;
     for replan in 0..=2 {
         if tokio::time::Instant::now() >= deadline {
             return Err("DFS metadata publish planning projection deadline elapsed".to_string());
@@ -563,7 +623,8 @@ pub(super) async fn prepare_daemon_dfs_metadata_publish_with_replanning(
             sinomo_dfs::run_metadata_publish_lane_planning_with_admission(
             Arc::clone(&mutation_scheduler),
             lane.clone(),
-            move || {
+            task_owner.as_ref(),
+            move |_| {
                 if tokio::time::Instant::now() >= deadline {
                     return Err("DFS metadata publish planning projection deadline elapsed".to_string());
                 }
@@ -724,9 +785,11 @@ async fn ensure_daemon_dfs_metadata_publish_resident_generation_before_deadline(
     ),
     String,
 > {
-    let peer_snapshot = read_daemon_dfs_message_peer_snapshot(&cluster_paths)
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| "DFS metadata publish lacks a cluster peer snapshot".to_string())?;
+    let peer_snapshot =
+        read_daemon_dfs_message_peer_snapshot_before(&cluster_paths, &runtime, deadline)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "DFS metadata publish lacks a cluster peer snapshot".to_string())?;
     for replan in 0..=2 {
         let authority = daemon_dfs_metadata_authority_generation_for_identity(
             &cluster_paths,
@@ -989,6 +1052,12 @@ pub(super) fn schedule_daemon_dfs_metadata_publish_lane_on_runtime(
                 shard_id: shard_id.clone(),
             };
             async move {
+                let task_owner = registered_dfs_runtime_host(&data_dir)
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| {
+                        "DFS metadata publish execution has no registered runtime task owner"
+                            .to_string()
+                    })?;
                 let replication_options = daemon_dfs_metadata_replication_options();
                 let plan = prepare_daemon_dfs_metadata_publish_with_replanning(
                     mutation_scheduler,
@@ -1013,6 +1082,7 @@ pub(super) fn schedule_daemon_dfs_metadata_publish_lane_on_runtime(
                 // the scheduler future is cancelled during runtime shutdown.
                 sinomo_dfs::run_metadata_publish_blocking_execution(
                     runtime,
+                    task_owner.as_ref(),
                     data_owner_lock,
                     async move {
                         sinomo_dfs::execute_prepared_cluster_dfs_metadata_publish_with_async_peer_transport(
@@ -1124,20 +1194,7 @@ pub(super) async fn run_daemon_dfs_smoke_async(
             &data_dir,
             &cluster_paths,
             peer_transport,
-            Box::new(DaemonDfsControlPlaneKvClient::new_on_runtime(
-                &cluster_paths,
-                &runtime,
-            )),
-            daemon_dfs_control_plane_client_on_runtime(&cluster_paths, Some(&runtime)),
-            DfsDefaultClusterSmokeOptions {
-                bootstrap: DfsDefaultClusterBootstrapOptions {
-                    publish_cluster_control: false,
-                    materialize_local_metadata: false,
-                    local_zone: None,
-                    local_content_advertisement: None,
-                },
-                smoke: daemon_dfs_smoke_options(),
-            },
+            daemon_dfs_smoke_options(),
         )
     });
     let Some(report) = tokio::time::timeout(DAEMON_DFS_SMOKE_TIMEOUT, smoke_task)

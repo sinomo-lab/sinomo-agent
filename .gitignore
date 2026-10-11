@@ -1,11 +1,13 @@
 /target
 /dist
+/data
 /crates/*/target/
 /modules/*/*/target/
 /fixtures/*/target/
 /tmp
 /local
 /benchmark-results
+/crates/sinomo-agent/tests/scenarios/*.recorded.json
 /.codegraph/
 /_apalache-out/
 

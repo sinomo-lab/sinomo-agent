@@ -388,7 +388,6 @@ fn register_observe_metric_descriptors() {
         "sinomo.dfs.receipts",
         "sinomo.dfs.intents",
         "sinomo.dfs.pending_writes",
-        "sinomo.dfs.open_conflicts",
         "sinomo.dfs.pending_repairs",
         "sinomo.dfs.pending_namespace_jobs",
         "sinomo.dfs.failed_namespace_jobs",

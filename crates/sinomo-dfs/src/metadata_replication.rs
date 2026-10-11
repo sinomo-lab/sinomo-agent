@@ -8,10 +8,6 @@
 
 use crate::{DfsMetadataRejection, DfsMetadataRejectionCode};
 
-#[cfg(test)]
-#[path = "metadata_replication_tests/reference_outcomes.rs"]
-mod default_layout_reference_tests;
-
 use serde::{Deserialize, Serialize};
 use sinomo_core::cluster::ClusterKvPathsExt;
 use sinomo_core::local::SinomoDataDir;
@@ -31,9 +27,9 @@ use std::task::Poll;
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 
-use crate::maintenance::{
-    DfsMaintenanceExecutionExclusions, migrate_legacy_dfs_metadata_replication_cursor,
-};
+#[cfg(test)]
+use crate::cluster_dfs_peer_node_ids;
+use crate::maintenance::DfsMaintenanceExecutionExclusions;
 use crate::metadata_sharded_backend::ResidentMetadataReplicationCursorStatusObserver;
 use crate::node_transport::value_response_from_rpc_result;
 use crate::{
@@ -44,11 +40,11 @@ use crate::{
     DfsMetadataJournalFrameRecord, DfsMetadataPrefixProbe, DfsMetadataReplicaApplyReport,
     DfsMetadataReplicaIngestPermit, DfsMetadataReplicationSuppressionRecord,
     DfsMetadataShardConfig, DfsMetadataShardId, DfsMetadataShardMembershipHandoff,
-    DfsMetadataShardMigrationReport, DfsMetadataSnapshotInstallCommand,
-    DfsMetadataSnapshotInstallResponse, DfsMetadataSnapshotInstallResult, DfsNamespaceResult,
-    DfsObjectKind, DfsObjectRpcSendOptions, DfsObjectVersionRecord, DfsPeerTransport,
-    DfsPeerTransportFuture, DfsVersion, LocalShardedMetadataBackend, LocalSobjMetadataBackend,
-    NetworkedDfsServiceEvent, ResidentLocalMetadataShardLease, cluster_dfs_metadata_shards,
+    DfsMetadataSnapshotInstallCommand, DfsMetadataSnapshotInstallResponse,
+    DfsMetadataSnapshotInstallResult, DfsNamespaceResult, DfsObjectKind, DfsObjectRpcSendOptions,
+    DfsObjectVersionRecord, DfsPeerTransport, DfsPeerTransportFuture, DfsVersion,
+    LocalShardedMetadataBackend, LocalSobjMetadataBackend, NetworkedDfsServiceEvent,
+    ResidentLocalMetadataShardLease, cluster_dfs_metadata_shards,
     decode_dfs_metadata_journal_batch_rpc_response,
     decode_dfs_metadata_snapshot_install_rpc_response,
     default_dfs_metadata_replication_suppression_snapshot_path,
@@ -59,372 +55,19 @@ use crate::{
     put_local_dfs_metadata_replication_suppression,
     read_dfs_metadata_replication_suppression_snapshot, sifs_file_system_id,
 };
-#[cfg(test)]
-use crate::{cluster_dfs_peer_node_ids, metadata_journal_rejection_allows_snapshot_repair};
 use crate::{metadata_cursor, metadata_lock};
 
 static DFS_METADATA_REPLICATION_SUPPRESSION_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 pub(crate) const DFS_METADATA_UNREADABLE_REPLICA_SNAPSHOT_REPAIR_REASON: &str =
     "metadata replica durable state is unreadable and requires authoritative snapshot repair";
 
-fn metadata_backend_open_error_allows_snapshot_repair(error: &crate::MetadataBackendError) -> bool {
+pub(crate) fn metadata_backend_open_error_allows_snapshot_repair(
+    error: &crate::MetadataBackendError,
+) -> bool {
     if error.rejection_code().allows_snapshot_repair() {
         return true;
     }
     matches!(error, crate::MetadataBackendError::Serde(_))
-}
-
-/// A topology change may leave legacy objects on their former metadata shard.
-/// Both catalog inspection and all logical object mutations are bounded by
-/// this per-generation budget; a durable object-id cursor resumes the next
-/// generation without rescanning a settled prefix.
-const DEFAULT_SIFS_BOOTSTRAP_SHARD_MIGRATION_MUTATION_LIMIT: usize = 32;
-// Read-only journal projection has a separate byte bound from object/family
-// mutation work. Receipt-only suffixes should drain in a few productive passes.
-const DEFAULT_SIFS_MIGRATION_JOURNAL_ENTRY_LIMIT: usize = 1024;
-const DEFAULT_SIFS_MIGRATION_JOURNAL_BYTE_LIMIT: usize = 4 * 1024 * 1024;
-const DEFAULT_SIFS_BOOTSTRAP_SHARD_MIGRATION_PAGE_SIZE: usize = 32;
-const DEFAULT_SIFS_BOOTSTRAP_SHARD_MIGRATION_CURSOR_FORMAT_VERSION: u16 = 7;
-
-fn bool_is_false(value: &bool) -> bool {
-    !*value
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-struct DfsDefaultSifsMigrationGeneration {
-    file_system_id: DfsFileSystemId,
-    local_node_id: NodeId,
-    shards: Vec<DfsMetadataShardConfig>,
-    active_primary_shard_ids: Vec<DfsMetadataShardId>,
-    certified_replica_shard_ids: Vec<DfsMetadataShardId>,
-}
-
-impl DfsDefaultSifsMigrationGeneration {
-    fn same_authority(&self, other: &Self) -> bool {
-        self.file_system_id == other.file_system_id
-            && self.local_node_id == other.local_node_id
-            && self.shards == other.shards
-            && self.active_primary_shard_ids == other.active_primary_shard_ids
-    }
-}
-
-enum DfsDefaultSifsMigrationCursorRead {
-    Resume(Box<DfsDefaultSifsMigrationCursor>),
-    Restart,
-    AwaitingReplicaProgress,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-struct DfsDefaultSifsMigrationCursor {
-    format_version: u16,
-    generation: DfsDefaultSifsMigrationGeneration,
-    /// The ordered catalog reached a durable end-of-generation fence. Later
-    /// process generations can replay only the journal suffix instead of
-    /// rescanning every settled object after each daemon restart.
-    #[serde(default, skip_serializing_if = "bool_is_false")]
-    catalog_complete: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    after_object_id: Option<crate::DfsObjectId>,
-    /// Durable source-journal positions already converted into dirty-object
-    /// replay. They close the ordered-catalog race without restarting the
-    /// catalog for migration's own canonicalization writes.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    // SOBJ map keys are strings. Store the shard identifier's canonical
-    // string directly so a durable cursor round-trips without asking serde to
-    // reconstruct a tuple-newtype from a map-key token.
-    observed_journal_sequences: BTreeMap<String, u64>,
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
-    dirty_object_ids: BTreeSet<crate::DfsObjectId>,
-    /// Progress inside one journal entry whose affected-object set is larger
-    /// than the per-pass replay capacity. The entry itself remains the durable
-    /// source of truth; this cursor records only the settled sorted-ID prefix.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pending_journal_replay: Option<DfsDefaultSifsPendingJournalReplay>,
-    /// A large object family is copied in bounded pages. Source eviction is
-    /// deferred until every dependent record and the live object are durable
-    /// on the target.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pending_migration: Option<DfsDefaultSifsPendingMigration>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-struct DfsDefaultSifsPendingJournalReplay {
-    shard_id: DfsMetadataShardId,
-    sequence: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    after_object_id: Option<crate::DfsObjectId>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-struct DfsDefaultSifsPendingMigration {
-    object: crate::DfsObjectMetadata,
-    source_shard_id: DfsMetadataShardId,
-    target_shard_id: DfsMetadataShardId,
-    /// Exact source generations which may be evicted after target durability.
-    /// Keeping the records (rather than only shard IDs) fences a concurrent
-    /// source update that lands between the target/index stages and a later
-    /// bounded source-eviction pass.
-    writable_sources: Vec<DfsDefaultSifsPendingSource>,
-    /// Historical slots can retain immutable outcomes after their object was
-    /// evicted. Reconcile these independently of canonical object selection.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    reference_outcome_sources: Vec<DfsMetadataShardId>,
-    #[serde(default, skip_serializing_if = "bool_is_false")]
-    reference_outcomes_only: bool,
-    #[serde(default, skip_serializing_if = "bool_is_false")]
-    target_writable: bool,
-    #[serde(default, skip_serializing_if = "bool_is_false")]
-    source_fence_required: bool,
-    #[serde(default)]
-    source_epoch: u64,
-    #[serde(default)]
-    source_replayed_through_sequence: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    source_fence: Option<Box<crate::DfsNamespacePrepareRecord>>,
-    /// Exact operation input already observed in the source suffix. Ordinary
-    /// commits replace the table body with receipts immediately; retain this
-    /// single dependency until its effects and outcome are fully projected.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    source_prepare: Option<Box<crate::DfsNamespacePrepareRecord>>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    retired_source_fences: Vec<crate::DfsNamespacePrepareRecord>,
-    /// Catalog items advance the ordered cursor only after every physical
-    /// stage completes; dirty replays never move that cursor backwards or
-    /// forwards.
-    catalog_object: bool,
-    counts_as_migration: bool,
-    stage: DfsDefaultSifsPendingMigrationStage,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-struct DfsDefaultSifsPendingSource {
-    shard_id: DfsMetadataShardId,
-    object: crate::DfsObjectMetadata,
-    /// Last source journal sequence whose object-family effects are durable on
-    /// the target. Source eviction atomically fences this exact prefix.
-    #[serde(default)]
-    replayed_through_sequence: u64,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-enum DfsDefaultSifsPendingMigrationStage {
-    EnsureFileSystem,
-    Versions {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        after_version: Option<crate::DfsObjectVersionPageCursor>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        active_version: Option<DfsVersion>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        after_receipt: Option<crate::DfsReplicaReceiptPageCursor>,
-    },
-    ClearPinTransfers {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        after_transfer_id: Option<String>,
-    },
-    ClearVersionPins {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        after: Option<crate::DfsMetadataVersionPinPageCursor>,
-    },
-    PinTransfers {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        after_transfer_id: Option<String>,
-    },
-    VersionPins {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        after: Option<crate::DfsMetadataVersionPinPageCursor>,
-    },
-    Intents {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        after: Option<crate::DfsWriteIntentPageCursor>,
-    },
-    ReferenceOutcomes {
-        next_source: usize,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        after_transaction_id: Option<String>,
-        #[serde(default, skip_serializing_if = "bool_is_false")]
-        retention_merged: bool,
-    },
-    Conflicts {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        after: Option<crate::DfsConflictPageCursor>,
-    },
-    ObjectAndLock,
-    SourceFence,
-    SourceJournal,
-    Index,
-    SourceEvictions {
-        next_source: usize,
-    },
-    Complete,
-}
-
-#[derive(Debug)]
-struct DfsDefaultSifsMigrationPassBudget {
-    remaining_family_records: usize,
-    remaining_physical_mutations: usize,
-    physical_mutations: usize,
-}
-
-impl DfsDefaultSifsMigrationPassBudget {
-    fn new(limit: usize) -> Self {
-        Self {
-            remaining_family_records: limit,
-            remaining_physical_mutations: limit,
-            physical_mutations: 0,
-        }
-    }
-
-    fn can_read_family_record(&self) -> bool {
-        self.remaining_family_records > 0
-    }
-
-    fn charge_family_record(&mut self) {
-        self.remaining_family_records = self.remaining_family_records.saturating_sub(1);
-    }
-
-    fn can_mutate(&self) -> bool {
-        self.remaining_physical_mutations > 0
-    }
-
-    fn charge_mutation(&mut self) {
-        self.remaining_physical_mutations = self.remaining_physical_mutations.saturating_sub(1);
-        self.physical_mutations = self.physical_mutations.saturating_add(1);
-    }
-}
-
-fn default_sifs_migration_generation(
-    file_system_id: &DfsFileSystemId,
-    local_node_id: &NodeId,
-    all_shards: &[DfsMetadataShardConfig],
-    active_primary_shard_ids: &BTreeSet<DfsMetadataShardId>,
-    certified_replica_shard_ids: &BTreeSet<DfsMetadataShardId>,
-) -> DfsDefaultSifsMigrationGeneration {
-    let mut shards = all_shards
-        .iter()
-        .filter(|shard| shard.file_system_id == *file_system_id)
-        .cloned()
-        .collect::<Vec<_>>();
-    shards.sort_by(|left, right| left.shard_id.cmp(&right.shard_id));
-    DfsDefaultSifsMigrationGeneration {
-        file_system_id: file_system_id.clone(),
-        local_node_id: local_node_id.clone(),
-        shards,
-        active_primary_shard_ids: active_primary_shard_ids.iter().cloned().collect(),
-        certified_replica_shard_ids: certified_replica_shard_ids.iter().cloned().collect(),
-    }
-}
-
-fn default_sifs_migration_cursor_path(
-    metadata_root: &std::path::Path,
-    file_system_id: &DfsFileSystemId,
-) -> PathBuf {
-    metadata_root
-        .join("shard-index")
-        .join("migration-cursors")
-        .join(format!(
-            "default-sifs-{}.sobj",
-            crate::metadata_keys::key_segment(file_system_id)
-        ))
-}
-
-fn read_default_sifs_migration_cursor(
-    metadata_root: &std::path::Path,
-    file_system_id: &DfsFileSystemId,
-    generation: &DfsDefaultSifsMigrationGeneration,
-) -> Result<DfsDefaultSifsMigrationCursorRead, DfsError> {
-    let path = default_sifs_migration_cursor_path(metadata_root, file_system_id);
-    let cursor = crate::metadata_io::read_sobj_optional::<DfsDefaultSifsMigrationCursor>(&path)?;
-    match cursor {
-        Some(cursor)
-            if cursor.format_version
-                == DEFAULT_SIFS_BOOTSTRAP_SHARD_MIGRATION_CURSOR_FORMAT_VERSION
-                && cursor.generation == *generation =>
-        {
-            Ok(DfsDefaultSifsMigrationCursorRead::Resume(Box::new(cursor)))
-        }
-        Some(cursor)
-            if cursor.format_version
-                == DEFAULT_SIFS_BOOTSTRAP_SHARD_MIGRATION_CURSOR_FORMAT_VERSION
-                && cursor.generation.same_authority(generation)
-                && cursor
-                    .generation
-                    .certified_replica_shard_ids
-                    .iter()
-                    .any(|shard| !generation.certified_replica_shard_ids.contains(shard)) =>
-        {
-            // A replica can durably ingest a newer journal prefix before its
-            // certification catches up. Keep the catalog proof, but do not
-            // use that replica or advance the cursor until the exact prefix
-            // is confirmed. Resetting here would continually restart a large
-            // catalog under ordinary replicated writes.
-            tracing::trace!(target: "sinomo.perf",
-                required_replica_shards = ?cursor.generation.certified_replica_shard_ids,
-                certified_replica_shards = ?generation.certified_replica_shard_ids,
-                "DFS migration parked for replica prefix certification");
-            Ok(DfsDefaultSifsMigrationCursorRead::AwaitingReplicaProgress)
-        }
-        Some(_) => {
-            // An obsolete generation must not leave a permanent journal-prune
-            // fence after membership or shard configuration changes.
-            crate::metadata_io::remove_file_if_exists(&path)?;
-            Ok(DfsDefaultSifsMigrationCursorRead::Restart)
-        }
-        None => Ok(DfsDefaultSifsMigrationCursorRead::Restart),
-    }
-}
-
-fn write_default_sifs_migration_cursor(
-    metadata_root: &std::path::Path,
-    cursor: &DfsDefaultSifsMigrationCursor,
-) -> Result<(), DfsError> {
-    let path = default_sifs_migration_cursor_path(metadata_root, &cursor.generation.file_system_id);
-    if crate::metadata_io::read_sobj_optional::<DfsDefaultSifsMigrationCursor>(&path)?.as_ref()
-        == Some(cursor)
-    {
-        return Ok(());
-    }
-    let parent = path.parent().ok_or_else(|| DfsError::Metadata {
-        message: format!(
-            "default SIFS migration cursor {} has no parent",
-            path.display()
-        ),
-    })?;
-    crate::metadata_io::create_dir_all(parent.to_path_buf())?;
-    crate::metadata_io::write_sobj_atomic(&path, cursor)?;
-    Ok(())
-}
-
-#[cfg(test)]
-thread_local! {
-    static DEFAULT_SIFS_MIGRATION_MAX_BUFFERED_RECORDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static DEFAULT_SIFS_MIGRATION_JOURNAL_READS: std::cell::RefCell<Vec<(usize, usize, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
-}
-
-#[cfg(test)]
-fn reset_default_sifs_migration_max_buffered_records() {
-    DEFAULT_SIFS_MIGRATION_MAX_BUFFERED_RECORDS.set(0);
-}
-
-#[cfg(test)]
-fn default_sifs_migration_max_buffered_records() -> usize {
-    DEFAULT_SIFS_MIGRATION_MAX_BUFFERED_RECORDS.get()
-}
-
-#[cfg(test)]
-fn observe_default_sifs_migration_buffered_records(records: usize) {
-    DEFAULT_SIFS_MIGRATION_MAX_BUFFERED_RECORDS.set(
-        DEFAULT_SIFS_MIGRATION_MAX_BUFFERED_RECORDS
-            .get()
-            .max(records),
-    );
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct DfsDefaultSifsMaterializationReport {
-    pub(crate) migration: DfsMetadataShardMigrationReport,
-    /// A local authority still needs an exact replica generation before it can
-    /// safely finish one side of a cross-node shard migration.
-    pub(crate) awaiting_replica_progress: bool,
 }
 
 pub const DEFAULT_DFS_METADATA_REPLICATION_MAX_BATCHES_PER_TARGET: usize = 64;
@@ -527,7 +170,10 @@ pub fn publish_cluster_dfs_metadata_journal_with_peer_transport(
     publish_cluster_dfs_metadata_journal(
         data_dir,
         cluster_paths,
-        dfs_metadata_journal_batch_sender_from_peer_transport(Arc::clone(&peer_transport)),
+        dfs_metadata_journal_batch_sender_from_peer_transport(
+            data_dir,
+            Arc::clone(&peer_transport),
+        ),
         dfs_metadata_snapshot_install_sender_from_peer_transport(peer_transport),
         options,
     )
@@ -542,7 +188,10 @@ pub async fn publish_cluster_dfs_metadata_journal_with_async_peer_transport(
     publish_cluster_dfs_metadata_journal_async(
         data_dir,
         cluster_paths,
-        async_dfs_metadata_journal_batch_sender_from_peer_transport(Arc::clone(&peer_transport)),
+        async_dfs_metadata_journal_batch_sender_from_peer_transport(
+            data_dir,
+            Arc::clone(&peer_transport),
+        ),
         async_dfs_metadata_snapshot_install_sender_from_peer_transport(peer_transport),
         options,
     )
@@ -578,7 +227,10 @@ pub async fn publish_cluster_dfs_metadata_journal_with_peer_transports_async_and
     publish_cluster_dfs_metadata_journal_async_with_execution_exclusions(
         data_dir,
         cluster_paths,
-        async_dfs_metadata_journal_batch_sender_from_peer_transport(Arc::clone(&peer_transport)),
+        async_dfs_metadata_journal_batch_sender_from_peer_transport(
+            data_dir,
+            Arc::clone(&peer_transport),
+        ),
         async_dfs_metadata_snapshot_install_sender_from_peer_transport(peer_transport),
         execution_exclusions,
         options,
@@ -752,12 +404,7 @@ pub fn prepare_cluster_dfs_metadata_shard_publish_with_backend_and_authority(
                 execution_exclusions,
                 options,
                 |backend, target_node_id, shard_id| {
-                    let cursor = migrate_legacy_dfs_metadata_replication_cursor(
-                        backend,
-                        data_dir,
-                        target_node_id,
-                        shard_id,
-                    )?;
+                    let cursor = backend.metadata_replication_cursor(target_node_id, shard_id)?;
                     // A retry can find a previously published hint already at
                     // the head and plan NoChanges. Discharge a registered
                     // selection wait from that same observation; the hint is
@@ -810,7 +457,10 @@ pub async fn execute_prepared_cluster_dfs_metadata_publish_with_async_peer_trans
 ) -> Result<DfsMetadataJournalReplicationReport, DfsError> {
     let transport = AsyncDfsMetadataNodeTransport::new(
         plan.peer_node_ids.clone(),
-        async_dfs_metadata_journal_batch_sender_from_peer_transport(Arc::clone(&peer_transport)),
+        async_dfs_metadata_journal_batch_sender_from_peer_transport(
+            &plan.data_dir,
+            Arc::clone(&peer_transport),
+        ),
         async_dfs_metadata_snapshot_install_sender_from_peer_transport(peer_transport),
     );
     execute_prepared_dfs_metadata_journal_publish_async(plan, &transport, options).await
@@ -1217,8 +867,7 @@ pub fn dfs_metadata_replication_fault_notice_lines(
 
 pub fn dfs_events_should_publish_metadata(events: &[NetworkedDfsServiceEvent]) -> bool {
     events.iter().any(|event| match event {
-        NetworkedDfsServiceEvent::WriteConflictCreated { .. }
-        | NetworkedDfsServiceEvent::OwnerHandoffCompleted { .. } => true,
+        NetworkedDfsServiceEvent::OwnerHandoffCompleted { .. } => true,
         NetworkedDfsServiceEvent::RemoteWriteServed { result, .. } => {
             matches!(result, DfsDistributedWriteResult::Outcome { .. })
         }
@@ -1589,7 +1238,10 @@ where
     run_cluster_dfs_metadata_publish_after_events(
         data_dir,
         cluster_paths,
-        dfs_metadata_journal_batch_sender_from_peer_transport(Arc::clone(&peer_transport)),
+        dfs_metadata_journal_batch_sender_from_peer_transport(
+            data_dir,
+            Arc::clone(&peer_transport),
+        ),
         dfs_metadata_snapshot_install_sender_from_peer_transport(peer_transport),
         events,
         replication_options,
@@ -2651,18 +2303,7 @@ fn validate_dfs_metadata_journal_replication_response(
 fn dfs_metadata_journal_batch_command_entry_count(
     command: &DfsMetadataJournalBatchCommand,
 ) -> usize {
-    command
-        .durable_replication
-        .as_ref()
-        .map(|replication| replication.journal_frames.len())
-        .or_else(|| {
-            command.authority_probe.as_ref().and_then(|probe| {
-                probe
-                    .durable_journal_ack
-                    .then_some(probe.journal_frames.len())
-            })
-        })
-        .unwrap_or(command.batch.entries.len())
+    command.batch.journal_frames.len()
 }
 
 fn validate_dfs_metadata_snapshot_install_response(
@@ -2907,12 +2548,7 @@ impl DfsMetadataJournalPublisherHost for LocalDfsMetadataJournalPublisherHost {
         target_node_id: &NodeId,
         shard_id: &DfsMetadataShardId,
     ) -> Result<u64, DfsError> {
-        migrate_legacy_dfs_metadata_replication_cursor(
-            backend,
-            &self.data_dir,
-            target_node_id,
-            shard_id,
-        )
+        Ok(backend.metadata_replication_cursor(target_node_id, shard_id)?)
     }
 }
 
@@ -2969,7 +2605,7 @@ fn validate_prepared_caught_up_probe(
         });
     let valid = valid_inconsistency && target.commands.len() == 1 && {
         let command = &target.commands[0];
-        command.batch.entries.is_empty()
+        command.batch.journal_frames.is_empty()
             && command.batch.shard_id == target.shard_id
             && command.batch.next_after_sequence == expected_probe_sequence
             && command.verify_prefix_only
@@ -3052,6 +2688,84 @@ mod metadata_publish_membership_tests {
     use super::*;
 
     #[test]
+    fn native_metadata_execution_exclusions_park_only_the_exact_offline_target() {
+        let nodes =
+            crate::test_runtime::DfsTestRuntime::ordered_node_ids("native-exclusion-plan", 3);
+        let mut runtime =
+            crate::test_runtime::DfsTestRuntime::new("native-exclusion-plan", nodes[0].clone())
+                .unwrap();
+        for node in &nodes[1..] {
+            runtime.define_node(node.clone()).unwrap();
+        }
+        runtime.start_nodes().unwrap();
+        let shard = runtime.root_shard().unwrap();
+        let offline = shard.replica_node_ids[0].clone();
+        let healthy = shard.replica_node_ids[1].clone();
+        let data_dir = runtime.data_dir(&shard.primary_node_id).clone();
+        let resident = {
+            let cache_slot = crate::runtime_host::daemon_dfs_message_service_cache()
+                .root(&data_dir.root())
+                .expect("actual root cache slot");
+            let cache = cache_slot.lock().unwrap();
+            cache
+                .as_ref()
+                .unwrap()
+                .bounded_status_resident_current()
+                .unwrap()
+        };
+        let handle = resident
+            .scope_shard(
+                &shard.file_system_id,
+                &DfsMetadataShardId::new(shard.shard_id.clone()),
+            )
+            .unwrap();
+        let mut lease = handle.checkout().unwrap();
+        let before = lease.export_table_snapshot();
+        let plan = crate::metadata_replication::prepare_cluster_dfs_metadata_shard_publish_with_backend_and_authority(
+        &data_dir, &shard.primary_node_id, shard.replica_node_ids.clone(), shard.file_system_id.clone(),
+        DfsMetadataShardId::new(shard.shard_id.clone()), Some(shard.clone()), &mut lease,
+        &DfsMaintenanceExecutionExclusions::new([offline.clone()]),
+        DfsMetadataJournalReplicationOptions { probe_caught_up_replicas: true, ..Default::default() },
+    ).unwrap().unwrap();
+        assert_eq!(
+            lease.export_table_snapshot(),
+            before,
+            "planning does not author visible state"
+        );
+        drop(lease);
+        let (_, peer) = runtime.peer_transports(&shard.primary_node_id).unwrap();
+        let transport = AsyncDfsMetadataNodeTransport::new(
+        shard.replica_node_ids.clone(),
+        crate::metadata_replication::async_dfs_metadata_journal_batch_sender_from_peer_transport(
+            &data_dir, Arc::clone(&peer),
+        ),
+        crate::metadata_replication::async_dfs_metadata_snapshot_install_sender_from_peer_transport(
+            peer,
+        ),
+    );
+        let executor = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let report = executor
+            .block_on(super::execute_prepared_dfs_metadata_journal_publish_async(
+                plan,
+                &transport,
+                DfsMetadataJournalReplicationOptions::default(),
+            ))
+            .unwrap();
+        assert!(report.outcomes.iter().any(|outcome| matches!(outcome,
+        DfsMetadataJournalReplicationOutcome::MissingRoute { target_node_id, .. } if target_node_id == &offline)));
+        assert!(report.outcomes.iter().any(|outcome| matches!(outcome,
+        DfsMetadataJournalReplicationOutcome::NoChanges { target_node_id, .. } | DfsMetadataJournalReplicationOutcome::Applied { target_node_id, .. } if target_node_id == &healthy)));
+        drop(executor);
+        drop(transport);
+        drop(handle);
+        drop(resident);
+        runtime.close().unwrap();
+    }
+
+    #[test]
     fn resident_publish_planning_reuses_exact_shard_and_rejects_wrong_root() {
         let root = sinomo_testdir::TestDir::new("dfs-resident-publish-identity");
         let data_dir = SinomoDataDir::new(root.path());
@@ -3087,7 +2801,7 @@ mod metadata_publish_membership_tests {
             replica_node_ids: vec![local_node_id],
             epoch: 1,
             assignment: crate::DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
+
             default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
         };
         let mut accepted =
@@ -3155,617 +2869,250 @@ mod metadata_publish_membership_tests {
     }
 
     #[test]
-    fn final_async_one_batch_ack_immediately_clears_resident_status_lag() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        runtime.block_on(async {
-            let root = sinomo_testdir::TestDir::new("dfs-resident-publish-ack-status");
-            let data_dir = SinomoDataDir::new(root.path());
-            data_dir.ensure_root_layout().expect("data root layout");
-            let local_node_id =
-                NodeId::from_legacy_named("node_dfs_resident_ack_local").expect("local node");
-            let target_node_id =
-                NodeId::from_legacy_named("node_dfs_resident_ack_target").expect("target node");
-            let file_system = distributed_sifs(local_node_id.clone());
-            let file_system_id = file_system.file_system_id.clone();
-            let shard_id = DfsMetadataShardId::new("root");
-            let shard = DfsMetadataShardConfig {
-                file_system_id: file_system_id.clone(),
-                shard_id: shard_id.0.clone(),
-                primary_node_id: local_node_id.clone(),
-                replica_node_ids: vec![target_node_id.clone()],
-                epoch: 1,
-                assignment: crate::DfsMetadataShardAssignment::Root,
-                namespace_prepare_codec: Default::default(),
-                default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
-            };
-            let metadata_root = crate::default_dfs_metadata_shards_root(&data_dir);
-            let mut backend = LocalShardedMetadataBackend::new(&metadata_root, vec![shard.clone()])
-                .expect("resident source backend");
-            backend
-                .put_file_system(&file_system)
-                .expect("author one journal entry");
-            let resident = backend.into_resident();
-            let handle = resident
-                .scope_shard(&file_system_id, &shard_id)
-                .expect("resident shard handle");
-
-            let before = resident
-                .bounded_status_snapshot()
-                .expect("bounded status before publish");
-            assert_eq!(before.metadata_shards.len(), 1);
-            assert_eq!(before.metadata_shards[0].journal_last_sequence, 1);
-            assert_eq!(before.metadata_shards[0].replica_lag.len(), 1);
-            assert_eq!(before.metadata_shards[0].replica_lag[0].lag_entries, 1);
-
-            let mut lease = handle.checkout().expect("resident publish lease");
-            let plan = prepare_cluster_dfs_metadata_shard_publish_with_backend_and_authority(
-                &data_dir,
-                &local_node_id,
-                vec![target_node_id.clone()],
-                file_system_id.clone(),
-                shard_id.clone(),
-                Some(shard.clone()),
-                &mut lease,
-                &DfsMaintenanceExecutionExclusions::default(),
-                DfsMetadataJournalReplicationOptions::default(),
-            )
-            .expect("resident publish plan")
-            .expect("prepared plan");
-            assert_eq!(plan.targets.len(), 1);
-            assert_eq!(plan.targets[0].commands.len(), 1);
-            assert_eq!(
-                plan.targets[0].commands[0]
-                    .durable_replication
-                    .as_ref()
-                    .expect("durable one-batch publication")
-                    .journal_frames
-                    .len(),
-                1
-            );
-            drop(lease);
-
-            let sender: AsyncDfsMetadataJournalBatchSender = Arc::new(
-                move |_target_node_id, command, _timeout| {
-                    Box::pin(async move {
-                        Ok(DfsMetadataJournalBatchResponse {
-                            request_id: command.request_id.clone(),
-                            shard_id: command.batch.shard_id.clone(),
-                            next_after_sequence: command.batch.next_after_sequence,
-                            applied_entries: dfs_metadata_journal_batch_command_entry_count(
-                                command,
-                            ),
-                            verified_prefix_only: command.verify_prefix_only,
-                            verified_authority_probe_id: command
-                                .durable_replication
-                                .as_ref()
-                                .map(|replication| replication.confirmation_id.clone()),
-                            result: DfsMetadataJournalBatchResult::Applied,
-                        })
-                    })
+    fn final_native_metadata_ack_clears_resident_status_lag() {
+        let nodes =
+            crate::test_runtime::DfsTestRuntime::ordered_node_ids("native-resident-ack-status", 3);
+        let mut runtime = crate::test_runtime::DfsTestRuntime::new(
+            "native-resident-ack-status",
+            nodes[0].clone(),
+        )
+        .unwrap();
+        for node in &nodes[1..] {
+            runtime.define_node(node.clone()).unwrap();
+        }
+        runtime.start_nodes().unwrap();
+        let shard = runtime.root_shard().unwrap();
+        let primary = shard.primary_node_id.clone();
+        let data_dir = runtime.data_dir(&primary).clone();
+        let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
+        let captures = nodes
+            .iter()
+            .map(|node| {
+                (
+                    node.clone(),
+                    crate::native_shard_trace::capture_native_shard_trace(
+                        &runtime.data_dir(node).root(),
+                        shard_id.clone(),
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let publication_deadline =
+            std::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+        let mut writer = runtime.client(&primary).unwrap();
+        writer
+            .posix_write_file(
+                "/native-resident-ack.bin",
+                b"real durable publication",
+                crate::DfsWriteOptions {
+                    policy: crate::DfsReplicationPolicy::new(1, 1).unwrap(),
+                    replica_candidates: vec![primary.clone()],
+                    wait_for_commit: true,
+                    foreground_replica_repair: false,
                 },
-            );
-            let snapshot_sender: AsyncDfsMetadataSnapshotInstallSender = Arc::new(
-                move |_target_node_id, command, _timeout| {
-                    Box::pin(async move {
-                        Ok(DfsMetadataSnapshotInstallResponse {
-                            request_id: command.request_id.clone(),
-                            shard_id: command.shard_id.clone(),
-                            next_after_sequence: command.next_after_sequence,
-                            result: DfsMetadataSnapshotInstallResult::Installed {
-                                archived_existing: false,
-                            },
-                        })
-                    })
-                },
-            );
-            let transport = AsyncDfsMetadataNodeTransport::new(
-                vec![target_node_id.clone()],
-                sender,
-                snapshot_sender,
-            );
-            crate::metadata_backend::reset_metadata_backend_open_calls();
-
-            let report = execute_prepared_dfs_metadata_journal_publish_async(
-                plan,
-                &transport,
-                DfsMetadataJournalReplicationOptions::default(),
             )
-            .await
-            .expect("async publish report");
-            assert!(matches!(
-                report.outcomes.as_slice(),
-                [DfsMetadataJournalReplicationOutcome::Applied {
-                    target_node_id: applied_target,
-                    shard_id: applied_shard,
-                    entries: 1,
-                    next_after_sequence: 1,
-                }] if applied_target == &target_node_id && applied_shard == &shard_id
-            ));
-            assert_eq!(
-                crate::metadata_backend::metadata_backend_open_calls(),
-                0,
-                "post-ACK status publication must not reopen the shard backend"
+            .unwrap();
+        drop(writer);
+        let expected_prefix = {
+            let inspector = runtime
+                .metadata_primary_service("/native-resident-ack.bin")
+                .unwrap();
+            inspector
+                .metadata_backend()
+                .unwrap()
+                .metadata_prefix_proof(&shard_id)
+                .unwrap()
+                .expect("the actual current committed source prefix")
+        };
+        let tick = runtime
+            .maintenance_tick(
+                &primary,
+                publication_deadline.saturating_duration_since(std::time::Instant::now()),
+            )
+            .expect("the ordinary Main publisher completes within the original publication budget");
+        assert!(
+            tick.outcome.is_ok(),
+            "actual Main publication outcome: {:?}",
+            tick.outcome
+        );
+        assert!(std::time::Instant::now() <= publication_deadline);
+        let observed = captures
+            .iter()
+            .map(|(node, capture)| {
+                let mut bytes = Vec::new();
+                capture.export_raw(&mut bytes).unwrap();
+                (
+                    node.clone(),
+                    serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let source = observed.get(&primary).unwrap();
+        let expected = serde_json::to_value(&expected_prefix).unwrap();
+        for target in &shard.replica_node_ids {
+            let returned = source["boundary_packets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| &row["facts"])
+                .find(|fact| {
+                    fact["phase"] == "source-journal-response-accepted"
+                        && fact["authenticated_source_node_id"] == target.as_str()
+                        && fact["expected_target_node_id"] == target.as_str()
+                        && fact["response"]["shard_id"] == shard.shard_id
+                        && fact["response"]["next_after_sequence"].as_u64()
+                            == Some(expected_prefix.journal_sequence)
+                        && fact["response"]["result"] == "applied"
+                })
+                .expect("the actual source accepted this target's exact final prefix ACK");
+            let receiver = observed.get(target).unwrap();
+            assert!(
+                receiver["boundary_packets"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|row| &row["facts"])
+                    .any(|fact| fact["phase"] == "replica-journal-persisted"
+                        && fact["command"]["request_id"] == returned["response"]["request_id"]
+                        && fact["command"]["source_node_id"] == primary.as_str()
+                        && fact["command"]["file_system_id"] == shard.file_system_id.as_str()
+                        && fact["command"]["batch"]["shard_id"] == shard.shard_id
+                        && fact["command"]["batch"]["next_after_sequence"].as_u64()
+                            == Some(expected_prefix.journal_sequence)
+                        && fact["durable_prefix"] == expected),
+                "the genuine final ACK correlates with that receiver's exact durable frame prefix"
             );
-
-            let after = resident
-                .bounded_status_snapshot()
-                .expect("bounded status immediately after final ACK");
-            assert_eq!(after.metadata_shards[0].journal_last_sequence, 1);
+        }
+        let resident = {
+            let cache_slot = crate::runtime_host::daemon_dfs_message_service_cache()
+                .root(&data_dir.root())
+                .expect("actual root cache slot");
+            let cache = cache_slot.lock().unwrap();
+            cache
+                .as_ref()
+                .unwrap()
+                .bounded_status_resident_current()
+                .unwrap()
+        };
+        let status = resident.bounded_status_snapshot().unwrap();
+        let actual = status
+            .metadata_shards
+            .iter()
+            .find(|row| row.shard_id.0 == shard.shard_id)
+            .unwrap();
+        assert!(actual.journal_last_sequence > 0);
+        for target in &shard.replica_node_ids {
+            let lag = actual
+                .replica_lag
+                .iter()
+                .find(|row| &row.target_node_id == target)
+                .unwrap();
             assert_eq!(
-                after.metadata_shards[0].replica_lag[0].replicated_through_sequence,
-                1
+                lag.lag_entries, 0,
+                "the actual durable ACK clears resident lag"
             );
             assert_eq!(
-                after.metadata_shards[0].replica_lag[0].lag_entries, 0,
-                "the final durable ACK must clear bounded resident lag without another planning or backend pass"
+                lag.replicated_through_sequence,
+                actual.journal_last_sequence
             );
             assert_eq!(
                 metadata_cursor::metadata_replication_cursor(
-                    &local_dfs_metadata_shard_path(&data_dir, &shard_id),
-                    &target_node_id,
-                    &shard_id,
+                    &local_dfs_metadata_shard_path(
+                        &data_dir,
+                        &DfsMetadataShardId::new(shard.shard_id.clone())
+                    ),
+                    target,
+                    &DfsMetadataShardId::new(shard.shard_id.clone()),
                 )
-                .expect("durable replication cursor"),
-                1,
-                "status may advance only after the durable cursor commit"
+                .unwrap(),
+                actual.journal_last_sequence
             );
-
-            let mut updated_file_system = file_system;
-            updated_file_system.display_name = "snapshot repair generation".to_string();
-            handle
-                .with_backend(|backend| {
-                    backend.put_file_system(&updated_file_system).map(|_| ())
-                })
-                .expect("author snapshot-repair journal entry");
-            let before_snapshot = resident
-                .bounded_status_snapshot()
-                .expect("bounded status before snapshot repair");
-            assert_eq!(before_snapshot.metadata_shards[0].journal_last_sequence, 2);
-            assert_eq!(before_snapshot.metadata_shards[0].replica_lag[0].lag_entries, 1);
-
-            let mut lease = handle.checkout().expect("snapshot repair publish lease");
-            let snapshot_plan =
-                prepare_cluster_dfs_metadata_shard_publish_with_backend_and_authority(
-                    &data_dir,
-                    &local_node_id,
-                    vec![target_node_id.clone()],
-                    file_system_id.clone(),
-                    shard_id.clone(),
-                    Some(shard.clone()),
-                    &mut lease,
-                    &DfsMaintenanceExecutionExclusions::default(),
-                    DfsMetadataJournalReplicationOptions::default(),
-                )
-                .expect("snapshot repair publish plan")
-                .expect("prepared snapshot repair plan");
-            drop(lease);
-            let rejecting_sender: AsyncDfsMetadataJournalBatchSender = Arc::new(
-                move |_target_node_id, command, _timeout| {
-                    Box::pin(async move {
-                        Ok(DfsMetadataJournalBatchResponse {
-                            request_id: command.request_id.clone(),
-                            shard_id: command.batch.shard_id.clone(),
-                            next_after_sequence: command.batch.next_after_sequence,
-                            applied_entries: 0,
-                            verified_prefix_only: false,
-                            verified_authority_probe_id: None,
-                            result: DfsMetadataJournalBatchResult::Rejected {
-                                reason: DFS_METADATA_UNREADABLE_REPLICA_SNAPSHOT_REPAIR_REASON
-                                    .to_string(),
-                             code: None,},
-                        })
-                    })
-                },
-            );
-            let installing_snapshot_sender: AsyncDfsMetadataSnapshotInstallSender = Arc::new(
-                move |_target_node_id, command, _timeout| {
-                    Box::pin(async move {
-                        Ok(DfsMetadataSnapshotInstallResponse {
-                            request_id: command.request_id.clone(),
-                            shard_id: command.shard_id.clone(),
-                            next_after_sequence: command.next_after_sequence,
-                            result: DfsMetadataSnapshotInstallResult::Installed {
-                                archived_existing: true,
-                            },
-                        })
-                    })
-                },
-            );
-            let snapshot_transport = AsyncDfsMetadataNodeTransport::new(
-                vec![target_node_id.clone()],
-                rejecting_sender,
-                installing_snapshot_sender,
-            );
-            let snapshot_report = execute_prepared_dfs_metadata_journal_publish_async(
-                snapshot_plan,
-                &snapshot_transport,
-                DfsMetadataJournalReplicationOptions::default(),
-            )
-            .await
-            .expect("snapshot repair report");
-            assert!(matches!(
-                snapshot_report.outcomes.as_slice(),
-                [DfsMetadataJournalReplicationOutcome::SnapshotInstalled {
-                    target_node_id: installed_target,
-                    shard_id: installed_shard,
-                    next_after_sequence: 2,
-                    archived_existing: true,
-                }] if installed_target == &target_node_id && installed_shard == &shard_id
-            ));
-            let after_snapshot = resident
-                .bounded_status_snapshot()
-                .expect("bounded status immediately after snapshot ACK");
-            assert_eq!(after_snapshot.metadata_shards[0].journal_last_sequence, 2);
-            assert_eq!(
-                after_snapshot.metadata_shards[0].replica_lag[0]
-                    .replicated_through_sequence,
-                2
-            );
-            assert_eq!(
-                after_snapshot.metadata_shards[0].replica_lag[0].lag_entries,
-                0,
-                "a durable snapshot-install ACK must immediately clear resident lag"
-            );
-
-            updated_file_system.display_name = "failed cursor generation".to_string();
-            handle
-                .with_backend(|backend| {
-                    backend.put_file_system(&updated_file_system).map(|_| ())
-                })
-                .expect("author failed-cursor journal entry");
-            let mut lease = handle.checkout().expect("failed cursor publish lease");
-            let failed_cursor_plan =
-                prepare_cluster_dfs_metadata_shard_publish_with_backend_and_authority(
-                    &data_dir,
-                    &local_node_id,
-                    vec![target_node_id.clone()],
-                    file_system_id,
-                    shard_id.clone(),
-                    Some(shard),
-                    &mut lease,
-                    &DfsMaintenanceExecutionExclusions::default(),
-                    DfsMetadataJournalReplicationOptions::default(),
-                )
-                .expect("failed cursor publish plan")
-                .expect("prepared failed cursor plan");
-            drop(lease);
-            let before_failed_cursor = resident
-                .bounded_status_snapshot()
-                .expect("bounded status before failed cursor commit");
-            assert_eq!(
-                before_failed_cursor.metadata_shards[0].journal_last_sequence,
-                3
-            );
-            assert_eq!(
-                before_failed_cursor.metadata_shards[0].replica_lag[0]
-                    .replicated_through_sequence,
-                2
-            );
-            assert_eq!(
-                before_failed_cursor.metadata_shards[0].replica_lag[0].lag_entries,
-                1
-            );
-
-            let cursor_path = metadata_cursor::metadata_replication_cursor_path(
-                &local_dfs_metadata_shard_path(&data_dir, &shard_id),
-                &target_node_id,
-                &shard_id,
-            );
-            std::fs::remove_file(&cursor_path).expect("remove durable cursor fixture");
-            std::fs::create_dir(&cursor_path).expect("block durable cursor replacement");
-            let applying_sender: AsyncDfsMetadataJournalBatchSender = Arc::new(
-                move |_target_node_id, command, _timeout| {
-                    Box::pin(async move {
-                        Ok(DfsMetadataJournalBatchResponse {
-                            request_id: command.request_id.clone(),
-                            shard_id: command.batch.shard_id.clone(),
-                            next_after_sequence: command.batch.next_after_sequence,
-                            applied_entries: dfs_metadata_journal_batch_command_entry_count(
-                                command,
-                            ),
-                            verified_prefix_only: command.verify_prefix_only,
-                            verified_authority_probe_id: command
-                                .durable_replication
-                                .as_ref()
-                                .map(|replication| replication.confirmation_id.clone()),
-                            result: DfsMetadataJournalBatchResult::Applied,
-                        })
-                    })
-                },
-            );
-            let unused_snapshot_sender: AsyncDfsMetadataSnapshotInstallSender = Arc::new(
-                move |_target_node_id, command, _timeout| {
-                    Box::pin(async move {
-                        Ok(DfsMetadataSnapshotInstallResponse {
-                            request_id: command.request_id.clone(),
-                            shard_id: command.shard_id.clone(),
-                            next_after_sequence: command.next_after_sequence,
-                            result: DfsMetadataSnapshotInstallResult::Installed {
-                                archived_existing: false,
-                            },
-                        })
-                    })
-                },
-            );
-            let failed_cursor_transport = AsyncDfsMetadataNodeTransport::new(
-                vec![target_node_id],
-                applying_sender,
-                unused_snapshot_sender,
-            );
-            execute_prepared_dfs_metadata_journal_publish_async(
-                failed_cursor_plan,
-                &failed_cursor_transport,
-                DfsMetadataJournalReplicationOptions::default(),
-            )
-            .await
-            .expect_err("durable cursor commit must fail for a directory at its file path");
-            let after_failed_cursor = resident
-                .bounded_status_snapshot()
-                .expect("bounded status after failed cursor commit");
-            assert_eq!(
-                after_failed_cursor.metadata_shards[0].replica_lag[0]
-                    .replicated_through_sequence,
-                2,
-                "a failed durable cursor commit must not advance resident status"
-            );
-            assert_eq!(
-                after_failed_cursor.metadata_shards[0].replica_lag[0].lag_entries,
-                1
-            );
-        });
+        }
+        drop(resident);
+        for (_, capture) in &captures {
+            capture.close();
+        }
+        runtime.close().unwrap();
+        for (_, capture) in captures {
+            let mut bytes = Vec::new();
+            capture.export_raw(&mut bytes).unwrap();
+            let raw: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            for field in ["dropped", "incomplete", "in_flight"] {
+                assert_eq!(raw[field], "0", "all actual ACK observations are complete");
+            }
+            assert_eq!(raw["actual_owner_stopped"], true);
+        }
     }
 
     #[test]
-    fn resident_status_rebind_rotates_replica_rows_and_fences_retained_ack() {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .expect("runtime");
-        runtime.block_on(async {
-            let root = sinomo_testdir::TestDir::new("dfs-resident-publish-rebind-status");
-            let data_dir = SinomoDataDir::new(root.path());
-            data_dir.ensure_root_layout().expect("data root layout");
-            let local_node_id =
-                NodeId::from_legacy_named("node_dfs_rebind_status_local").expect("local node");
-            let old_target_node_id =
-                NodeId::from_legacy_named("node_dfs_rebind_status_old").expect("old target");
-            let new_target_node_id =
-                NodeId::from_legacy_named("node_dfs_rebind_status_new").expect("new target");
-            let file_system = distributed_sifs(local_node_id.clone());
-            let file_system_id = file_system.file_system_id.clone();
-            let shard_id = DfsMetadataShardId::new("root");
-            let shard = DfsMetadataShardConfig {
-                file_system_id: file_system_id.clone(),
-                shard_id: shard_id.0.clone(),
-                primary_node_id: local_node_id.clone(),
-                replica_node_ids: vec![old_target_node_id.clone()],
-                epoch: 7,
-                assignment: crate::DfsMetadataShardAssignment::Root,
-                namespace_prepare_codec: Default::default(),
-                default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
-            };
-            let metadata_root = crate::default_dfs_metadata_shards_root(&data_dir);
-            let mut backend = LocalShardedMetadataBackend::new(&metadata_root, vec![shard.clone()])
-                .expect("resident source backend");
-            backend
-                .put_file_system(&file_system)
-                .expect("author one journal entry");
-            let resident = backend.into_resident();
-            let handle = resident
-                .scope_shard(&file_system_id, &shard_id)
-                .expect("resident shard handle");
-
-            let mut lease = handle.checkout().expect("predecessor publish lease");
-            let retained_plan =
-                prepare_cluster_dfs_metadata_shard_publish_with_backend_and_authority(
-                    &data_dir,
-                    &local_node_id,
-                    vec![old_target_node_id.clone(), new_target_node_id.clone()],
-                    file_system_id,
-                    shard_id.clone(),
-                    Some(shard.clone()),
-                    &mut lease,
-                    &DfsMaintenanceExecutionExclusions::default(),
-                    DfsMetadataJournalReplicationOptions::default(),
-                )
-                .expect("predecessor publish plan")
-                .expect("retained predecessor plan");
-            assert_eq!(retained_plan.targets.len(), 1);
-            assert_eq!(
-                retained_plan.targets[0].target_node_id,
-                old_target_node_id
-            );
-            drop(lease);
-
-            let ack_started = Arc::new(tokio::sync::Notify::new());
-            let release_ack = Arc::new(tokio::sync::Notify::new());
-            let sender: AsyncDfsMetadataJournalBatchSender = {
-                let ack_started = Arc::clone(&ack_started);
-                let release_ack = Arc::clone(&release_ack);
-                Arc::new(move |_target_node_id, command, _timeout| {
-                    let ack_started = Arc::clone(&ack_started);
-                    let release_ack = Arc::clone(&release_ack);
-                    Box::pin(async move {
-                        ack_started.notify_one();
-                        release_ack.notified().await;
-                        Ok(DfsMetadataJournalBatchResponse {
-                            request_id: command.request_id.clone(),
-                            shard_id: command.batch.shard_id.clone(),
-                            next_after_sequence: command.batch.next_after_sequence,
-                            applied_entries: dfs_metadata_journal_batch_command_entry_count(
-                                command,
-                            ),
-                            verified_prefix_only: command.verify_prefix_only,
-                            verified_authority_probe_id: command
-                                .durable_replication
-                                .as_ref()
-                                .map(|replication| replication.confirmation_id.clone()),
-                            result: DfsMetadataJournalBatchResult::Applied,
-                        })
-                    })
-                })
-            };
-            let snapshot_sender: AsyncDfsMetadataSnapshotInstallSender = Arc::new(
-                move |_target_node_id, command, _timeout| {
-                    Box::pin(async move {
-                        Ok(DfsMetadataSnapshotInstallResponse {
-                            request_id: command.request_id.clone(),
-                            shard_id: command.shard_id.clone(),
-                            next_after_sequence: command.next_after_sequence,
-                            result: DfsMetadataSnapshotInstallResult::Installed {
-                                archived_existing: false,
-                            },
-                        })
-                    })
+    fn native_replica_membership_handoff_rebinds_status_and_preserves_bytes() {
+        let nodes =
+            crate::test_runtime::DfsTestRuntime::ordered_node_ids("native-resident-membership", 3);
+        let mut runtime = crate::test_runtime::DfsTestRuntime::new(
+            "native-resident-membership",
+            nodes[0].clone(),
+        )
+        .unwrap();
+        for node in &nodes[1..] {
+            runtime.define_node(node.clone()).unwrap();
+        }
+        runtime.start_nodes().unwrap();
+        let original = runtime.root_shard().unwrap();
+        let mut writer = runtime.client(&original.primary_node_id).unwrap();
+        let stat = writer
+            .posix_write_file(
+                "/native-membership.bin",
+                b"preserve through native handoff",
+                crate::DfsWriteOptions {
+                    policy: crate::DfsReplicationPolicy::new(1, 1).unwrap(),
+                    replica_candidates: vec![original.primary_node_id.clone()],
+                    wait_for_commit: true,
+                    foreground_replica_repair: false,
                 },
-            );
-            let transport = AsyncDfsMetadataNodeTransport::new(
-                vec![old_target_node_id.clone(), new_target_node_id.clone()],
-                sender,
-                snapshot_sender,
-            );
-            let publish = tokio::spawn(async move {
-                execute_prepared_dfs_metadata_journal_publish_async(
-                    retained_plan,
-                    &transport,
-                    DfsMetadataJournalReplicationOptions::default(),
-                )
-                .await
-            });
-            tokio::time::timeout(Duration::from_secs(1), ack_started.notified())
-                .await
-                .expect("predecessor ACK reached the handoff race");
-
-            put_local_dfs_metadata_replication_cursor(
-                &data_dir,
-                &new_target_node_id,
-                &shard_id,
-                1,
             )
-            .expect("seed successor durable cursor outside resident projection");
-            let mut active = shard.clone();
-            active.epoch += 1;
-            active.replica_node_ids = vec![new_target_node_id.clone()];
-            {
-                let mut global = resident.checkout_global().expect("global handoff lease");
-                global
-                    .freeze_metadata_shard_for_membership_handoff(
-                        &shard_id,
-                        "resident-status-rebind",
-                        shard.epoch,
-                    )
-                    .expect("freeze predecessor topology");
-                assert!(
-                    global
-                        .clear_metadata_shard_membership_handoff_freeze(
-                            &shard_id,
-                            "resident-status-rebind",
-                            &active,
-                        )
-                        .expect("activate successor topology")
-                );
-            }
-
-            let rebound = resident
-                .bounded_status_snapshot()
-                .expect("bounded successor status");
-            assert_eq!(rebound.metadata_shards.len(), 1);
-            let rebound_shard = &rebound.metadata_shards[0];
-            assert_eq!(rebound_shard.epoch, Some(active.epoch));
-            assert_eq!(
-                rebound_shard.replica_node_ids,
-                vec![new_target_node_id.clone()]
-            );
-            assert_eq!(rebound_shard.replica_lag.len(), 1);
-            assert_eq!(
-                rebound_shard.replica_lag[0].target_node_id,
-                new_target_node_id
-            );
-            assert_eq!(
-                rebound_shard.replica_lag[0].replicated_through_sequence,
-                1,
-                "topology rebind must seed a newly configured replica from its durable sidecar"
-            );
-            assert_eq!(rebound_shard.replica_lag[0].lag_entries, 0);
-
-            release_ack.notify_one();
-            let report = tokio::time::timeout(Duration::from_secs(1), publish)
-                .await
-                .expect("retained predecessor publish completed")
-                .expect("retained publish task")
-                .expect("retained publish report");
-            assert!(matches!(
-                report.outcomes.as_slice(),
-                [DfsMetadataJournalReplicationOutcome::Applied {
-                    target_node_id,
-                    next_after_sequence: 1,
-                    ..
-                }] if target_node_id == &old_target_node_id
-            ));
-            assert_eq!(
-                metadata_cursor::metadata_replication_cursor(
-                    &local_dfs_metadata_shard_path(&data_dir, &shard_id),
-                    &old_target_node_id,
-                    &shard_id,
-                )
-                .expect("retained predecessor durable cursor"),
-                1,
-                "the retained predecessor ACK remains durable even though it is absent from current status"
-            );
-
-            let after_old_ack = resident
-                .bounded_status_snapshot()
-                .expect("status after retained predecessor ACK");
-            let after_old_ack = &after_old_ack.metadata_shards[0];
-            assert_eq!(
-                after_old_ack
-                    .replica_lag
-                    .iter()
-                    .map(|lag| lag.target_node_id.clone())
-                    .collect::<Vec<_>>(),
-                vec![new_target_node_id.clone()],
-                "a removed target's retained ACK must not repopulate current lag rows"
-            );
-            let lease = handle.checkout().expect("inspect successor projection");
-            assert!(
-                lease
-                    .resident_metadata_cursor_status_projection(
-                        std::slice::from_ref(&old_target_node_id),
-                        &shard_id,
-                    )
-                    .is_none(),
-                "a removed target's retained ACK must not repopulate the current resident projection"
-            );
-            let observer = lease.metadata_replication_cursor_status_observer();
-            drop(lease);
-
-            put_local_dfs_metadata_replication_cursor_async(
-                data_dir,
-                new_target_node_id.clone(),
-                shard_id,
-                0,
-                Some(observer),
+            .unwrap();
+        drop(writer);
+        let successor = nodes
+            .iter()
+            .find(|node| **node != original.primary_node_id)
+            .unwrap()
+            .clone();
+        let desired = runtime
+            .reassign_metadata_shard(
+                &original.file_system_id,
+                &original.shard_id,
+                successor.clone(),
+                vec![original.primary_node_id.clone()],
             )
-            .await
-            .expect("lower successor ACK");
-            let after_lower_ack = resident
-                .bounded_status_snapshot()
-                .expect("status after lower successor ACK");
-            assert_eq!(
-                after_lower_ack.metadata_shards[0].replica_lag[0]
-                    .replicated_through_sequence,
-                1,
-                "lower ACKs must not regress the resident cursor projection"
-            );
-            assert_eq!(
-                after_lower_ack.metadata_shards[0].replica_lag[0].lag_entries,
-                0
-            );
-        });
+            .unwrap();
+        assert_eq!(desired.epoch, original.epoch + 1);
+        let mut reader = runtime.client(&successor).unwrap();
+        assert_eq!(
+            reader
+                .posix_read_file_distributed("/native-membership.bin")
+                .unwrap(),
+            b"preserve through native handoff"
+        );
+        assert_eq!(
+            reader
+                .posix_stat_distributed("/native-membership.bin")
+                .unwrap()
+                .object_id,
+            stat.object_id
+        );
+        drop(reader);
+        runtime.stop_node(&successor).unwrap();
+        runtime.reopen_node(successor.clone()).unwrap();
+        let mut reader = runtime.client(&successor).unwrap();
+        assert_eq!(
+            reader
+                .posix_read_file_distributed("/native-membership.bin")
+                .unwrap(),
+            b"preserve through native handoff"
+        );
+        drop(reader);
+        runtime.close().unwrap();
     }
 
     #[test]
@@ -3915,7 +3262,7 @@ mod metadata_publish_membership_tests {
             replica_node_ids: vec![receiver_node_id.clone()],
             epoch: 8,
             assignment: crate::DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
+
             default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
         };
         let retired_snapshot = sinomo_core::cluster::append_cluster_raft_command(
@@ -3934,7 +3281,7 @@ mod metadata_publish_membership_tests {
             replica_node_ids: vec![receiver_node_id.clone()],
             epoch: 9,
             assignment: crate::DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
+
             default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
         };
         let mut accepted = sinomo_core::kv::InProcessKvStore::restore(retired_snapshot)
@@ -3977,9 +3324,9 @@ mod metadata_publish_membership_tests {
                 prefix_probe: None,
                 authority_probe: None,
                 durable_replication: None,
-                batch: DfsMetadataJournalBatch {
+                batch: crate::DfsMetadataJournalFrameBatch {
                     shard_id: DfsMetadataShardId::new("root"),
-                    entries: Vec::new(),
+                    journal_frames: Vec::new(),
                     next_after_sequence: 0,
                 },
             },
@@ -4254,12 +3601,7 @@ fn prepare_dfs_metadata_journal_publish_with_local_backends_and_execution_exclus
                 execution_exclusions,
                 options,
                 |backend, target_node_id, shard_id| {
-                    migrate_legacy_dfs_metadata_replication_cursor(
-                        backend,
-                        data_dir,
-                        target_node_id,
-                        shard_id,
-                    )
+                    Ok(backend.metadata_replication_cursor(target_node_id, shard_id)?)
                 },
             )?;
         outcomes.extend(shard_outcomes);
@@ -4298,12 +3640,7 @@ enum DfsPreparedMetadataJournalPayload {
     },
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct DfsPreparedMetadataJournalFrameBatch {
-    shard_id: DfsMetadataShardId,
-    next_after_sequence: u64,
-    journal_frames: Vec<DfsMetadataJournalFrameRecord>,
-}
+pub(crate) type DfsPreparedMetadataJournalFrameBatch = crate::DfsMetadataJournalFrameBatch;
 
 pub(crate) fn prepare_dfs_metadata_journal_frame_batch(
     backend: &dyn DfsMetadataBackend,
@@ -4546,7 +3883,7 @@ fn dfs_metadata_replication_suppression_for<'a>(
             // Older versions persisted transient receiver-startup failures as
             // epoch-long suppressions. Revalidate the reason so those records
             // cannot strand a restarted replica after upgrading.
-            && DfsMetadataRejectionCode::resolve(record.code, &record.reason).suppresses_replication()
+            && record.code.unwrap_or(DfsMetadataRejectionCode::Other).suppresses_replication()
     })
 }
 
@@ -4555,10 +3892,10 @@ fn record_dfs_metadata_replication_topology_mismatch(
     target_node_id: &NodeId,
     shard_id: &DfsMetadataShardId,
     shard_epoch: u64,
-    code: Option<DfsMetadataRejectionCode>,
+    code: DfsMetadataRejectionCode,
     reason: &str,
 ) -> Result<(), DfsError> {
-    if !DfsMetadataRejectionCode::resolve(code, reason).suppresses_replication() {
+    if !code.suppresses_replication() {
         return Ok(());
     }
     let _write_guard = DFS_METADATA_REPLICATION_SUPPRESSION_WRITE_LOCK
@@ -4574,7 +3911,7 @@ fn record_dfs_metadata_replication_topology_mismatch(
             shard_id: shard_id.clone(),
             shard_epoch,
             reason: reason.to_owned(),
-            code: Some(DfsMetadataRejectionCode::resolve(code, reason)),
+            code: Some(code),
             updated_at_unix_nanos: dfs_now_unix_nanos(),
         },
     )
@@ -4585,10 +3922,10 @@ async fn record_dfs_metadata_replication_topology_mismatch_async(
     target_node_id: &NodeId,
     shard_id: &DfsMetadataShardId,
     shard_epoch: u64,
-    code: Option<DfsMetadataRejectionCode>,
+    code: DfsMetadataRejectionCode,
     reason: &str,
 ) -> Result<(), DfsError> {
-    if !DfsMetadataRejectionCode::resolve(code, reason).suppresses_replication() {
+    if !code.suppresses_replication() {
         return Ok(());
     }
     let data_dir = data_dir.clone();
@@ -5471,6 +4808,12 @@ fn execute_prepared_dfs_metadata_journal_target_publish(
                     completed_plan = false;
                     break;
                 }
+                #[cfg(any(test, feature = "test-support"))]
+                if let Some(context) =
+                    crate::native_shard_trace::direct_journal_attempt_context(data_dir, &command)
+                {
+                    context.accepted_direct_journal(&target_node_id, &command, &response);
+                }
                 let next_after_sequence = command.batch.next_after_sequence;
                 put_local_dfs_metadata_replication_cursor(
                     data_dir,
@@ -5508,8 +4851,7 @@ fn execute_prepared_dfs_metadata_journal_target_publish(
                 // this frozen plan. Rejecting old work is not evidence of a
                 // damaged replica. Re-plan without inventing an ACK or moving
                 // a cursor; unchanged mismatches retain snapshot recovery.
-                if DfsMetadataRejectionCode::resolve(code, &reason)
-                    == DfsMetadataRejectionCode::PrefixMismatch
+                if code == DfsMetadataRejectionCode::PrefixMismatch
                     && metadata_replication_plan_advanced(
                         data_dir,
                         &shard_id,
@@ -5525,7 +4867,7 @@ fn execute_prepared_dfs_metadata_journal_target_publish(
                     completed_plan = false;
                     break;
                 }
-                if DfsMetadataRejectionCode::resolve(code, &reason).allows_snapshot_repair() {
+                if code.allows_snapshot_repair() {
                     execute_prepared_dfs_metadata_snapshot_repair(
                         data_dir,
                         local_node_id,
@@ -5759,9 +5101,9 @@ mod concurrent_target_publish_tests {
                 prefix_probe: None,
                 authority_probe: None,
                 durable_replication: None,
-                batch: DfsMetadataJournalBatch {
+                batch: crate::DfsMetadataJournalFrameBatch {
                     shard_id,
-                    entries: Vec::new(),
+                    journal_frames: Vec::new(),
                     next_after_sequence: 1,
                 },
             }],
@@ -5835,7 +5177,7 @@ mod concurrent_target_publish_tests {
                     request_id: command.request_id.clone(),
                     shard_id: command.batch.shard_id.clone(),
                     next_after_sequence: command.batch.next_after_sequence,
-                    applied_entries: command.batch.entries.len(),
+                    applied_entries: command.batch.journal_frames.len(),
                     verified_prefix_only: command.verify_prefix_only,
                     verified_authority_probe_id: None,
                     result: DfsMetadataJournalBatchResult::Applied,
@@ -5947,7 +5289,7 @@ mod concurrent_target_publish_tests {
                             request_id: command.request_id.clone(),
                             shard_id: command.batch.shard_id.clone(),
                             next_after_sequence: command.batch.next_after_sequence,
-                            applied_entries: command.batch.entries.len(),
+                            applied_entries: command.batch.journal_frames.len(),
                             verified_prefix_only: command.verify_prefix_only,
                             verified_authority_probe_id: None,
                             result: DfsMetadataJournalBatchResult::Applied,
@@ -6060,7 +5402,7 @@ mod concurrent_target_publish_tests {
                             request_id: command.request_id.clone(),
                             shard_id: command.batch.shard_id.clone(),
                             next_after_sequence: command.batch.next_after_sequence,
-                            applied_entries: command.batch.entries.len(),
+                            applied_entries: command.batch.journal_frames.len(),
                             verified_prefix_only: command.verify_prefix_only,
                             verified_authority_probe_id: None,
                             result: DfsMetadataJournalBatchResult::Applied,
@@ -6279,6 +5621,12 @@ async fn execute_prepared_dfs_metadata_journal_target_publish_async(
                     completed_plan = false;
                     break;
                 }
+                #[cfg(any(test, feature = "test-support"))]
+                if let Some(context) =
+                    crate::native_shard_trace::direct_journal_attempt_context(data_dir, &command)
+                {
+                    context.accepted_direct_journal(&target_node_id, &command, &response);
+                }
                 let next_after_sequence = command.batch.next_after_sequence;
                 put_local_dfs_metadata_replication_cursor_async(
                     data_dir.clone(),
@@ -6318,8 +5666,7 @@ async fn execute_prepared_dfs_metadata_journal_target_publish_async(
                 // this frozen plan. Rejecting old work is not evidence of a
                 // damaged replica. Re-plan without inventing an ACK or moving
                 // a cursor; unchanged mismatches retain snapshot recovery.
-                if DfsMetadataRejectionCode::resolve(code, &reason)
-                    == DfsMetadataRejectionCode::PrefixMismatch
+                if code == DfsMetadataRejectionCode::PrefixMismatch
                     && metadata_replication_plan_advanced_async(
                         data_dir,
                         &shard_id,
@@ -6336,7 +5683,7 @@ async fn execute_prepared_dfs_metadata_journal_target_publish_async(
                     completed_plan = false;
                     break;
                 }
-                if DfsMetadataRejectionCode::resolve(code, &reason).allows_snapshot_repair() {
+                if code.allows_snapshot_repair() {
                     execute_prepared_dfs_metadata_snapshot_repair_async(
                         data_dir,
                         local_node_id,
@@ -6861,52 +6208,40 @@ pub async fn publish_dfs_metadata_journal_with_async_host_and_execution_exclusio
 pub(crate) fn validate_durable_metadata_journal_frames(
     command: &DfsMetadataJournalBatchCommand,
 ) -> Result<(), String> {
-    if let Some(replication) = command.durable_replication.as_ref() {
-        if command.authority_probe.is_some()
-            || command.verify_prefix_only
-            || command.prefix_probe.is_some()
-            || !command.batch.entries.is_empty()
-            || replication.confirmation_id.is_empty()
-            || replication.journal_frames.is_empty()
+    if command.verify_prefix_only {
+        if command.prefix_probe.is_none()
+            || command.authority_probe.is_some()
+            || command.durable_replication.is_some()
+            || !command.batch.journal_frames.is_empty()
         {
             return Err(
-                "ordinary durable metadata replication requires one exact-frame carrier and an empty legacy batch"
-                    .to_string(),
+                "prefix verification requires one explicit prefix request and no frames".into(),
             );
         }
-        return validate_durable_metadata_journal_frame_order(
-            "ordinary durable metadata replication",
-            &replication.journal_frames,
-            command.batch.next_after_sequence,
-        );
-    }
-    let Some(probe) = command.authority_probe.as_ref() else {
         return Ok(());
-    };
-    if !probe.durable_journal_ack {
-        return if probe.journal_frames.is_empty() {
-            Ok(())
-        } else {
-            Err("legacy metadata authority probe cannot carry exact journal frames".to_string())
-        };
     }
-    if !command.batch.entries.is_empty() || probe.journal_frames.is_empty() {
-        return Err(
-            "durable metadata authority ingest requires exact frames and an empty legacy batch"
-                .to_string(),
-        );
+    if command.prefix_probe.is_some() || command.batch.journal_frames.is_empty() {
+        return Err("current metadata ingest requires its one exact-frame carrier".into());
     }
-    if !probe.prepared_prefix.as_ref().is_some_and(|prefix| {
-        prefix.is_well_formed() && prefix.journal_sequence == command.batch.next_after_sequence
-    }) {
-        return Err(
-            "durable metadata authority ingest requires a well-formed exact target prefix"
-                .to_string(),
-        );
+    match (&command.durable_replication, &command.authority_probe) {
+        (Some(replication), None) if !replication.confirmation_id.is_empty() => {}
+        (None, Some(probe)) => {
+            let prefix = &probe.prepared_prefix;
+            if !prefix.is_well_formed()
+                || prefix.journal_sequence != command.batch.next_after_sequence
+            {
+                return Err(
+                    "metadata authority ingest requires a well-formed exact target prefix".into(),
+                );
+            }
+        }
+        _ => {
+            return Err("metadata ingest requires exactly one current confirmation purpose".into());
+        }
     }
     validate_durable_metadata_journal_frame_order(
-        "durable metadata authority",
-        &probe.journal_frames,
+        "current metadata journal",
+        &command.batch.journal_frames,
         command.batch.next_after_sequence,
     )
 }
@@ -6940,55 +6275,32 @@ mod durable_metadata_journal_frame_validation_tests {
 
     #[test]
     fn durable_authority_without_prepared_prefix_is_rejected_before_ingest() {
-        let primary = NodeId::from_legacy_named("node_missing_durable_prefix_primary")
-            .expect("primary node id");
-        let replica = NodeId::from_legacy_named("node_missing_durable_prefix_replica")
-            .expect("replica node id");
-        let file_system_id = sifs_file_system_id();
-        let shard_id = DfsMetadataShardId::new("root");
-        let command = DfsMetadataJournalBatchCommand {
-            request_id: "missing-durable-authority-prefix".to_string(),
-            source_node_id: Some(primary.clone()),
-            file_system_id: Some(file_system_id.clone()),
-            authority_epoch: Some(3),
-            verify_prefix_only: false,
-            prefix_probe: None,
-            authority_probe: Some(crate::DfsMetadataAuthorityProbe {
-                probe_id: "missing-durable-authority-prefix-probe".to_string(),
-                expected_shard: DfsMetadataShardConfig {
-                    file_system_id: file_system_id.clone(),
-                    shard_id: shard_id.0.clone(),
-                    primary_node_id: primary,
-                    replica_node_ids: vec![replica],
-                    epoch: 3,
-                    assignment: crate::DfsMetadataShardAssignment::Root,
-                    namespace_prepare_codec: Default::default(),
-                    default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+        let primary = NodeId::from_legacy_named("node_missing_durable_prefix_primary").unwrap();
+        let replica = NodeId::from_legacy_named("node_missing_durable_prefix_replica").unwrap();
+        let fs = sifs_file_system_id();
+        let wire = serde_json::json!({
+            "request_id":"missing-durable-authority-prefix", "source_node_id":primary,
+            "file_system_id":fs, "authority_epoch":3, "verify_prefix_only":false,
+            "prefix_probe":null, "durable_replication":null,
+            "authority_probe":{
+                "probe_id":"missing-durable-authority-prefix-probe",
+                "expected_shard":{
+                    "file_system_id":fs, "shard_id":"root", "primary_node_id":primary,
+                    "replica_node_ids":[replica], "epoch":3, "assignment":"root",
+                    "default_policy":"replicated-eventual"
                 },
-                operation: crate::DfsMetadataAuthorityOperation::NamespaceMutation {
-                    operation_id: "missing-durable-authority-prefix-operation".to_string(),
-                    file_system_id,
-                    prepare_sequence: 1,
-                    payload_digest: "blake3:missing-durable-authority-prefix".to_string(),
-                },
-                durable_journal_ack: true,
-                journal_frames: vec![DfsMetadataJournalFrameRecord {
-                    sequence: 1,
-                    exact_bytes: bytes::Bytes::from_static(b"malformed-frame-is-not-decoded"),
-                }],
-                prepared_prefix: None,
-            }),
-            durable_replication: None,
-            batch: DfsMetadataJournalBatch {
-                shard_id,
-                entries: Vec::new(),
-                next_after_sequence: 1,
+                "operation":{
+                    "kind":"prepared-operation", "operation_id":"missing-durable-authority-prefix-operation",
+                    "file_system_id":fs,"shard_id":"root","owner_epoch":3,"prepare_sequence":1,
+                    "payload_digest":"blake3:missing-durable-authority-prefix"
+                }
             },
-        };
-
-        let error = validate_durable_metadata_journal_frames(&command)
-            .expect_err("missing durable authority prefix must be rejected");
-        assert!(error.contains("well-formed exact target prefix"));
+            "batch":{"shard_id":"root","journal_frames":[],"next_after_sequence":1}
+        });
+        assert!(
+            serde_json::from_value::<DfsMetadataJournalBatchCommand>(wire).is_err(),
+            "a missing exact prepared prefix cannot become an ingest command"
+        );
     }
 }
 
@@ -7017,7 +6329,7 @@ pub(crate) fn persist_durable_metadata_replication_ack(
             shard_id: command.batch.shard_id.clone(),
             journal_sequence: command.batch.next_after_sequence,
             state_fingerprint: String::new(),
-            durable_prefix_proof: Some(durable_prefix),
+            durable_prefix_proof: durable_prefix,
         })
         .map_err(|error| {
             format!(
@@ -7047,35 +6359,55 @@ pub fn process_dfs_metadata_journal_batch(
             .source_node_id
             .as_ref()
             .expect("validated metadata prefix probe has a source node");
-        return match verify_dfs_metadata_journal_prefix(backend, context, source_node_id, &command)
-        {
-            Ok(verified_primary_handoff_id) => DfsMetadataJournalBatchResponse {
-                request_id: command.request_id,
-                shard_id,
-                next_after_sequence,
-                applied_entries: 0,
-                verified_prefix_only: true,
-                verified_authority_probe_id: verified_primary_handoff_id,
-                result: DfsMetadataJournalBatchResult::Applied,
-            },
-            Err(reason) => DfsMetadataJournalBatchResponse {
-                request_id: command.request_id,
-                shard_id,
-                next_after_sequence,
-                applied_entries: 0,
-                verified_prefix_only: false,
-                verified_authority_probe_id: None,
-                result: DfsMetadataJournalBatchResult::from_rejection(reason),
-            },
-        };
-    }
-    if command
-        .authority_probe
-        .as_ref()
-        .is_some_and(|probe| !probe.durable_journal_ack)
-        && let Err(reason) = validate_contiguous_metadata_authority_batch(backend, &command.batch)
-    {
-        return dfs_metadata_journal_rejection_response(&command, reason);
+        #[cfg(any(test, feature = "test-support"))]
+        let mut native_boundary = crate::native_shard_trace::current_boundary_interest();
+        #[cfg(any(test, feature = "test-support"))]
+        let native_input = native_boundary.as_ref().map(|_| command.clone());
+        #[cfg(any(test, feature = "test-support"))]
+        let native_before = native_boundary.as_ref().and_then(|_| {
+            backend.native_held_snapshot_for_scope(&context.shard.file_system_id, &shard_id)
+        });
+        let response =
+            match verify_dfs_metadata_journal_prefix(backend, context, source_node_id, &command) {
+                Ok(verified_primary_handoff_id) => DfsMetadataJournalBatchResponse {
+                    request_id: command.request_id,
+                    shard_id,
+                    next_after_sequence,
+                    applied_entries: 0,
+                    verified_prefix_only: true,
+                    verified_authority_probe_id: verified_primary_handoff_id,
+                    result: DfsMetadataJournalBatchResult::Applied,
+                },
+                Err(reason) => DfsMetadataJournalBatchResponse {
+                    request_id: command.request_id,
+                    shard_id,
+                    next_after_sequence,
+                    applied_entries: 0,
+                    verified_prefix_only: false,
+                    verified_authority_probe_id: None,
+                    result: DfsMetadataJournalBatchResult::from_rejection(reason),
+                },
+            };
+        #[cfg(any(test, feature = "test-support"))]
+        if matches!(&response.result, DfsMetadataJournalBatchResult::Applied) {
+            if let (Some(trace), Some(input)) = (native_boundary.as_mut(), native_input) {
+                trace.observe(
+                    crate::native_shard_trace::NativeBoundaryFactsV1::ReplicaPrefixProbeAccepted {
+                        local_node_id: context.local_node_id.clone(),
+                        actual_source_config: context.shard.clone(),
+                        actual_pending_handoff: context.pending_membership_handoff.clone(),
+                        command: input,
+                        response: response.clone(),
+                    },
+                    native_before,
+                    backend.native_held_snapshot_for_scope(
+                        &context.shard.file_system_id,
+                        &response.shard_id,
+                    ),
+                );
+            }
+        }
+        return response;
     }
     let context = context.expect("validated metadata replica ingest has a shard context");
     let permit = DfsMetadataReplicaIngestPermit::new_validated(
@@ -7084,40 +6416,51 @@ pub fn process_dfs_metadata_journal_batch(
         context.shard.primary_node_id.clone(),
         context.shard.epoch,
     );
-    let apply_result = if let Some(replication) = command.durable_replication.as_ref() {
-        backend.persist_journal_frames_with_replica_permit_report(
-            &permit,
-            &command.batch,
-            &replication.journal_frames,
-        )
-    } else if command
-        .authority_probe
-        .as_ref()
-        .is_some_and(|probe| probe.durable_journal_ack)
-    {
-        let probe = command
-            .authority_probe
-            .as_ref()
-            .expect("durable authority probe checked above");
+    #[cfg(any(test, feature = "test-support"))]
+    let mut native_trace = crate::native_shard_trace::current_boundary_interest();
+    #[cfg(any(test, feature = "test-support"))]
+    let native_before = native_trace.as_ref().and_then(|_| {
+        backend.native_held_snapshot_for_scope(&context.shard.file_system_id, &shard_id)
+    });
+    let header = command.batch.header();
+    let apply_result = if let Some(probe) = command.authority_probe.as_ref() {
         backend.persist_authority_journal_frames_with_replica_permit_report(
             &permit,
-            &command.batch,
-            &probe.journal_frames,
-            probe
-                .prepared_prefix
-                .as_ref()
-                .expect("durable authority prefix validated above"),
+            &header,
+            &command.batch.journal_frames,
+            &probe.prepared_prefix,
         )
-    } else if command.authority_probe.is_some() {
-        backend.apply_journal_batch_with_replica_permit_report(&permit, &command.batch)
     } else {
-        backend
-            .apply_journal_batch_with_replica_permit(&permit, &command.batch)
-            .map(crate::DfsMetadataReplicaApplyReport::without_authority_proofs)
+        backend.persist_journal_frames_with_replica_permit_report(
+            &permit,
+            &header,
+            &command.batch.journal_frames,
+        )
     };
     match apply_result {
         Ok(apply_report) => {
             let applied_entries = apply_report.applied_entries();
+            #[cfg(any(test, feature = "test-support"))]
+            if let Some(trace) = native_trace.as_mut() {
+                trace.observe(
+                    crate::native_shard_trace::NativeBoundaryFactsV1::ReplicaJournalPersisted {
+                        local_node_id: context.local_node_id.clone(),
+                        actual_source_config: context.shard.clone(),
+                        actual_pending_handoff: context.pending_membership_handoff.clone(),
+                        command: command.clone(),
+                        applied_entries,
+                        permit: crate::native_shard_trace::NativeReplicaPermitTupleV1::observed(
+                            &permit,
+                        ),
+                        durable_prefix: apply_report.durable_prefix_proof().cloned(),
+                        materialization_pending: apply_report.materialization_pending(),
+                    },
+                    native_before,
+                    backend
+                        .native_held_snapshot_for_scope(&context.shard.file_system_id, &shard_id),
+                );
+            }
+
             let verified_durable_replication_id =
                 match persist_durable_metadata_replication_ack(backend, &command, &apply_report) {
                     Ok(confirmation_id) => confirmation_id,
@@ -7143,11 +6486,18 @@ pub fn process_dfs_metadata_journal_batch(
                             );
                         }
                     };
+                let Some(durable_prefix_proof) = apply_report.durable_prefix_proof().cloned()
+                else {
+                    return dfs_metadata_journal_rejection_response(
+                        &command,
+                        "authority acknowledgement has no exact durable prefix",
+                    );
+                };
                 if let Err(error) =
                     backend.put_metadata_authority_ack_floor(&crate::DfsMetadataAuthorityAckFloor {
                         shard_id: command.batch.shard_id.clone(),
                         journal_sequence: command.batch.next_after_sequence,
-                        durable_prefix_proof: apply_report.durable_prefix_proof().cloned(),
+                        durable_prefix_proof,
                     })
                 {
                     return dfs_metadata_journal_rejection_response(
@@ -7162,8 +6512,8 @@ pub fn process_dfs_metadata_journal_batch(
             } else {
                 None
             };
-            DfsMetadataJournalBatchResponse {
-                request_id: command.request_id,
+            let response = DfsMetadataJournalBatchResponse {
+                request_id: command.request_id.clone(),
                 shard_id,
                 next_after_sequence,
                 applied_entries,
@@ -7172,95 +6522,42 @@ pub fn process_dfs_metadata_journal_batch(
                 // hidden operation and complete primary history are durable.
                 verified_authority_probe_id,
                 result: DfsMetadataJournalBatchResult::Applied,
+            };
+            #[cfg(any(test, feature = "test-support"))]
+            if let Some(trace) = native_trace.as_mut() {
+                trace.observe(
+                    crate::native_shard_trace::NativeBoundaryFactsV1::ReplicaJournalResponseConstructed {
+                        response: response.clone(),
+                    }, None, None,
+                );
+            }
+            response
+        }
+        Err(error) => {
+            #[cfg(any(test, feature = "test-support"))]
+            if let Some(trace) = native_trace.as_mut() {
+                trace.observe(
+                    crate::native_shard_trace::NativeBoundaryFactsV1::ReplicaJournalPersistenceFailed {
+                        local_node_id: context.local_node_id.clone(),
+                        actual_source_config: context.shard.clone(),
+                        command: command.clone(), error_detail: error.to_string(),
+                    },
+                    native_before,
+                    backend.native_held_snapshot_for_scope(&context.shard.file_system_id, &shard_id),
+                );
+                trace.uncertain();
+            }
+            DfsMetadataJournalBatchResponse {
+                request_id: command.request_id,
+                shard_id,
+                next_after_sequence,
+                applied_entries: 0,
+                verified_prefix_only: false,
+                verified_authority_probe_id: None,
+                result: DfsMetadataJournalBatchResult::from_rejection(error),
             }
         }
-        Err(error) => DfsMetadataJournalBatchResponse {
-            request_id: command.request_id,
-            shard_id,
-            next_after_sequence,
-            applied_entries: 0,
-            verified_prefix_only: false,
-            verified_authority_probe_id: None,
-            result: DfsMetadataJournalBatchResult::from_rejection(error),
-        },
     }
-}
-
-fn validate_contiguous_metadata_authority_batch(
-    backend: &mut dyn DfsMetadataBackend,
-    batch: &DfsMetadataJournalBatch,
-) -> Result<(), DfsMetadataRejection> {
-    let Some(last_entry) = batch.entries.last() else {
-        return Err(DfsMetadataRejection::from(format!(
-            "metadata authority batch for shard {} must contain the exact hidden operation prepare",
-            batch.shard_id.0
-        )));
-    };
-    if last_entry.sequence != batch.next_after_sequence {
-        return Err(DfsMetadataRejection::from(format!(
-            "metadata authority batch for shard {} ends at sequence {} but names sequence {}",
-            batch.shard_id.0, last_entry.sequence, batch.next_after_sequence
-        )));
-    }
-    let mut replayed_through_sequence =
-        backend
-            .metadata_replay_cursor(&batch.shard_id)
-            .map_err(|error| {
-                format!(
-                    "read metadata replay cursor for authority batch shard {}: {error}",
-                    batch.shard_id.0
-                )
-            })?;
-    // Exact-frame replication can durably acknowledge a prefix before this
-    // handle's rebuildable tables catch up. Refresh the actual durable journal
-    // before declaring a gap; a cached replay cursor is not a missing-history
-    // proof. Do not trust a larger advisory cursor or relax contiguous replay.
-    if batch
-        .entries
-        .iter()
-        .find(|entry| entry.sequence > replayed_through_sequence)
-        .is_some_and(|entry| entry.sequence > replayed_through_sequence.saturating_add(1))
-    {
-        backend
-            .refresh_metadata_shard_durable_view(&batch.shard_id)
-            .map_err(|error| format!("refresh durable authority prefix: {error}"))?;
-        replayed_through_sequence = backend
-            .metadata_replay_cursor(&batch.shard_id)
-            .map_err(|error| format!("read refreshed authority prefix: {error}"))?;
-    }
-    let mut previous_sequence: Option<u64> = None;
-    let mut expected_unseen_sequence = replayed_through_sequence.saturating_add(1);
-    for entry in &batch.entries {
-        if entry.shard_id != batch.shard_id {
-            return Err(DfsMetadataRejection::from(format!(
-                "metadata authority batch for shard {} contains entry from shard {}",
-                batch.shard_id.0, entry.shard_id.0
-            )));
-        }
-        if let Some(previous_sequence) = previous_sequence
-            && entry.sequence != previous_sequence.saturating_add(1)
-        {
-            return Err(DfsMetadataRejection::from(format!(
-                "metadata authority batch for shard {} is not contiguous between sequences {} and {}",
-                batch.shard_id.0, previous_sequence, entry.sequence
-            )));
-        }
-        previous_sequence = Some(entry.sequence);
-        if entry.sequence <= replayed_through_sequence {
-            continue;
-        }
-        if entry.sequence != expected_unseen_sequence {
-            return Err(DfsMetadataRejection::new(
-                DfsMetadataRejectionCode::ReplicaDiverged,
-                format!(
-                    "metadata authority batch for shard {} starts unseen history at sequence {} but durable replay requires sequence {}",
-                    batch.shard_id.0, entry.sequence, expected_unseen_sequence
-                ),
-            ));
-        }
-        expected_unseen_sequence = expected_unseen_sequence.saturating_add(1);
-    }
-    Ok(())
 }
 
 pub(crate) fn verify_dfs_metadata_journal_prefix(
@@ -7276,12 +6573,10 @@ pub(crate) fn verify_dfs_metadata_journal_prefix(
                 .into(),
         );
     };
-    if !batch.entries.is_empty() {
-        return Err(
-            ("metadata journal prefix probe must carry an empty rolling-upgrade-safe batch"
-                .to_string())
-            .into(),
-        );
+    if !batch.journal_frames.is_empty() {
+        return Err("metadata prefix verification cannot carry journal frames"
+            .to_string()
+            .into());
     }
     if probe.barrier_id.is_empty()
         || probe.state_fingerprint.is_empty()
@@ -7383,7 +6678,7 @@ pub(crate) fn verify_dfs_metadata_journal_prefix(
             shard_id: probe.shard_id.clone(),
             journal_sequence: probe.journal_sequence,
             state_fingerprint: probe.state_fingerprint.clone(),
-            durable_prefix_proof: Some(durable_prefix_proof),
+            durable_prefix_proof,
         })
         .map_err(|error| {
             format!(
@@ -7615,6 +6910,29 @@ pub(crate) fn schedule_cluster_dfs_metadata_replica_materialization_on_runtime(
     );
 }
 
+pub(crate) fn metadata_snapshot_install_permit(
+    context: &DfsMetadataReplicaShardContext,
+    command: &DfsMetadataSnapshotInstallCommand,
+) -> std::result::Result<DfsMetadataReplicaIngestPermit, String> {
+    let handoff_id = validated_pending_primary_handoff_snapshot_id(context, command)?;
+    Ok(if let Some(handoff_id) = handoff_id {
+        DfsMetadataReplicaIngestPermit::new_validated_pending_primary_handoff(
+            context.shard.file_system_id.clone(),
+            command.shard_id.clone(),
+            context.shard.primary_node_id.clone(),
+            context.shard.epoch,
+            handoff_id,
+        )
+    } else {
+        DfsMetadataReplicaIngestPermit::new_validated(
+            context.shard.file_system_id.clone(),
+            command.shard_id.clone(),
+            context.shard.primary_node_id.clone(),
+            context.shard.epoch,
+        )
+    })
+}
+
 pub fn process_dfs_metadata_snapshot_install(
     backend: &mut dyn DfsMetadataBackend,
     context: Option<&DfsMetadataReplicaShardContext>,
@@ -7646,39 +6964,34 @@ pub fn process_dfs_metadata_snapshot_install(
         Ok(None) => {}
     }
     let context = context.expect("validated metadata snapshot ingest has a shard context");
-    let pending_primary_handoff_id =
-        match validated_pending_primary_handoff_snapshot_id(context, &command) {
-            Ok(handoff_id) => handoff_id,
-            Err(reason) => {
-                return DfsMetadataSnapshotInstallResponse {
-                    request_id,
-                    shard_id,
-                    next_after_sequence,
-                    result: DfsMetadataSnapshotInstallResult::from_rejection(reason),
-                };
-            }
-        };
-    let permit = if let Some(handoff_id) = pending_primary_handoff_id {
-        DfsMetadataReplicaIngestPermit::new_validated_pending_primary_handoff(
-            context.shard.file_system_id.clone(),
-            shard_id.clone(),
-            context.shard.primary_node_id.clone(),
-            context.shard.epoch,
-            handoff_id,
-        )
-    } else {
-        DfsMetadataReplicaIngestPermit::new_validated(
-            context.shard.file_system_id.clone(),
-            shard_id.clone(),
-            context.shard.primary_node_id.clone(),
-            context.shard.epoch,
-        )
+    let permit = match metadata_snapshot_install_permit(context, &command) {
+        Ok(permit) => permit,
+        Err(reason) => {
+            return DfsMetadataSnapshotInstallResponse {
+                request_id,
+                shard_id,
+                next_after_sequence,
+                result: DfsMetadataSnapshotInstallResult::from_rejection(reason),
+            };
+        }
     };
-    match backend.replace_with_replicated_snapshot_with_replica_permit(
+    #[cfg(any(test, feature = "test-support"))]
+    let mut native_boundary = crate::native_shard_trace::current_boundary_interest();
+    #[cfg(any(test, feature = "test-support"))]
+    let native_input = native_boundary.as_ref().map(|_| command.clone());
+    #[cfg(any(test, feature = "test-support"))]
+    let native_before = native_boundary.as_ref().and_then(|_| {
+        backend.native_held_snapshot_for_scope(&context.shard.file_system_id, &shard_id)
+    });
+    let snapshot_image = command
+        .image()
+        .cloned()
+        .expect("validated native snapshot resource");
+    let response = match backend.replace_with_replicated_snapshot_with_replica_permit(
         &permit,
         command.shard_id,
         command.next_after_sequence,
-        command.snapshot,
+        snapshot_image,
     ) {
         Ok(archived_existing) => DfsMetadataSnapshotInstallResponse {
             request_id,
@@ -7692,14 +7005,35 @@ pub fn process_dfs_metadata_snapshot_install(
             next_after_sequence,
             result: DfsMetadataSnapshotInstallResult::from_rejection(error),
         },
+    };
+    #[cfg(any(test, feature = "test-support"))]
+    if matches!(
+        &response.result,
+        DfsMetadataSnapshotInstallResult::Installed { .. }
+    ) && let (Some(trace), Some(input)) = (native_boundary.as_mut(), native_input)
+    {
+        trace.observe(
+            crate::native_shard_trace::NativeBoundaryFactsV1::ReplicaSnapshotAccepted {
+                local_node_id: context.local_node_id.clone(),
+                actual_source_config: context.shard.clone(),
+                actual_pending_handoff: context.pending_membership_handoff.clone(),
+                command: input,
+                response: response.clone(),
+                permit: crate::native_shard_trace::NativeReplicaPermitTupleV1::observed(&permit),
+            },
+            native_before,
+            backend
+                .native_held_snapshot_for_scope(&context.shard.file_system_id, &response.shard_id),
+        );
     }
+    response
 }
 
 pub(crate) fn validate_dfs_metadata_snapshot_install_state(
     backend: &dyn DfsMetadataBackend,
     command: &DfsMetadataSnapshotInstallCommand,
 ) -> Result<Option<String>, DfsError> {
-    if command.snapshot.materialized_through_sequence != Some(command.next_after_sequence) {
+    if command.snapshot.materialized_through_sequence != command.next_after_sequence {
         return Ok(Some(format!(
             "metadata snapshot embedded sequence {:?} does not match install sequence {} for shard {}",
             command.snapshot.materialized_through_sequence,
@@ -7707,35 +7041,17 @@ pub(crate) fn validate_dfs_metadata_snapshot_install_state(
             command.shard_id.0
         )));
     }
-    if let Some(proof) = command.snapshot.prefix_proof.as_ref() {
+    {
+        let proof = &command.snapshot.prefix_proof;
         if !proof.is_well_formed() || proof.journal_sequence != command.next_after_sequence {
             return Ok(Some(format!(
                 "metadata snapshot prefix proof does not name exact install sequence {} for shard {}",
                 command.next_after_sequence, command.shard_id.0
             )));
         }
-        let Some(expected_semantic_fingerprint) =
-            command.snapshot.semantic_state_fingerprint.as_ref()
-        else {
+        if let Err(error) = command.image().and_then(|image| image.validate()) {
             return Ok(Some(format!(
-                "metadata snapshot prefix proof for shard {} sequence {} is missing its semantic checksum",
-                command.shard_id.0, command.next_after_sequence
-            )));
-        };
-        let actual_semantic_fingerprint =
-            crate::metadata_records::dfs_metadata_table_snapshot_state_fingerprint(
-                &command.snapshot,
-            )
-            .map_err(|source| DfsError::Serialization {
-                message: format!(
-                    "encode metadata snapshot semantic checksum for {}: {source}",
-                    command.shard_id.0
-                ),
-            })?;
-        if &actual_semantic_fingerprint != expected_semantic_fingerprint {
-            return Ok(Some(format!(
-                "metadata snapshot semantic checksum does not match its prefix proof transfer for shard {} sequence {}",
-                command.shard_id.0, command.next_after_sequence
+                "native snapshot image failed verification: {error}"
             )));
         }
     }
@@ -7747,8 +7063,7 @@ pub(crate) fn validate_dfs_metadata_snapshot_install_state(
             )));
         }
         if command.next_after_sequence == authority_floor.journal_sequence
-            && authority_floor.durable_prefix_proof.as_ref()
-                != command.snapshot.prefix_proof.as_ref()
+            && authority_floor.durable_prefix_proof != command.snapshot.prefix_proof
         {
             return Ok(Some(format!(
                 "metadata snapshot prefix conflicts with locally acknowledged authority operation for shard {} sequence {}",
@@ -7766,26 +7081,16 @@ pub(crate) fn validate_dfs_metadata_snapshot_install_state(
         )));
     }
     if command.next_after_sequence == floor.journal_sequence {
-        if let Some(durable_prefix) = floor.durable_prefix_proof.as_ref()
-            && command.snapshot.prefix_proof.as_ref() != Some(durable_prefix)
-        {
+        if command.snapshot.prefix_proof != floor.durable_prefix_proof {
             return Ok(Some(format!(
                 "metadata snapshot journal prefix conflicts with locally acknowledged checkpoint for shard {} sequence {}",
                 command.shard_id.0, command.next_after_sequence
             )));
         }
         if !floor.state_fingerprint.is_empty() {
-            let matches = crate::metadata_records::dfs_metadata_table_snapshot_matches_checkpoint(
-                &command.snapshot,
-                command.next_after_sequence,
-                &floor.state_fingerprint,
-            )
-            .map_err(|source| DfsError::Serialization {
-                message: format!(
-                    "encode metadata snapshot local acknowledgement check for {}: {source}",
-                    command.shard_id.0
-                ),
-            })?;
+            let matches = command
+                .snapshot
+                .matches_checkpoint(command.next_after_sequence, &floor.state_fingerprint);
             if !matches {
                 return Ok(Some(format!(
                     "metadata snapshot state does not match locally acknowledged checkpoint for shard {} sequence {}",
@@ -7829,7 +7134,7 @@ pub(crate) fn process_cluster_dfs_metadata_snapshot_install_with_context(
                     "authenticated metadata snapshot caller {authenticated_source_node_id} does not match claimed source {}",
                     command.source_node_id
                 ),
-                code: None,
+                code: DfsMetadataRejectionCode::Other,
             },
         });
     }
@@ -7857,19 +7162,16 @@ pub(crate) fn process_cluster_dfs_metadata_snapshot_install_with_context(
             let context = context
                 .as_ref()
                 .expect("validated metadata snapshot ingest has a shard context");
-            let permit = DfsMetadataReplicaIngestPermit::new_validated(
-                context.shard.file_system_id.clone(),
-                shard_id.clone(),
-                context.shard.primary_node_id.clone(),
-                context.shard.epoch,
-            );
+            let permit = metadata_snapshot_install_permit(context, &command)
+                .map_err(|message| DfsError::Metadata { message })?;
+            let snapshot_image = command.image().cloned().map_err(DfsError::from)?;
             let result = LocalSobjMetadataBackend::replace_unreadable_with_replicated_snapshot(
                 &permit,
                 shard_id.clone(),
                 root,
                 command.shard_id,
                 command.next_after_sequence,
-                command.snapshot,
+                snapshot_image,
             );
             let result = match result {
                 Ok((_backend, archived_existing)) => {
@@ -7879,7 +7181,7 @@ pub(crate) fn process_cluster_dfs_metadata_snapshot_install_with_context(
                     reason: format!(
                         "cannot open metadata shard for snapshot install: {open_error}; unreadable-shard snapshot replacement failed: {repair_error}"
                     ),
-                    code: None,
+                    code: DfsMetadataRejectionCode::Other,
                 },
             };
             Ok(DfsMetadataSnapshotInstallResponse {
@@ -7891,3515 +7193,6 @@ pub(crate) fn process_cluster_dfs_metadata_snapshot_install_with_context(
         }
         Err(open_error) => Err(open_error.into()),
     }
-}
-
-pub fn materialize_default_sifs_metadata(
-    backend: &mut dyn DfsMetadataBackend,
-    file_system: &DfsFileSystem,
-    bootstrap_owner_node_ids: impl IntoIterator<Item = NodeId>,
-    fallback_owner_node_id: NodeId,
-    created_at: OffsetDateTime,
-) -> Result<(), DfsError> {
-    backend.ensure_file_system(file_system)?;
-    materialize_default_sifs_metadata_objects(
-        backend,
-        distributed_sifs_bootstrap_objects_for_nodes(
-            bootstrap_owner_node_ids,
-            fallback_owner_node_id,
-        ),
-        created_at,
-    )
-}
-
-fn materialize_default_sifs_metadata_objects(
-    backend: &mut dyn DfsMetadataBackend,
-    objects: impl IntoIterator<Item = crate::DfsObjectMetadata>,
-    created_at: OffsetDateTime,
-) -> Result<(), DfsError> {
-    for object in objects {
-        if backend
-            .get_object_by_path(&object.file_system_id, object.path.trim_matches('/'))?
-            .is_none()
-        {
-            backend.put_object(&object)?;
-            backend.put_version(&DfsObjectVersionRecord {
-                metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
-                content_durability: None,
-                retention: Default::default(),
-                module_metadata: Default::default(),
-                file_system_id: object.file_system_id.clone(),
-                object_id: object.object_id.clone(),
-                version: object.version.clone(),
-                content_hash: object.content_hash.clone(),
-                size_bytes: object.content_size_bytes,
-                locations: object.current_locations.clone(),
-                created_by_event_id: object.created_by_event_id.clone(),
-                created_at,
-                visible: true,
-            })?;
-        }
-    }
-    Ok(())
-}
-
-/// Materialize only bootstrap objects whose committed shard authority is a
-/// currently writable local primary.
-///
-/// The full local router is bounded to this call. Only selected local primaries
-/// are writable; replica shards participate as read-only migration evidence.
-/// Shards parked behind a membership handoff are omitted from the writable set
-/// and revisited when the handoff generation becomes active.
-#[cfg(test)]
-pub(crate) fn materialize_default_sifs_metadata_on_active_primary_shards(
-    metadata_root: impl Into<PathBuf>,
-    file_system: &DfsFileSystem,
-    all_shards: &[DfsMetadataShardConfig],
-    active_primary_shard_ids: &BTreeSet<DfsMetadataShardId>,
-    local_node_id: &NodeId,
-    bootstrap_owner_node_ids: impl IntoIterator<Item = NodeId>,
-    fallback_owner_node_id: NodeId,
-    created_at: OffsetDateTime,
-) -> Result<DfsDefaultSifsMaterializationReport, DfsError> {
-    let metadata_root = metadata_root.into();
-    if active_primary_shard_ids.is_empty() {
-        return Ok(DfsDefaultSifsMaterializationReport {
-            migration: DfsMetadataShardMigrationReport {
-                file_system_id: file_system.file_system_id.clone(),
-                scanned_objects: 0,
-                indexed_objects: 0,
-                migrated_objects: 0,
-                skipped_stale_sources: 0,
-                reached_limit: false,
-            },
-            awaiting_replica_progress: false,
-        });
-    }
-    let mut backend = LocalShardedMetadataBackend::new_with_replica_repair(
-        metadata_root.clone(),
-        all_shards.to_vec(),
-        local_node_id,
-    )?;
-    materialize_default_sifs_metadata_on_bound_primary_shards(
-        metadata_root,
-        &mut backend,
-        file_system,
-        all_shards,
-        active_primary_shard_ids,
-        local_node_id,
-        bootstrap_owner_node_ids,
-        fallback_owner_node_id,
-        created_at,
-    )
-}
-
-/// Materialize default metadata through the exact shard backend instances
-/// whose current authority generation was validated by the caller.
-///
-/// A completed membership handoff binds authority to one in-memory backend
-/// instance. Durable activation markers deliberately do not grant authority
-/// to another instance opened on the same path, so neither bootstrap writes
-/// nor bounded cross-shard migration may reopen a validated primary.
-pub(crate) fn materialize_default_sifs_metadata_on_bound_primary_shards(
-    metadata_root: impl Into<PathBuf>,
-    backend: &mut LocalShardedMetadataBackend,
-    file_system: &DfsFileSystem,
-    all_shards: &[DfsMetadataShardConfig],
-    active_primary_shard_ids: &BTreeSet<DfsMetadataShardId>,
-    local_node_id: &NodeId,
-    bootstrap_owner_node_ids: impl IntoIterator<Item = NodeId>,
-    fallback_owner_node_id: NodeId,
-    created_at: OffsetDateTime,
-) -> Result<DfsDefaultSifsMaterializationReport, DfsError> {
-    let metadata_root = metadata_root.into();
-    let expected_bound_shard_ids = all_shards
-        .iter()
-        .filter(|shard| {
-            shard.file_system_id == file_system.file_system_id
-                && shard.primary_node_id == *local_node_id
-                && active_primary_shard_ids
-                    .contains(&DfsMetadataShardId::new(shard.shard_id.clone()))
-        })
-        .map(|shard| DfsMetadataShardId::new(shard.shard_id.clone()))
-        .collect::<BTreeSet<_>>();
-    if expected_bound_shard_ids.is_empty() {
-        return Ok(DfsDefaultSifsMaterializationReport {
-            migration: DfsMetadataShardMigrationReport {
-                file_system_id: file_system.file_system_id.clone(),
-                scanned_objects: 0,
-                indexed_objects: 0,
-                migrated_objects: 0,
-                skipped_stale_sources: 0,
-                reached_limit: false,
-            },
-            awaiting_replica_progress: false,
-        });
-    }
-    let configured_shard_ids = all_shards
-        .iter()
-        .filter(|shard| shard.file_system_id == file_system.file_system_id)
-        .map(|shard| DfsMetadataShardId::new(shard.shard_id.clone()))
-        .collect::<BTreeSet<_>>();
-    let bound_shard_ids = backend.shard_ids().into_iter().collect::<BTreeSet<_>>();
-    if !configured_shard_ids.is_subset(&bound_shard_ids) {
-        return Err(DfsError::Metadata {
-            message: format!(
-                "default SIFS materialization backend shards {:?} do not cover configured shards {:?}",
-                bound_shard_ids, configured_shard_ids
-            ),
-        });
-    }
-
-    let objects = distributed_sifs_bootstrap_objects_for_nodes(
-        bootstrap_owner_node_ids,
-        fallback_owner_node_id,
-    )
-    .into_iter()
-    .map(|object| {
-        let selected =
-            crate::control_plane::select_metadata_shard_config_for_path_strict_default_sifs_split(
-                &object.file_system_id,
-                all_shards,
-                &object.path,
-            )?
-            .ok_or_else(|| sinomo_core::kv::KvError::Serialization {
-                detail: format!(
-                    "default SIFS bootstrap object {} has no committed metadata shard",
-                    object.path
-                ),
-            })?;
-        Ok((selected, object))
-    })
-    .collect::<Result<Vec<_>, sinomo_core::kv::KvError>>()?
-    .into_iter()
-    .filter_map(|(selected, object)| {
-        let shard_id = DfsMetadataShardId::new(selected.shard_id.clone());
-        (selected.primary_node_id == *local_node_id && active_primary_shard_ids.contains(&shard_id))
-            .then_some((shard_id, object))
-    })
-    .collect::<Vec<_>>();
-
-    for shard_id in &expected_bound_shard_ids {
-        backend
-            .shard_backend_mut(shard_id)?
-            .ensure_file_system(file_system)?;
-    }
-    // The selected shard is already proven from the committed topology.
-    // Materialize directly through that shard rather than asking the full
-    // router to repeat path selection and inspect historical fallback shards.
-    for (shard_id, object) in objects {
-        materialize_default_sifs_metadata_objects(
-            backend.shard_backend_mut(&shard_id)?,
-            [object],
-            created_at,
-        )?;
-    }
-
-    migrate_default_sifs_metadata_on_active_primary_shards(
-        &metadata_root,
-        backend,
-        file_system,
-        all_shards,
-        active_primary_shard_ids,
-        local_node_id,
-        DEFAULT_SIFS_BOOTSTRAP_SHARD_MIGRATION_MUTATION_LIMIT,
-    )
-}
-
-struct DfsDefaultSifsMigrationShardScan {
-    shard_id: DfsMetadataShardId,
-    buffered: VecDeque<crate::DfsObjectMetadata>,
-    next_after: Option<crate::DfsObjectId>,
-}
-
-struct DfsDefaultSifsMigrationScanBatch {
-    candidates_by_object:
-        BTreeMap<crate::DfsObjectId, Vec<(DfsMetadataShardId, crate::DfsObjectMetadata)>>,
-    scanned_object_ids: Vec<crate::DfsObjectId>,
-    catalog_has_more: bool,
-    awaiting_replica_progress: bool,
-}
-
-fn refill_default_sifs_migration_shard_scan(
-    scan: &mut DfsDefaultSifsMigrationShardScan,
-    backend: &LocalSobjMetadataBackend,
-    file_system_id: &DfsFileSystemId,
-    page_size: usize,
-) -> Result<(), DfsError> {
-    if !scan.buffered.is_empty() {
-        return Ok(());
-    }
-    let Some(after_object_id) = scan.next_after.take() else {
-        return Ok(());
-    };
-    let (objects, next_after) = backend.objects_for_file_system_by_id_page(
-        file_system_id,
-        Some(&after_object_id),
-        page_size,
-    )?;
-    scan.buffered = objects.into();
-    scan.next_after = next_after;
-    Ok(())
-}
-
-fn collect_default_sifs_migration_scan_batch(
-    shard_backends: &LocalShardedMetadataBackend,
-    participating_shard_ids: &BTreeSet<DfsMetadataShardId>,
-    file_system_id: &DfsFileSystemId,
-    all_shards: &[DfsMetadataShardConfig],
-    writable_shard_ids: &BTreeSet<DfsMetadataShardId>,
-    certified_replica_shard_ids: &BTreeSet<DfsMetadataShardId>,
-    local_replica_shard_ids: &BTreeSet<DfsMetadataShardId>,
-    after_object_id: Option<&crate::DfsObjectId>,
-    scan_limit: usize,
-) -> Result<DfsDefaultSifsMigrationScanBatch, DfsError> {
-    let page_size = DEFAULT_SIFS_BOOTSTRAP_SHARD_MIGRATION_PAGE_SIZE
-        .min(scan_limit.saturating_add(1))
-        .max(1);
-    let mut scans = Vec::with_capacity(participating_shard_ids.len());
-    for shard_id in participating_shard_ids {
-        let backend = shard_backends.shard_backend(shard_id)?;
-        let (objects, next_after) = backend.objects_for_file_system_by_id_page(
-            file_system_id,
-            after_object_id,
-            page_size,
-        )?;
-        scans.push(DfsDefaultSifsMigrationShardScan {
-            shard_id: shard_id.clone(),
-            buffered: objects.into(),
-            next_after,
-        });
-    }
-    #[cfg(test)]
-    observe_default_sifs_migration_buffered_records(
-        scans.iter().map(|scan| scan.buffered.len()).sum(),
-    );
-
-    let mut candidates_by_object =
-        BTreeMap::<crate::DfsObjectId, Vec<(DfsMetadataShardId, crate::DfsObjectMetadata)>>::new();
-    let mut scanned_object_ids = Vec::with_capacity(scan_limit);
-    let mut awaiting_replica_progress = false;
-    while scanned_object_ids.len() < scan_limit {
-        for scan in &mut scans {
-            if scan.buffered.is_empty() && scan.next_after.is_some() {
-                let backend = shard_backends.shard_backend(&scan.shard_id)?;
-                refill_default_sifs_migration_shard_scan(scan, backend, file_system_id, page_size)?;
-            }
-        }
-        let Some(next_object_id) = scans
-            .iter()
-            .filter_map(|scan| scan.buffered.front().map(|object| object.object_id.clone()))
-            .min()
-        else {
-            break;
-        };
-        scanned_object_ids.push(next_object_id.clone());
-        for scan in &mut scans {
-            if scan
-                .buffered
-                .front()
-                .is_none_or(|object| object.object_id != next_object_id)
-            {
-                continue;
-            }
-            let object = scan
-                .buffered
-                .pop_front()
-                .expect("front object was checked above");
-            let source_usable = writable_shard_ids.contains(&scan.shard_id)
-                || certified_replica_shard_ids.contains(&scan.shard_id);
-            if !source_usable {
-                // An assigned but uncertified replica is evidence only when
-                // it contains a legacy object whose current route is one of
-                // this node's writable authorities.
-                if local_replica_shard_ids.contains(&scan.shard_id)
-                    && object.kind != DfsObjectKind::Tombstone
-                    && crate::control_plane::select_metadata_shard_config_for_path_strict_default_sifs_split(
-                        &object.file_system_id,
-                        all_shards,
-                        &object.path,
-                    )?
-                    .is_some_and(|selected| {
-                        let target_shard_id = DfsMetadataShardId::new(selected.shard_id);
-                        target_shard_id != scan.shard_id
-                            && writable_shard_ids.contains(&target_shard_id)
-                    })
-                {
-                    awaiting_replica_progress = true;
-                }
-                continue;
-            }
-            candidates_by_object
-                .entry(next_object_id.clone())
-                .or_default()
-                .push((scan.shard_id.clone(), object));
-        }
-        #[cfg(test)]
-        observe_default_sifs_migration_buffered_records(
-            scans.iter().map(|scan| scan.buffered.len()).sum::<usize>()
-                + candidates_by_object.values().map(Vec::len).sum::<usize>(),
-        );
-    }
-    let catalog_has_more = scans
-        .iter()
-        .any(|scan| !scan.buffered.is_empty() || scan.next_after.is_some());
-    Ok(DfsDefaultSifsMigrationScanBatch {
-        candidates_by_object,
-        scanned_object_ids,
-        catalog_has_more,
-        awaiting_replica_progress,
-    })
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DfsDefaultSifsPendingProgress {
-    Complete,
-    Incomplete,
-    AwaitingReplica,
-    Restart,
-}
-
-fn default_sifs_migration_object_generation_supersedes(
-    incoming: &crate::DfsObjectMetadata,
-    existing: &crate::DfsObjectMetadata,
-) -> bool {
-    let incoming_generation = (incoming.changed_at_unix_nanos, &incoming.version);
-    let existing_generation = (existing.changed_at_unix_nanos, &existing.version);
-    incoming.file_system_id == existing.file_system_id
-        && (incoming_generation > existing_generation
-            || (incoming_generation == existing_generation
-                && incoming.kind != DfsObjectKind::Tombstone
-                && existing.kind == DfsObjectKind::Tombstone))
-}
-
-fn migrate_default_sifs_reference_outcome(
-    target: &mut LocalSobjMetadataBackend,
-    object: &crate::DfsObjectMetadata,
-    receipt: &crate::DfsNamespaceTransactionReceipt,
-    writable: bool,
-    budget: &mut DfsDefaultSifsMigrationPassBudget,
-) -> Result<DfsDefaultSifsPendingProgress, DfsError> {
-    let existing =
-        if let Some(transaction) = target.get_namespace_transaction(&receipt.transaction_id)? {
-            Some(
-                crate::DfsNamespaceTransactionReceipt::from_transaction(
-                    &transaction,
-                    transaction.created_at,
-                )
-                .map_err(|error| DfsError::Metadata {
-                    message: error.to_string(),
-                })?,
-            )
-        } else {
-            target.get_namespace_transaction_receipt(&receipt.transaction_id)?
-        };
-    if let Some(existing) = existing {
-        if !existing.same_outcome_identity(receipt) {
-            return Err(DfsError::Metadata {
-                message: "conflicting reference outcome during default layout migration".into(),
-            });
-        }
-        if existing.retained_at <= receipt.retained_at {
-            return Ok(DfsDefaultSifsPendingProgress::Complete);
-        }
-    }
-    if !writable {
-        return Ok(DfsDefaultSifsPendingProgress::AwaitingReplica);
-    }
-    if !budget.can_mutate() {
-        return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-    }
-    let entries =
-        target.install_content_reference_outcomes(object, std::slice::from_ref(receipt), None)?;
-    for _ in entries {
-        budget.charge_mutation();
-    }
-    Ok(DfsDefaultSifsPendingProgress::Complete)
-}
-
-fn default_layout_source_fence_id(
-    object: &crate::DfsObjectMetadata,
-    source: &DfsMetadataShardId,
-    target: &DfsMetadataShardId,
-) -> Result<String, DfsError> {
-    let bytes = serde_json::to_vec(&(
-        &object.file_system_id,
-        &object.object_id,
-        &object.version,
-        source,
-        target,
-    ))
-    .map_err(|error| DfsError::Metadata {
-        message: error.to_string(),
-    })?;
-    Ok(format!(
-        "default-layout-fence-v1:{}",
-        blake3::hash(&bytes).to_hex()
-    ))
-}
-
-fn abort_default_layout_source_fence(
-    backends: &mut LocalShardedMetadataBackend,
-    fence: &crate::DfsNamespacePrepareRecord,
-    budget: &mut DfsDefaultSifsMigrationPassBudget,
-) -> Result<bool, DfsError> {
-    let source = backends.shard_backend_mut(&fence.shard_id)?;
-    match source.get_namespace_prepare(&fence.operation_id)? {
-        Some(stored)
-            if stored.status == crate::DfsNamespacePrepareStatus::Aborted
-                && stored.operation_digest == fence.operation_digest
-                && stored.owner_epoch == fence.owner_epoch =>
-        {
-            return Ok(true);
-        }
-        Some(stored) if stored == *fence => {}
-        None => {} // The fenced abort API validates any compact terminal witness.
-        _ => {
-            return Err(DfsError::Metadata {
-                message: "default layout source fence disappeared or changed before retirement"
-                    .into(),
-            });
-        }
-    }
-    if !budget.can_mutate() {
-        return Ok(false);
-    }
-    source.abort_prepared_namespace_transaction(
-        &fence.operation_id,
-        &fence.operation_digest,
-        fence.owner_epoch,
-    )?;
-    budget.charge_mutation();
-    Ok(true)
-}
-
-fn migrate_default_sifs_reference_expiry(
-    target: &mut LocalSobjMetadataBackend,
-    object: &crate::DfsObjectMetadata,
-    retention: &crate::DfsContentReferenceOutcomeRetention,
-    writable: bool,
-    budget: &mut DfsDefaultSifsMigrationPassBudget,
-) -> Result<DfsDefaultSifsPendingProgress, DfsError> {
-    let existing =
-        target.content_reference_outcome_retention(&object.file_system_id, &object.object_id)?;
-    let mut merged = existing.clone().unwrap_or_else(|| retention.clone());
-    merged.merge_conservative(retention);
-    if existing.as_ref() == Some(&merged) {
-        return Ok(DfsDefaultSifsPendingProgress::Complete);
-    }
-    if !writable {
-        return Ok(DfsDefaultSifsPendingProgress::AwaitingReplica);
-    }
-    if !budget.can_mutate() {
-        return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-    }
-    let entries = target.install_content_reference_outcomes(object, &[], Some(retention))?;
-    for _ in entries {
-        budget.charge_mutation();
-    }
-    Ok(DfsDefaultSifsPendingProgress::Complete)
-}
-
-fn observe_default_sifs_source_prepare(
-    object_id: &crate::DfsObjectId,
-    source_prepare: &mut Option<Box<crate::DfsNamespacePrepareRecord>>,
-    entry: &crate::DfsMetadataJournalEntry,
-) -> Result<(), DfsError> {
-    if let crate::DfsMetadataMutation::PutNamespacePrepareReceipt { receipt, .. } = &entry.mutation
-        && receipt.status == crate::DfsNamespacePrepareStatus::Aborted
-        && source_prepare
-            .as_ref()
-            .is_some_and(|prepare| prepare.operation_id == receipt.operation_id)
-    {
-        *source_prepare = None;
-    }
-    let crate::DfsMetadataMutation::PutNamespacePrepare {
-        operation_id,
-        status,
-        ..
-    } = &entry.mutation
-    else {
-        return Ok(());
-    };
-    if *status == crate::DfsNamespacePrepareStatus::Aborted {
-        if source_prepare
-            .as_ref()
-            .is_some_and(|prepare| prepare.operation_id == *operation_id)
-        {
-            *source_prepare = None;
-        }
-        return Ok(());
-    }
-    if *status != crate::DfsNamespacePrepareStatus::Prepared
-        || crate::metadata_records::is_default_layout_migration_fence(operation_id)
-        || !entry.mutation.affects_object_id(object_id)
-    {
-        return Ok(());
-    }
-    let prepare = entry
-        .mutation
-        .namespace_prepare_payload_ref()
-        .map_err(|error| DfsError::Metadata {
-            message: error.to_string(),
-        })?
-        .map(|payload| payload.into_normalized_canonical())
-        .transpose()
-        .map_err(|error| DfsError::Metadata {
-            message: error.to_string(),
-        })?
-        .ok_or_else(|| DfsError::Metadata {
-            message: "default layout source Prepared entry has no exact body".into(),
-        })?
-        .into_owned();
-    if source_prepare
-        .as_ref()
-        .is_some_and(|previous| previous.operation_id != prepare.operation_id)
-    {
-        return Err(DfsError::Metadata {
-            message: "default layout source has overlapping unresolved prepare inputs".into(),
-        });
-    }
-    *source_prepare = Some(Box::new(prepare));
-    Ok(())
-}
-
-fn finish_default_sifs_source_prepare(
-    source_prepare: &mut Option<Box<crate::DfsNamespacePrepareRecord>>,
-    entry: &crate::DfsMetadataJournalEntry,
-) {
-    let operation_id = match &entry.mutation {
-        crate::DfsMetadataMutation::CommitNamespacePrepare { operation_id, .. }
-        | crate::DfsMetadataMutation::PutNamespacePrepare {
-            operation_id,
-            status: crate::DfsNamespacePrepareStatus::Committed,
-            ..
-        } => operation_id,
-        _ => return,
-    };
-    if source_prepare
-        .as_ref()
-        .is_some_and(|prepare| prepare.operation_id == *operation_id)
-    {
-        *source_prepare = None;
-    }
-}
-
-fn default_sifs_committed_prepare_transaction(
-    source: &LocalSobjMetadataBackend,
-    entry: &crate::DfsMetadataJournalEntry,
-    observed_prepare: Option<&crate::DfsNamespacePrepareRecord>,
-) -> Result<Option<crate::DfsNamespaceTransaction>, DfsError> {
-    match &entry.mutation {
-        crate::DfsMetadataMutation::CommitNamespacePrepare {
-            file_system_id,
-            operation_id,
-            operation_digest,
-            owner_epoch,
-            object_ids,
-            ..
-        } => {
-            let prepare = observed_prepare
-                .filter(|prepare| prepare.operation_id == *operation_id)
-                .cloned()
-                .or(source.get_namespace_prepare(operation_id)?)
-                .ok_or_else(|| DfsError::Metadata {
-                message: format!("default layout migration requires source prepare {operation_id}; refusing to advance its journal prefix without the committed effects"),
-            })?;
-            if prepare.file_system_id != *file_system_id
-                || prepare.operation_id != *operation_id
-                || prepare.shard_id != *source.shard_id()
-                || entry.shard_id != *source.shard_id()
-                || prepare.operation_digest != *operation_digest
-                || prepare.owner_epoch != *owner_epoch
-                || prepare.status == crate::DfsNamespacePrepareStatus::Aborted
-                || crate::service_replica::metadata_namespace_prepare_payload_digest(&prepare)?
-                    != *operation_digest
-            {
-                return Err(DfsError::Metadata { message: "default layout migration source prepare dependency does not match its commit".into() });
-            }
-            let crate::DfsMetadataMutation::CommitNamespacePrepare {
-                object_ids: expected_object_ids,
-                ..
-            } = crate::DfsMetadataMutation::commit_namespace_prepare(&prepare)
-            else {
-                unreachable!("prepare commit constructor");
-            };
-            if *object_ids != expected_object_ids {
-                return Err(DfsError::Metadata {
-                    message:
-                        "default layout migration source prepare affected-object binding changed"
-                            .into(),
-                });
-            }
-            Ok(Some(prepare.transaction))
-        }
-        crate::DfsMetadataMutation::PutNamespacePrepare {
-            status: crate::DfsNamespacePrepareStatus::Committed,
-            ..
-        } => {
-            let prepare = entry
-                .mutation
-                .namespace_prepare_payload_ref()
-                .map_err(|error| DfsError::Metadata {
-                    message: error.to_string(),
-                })?
-                .map(|payload| payload.into_normalized_canonical())
-                .transpose()
-                .map_err(|error| DfsError::Metadata {
-                    message: error.to_string(),
-                })?
-                .ok_or_else(|| DfsError::Metadata {
-                    message: "committed default layout prepare has no authoritative body".into(),
-                })?;
-            Ok(Some(prepare.transaction.clone()))
-        }
-        _ => Ok(None),
-    }
-}
-
-fn replay_default_sifs_family_transaction(
-    target: &mut LocalSobjMetadataBackend,
-    object: &crate::DfsObjectMetadata,
-    transaction: &crate::DfsNamespaceTransaction,
-    writable: bool,
-    reference_effects_already_published: bool,
-    budget: &mut DfsDefaultSifsMigrationPassBudget,
-) -> Result<DfsDefaultSifsPendingProgress, DfsError> {
-    if reference_effects_already_published && transaction.content_reference_identity.is_some() {
-        let offered = crate::DfsNamespaceTransactionReceipt::from_transaction(
-            transaction,
-            transaction.created_at,
-        )
-        .map_err(|error| DfsError::Metadata {
-            message: error.to_string(),
-        })?;
-        let existing = if let Some(existing) =
-            target.get_namespace_transaction(&transaction.transaction_id)?
-        {
-            Some(
-                crate::DfsNamespaceTransactionReceipt::from_transaction(
-                    &existing,
-                    existing.created_at,
-                )
-                .map_err(|error| DfsError::Metadata {
-                    message: error.to_string(),
-                })?,
-            )
-        } else {
-            target.get_namespace_transaction_receipt(&transaction.transaction_id)?
-        };
-        if let Some(existing) = existing {
-            if !existing.same_outcome_identity(&offered) {
-                return Err(DfsError::Metadata {
-                    message: "published layout reference outcome has conflicting source input"
-                        .into(),
-                });
-            }
-            return Ok(DfsDefaultSifsPendingProgress::Complete);
-        }
-    }
-    if transaction
-        .objects
-        .iter()
-        .any(|candidate| candidate.object_id == object.object_id)
-    {
-        return Ok(DfsDefaultSifsPendingProgress::Restart);
-    }
-    for version in transaction
-        .versions
-        .iter()
-        .filter(|version| version.object_id == object.object_id)
-    {
-        let existing = target.get_version(&version.object_id, &version.version)?;
-        if existing.as_ref() == Some(version) {
-            continue;
-        }
-        let expected = transaction
-            .extension_expectations
-            .iter()
-            .find(|expected| {
-                expected.object_id == version.object_id && expected.version == version.version
-            })
-            .and_then(|expected| expected.expected.as_deref());
-        if existing.is_some() && existing.as_ref() != expected {
-            return Err(DfsError::Metadata {
-                message: "late migration revision conflicts with later target metadata".into(),
-            });
-        }
-        if !writable {
-            return Ok(DfsDefaultSifsPendingProgress::AwaitingReplica);
-        }
-        if !budget.can_mutate() {
-            return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-        }
-        target.apply_namespace_transaction(&crate::DfsNamespaceTransaction {
-            content_reference_identity: None,
-            contribution_digest: None,
-            extension_expectations: vec![crate::DfsRevisionMetadataExpectation {
-                object_id: version.object_id.clone(),
-                version: version.version.clone(),
-                expected: existing.map(Box::new),
-            }],
-            transaction_id: format!(
-                "migrate-reference-version:{}:{}",
-                transaction.transaction_id, version.version
-            ),
-            file_system_id: object.file_system_id.clone(),
-            objects: Vec::new(),
-            versions: vec![version.clone()],
-            file_version_pins: None,
-            advisory_lock_states: Vec::new(),
-            created_at: transaction.created_at,
-        })?;
-        budget.charge_mutation();
-    }
-    if let Some(pins) = &transaction.file_version_pins {
-        for pin in pins
-            .remove
-            .iter()
-            .filter(|pin| pin.object_id == object.object_id)
-        {
-            let current = target
-                .current_tables_snapshot()?
-                .version_pins
-                .get(&(
-                    pin.object_id.clone(),
-                    pin.version.clone(),
-                    pin.pin_id.clone(),
-                ))
-                .cloned();
-            // The source removed this creation generation. A later reference
-            // with the same leaf belongs to the target and must survive.
-            if current.as_ref() != Some(pin) {
-                continue;
-            }
-            if !writable {
-                return Ok(DfsDefaultSifsPendingProgress::AwaitingReplica);
-            }
-            if !budget.can_mutate() {
-                return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-            }
-            let version = target
-                .get_version(&pin.object_id, &pin.version)?
-                .ok_or_else(|| DfsError::Metadata {
-                    message: "late reference removal lost its target revision authority".into(),
-                })?;
-            target.apply_namespace_transaction(&crate::DfsNamespaceTransaction {
-                content_reference_identity: None,
-                contribution_digest: None,
-                extension_expectations: vec![crate::DfsRevisionMetadataExpectation {
-                    object_id: pin.object_id.clone(),
-                    version: pin.version.clone(),
-                    expected: Some(Box::new(version.clone())),
-                }],
-                transaction_id: format!(
-                    "migrate-reference-remove:{}:{}",
-                    transaction.transaction_id,
-                    blake3::hash(
-                        &serde_json::to_vec(pin).map_err(|error| DfsError::Metadata {
-                            message: error.to_string()
-                        })?
-                    )
-                    .to_hex()
-                ),
-                file_system_id: object.file_system_id.clone(),
-                objects: Vec::new(),
-                versions: vec![version],
-                file_version_pins: Some(crate::DfsFileVersionPinMutation {
-                    add: Vec::new(),
-                    remove: vec![pin.clone()],
-                }),
-                advisory_lock_states: Vec::new(),
-                created_at: transaction.created_at,
-            })?;
-            budget.charge_mutation();
-        }
-        for pin in pins
-            .add
-            .iter()
-            .filter(|pin| pin.object_id == object.object_id)
-        {
-            let current = target
-                .current_tables_snapshot()?
-                .version_pins
-                .get(&(
-                    pin.object_id.clone(),
-                    pin.version.clone(),
-                    pin.pin_id.clone(),
-                ))
-                .cloned();
-            if let Some(current) = current {
-                if current.file_system_id != pin.file_system_id
-                    || current.namespace != pin.namespace
-                {
-                    return Err(DfsError::Metadata {
-                        message: "conflicting target reference identity during migration".into(),
-                    });
-                }
-                // Existing same-identity target roots need no timestamp reset.
-                continue;
-            }
-            if !writable {
-                return Ok(DfsDefaultSifsPendingProgress::AwaitingReplica);
-            }
-            if !budget.can_mutate() {
-                return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-            }
-            if target.put_version_pin(pin)?.is_some() {
-                budget.charge_mutation();
-            }
-        }
-    }
-    for state in transaction
-        .advisory_lock_states
-        .iter()
-        .filter(|state| state.object_id == object.object_id)
-    {
-        let mut desired = state.clone();
-        desired.authority_rebind_required = true;
-        if target.get_advisory_lock_state(&desired.file_system_id, &desired.object_id)?
-            == Some(desired.clone())
-        {
-            continue;
-        }
-        if !writable {
-            return Ok(DfsDefaultSifsPendingProgress::AwaitingReplica);
-        }
-        if !budget.can_mutate() {
-            return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-        }
-        target.install_advisory_lock_state_for_migration(&desired)?;
-        budget.charge_mutation();
-    }
-    if transaction
-        .content_reference_identity
-        .as_ref()
-        .is_some_and(|identity| {
-            identity.file_system_id == object.file_system_id
-                && identity.object_id == object.object_id
-        })
-    {
-        let receipt = crate::DfsNamespaceTransactionReceipt::from_transaction(
-            transaction,
-            transaction.created_at,
-        )
-        .map_err(|error| DfsError::Metadata {
-            message: error.to_string(),
-        })?;
-        return migrate_default_sifs_reference_outcome(target, object, &receipt, writable, budget);
-    }
-    Ok(DfsDefaultSifsPendingProgress::Complete)
-}
-
-fn replay_default_sifs_object_family_entry(
-    target: &mut LocalSobjMetadataBackend,
-    target_shard_id: &DfsMetadataShardId,
-    object: &crate::DfsObjectMetadata,
-    entry: &crate::DfsMetadataJournalEntry,
-    prepared_transaction: Option<&crate::DfsNamespaceTransaction>,
-    writable: bool,
-    reference_effects_already_published: bool,
-    budget: &mut DfsDefaultSifsMigrationPassBudget,
-) -> Result<DfsDefaultSifsPendingProgress, DfsError> {
-    if !entry.mutation.affects_object_id(&object.object_id) {
-        return Ok(DfsDefaultSifsPendingProgress::Complete);
-    }
-
-    if let Some(transaction) = prepared_transaction {
-        return replay_default_sifs_family_transaction(
-            target,
-            object,
-            transaction,
-            writable,
-            reference_effects_already_published,
-            budget,
-        );
-    }
-
-    match &entry.mutation {
-        crate::DfsMetadataMutation::PutObject { .. }
-        | crate::DfsMetadataMutation::CommitVisibleVersion { .. } => {
-            // The object generation is the migration's authority fence. Plan
-            // again rather than combining a new object with an old family.
-            Ok(DfsDefaultSifsPendingProgress::Restart)
-        }
-        crate::DfsMetadataMutation::PutVersion {
-            version_record: Some(version),
-            ..
-        } => {
-            match target.get_version(&version.object_id, &version.version)? {
-                Some(existing) if existing != *version => {
-                    return Err(DfsError::Metadata {
-                        message: format!(
-                            "target metadata shard {} has conflicting late version {} for object {} during bounded migration",
-                            target_shard_id.0, version.version, version.object_id
-                        ),
-                    });
-                }
-                Some(_) => {}
-                None => {
-                    if !budget.can_mutate() {
-                        return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-                    }
-                    target.put_version(version)?;
-                    budget.charge_mutation();
-                }
-            }
-            Ok(DfsDefaultSifsPendingProgress::Complete)
-        }
-        crate::DfsMetadataMutation::ReconcileCrossShardPinTransfer {
-            versions, transfer, ..
-        } => {
-            if !budget.can_mutate() {
-                return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-            }
-            target
-                .install_cross_shard_pin_transfer_for_authoritative_migration(transfer, versions)?;
-            budget.charge_mutation();
-            Ok(DfsDefaultSifsPendingProgress::Complete)
-        }
-        crate::DfsMetadataMutation::RemoveCrossShardPinTransfer {
-            file_system_id,
-            object_id,
-            transfer_id,
-        } => {
-            if !budget.can_mutate() {
-                return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-            }
-            target.remove_cross_shard_pin_transfer_for_authoritative_migration(
-                file_system_id,
-                object_id,
-                transfer_id,
-            )?;
-            budget.charge_mutation();
-            Ok(DfsDefaultSifsPendingProgress::Complete)
-        }
-        crate::DfsMetadataMutation::PutVersionPin { pin, .. } => {
-            if !budget.can_mutate() {
-                return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-            }
-            if target.put_version_pin(pin)?.is_some() {
-                budget.charge_mutation();
-            }
-            Ok(DfsDefaultSifsPendingProgress::Complete)
-        }
-        crate::DfsMetadataMutation::RemoveVersionPin {
-            file_system_id,
-            object_id,
-            version,
-            pin_id,
-        } => {
-            if !budget.can_mutate() {
-                return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-            }
-            if target
-                .remove_version_pin(file_system_id, object_id, version, pin_id)?
-                .is_some()
-            {
-                budget.charge_mutation();
-            }
-            Ok(DfsDefaultSifsPendingProgress::Complete)
-        }
-        crate::DfsMetadataMutation::RemoveVersion { .. }
-        | crate::DfsMetadataMutation::PutIntentReceipt { .. }
-        | crate::DfsMetadataMutation::RemoveIntentReceipt { .. }
-        | crate::DfsMetadataMutation::RemoveRetainedRepairOwner { .. }
-        | crate::DfsMetadataMutation::MergeIntentReceiptRetention { .. }
-        | crate::DfsMetadataMutation::RemoveVisibleCommit { .. } => {
-            if !budget.can_mutate() {
-                return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-            }
-            target.apply_migrated_object_family_gc_mutation(&entry.mutation)?;
-            budget.charge_mutation();
-            Ok(DfsDefaultSifsPendingProgress::Complete)
-        }
-        crate::DfsMetadataMutation::PutReceipt {
-            receipt: Some(receipt),
-            ..
-        } => {
-            if target.receipt_for_replica(
-                &receipt.receipt.object_id,
-                &receipt.receipt.committed_version,
-                &receipt.replica_node_id,
-            )? != Some(receipt.clone())
-            {
-                if !budget.can_mutate() {
-                    return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-                }
-                target.put_receipt(receipt)?;
-                budget.charge_mutation();
-            }
-            Ok(DfsDefaultSifsPendingProgress::Complete)
-        }
-        crate::DfsMetadataMutation::RemoveReceipt {
-            object_id,
-            version,
-            replica_node_id,
-            ..
-        } => {
-            if target
-                .receipt_for_replica(object_id, version, replica_node_id)?
-                .is_some()
-            {
-                if !budget.can_mutate() {
-                    return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-                }
-                target.remove_receipt(object_id, version, replica_node_id)?;
-                budget.charge_mutation();
-            }
-            Ok(DfsDefaultSifsPendingProgress::Complete)
-        }
-        crate::DfsMetadataMutation::PutIntent {
-            intent: Some(intent),
-            ..
-        } => {
-            if target.get_intent(&intent.object_id, &intent.intent_id)? != Some(intent.clone()) {
-                if !budget.can_mutate() {
-                    return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-                }
-                target.put_migrated_intent_for_object(Some(object), intent)?;
-                budget.charge_mutation();
-            }
-            Ok(DfsDefaultSifsPendingProgress::Complete)
-        }
-        crate::DfsMetadataMutation::PutConflict {
-            object_id,
-            conflict_id,
-            conflict,
-            ..
-        } => {
-            match conflict {
-                Some(conflict)
-                    if target.get_conflict(object_id, conflict_id)? != Some(conflict.clone()) =>
-                {
-                    if !budget.can_mutate() {
-                        return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-                    }
-                    target.put_conflict(conflict)?;
-                    budget.charge_mutation();
-                }
-                None if target.get_conflict(object_id, conflict_id)?.is_some() => {
-                    if !budget.can_mutate() {
-                        return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-                    }
-                    target.remove_conflict(object_id, conflict_id)?;
-                    budget.charge_mutation();
-                }
-                _ => {}
-            }
-            Ok(DfsDefaultSifsPendingProgress::Complete)
-        }
-        crate::DfsMetadataMutation::PutAdvisoryLockState {
-            state: Some(state), ..
-        } => {
-            let mut desired = state.clone();
-            desired.authority_rebind_required = true;
-            if target.get_advisory_lock_state(&desired.file_system_id, &desired.object_id)?
-                != Some(desired.clone())
-            {
-                if !budget.can_mutate() {
-                    return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-                }
-                target.apply_namespace_transaction(&crate::DfsNamespaceTransaction {
-                    content_reference_identity: None,
-                    contribution_digest: None,
-                    extension_expectations: Vec::new(),
-                    file_version_pins: None,
-                    transaction_id: format!(
-                        "migrate-lock:{}:{}:{}",
-                        object.object_id, target_shard_id.0, entry.sequence
-                    ),
-                    file_system_id: object.file_system_id.clone(),
-                    objects: Vec::new(),
-                    versions: Vec::new(),
-                    advisory_lock_states: vec![desired],
-                    created_at: entry.created_at,
-                })?;
-                budget.charge_mutation();
-            }
-            Ok(DfsDefaultSifsPendingProgress::Complete)
-        }
-        crate::DfsMetadataMutation::ApplyNamespaceTransaction {
-            transaction: Some(transaction),
-            ..
-        } => replay_default_sifs_family_transaction(
-            target,
-            object,
-            transaction,
-            writable,
-            reference_effects_already_published,
-            budget,
-        ),
-        crate::DfsMetadataMutation::PutNamespaceTransactionReceipt { receipt, .. }
-            if receipt
-                .content_reference_identity
-                .as_ref()
-                .is_some_and(|identity| identity.object_id == object.object_id) =>
-        {
-            migrate_default_sifs_reference_outcome(target, object, receipt, writable, budget)
-        }
-        crate::DfsMetadataMutation::RemoveNamespaceTransactionReceipt { retention, .. } => {
-            if let Some(retention) = retention
-                .content_reference_outcome_retention
-                .get(&object.object_id)
-            {
-                migrate_default_sifs_reference_expiry(target, object, retention, writable, budget)
-            } else {
-                Ok(DfsDefaultSifsPendingProgress::Complete)
-            }
-        }
-        // A source-eviction record describes the source shard's physical
-        // cleanup and must never be replayed onto the authoritative target.
-        // Payload-less legacy mutations and namespace prepare/job records do
-        // not change the migrated metadata family either.
-        crate::DfsMetadataMutation::FinalizeCrossShardSourceEviction { .. }
-        | crate::DfsMetadataMutation::PutVersion {
-            version_record: None,
-            ..
-        }
-        | crate::DfsMetadataMutation::PutReceipt { receipt: None, .. }
-        | crate::DfsMetadataMutation::PutIntent { intent: None, .. }
-        | crate::DfsMetadataMutation::PutAdvisoryLockState { state: None, .. }
-        | crate::DfsMetadataMutation::ApplyNamespaceTransaction {
-            transaction: None, ..
-        } => Ok(DfsDefaultSifsPendingProgress::Complete),
-        _ => Ok(DfsDefaultSifsPendingProgress::Complete),
-    }
-}
-
-fn advance_default_sifs_pending_migration(
-    metadata_root: &std::path::Path,
-    shard_backends: &mut LocalShardedMetadataBackend,
-    file_system: &DfsFileSystem,
-    pending: &mut DfsDefaultSifsPendingMigration,
-    budget: &mut DfsDefaultSifsMigrationPassBudget,
-    report: &mut DfsMetadataShardMigrationReport,
-) -> Result<DfsDefaultSifsPendingProgress, DfsError> {
-    // Before the target object becomes visible, every pass revalidates the
-    // exact source generation. A concurrent mutation is replayed through the
-    // durable dirty-ID lane instead of completing a mixed-generation bundle.
-    if !matches!(
-        pending.stage,
-        DfsDefaultSifsPendingMigrationStage::SourceEvictions { .. }
-            | DfsDefaultSifsPendingMigrationStage::Complete
-    ) {
-        let source = shard_backends.shard_backend(&pending.source_shard_id)?;
-        let expected_source = pending
-            .source_fence
-            .as_ref()
-            .and_then(|_| {
-                pending
-                    .writable_sources
-                    .iter()
-                    .find(|source| source.shard_id == pending.source_shard_id)
-                    .map(|source| &source.object)
-            })
-            .unwrap_or(&pending.object);
-        if source
-            .object_or_compacted_tombstone(&pending.object.object_id)?
-            .as_ref()
-            != Some(expected_source)
-        {
-            return Ok(DfsDefaultSifsPendingProgress::Restart);
-        }
-    }
-
-    loop {
-        match &mut pending.stage {
-            DfsDefaultSifsPendingMigrationStage::EnsureFileSystem => {
-                let target = shard_backends.shard_backend_mut(&pending.target_shard_id)?;
-                match target.get_file_system(&file_system.file_system_id)? {
-                    Some(existing)
-                        if !crate::placement::dfs_file_system_semantically_eq(
-                            &existing,
-                            file_system,
-                        ) =>
-                    {
-                        return Err(DfsError::Metadata {
-                            message: format!(
-                                "target metadata shard {} has conflicting filesystem {} during bounded migration",
-                                pending.target_shard_id.0, file_system.file_system_id
-                            ),
-                        });
-                    }
-                    Some(_) => {}
-                    None => {
-                        if !budget.can_mutate() {
-                            return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-                        }
-                        target.put_file_system(file_system)?;
-                        budget.charge_mutation();
-                    }
-                }
-                pending.stage = DfsDefaultSifsPendingMigrationStage::Versions {
-                    after_version: None,
-                    active_version: None,
-                    after_receipt: None,
-                };
-            }
-            DfsDefaultSifsPendingMigrationStage::Versions {
-                after_version,
-                active_version,
-                after_receipt,
-            } => {
-                if let Some(version) = active_version.clone() {
-                    if !budget.can_read_family_record() {
-                        return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-                    }
-                    let page_size = DEFAULT_SIFS_BOOTSTRAP_SHARD_MIGRATION_PAGE_SIZE
-                        .min(budget.remaining_family_records)
-                        .max(1);
-                    let receipt_page = shard_backends
-                        .shard_backend(&pending.source_shard_id)?
-                        .receipts_for_version_page(
-                            &pending.object.object_id,
-                            &version,
-                            after_receipt.as_ref(),
-                            page_size,
-                        )?;
-                    for receipt in receipt_page.receipts {
-                        budget.charge_family_record();
-                        let target = shard_backends.shard_backend_mut(&pending.target_shard_id)?;
-                        match target.receipt_for_replica(
-                            &receipt.receipt.object_id,
-                            &receipt.receipt.committed_version,
-                            &receipt.replica_node_id,
-                        )? {
-                            Some(existing) if existing != receipt => {
-                                return Err(DfsError::Metadata {
-                                    message: format!(
-                                        "target metadata shard {} has conflicting receipt for object {} version {} replica {} during bounded migration",
-                                        pending.target_shard_id.0,
-                                        receipt.receipt.object_id,
-                                        receipt.receipt.committed_version,
-                                        receipt.replica_node_id
-                                    ),
-                                });
-                            }
-                            Some(_) => {}
-                            None => {
-                                if !budget.can_mutate() {
-                                    return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-                                }
-                                target.put_receipt(&receipt)?;
-                                budget.charge_mutation();
-                            }
-                        }
-                        *after_receipt = Some(crate::DfsReplicaReceiptPageCursor {
-                            replica_node_id: receipt.replica_node_id,
-                            shard_id: None,
-                        });
-                    }
-                    if receipt_page.next_cursor.is_some() {
-                        return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-                    }
-                    *active_version = None;
-                    *after_receipt = None;
-                    *after_version = Some(crate::DfsObjectVersionPageCursor {
-                        version,
-                        shard_id: None,
-                    });
-                    continue;
-                }
-
-                if !budget.can_read_family_record() {
-                    return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-                }
-                let version_page = shard_backends
-                    .shard_backend(&pending.source_shard_id)?
-                    .versions_for_object_page(
-                        &pending.object.object_id,
-                        after_version.as_ref(),
-                        1,
-                    )?;
-                let Some(version) = version_page.versions.into_iter().next() else {
-                    pending.stage = DfsDefaultSifsPendingMigrationStage::ClearPinTransfers {
-                        after_transfer_id: None,
-                    };
-                    continue;
-                };
-                budget.charge_family_record();
-                let target = shard_backends.shard_backend_mut(&pending.target_shard_id)?;
-                match target.get_version(&version.object_id, &version.version)? {
-                    Some(existing) if existing != version => {
-                        return Err(DfsError::Metadata {
-                            message: format!(
-                                "target metadata shard {} has conflicting version {} for object {} during bounded migration",
-                                pending.target_shard_id.0, version.version, version.object_id
-                            ),
-                        });
-                    }
-                    Some(_) => {}
-                    None => {
-                        if !budget.can_mutate() {
-                            return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-                        }
-                        target.put_version(&version)?;
-                        budget.charge_mutation();
-                    }
-                }
-                *active_version = Some(version.version);
-                *after_receipt = None;
-            }
-            DfsDefaultSifsPendingMigrationStage::ClearPinTransfers { after_transfer_id } => {
-                if !budget.can_read_family_record() {
-                    return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-                }
-                let mut transfers = shard_backends
-                    .shard_backend(&pending.target_shard_id)?
-                    .cross_shard_pin_transfers_for_object(&pending.object.object_id)?;
-                transfers.sort_by(|left, right| left.transfer_id.cmp(&right.transfer_id));
-                let next = transfers.into_iter().find(|transfer| {
-                    after_transfer_id
-                        .as_ref()
-                        .is_none_or(|after| transfer.transfer_id > *after)
-                });
-                let Some(transfer) = next else {
-                    pending.stage =
-                        DfsDefaultSifsPendingMigrationStage::ClearVersionPins { after: None };
-                    continue;
-                };
-                budget.charge_family_record();
-                if !budget.can_mutate() {
-                    return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-                }
-                shard_backends
-                    .shard_backend_mut(&pending.target_shard_id)?
-                    .remove_cross_shard_pin_transfer_for_authoritative_migration(
-                        &transfer.file_system_id,
-                        &transfer.object_id,
-                        &transfer.transfer_id,
-                    )?;
-                budget.charge_mutation();
-                *after_transfer_id = Some(transfer.transfer_id);
-            }
-            DfsDefaultSifsPendingMigrationStage::ClearVersionPins { after } => {
-                if !budget.can_read_family_record() {
-                    return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-                }
-                let page_size = DEFAULT_SIFS_BOOTSTRAP_SHARD_MIGRATION_PAGE_SIZE
-                    .min(budget.remaining_family_records)
-                    .max(1);
-                let page = shard_backends
-                    .shard_backend(&pending.target_shard_id)?
-                    .version_pins_for_object_page(
-                        &pending.object.object_id,
-                        after.as_ref(),
-                        page_size,
-                    )?;
-                for pin in page.pins {
-                    budget.charge_family_record();
-                    if !budget.can_mutate() {
-                        return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-                    }
-                    if shard_backends
-                        .shard_backend_mut(&pending.target_shard_id)?
-                        .remove_version_pin(
-                            &pin.file_system_id,
-                            &pin.object_id,
-                            &pin.version,
-                            &pin.pin_id,
-                        )?
-                        .is_some()
-                    {
-                        budget.charge_mutation();
-                    }
-                    *after = Some(crate::DfsMetadataVersionPinPageCursor {
-                        version: pin.version,
-                        pin_id: pin.pin_id,
-                        shard_id: None,
-                    });
-                }
-                if page.next_cursor.is_some() {
-                    return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-                }
-                pending.stage = DfsDefaultSifsPendingMigrationStage::PinTransfers {
-                    after_transfer_id: None,
-                };
-            }
-            DfsDefaultSifsPendingMigrationStage::PinTransfers { after_transfer_id } => {
-                if !budget.can_read_family_record() {
-                    return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-                }
-                let mut transfers = shard_backends
-                    .shard_backend(&pending.source_shard_id)?
-                    .cross_shard_pin_transfers_for_object(&pending.object.object_id)?;
-                transfers.sort_by(|left, right| left.transfer_id.cmp(&right.transfer_id));
-                let next = transfers.into_iter().find(|transfer| {
-                    after_transfer_id
-                        .as_ref()
-                        .is_none_or(|after| transfer.transfer_id > *after)
-                });
-                let Some(transfer) = next else {
-                    pending.stage =
-                        DfsDefaultSifsPendingMigrationStage::VersionPins { after: None };
-                    continue;
-                };
-                budget.charge_family_record();
-                if !budget.can_mutate() {
-                    return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-                }
-
-                // Versions were copied in the preceding stage. Include the
-                // exact source records again in the provenance mutation so a
-                // transfer appended concurrently with that scan can still
-                // install newly pinned versions atomically.
-                let mut transfer_version_ids = transfer
-                    .source_pins
-                    .iter()
-                    .chain(&transfer.copied_pins)
-                    .map(|pin| pin.version.clone())
-                    .collect::<BTreeSet<_>>();
-                transfer_version_ids.insert(transfer.target_version.clone());
-                let source = shard_backends.shard_backend(&pending.source_shard_id)?;
-                let mut versions = Vec::with_capacity(transfer_version_ids.len());
-                for version_id in transfer_version_ids {
-                    let version = source
-                        .get_version(&pending.object.object_id, &version_id)?
-                        .ok_or_else(|| DfsError::Metadata {
-                            message: format!(
-                                "default SIFS migration source shard {} pin transfer {} references missing version {}/{}",
-                                pending.source_shard_id.0,
-                                transfer.transfer_id,
-                                pending.object.object_id,
-                                version_id
-                            ),
-                        })?;
-                    versions.push(version);
-                }
-                shard_backends
-                    .shard_backend_mut(&pending.target_shard_id)?
-                    .install_cross_shard_pin_transfer_for_authoritative_migration(
-                        &transfer, &versions,
-                    )?;
-                budget.charge_mutation();
-                *after_transfer_id = Some(transfer.transfer_id);
-            }
-            DfsDefaultSifsPendingMigrationStage::VersionPins { after } => {
-                if !budget.can_read_family_record() {
-                    return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-                }
-                let page_size = DEFAULT_SIFS_BOOTSTRAP_SHARD_MIGRATION_PAGE_SIZE
-                    .min(budget.remaining_family_records)
-                    .max(1);
-                let page = shard_backends
-                    .shard_backend(&pending.source_shard_id)?
-                    .version_pins_for_object_page(
-                        &pending.object.object_id,
-                        after.as_ref(),
-                        page_size,
-                    )?;
-                // The preceding stage installed the source's captured
-                // provenance exactly. Skip every acknowledged key here,
-                // including pre-existing target pins that the transfer fences
-                // without owning. Replay of a later transfer mutation will
-                // atomically reconcile any ownership change that raced the
-                // base scan.
-                let target_transfer_acknowledged_pins = shard_backends
-                    .shard_backend(&pending.target_shard_id)?
-                    .cross_shard_pin_transfers_for_object(&pending.object.object_id)?
-                    .into_iter()
-                    .flat_map(|transfer| transfer.source_pins)
-                    .map(|pin| (pin.version, pin.pin_id))
-                    .collect::<BTreeSet<_>>();
-                for pin in page.pins {
-                    budget.charge_family_record();
-                    if !target_transfer_acknowledged_pins
-                        .contains(&(pin.version.clone(), pin.pin_id.clone()))
-                    {
-                        if !budget.can_mutate() {
-                            return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-                        }
-                        if shard_backends
-                            .shard_backend_mut(&pending.target_shard_id)?
-                            .put_version_pin(&pin)?
-                            .is_some()
-                        {
-                            budget.charge_mutation();
-                        }
-                    }
-                    *after = Some(crate::DfsMetadataVersionPinPageCursor {
-                        version: pin.version,
-                        pin_id: pin.pin_id,
-                        shard_id: None,
-                    });
-                }
-                if page.next_cursor.is_some() {
-                    return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-                }
-                pending.stage = DfsDefaultSifsPendingMigrationStage::Intents { after: None };
-            }
-            DfsDefaultSifsPendingMigrationStage::Intents { after } => {
-                if !budget.can_read_family_record() {
-                    return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-                }
-                let page_size = DEFAULT_SIFS_BOOTSTRAP_SHARD_MIGRATION_PAGE_SIZE
-                    .min(budget.remaining_family_records)
-                    .max(1);
-                let page = shard_backends
-                    .shard_backend(&pending.source_shard_id)?
-                    .intents_for_object_page(
-                        &pending.object.object_id,
-                        after.as_ref(),
-                        page_size,
-                    )?;
-                for intent in page.intents {
-                    budget.charge_family_record();
-                    let source_receipt = shard_backends
-                        .shard_backend(&pending.source_shard_id)?
-                        .get_intent_receipt(&intent.object_id, &intent.intent_id)?;
-                    let target = shard_backends.shard_backend_mut(&pending.target_shard_id)?;
-                    if let Some(receipt) = source_receipt {
-                        match target.get_intent_receipt(&receipt.object_id, &receipt.intent_id)? {
-                            Some(existing) if existing != receipt => {
-                                return Err(DfsError::Metadata {
-                                    message: format!(
-                                        "target metadata shard {} has conflicting compact intent receipt {} for object {} during bounded migration",
-                                        pending.target_shard_id.0,
-                                        receipt.intent_id,
-                                        receipt.object_id
-                                    ),
-                                });
-                            }
-                            Some(_) => {}
-                            None => {
-                                if let Some(existing) =
-                                    target.get_intent(&receipt.object_id, &receipt.intent_id)?
-                                    && !receipt.matches_intent(&existing)
-                                {
-                                    return Err(DfsError::Metadata {
-                                        message: format!(
-                                            "target metadata shard {} has conflicting intent {} for object {} during bounded migration",
-                                            pending.target_shard_id.0,
-                                            receipt.intent_id,
-                                            receipt.object_id
-                                        ),
-                                    });
-                                }
-                                if !budget.can_mutate() {
-                                    return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-                                }
-                                target.put_intent_receipt_for_object(
-                                    Some(&pending.object),
-                                    &receipt,
-                                )?;
-                                budget.charge_mutation();
-                            }
-                        }
-                    } else {
-                        match target.get_intent_receipt(&intent.object_id, &intent.intent_id)? {
-                            Some(receipt) if !receipt.matches_intent(&intent) => {
-                                return Err(DfsError::Metadata {
-                                    message: format!(
-                                        "target metadata shard {} has conflicting compact intent receipt {} for object {} during bounded migration",
-                                        pending.target_shard_id.0,
-                                        intent.intent_id,
-                                        intent.object_id
-                                    ),
-                                });
-                            }
-                            Some(_) => {}
-                            None => {
-                                match target.get_intent(&intent.object_id, &intent.intent_id)? {
-                                    Some(existing) if existing != intent => {
-                                        return Err(DfsError::Metadata {
-                                            message: format!(
-                                                "target metadata shard {} has conflicting intent {} for object {} during bounded migration",
-                                                pending.target_shard_id.0,
-                                                intent.intent_id,
-                                                intent.object_id
-                                            ),
-                                        });
-                                    }
-                                    Some(_) => {}
-                                    None => {
-                                        if !budget.can_mutate() {
-                                            return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-                                        }
-                                        target.put_migrated_intent_for_object(
-                                            Some(&pending.object),
-                                            &intent,
-                                        )?;
-                                        budget.charge_mutation();
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    *after = Some(crate::DfsWriteIntentPageCursor {
-                        intent_id: intent.intent_id,
-                        shard_id: None,
-                    });
-                }
-                if page.next_cursor.is_some() {
-                    return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-                }
-                if !budget.can_read_family_record() {
-                    return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-                }
-                let retention = shard_backends
-                    .shard_backend(&pending.source_shard_id)?
-                    .intent_receipt_retention_for_object(&pending.object.object_id)?;
-                budget.charge_family_record();
-                if !retention.is_empty() {
-                    if !budget.can_mutate() {
-                        return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-                    }
-                    shard_backends
-                        .shard_backend_mut(&pending.target_shard_id)?
-                        .merge_intent_receipt_retention_for_object(
-                            Some(&pending.object),
-                            &pending.object.file_system_id,
-                            &pending.object.object_id,
-                            &retention,
-                        )?;
-                    budget.charge_mutation();
-                }
-                pending.stage = DfsDefaultSifsPendingMigrationStage::ReferenceOutcomes {
-                    next_source: 0,
-                    after_transaction_id: None,
-                    retention_merged: false,
-                };
-            }
-            DfsDefaultSifsPendingMigrationStage::ReferenceOutcomes {
-                next_source,
-                after_transaction_id,
-                retention_merged,
-            } => {
-                while *next_source < pending.reference_outcome_sources.len() {
-                    if !budget.can_read_family_record() || !budget.can_mutate() {
-                        return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-                    }
-                    let source_id = &pending.reference_outcome_sources[*next_source];
-                    if !*retention_merged {
-                        let limit = 128
-                            .min(budget.remaining_family_records)
-                            .min(budget.remaining_physical_mutations)
-                            .max(1);
-                        let page = shard_backends
-                            .shard_backend(source_id)?
-                            .content_reference_outcomes_for_object_page(
-                                &pending.object.file_system_id,
-                                &pending.object.object_id,
-                                after_transaction_id.as_deref(),
-                                limit,
-                            )?;
-                        if page.outcomes.is_empty() {
-                            budget.charge_family_record();
-                        }
-                        for receipt in page.outcomes {
-                            if !pending.reference_outcomes_only {
-                                pending.source_fence_required = true;
-                            }
-                            budget.charge_family_record();
-                            let progress = migrate_default_sifs_reference_outcome(
-                                shard_backends.shard_backend_mut(&pending.target_shard_id)?,
-                                &pending.object,
-                                &receipt,
-                                pending.target_writable,
-                                budget,
-                            )?;
-                            if !matches!(progress, DfsDefaultSifsPendingProgress::Complete) {
-                                return Ok(progress);
-                            }
-                            *after_transaction_id = Some(receipt.transaction_id);
-                        }
-                        if page.next_cursor.is_some() {
-                            return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-                        }
-                        *retention_merged = true;
-                    }
-                    if !budget.can_read_family_record() {
-                        return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-                    }
-                    let retention = shard_backends
-                        .shard_backend(source_id)?
-                        .content_reference_outcome_retention(
-                            &pending.object.file_system_id,
-                            &pending.object.object_id,
-                        )?;
-                    budget.charge_family_record();
-                    if let Some(retention) = retention {
-                        if !pending.reference_outcomes_only {
-                            pending.source_fence_required = true;
-                        }
-                        let progress = migrate_default_sifs_reference_expiry(
-                            shard_backends.shard_backend_mut(&pending.target_shard_id)?,
-                            &pending.object,
-                            &retention,
-                            pending.target_writable,
-                            budget,
-                        )?;
-                        if !matches!(progress, DfsDefaultSifsPendingProgress::Complete) {
-                            return Ok(progress);
-                        }
-                    }
-                    *next_source += 1;
-                    *after_transaction_id = None;
-                    *retention_merged = false;
-                }
-                pending.stage = if pending.source_fence.is_some() {
-                    DfsDefaultSifsPendingMigrationStage::SourceJournal
-                } else if pending.reference_outcomes_only {
-                    DfsDefaultSifsPendingMigrationStage::Index
-                } else {
-                    DfsDefaultSifsPendingMigrationStage::Conflicts { after: None }
-                };
-            }
-            DfsDefaultSifsPendingMigrationStage::Conflicts { after } => {
-                if !budget.can_read_family_record() {
-                    return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-                }
-                let page_size = DEFAULT_SIFS_BOOTSTRAP_SHARD_MIGRATION_PAGE_SIZE
-                    .min(budget.remaining_family_records)
-                    .max(1);
-                let page = shard_backends
-                    .shard_backend(&pending.source_shard_id)?
-                    .conflicts_for_object_page(
-                        &pending.object.object_id,
-                        after.as_ref(),
-                        page_size,
-                    )?;
-                for conflict in page.conflicts {
-                    budget.charge_family_record();
-                    let target = shard_backends.shard_backend_mut(&pending.target_shard_id)?;
-                    match target.get_conflict(&conflict.object_id, &conflict.conflict_id)? {
-                        Some(existing) if existing != conflict => {
-                            return Err(DfsError::Metadata {
-                                message: format!(
-                                    "target metadata shard {} has conflicting conflict {} for object {} during bounded migration",
-                                    pending.target_shard_id.0,
-                                    conflict.conflict_id,
-                                    conflict.object_id
-                                ),
-                            });
-                        }
-                        Some(_) => {}
-                        None => {
-                            if !budget.can_mutate() {
-                                return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-                            }
-                            target.put_conflict(&conflict)?;
-                            budget.charge_mutation();
-                        }
-                    }
-                    *after = Some(crate::DfsConflictPageCursor {
-                        conflict_id: conflict.conflict_id,
-                    });
-                }
-                if page.next_cursor.is_some() {
-                    return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-                }
-                pending.stage = DfsDefaultSifsPendingMigrationStage::SourceFence;
-            }
-            DfsDefaultSifsPendingMigrationStage::SourceFence => {
-                if !pending.source_fence_required {
-                    pending.stage = DfsDefaultSifsPendingMigrationStage::ObjectAndLock;
-                    continue;
-                }
-                if !pending
-                    .writable_sources
-                    .iter()
-                    .any(|source| source.shard_id == pending.source_shard_id)
-                {
-                    return Ok(DfsDefaultSifsPendingProgress::AwaitingReplica);
-                }
-                if !budget.can_mutate() {
-                    return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-                }
-                let source = shard_backends.shard_backend_mut(&pending.source_shard_id)?;
-                let revision = source
-                    .get_version(&pending.object.object_id, &pending.object.version)?
-                    .map(|mut revision| {
-                        revision.metadata_format = crate::DfsRevisionMetadataFormat::NamespacedV6;
-                        revision
-                    });
-                let operation_id = default_layout_source_fence_id(
-                    &pending.object,
-                    &pending.source_shard_id,
-                    &pending.target_shard_id,
-                )?;
-                let identity = operation_id
-                    .strip_prefix("default-layout-fence-v1:")
-                    .expect("fence prefix")
-                    .to_string();
-                if pending.source_fence.is_none() {
-                    pending.source_fence =
-                        source.get_namespace_prepare(&operation_id)?.map(Box::new);
-                }
-                if let Some(existing) = pending.source_fence.as_ref() {
-                    existing
-                        .validate_default_layout_migration_fence()
-                        .map_err(|message| DfsError::Metadata { message })?;
-                    if existing.operation_id != operation_id
-                        || existing.status != crate::DfsNamespacePrepareStatus::Prepared
-                    {
-                        return Err(DfsError::Metadata { message: "default layout migration cannot reuse a different or aborted source fence".into() });
-                    }
-                } else {
-                    let expected_path_occupant = source
-                        .get_object_by_path(&pending.object.file_system_id, &pending.object.path)?
-                        .map(|occupant| occupant.object_id);
-                    let mut fence = crate::DfsNamespacePrepareRecord {
-                        operation_id,
-                        file_system_id: pending.object.file_system_id.clone(),
-                        shard_id: pending.source_shard_id.clone(),
-                        owner_epoch: pending.source_epoch,
-                        operation_digest: String::new(),
-                        expected_object_versions: vec![
-                            crate::DfsNamespaceObjectVersionExpectation {
-                                object_id: pending.object.object_id.clone(),
-                                expected_version: Some(pending.object.version.clone()),
-                            },
-                        ],
-                        expected_path_occupants: vec![crate::DfsNamespacePathOccupantExpectation {
-                            path: pending.object.path.clone(),
-                            expected_object_id: expected_path_occupant,
-                        }],
-                        content_receipts: Vec::new(),
-                        transaction: crate::DfsNamespaceTransaction {
-                            content_reference_identity: None,
-                            contribution_digest: None,
-                            extension_expectations: Vec::new(),
-                            transaction_id: format!(
-                                "default-layout-fence-tx-v1:{identity}:{}",
-                                pending.source_replayed_through_sequence
-                            ),
-                            file_system_id: pending.object.file_system_id.clone(),
-                            objects: if revision.is_none() {
-                                vec![pending.object.clone()]
-                            } else {
-                                Vec::new()
-                            },
-                            versions: revision.into_iter().collect(),
-                            file_version_pins: None,
-                            advisory_lock_states: Vec::new(),
-                            created_at: OffsetDateTime::now_utc(),
-                        },
-                        completed_request: None,
-                        completed_request_completion: None,
-                        status: crate::DfsNamespacePrepareStatus::Prepared,
-                    };
-                    crate::metadata_records::normalize_namespace_prepare_in_place(&mut fence);
-                    fence.operation_digest =
-                        crate::service_replica::metadata_namespace_prepare_payload_digest_normalized(
-                            &fence,
-                        )?;
-                    if let Err(error) = source.prepare_namespace_transaction(&fence) {
-                        if matches!(
-                            error,
-                            crate::MetadataBackendError::ReaderFloorUpgradePending { .. }
-                        ) {
-                            return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-                        }
-                        return Err(error.into());
-                    }
-                    budget.charge_mutation();
-                    pending.source_fence = Some(Box::new(fence));
-                }
-                pending.stage = DfsDefaultSifsPendingMigrationStage::SourceJournal;
-            }
-            DfsDefaultSifsPendingMigrationStage::SourceJournal => {
-                if !budget.can_read_family_record() {
-                    return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-                }
-                let source = shard_backends.shard_backend(&pending.source_shard_id)?;
-                let entries = source.durable_journal_since_limited(
-                    pending.source_replayed_through_sequence,
-                    budget.remaining_family_records.clamp(1, 128),
-                )?;
-                if entries.is_empty() {
-                    if source.journal_last_sequence() != pending.source_replayed_through_sequence {
-                        return Err(DfsError::Metadata { message: "default layout source prefix needed before publication is unavailable".into() });
-                    }
-                    pending.stage = if pending.reference_outcomes_only {
-                        DfsDefaultSifsPendingMigrationStage::Index
-                    } else {
-                        DfsDefaultSifsPendingMigrationStage::ObjectAndLock
-                    };
-                    continue;
-                }
-                for entry in entries {
-                    if entry.sequence != pending.source_replayed_through_sequence.saturating_add(1)
-                    {
-                        return Err(DfsError::Metadata {
-                            message: "default layout source journal has a gap before publication"
-                                .into(),
-                        });
-                    }
-                    budget.charge_family_record();
-                    observe_default_sifs_source_prepare(
-                        &pending.object.object_id,
-                        &mut pending.source_prepare,
-                        &entry,
-                    )?;
-                    let resolved = if entry.mutation.affects_object_id(&pending.object.object_id) {
-                        default_sifs_committed_prepare_transaction(
-                            shard_backends.shard_backend(&pending.source_shard_id)?,
-                            &entry,
-                            pending.source_prepare.as_deref(),
-                        )?
-                    } else {
-                        None
-                    };
-                    let progress = replay_default_sifs_object_family_entry(
-                        shard_backends.shard_backend_mut(&pending.target_shard_id)?,
-                        &pending.target_shard_id,
-                        &pending.object,
-                        &entry,
-                        resolved.as_ref(),
-                        pending.target_writable,
-                        pending.reference_outcomes_only,
-                        budget,
-                    )?;
-                    if !matches!(progress, DfsDefaultSifsPendingProgress::Complete) {
-                        return Ok(progress);
-                    }
-                    finish_default_sifs_source_prepare(&mut pending.source_prepare, &entry);
-                    pending.source_replayed_through_sequence = entry.sequence;
-                    for source in &mut pending.writable_sources {
-                        if source.shard_id == pending.source_shard_id {
-                            source.replayed_through_sequence = entry.sequence;
-                        }
-                    }
-                }
-            }
-            DfsDefaultSifsPendingMigrationStage::ObjectAndLock => {
-                let source_lock = shard_backends
-                    .shard_backend(&pending.source_shard_id)?
-                    .get_advisory_lock_state(
-                        &pending.object.file_system_id,
-                        &pending.object.object_id,
-                    )?;
-                let desired_lock = source_lock.map(|mut state| {
-                    state.authority_rebind_required = true;
-                    state
-                });
-                let target = shard_backends.shard_backend_mut(&pending.target_shard_id)?;
-                let target_object = target.get_object(&pending.object.object_id)?;
-                if target_object.as_ref().is_some_and(|existing| {
-                    existing != &pending.object
-                        && !default_sifs_migration_object_generation_supersedes(
-                            &pending.object,
-                            existing,
-                        )
-                }) {
-                    return Ok(DfsDefaultSifsPendingProgress::Restart);
-                }
-                let target_lock = target.get_advisory_lock_state(
-                    &pending.object.file_system_id,
-                    &pending.object.object_id,
-                )?;
-                if target_object.as_ref() != Some(&pending.object) || target_lock != desired_lock {
-                    if !budget.can_mutate() {
-                        return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-                    }
-                    target.apply_namespace_transaction(&crate::DfsNamespaceTransaction {
-                        content_reference_identity: None,
-                        contribution_digest: None,
-                        extension_expectations: Vec::new(),
-                        file_version_pins: None,
-                        transaction_id: format!(
-                            "migrate-object:{}:{}",
-                            pending.object.object_id, pending.target_shard_id.0
-                        ),
-                        file_system_id: pending.object.file_system_id.clone(),
-                        objects: vec![pending.object.clone()],
-                        versions: Vec::new(),
-                        advisory_lock_states: desired_lock.into_iter().collect(),
-                        created_at: OffsetDateTime::UNIX_EPOCH,
-                    })?;
-                    budget.charge_mutation();
-                }
-                pending.stage = DfsDefaultSifsPendingMigrationStage::Index;
-            }
-            DfsDefaultSifsPendingMigrationStage::Index => {
-                if !crate::metadata_shard_index::object_shard_index_matches(
-                    metadata_root,
-                    &pending.object,
-                    &pending.target_shard_id,
-                )? {
-                    if !budget.can_mutate() {
-                        return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-                    }
-                    crate::metadata_shard_index::write_object_shard_index(
-                        metadata_root,
-                        &pending.object,
-                        &pending.target_shard_id,
-                    )?;
-                    report.indexed_objects = report.indexed_objects.saturating_add(1);
-                    budget.charge_mutation();
-                }
-                pending.stage =
-                    DfsDefaultSifsPendingMigrationStage::SourceEvictions { next_source: 0 };
-            }
-            DfsDefaultSifsPendingMigrationStage::SourceEvictions { next_source } => {
-                while *next_source < pending.writable_sources.len() {
-                    let source_index = *next_source;
-                    let source_generation = pending.writable_sources[source_index].clone();
-                    let source_shard_id = source_generation.shard_id;
-                    let expected_source = source_generation.object;
-                    let current_source = shard_backends
-                        .shard_backend(&source_shard_id)?
-                        .object_or_compacted_tombstone(&pending.object.object_id)?;
-                    let already_evicted = current_source.as_ref().is_some_and(|current| {
-                        matches!(
-                            current.tombstone_provenance.as_ref(),
-                            Some(crate::DfsTombstoneProvenance::SourceEviction {
-                                source_shard_id: recorded_source,
-                                target_shard_id: recorded_target,
-                                ..
-                            }) if recorded_source == &source_shard_id
-                                && recorded_target == &pending.target_shard_id
-                        )
-                    });
-                    if already_evicted {
-                        if let Some(fence) = pending
-                            .source_fence
-                            .as_ref()
-                            .filter(|fence| fence.shard_id == source_shard_id)
-                        {
-                            if !abort_default_layout_source_fence(shard_backends, fence, budget)? {
-                                return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-                            }
-                            pending.source_fence = None;
-                        }
-                        *next_source = next_source.saturating_add(1);
-                        continue;
-                    }
-                    if current_source.as_ref() != Some(&expected_source) {
-                        return Ok(DfsDefaultSifsPendingProgress::Restart);
-                    }
-
-                    if !budget.can_read_family_record() {
-                        return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-                    }
-                    let journal_page_size = budget.remaining_family_records.clamp(1, 128);
-                    let entries = shard_backends
-                        .shard_backend(&source_shard_id)?
-                        .durable_journal_since_limited(
-                            source_generation.replayed_through_sequence,
-                            journal_page_size,
-                        )?;
-                    let source_journal_head = shard_backends
-                        .shard_backend(&source_shard_id)?
-                        .journal_last_sequence();
-                    let expected_sequence = source_generation
-                        .replayed_through_sequence
-                        .saturating_add(1);
-                    if source_journal_head > source_generation.replayed_through_sequence
-                        && entries.first().is_none_or(|entry| {
-                            entry.shard_id != source_shard_id || entry.sequence != expected_sequence
-                        })
-                    {
-                        return Err(DfsError::Metadata {
-                            message: format!(
-                                "default SIFS migration source shard {} lost journal sequence {} while object {} still references that prefix",
-                                source_shard_id.0, expected_sequence, pending.object.object_id
-                            ),
-                        });
-                    }
-                    if !entries.is_empty() {
-                        for entry in entries {
-                            budget.charge_family_record();
-                            let progress = if source_shard_id == pending.source_shard_id {
-                                observe_default_sifs_source_prepare(
-                                    &pending.object.object_id,
-                                    &mut pending.source_prepare,
-                                    &entry,
-                                )?;
-                                let prepared_transaction = if entry
-                                    .mutation
-                                    .affects_object_id(&pending.object.object_id)
-                                {
-                                    default_sifs_committed_prepare_transaction(
-                                        shard_backends.shard_backend(&source_shard_id)?,
-                                        &entry,
-                                        pending.source_prepare.as_deref(),
-                                    )?
-                                } else {
-                                    None
-                                };
-                                let target =
-                                    shard_backends.shard_backend_mut(&pending.target_shard_id)?;
-                                replay_default_sifs_object_family_entry(
-                                    target,
-                                    &pending.target_shard_id,
-                                    &pending.object,
-                                    &entry,
-                                    prepared_transaction.as_ref(),
-                                    pending.target_writable,
-                                    pending.source_fence.is_some(),
-                                    budget,
-                                )?
-                            } else {
-                                // A stale duplicate object is evicted, but its
-                                // attached records are not authoritative input
-                                // for the canonical target family.
-                                DfsDefaultSifsPendingProgress::Complete
-                            };
-                            match progress {
-                                DfsDefaultSifsPendingProgress::Complete => {
-                                    finish_default_sifs_source_prepare(
-                                        &mut pending.source_prepare,
-                                        &entry,
-                                    );
-                                    pending.writable_sources[source_index]
-                                        .replayed_through_sequence = entry.sequence;
-                                }
-                                DfsDefaultSifsPendingProgress::Incomplete => {
-                                    return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-                                }
-                                DfsDefaultSifsPendingProgress::AwaitingReplica => {
-                                    return Ok(DfsDefaultSifsPendingProgress::AwaitingReplica);
-                                }
-                                DfsDefaultSifsPendingProgress::Restart => {
-                                    return Ok(DfsDefaultSifsPendingProgress::Restart);
-                                }
-                            }
-                        }
-                        // If this page consumed the read allowance, yield
-                        // before probing again. The source journal sequence is
-                        // durable, so no already-settled family entry is lost.
-                        if !budget.can_read_family_record() {
-                            return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-                        }
-                        continue;
-                    }
-
-                    if !budget.can_mutate() {
-                        return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-                    }
-                    let eviction = if let Some(fence) = pending
-                        .source_fence
-                        .as_ref()
-                        .filter(|fence| fence.shard_id == source_shard_id)
-                    {
-                        shard_backends
-                            .shard_backend_mut(&source_shard_id)?
-                            .put_cross_shard_tombstone_if_unchanged_with_fence(
-                                &expected_source,
-                                &pending.object,
-                                &source_shard_id,
-                                &pending.target_shard_id,
-                                pending.writable_sources[source_index].replayed_through_sequence,
-                                fence,
-                            )?
-                    } else {
-                        shard_backends
-                            .shard_backend_mut(&source_shard_id)?
-                            .put_cross_shard_tombstone_if_unchanged(
-                                &expected_source,
-                                &pending.object,
-                                &source_shard_id,
-                                &pending.target_shard_id,
-                                pending.writable_sources[source_index].replayed_through_sequence,
-                                None,
-                            )?
-                    };
-                    match eviction {
-                        crate::metadata_backend::DfsConditionalSourceEviction::Applied {
-                            ..
-                        } => {
-                            budget.charge_mutation();
-                            if let Some(fence) = pending
-                                .source_fence
-                                .as_ref()
-                                .filter(|fence| fence.shard_id == source_shard_id)
-                            {
-                                if !abort_default_layout_source_fence(
-                                    shard_backends,
-                                    fence,
-                                    budget,
-                                )? {
-                                    return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-                                }
-                                pending.source_fence = None;
-                            }
-                            *next_source = next_source.saturating_add(1);
-                        }
-                        crate::metadata_backend::DfsConditionalSourceEviction::AlreadyApplied => {
-                            if let Some(fence) = pending
-                                .source_fence
-                                .as_ref()
-                                .filter(|fence| fence.shard_id == source_shard_id)
-                            {
-                                if !abort_default_layout_source_fence(
-                                    shard_backends,
-                                    fence,
-                                    budget,
-                                )? {
-                                    return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-                                }
-                                pending.source_fence = None;
-                            }
-                            *next_source = next_source.saturating_add(1);
-                        }
-                        crate::metadata_backend::DfsConditionalSourceEviction::JournalAdvanced => {
-                            return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-                        }
-                        crate::metadata_backend::DfsConditionalSourceEviction::SourceChanged => {
-                            return Ok(DfsDefaultSifsPendingProgress::Restart);
-                        }
-                    }
-                }
-                while let Some(fence) = pending.retired_source_fences.last() {
-                    if !abort_default_layout_source_fence(shard_backends, fence, budget)? {
-                        return Ok(DfsDefaultSifsPendingProgress::Incomplete);
-                    }
-                    pending.retired_source_fences.pop();
-                }
-                pending.stage = DfsDefaultSifsPendingMigrationStage::Complete;
-            }
-            DfsDefaultSifsPendingMigrationStage::Complete => {
-                return Ok(DfsDefaultSifsPendingProgress::Complete);
-            }
-        }
-    }
-}
-
-fn default_sifs_is_legacy_source_eviction_marker(
-    metadata_root: &std::path::Path,
-    candidate_shard_id: &DfsMetadataShardId,
-    candidate: &crate::DfsObjectMetadata,
-    candidates: &[(DfsMetadataShardId, crate::DfsObjectMetadata)],
-    all_shards: &[DfsMetadataShardConfig],
-) -> Result<bool, DfsError> {
-    if candidate.kind != DfsObjectKind::Tombstone || candidate.tombstone_provenance.is_some() {
-        return Ok(false);
-    }
-    let Some(selected) =
-        crate::control_plane::select_metadata_shard_config_for_path_strict_default_sifs_split(
-            &candidate.file_system_id,
-            all_shards,
-            &candidate.path,
-        )?
-    else {
-        return Ok(false);
-    };
-    let target_shard_id = DfsMetadataShardId::new(selected.shard_id);
-    if target_shard_id == *candidate_shard_id {
-        // An unmarked tombstone on its committed route remains authoritative
-        // deletion evidence.
-        return Ok(false);
-    }
-    let Some((_, live_target)) = candidates.iter().find(|(shard_id, target)| {
-        shard_id == &target_shard_id
-            && target.kind != DfsObjectKind::Tombstone
-            && target.tombstone_provenance.is_none()
-    }) else {
-        return Ok(false);
-    };
-    let mut expected_legacy_marker = live_target.clone();
-    expected_legacy_marker.kind = DfsObjectKind::Tombstone;
-    expected_legacy_marker.changed_at_unix_nanos =
-        live_target.changed_at_unix_nanos.saturating_add(1);
-    Ok(candidate == &expected_legacy_marker
-        && crate::metadata_shard_index::object_shard_index_matches(
-            metadata_root,
-            live_target,
-            &target_shard_id,
-        )?)
-}
-
-fn plan_default_sifs_pending_migration(
-    metadata_root: &std::path::Path,
-    shard_backends: &LocalShardedMetadataBackend,
-    mut candidates: Vec<(DfsMetadataShardId, crate::DfsObjectMetadata)>,
-    all_shards: &[DfsMetadataShardConfig],
-    writable_shard_ids: &BTreeSet<DfsMetadataShardId>,
-    certified_replica_shard_ids: &BTreeSet<DfsMetadataShardId>,
-    local_node_id: &NodeId,
-    report: &mut DfsMetadataShardMigrationReport,
-    awaiting_replica_progress: &mut bool,
-) -> Result<Option<DfsDefaultSifsPendingMigration>, DfsError> {
-    for (candidate_shard_id, candidate) in &candidates {
-        if candidate.kind != DfsObjectKind::Tombstone && candidate.tombstone_provenance.is_some() {
-            return Err(DfsError::Metadata {
-                message: format!(
-                    "live default SIFS object {} on shard {} carries tombstone provenance",
-                    candidate.object_id, candidate_shard_id.0
-                ),
-            });
-        }
-        if let Some(crate::DfsTombstoneProvenance::SourceEviction {
-            source_shard_id,
-            target_shard_id,
-            ..
-        }) = candidate.tombstone_provenance.as_ref()
-            && (source_shard_id != candidate_shard_id || target_shard_id == source_shard_id)
-        {
-            return Err(DfsError::Metadata {
-                message: format!(
-                    "default SIFS object {} has malformed source-eviction provenance {} -> {} on shard {}",
-                    candidate.object_id, source_shard_id.0, target_shard_id.0, candidate_shard_id.0
-                ),
-            });
-        }
-    }
-    let mut legacy_source_eviction_shards = BTreeSet::new();
-    for (candidate_shard_id, candidate) in &candidates {
-        if default_sifs_is_legacy_source_eviction_marker(
-            metadata_root,
-            candidate_shard_id,
-            candidate,
-            &candidates,
-            all_shards,
-        )? {
-            legacy_source_eviction_shards.insert(candidate_shard_id.clone());
-        }
-    }
-    candidates.retain(|(candidate_shard_id, candidate)| {
-        !matches!(
-            candidate.tombstone_provenance,
-            Some(crate::DfsTombstoneProvenance::SourceEviction { .. })
-        ) && !legacy_source_eviction_shards.contains(candidate_shard_id)
-    });
-    if candidates.is_empty() {
-        return Ok(None);
-    }
-    candidates.sort_by(|(left_shard, left), (right_shard, right)| {
-        (left.changed_at_unix_nanos, &left.version)
-            .cmp(&(right.changed_at_unix_nanos, &right.version))
-            .then_with(|| {
-                let left_routed = crate::control_plane::select_metadata_shard_config_for_path_strict_default_sifs_split(
-                    &left.file_system_id,
-                    all_shards,
-                    &left.path,
-                )
-                .ok()
-                .flatten()
-                .is_some_and(|selected| selected.shard_id == left_shard.0);
-                let right_routed = crate::control_plane::select_metadata_shard_config_for_path_strict_default_sifs_split(
-                    &right.file_system_id,
-                    all_shards,
-                    &right.path,
-                )
-                .ok()
-                .flatten()
-                .is_some_and(|selected| selected.shard_id == right_shard.0);
-                left_routed.cmp(&right_routed)
-            })
-            .then_with(|| {
-                writable_shard_ids
-                    .contains(left_shard)
-                    .cmp(&writable_shard_ids.contains(right_shard))
-            })
-            .then_with(|| {
-                crate::metadata_keys::normalize_path(&left.path)
-                    .cmp(&crate::metadata_keys::normalize_path(&right.path))
-            })
-            .then_with(|| left_shard.cmp(right_shard))
-    });
-    let (source_shard_id, object) = candidates
-        .last()
-        .cloned()
-        .expect("nonempty candidates were checked above");
-    report.skipped_stale_sources = report
-        .skipped_stale_sources
-        .saturating_add(candidates.len().saturating_sub(1));
-
-    let target =
-        crate::control_plane::select_metadata_shard_config_for_path_strict_default_sifs_split(
-            &object.file_system_id,
-            all_shards,
-            &object.path,
-        )?
-        .ok_or_else(|| sinomo_core::kv::KvError::Serialization {
-            detail: format!(
-                "default SIFS object {} has no committed metadata shard",
-                object.path
-            ),
-        })?;
-    let target_shard_id = DfsMetadataShardId::new(target.shard_id.clone());
-    let target_is_writable = writable_shard_ids.contains(&target_shard_id);
-    let target_is_certified =
-        target_is_writable || certified_replica_shard_ids.contains(&target_shard_id);
-    let target_object = target_is_certified
-        .then(|| {
-            candidates
-                .iter()
-                .find(|(candidate_shard_id, _)| candidate_shard_id == &target_shard_id)
-                .map(|(_, target_object)| target_object.clone())
-        })
-        .flatten();
-    let target_preserves_canonical_object = match target_object.as_ref() {
-        Some(target_object) if target_object.file_system_id == object.file_system_id => {
-            let target_routes_here = crate::control_plane::select_metadata_shard_config_for_path_strict_default_sifs_split(
-                &target_object.file_system_id,
-                all_shards,
-                &target_object.path,
-            )?
-            .is_some_and(|selected| selected.shard_id == target_shard_id.0);
-            let target_generation = (target_object.changed_at_unix_nanos, &target_object.version);
-            let source_generation = (object.changed_at_unix_nanos, &object.version);
-            target_routes_here
-                && (target_generation > source_generation
-                    || (target_generation == source_generation
-                        && target_object.kind == object.kind
-                        && crate::metadata_keys::normalize_path(&target_object.path)
-                            == crate::metadata_keys::normalize_path(&object.path)))
-        }
-        _ => false,
-    };
-    let needs_target_install = target_is_writable && !target_preserves_canonical_object;
-    if !needs_target_install && !target_preserves_canonical_object {
-        *awaiting_replica_progress |= target
-            .replica_node_ids
-            .iter()
-            .any(|node_id| node_id == local_node_id);
-        return Ok(None);
-    }
-    let writable_sources = candidates
-        .iter()
-        .filter(|(shard_id, _)| {
-            *shard_id != target_shard_id && writable_shard_ids.contains(shard_id)
-        })
-        .map(|(shard_id, object)| {
-            Ok(DfsDefaultSifsPendingSource {
-                shard_id: shard_id.clone(),
-                object: object.clone(),
-                replayed_through_sequence: shard_backends
-                    .shard_backend(shard_id)?
-                    .journal_last_sequence(),
-            })
-        })
-        .collect::<Result<Vec<_>, crate::MetadataBackendError>>()?;
-    let canonical_target_object = if needs_target_install {
-        object
-    } else {
-        report.skipped_stale_sources = report.skipped_stale_sources.saturating_add(1);
-        target_object.expect("accepted target object was checked above")
-    };
-    let needs_index_mutation = !crate::metadata_shard_index::object_shard_index_matches(
-        metadata_root,
-        &canonical_target_object,
-        &target_shard_id,
-    )?;
-    let reference_history_sources = writable_shard_ids
-        .union(certified_replica_shard_ids)
-        .filter(|shard| **shard != target_shard_id)
-        .cloned()
-        .collect::<Vec<_>>();
-    let mut reference_outcome_sources = Vec::new();
-    let mut needs_reference_outcomes = false;
-    let mut resumed_source_fence = None;
-    let mut retired_source_fences = Vec::new();
-    for source in &reference_history_sources {
-        let source_id = source;
-        let source = shard_backends.shard_backend(source_id)?;
-        if writable_shard_ids.contains(source_id)
-            && let Some(fence) = source.default_layout_migration_fence_for_object(
-                &canonical_target_object.file_system_id,
-                &canonical_target_object.object_id,
-            )?
-            && fence.status == crate::DfsNamespacePrepareStatus::Prepared
-        {
-            fence
-                .validate_default_layout_migration_fence()
-                .map_err(|message| DfsError::Metadata { message })?;
-            let evicted = if let Some(mut object) =
-                source.object_or_compacted_tombstone(&canonical_target_object.object_id)?
-            {
-                if let Some(crate::DfsTombstoneProvenance::SourceEviction {
-                    source_shard_id: recorded_source,
-                    target_shard_id: recorded_target,
-                    ..
-                }) = object.tombstone_provenance.clone()
-                {
-                    // Retirement names the completed source cut, independently
-                    // of a later target edit or subsequent shard move.
-                    object.version = fence.expected_object_versions[0]
-                        .expected_version
-                        .clone()
-                        .expect("validated migration fence has an exact source head");
-                    if recorded_source != *source_id
-                        || recorded_target == recorded_source
-                        || default_layout_source_fence_id(
-                            &object,
-                            &recorded_source,
-                            &recorded_target,
-                        )? != fence.operation_id
-                    {
-                        return Err(DfsError::Metadata {
-                            message:
-                                "evicted layout source does not match its saved migration fence"
-                                    .into(),
-                        });
-                    }
-                    true
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
-            if evicted {
-                retired_source_fences.push(fence);
-            } else {
-                if resumed_source_fence.is_some() {
-                    return Err(DfsError::Metadata {
-                        message: "default layout migration has multiple active source fences"
-                            .into(),
-                    });
-                }
-                resumed_source_fence = Some(Box::new(fence));
-            }
-        }
-        if !source
-            .content_reference_outcomes_for_object_page(
-                &canonical_target_object.file_system_id,
-                &canonical_target_object.object_id,
-                None,
-                1,
-            )?
-            .outcomes
-            .is_empty()
-            || source
-                .content_reference_outcome_retention(
-                    &canonical_target_object.file_system_id,
-                    &canonical_target_object.object_id,
-                )?
-                .is_some()
-        {
-            needs_reference_outcomes = true;
-            reference_outcome_sources.push(source_id.clone());
-        }
-    }
-    if !needs_target_install
-        && writable_sources.is_empty()
-        && !needs_index_mutation
-        && !needs_reference_outcomes
-        && resumed_source_fence.is_none()
-        && retired_source_fences.is_empty()
-    {
-        return Ok(None);
-    }
-    let counts_as_migration = needs_target_install || !writable_sources.is_empty();
-    let effective_source_id = resumed_source_fence
-        .as_ref()
-        .map(|fence| fence.shard_id.clone())
-        .unwrap_or_else(|| {
-            if needs_target_install {
-                source_shard_id.clone()
-            } else {
-                target_shard_id.clone()
-            }
-        });
-    let source_config = all_shards
-        .iter()
-        .find(|shard| shard.shard_id == effective_source_id.0);
-    let source_fence_required = needs_target_install
-        && (needs_reference_outcomes
-            || source_config.is_some_and(|source| {
-                source.namespace_prepare_codec == crate::DfsMetadataNamespacePrepareCodec::PackedV6
-            }));
-    let source_epoch = source_config.map_or(1, |source| source.epoch);
-    let source_replayed_through_sequence = resumed_source_fence
-        .as_ref()
-        .map(|fence| {
-            fence
-                .transaction
-                .transaction_id
-                .rsplit(':')
-                .next()
-                .and_then(|sequence| sequence.parse::<u64>().ok())
-                .ok_or_else(|| DfsError::Metadata {
-                    message: "stored layout fence has no source prefix".into(),
-                })
-        })
-        .transpose()?
-        .unwrap_or(
-            shard_backends
-                .shard_backend(&effective_source_id)?
-                .journal_last_sequence(),
-        );
-    Ok(Some(DfsDefaultSifsPendingMigration {
-        object: canonical_target_object,
-        source_shard_id: effective_source_id,
-        target_shard_id,
-        writable_sources,
-        reference_outcome_sources,
-        reference_outcomes_only: !needs_target_install,
-        target_writable: target_is_writable,
-        source_fence_required,
-        source_epoch,
-        source_replayed_through_sequence,
-        source_fence: resumed_source_fence,
-        source_prepare: None,
-        retired_source_fences,
-        catalog_object: false,
-        counts_as_migration,
-        stage: if needs_target_install {
-            DfsDefaultSifsPendingMigrationStage::EnsureFileSystem
-        } else {
-            DfsDefaultSifsPendingMigrationStage::ReferenceOutcomes {
-                next_source: 0,
-                after_transaction_id: None,
-                retention_merged: false,
-            }
-        },
-    }))
-}
-
-fn collect_default_sifs_candidates_for_object(
-    shard_backends: &LocalShardedMetadataBackend,
-    participating_shard_ids: &BTreeSet<DfsMetadataShardId>,
-    object_id: &crate::DfsObjectId,
-    all_shards: &[DfsMetadataShardConfig],
-    writable_shard_ids: &BTreeSet<DfsMetadataShardId>,
-    certified_replica_shard_ids: &BTreeSet<DfsMetadataShardId>,
-    local_replica_shard_ids: &BTreeSet<DfsMetadataShardId>,
-    awaiting_replica_progress: &mut bool,
-) -> Result<Vec<(DfsMetadataShardId, crate::DfsObjectMetadata)>, DfsError> {
-    let mut candidates = Vec::new();
-    for shard_id in participating_shard_ids {
-        let backend = shard_backends.shard_backend(shard_id)?;
-        let Some(object) = backend.object_or_compacted_tombstone(object_id)? else {
-            continue;
-        };
-        let source_usable =
-            writable_shard_ids.contains(shard_id) || certified_replica_shard_ids.contains(shard_id);
-        if !source_usable {
-            if local_replica_shard_ids.contains(shard_id)
-                && object.kind != DfsObjectKind::Tombstone
-                && crate::control_plane::select_metadata_shard_config_for_path_strict_default_sifs_split(
-                    &object.file_system_id,
-                    all_shards,
-                    &object.path,
-                )?
-                .is_some_and(|selected| {
-                    let target_shard_id = DfsMetadataShardId::new(selected.shard_id);
-                    target_shard_id != *shard_id
-                        && writable_shard_ids.contains(&target_shard_id)
-                })
-            {
-                *awaiting_replica_progress = true;
-            }
-            continue;
-        }
-        candidates.push((shard_id.clone(), object));
-    }
-    Ok(candidates)
-}
-
-fn default_sifs_journal_entry_requires_object_work(
-    cursor: &DfsDefaultSifsMigrationCursor,
-    entry: &crate::DfsMetadataJournalEntry,
-) -> bool {
-    !cursor.catalog_complete
-        || cursor.pending_migration.is_some()
-        || default_sifs_journal_entry_has_reference_effects(entry)
-        || entry.mutation.changes_object_routing()
-}
-
-fn default_sifs_journal_entry_has_reference_effects(
-    entry: &crate::DfsMetadataJournalEntry,
-) -> bool {
-    match &entry.mutation {
-        crate::DfsMetadataMutation::ApplyNamespaceTransaction {
-            transaction: Some(transaction),
-            ..
-        } => {
-            transaction.content_reference_identity.is_some()
-                || transaction.file_version_pins.is_some()
-        }
-        crate::DfsMetadataMutation::PutNamespaceTransactionReceipt { receipt, .. } => {
-            receipt.content_reference_identity.is_some()
-        }
-        crate::DfsMetadataMutation::RemoveNamespaceTransactionReceipt { retention, .. } => {
-            !retention.content_reference_outcome_retention.is_empty()
-        }
-        crate::DfsMetadataMutation::PutNamespacePrepare {
-            status: crate::DfsNamespacePrepareStatus::Committed,
-            ..
-        }
-        | crate::DfsMetadataMutation::CommitNamespacePrepare { .. } => true,
-        _ => false,
-    }
-}
-
-fn stage_default_sifs_journal_entry_object_ids(
-    cursor: &mut DfsDefaultSifsMigrationCursor,
-    shard_id: &DfsMetadataShardId,
-    entry: &crate::DfsMetadataJournalEntry,
-    mut after_object_id: Option<crate::DfsObjectId>,
-    replay_capacity: usize,
-) -> Result<bool, DfsError> {
-    let observed_sequence = cursor
-        .observed_journal_sequences
-        .get(&shard_id.0)
-        .copied()
-        .unwrap_or_default();
-    let expected_sequence = observed_sequence.saturating_add(1);
-    if entry.shard_id != *shard_id || entry.sequence != expected_sequence {
-        return Err(DfsError::Metadata {
-            message: format!(
-                "default SIFS migration journal replay for shard {} expected sequence {}, got shard {} sequence {}",
-                shard_id.0, expected_sequence, entry.shard_id.0, entry.sequence
-            ),
-        });
-    }
-
-    if !default_sifs_journal_entry_requires_object_work(cursor, entry) {
-        // A completed catalog has already established the routing of every
-        // visible object. Receipt/intent/version changes do not move that
-        // namespace. Consume their journal positions without manufacturing
-        // new object-migration work. An unfinished family still observes all
-        // mutations so its source-prefix fence cannot miss a late receipt.
-        cursor
-            .observed_journal_sequences
-            .insert(shard_id.0.clone(), entry.sequence);
-        cursor.pending_journal_replay = None;
-        metrics::counter!("sinomo.dfs.background.items", "worker" => "migration", "kind" => "non_routing_journal_entries").increment(1);
-        return Ok(true);
-    }
-
-    loop {
-        let remaining = replay_capacity.saturating_sub(cursor.dirty_object_ids.len());
-        if remaining == 0 {
-            cursor.pending_journal_replay = Some(DfsDefaultSifsPendingJournalReplay {
-                shard_id: shard_id.clone(),
-                sequence: entry.sequence,
-                after_object_id,
-            });
-            return Ok(false);
-        }
-        let (object_ids, has_more) = entry
-            .mutation
-            .affected_object_ids_page(after_object_id.as_ref(), remaining);
-        if let Some(last) = object_ids.last() {
-            after_object_id = Some(last.clone());
-        }
-        cursor.dirty_object_ids.extend(object_ids);
-        if !has_more {
-            cursor
-                .observed_journal_sequences
-                .insert(shard_id.0.clone(), entry.sequence);
-            cursor.pending_journal_replay = None;
-            return Ok(true);
-        }
-        if cursor.dirty_object_ids.len() >= replay_capacity {
-            cursor.pending_journal_replay = Some(DfsDefaultSifsPendingJournalReplay {
-                shard_id: shard_id.clone(),
-                sequence: entry.sequence,
-                after_object_id,
-            });
-            return Ok(false);
-        }
-    }
-}
-
-fn default_sifs_migration_cursor_has_journal_gap(
-    cursor: &DfsDefaultSifsMigrationCursor,
-    shard_backends: &LocalShardedMetadataBackend,
-    participating_shard_ids: &BTreeSet<DfsMetadataShardId>,
-) -> Result<bool, DfsError> {
-    for shard_id in participating_shard_ids {
-        let backend = shard_backends.shard_backend(shard_id)?;
-        let after_sequence = cursor
-            .observed_journal_sequences
-            .get(&shard_id.0)
-            .copied()
-            .unwrap_or_default();
-        if backend.journal_last_sequence() <= after_sequence {
-            continue;
-        }
-        let expected_sequence = after_sequence.saturating_add(1);
-        let first = backend
-            .durable_journal_since_limited(after_sequence, 1)?
-            .into_iter()
-            .next();
-        if first
-            .as_ref()
-            .is_none_or(|entry| entry.shard_id != *shard_id || entry.sequence != expected_sequence)
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-fn resume_default_sifs_pending_journal_replay(
-    cursor: &mut DfsDefaultSifsMigrationCursor,
-    shard_backends: &LocalShardedMetadataBackend,
-    replay_capacity: usize,
-    remaining_journal_bytes: &mut usize,
-) -> Result<bool, DfsError> {
-    let Some(pending) = cursor.pending_journal_replay.clone() else {
-        return Ok(true);
-    };
-    let backend = shard_backends.shard_backend(&pending.shard_id)?;
-    let batch = backend.durable_journal_since_limits(
-        pending.sequence.saturating_sub(1),
-        1,
-        *remaining_journal_bytes,
-    )?;
-    *remaining_journal_bytes = remaining_journal_bytes
-        .saturating_sub(usize::try_from(batch.encoded_bytes).unwrap_or(usize::MAX));
-    let entry = batch
-        .entries
-        .into_iter()
-        .next()
-        .ok_or_else(|| DfsError::Metadata {
-            message: format!(
-                "default SIFS migration pending journal entry {} on shard {} disappeared",
-                pending.sequence, pending.shard_id.0
-            ),
-        })?;
-    stage_default_sifs_journal_entry_object_ids(
-        cursor,
-        &pending.shard_id,
-        &entry,
-        pending.after_object_id,
-        replay_capacity,
-    )
-}
-
-fn fence_default_sifs_journal_tail(
-    cursor: &mut DfsDefaultSifsMigrationCursor,
-    shard_backends: &LocalShardedMetadataBackend,
-    participating_shard_ids: &BTreeSet<DfsMetadataShardId>,
-    replay_capacity: usize,
-    remaining_journal_entries: &mut usize,
-    remaining_object_journal_entries: &mut usize,
-    remaining_journal_bytes: &mut usize,
-) -> Result<bool, DfsError> {
-    if cursor.pending_journal_replay.is_some()
-        || cursor.dirty_object_ids.len() >= replay_capacity
-        || *remaining_journal_entries == 0
-        || *remaining_journal_bytes == 0
-    {
-        return Ok(true);
-    }
-
-    for shard_id in participating_shard_ids {
-        let backend = shard_backends.shard_backend(shard_id)?;
-        if cursor.pending_journal_replay.is_some()
-            || cursor.dirty_object_ids.len() >= replay_capacity
-            || *remaining_journal_entries == 0
-            || *remaining_journal_bytes == 0
-        {
-            return Ok(true);
-        }
-        let after_sequence = cursor
-            .observed_journal_sequences
-            .get(&shard_id.0)
-            .copied()
-            .unwrap_or_default();
-        // One entry is admitted into this pass. The second is an exact
-        // lookahead: a zero-object control mutation must not make the fence
-        // look quiescent while an object mutation is already behind it.
-        let batch =
-            backend.durable_journal_since_limits(after_sequence, 2, *remaining_journal_bytes)?;
-        *remaining_journal_bytes = remaining_journal_bytes
-            .saturating_sub(usize::try_from(batch.encoded_bytes).unwrap_or(usize::MAX));
-        let has_lookahead = batch.entries.len() > 1 || batch.byte_limit_reached;
-        let Some(entry) = batch.entries.into_iter().next() else {
-            continue;
-        };
-        if default_sifs_journal_entry_requires_object_work(cursor, &entry) {
-            if *remaining_object_journal_entries == 0 {
-                return Ok(true);
-            }
-            *remaining_object_journal_entries = remaining_object_journal_entries.saturating_sub(1);
-        }
-        *remaining_journal_entries = remaining_journal_entries.saturating_sub(1);
-        if !stage_default_sifs_journal_entry_object_ids(
-            cursor,
-            shard_id,
-            &entry,
-            None,
-            replay_capacity,
-        )? {
-            return Ok(true);
-        }
-        if has_lookahead {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-#[tracing::instrument(target = "sinomo.perf", level = "trace", name = "dfs.metadata.migration",
-    skip_all, fields(stage = "dfs.metadata.migration", outcome = tracing::field::Empty,
-    scanned_objects = tracing::field::Empty, migrated_objects = tracing::field::Empty,
-    catalog_complete = tracing::field::Empty, awaiting_replica_progress = tracing::field::Empty,
-    reached_limit = tracing::field::Empty))]
-fn migrate_default_sifs_metadata_on_active_primary_shards(
-    metadata_root: &std::path::Path,
-    shard_backends: &mut LocalShardedMetadataBackend,
-    file_system: &DfsFileSystem,
-    all_shards: &[DfsMetadataShardConfig],
-    active_primary_shard_ids: &BTreeSet<DfsMetadataShardId>,
-    local_node_id: &NodeId,
-    max_migrations: usize,
-) -> Result<DfsDefaultSifsMaterializationReport, DfsError> {
-    let mut observation = crate::background_observation::DfsBackgroundObservation::new(
-        "migration",
-        "default-catalog",
-    );
-    let mut report = DfsMetadataShardMigrationReport {
-        file_system_id: file_system.file_system_id.clone(),
-        scanned_objects: 0,
-        indexed_objects: 0,
-        migrated_objects: 0,
-        skipped_stale_sources: 0,
-        reached_limit: false,
-    };
-    let writable_shard_ids = all_shards
-        .iter()
-        .filter(|shard| {
-            shard.file_system_id == file_system.file_system_id
-                && shard.primary_node_id == *local_node_id
-                && active_primary_shard_ids
-                    .contains(&DfsMetadataShardId::new(shard.shard_id.clone()))
-        })
-        .map(|shard| DfsMetadataShardId::new(shard.shard_id.clone()))
-        .collect::<BTreeSet<_>>();
-    let bound_shard_ids = shard_backends
-        .shard_ids()
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-    if !writable_shard_ids.is_subset(&bound_shard_ids) {
-        return Err(DfsError::Metadata {
-            message: format!(
-                "default SIFS migration backend shards {:?} do not cover locally active shards {:?}",
-                bound_shard_ids, writable_shard_ids
-            ),
-        });
-    }
-    let mut participating_shard_ids = writable_shard_ids.clone();
-    let mut certified_replica_shard_ids = BTreeSet::new();
-    let mut local_replica_shard_ids = BTreeSet::new();
-    let mut awaiting_replica_progress = false;
-
-    for shard in all_shards
-        .iter()
-        .filter(|shard| shard.file_system_id == file_system.file_system_id)
-    {
-        let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
-        let shard_root = metadata_root.join(crate::metadata_keys::key_segment(&shard_id.0));
-        let local_replica_assigned = shard
-            .replica_node_ids
-            .iter()
-            .any(|node_id| node_id == local_node_id);
-        if local_replica_assigned {
-            local_replica_shard_ids.insert(shard_id.clone());
-        }
-        if writable_shard_ids.contains(&shard_id) {
-            continue;
-        }
-        if !shard_root.exists() {
-            continue;
-        }
-        if !bound_shard_ids.contains(&shard_id) {
-            return Err(DfsError::Metadata {
-                message: format!(
-                    "default SIFS migration backend is missing local replica shard {}",
-                    shard_id.0
-                ),
-            });
-        }
-        let backend = shard_backends.shard_backend_mut(&shard_id)?;
-        backend.refresh_for_inspection()?;
-        let journal_sequence = backend.journal_last_sequence();
-        let authority_floor = backend.metadata_authority_ack_floor(&shard_id)?;
-        let prefix_floor = backend.metadata_prefix_ack_floor(&shard_id)?;
-        if local_replica_assigned
-            && (journal_sequence == 0
-                || authority_floor
-                    .as_ref()
-                    .is_some_and(|floor| floor.journal_sequence >= journal_sequence)
-                || prefix_floor
-                    .as_ref()
-                    .is_some_and(|floor| floor.journal_sequence >= journal_sequence))
-        {
-            certified_replica_shard_ids.insert(shard_id.clone());
-        }
-        participating_shard_ids.insert(shard_id);
-    }
-
-    let generation = default_sifs_migration_generation(
-        &file_system.file_system_id,
-        local_node_id,
-        all_shards,
-        active_primary_shard_ids,
-        &certified_replica_shard_ids,
-    );
-    let scan_limit = max_migrations.max(1);
-    let observed_journal_sequences = participating_shard_ids
-        .iter()
-        .map(|shard_id| {
-            shard_backends
-                .shard_backend(shard_id)
-                .map(|backend| (shard_id.0.clone(), backend.journal_last_sequence()))
-        })
-        .collect::<Result<BTreeMap<_, _>, _>>()?;
-    let new_cursor = || DfsDefaultSifsMigrationCursor {
-        format_version: DEFAULT_SIFS_BOOTSTRAP_SHARD_MIGRATION_CURSOR_FORMAT_VERSION,
-        generation: generation.clone(),
-        catalog_complete: false,
-        after_object_id: None,
-        observed_journal_sequences: observed_journal_sequences.clone(),
-        dirty_object_ids: BTreeSet::new(),
-        pending_journal_replay: None,
-        pending_migration: None,
-    };
-    let mut cursor = match read_default_sifs_migration_cursor(
-        metadata_root,
-        &file_system.file_system_id,
-        &generation,
-    )? {
-        DfsDefaultSifsMigrationCursorRead::Resume(cursor) => *cursor,
-        DfsDefaultSifsMigrationCursorRead::Restart => new_cursor(),
-        DfsDefaultSifsMigrationCursorRead::AwaitingReplicaProgress => {
-            observation.finish("deferred");
-            tracing::Span::current().record("scanned_objects", 0usize);
-            tracing::Span::current().record("migrated_objects", 0usize);
-            tracing::Span::current().record("awaiting_replica_progress", true);
-            tracing::Span::current().record("reached_limit", false);
-            return Ok(DfsDefaultSifsMaterializationReport {
-                migration: report,
-                awaiting_replica_progress: true,
-            });
-        }
-    };
-    for shard_id in &participating_shard_ids {
-        let backend = shard_backends.shard_backend(shard_id)?;
-        cursor
-            .observed_journal_sequences
-            .entry(shard_id.0.clone())
-            .or_insert_with(|| backend.journal_last_sequence());
-    }
-    if default_sifs_migration_cursor_has_journal_gap(
-        &cursor,
-        shard_backends,
-        &participating_shard_ids,
-    )? {
-        if cursor.catalog_complete {
-            // A settled marker has no in-flight source eviction or partially
-            // replayed family. If its incremental journal fence was pruned,
-            // restart a complete ordered proof from the current durable heads.
-            cursor = new_cursor();
-        } else {
-            return Err(DfsError::Metadata {
-                message: "default SIFS migration cursor references pruned journal history"
-                    .to_string(),
-            });
-        }
-    }
-
-    // Convert a bounded durable journal suffix into dirty object IDs before
-    // advancing the ordered catalog. A journal sequence is checkpointed only
-    // after every affected ID from that entry has crossed the durable inner
-    // cursor. One lookahead entry makes backlog detection exact.
-    let mut journal_backlog = false;
-    let mut remaining_journal_entries = DEFAULT_SIFS_MIGRATION_JOURNAL_ENTRY_LIMIT;
-    let mut remaining_object_journal_entries = scan_limit;
-    let mut remaining_journal_bytes = DEFAULT_SIFS_MIGRATION_JOURNAL_BYTE_LIMIT;
-    if cursor.pending_journal_replay.is_some() {
-        remaining_journal_entries = remaining_journal_entries.saturating_sub(1);
-        remaining_object_journal_entries = remaining_object_journal_entries.saturating_sub(1);
-        if !resume_default_sifs_pending_journal_replay(
-            &mut cursor,
-            shard_backends,
-            scan_limit,
-            &mut remaining_journal_bytes,
-        )? {
-            journal_backlog = true;
-        }
-    }
-    if cursor.pending_journal_replay.is_none() {
-        'journal_shards: for shard_id in &participating_shard_ids {
-            let backend = shard_backends.shard_backend(shard_id)?;
-            loop {
-                if remaining_journal_entries == 0
-                    || remaining_journal_bytes == 0
-                    || cursor.dirty_object_ids.len() >= scan_limit
-                {
-                    journal_backlog = true;
-                    break 'journal_shards;
-                }
-                // Decode only the object work this pass can admit, plus one
-                // exact lookahead. Non-routing entries advance the journal
-                // fence without spending the object budget, so keep reading
-                // small chunks within the unchanged total entry/byte bounds.
-                let processable_entries = remaining_object_journal_entries
-                    .min(scan_limit.saturating_sub(cursor.dirty_object_ids.len()));
-                let read_limit = remaining_journal_entries
-                    .min(processable_entries)
-                    .saturating_add(1);
-                let after_sequence = cursor
-                    .observed_journal_sequences
-                    .get(&shard_id.0)
-                    .copied()
-                    .unwrap_or_default();
-                let batch = backend.durable_journal_since_limits(
-                    after_sequence,
-                    read_limit,
-                    remaining_journal_bytes,
-                )?;
-                let returned_entries = batch.entries.len();
-                #[cfg(test)]
-                DEFAULT_SIFS_MIGRATION_JOURNAL_READS.with(|reads| {
-                    reads
-                        .borrow_mut()
-                        .push((processable_entries, read_limit, returned_entries));
-                });
-                remaining_journal_bytes = remaining_journal_bytes
-                    .saturating_sub(usize::try_from(batch.encoded_bytes).unwrap_or(usize::MAX));
-                for entry in batch.entries {
-                    let object_work =
-                        default_sifs_journal_entry_requires_object_work(&cursor, &entry);
-                    if remaining_journal_entries == 0
-                        || (object_work && remaining_object_journal_entries == 0)
-                        || cursor.dirty_object_ids.len() >= scan_limit
-                    {
-                        journal_backlog = true;
-                        break 'journal_shards;
-                    }
-                    remaining_journal_entries = remaining_journal_entries.saturating_sub(1);
-                    if object_work {
-                        remaining_object_journal_entries =
-                            remaining_object_journal_entries.saturating_sub(1);
-                    }
-                    if !stage_default_sifs_journal_entry_object_ids(
-                        &mut cursor,
-                        shard_id,
-                        &entry,
-                        None,
-                        scan_limit,
-                    )? {
-                        journal_backlog = true;
-                        break 'journal_shards;
-                    }
-                }
-                if batch.byte_limit_reached {
-                    journal_backlog = true;
-                    break 'journal_shards;
-                }
-                if returned_entries < read_limit {
-                    break;
-                }
-            }
-        }
-    }
-
-    let mut budget = DfsDefaultSifsMigrationPassBudget::new(max_migrations);
-    let mut remaining_object_scans = scan_limit;
-    let mut stopped_for_budget = false;
-
-    if let Some(mut pending) = cursor.pending_migration.take() {
-        let object_id = pending.object.object_id.clone();
-        match advance_default_sifs_pending_migration(
-            metadata_root,
-            shard_backends,
-            file_system,
-            &mut pending,
-            &mut budget,
-            &mut report,
-        )? {
-            DfsDefaultSifsPendingProgress::Complete => {
-                if pending.counts_as_migration {
-                    report.migrated_objects = report.migrated_objects.saturating_add(1);
-                }
-                if pending.catalog_object {
-                    cursor.after_object_id = Some(object_id.clone());
-                }
-                cursor.dirty_object_ids.remove(&object_id);
-            }
-            DfsDefaultSifsPendingProgress::Incomplete => {
-                cursor.pending_migration = Some(pending);
-                stopped_for_budget = true;
-            }
-            DfsDefaultSifsPendingProgress::AwaitingReplica => {
-                cursor.pending_migration = Some(pending);
-                awaiting_replica_progress = true;
-                stopped_for_budget = true;
-            }
-            DfsDefaultSifsPendingProgress::Restart => {
-                cursor.dirty_object_ids.insert(object_id);
-                stopped_for_budget = true;
-            }
-        }
-    }
-
-    if !stopped_for_budget {
-        let dirty_ids = cursor
-            .dirty_object_ids
-            .iter()
-            .take(remaining_object_scans)
-            .cloned()
-            .collect::<Vec<_>>();
-        for object_id in dirty_ids {
-            remaining_object_scans = remaining_object_scans.saturating_sub(1);
-            report.scanned_objects = report.scanned_objects.saturating_add(1);
-            let candidates = collect_default_sifs_candidates_for_object(
-                shard_backends,
-                &participating_shard_ids,
-                &object_id,
-                all_shards,
-                &writable_shard_ids,
-                &certified_replica_shard_ids,
-                &local_replica_shard_ids,
-                &mut awaiting_replica_progress,
-            )?;
-            let Some(mut pending) = plan_default_sifs_pending_migration(
-                metadata_root,
-                shard_backends,
-                candidates,
-                all_shards,
-                &writable_shard_ids,
-                &certified_replica_shard_ids,
-                local_node_id,
-                &mut report,
-                &mut awaiting_replica_progress,
-            )?
-            else {
-                cursor.dirty_object_ids.remove(&object_id);
-                continue;
-            };
-            match advance_default_sifs_pending_migration(
-                metadata_root,
-                shard_backends,
-                file_system,
-                &mut pending,
-                &mut budget,
-                &mut report,
-            )? {
-                DfsDefaultSifsPendingProgress::Complete => {
-                    if pending.counts_as_migration {
-                        report.migrated_objects = report.migrated_objects.saturating_add(1);
-                    }
-                    cursor.dirty_object_ids.remove(&object_id);
-                }
-                DfsDefaultSifsPendingProgress::Incomplete => {
-                    cursor.pending_migration = Some(pending);
-                    stopped_for_budget = true;
-                    break;
-                }
-                DfsDefaultSifsPendingProgress::AwaitingReplica => {
-                    cursor.pending_migration = Some(pending);
-                    awaiting_replica_progress = true;
-                    stopped_for_budget = true;
-                    break;
-                }
-                DfsDefaultSifsPendingProgress::Restart => {
-                    stopped_for_budget = true;
-                    break;
-                }
-            }
-        }
-    }
-
-    let mut catalog_has_more = !cursor.catalog_complete;
-    if !stopped_for_budget
-        && !cursor.catalog_complete
-        && cursor.dirty_object_ids.is_empty()
-        && remaining_object_scans > 0
-    {
-        let scan = collect_default_sifs_migration_scan_batch(
-            shard_backends,
-            &participating_shard_ids,
-            &file_system.file_system_id,
-            all_shards,
-            &writable_shard_ids,
-            &certified_replica_shard_ids,
-            &local_replica_shard_ids,
-            cursor.after_object_id.as_ref(),
-            remaining_object_scans,
-        )?;
-        let DfsDefaultSifsMigrationScanBatch {
-            mut candidates_by_object,
-            scanned_object_ids,
-            catalog_has_more: scan_has_more,
-            awaiting_replica_progress: scan_awaiting_replica_progress,
-            ..
-        } = scan;
-        catalog_has_more = scan_has_more;
-        awaiting_replica_progress |= scan_awaiting_replica_progress;
-        report.scanned_objects = report
-            .scanned_objects
-            .saturating_add(scanned_object_ids.len());
-
-        let candidate_object_ids = candidates_by_object
-            .keys()
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        for evidence_shard_id in &participating_shard_ids {
-            if !writable_shard_ids.contains(evidence_shard_id)
-                && !certified_replica_shard_ids.contains(evidence_shard_id)
-            {
-                continue;
-            }
-            let evidence_backend = shard_backends.shard_backend(evidence_shard_id)?;
-            for tombstone in
-                evidence_backend.compacted_tombstones_for_object_ids(&candidate_object_ids)?
-            {
-                let candidates = candidates_by_object
-                    .entry(tombstone.object_id.clone())
-                    .or_default();
-                if !candidates
-                    .iter()
-                    .any(|(candidate_shard_id, _)| candidate_shard_id == evidence_shard_id)
-                {
-                    candidates.push((evidence_shard_id.clone(), tombstone));
-                }
-            }
-        }
-        #[cfg(test)]
-        observe_default_sifs_migration_buffered_records(
-            candidates_by_object.values().map(Vec::len).sum(),
-        );
-
-        for object_id in scanned_object_ids {
-            let candidates = candidates_by_object.remove(&object_id).unwrap_or_default();
-            let Some(mut pending) = plan_default_sifs_pending_migration(
-                metadata_root,
-                shard_backends,
-                candidates,
-                all_shards,
-                &writable_shard_ids,
-                &certified_replica_shard_ids,
-                local_node_id,
-                &mut report,
-                &mut awaiting_replica_progress,
-            )?
-            else {
-                cursor.after_object_id = Some(object_id);
-                continue;
-            };
-            pending.catalog_object = true;
-            match advance_default_sifs_pending_migration(
-                metadata_root,
-                shard_backends,
-                file_system,
-                &mut pending,
-                &mut budget,
-                &mut report,
-            )? {
-                DfsDefaultSifsPendingProgress::Complete => {
-                    if pending.counts_as_migration {
-                        report.migrated_objects = report.migrated_objects.saturating_add(1);
-                    }
-                    cursor.after_object_id = Some(object_id);
-                }
-                DfsDefaultSifsPendingProgress::Incomplete => {
-                    cursor.pending_migration = Some(pending);
-                    stopped_for_budget = true;
-                    break;
-                }
-                DfsDefaultSifsPendingProgress::AwaitingReplica => {
-                    cursor.pending_migration = Some(pending);
-                    awaiting_replica_progress = true;
-                    stopped_for_budget = true;
-                    break;
-                }
-                DfsDefaultSifsPendingProgress::Restart => {
-                    cursor.dirty_object_ids.insert(object_id);
-                    stopped_for_budget = true;
-                    break;
-                }
-            }
-        }
-        if !stopped_for_budget && !scan_has_more {
-            cursor.catalog_complete = true;
-            catalog_has_more = false;
-        }
-    }
-
-    // End with a quiescent journal fence. This catches a mutation that lands
-    // after the pass's initial dirty-tail sample, including one for an object
-    // whose catalog ID is already behind the cursor. Migration's own writes
-    // enter the same bounded replay lane; they never reset the catalog.
-    journal_backlog |= fence_default_sifs_journal_tail(
-        &mut cursor,
-        shard_backends,
-        &participating_shard_ids,
-        scan_limit,
-        &mut remaining_journal_entries,
-        &mut remaining_object_journal_entries,
-        &mut remaining_journal_bytes,
-    )?;
-
-    report.reached_limit = stopped_for_budget
-        || journal_backlog
-        || !cursor.dirty_object_ids.is_empty()
-        || cursor.pending_journal_replay.is_some()
-        || cursor.pending_migration.is_some()
-        || catalog_has_more;
-    if report.reached_limit {
-        write_default_sifs_migration_cursor(metadata_root, &cursor)?;
-    } else {
-        // The completed catalog sweep and quiescent journal fence above are
-        // the durable proof that no live record still depends on an obsolete
-        // route. Retire only this filesystem from the already-open router;
-        // this adds no second scan and preserves other filesystems' fallbacks.
-        // Persist retirement before refreshing the completed cursor so a
-        // history-write failure retains bounded completion progress for the
-        // next retry.
-        shard_backends.retire_routing_fallbacks_for_file_system(&file_system.file_system_id)?;
-        // Retain the completed ordered-catalog fence and exact journal heads.
-        // Process restart can then prove only the bounded suffix which landed
-        // after this pass; topology-generation changes still discard it in
-        // `read_default_sifs_migration_cursor` and force a complete scan.
-        write_default_sifs_migration_cursor(metadata_root, &cursor)?;
-    }
-
-    tracing::Span::current().record("scanned_objects", report.scanned_objects);
-    tracing::Span::current().record("migrated_objects", report.migrated_objects);
-    tracing::Span::current().record("catalog_complete", cursor.catalog_complete);
-    tracing::Span::current().record("awaiting_replica_progress", awaiting_replica_progress);
-    tracing::Span::current().record("reached_limit", report.reached_limit);
-    observation.finish(if report.reached_limit {
-        "continuation"
-    } else if awaiting_replica_progress {
-        "deferred"
-    } else {
-        "complete"
-    });
-    Ok(DfsDefaultSifsMaterializationReport {
-        migration: report,
-        awaiting_replica_progress,
-    })
-}
-
-pub fn materialize_default_sifs_metadata_on_shards(
-    backend: &mut LocalShardedMetadataBackend,
-    file_system: &DfsFileSystem,
-    bootstrap_owner_node_ids: impl IntoIterator<Item = NodeId>,
-    fallback_owner_node_id: NodeId,
-    created_at: OffsetDateTime,
-) -> Result<(), DfsError> {
-    materialize_default_sifs_metadata_on_shards_with_report(
-        backend,
-        file_system,
-        bootstrap_owner_node_ids,
-        fallback_owner_node_id,
-        created_at,
-    )?;
-    Ok(())
-}
-
-pub(crate) fn materialize_default_sifs_metadata_on_shards_with_report(
-    backend: &mut LocalShardedMetadataBackend,
-    file_system: &DfsFileSystem,
-    bootstrap_owner_node_ids: impl IntoIterator<Item = NodeId>,
-    fallback_owner_node_id: NodeId,
-    created_at: OffsetDateTime,
-) -> Result<DfsMetadataShardMigrationReport, DfsError> {
-    backend.ensure_file_system_on_all_shards(file_system)?;
-    materialize_default_sifs_metadata(
-        backend,
-        file_system,
-        bootstrap_owner_node_ids,
-        fallback_owner_node_id,
-        created_at,
-    )?;
-    Ok(backend.migrate_objects_to_configured_shards(
-        &file_system.file_system_id,
-        DEFAULT_SIFS_BOOTSTRAP_SHARD_MIGRATION_MUTATION_LIMIT,
-    )?)
 }
 
 pub fn validate_dfs_metadata_journal_batch_source(
@@ -11432,8 +7225,7 @@ pub fn validate_dfs_metadata_journal_batch_source(
         ));
     }
     if let Some(probe) = command.authority_probe.as_ref() {
-        let has_authority_payload = !command.batch.entries.is_empty()
-            || (probe.durable_journal_ack && !probe.journal_frames.is_empty());
+        let has_authority_payload = !command.batch.journal_frames.is_empty();
         if command.verify_prefix_only
             || command.prefix_probe.is_some()
             || !has_authority_payload
@@ -11602,17 +7394,9 @@ pub(crate) fn validated_pending_primary_handoff_snapshot_id(
         fence.handoff_id == primary_handoff_id
             && fence.primary_node_id == command.source_node_id
             && fence.journal_sequence == command.next_after_sequence
-            && crate::metadata_records::dfs_metadata_table_snapshot_matches_checkpoint(
-                &command.snapshot,
-                fence.journal_sequence,
-                &fence.state_fingerprint,
-            )
-            .map_err(|source| {
-                format!(
-                    "encode metadata primary-handoff snapshot checkpoint for shard {}: {source}",
-                    command.shard_id.0
-                )
-            })?
+            && command
+                .snapshot
+                .matches_checkpoint(fence.journal_sequence, &fence.state_fingerprint)
     } else {
         false
     };
@@ -11778,9 +7562,9 @@ fn dfs_metadata_caught_up_probe_command(
         }),
         authority_probe: None,
         durable_replication: None,
-        batch: DfsMetadataJournalBatch {
+        batch: crate::DfsMetadataJournalFrameBatch {
             shard_id: shard_id.clone(),
-            entries: Vec::new(),
+            journal_frames: Vec::new(),
             next_after_sequence: journal_sequence,
         },
     }
@@ -11807,7 +7591,8 @@ fn dfs_metadata_journal_batch_command(
         prefix_probe: None,
         authority_probe: None,
         durable_replication: None,
-        batch,
+        batch: crate::test_support::structural_journal_frame_batch(batch)
+            .expect("encode structural current frame fixture"),
     }
 }
 
@@ -11833,14 +7618,9 @@ pub(crate) fn dfs_metadata_durable_journal_batch_command(
         authority_probe: None,
         durable_replication: Some(DfsMetadataDurableReplication {
             confirmation_id,
-            journal_frames: batch.journal_frames,
             background_publication,
         }),
-        batch: DfsMetadataJournalBatch {
-            shard_id: batch.shard_id,
-            entries: Vec::new(),
-            next_after_sequence: batch.next_after_sequence,
-        },
+        batch,
     }
 }
 
@@ -11853,7 +7633,15 @@ fn dfs_metadata_snapshot_install_command(
     shard_id: &DfsMetadataShardId,
     reason: String,
 ) -> Result<DfsMetadataSnapshotInstallCommand, DfsError> {
-    let next_after_sequence = backend.journal_last_sequence()?;
+    let image = backend
+        .export_shard_snapshot_image(shard_id)?
+        .ok_or_else(|| DfsError::Metadata {
+            message: format!(
+                "metadata shard {} cannot export its current snapshot image",
+                shard_id.0
+            ),
+        })?;
+    let next_after_sequence = image.materialized_through_sequence;
     Ok(DfsMetadataSnapshotInstallCommand {
         request_id: format!(
             "dfs_meta_snapshot_{}_{}_{}",
@@ -11865,7 +7653,8 @@ fn dfs_metadata_snapshot_install_command(
         primary_handoff_id: None,
         shard_id: shard_id.clone(),
         next_after_sequence,
-        snapshot: backend.export_table_snapshot()?,
+        snapshot: image.descriptor().clone(),
+        image: Some(image),
         reason,
     })
 }
@@ -11936,7 +7725,7 @@ fn handle_dfs_metadata_journal_batch_response(
             })
         }
         DfsMetadataJournalBatchResult::Rejected { reason, code } => {
-            if DfsMetadataRejectionCode::resolve(code, &reason).allows_snapshot_repair() {
+            if code.allows_snapshot_repair() {
                 let command = dfs_metadata_snapshot_install_command(
                     backend,
                     local_node_id,
@@ -12273,13 +8062,30 @@ fn dfs_metadata_value_response(
 }
 
 pub(crate) fn async_dfs_metadata_journal_batch_sender_from_peer_transport(
+    _data_dir: &SinomoDataDir,
     peer_transport: Arc<dyn AsyncDfsPeerTransport>,
 ) -> AsyncDfsMetadataJournalBatchSender {
+    #[cfg(any(test, feature = "test-support"))]
+    let observer_data_dir = _data_dir.clone();
     Arc::new(move |target_node_id, command, operation_timeout| {
         let peer_transport = Arc::clone(&peer_transport);
+        #[cfg(any(test, feature = "test-support"))]
+        let observer_data_dir = observer_data_dir.clone();
         Box::pin(async move {
             let call = dfs_metadata_journal_batch_rpc_call(command)
                 .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))?;
+            #[cfg(any(test, feature = "test-support"))]
+            let mut native_attempt = crate::native_shard_trace::direct_journal_attempt_context(
+                &observer_data_dir,
+                command,
+            )
+            .and_then(|context| {
+                context.begin_direct_journal(
+                    target_node_id,
+                    &call.request.route,
+                    Arc::new(command.clone()),
+                )
+            });
             let response = peer_transport
                 .call_object_rpc_async(
                     target_node_id,
@@ -12287,11 +8093,32 @@ pub(crate) fn async_dfs_metadata_journal_batch_sender_from_peer_transport(
                     DfsObjectRpcSendOptions::default().with_overall_timeout(operation_timeout),
                 )
                 .await
-                .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))?;
-            response
+                .map_err(|source| {
+                    #[cfg(any(test, feature = "test-support"))]
+                    if let Some(attempt) = native_attempt.as_mut() {
+                        attempt.returned_direct_journal(
+                            None,
+                            Some(source.to_string()),
+                            source.delivery_state(),
+                        );
+                    }
+                    DfsMetadataPeerTransportError::new(source.to_string())
+                })?;
+            let decoded = response
                 .decode_body::<DfsMetadataJournalBatchResponse>()
-                .await
-                .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))
+                .await;
+            #[cfg(any(test, feature = "test-support"))]
+            if let Some(attempt) = native_attempt.as_mut() {
+                attempt.returned_direct_journal(
+                    decoded.as_ref().ok(),
+                    decoded.as_ref().err().map(ToString::to_string),
+                    decoded
+                        .as_ref()
+                        .err()
+                        .and_then(|error| error.delivery_state()),
+                );
+            }
+            decoded.map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))
         })
     })
 }
@@ -12321,21 +8148,61 @@ pub(crate) fn async_dfs_metadata_snapshot_install_sender_from_peer_transport(
 }
 
 pub(crate) fn dfs_metadata_journal_batch_sender_from_peer_transport(
+    _data_dir: &SinomoDataDir,
     peer_transport: Arc<dyn DfsPeerTransport>,
 ) -> DfsMetadataJournalBatchSender {
+    #[cfg(any(test, feature = "test-support"))]
+    let observer_data_dir = _data_dir.clone();
     Arc::new(move |target_node_id, command, operation_timeout| {
         let call = dfs_metadata_journal_batch_rpc_call(command)
             .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))?;
+        #[cfg(any(test, feature = "test-support"))]
+        let mut native_attempt =
+            crate::native_shard_trace::direct_journal_attempt_context(&observer_data_dir, command)
+                .and_then(|context| {
+                    context.begin_direct_journal(
+                        target_node_id,
+                        &call.request.route,
+                        Arc::new(command.clone()),
+                    )
+                });
         let response = peer_transport
             .call_object_rpc(
                 target_node_id,
                 call,
                 DfsObjectRpcSendOptions::default().with_overall_timeout(operation_timeout),
             )
-            .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))?;
-        let response = dfs_metadata_value_response(response)?;
-        decode_dfs_metadata_journal_batch_rpc_response(&response)
-            .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))
+            .map_err(|source| {
+                #[cfg(any(test, feature = "test-support"))]
+                if let Some(attempt) = native_attempt.as_mut() {
+                    attempt.returned_direct_journal(
+                        None,
+                        Some(source.to_string()),
+                        source.delivery_state(),
+                    );
+                }
+                DfsMetadataPeerTransportError::new(source.to_string())
+            })?;
+        let response = dfs_metadata_value_response(response).map_err(|error| {
+            #[cfg(any(test, feature = "test-support"))]
+            if let Some(attempt) = native_attempt.as_mut() {
+                attempt.returned_direct_journal(None, Some(error.to_string()), None);
+            }
+            error
+        })?;
+        let decoded = decode_dfs_metadata_journal_batch_rpc_response(&response);
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(attempt) = native_attempt.as_mut() {
+            attempt.returned_direct_journal(
+                decoded.as_ref().ok(),
+                decoded.as_ref().err().map(ToString::to_string),
+                decoded
+                    .as_ref()
+                    .err()
+                    .and_then(|error| error.delivery_state()),
+            );
+        }
+        decoded.map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))
     })
 }
 
@@ -12362,853 +8229,77 @@ pub(crate) fn dfs_metadata_snapshot_install_sender_from_peer_transport(
 mod cursor_update_tests {
     use super::*;
 
-    fn configure_replica_shard(
-        data_dir: &SinomoDataDir,
-        local_node_id: &NodeId,
-        shard: &DfsMetadataShardConfig,
-    ) {
-        data_dir.ensure_root_layout().expect("replica root layout");
-        let cluster_paths = ClusterPaths::new(data_dir);
-        let cluster_id =
-            sinomo_core::node::ClusterId::from_legacy_named("cluster_replica_recovery")
-                .expect("cluster id");
-        let state = ClusterBootstrapState::initialized_locally(
-            cluster_id,
-            "replica recovery",
-            local_node_id.clone(),
-            "replica",
-            "pk-replica-recovery",
-            OffsetDateTime::now_utc(),
-        );
-        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("cluster state");
-        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
-            .expect("cluster KV state");
-
-        let mut cluster_kv = sinomo_core::kv::InProcessKvStore::restore(
-            sinomo_core::kv::read_cluster_kv_cached_snapshot(&cluster_paths.kv_paths())
-                .expect("cluster KV snapshot"),
-        )
-        .expect("cluster KV store");
-        cluster_kv
-            .put_serde(
-                metadata_shard_key(&shard.file_system_id, &shard.shard_id),
-                shard,
-                None,
-            )
-            .expect("metadata shard config");
-        let snapshot = cluster_kv.snapshot().expect("updated cluster KV snapshot");
-        sinomo_core::kv::write_cluster_kv_snapshot(&cluster_paths.kv_paths(), &snapshot)
-            .expect("write metadata shard config");
+    // Shared negative physical fault on a genuine current snapshot record.
+    fn corrupt_current_snapshot(path: &std::path::Path) -> Vec<u8> {
+        use std::io::{Seek, Write};
+        let reader =
+            sinomo_core::storage::migration::stream::MigrationStreamReader::open(path).unwrap();
+        let payload_offset = reader.cursor().offset + 8;
+        drop(reader);
+        let mut file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.seek(std::io::SeekFrom::Start(payload_offset)).unwrap();
+        file.write_all(b"BAD").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        std::fs::read(path).unwrap()
     }
 
-    struct LocalReplicaRecoveryTransport {
-        receiver_data_dir: SinomoDataDir,
-        source_node_id: NodeId,
-        target_node_id: NodeId,
-        authority_context: DfsMetadataReplicaShardContext,
-        journal_rejection_reason: Option<String>,
-        snapshot_install_calls: usize,
-    }
-
-    impl DfsMetadataJournalReplicationTransport for LocalReplicaRecoveryTransport {
-        fn has_metadata_replication_route(&self, target_node_id: &NodeId) -> bool {
-            target_node_id == &self.target_node_id
+    #[test]
+    fn native_cursor_ahead_of_durable_head_is_reported_without_publication() {
+        let nodes =
+            crate::test_runtime::DfsTestRuntime::ordered_node_ids("native-invalid-cursor", 3);
+        let mut runtime =
+            crate::test_runtime::DfsTestRuntime::new("native-invalid-cursor", nodes[0].clone())
+                .unwrap();
+        for node in &nodes[1..] {
+            runtime.define_node(node.clone()).unwrap();
         }
-
-        fn send_metadata_journal_batch(
-            &mut self,
-            target_node_id: &NodeId,
-            command: &DfsMetadataJournalBatchCommand,
-            _timeout: Duration,
-        ) -> Result<DfsMetadataJournalBatchResponse, DfsMetadataJournalReplicationTransportError>
-        {
-            assert_eq!(target_node_id, &self.target_node_id);
-            let response = process_cluster_dfs_metadata_journal_batch_with_context(
-                &self.receiver_data_dir,
-                &self.source_node_id,
-                command.clone(),
-                Some(self.authority_context.clone()),
-            )
-            .map_err(
-                |error| DfsMetadataJournalReplicationTransportError::Failed {
-                    reason: error.to_string(),
-                },
-            )?;
-            if let DfsMetadataJournalBatchResult::Rejected { reason, .. } = &response.result {
-                self.journal_rejection_reason = Some(reason.clone());
-            }
-            Ok(response)
-        }
-
-        fn send_metadata_snapshot_install(
-            &mut self,
-            target_node_id: &NodeId,
-            command: &DfsMetadataSnapshotInstallCommand,
-            _timeout: Duration,
-        ) -> Result<DfsMetadataSnapshotInstallResponse, DfsMetadataJournalReplicationTransportError>
-        {
-            assert_eq!(target_node_id, &self.target_node_id);
-            self.snapshot_install_calls = self.snapshot_install_calls.saturating_add(1);
-            process_cluster_dfs_metadata_snapshot_install_with_context(
-                &self.receiver_data_dir,
-                &self.source_node_id,
-                command.clone(),
-                Some(self.authority_context.clone()),
-            )
-            .map_err(
-                |error| DfsMetadataJournalReplicationTransportError::Failed {
-                    reason: error.to_string(),
-                },
-            )
-        }
-    }
-
-    struct AsyncLocalReplicaRecoveryTransport(std::sync::Mutex<LocalReplicaRecoveryTransport>);
-
-    impl AsyncDfsMetadataJournalReplicationTransport for AsyncLocalReplicaRecoveryTransport {
-        fn has_metadata_replication_route(&self, target: &NodeId) -> bool {
-            self.0
-                .lock()
-                .unwrap()
-                .has_metadata_replication_route(target)
-        }
-        fn send_metadata_journal_batch_async<'a>(
-            &'a self,
-            target: &'a NodeId,
-            command: &'a DfsMetadataJournalBatchCommand,
-            timeout: Duration,
-        ) -> DfsMetadataJournalReplicationTransportFuture<
-            'a,
-            Result<DfsMetadataJournalBatchResponse, DfsMetadataJournalReplicationTransportError>,
-        > {
-            let result = self
-                .0
-                .lock()
-                .unwrap()
-                .send_metadata_journal_batch(target, command, timeout);
-            Box::pin(async move { result })
-        }
-        fn send_metadata_snapshot_install_async<'a>(
-            &'a self,
-            target: &'a NodeId,
-            command: &'a DfsMetadataSnapshotInstallCommand,
-            timeout: Duration,
-        ) -> DfsMetadataJournalReplicationTransportFuture<
-            'a,
-            Result<DfsMetadataSnapshotInstallResponse, DfsMetadataJournalReplicationTransportError>,
-        > {
-            let result = self
-                .0
-                .lock()
-                .unwrap()
-                .send_metadata_snapshot_install(target, command, timeout);
-            Box::pin(async move { result })
-        }
-    }
-
-    struct PromotedSnapshotCursorFixture {
-        _target: sinomo_testdir::TestDir,
-        source_data_dir: SinomoDataDir,
-        receiver_data_dir: SinomoDataDir,
-        source_node_id: NodeId,
-        receiver_node_id: NodeId,
-        shard_id: DfsMetadataShardId,
-        file_system: DfsFileSystem,
-        shard: DfsMetadataShardConfig,
-        shard_epoch: u64,
-        durable_head_sequence: u64,
-    }
-
-    fn promoted_snapshot_cursor_fixture(
-        name: &str,
-        seed_receiver_with_exact_snapshot: bool,
-    ) -> PromotedSnapshotCursorFixture {
-        let target = sinomo_testdir::TestDir::new(name);
-        let source_data_dir = SinomoDataDir::new(target.path().join("source"));
-        let receiver_data_dir = SinomoDataDir::new(target.path().join("receiver"));
-        source_data_dir
-            .ensure_root_layout()
-            .expect("source root layout");
-        receiver_data_dir
-            .ensure_root_layout()
-            .expect("receiver root layout");
-        let source_node_id =
-            NodeId::from_legacy_named(format!("{name}_source")).expect("source node identifier");
-        let receiver_node_id = NodeId::from_legacy_named(format!("{name}_receiver"))
-            .expect("receiver node identifier");
-        let shard_id = DfsMetadataShardId::new("root");
-        let file_system = DfsFileSystem::sifs(source_node_id.clone());
-
-        let mut snapshot_source =
-            LocalSobjMetadataBackend::new(shard_id.clone(), target.path().join("snapshot-source"))
-                .expect("snapshot source backend");
-        snapshot_source
-            .put_file_system(&file_system)
-            .expect("snapshot source filesystem");
-        let durable_head_sequence = snapshot_source.journal_last_sequence();
-        assert!(durable_head_sequence > 0);
-        let snapshot = snapshot_source.export_table_snapshot();
-
-        let source_root = local_dfs_metadata_shard_path(&source_data_dir, &shard_id);
-        let mut promoted_source = LocalSobjMetadataBackend::new(shard_id.clone(), &source_root)
-            .expect("promoted source backend");
-        promoted_source
-            .replace_with_replicated_snapshot(
-                shard_id.clone(),
-                durable_head_sequence,
-                snapshot.clone(),
-            )
-            .expect("install promoted source snapshot");
-        assert_eq!(
-            promoted_source
-                .journal_batch_for_shard_since_limited(&shard_id, 0, 64, 1024 * 1024)
-                .expect("inspect promoted source journal"),
-            None,
-            "the promotion fixture must reproduce an exact durable prefix with no retained journal suffix"
-        );
-
-        let receiver_root = local_dfs_metadata_shard_path(&receiver_data_dir, &shard_id);
-        let mut receiver = LocalSobjMetadataBackend::new(shard_id.clone(), receiver_root)
-            .expect("receiver backend");
-        if seed_receiver_with_exact_snapshot {
-            receiver
-                .replace_with_replicated_snapshot(shard_id.clone(), durable_head_sequence, snapshot)
-                .expect("seed exact receiver snapshot");
-        }
-
-        let shard_epoch = 7;
-        let shard = DfsMetadataShardConfig {
-            file_system_id: file_system.file_system_id.clone(),
-            shard_id: shard_id.0.clone(),
-            primary_node_id: source_node_id.clone(),
-            replica_node_ids: vec![receiver_node_id.clone()],
-            epoch: shard_epoch,
-            assignment: crate::DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
-            default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
-        };
-        configure_replica_shard(&receiver_data_dir, &receiver_node_id, &shard);
-
-        PromotedSnapshotCursorFixture {
-            _target: target,
-            source_data_dir,
-            receiver_data_dir,
-            source_node_id,
-            receiver_node_id,
-            shard_id,
-            file_system,
-            shard,
-            shard_epoch,
-            durable_head_sequence,
-        }
-    }
-
-    fn prepare_promoted_snapshot_cursor_healing(
-        fixture: &PromotedSnapshotCursorFixture,
-        after_sequence: u64,
-    ) -> DfsPreparedMetadataJournalTargetPublishResult {
-        let mut source_backend = LocalSobjMetadataBackend::new(
-            fixture.shard_id.clone(),
-            local_dfs_metadata_shard_path(&fixture.source_data_dir, &fixture.shard_id),
-        )
-        .expect("reopen promoted source");
-        prepare_dfs_metadata_journal_target_publish(
-            &mut source_backend,
-            &fixture.source_node_id,
-            fixture.receiver_node_id.clone(),
-            fixture.file_system.file_system_id.clone(),
-            fixture.shard_id.clone(),
-            fixture.shard_epoch,
-            after_sequence,
+        runtime.start_nodes().unwrap();
+        let shard = runtime.root_shard().unwrap();
+        let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
+        let mut client = runtime.client(&shard.primary_node_id).unwrap();
+        let backend = client.metadata_backend_mut().unwrap();
+        let before = backend
+            .export_shard_table_snapshot(&shard_id)
+            .unwrap()
+            .unwrap();
+        let head = backend.journal_last_sequence().unwrap();
+        let outcome = match prepare_dfs_metadata_journal_target_publish(
+            backend,
+            &shard.primary_node_id,
+            shard.replica_node_ids[0].clone(),
+            shard.file_system_id.clone(),
+            shard_id.clone(),
+            shard.epoch,
+            head + 1,
             DfsMetadataJournalReplicationOptions::default(),
             &mut BTreeMap::new(),
         )
-        .expect("prepare promoted snapshot cursor healing")
-    }
-
-    #[test]
-    fn foreground_progress_retires_obsolete_background_batches_and_probes() {
-        for asynchronous in [false, true] {
-            for probe in [false, true] {
-                for hint in [false, true] {
-                    exercise_obsolete_background_plan(asynchronous, probe, hint);
-                }
-            }
-        }
-    }
-
-    fn exercise_obsolete_background_plan(asynchronous: bool, probe: bool, hint: bool) {
-        let fixture = promoted_snapshot_cursor_fixture(
-            &format!("obsolete-background-{asynchronous}-{probe}-{hint}"),
-            true,
-        );
-        let source_root =
-            local_dfs_metadata_shard_path(&fixture.source_data_dir, &fixture.shard_id);
-        let receiver_root =
-            local_dfs_metadata_shard_path(&fixture.receiver_data_dir, &fixture.shard_id);
-        let mut source =
-            LocalSobjMetadataBackend::new(fixture.shard_id.clone(), &source_root).unwrap();
-        let mut receiver =
-            LocalSobjMetadataBackend::new(fixture.shard_id.clone(), &receiver_root).unwrap();
-        let mut filesystem = fixture.file_system.clone();
-        filesystem.display_name = "prepared publication".into();
-        let prepared = source.put_file_system(&filesystem).unwrap();
-        let permit = DfsMetadataReplicaIngestPermit::new_validated(
-            filesystem.file_system_id.clone(),
-            fixture.shard_id.clone(),
-            fixture.source_node_id.clone(),
-            fixture.shard_epoch,
-        );
-        if probe {
-            receiver
-                .persist_journal_batch_with_replica_permit_report(
-                    &permit,
-                    &DfsMetadataJournalBatch {
-                        shard_id: fixture.shard_id.clone(),
-                        entries: vec![prepared.clone()],
-                        next_after_sequence: prepared.sequence,
-                    },
-                )
-                .unwrap();
-        }
-        let after = if probe {
-            prepared.sequence
-        } else {
-            fixture.durable_head_sequence
-        };
-        source
-            .put_metadata_replication_cursor(&fixture.receiver_node_id, &fixture.shard_id, after)
-            .unwrap();
-        let options = DfsMetadataJournalReplicationOptions {
-            probe_caught_up_replicas: true,
-            attempt_timeout: Duration::from_secs(5),
-            target_timeout: Duration::from_secs(5),
-            ..Default::default()
-        };
-        let prepare = |source: &mut LocalSobjMetadataBackend, after| {
-            match prepare_dfs_metadata_journal_target_publish(
-                source,
-                &fixture.source_node_id,
-                fixture.receiver_node_id.clone(),
-                filesystem.file_system_id.clone(),
-                fixture.shard_id.clone(),
-                fixture.shard_epoch,
-                after,
-                options,
-                &mut BTreeMap::new(),
-            )
-            .unwrap()
-            {
-                DfsPreparedMetadataJournalTargetPublishResult::Publish { target } => target,
-                _ => panic!("expected a frozen plan"),
+        .unwrap()
+        {
+            DfsPreparedMetadataJournalTargetPublishResult::NoChanges { outcome } => outcome,
+            DfsPreparedMetadataJournalTargetPublishResult::Publish { target } => {
+                panic!("invalid cursor must not publish: {target:?}")
             }
         };
-        let target = prepare(&mut source, after);
-        assert_eq!(target.caught_up_probe, probe);
-        filesystem.display_name = "foreground commit overtakes background plan".into();
-        let newer = source.put_file_system(&filesystem).unwrap();
-        let applied = receiver
-            .persist_journal_batch_with_replica_permit_report(
-                &permit,
-                &DfsMetadataJournalBatch {
-                    shard_id: fixture.shard_id.clone(),
-                    entries: vec![prepared, newer.clone()],
-                    next_after_sequence: newer.sequence,
-                },
-            )
-            .unwrap();
-        receiver
-            .put_metadata_authority_ack_floor(&crate::DfsMetadataAuthorityAckFloor {
-                shard_id: fixture.shard_id.clone(),
-                journal_sequence: newer.sequence,
-                durable_prefix_proof: applied.durable_prefix_proof().cloned(),
-            })
-            .unwrap();
-        drop(receiver);
-        if hint {
-            source.observe_metadata_replication_cursors(
-                &fixture.shard_id,
-                &[(fixture.receiver_node_id.clone(), newer.sequence)],
-            );
-            let reader =
-                LocalSobjMetadataBackend::new(fixture.shard_id.clone(), &source_root).unwrap();
-            assert_eq!(
-                reader
-                    .metadata_replication_cursor(&fixture.receiver_node_id, &fixture.shard_id)
-                    .unwrap(),
-                newer.sequence,
-                "another backend must see the fresh ACK without a cursor-file write"
-            );
-        }
-        let make_transport = || LocalReplicaRecoveryTransport {
-            receiver_data_dir: fixture.receiver_data_dir.clone(),
-            source_node_id: fixture.source_node_id.clone(),
-            target_node_id: fixture.receiver_node_id.clone(),
-            authority_context: DfsMetadataReplicaShardContext {
-                local_node_id: fixture.receiver_node_id.clone(),
-                shard: fixture.shard.clone(),
-                pending_membership_handoff: None,
-            },
-            journal_rejection_reason: None,
-            snapshot_install_calls: 0,
-        };
-        let execute = |target, transport: LocalReplicaRecoveryTransport| {
-            let mut outcomes = Vec::new();
-            let transport = if asynchronous {
-                let transport =
-                    AsyncLocalReplicaRecoveryTransport(std::sync::Mutex::new(transport));
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap()
-                    .block_on(execute_prepared_dfs_metadata_journal_target_publish_async(
-                        &fixture.source_data_dir,
-                        &fixture.source_node_id,
-                        target,
-                        None,
-                        &transport,
-                        options,
-                        &mut outcomes,
-                    ))
-                    .unwrap();
-                transport.0.into_inner().unwrap()
-            } else {
-                let mut transport = transport;
-                execute_prepared_dfs_metadata_journal_target_publish(
-                    &fixture.source_data_dir,
-                    &fixture.source_node_id,
-                    target,
-                    &mut transport,
-                    options,
-                    &mut outcomes,
-                )
-                .unwrap();
-                transport
-            };
-            (outcomes, transport)
-        };
-        assert!(
-            metadata_replication_plan_advanced(
-                &fixture.source_data_dir,
-                &fixture.shard_id,
-                target.prepared_source_head
-            )
-            .unwrap(),
-            "foreground append must supersede the captured source head"
-        );
-        let (outcomes, transport) = execute(target, make_transport());
-        assert_eq!(
-            transport.snapshot_install_calls, 0,
-            "async={asynchronous} probe={probe} hint={hint}: {outcomes:?}; {:?}",
-            transport.journal_rejection_reason
-        );
-        assert!(matches!(
-            outcomes.as_slice(),
-            [DfsMetadataJournalReplicationOutcome::BacklogRemaining { .. }]
-        ));
-        assert_eq!(
-            metadata_cursor::metadata_replication_cursor(
-                &source_root,
-                &fixture.receiver_node_id,
-                &fixture.shard_id
-            )
-            .unwrap(),
-            after,
-            "retiring old work must not forge a durable ACK"
-        );
-        assert_eq!(
-            transport.journal_rejection_reason.is_some(),
-            probe || !hint,
-            "only ordinary delivery may be skipped using a hint; probes require a fresh response"
-        );
-        let next_after = source
-            .metadata_replication_cursor(&fixture.receiver_node_id, &fixture.shard_id)
-            .unwrap();
-        let (outcomes, transport) = execute(prepare(&mut source, next_after), make_transport());
-        assert_eq!(
-            transport.snapshot_install_calls, 0,
-            "fresh work must converge without a snapshot: {outcomes:?}"
-        );
-        assert_eq!(
-            metadata_cursor::metadata_replication_cursor(
-                &source_root,
-                &fixture.receiver_node_id,
-                &fixture.shard_id
-            )
-            .unwrap(),
-            newer.sequence
-        );
-        if hint {
-            let observer = source
-                .subscribe_metadata_replica_progress(&fixture.shard_id)
-                .unwrap()
-                .unwrap();
-            let snapshot = source.export_table_snapshot();
-            source
-                .replace_with_replicated_snapshot_with_replica_permit(
-                    &permit,
-                    fixture.shard_id.clone(),
-                    newer.sequence,
-                    snapshot,
-                )
-                .unwrap();
-            assert_eq!(
-                observer.outbound_cursor(&fixture.receiver_node_id),
-                None,
-                "snapshot replacement must retire delivery hints from the previous generation"
-            );
-        }
-    }
-
-    #[test]
-    fn stale_catchup_behind_durable_prefix_recovers_through_existing_snapshot_path() {
-        for with_authority_floor in [false, true] {
-            let fixture = promoted_snapshot_cursor_fixture(
-                &format!("stale-catchup-prefix-repair-{with_authority_floor}"),
-                true,
-            );
-            let source_root =
-                local_dfs_metadata_shard_path(&fixture.source_data_dir, &fixture.shard_id);
-            let receiver_root =
-                local_dfs_metadata_shard_path(&fixture.receiver_data_dir, &fixture.shard_id);
-            let mut source =
-                LocalSobjMetadataBackend::new(fixture.shard_id.clone(), &source_root).unwrap();
-            let mut filesystem = fixture.file_system.clone();
-            filesystem.display_name = "first catch-up record".into();
-            let first = source.put_file_system(&filesystem).unwrap();
-            filesystem.display_name = "already acknowledged newer prefix".into();
-            let later = source.put_file_system(&filesystem).unwrap();
-            let permit = DfsMetadataReplicaIngestPermit::new_validated(
-                filesystem.file_system_id.clone(),
-                fixture.shard_id.clone(),
-                fixture.source_node_id.clone(),
-                fixture.shard_epoch,
-            );
-            let mut receiver =
-                LocalSobjMetadataBackend::new(fixture.shard_id.clone(), &receiver_root).unwrap();
-            let report = receiver
-                .persist_journal_batch_with_replica_permit_report(
-                    &permit,
-                    &DfsMetadataJournalBatch {
-                        shard_id: fixture.shard_id.clone(),
-                        entries: vec![first.clone(), later.clone()],
-                        next_after_sequence: later.sequence,
-                    },
-                )
-                .unwrap();
-            if with_authority_floor {
-                receiver
-                    .put_metadata_authority_ack_floor(&crate::DfsMetadataAuthorityAckFloor {
-                        shard_id: fixture.shard_id.clone(),
-                        journal_sequence: later.sequence,
-                        durable_prefix_proof: report.durable_prefix_proof().cloned(),
-                    })
-                    .unwrap();
-            }
-            drop(receiver);
-            // Reopen materializes the durable prefix. The sender's earlier
-            // cursor still asks for only the first record in a bounded batch.
-            let mut receiver =
-                LocalSobjMetadataBackend::new(fixture.shard_id.clone(), &receiver_root).unwrap();
-            let error = receiver
-                .persist_journal_batch_with_replica_permit_report(
-                    &permit,
-                    &DfsMetadataJournalBatch {
-                        shard_id: fixture.shard_id.clone(),
-                        entries: vec![first],
-                        next_after_sequence: fixture.durable_head_sequence + 1,
-                    },
-                )
-                .expect_err("stale incremental prefix must not be acknowledged");
-            assert_eq!(
-                error.rejection_code(),
-                DfsMetadataRejectionCode::PrefixMismatch
-            );
-            assert_eq!(receiver.journal_last_sequence(), later.sequence);
-            drop(receiver);
-
-            filesystem.display_name = "current primary state".into();
-            let current = source.put_file_system(&filesystem).unwrap();
-            let options = DfsMetadataJournalReplicationOptions {
-                batch_entry_limit: 1,
-                max_batches_per_target: 1,
-                attempt_timeout: Duration::from_secs(5),
-                target_timeout: Duration::from_secs(5),
-                ..DfsMetadataJournalReplicationOptions::default()
-            };
-            let target = match prepare_dfs_metadata_journal_target_publish(
-                &mut source,
-                &fixture.source_node_id,
-                fixture.receiver_node_id.clone(),
-                filesystem.file_system_id.clone(),
-                fixture.shard_id.clone(),
-                fixture.shard_epoch,
-                fixture.durable_head_sequence,
-                options,
-                &mut BTreeMap::new(),
-            )
-            .unwrap()
-            {
-                DfsPreparedMetadataJournalTargetPublishResult::Publish { target } => target,
-                _ => panic!("stale cursor must prepare incremental catch-up"),
-            };
-            assert_eq!(
-                target.commands[0].batch.next_after_sequence,
-                fixture.durable_head_sequence + 1
-            );
-            drop(source);
-            let mut transport = LocalReplicaRecoveryTransport {
-                receiver_data_dir: fixture.receiver_data_dir.clone(),
-                source_node_id: fixture.source_node_id.clone(),
-                target_node_id: fixture.receiver_node_id.clone(),
-                authority_context: DfsMetadataReplicaShardContext {
-                    local_node_id: fixture.receiver_node_id.clone(),
-                    shard: fixture.shard.clone(),
-                    pending_membership_handoff: None,
-                },
-                journal_rejection_reason: None,
-                snapshot_install_calls: 0,
-            };
-            let mut outcomes = Vec::new();
-            execute_prepared_dfs_metadata_journal_target_publish(
-                &fixture.source_data_dir,
-                &fixture.source_node_id,
-                target,
-                &mut transport,
-                options,
-                &mut outcomes,
-            )
-            .unwrap();
-            assert_eq!(transport.snapshot_install_calls, 1, "{outcomes:?}");
-            let receiver =
-                LocalSobjMetadataBackend::new(fixture.shard_id.clone(), &receiver_root).unwrap();
-            assert_eq!(receiver.journal_last_sequence(), current.sequence);
-            assert_eq!(
-                receiver
-                    .get_file_system(&filesystem.file_system_id)
-                    .unwrap(),
-                Some(filesystem)
-            );
-            if with_authority_floor {
-                assert!(
-                    receiver
-                        .metadata_authority_ack_floor(&fixture.shard_id)
-                        .unwrap()
-                        .is_some_and(|floor| floor.journal_sequence >= later.sequence)
-                );
-            }
-            let source =
-                LocalSobjMetadataBackend::new(fixture.shard_id.clone(), source_root).unwrap();
-            assert_eq!(
-                source
-                    .metadata_replication_cursor(&fixture.receiver_node_id, &fixture.shard_id)
-                    .unwrap(),
-                current.sequence
-            );
-        }
-    }
-
-    #[test]
-    fn promoted_snapshot_primary_heals_missing_cursor_with_exact_prefix_proof() {
-        let fixture =
-            promoted_snapshot_cursor_fixture("sinomo-dfs-promoted-snapshot-cursor-proof", true);
-        let target_publish = match prepare_promoted_snapshot_cursor_healing(&fixture, 0) {
-            DfsPreparedMetadataJournalTargetPublishResult::Publish { target } => target,
-            DfsPreparedMetadataJournalTargetPublishResult::NoChanges { outcome } => {
-                panic!("cursor inconsistency unexpectedly skipped: {outcome:?}")
-            }
-        };
-        assert!(target_publish.caught_up_probe);
-        assert_eq!(
-            target_publish.cursor_durability_inconsistency,
-            Some(DfsMetadataCursorDurabilityInconsistency {
-                cursor_after_sequence: 0,
-                durable_head_sequence: fixture.durable_head_sequence,
-            })
-        );
-        assert_eq!(target_publish.commands.len(), 1);
-        assert!(target_publish.commands[0].verify_prefix_only);
-        assert!(target_publish.commands[0].batch.entries.is_empty());
-        assert_eq!(
-            target_publish.commands[0].batch.next_after_sequence,
-            fixture.durable_head_sequence
-        );
-
-        let mut transport = LocalReplicaRecoveryTransport {
-            receiver_data_dir: fixture.receiver_data_dir.clone(),
-            source_node_id: fixture.source_node_id.clone(),
-            target_node_id: fixture.receiver_node_id.clone(),
-            authority_context: DfsMetadataReplicaShardContext {
-                local_node_id: fixture.receiver_node_id.clone(),
-                shard: fixture.shard.clone(),
-                pending_membership_handoff: None,
-            },
-            journal_rejection_reason: None,
-            snapshot_install_calls: 0,
-        };
-        let mut outcomes = Vec::new();
-        execute_prepared_dfs_metadata_journal_target_publish(
-            &fixture.source_data_dir,
-            &fixture.source_node_id,
-            target_publish,
-            &mut transport,
-            DfsMetadataJournalReplicationOptions::default(),
-            &mut outcomes,
-        )
-        .expect("heal promoted snapshot cursor");
-
-        assert_eq!(
-            outcomes,
-            vec![
-                DfsMetadataJournalReplicationOutcome::CursorDurabilityInconsistencyDetected {
-                    target_node_id: fixture.receiver_node_id.clone(),
-                    shard_id: fixture.shard_id.clone(),
-                    cursor_after_sequence: 0,
-                    durable_head_sequence: fixture.durable_head_sequence,
-                },
-                DfsMetadataJournalReplicationOutcome::CursorDurabilityInconsistencyHealed {
-                    target_node_id: fixture.receiver_node_id.clone(),
-                    shard_id: fixture.shard_id.clone(),
-                    previous_cursor_after_sequence: 0,
-                    next_after_sequence: fixture.durable_head_sequence,
-                },
-            ]
-        );
-        assert_eq!(transport.snapshot_install_calls, 0);
-        assert_eq!(
-            metadata_cursor::metadata_replication_cursor(
-                &local_dfs_metadata_shard_path(&fixture.source_data_dir, &fixture.shard_id),
-                &fixture.receiver_node_id,
-                &fixture.shard_id,
-            )
-            .expect("healed sender cursor"),
-            fixture.durable_head_sequence
-        );
-        let report = DfsMetadataJournalReplicationReport {
-            outcomes: outcomes.clone(),
-        };
-        assert!(dfs_metadata_replication_notice_lines(&report).is_empty());
-        assert_eq!(
-            dfs_metadata_replication_fault_notice_lines(&report).len(),
-            2
-        );
-        assert!(!dfs_metadata_replication_report_needs_retry(&report));
-    }
-
-    #[test]
-    fn promoted_snapshot_primary_repairs_stale_replica_before_healing_cursor() {
-        let fixture =
-            promoted_snapshot_cursor_fixture("sinomo-dfs-promoted-snapshot-cursor-snapshot", false);
-        let target_publish = match prepare_promoted_snapshot_cursor_healing(&fixture, 0) {
-            DfsPreparedMetadataJournalTargetPublishResult::Publish { target } => target,
-            DfsPreparedMetadataJournalTargetPublishResult::NoChanges { outcome } => {
-                panic!("cursor inconsistency unexpectedly skipped: {outcome:?}")
-            }
-        };
-        let mut transport = LocalReplicaRecoveryTransport {
-            receiver_data_dir: fixture.receiver_data_dir.clone(),
-            source_node_id: fixture.source_node_id.clone(),
-            target_node_id: fixture.receiver_node_id.clone(),
-            authority_context: DfsMetadataReplicaShardContext {
-                local_node_id: fixture.receiver_node_id.clone(),
-                shard: fixture.shard.clone(),
-                pending_membership_handoff: None,
-            },
-            journal_rejection_reason: None,
-            snapshot_install_calls: 0,
-        };
-        let mut outcomes = Vec::new();
-        execute_prepared_dfs_metadata_journal_target_publish(
-            &fixture.source_data_dir,
-            &fixture.source_node_id,
-            target_publish,
-            &mut transport,
-            DfsMetadataJournalReplicationOptions::default(),
-            &mut outcomes,
-        )
-        .expect("repair stale replica and sender cursor");
-
-        assert_eq!(transport.snapshot_install_calls, 1);
-        assert!(
-            transport.journal_rejection_reason.as_deref().is_some_and(
-                |reason| reason.contains("metadata journal prefix probe state mismatch")
-            )
-        );
-        assert!(matches!(
-            outcomes.as_slice(),
-            [
-                DfsMetadataJournalReplicationOutcome::CursorDurabilityInconsistencyDetected {
-                    cursor_after_sequence: 0,
-                    durable_head_sequence,
-                    ..
-                },
-                DfsMetadataJournalReplicationOutcome::CursorDurabilityInconsistencySnapshotInstalled {
-                    previous_cursor_after_sequence: 0,
-                    next_after_sequence,
-                    ..
-                },
-            ] if *durable_head_sequence == fixture.durable_head_sequence
-                && *next_after_sequence == fixture.durable_head_sequence
-        ));
-        let repaired_receiver = LocalSobjMetadataBackend::new(
-            fixture.shard_id.clone(),
-            local_dfs_metadata_shard_path(&fixture.receiver_data_dir, &fixture.shard_id),
-        )
-        .expect("reopen repaired receiver");
-        assert_eq!(
-            repaired_receiver
-                .get_file_system(&fixture.file_system.file_system_id)
-                .expect("read repaired filesystem"),
-            Some(fixture.file_system.clone())
-        );
-        assert_eq!(
-            metadata_cursor::metadata_replication_cursor(
-                &local_dfs_metadata_shard_path(&fixture.source_data_dir, &fixture.shard_id),
-                &fixture.receiver_node_id,
-                &fixture.shard_id,
-            )
-            .expect("healed sender cursor"),
-            fixture.durable_head_sequence
-        );
-        let report = DfsMetadataJournalReplicationReport { outcomes };
-        assert!(dfs_metadata_replication_notice_lines(&report).is_empty());
-        assert_eq!(
-            dfs_metadata_replication_fault_notice_lines(&report).len(),
-            2
-        );
-        assert!(!dfs_metadata_replication_report_needs_retry(&report));
-    }
-
-    #[test]
-    fn cursor_ahead_of_durable_head_is_logged_and_never_lowered() {
-        let fixture =
-            promoted_snapshot_cursor_fixture("sinomo-dfs-cursor-ahead-of-durability", true);
-        let cursor_after_sequence = fixture.durable_head_sequence.saturating_add(1);
-        let outcome =
-            match prepare_promoted_snapshot_cursor_healing(&fixture, cursor_after_sequence) {
-                DfsPreparedMetadataJournalTargetPublishResult::NoChanges { outcome } => outcome,
-                DfsPreparedMetadataJournalTargetPublishResult::Publish { target } => {
-                    panic!("cursor ahead of durability must not publish: {target:?}")
-                }
-            };
         let report = DfsMetadataJournalReplicationReport {
             outcomes: vec![outcome],
         };
-        assert!(matches!(
-            report.outcomes.as_slice(),
-            [DfsMetadataJournalReplicationOutcome::CursorDurabilityInconsistencyUnhealed {
-                cursor_after_sequence: observed_cursor,
-                durable_head_sequence,
-                ..
-            }] if *observed_cursor == cursor_after_sequence
-                && *durable_head_sequence == fixture.durable_head_sequence
-        ));
-        assert!(dfs_metadata_replication_notice_lines(&report).is_empty());
-        assert_eq!(
-            dfs_metadata_replication_fault_notice_lines(&report).len(),
-            1
+        assert!(
+            matches!(report.outcomes.as_slice(), [DfsMetadataJournalReplicationOutcome::CursorDurabilityInconsistencyUnhealed {
+            cursor_after_sequence, durable_head_sequence, ..
+        }] if *cursor_after_sequence == head + 1 && *durable_head_sequence == head)
         );
         assert!(dfs_metadata_replication_report_needs_retry(&report));
+        assert_eq!(
+            backend
+                .export_shard_table_snapshot(&shard_id)
+                .unwrap()
+                .unwrap(),
+            before
+        );
+        drop(client);
+        runtime.close().unwrap();
     }
 
     #[test]
@@ -13259,3745 +8350,441 @@ mod cursor_update_tests {
     }
 
     #[test]
-    fn default_sifs_bootstrap_shard_migration_is_bounded() {
-        assert_eq!(DEFAULT_SIFS_BOOTSTRAP_SHARD_MIGRATION_MUTATION_LIMIT, 32);
-        let source = include_str!("metadata_replication.rs");
-        assert!(!source.contains(concat!(
-            "migrate_objects_to_configured_shards(&file_system.file_system_id, ",
-            "usize::MAX"
-        )));
-    }
-
-    #[test]
-    fn migration_end_fence_does_not_hide_object_write_behind_control_entry() {
-        let root = sinomo_testdir::TestDir::new("dfs-default-migration-two-entry-fence");
-        let local = NodeId::from_legacy_named("node_dfs_two_entry_fence").expect("node");
-        let file_system = distributed_sifs(local.clone());
-        let shard_id = DfsMetadataShardId::new("root");
-        let mut backends = LocalShardedMetadataBackend::new(
-            root.path(),
-            vec![DfsMetadataShardConfig {
-                file_system_id: file_system.file_system_id.clone(),
-                shard_id: shard_id.0.clone(),
-                primary_node_id: local.clone(),
-                replica_node_ids: Vec::new(),
-                epoch: 1,
-                assignment: crate::DfsMetadataShardAssignment::Root,
-                namespace_prepare_codec: Default::default(),
-                default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
-            }],
-        )
-        .expect("root backend router");
-        let backend = backends
-            .shard_backend_mut(&shard_id)
-            .expect("root shard backend");
-        backend.put_file_system(&file_system).expect("filesystem");
-        let baseline_sequence = backend.journal_last_sequence();
-
-        // This entry carries no object IDs. The following entry must still be
-        // visible to the fence's lookahead in this same observation window.
-        backend
-            .put_file_system(&file_system)
-            .expect("zero-object control mutation");
-        let mut object = crate::distributed_sifs_bootstrap_objects(local.clone())
-            .into_iter()
-            .next()
-            .expect("bootstrap object");
-        object.object_id =
-            crate::DfsObjectId::from_legacy_named("obj_two_entry_fence").expect("object id");
-        object.path = "/two-entry-fence".to_string();
-        backend.put_object(&object).expect("object mutation");
-        let durable_tail = backend
-            .durable_journal_since_limited(baseline_sequence, 3)
-            .expect("durable two-entry tail");
-        assert_eq!(
-            durable_tail.len(),
-            2,
-            "test fixture must expose both consecutive journal entries: {durable_tail:?}"
-        );
-
-        let mut cursor = DfsDefaultSifsMigrationCursor {
-            format_version: DEFAULT_SIFS_BOOTSTRAP_SHARD_MIGRATION_CURSOR_FORMAT_VERSION,
-            generation: DfsDefaultSifsMigrationGeneration {
-                file_system_id: file_system.file_system_id.clone(),
-                local_node_id: local,
-                shards: Vec::new(),
-                active_primary_shard_ids: vec![shard_id.clone()],
-                certified_replica_shard_ids: Vec::new(),
-            },
-            catalog_complete: false,
-            after_object_id: None,
-            observed_journal_sequences: BTreeMap::from([(shard_id.0.clone(), baseline_sequence)]),
-            dirty_object_ids: BTreeSet::new(),
-            pending_journal_replay: None,
-            pending_migration: None,
-        };
-        let participating_shard_ids = BTreeSet::from([shard_id.clone()]);
-        let mut remaining_entries = 1;
-        let mut remaining_object_entries = 1;
-        let mut remaining_bytes = DEFAULT_SIFS_MIGRATION_JOURNAL_BYTE_LIMIT;
-        assert!(
-            fence_default_sifs_journal_tail(
-                &mut cursor,
-                &backends,
-                &participating_shard_ids,
-                1,
-                &mut remaining_entries,
-                &mut remaining_object_entries,
-                &mut remaining_bytes,
-            )
-            .expect("first end fence"),
-            "the second entry is exact backlog even when the first affects no object"
-        );
-        assert!(cursor.dirty_object_ids.is_empty());
-        assert_eq!(
-            cursor.observed_journal_sequences.get(&shard_id.0),
-            Some(&baseline_sequence.saturating_add(1))
-        );
-
-        let mut remaining_entries = 1;
-        let mut remaining_object_entries = 1;
-        assert!(
-            !fence_default_sifs_journal_tail(
-                &mut cursor,
-                &backends,
-                &participating_shard_ids,
-                1,
-                &mut remaining_entries,
-                &mut remaining_object_entries,
-                &mut remaining_bytes,
-            )
-            .expect("second end fence")
-        );
-        assert_eq!(cursor.dirty_object_ids, BTreeSet::from([object.object_id]));
-    }
-
-    #[test]
-    fn completed_migration_consumes_receipts_without_namespace_work() {
-        let local = NodeId::from_legacy_named("migration-receipt-owner").unwrap();
-        let object = crate::distributed_sifs_bootstrap_objects(local.clone()).remove(0);
-        let shard = DfsMetadataShardId::new("root");
-        let entry = crate::DfsMetadataJournalEntry {
-            shard_id: shard.clone(),
-            sequence: 1,
-            created_at: OffsetDateTime::UNIX_EPOCH,
-            mutation: crate::DfsMetadataMutation::RemoveReceipt {
-                file_system_id: object.file_system_id.clone(),
-                object_id: object.object_id.clone(),
-                version: object.version.clone(),
-                replica_node_id: local.clone(),
-            },
-        };
-        for (catalog_complete, copying_family, expect_object) in [
-            (false, false, true),
-            (true, true, true),
-            (true, false, false),
-        ] {
-            let mut cursor = DfsDefaultSifsMigrationCursor {
-                format_version: DEFAULT_SIFS_BOOTSTRAP_SHARD_MIGRATION_CURSOR_FORMAT_VERSION,
-                generation: DfsDefaultSifsMigrationGeneration {
-                    file_system_id: object.file_system_id.clone(),
-                    local_node_id: local.clone(),
-                    shards: Vec::new(),
-                    active_primary_shard_ids: vec![shard.clone()],
-                    certified_replica_shard_ids: Vec::new(),
-                },
-                catalog_complete,
-                after_object_id: None,
-                observed_journal_sequences: BTreeMap::from([(shard.0.clone(), 0)]),
-                dirty_object_ids: BTreeSet::new(),
-                pending_journal_replay: None,
-                pending_migration: copying_family.then(|| DfsDefaultSifsPendingMigration {
-                    object: object.clone(),
-                    source_shard_id: shard.clone(),
-                    target_shard_id: DfsMetadataShardId::new("services"),
-                    writable_sources: Vec::new(),
-                    reference_outcome_sources: Vec::new(),
-                    reference_outcomes_only: false,
-                    target_writable: true,
-                    source_fence_required: false,
-                    source_epoch: 1,
-                    source_replayed_through_sequence: 0,
-                    source_fence: None,
-                    source_prepare: None,
-                    retired_source_fences: Vec::new(),
-                    catalog_object: false,
-                    counts_as_migration: true,
-                    stage: DfsDefaultSifsPendingMigrationStage::ObjectAndLock,
-                }),
-            };
-            assert!(
-                stage_default_sifs_journal_entry_object_ids(&mut cursor, &shard, &entry, None, 1)
-                    .unwrap()
-            );
-            assert_eq!(cursor.observed_journal_sequences[&shard.0], 1);
-            assert_eq!(
-                cursor.dirty_object_ids.contains(&object.object_id),
-                expect_object
-            );
-            cursor.dirty_object_ids.clear();
-            let object_entry = crate::DfsMetadataJournalEntry {
-                sequence: 2,
-                mutation: crate::DfsMetadataMutation::put_object(&object),
-                ..entry.clone()
-            };
-            assert!(
-                stage_default_sifs_journal_entry_object_ids(
-                    &mut cursor,
-                    &shard,
-                    &object_entry,
-                    None,
-                    1
-                )
-                .unwrap()
-            );
-            assert!(
-                cursor.dirty_object_ids.contains(&object.object_id),
-                "namespace changes remain work after catalog completion"
-            );
-            assert_eq!(cursor.observed_journal_sequences[&shard.0], 2);
-        }
-    }
-
-    #[test]
-    fn migration_replay_checkpoints_inside_512_object_journal_transaction() {
-        let local = NodeId::from_legacy_named("node_dfs_512_entry_replay").expect("node");
-        let file_system = distributed_sifs(local.clone());
-        let shard_id = DfsMetadataShardId::new("root");
-        let mut objects = Vec::with_capacity(512);
-        for index in (0..512).rev() {
-            let mut object = crate::distributed_sifs_bootstrap_objects(local.clone())
-                .into_iter()
-                .next()
-                .expect("bootstrap object");
-            object.object_id =
-                crate::DfsObjectId::from_legacy_named(format!("obj_512_entry_replay_{index:04}"))
-                    .expect("object id");
-            object.path = format!("/journal-512/{index:04}");
-            objects.push(object);
-        }
-        let transaction = crate::DfsNamespaceTransaction {
-            content_reference_identity: None,
-            contribution_digest: None,
-            extension_expectations: Vec::new(),
-            file_version_pins: None,
-            transaction_id: "transaction_512_entry_replay".to_string(),
-            file_system_id: file_system.file_system_id.clone(),
-            objects,
-            versions: Vec::new(),
-            advisory_lock_states: Vec::new(),
-            created_at: OffsetDateTime::UNIX_EPOCH,
-        };
-        let entry = crate::DfsMetadataJournalEntry {
-            shard_id: shard_id.clone(),
-            sequence: 1,
-            created_at: OffsetDateTime::UNIX_EPOCH,
-            mutation: crate::DfsMetadataMutation::ApplyNamespaceTransaction {
-                file_system_id: transaction.file_system_id.clone(),
-                transaction_id: transaction.transaction_id.clone(),
-                object_count: transaction.objects.len(),
-                operation_id: None,
-                transaction: Some(transaction),
-            },
-        };
-        let mut cursor = DfsDefaultSifsMigrationCursor {
-            format_version: DEFAULT_SIFS_BOOTSTRAP_SHARD_MIGRATION_CURSOR_FORMAT_VERSION,
-            generation: DfsDefaultSifsMigrationGeneration {
-                file_system_id: file_system.file_system_id,
-                local_node_id: local,
-                shards: Vec::new(),
-                active_primary_shard_ids: vec![shard_id.clone()],
-                certified_replica_shard_ids: Vec::new(),
-            },
-            catalog_complete: false,
-            after_object_id: None,
-            observed_journal_sequences: BTreeMap::from([(shard_id.0.clone(), 0)]),
-            dirty_object_ids: BTreeSet::new(),
-            pending_journal_replay: None,
-            pending_migration: None,
-        };
-
-        assert!(
-            !stage_default_sifs_journal_entry_object_ids(
-                &mut cursor,
-                &shard_id,
-                &entry,
-                None,
-                256,
-            )
-            .expect("first half")
-        );
-        assert_eq!(cursor.dirty_object_ids.len(), 256);
-        assert_eq!(cursor.observed_journal_sequences.get(&shard_id.0), Some(&0));
-        let pending = cursor
-            .pending_journal_replay
-            .clone()
-            .expect("durable inner-entry cursor");
-
-        cursor.dirty_object_ids.clear();
-        assert!(
-            stage_default_sifs_journal_entry_object_ids(
-                &mut cursor,
-                &shard_id,
-                &entry,
-                pending.after_object_id,
-                256,
-            )
-            .expect("second half")
-        );
-        assert_eq!(cursor.dirty_object_ids.len(), 256);
-        assert_eq!(cursor.observed_journal_sequences.get(&shard_id.0), Some(&1));
-        assert!(cursor.pending_journal_replay.is_none());
-    }
-
-    #[test]
-    fn authority_scoped_migration_stops_scanning_at_the_mutation_cap() {
-        let root = sinomo_testdir::TestDir::new("dfs-authority-migration-bounded-scan");
-        let data_dir = SinomoDataDir::new(root.join("data"));
-        data_dir.ensure_root_layout().expect("data dir");
-        let local =
-            NodeId::from_legacy_named("node_dfs_bounded_authority_migration").expect("node");
-        let file_system = distributed_sifs(local.clone());
-        let shards = vec![
-            DfsMetadataShardConfig {
-                file_system_id: file_system.file_system_id.clone(),
-                shard_id: "root".to_string(),
-                primary_node_id: local.clone(),
-                replica_node_ids: Vec::new(),
-                epoch: 1,
-                assignment: crate::DfsMetadataShardAssignment::Root,
-                namespace_prepare_codec: Default::default(),
-                default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
-            },
-            DfsMetadataShardConfig {
-                file_system_id: file_system.file_system_id.clone(),
-                shard_id: "services".to_string(),
-                primary_node_id: local.clone(),
-                replica_node_ids: Vec::new(),
-                epoch: 1,
-                assignment: crate::DfsMetadataShardAssignment::PathPrefix {
-                    prefix: crate::SIFS_SERVICES_PATH.to_string(),
-                },
-                namespace_prepare_codec: Default::default(),
-                default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
-            },
-            DfsMetadataShardConfig {
-                file_system_id: file_system.file_system_id.clone(),
-                shard_id: "users".to_string(),
-                primary_node_id: local.clone(),
-                replica_node_ids: Vec::new(),
-                epoch: 1,
-                assignment: crate::DfsMetadataShardAssignment::PathPrefix {
-                    prefix: crate::SIFS_USERS_PATH.to_string(),
-                },
-                namespace_prepare_codec: Default::default(),
-                default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
-            },
-        ];
-        let mut source =
-            open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("root"))
-                .expect("root backend");
-        source.put_file_system(&file_system).expect("filesystem");
-        for index in 0..4 {
-            let mut object = crate::distributed_sifs_bootstrap_objects(local.clone())
-                .into_iter()
-                .next()
-                .expect("bootstrap object");
-            object.object_id = crate::DfsObjectId::from_legacy_named(format!(
-                "obj_bounded_authority_migration_{index}"
-            ))
-            .expect("object id");
-            object.path = format!("/services/legacy-{index}.txt");
-            source.put_object(&object).expect("legacy object");
-        }
-        drop(source);
-        let mut backend = LocalShardedMetadataBackend::new(
-            crate::default_dfs_metadata_shards_root(&data_dir),
-            shards.clone(),
-        )
-        .expect("bound local primary backend");
-        crate::metadata_backend::reset_metadata_journal_write_count();
-        crate::metadata_shard_index::reset_object_shard_index_write_count();
-
-        let report = migrate_default_sifs_metadata_on_active_primary_shards(
-            &crate::default_dfs_metadata_shards_root(&data_dir),
-            &mut backend,
-            &file_system,
-            &shards,
-            &BTreeSet::from([
-                DfsMetadataShardId::new("root"),
-                DfsMetadataShardId::new("services"),
-                DfsMetadataShardId::new("users"),
-            ]),
-            &local,
-            1,
-        )
-        .expect("bounded authority migration");
-
-        assert!(report.migration.reached_limit);
-        assert_eq!(
-            report.migration.migrated_objects, 0,
-            "one physical mutation can establish the target filesystem but cannot complete an object bundle"
-        );
-        assert_eq!(
-            crate::metadata_backend::metadata_journal_write_count()
-                + crate::metadata_shard_index::object_shard_index_write_count(),
-            1,
-            "the pass cap applies to physical durable mutations, not only completed objects"
-        );
-        assert_eq!(
-            report.migration.scanned_objects, 1,
-            "catalog inspection must share the per-generation work bound"
-        );
-    }
-
-    #[test]
-    fn completed_default_migration_retires_only_its_filesystem_routing_fallbacks() {
-        #[derive(Deserialize)]
-        struct RoutingTopologyHistoryProbe {
-            #[serde(default)]
-            fallbacks: Vec<Vec<DfsMetadataShardConfig>>,
-        }
-
-        let root = sinomo_testdir::TestDir::new("dfs-default-migration-retires-fallbacks");
-        let data_dir = SinomoDataDir::new(root.join("data"));
-        data_dir.ensure_root_layout().expect("data dir");
-        let metadata_root = crate::default_dfs_metadata_shards_root(&data_dir);
-        let local = NodeId::from_legacy_named("node_dfs_retire_routing_fallbacks").expect("node");
-        let file_system = distributed_sifs(local.clone());
-        let mut shards = local_default_migration_shards(&file_system.file_system_id, &local);
-        let active_primary_shard_ids = shards
-            .iter()
-            .map(|shard| DfsMetadataShardId::new(&shard.shard_id))
-            .collect::<BTreeSet<_>>();
-
-        let other_file_system_id =
-            DfsFileSystemId::from_legacy_named("fs_other_routing_history").expect("filesystem");
-        shards.extend([
-            DfsMetadataShardConfig {
-                file_system_id: other_file_system_id.clone(),
-                shard_id: "other-root".to_string(),
-                primary_node_id: local.clone(),
-                replica_node_ids: Vec::new(),
-                epoch: 1,
-                assignment: crate::DfsMetadataShardAssignment::Root,
-                namespace_prepare_codec: Default::default(),
-                default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
-            },
-            DfsMetadataShardConfig {
-                file_system_id: other_file_system_id.clone(),
-                shard_id: "other-prefix".to_string(),
-                primary_node_id: local.clone(),
-                replica_node_ids: Vec::new(),
-                epoch: 1,
-                assignment: crate::DfsMetadataShardAssignment::PathPrefix {
-                    prefix: "/other".to_string(),
-                },
-                namespace_prepare_codec: Default::default(),
-                default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
-            },
-        ]);
-
-        let fallback_file_system_ids = || {
-            crate::metadata_io::read_sobj::<RoutingTopologyHistoryProbe>(
-                &crate::metadata_sharded_backend::routing_topology_history_path(&metadata_root),
-            )
-            .expect("routing topology history")
-            .fallbacks
-            .into_iter()
-            .flatten()
-            .map(|shard| shard.file_system_id)
-            .collect::<BTreeSet<_>>()
-        };
-
-        let mut backend = LocalShardedMetadataBackend::new(&metadata_root, shards.clone())
-            .expect("production migration router");
-        let root_shard_id = DfsMetadataShardId::new("root");
-        let services_shard_id = DfsMetadataShardId::new("services");
-        let mut legacy_object = crate::distributed_sifs_bootstrap_objects(local.clone())
-            .into_iter()
-            .next()
-            .expect("bootstrap object");
-        legacy_object.object_id =
-            crate::DfsObjectId::from_legacy_named("obj_retire_routing_fallback")
-                .expect("object id");
-        legacy_object.path = "/services/retire-routing-fallback.txt".to_string();
-        let root_backend = backend
-            .shard_backend_mut(&root_shard_id)
-            .expect("root shard");
-        root_backend
-            .put_file_system(&file_system)
-            .expect("filesystem");
-        root_backend
-            .put_object(&legacy_object)
-            .expect("legacy-routed object");
-
-        let initial_fallbacks = fallback_file_system_ids();
-        assert!(initial_fallbacks.contains(&file_system.file_system_id));
-        assert!(initial_fallbacks.contains(&other_file_system_id));
-
-        let incomplete = migrate_default_sifs_metadata_on_active_primary_shards(
-            &metadata_root,
-            &mut backend,
-            &file_system,
-            &shards,
-            &active_primary_shard_ids,
-            &local,
-            1,
-        )
-        .expect("bounded incomplete migration");
-        assert!(incomplete.migration.reached_limit);
-        assert_eq!(
-            fallback_file_system_ids(),
-            initial_fallbacks,
-            "an incomplete pass must retain every historical route"
-        );
-
-        let mut invalid_shards = shards.clone();
-        invalid_shards.push(DfsMetadataShardConfig {
-            file_system_id: file_system.file_system_id.clone(),
-            shard_id: "missing-local-primary".to_string(),
-            primary_node_id: local.clone(),
-            replica_node_ids: Vec::new(),
-            epoch: 1,
-            assignment: crate::DfsMetadataShardAssignment::PathPrefix {
-                prefix: "/missing".to_string(),
-            },
-            namespace_prepare_codec: Default::default(),
-            default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
-        });
-        let mut invalid_active_primary_shard_ids = active_primary_shard_ids.clone();
-        invalid_active_primary_shard_ids.insert(DfsMetadataShardId::new("missing-local-primary"));
-        migrate_default_sifs_metadata_on_active_primary_shards(
-            &metadata_root,
-            &mut backend,
-            &file_system,
-            &invalid_shards,
-            &invalid_active_primary_shard_ids,
-            &local,
-            256,
-        )
-        .expect_err("an unbound active primary must fail migration");
-        assert_eq!(
-            fallback_file_system_ids(),
-            initial_fallbacks,
-            "a failed pass must retain every historical route"
-        );
-
-        let cursor_path =
-            default_sifs_migration_cursor_path(&metadata_root, &file_system.file_system_id);
-        assert!(
-            cursor_path.exists(),
-            "the incomplete pass must leave durable progress"
-        );
-        let routing_history_path =
-            crate::metadata_sharded_backend::routing_topology_history_path(&metadata_root);
-        let routing_history_bytes =
-            std::fs::read(&routing_history_path).expect("read routing history fixture");
-        std::fs::write(&routing_history_path, b"invalid routing history")
-            .expect("corrupt routing history fixture");
-        let mut retirement_error = None;
-        for _ in 0..16 {
-            match migrate_default_sifs_metadata_on_active_primary_shards(
-                &metadata_root,
-                &mut backend,
-                &file_system,
-                &shards,
-                &active_primary_shard_ids,
-                &local,
-                256,
-            ) {
-                Ok(report) => assert!(
-                    report.migration.reached_limit,
-                    "a complete pass must attempt durable fallback retirement"
-                ),
-                Err(error) => {
-                    retirement_error = Some(error);
-                    break;
-                }
-            }
-        }
-        let retirement_error = retirement_error.expect("routing history retirement must fail");
-        assert!(
-            retirement_error
-                .to_string()
-                .contains("routing-topologies.sobj")
-        );
-        assert!(
-            cursor_path.exists(),
-            "failed durable fallback retirement must retain the completed migration cursor"
-        );
-        std::fs::write(&routing_history_path, routing_history_bytes)
-            .expect("restore routing history fixture");
-        assert_eq!(
-            fallback_file_system_ids(),
-            initial_fallbacks,
-            "failed durable retirement must retain every historical route"
-        );
-
-        let mut settled = false;
-        for _ in 0..16 {
-            let report = materialize_default_sifs_metadata_on_bound_primary_shards(
-                metadata_root.clone(),
-                &mut backend,
-                &file_system,
-                &shards,
-                &active_primary_shard_ids,
-                &local,
-                [local.clone()],
-                local.clone(),
-                OffsetDateTime::UNIX_EPOCH,
-            )
-            .expect("production default materialization");
-            if !report.migration.reached_limit {
-                settled = true;
-                break;
-            }
-        }
-        assert!(settled, "bounded production migration must converge");
-
-        let retired_fallbacks = fallback_file_system_ids();
-        assert!(
-            !retired_fallbacks.contains(&file_system.file_system_id),
-            "the completed filesystem must leave no obsolete fallback route"
-        );
-        assert!(
-            retired_fallbacks.contains(&other_file_system_id),
-            "retiring SIFS must preserve another filesystem's fallback route"
-        );
-        let source_marker = backend
-            .shard_backend(&root_shard_id)
-            .expect("source shard")
-            .get_object(&legacy_object.object_id)
-            .expect("source lookup")
-            .expect("durable source marker");
-        let durable_target = backend
-            .shard_backend(&services_shard_id)
-            .expect("target shard")
-            .get_object(&legacy_object.object_id)
-            .expect("target lookup")
-            .expect("durable migrated target");
-        assert_eq!(source_marker.kind, DfsObjectKind::Tombstone);
-        assert_ne!(durable_target.kind, DfsObjectKind::Tombstone);
-        assert_eq!(durable_target.path, legacy_object.path);
-    }
-
-    fn local_default_migration_shards(
-        file_system_id: &DfsFileSystemId,
-        local: &NodeId,
-    ) -> Vec<DfsMetadataShardConfig> {
-        vec![
-            DfsMetadataShardConfig {
-                file_system_id: file_system_id.clone(),
-                shard_id: "root".to_string(),
-                primary_node_id: local.clone(),
-                replica_node_ids: Vec::new(),
-                epoch: 1,
-                assignment: crate::DfsMetadataShardAssignment::Root,
-                namespace_prepare_codec: Default::default(),
-                default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
-            },
-            DfsMetadataShardConfig {
-                file_system_id: file_system_id.clone(),
-                shard_id: "services".to_string(),
-                primary_node_id: local.clone(),
-                replica_node_ids: Vec::new(),
-                epoch: 1,
-                assignment: crate::DfsMetadataShardAssignment::PathPrefix {
-                    prefix: crate::SIFS_SERVICES_PATH.to_string(),
-                },
-                namespace_prepare_codec: Default::default(),
-                default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
-            },
-            DfsMetadataShardConfig {
-                file_system_id: file_system_id.clone(),
-                shard_id: "users".to_string(),
-                primary_node_id: local.clone(),
-                replica_node_ids: Vec::new(),
-                epoch: 1,
-                assignment: crate::DfsMetadataShardAssignment::PathPrefix {
-                    prefix: crate::SIFS_USERS_PATH.to_string(),
-                },
-                namespace_prepare_codec: Default::default(),
-                default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
-            },
-        ]
-    }
-
-    fn run_test_default_migration_pass(
-        data_dir: &SinomoDataDir,
-        file_system: &DfsFileSystem,
-        shards: &[DfsMetadataShardConfig],
-        local: &NodeId,
-        mutation_limit: usize,
-    ) -> (
-        DfsDefaultSifsMaterializationReport,
-        usize,
-        usize,
-        usize,
-        usize,
-    ) {
-        let metadata_root = crate::default_dfs_metadata_shards_root(data_dir);
-        let mut backend = LocalShardedMetadataBackend::new(metadata_root.clone(), shards.to_vec())
-            .expect("bound local primary backend");
-        reset_default_sifs_migration_max_buffered_records();
-        crate::metadata_backend::reset_metadata_current_tables_snapshot_calls();
-        crate::metadata_backend::reset_metadata_journal_write_count();
-        crate::metadata_shard_index::reset_object_shard_index_write_count();
-        let report = migrate_default_sifs_metadata_on_active_primary_shards(
-            &metadata_root,
-            &mut backend,
-            file_system,
-            shards,
-            &shards
-                .iter()
-                .map(|shard| DfsMetadataShardId::new(shard.shard_id.clone()))
-                .collect(),
-            local,
-            mutation_limit,
-        )
-        .expect("bounded default migration pass");
-        (
-            report,
-            crate::metadata_backend::metadata_current_tables_snapshot_calls(),
-            default_sifs_migration_max_buffered_records(),
-            crate::metadata_shard_index::object_shard_index_write_count(),
-            crate::metadata_backend::metadata_journal_write_count(),
-        )
-    }
-
-    fn layout_reference_transaction(
-        object: &crate::DfsObjectMetadata,
-        operation_id: &str,
-    ) -> crate::DfsNamespaceTransaction {
-        let identity = crate::DfsRevisionReference {
-            file_system_id: object.file_system_id.clone(),
-            object_id: object.object_id.clone(),
-            version: object.version.clone(),
-        };
-        let request = crate::DfsContentReferenceRequest {
-            wire_format: crate::DfsContentReferenceFormat::NamespacedV6,
-            namespace: "org.example.layout".into(),
-            path: object.path.clone(),
-            identity: identity.clone(),
-            operation: crate::DfsContentReferenceOperation::Release {
-                reference_id: "leaf".into(),
-            },
-            operation_id: operation_id.into(),
-        };
-        crate::DfsNamespaceTransaction {
-            content_reference_identity: Some(identity),
-            contribution_digest: Some(
-                blake3::hash(&serde_json::to_vec(&request).unwrap())
-                    .to_hex()
-                    .to_string(),
-            ),
-            extension_expectations: Vec::new(),
-            transaction_id: format!("file-history:{operation_id}"),
-            file_system_id: object.file_system_id.clone(),
-            objects: Vec::new(),
-            versions: Vec::new(),
-            file_version_pins: Some(crate::DfsFileVersionPinMutation::default()),
-            advisory_lock_states: Vec::new(),
-            created_at: OffsetDateTime::UNIX_EPOCH,
-        }
-    }
-
-    #[test]
-    fn layout_migration_copies_bounded_reference_outcomes_and_repairs_old_completed_cursor() {
-        let root = sinomo_testdir::TestDir::new("dfs-layout-reference-outcomes");
-        let data_dir = SinomoDataDir::new(root.join("data"));
-        data_dir.ensure_root_layout().unwrap();
-        let local = NodeId::from_legacy_named("layout-reference-owner").unwrap();
-        let file_system = distributed_sifs(local.clone());
-        let mut shards = local_default_migration_shards(&file_system.file_system_id, &local);
-        for shard in &mut shards {
-            shard.namespace_prepare_codec = crate::DfsMetadataNamespacePrepareCodec::PackedV6;
-        }
-        let mut object = crate::distributed_sifs_bootstrap_objects(local.clone()).remove(0);
-        object.object_id =
-            crate::DfsObjectId::from_legacy_named("layout-reference-object").unwrap();
-        object.path = "/services/reference-outcomes".into();
-        let mut source =
-            open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("root")).unwrap();
-        source.set_namespace_prepare_codec(crate::DfsMetadataNamespacePrepareCodec::PackedV6);
-        source.put_file_system(&file_system).unwrap();
-        source.put_object(&object).unwrap();
-        for index in 0..130 {
-            source
-                .apply_namespace_transaction(&layout_reference_transaction(
-                    &object,
-                    &format!("layout-noop-{index:03}"),
-                ))
-                .unwrap();
-        }
-        let expiry = crate::DfsContentReferenceOutcomeRetention {
-            file_system_id: object.file_system_id.clone(),
-            max_evicted_operation_order_token: None,
-            opaque_operation_history_evicted: true,
-        };
-        source
-            .install_content_reference_outcomes(&object, &[], Some(&expiry))
-            .unwrap();
-        drop(source);
-        let mut settled = false;
-        for _ in 0..128 {
-            let (report, _, _, index_writes, journal_writes) =
-                run_test_default_migration_pass(&data_dir, &file_system, &shards, &local, 17);
-            assert!(index_writes + journal_writes <= 17);
-            let source =
-                open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("root"))
-                    .unwrap();
-            if source
-                .object_or_compacted_tombstone(&object.object_id)
-                .unwrap()
-                .is_some_and(|object| {
-                    matches!(
-                        object.tombstone_provenance,
-                        Some(crate::DfsTombstoneProvenance::SourceEviction { .. })
-                    )
-                })
-            {
-                let target = open_local_metadata_shard_backend(
-                    &data_dir,
-                    DfsMetadataShardId::new("services"),
-                )
-                .unwrap();
-                let first = target
-                    .content_reference_outcomes_for_object_page(
-                        &object.file_system_id,
-                        &object.object_id,
-                        None,
-                        128,
-                    )
-                    .unwrap();
-                let last = target
-                    .content_reference_outcomes_for_object_page(
-                        &object.file_system_id,
-                        &object.object_id,
-                        first.next_cursor.as_deref(),
-                        128,
-                    )
-                    .unwrap();
-                assert_eq!(first.outcomes.len() + last.outcomes.len(), 130);
-                assert_eq!(
-                    target
-                        .content_reference_outcome_retention(
-                            &object.file_system_id,
-                            &object.object_id,
-                        )
-                        .unwrap(),
-                    Some(expiry.clone()),
-                    "source eviction requires the complete outcome and expiry proof"
-                );
-            }
-            if !report.migration.reached_limit {
-                settled = true;
-                break;
-            }
-        }
-        assert!(settled);
-        let target =
-            open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("services"))
-                .unwrap();
-        let first = target
-            .content_reference_outcomes_for_object_page(
-                &object.file_system_id,
-                &object.object_id,
-                None,
-                128,
-            )
-            .unwrap();
-        assert_eq!(first.outcomes.len(), 128);
-        let last = target
-            .content_reference_outcomes_for_object_page(
-                &object.file_system_id,
-                &object.object_id,
-                first.next_cursor.as_deref(),
-                128,
-            )
-            .unwrap();
-        assert_eq!(last.outcomes.len(), 2);
-        assert_eq!(
-            target
-                .content_reference_outcome_retention(&object.file_system_id, &object.object_id)
-                .unwrap(),
-            Some(expiry)
-        );
-        let before_object = target.get_object(&object.object_id).unwrap().unwrap();
-        drop(target);
-
-        // Old completed cursors skipped already-evicted root slots. A new
-        // bounded witness-only pass must recover their remaining exact state.
-        let late = layout_reference_transaction(&object, "layout-old-completed-witness");
-        let mut old_root =
-            open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("root")).unwrap();
-        old_root.apply_namespace_transaction(&late).unwrap();
-        drop(old_root);
-        let metadata_root = crate::default_dfs_metadata_shards_root(&data_dir);
-        let cursor_path =
-            default_sifs_migration_cursor_path(&metadata_root, &file_system.file_system_id);
-        let mut cursor: DfsDefaultSifsMigrationCursor =
-            crate::metadata_io::read_sobj(&cursor_path).unwrap();
-        assert!(cursor.catalog_complete);
-        cursor.format_version = 6;
-        crate::metadata_io::write_sobj_atomic(&cursor_path, &cursor).unwrap();
-        let mut repaired = false;
-        for _ in 0..256 {
-            let (report, _, _, index_writes, journal_writes) =
-                run_test_default_migration_pass(&data_dir, &file_system, &shards, &local, 1);
-            assert!(index_writes + journal_writes <= 1);
-            if !report.migration.reached_limit {
-                repaired = true;
-                break;
-            }
-        }
-        assert!(repaired);
-        let target =
-            open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("services"))
-                .unwrap();
-        let copied = target
-            .get_namespace_transaction_receipt(&late.transaction_id)
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            copied.content_reference_identity,
-            late.content_reference_identity
-        );
-        assert_eq!(copied.contribution_digest, late.contribution_digest);
-        assert_eq!(copied.retained_at, late.created_at);
-        assert_eq!(
-            target.get_object(&object.object_id).unwrap().unwrap(),
-            before_object
-        );
-        // A subsequent owner receives only the current target family. Neither
-        // its exact retry witnesses nor its expiry floor depend on the old root.
-        let mut target = target;
-        let family = target
-            .capture_cross_shard_source_family(&object.object_id)
-            .unwrap();
-        let mut independent = LocalSobjMetadataBackend::new(
-            DfsMetadataShardId::new("independent-owner"),
-            root.join("independent-owner"),
+    fn native_snapshot_install_and_corruption_recovery_preserve_actual_committed_state() {
+        let nodes =
+            crate::test_runtime::DfsTestRuntime::ordered_node_ids("native-snapshot-corruption", 3);
+        let mut runtime = crate::test_runtime::DfsTestRuntime::new(
+            "native-snapshot-corruption",
+            nodes[0].clone(),
         )
         .unwrap();
-        independent.set_namespace_prepare_codec(crate::DfsMetadataNamespacePrepareCodec::PackedV6);
-        independent.put_file_system(&file_system).unwrap();
-        independent.put_object(&family.source_object).unwrap();
-        independent
-            .install_content_reference_outcomes(
-                &family.source_object,
-                &family.content_reference_outcomes,
-                family.content_reference_outcome_retention.as_ref(),
-            )
-            .unwrap();
-        assert_eq!(
-            independent
-                .get_namespace_transaction_receipt(&late.transaction_id)
-                .unwrap(),
-            Some(copied)
-        );
-        assert!(
-            independent
-                .content_reference_outcome_history_expired(
-                    late.content_reference_identity.as_ref().unwrap(),
-                    "missing-old-opaque-operation",
-                )
-                .unwrap()
-        );
-        drop(target);
-        let (quiet, _, _, index_writes, journal_writes) =
-            run_test_default_migration_pass(&data_dir, &file_system, &shards, &local, 17);
-        assert!(!quiet.migration.reached_limit);
-        assert_eq!(
-            (
-                quiet.migration.scanned_objects,
-                index_writes,
-                journal_writes
-            ),
-            (0, 0, 0)
-        );
-    }
-
-    #[test]
-    fn layout_late_reference_projection_preserves_later_pins_and_foreign_metadata() {
-        let root = sinomo_testdir::TestDir::new("dfs-layout-late-reference-effects");
-        let owner = NodeId::from_legacy_named("layout-late-reference-owner").unwrap();
-        let fs = distributed_sifs(owner.clone());
-        let mut object = crate::distributed_sifs_bootstrap_objects(owner).remove(0);
-        object.object_id =
-            crate::DfsObjectId::from_legacy_named("layout-late-reference-object").unwrap();
-        object.path = "/services/late-reference".into();
-        object.kind = crate::DfsObjectKind::File;
-        object.content_hash = Some(format!(
-            "blake3:{}",
-            blake3::hash(b"layout source").to_hex()
-        ));
-        object.content_size_bytes = Some(13);
-        let mut target =
-            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("target"), root.path()).unwrap();
-        target.set_namespace_prepare_codec(crate::DfsMetadataNamespacePrepareCodec::PackedV6);
-        target.put_file_system(&fs).unwrap();
-        target.put_object(&object).unwrap();
-        let mut version = crate::object_version_record(&object, object.content_size_bytes);
-        version.metadata_format = crate::DfsRevisionMetadataFormat::NamespacedV6;
-        version.retention.insert(
-            "org.example.layout".into(),
-            crate::DfsRevisionRetentionState {
-                order: 0,
-                grant: Some(Box::new(crate::DfsRevisionRetentionGrant {
-                    object: Box::new(object.clone()),
-                    granted_at_unix_nanos: 0,
-                    origin: crate::DfsRetentionGrantOrigin::ExplicitOperation,
-                    minimum: None,
-                })),
-            },
-        );
-        target.put_version(&version).unwrap();
-        let old = crate::DfsMetadataVersionPinRecord {
-            namespace: Some("org.example.layout".into()),
-            file_system_id: object.file_system_id.clone(),
-            object_id: object.object_id.clone(),
-            version: object.version.clone(),
-            pin_id: crate::content_reference_storage_id("org.example.layout", "leaf"),
-            created_at: OffsetDateTime::UNIX_EPOCH,
-        };
-        let later = crate::DfsMetadataVersionPinRecord {
-            created_at: OffsetDateTime::UNIX_EPOCH + Duration::from_secs(1),
-            ..old.clone()
-        };
-        target.put_version_pin(&later).unwrap();
-        let mut release = layout_reference_transaction(&object, "layout-late-release");
-        release.file_version_pins = Some(crate::DfsFileVersionPinMutation {
-            add: Vec::new(),
-            remove: vec![old],
-        });
-        let mut budget = DfsDefaultSifsMigrationPassBudget::new(1);
-        assert!(matches!(
-            replay_default_sifs_family_transaction(
-                &mut target,
-                &object,
-                &release,
-                true,
-                false,
-                &mut budget
-            )
-            .unwrap(),
-            DfsDefaultSifsPendingProgress::Complete
-        ));
-        assert_eq!(
-            target.version_pins_for_object(&object.object_id).unwrap(),
-            vec![later]
-        );
-        assert!(
-            target
-                .get_namespace_transaction_receipt(&release.transaction_id)
-                .unwrap()
-                .is_some()
-        );
-
-        let compact_transaction = layout_reference_transaction(&object, "layout-late-compact");
-        let compact = crate::DfsNamespaceTransactionReceipt::from_transaction(
-            &compact_transaction,
-            OffsetDateTime::UNIX_EPOCH,
-        )
-        .unwrap();
-        let compact_entry = crate::DfsMetadataJournalEntry {
-            shard_id: DfsMetadataShardId::new("source"),
-            sequence: 1,
-            created_at: OffsetDateTime::now_utc(),
-            mutation: crate::DfsMetadataMutation::put_namespace_transaction_receipt(&compact),
-        };
-        let mut budget = DfsDefaultSifsMigrationPassBudget::new(1);
-        assert!(matches!(
-            replay_default_sifs_object_family_entry(
-                &mut target,
-                &DfsMetadataShardId::new("target"),
-                &object,
-                &compact_entry,
-                None,
-                true,
-                false,
-                &mut budget,
-            )
-            .unwrap(),
-            DfsDefaultSifsPendingProgress::Complete
-        ));
-        assert_eq!(
-            target
-                .get_namespace_transaction_receipt(&compact.transaction_id)
-                .unwrap(),
-            Some(compact)
-        );
-        let expiry = crate::DfsContentReferenceOutcomeRetention {
-            file_system_id: object.file_system_id.clone(),
-            max_evicted_operation_order_token: None,
-            opaque_operation_history_evicted: true,
-        };
-        let unrelated_object = crate::DfsObjectId::generate();
-        let mut retention = crate::metadata_records::DfsNamespaceReceiptRetentionState::default();
-        retention
-            .content_reference_outcome_retention
-            .insert(object.object_id.clone(), expiry.clone());
-        retention
-            .content_reference_outcome_retention
-            .insert(unrelated_object.clone(), expiry.clone());
-        let expiry_entry = crate::DfsMetadataJournalEntry {
-            sequence: 2,
-            mutation: crate::DfsMetadataMutation::RemoveNamespaceTransactionReceipt {
-                file_system_id: object.file_system_id.clone(),
-                transaction_id: "layout-old-evicted-receipt".into(),
-                retention,
-            },
-            ..compact_entry
-        };
-        let mut budget = DfsDefaultSifsMigrationPassBudget::new(1);
-        assert!(matches!(
-            replay_default_sifs_object_family_entry(
-                &mut target,
-                &DfsMetadataShardId::new("target"),
-                &object,
-                &expiry_entry,
-                None,
-                true,
-                false,
-                &mut budget,
-            )
-            .unwrap(),
-            DfsDefaultSifsPendingProgress::Complete
-        ));
-        assert_eq!(
-            target
-                .content_reference_outcome_retention(&object.file_system_id, &object.object_id)
-                .unwrap(),
-            Some(expiry)
-        );
-        assert!(
-            target
-                .content_reference_outcome_retention(&object.file_system_id, &unrelated_object)
-                .unwrap()
-                .is_none()
-        );
-
-        let mut source_update = version.clone();
-        source_update.module_metadata.insert(
-            "org.example.layout".into(),
-            crate::DfsModuleMetadataValue {
-                schema_version: 1,
-                payload: serde_json::json!({"source":1}),
-            },
-        );
-        let mut foreign = version.clone();
-        foreign.module_metadata.insert(
-            "vendor.foreign".into(),
-            crate::DfsModuleMetadataValue {
-                schema_version: 1,
-                payload: serde_json::json!({"target":2}),
-            },
-        );
-        target.put_version(&foreign).unwrap();
-        let mut update = layout_reference_transaction(&object, "layout-late-version");
-        update.versions = vec![source_update];
-        update.extension_expectations = vec![crate::DfsRevisionMetadataExpectation {
-            object_id: object.object_id.clone(),
-            version: object.version.clone(),
-            expected: Some(Box::new(version)),
-        }];
-        let mut budget = DfsDefaultSifsMigrationPassBudget::new(4);
-        assert!(
-            replay_default_sifs_family_transaction(
-                &mut target,
-                &object,
-                &update,
-                true,
-                false,
-                &mut budget
-            )
-            .is_err()
-        );
-        assert_eq!(
-            target
-                .get_version(&object.object_id, &object.version)
-                .unwrap(),
-            Some(foreign)
-        );
-        assert!(
-            target
-                .get_namespace_transaction_receipt(&update.transaction_id)
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn layout_late_committed_prepare_requires_exact_source_body() {
-        let root = sinomo_testdir::TestDir::new("dfs-layout-late-prepared-reference");
-        let owner = NodeId::from_legacy_named("layout-prepare-owner").unwrap();
-        let fs = distributed_sifs(owner.clone());
-        let mut object = crate::distributed_sifs_bootstrap_objects(owner).remove(0);
-        object.object_id = crate::DfsObjectId::from_legacy_named("layout-prepare-object").unwrap();
-        object.path = "/services/prepared-reference".into();
-        let mut source =
-            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("source"), root.join("source"))
-                .unwrap();
-        source.set_namespace_prepare_codec(crate::DfsMetadataNamespacePrepareCodec::PackedV6);
-        source.put_file_system(&fs).unwrap();
-        source.put_object(&object).unwrap();
-        let transaction = layout_reference_transaction(&object, "layout-prepared-noop");
-        let (expected_object_versions, expected_path_occupants, _) = source
-            .namespace_prepare_expectations(&DfsMetadataShardId::new("source"), &transaction)
-            .unwrap();
-        let mut prepare = crate::DfsNamespacePrepareRecord {
-            operation_id: "layout-prepared-noop".into(),
-            file_system_id: fs.file_system_id.clone(),
-            shard_id: DfsMetadataShardId::new("source"),
-            owner_epoch: 1,
-            operation_digest: String::new(),
-            expected_object_versions,
-            expected_path_occupants,
-            content_receipts: Vec::new(),
-            transaction: transaction.clone(),
-            completed_request: None,
-            completed_request_completion: None,
-            status: crate::DfsNamespacePrepareStatus::Prepared,
-        };
-        prepare.operation_digest =
-            crate::service_replica::metadata_namespace_prepare_payload_digest(&prepare).unwrap();
-        source.prepare_namespace_transaction(&prepare).unwrap();
-        let committed = source
-            .commit_prepared_namespace_transaction(
-                &prepare.operation_id,
-                &prepare.operation_digest,
-                1,
-            )
-            .unwrap();
-        let observed = crate::metadata_records::normalized_namespace_prepare(&prepare);
-        let resolved =
-            default_sifs_committed_prepare_transaction(&source, &committed, Some(&observed))
-                .unwrap()
-                .unwrap();
-        assert_eq!(resolved, transaction);
-        let mut target =
-            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("target"), root.join("target"))
-                .unwrap();
-        target.set_namespace_prepare_codec(crate::DfsMetadataNamespacePrepareCodec::PackedV6);
-        target.put_file_system(&fs).unwrap();
-        target.put_object(&object).unwrap();
-        let mut budget = DfsDefaultSifsMigrationPassBudget::new(1);
-        assert!(matches!(
-            replay_default_sifs_object_family_entry(
-                &mut target,
-                &DfsMetadataShardId::new("target"),
-                &object,
-                &committed,
-                Some(&resolved),
-                true,
-                false,
-                &mut budget
-            )
-            .unwrap(),
-            DfsDefaultSifsPendingProgress::Complete
-        ));
-        assert_eq!(
-            target
-                .get_namespace_transaction_receipt(&transaction.transaction_id)
-                .unwrap()
-                .unwrap()
-                .contribution_digest,
-            transaction.contribution_digest
-        );
-        let missing = crate::DfsMetadataJournalEntry {
-            mutation: crate::DfsMetadataMutation::CommitNamespacePrepare {
-                file_system_id: fs.file_system_id,
-                operation_id: "missing-source-prepare".into(),
-                operation_digest: prepare.operation_digest,
-                owner_epoch: 1,
-                object_ids: vec![object.object_id],
-            },
-            ..committed
-        };
-        assert!(default_sifs_committed_prepare_transaction(&source, &missing, None).is_err());
-    }
-
-    fn run_active_default_materialization_pass(
-        data_dir: &SinomoDataDir,
-        file_system: &DfsFileSystem,
-        shards: &[DfsMetadataShardConfig],
-        local: &NodeId,
-    ) -> DfsDefaultSifsMaterializationReport {
-        materialize_default_sifs_metadata_on_active_primary_shards(
-            crate::default_dfs_metadata_shards_root(data_dir),
-            file_system,
-            shards,
-            &shards
-                .iter()
-                .map(|shard| DfsMetadataShardId::new(shard.shard_id.clone()))
-                .collect(),
-            local,
-            [local.clone()],
-            local.clone(),
-            OffsetDateTime::UNIX_EPOCH,
-        )
-        .expect("active-primary default materialization")
-    }
-
-    #[test]
-    fn reordered_policy_discovery_does_not_rejournal_default_filesystem_on_shards() {
-        let root = sinomo_testdir::TestDir::new("dfs-default-policy-order-noop");
-        let data_dir = SinomoDataDir::new(root.join("data"));
-        data_dir.ensure_root_layout().expect("data dir");
-        let local = NodeId::from_legacy_named("node_dfs_policy_order_noop").expect("node");
-        let file_system = distributed_sifs(local.clone());
-        let shards = local_default_migration_shards(&file_system.file_system_id, &local);
-
-        let mut settled = false;
-        for _ in 0..16 {
-            let report =
-                run_active_default_materialization_pass(&data_dir, &file_system, &shards, &local);
-            if !report.migration.reached_limit {
-                settled = true;
-                break;
-            }
+        for node in &nodes[1..] {
+            runtime.define_node(node.clone()).unwrap();
         }
-        assert!(settled, "initial bounded materialization must converge");
-
-        let mut reordered = file_system.clone();
-        reordered.subtree_policies.reverse();
-        crate::metadata_backend::reset_metadata_journal_write_count();
-        crate::metadata_shard_index::reset_object_shard_index_write_count();
-        let verification =
-            run_active_default_materialization_pass(&data_dir, &reordered, &shards, &local);
-
-        assert!(!verification.migration.reached_limit);
-        assert_eq!(verification.migration.migrated_objects, 0);
-        assert_eq!(
-            crate::metadata_backend::metadata_journal_write_count(),
-            0,
-            "a distinct-rule ordering change must not append PutFileSystem on any shard"
-        );
-        assert_eq!(
-            crate::metadata_shard_index::object_shard_index_write_count(),
-            0
-        );
-
-        let metadata_root = crate::default_dfs_metadata_shards_root(&data_dir);
-        let mut sharded = LocalShardedMetadataBackend::new(metadata_root, shards.clone())
-            .expect("reopen sharded backend");
-        crate::metadata_backend::reset_metadata_journal_write_count();
-        assert!(
-            sharded
-                .ensure_file_system(&reordered)
-                .expect("ensure reordered filesystem")
-                .is_none(),
-            "the generic sharded ensure path must report a semantic no-op"
-        );
-        assert_eq!(
-            crate::metadata_backend::metadata_journal_write_count(),
-            0,
-            "the generic sharded ensure path must not append PutFileSystem"
-        );
-    }
-
-    #[test]
-    fn exact_object_shard_index_is_a_noop() {
-        let root = sinomo_testdir::TestDir::new("dfs-default-migration-exact-index-noop");
-        let data_dir = SinomoDataDir::new(root.join("data"));
-        data_dir.ensure_root_layout().expect("data dir");
-        let local = NodeId::from_legacy_named("node_dfs_exact_index_noop").expect("node");
-        let file_system = distributed_sifs(local.clone());
-        let shards = local_default_migration_shards(&file_system.file_system_id, &local);
-        let mut root_backend =
-            open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("root"))
-                .expect("root backend");
-        root_backend
-            .put_file_system(&file_system)
-            .expect("filesystem");
-        let mut object = crate::distributed_sifs_bootstrap_objects(local.clone())
-            .into_iter()
-            .next()
-            .expect("bootstrap object");
-        object.object_id =
-            crate::DfsObjectId::from_legacy_named("obj_exact_index_noop").expect("object id");
-        object.path = "/exact-index-noop".to_string();
-        root_backend.put_object(&object).expect("root object");
-        drop(root_backend);
-        crate::metadata_shard_index::write_object_shard_index(
-            &crate::default_dfs_metadata_shards_root(&data_dir),
-            &object,
-            &DfsMetadataShardId::new("root"),
-        )
-        .expect("seed exact index");
-
-        let (report, snapshots, buffered, index_writes, _) =
-            run_test_default_migration_pass(&data_dir, &file_system, &shards, &local, 8);
-        assert!(!report.migration.reached_limit);
-        assert_eq!(report.migration.scanned_objects, 1);
-        assert_eq!(report.migration.migrated_objects, 0);
-        assert_eq!(report.migration.indexed_objects, 0);
-        assert_eq!(index_writes, 0, "an exact index must not be rewritten");
-        assert!(snapshots <= 16, "unexpected snapshot work: {snapshots}");
-        assert!(buffered <= 3, "unexpected buffered records: {buffered}");
-    }
-
-    #[test]
-    fn completed_migration_bounds_mixed_journal_fetches_and_advances_its_fence() {
-        const PASS_LIMIT: usize = 2;
-        const TAIL_ENTRIES: usize = 5;
-        let root = sinomo_testdir::TestDir::new("dfs-default-migration-mixed-journal-budget");
-        let data_dir = SinomoDataDir::new(root.join("data"));
-        data_dir.ensure_root_layout().expect("data dir");
-        let local = NodeId::from_legacy_named("node_dfs_mixed_journal_budget").expect("node");
-        let file_system = distributed_sifs(local.clone());
-        let shards = local_default_migration_shards(&file_system.file_system_id, &local);
-        let metadata_root = crate::default_dfs_metadata_shards_root(&data_dir);
-        let shard_id = DfsMetadataShardId::new("root");
-        let mut writer =
-            open_local_metadata_shard_backend(&data_dir, shard_id.clone()).expect("root backend");
-        writer.put_file_system(&file_system).expect("filesystem");
-        let mut object = crate::distributed_sifs_bootstrap_objects(local.clone())
-            .into_iter()
-            .next()
-            .expect("bootstrap object");
-        object.object_id =
-            crate::DfsObjectId::from_legacy_named("obj_mixed_journal_budget").expect("object id");
-        object.path = "/mixed-journal-budget".to_string();
-        writer.put_object(&object).expect("root object");
+        runtime.start_nodes().unwrap();
+        let shard = runtime.root_shard().unwrap();
+        let primary = shard.primary_node_id.clone();
+        let receiver = shard.replica_node_ids[0].clone();
+        let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
+        let receiver_root = local_dfs_metadata_shard_path(runtime.data_dir(&receiver), &shard_id);
+        let mut writer = runtime.client(&primary).unwrap();
+        let stat = writer
+            .posix_write_file(
+                "/native-snapshot-recovery.bin",
+                b"actual sealed bytes",
+                crate::DfsWriteOptions {
+                    policy: crate::DfsReplicationPolicy::new(1, 1).unwrap(),
+                    replica_candidates: vec![primary.clone()],
+                    wait_for_commit: true,
+                    foreground_replica_repair: false,
+                },
+            )
+            .unwrap();
         drop(writer);
-        crate::metadata_shard_index::write_object_shard_index(&metadata_root, &object, &shard_id)
-            .expect("seed exact index");
-        let (settled, _, _, _, _) =
-            run_test_default_migration_pass(&data_dir, &file_system, &shards, &local, PASS_LIMIT);
-        assert!(!settled.migration.reached_limit);
-        let cursor_path =
-            default_sifs_migration_cursor_path(&metadata_root, &file_system.file_system_id);
-        let before: DfsDefaultSifsMigrationCursor =
-            crate::metadata_io::read_sobj(&cursor_path).expect("settled cursor");
-        assert!(before.catalog_complete);
-        let mut previous_sequence = before.observed_journal_sequences[&shard_id.0];
-
-        // Existing objects already have their canonical route and exact index.
-        // Repeated writes still journal. Their writer-stamped stable routing
-        // edges and the intervening filesystem entries advance the fence
-        // without using the object-work budget.
-        let mut writer =
-            open_local_metadata_shard_backend(&data_dir, shard_id.clone()).expect("root writer");
-        assert_eq!(writer.journal_last_sequence(), previous_sequence);
-        for index in 0..3 {
-            writer
-                .put_object(&object)
-                .expect("existing object journal entry");
-            if index < 2 {
-                writer
-                    .put_file_system(&file_system)
-                    .expect("non-routing journal entry");
-            }
-        }
-        let tail_sequence = writer.journal_last_sequence();
-        assert_eq!(tail_sequence - previous_sequence, TAIL_ENTRIES as u64);
-        drop(writer);
-
-        let mut completed = false;
-        for pass in 0..TAIL_ENTRIES {
-            DEFAULT_SIFS_MIGRATION_JOURNAL_READS.with(|reads| reads.borrow_mut().clear());
-            let (report, _, _, index_writes, journal_writes) = run_test_default_migration_pass(
-                &data_dir,
-                &file_system,
-                &shards,
-                &local,
-                PASS_LIMIT,
-            );
-            assert_eq!(report.migration.migrated_objects, 0);
-            assert_eq!(report.migration.indexed_objects, 0);
-            assert_eq!(report.migration.scanned_objects, 0);
-            assert_eq!(index_writes, 0);
-            assert_eq!(journal_writes, 0);
-            DEFAULT_SIFS_MIGRATION_JOURNAL_READS.with(|reads| {
-                let reads = reads.borrow();
-                assert!(reads.len() <= TAIL_ENTRIES + shards.len());
-                for &(processable, requested, returned) in reads.iter() {
-                    assert!(processable <= PASS_LIMIT);
-                    assert!(requested <= processable + 1);
-                    assert!(returned <= requested);
-                }
-                if pass == 0 {
-                    assert_eq!(
-                        reads.first(),
-                        Some(&(PASS_LIMIT, PASS_LIMIT + 1, PASS_LIMIT + 1))
-                    );
-                    assert!(
-                        reads
-                            .iter()
-                            .filter(|(_, _, returned)| *returned > 0)
-                            .count()
-                            >= 2,
-                        "non-routing entries must drain through successive bounded chunks"
-                    );
-                }
-            });
-            let cursor: DfsDefaultSifsMigrationCursor =
-                crate::metadata_io::read_sobj(&cursor_path).expect("advanced cursor");
-            assert!(cursor.catalog_complete);
-            let observed = cursor.observed_journal_sequences[&shard_id.0];
-            assert!(observed > previous_sequence);
-            assert!(observed <= tail_sequence);
-            previous_sequence = observed;
-            if !report.migration.reached_limit {
-                assert_eq!(observed, tail_sequence);
-                assert!(cursor.dirty_object_ids.is_empty());
-                assert!(cursor.pending_journal_replay.is_none());
-                assert!(cursor.pending_migration.is_none());
-                completed = true;
-                break;
-            }
-        }
-        assert!(completed, "the bounded mixed journal suffix must settle");
-        let (report, _, _, index_writes, journal_writes) =
-            run_test_default_migration_pass(&data_dir, &file_system, &shards, &local, PASS_LIMIT);
-        assert!(!report.migration.reached_limit);
-        assert_eq!(report.migration.scanned_objects, 0);
-        assert_eq!(report.migration.migrated_objects, 0);
-        assert_eq!((index_writes, journal_writes), (0, 0));
-        let cursor: DfsDefaultSifsMigrationCursor =
-            crate::metadata_io::read_sobj(&cursor_path).expect("settled journal fence");
-        assert_eq!(
-            cursor.observed_journal_sequences[&shard_id.0],
-            tail_sequence
-        );
-    }
-
-    #[test]
-    fn newer_source_eviction_marker_never_overrides_live_target() {
-        let root = sinomo_testdir::TestDir::new("dfs-default-migration-source-eviction-marker");
-        let data_dir = SinomoDataDir::new(root.join("data"));
-        data_dir.ensure_root_layout().expect("data dir");
-        let local = NodeId::from_legacy_named("node_dfs_source_eviction_marker").expect("node");
-        let file_system = distributed_sifs(local.clone());
-        let shards = local_default_migration_shards(&file_system.file_system_id, &local);
-        let metadata_root = crate::default_dfs_metadata_shards_root(&data_dir);
-
-        let mut root_backend =
-            open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("root"))
-                .expect("root backend");
-        root_backend
-            .put_file_system(&file_system)
-            .expect("filesystem");
-        let mut object = crate::distributed_sifs_bootstrap_objects(local.clone())
-            .into_iter()
-            .next()
-            .expect("bootstrap object");
-        object.object_id =
-            crate::DfsObjectId::from_legacy_named("obj_source_eviction_marker_canonical_target")
-                .expect("object id");
-        object.path = "/services/source-eviction-marker.txt".to_string();
-        root_backend.put_object(&object).expect("legacy object");
-        drop(root_backend);
-
-        let mut settled = false;
-        for _ in 0..16 {
-            let report =
-                run_active_default_materialization_pass(&data_dir, &file_system, &shards, &local);
-            if !report.migration.reached_limit {
-                settled = true;
-                break;
-            }
-        }
-        assert!(settled, "bounded materialization must converge");
-
-        let source = open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("root"))
-            .expect("source backend");
-        let marker = source
-            .get_object(&object.object_id)
-            .expect("source lookup")
-            .expect("source marker");
-        let target =
-            open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("services"))
-                .expect("target backend");
-        let live = target
-            .get_object(&object.object_id)
-            .expect("target lookup")
-            .expect("live target");
-        assert_ne!(live.kind, DfsObjectKind::Tombstone);
-        assert_eq!(live.path, object.path);
-        assert_eq!(marker.kind, DfsObjectKind::Tombstone);
-        assert!(marker.changed_at_unix_nanos > live.changed_at_unix_nanos);
-        assert_eq!(
-            marker.tombstone_provenance,
-            Some(crate::DfsTombstoneProvenance::SourceEviction {
-                source_shard_id: DfsMetadataShardId::new("root"),
-                target_shard_id: DfsMetadataShardId::new("services"),
-                pin_transfer_id: None,
-            })
-        );
-        drop(source);
-        drop(target);
-
-        crate::metadata_backend::reset_metadata_journal_write_count();
-        crate::metadata_shard_index::reset_object_shard_index_write_count();
-        let verification =
-            run_active_default_materialization_pass(&data_dir, &file_system, &shards, &local);
-        assert!(!verification.migration.reached_limit);
-        assert_eq!(verification.migration.migrated_objects, 0);
-        assert_eq!(crate::metadata_backend::metadata_journal_write_count(), 0);
-        assert_eq!(
-            crate::metadata_shard_index::object_shard_index_write_count(),
-            0
-        );
-
-        let target =
-            open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("services"))
-                .expect("target backend after verification");
-        assert_eq!(
-            target
-                .get_object(&object.object_id)
-                .expect("target lookup after verification")
-                .expect("live target after verification"),
-            live,
-            "a newer source-eviction marker is not authoritative deletion evidence"
-        );
-        assert!(
-            crate::metadata_shard_index::object_shard_index_matches(
-                &metadata_root,
-                &live,
-                &DfsMetadataShardId::new("services"),
-            )
-            .expect("exact target index")
-        );
-
-        // Cursors written before provenance was introduced contain the exact
-        // historical marker shape. An exact target index plus the matching
-        // live generation is sufficient to upgrade that old record without
-        // mistaking an on-route unmarked tombstone for an eviction.
-        let mut source =
-            open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("root"))
-                .expect("legacy source backend");
-        let mut legacy_marker = source
-            .get_object(&object.object_id)
-            .expect("legacy source lookup")
-            .expect("legacy source marker");
-        legacy_marker.tombstone_provenance = None;
-        source
-            .put_object(&legacy_marker)
-            .expect("seed pre-provenance source marker");
-        drop(source);
-        crate::metadata_backend::reset_metadata_journal_write_count();
-        crate::metadata_shard_index::reset_object_shard_index_write_count();
-        let legacy_verification =
-            run_active_default_materialization_pass(&data_dir, &file_system, &shards, &local);
-        assert!(!legacy_verification.migration.reached_limit);
-        assert_eq!(legacy_verification.migration.migrated_objects, 0);
-        assert_eq!(crate::metadata_backend::metadata_journal_write_count(), 0);
-        assert_eq!(
-            crate::metadata_shard_index::object_shard_index_write_count(),
-            0
-        );
-        let target =
-            open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("services"))
-                .expect("target after legacy marker verification");
-        assert_eq!(
-            target
-                .get_object(&object.object_id)
-                .expect("target lookup after legacy marker verification")
-                .expect("live target after legacy marker verification"),
-            live
-        );
-    }
-
-    #[test]
-    fn migration_cursor_generation_tracks_replica_certification() {
-        let local = NodeId::from_legacy_named("node_dfs_cursor_generation_local").expect("node");
-        let remote = NodeId::from_legacy_named("node_dfs_cursor_generation_remote").expect("node");
-        let file_system = distributed_sifs(local.clone());
-        let mut shards = local_default_migration_shards(&file_system.file_system_id, &local);
-        let services = shards
-            .iter_mut()
-            .find(|shard| shard.shard_id == "services")
-            .expect("services shard");
-        services.primary_node_id = remote.clone();
-        services.replica_node_ids = vec![local.clone()];
-        let active = BTreeSet::from([
-            DfsMetadataShardId::new("root"),
-            DfsMetadataShardId::new("users"),
-        ]);
-        let certified = BTreeSet::from([DfsMetadataShardId::new("services")]);
-        let base = default_sifs_migration_generation(
-            &file_system.file_system_id,
-            &local,
-            &shards,
-            &active,
-            &certified,
-        );
-        assert_ne!(
-            default_sifs_migration_generation(
-                &file_system.file_system_id,
-                &local,
-                &shards,
-                &active,
-                &BTreeSet::new(),
-            ),
-            base,
-            "certification transitions remain distinguishable from matching generations"
-        );
-    }
-
-    #[test]
-    fn migration_cursor_parks_during_temporary_replica_certification_loss() {
-        let root = sinomo_testdir::TestDir::new("dfs-migration-replica-prefix-progress");
-        let local = NodeId::from_legacy_named("migration-prefix-local").unwrap();
-        let remote = NodeId::from_legacy_named("migration-prefix-remote").unwrap();
-        let file_system = distributed_sifs(local.clone());
-        let mut shards = local_default_migration_shards(&file_system.file_system_id, &local);
-        shards[1].primary_node_id = remote;
-        shards[1].replica_node_ids = vec![local.clone()];
-        let active = BTreeSet::from([
-            DfsMetadataShardId::new("root"),
-            DfsMetadataShardId::new("users"),
-        ]);
-        let mut backend = LocalShardedMetadataBackend::new(root.path(), shards.clone()).unwrap();
-        let root_id = DfsMetadataShardId::new("root");
-        let replica_id = DfsMetadataShardId::new("services");
-        backend
-            .shard_backend_mut(&root_id)
+        let mut primary_view = runtime
+            .metadata_primary_service("/native-snapshot-recovery.bin")
+            .unwrap();
+        let committed = primary_view
+            .metadata_backend()
             .unwrap()
-            .put_file_system(&file_system)
-            .unwrap();
-        let mut template = crate::distributed_sifs_bootstrap_objects(local.clone())
-            .into_iter()
-            .next()
-            .unwrap();
-        for index in 0..4 {
-            template.object_id =
-                crate::DfsObjectId::from_legacy_named(format!("migration-prefix-object-{index}"))
-                    .unwrap();
-            template.path = format!("/object-{index}");
-            backend
-                .shard_backend_mut(&root_id)
-                .unwrap()
-                .put_object(&template)
-                .unwrap();
-        }
-        let run = |backend: &mut LocalShardedMetadataBackend| {
-            migrate_default_sifs_metadata_on_active_primary_shards(
-                root.path(),
-                backend,
-                &file_system,
-                &shards,
-                &active,
-                &local,
-                1,
-            )
+            .get_object(&stat.object_id)
             .unwrap()
-        };
-        assert!(run(&mut backend).migration.reached_limit);
-        let cursor_path =
-            default_sifs_migration_cursor_path(root.path(), &file_system.file_system_id);
-        let before_bytes = std::fs::read(&cursor_path).unwrap();
-        let before: DfsDefaultSifsMigrationCursor =
-            crate::metadata_io::read_sobj_optional(&cursor_path)
-                .unwrap()
-                .unwrap();
-        assert!(before.after_object_id.is_some());
-        assert_eq!(
-            before.generation.certified_replica_shard_ids,
-            vec![replica_id.clone()]
-        );
-
-        // Model durable journal ingestion before the replica has published
-        // its exact prefix certificate. The earlier catalog proof is retained,
-        // but cannot authorize migration from this unconfirmed newer head.
-        backend
-            .shard_backend_mut(&replica_id)
-            .unwrap()
-            .put_file_system(&file_system)
             .unwrap();
-        for _ in 0..2 {
-            let parked = run(&mut backend);
-            assert!(parked.awaiting_replica_progress);
-            assert!(
-                !parked.migration.reached_limit,
-                "wait for a replica edge, not an immediate loop"
-            );
-            assert_eq!(parked.migration.scanned_objects, 0);
-            assert_eq!(std::fs::read(&cursor_path).unwrap(), before_bytes);
-        }
-        let replica = backend.shard_backend_mut(&replica_id).unwrap();
-        let proof = replica.metadata_prefix_proof().unwrap();
-        replica
-            .put_metadata_prefix_ack_floor(&crate::DfsMetadataPrefixAckFloor {
-                shard_id: replica_id,
-                journal_sequence: proof.journal_sequence,
-                state_fingerprint: String::new(),
-                durable_prefix_proof: Some(proof),
-            })
-            .unwrap();
-        let resumed = run(&mut backend);
-        assert!(resumed.migration.reached_limit);
-        let after: DfsDefaultSifsMigrationCursor =
-            crate::metadata_io::read_sobj_optional(&cursor_path)
-                .unwrap()
-                .unwrap();
-        assert!(
-            after.after_object_id > before.after_object_id,
-            "resume the exact catalog prefix"
-        );
-        let mut settled = false;
-        for _ in 0..16 {
-            if !run(&mut backend).migration.reached_limit {
-                settled = true;
-                break;
-            }
-        }
-        assert!(settled);
-
-        // Gaining previously unavailable source evidence still requires the
-        // catalog scan, and real authority changes must never park an obsolete
-        // cursor merely because a replica also became unconfirmed.
-        let mut previously_uncertified = before.clone();
-        previously_uncertified
-            .generation
-            .certified_replica_shard_ids
-            .clear();
-        write_default_sifs_migration_cursor(root.path(), &previously_uncertified).unwrap();
-        assert!(matches!(
-            read_default_sifs_migration_cursor(
-                root.path(),
-                &file_system.file_system_id,
-                &before.generation
-            )
-            .unwrap(),
-            DfsDefaultSifsMigrationCursorRead::Restart
-        ));
-        write_default_sifs_migration_cursor(root.path(), &before).unwrap();
-        let mut changed_authority = before.generation.clone();
-        changed_authority.shards[0].epoch += 1;
-        changed_authority.certified_replica_shard_ids.clear();
-        assert!(matches!(
-            read_default_sifs_migration_cursor(
-                root.path(),
-                &file_system.file_system_id,
-                &changed_authority
-            )
-            .unwrap(),
-            DfsDefaultSifsMigrationCursorRead::Restart
-        ));
-    }
-
-    #[test]
-    fn large_default_migration_is_cursor_bounded_and_converges_without_prefix_rewrites() {
-        const OBJECTS: usize = 300;
-        const PASS_LIMIT: usize = 17;
-        let root = sinomo_testdir::TestDir::new("dfs-default-migration-large-cursor");
-        let data_dir = SinomoDataDir::new(root.join("data"));
-        data_dir.ensure_root_layout().expect("data dir");
-        let local = NodeId::from_legacy_named("node_dfs_large_cursor_migration").expect("node");
-        let file_system = distributed_sifs(local.clone());
-        let shards = local_default_migration_shards(&file_system.file_system_id, &local);
-        let mut source =
-            open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("root"))
-                .expect("root source");
-        source.put_file_system(&file_system).expect("filesystem");
-        for index in 0..OBJECTS {
-            let mut object = crate::distributed_sifs_bootstrap_objects(local.clone())
-                .into_iter()
-                .next()
-                .expect("bootstrap object");
-            object.object_id = crate::DfsObjectId::from_legacy_named(format!(
-                "obj_large_cursor_migration_{index:04}"
-            ))
-            .expect("object id");
-            object.path = format!("/services/legacy-{index:04}.txt");
-            source.put_object(&object).expect("legacy object");
-        }
-        drop(source);
-
-        let metadata_root = crate::default_dfs_metadata_shards_root(&data_dir);
-        let cursor_path =
-            default_sifs_migration_cursor_path(&metadata_root, &file_system.file_system_id);
-        let mut previous_cursor = None;
-        let mut total_migrated = 0usize;
-        let mut total_indexed = 0usize;
-        for pass in 0..64 {
-            let (report, snapshots, buffered, index_writes, _) = run_test_default_migration_pass(
-                &data_dir,
-                &file_system,
-                &shards,
-                &local,
-                PASS_LIMIT,
-            );
-            assert!(report.migration.scanned_objects <= PASS_LIMIT);
-            assert!(report.migration.migrated_objects <= PASS_LIMIT);
-            assert!(report.migration.indexed_objects <= PASS_LIMIT);
-            assert_eq!(index_writes, report.migration.indexed_objects);
-            assert!(
-                snapshots <= PASS_LIMIT.saturating_mul(32).saturating_add(16),
-                "pass {pass} performed unbounded snapshot work: {snapshots}"
-            );
-            assert!(
-                buffered <= (PASS_LIMIT + 1).saturating_mul(shards.len()),
-                "pass {pass} buffered too much catalog state: {buffered}"
-            );
-            total_migrated = total_migrated.saturating_add(report.migration.migrated_objects);
-            total_indexed = total_indexed.saturating_add(report.migration.indexed_objects);
-            if !report.migration.reached_limit {
-                let cursor =
-                    crate::metadata_io::read_sobj::<DfsDefaultSifsMigrationCursor>(&cursor_path)
-                        .expect("settled durable migration cursor");
-                assert!(
-                    cursor.catalog_complete,
-                    "settled migration must retain a completed catalog fence"
-                );
-                break;
-            }
-            let cursor =
-                crate::metadata_io::read_sobj::<DfsDefaultSifsMigrationCursor>(&cursor_path)
-                    .expect("durable migration cursor");
-            if let Some(after) = cursor.after_object_id {
-                assert!(
-                    previous_cursor
-                        .as_ref()
-                        .is_none_or(|previous| after >= *previous),
-                    "pass {pass} regressed the durable object-id cursor"
-                );
-                previous_cursor = Some(after);
-            } else {
-                assert!(
-                    cursor.pending_migration.is_some() || !cursor.dirty_object_ids.is_empty(),
-                    "a partial pass without a catalog position must retain exact pending work"
-                );
-            }
-        }
-        assert_eq!(total_migrated, OBJECTS);
-        assert_eq!(total_indexed, OBJECTS);
-
-        // A process restart reuses the completed catalog fence and validates
-        // only the journal suffix. With no new suffix, this is a zero-object
-        // pass and no exact index or target generation is rewritten.
-        let (verification, _, _, index_writes, _) =
-            run_test_default_migration_pass(&data_dir, &file_system, &shards, &local, PASS_LIMIT);
-        assert!(!verification.migration.reached_limit);
-        assert_eq!(verification.migration.scanned_objects, 0);
-        assert_eq!(verification.migration.migrated_objects, 0);
-        assert_eq!(verification.migration.indexed_objects, 0);
-        assert_eq!(index_writes, 0, "settled prefixes must not be rewritten");
-
-        // The durable completion marker is not a stale snapshot: a later
-        // journal entry for an object behind the catalog cursor must still be
-        // selected exactly and migrated without restarting the full scan. The
-        // target install contributes one more exact journal observation, so
-        // the same ID is checked once after migration to settle the fence.
-        let mut late = crate::distributed_sifs_bootstrap_objects(local.clone())
-            .into_iter()
-            .next()
-            .expect("late bootstrap object");
-        late.object_id =
-            crate::DfsObjectId::from_legacy_named("obj_large_cursor_migration_after_settlement")
-                .expect("late object id");
-        late.path = "/services/after-settlement.txt".to_string();
-        open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("root"))
-            .expect("late legacy source")
-            .put_object(&late)
-            .expect("late journal mutation");
-        let mut late_scanned = 0usize;
-        let mut late_migrated = 0usize;
-        for _ in 0..16 {
-            let (report, _, _, _, _) = run_test_default_migration_pass(
-                &data_dir,
-                &file_system,
-                &shards,
-                &local,
-                PASS_LIMIT,
-            );
-            late_scanned = late_scanned.saturating_add(report.migration.scanned_objects);
-            late_migrated = late_migrated.saturating_add(report.migration.migrated_objects);
-            if !report.migration.reached_limit {
-                break;
-            }
-        }
-        assert_eq!(late_scanned, 2);
-        assert_eq!(late_migrated, 1);
-        assert_eq!(
-            open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("services"))
-                .expect("late target")
-                .get_object(&late.object_id)
-                .expect("late target lookup"),
-            Some(late)
-        );
-        let (settled, _, _, settled_index_writes, _) =
-            run_test_default_migration_pass(&data_dir, &file_system, &shards, &local, PASS_LIMIT);
-        assert!(!settled.migration.reached_limit);
-        assert_eq!(settled.migration.scanned_objects, 0);
-        assert_eq!(settled_index_writes, 0);
-    }
-
-    #[test]
-    fn bounded_materialization_reuses_resident_backends_with_only_a_durable_cursor() {
-        const OBJECTS: usize = 120;
-        let root = sinomo_testdir::TestDir::new("dfs-default-migration-retained-backends");
-        let data_dir = SinomoDataDir::new(root.join("data"));
-        data_dir.ensure_root_layout().expect("data dir");
-        let local =
-            NodeId::from_legacy_named("node_dfs_retained_migration_backends").expect("node");
-        let file_system = distributed_sifs(local.clone());
-        let shards = local_default_migration_shards(&file_system.file_system_id, &local);
-        let mut source =
-            open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("root"))
-                .expect("root source");
-        source.put_file_system(&file_system).expect("filesystem");
-        for index in 0..OBJECTS {
-            let mut object = crate::distributed_sifs_bootstrap_objects(local.clone())
-                .into_iter()
-                .next()
-                .expect("bootstrap object");
-            object.object_id = crate::DfsObjectId::from_legacy_named(format!(
-                "obj_retained_migration_backend_{index:04}"
-            ))
-            .expect("object id");
-            object.path = format!("/services/retained-{index:04}.txt");
-            source.put_object(&object).expect("legacy object");
-        }
-        drop(source);
-
-        crate::metadata_backend::reset_metadata_backend_open_calls();
-        let resident = LocalShardedMetadataBackend::new(
-            crate::default_dfs_metadata_shards_root(&data_dir),
-            shards.clone(),
-        )
-        .expect("resident migration backend")
-        .into_resident();
-        assert_eq!(
-            crate::metadata_backend::metadata_backend_open_calls(),
-            shards.len(),
-            "the resident generation opens each local primary exactly once"
-        );
-
-        let active_primary_shard_ids = shards
-            .iter()
-            .map(|shard| DfsMetadataShardId::new(shard.shard_id.clone()))
-            .collect::<BTreeSet<_>>();
-        let mut report = DfsDefaultSifsMaterializationReport {
-            migration: DfsMetadataShardMigrationReport {
-                file_system_id: file_system.file_system_id.clone(),
-                scanned_objects: 0,
-                indexed_objects: 0,
-                migrated_objects: 0,
-                skipped_stale_sources: 0,
-                reached_limit: true,
-            },
-            awaiting_replica_progress: false,
-        };
-        let mut saw_bounded_pass = false;
-        for pass in 0..32 {
-            crate::metadata_backend::reset_metadata_backend_open_calls();
-            let mut lease = resident
-                .checkout_global()
-                .expect("resident global checkout");
-            report = materialize_default_sifs_metadata_on_bound_primary_shards(
-                crate::default_dfs_metadata_shards_root(&data_dir),
-                &mut lease,
-                &file_system,
-                &shards,
-                &active_primary_shard_ids,
-                &local,
-                [local.clone()],
-                local.clone(),
-                OffsetDateTime::UNIX_EPOCH,
-            )
-            .expect("resident bounded materialization");
-            saw_bounded_pass |= report.migration.reached_limit;
-            assert_eq!(
-                crate::metadata_backend::metadata_backend_open_calls(),
-                0,
-                "resident pass {pass} reopened and rehydrated a shard backend"
-            );
-            if !report.migration.reached_limit {
-                break;
-            }
-        }
-        assert!(
-            saw_bounded_pass,
-            "the fixture must require more than one bounded migration pass"
-        );
-        assert!(
-            !report.migration.reached_limit,
-            "durable-cursor bounded migration must converge"
-        );
-    }
-
-    #[test]
-    fn durable_journal_replays_earlier_object_without_resetting_catalog_cursor() {
-        const OBJECTS: usize = 40;
-        const PASS_LIMIT: usize = 8;
-        let root = sinomo_testdir::TestDir::new("dfs-default-migration-dirty-earlier-id");
-        let data_dir = SinomoDataDir::new(root.join("data"));
-        data_dir.ensure_root_layout().expect("data dir");
-        let local = NodeId::from_legacy_named("node_dfs_dirty_earlier_id").expect("node");
-        let file_system = distributed_sifs(local.clone());
-        let shards = local_default_migration_shards(&file_system.file_system_id, &local);
-        let metadata_root = crate::default_dfs_metadata_shards_root(&data_dir);
-        let cursor_path =
-            default_sifs_migration_cursor_path(&metadata_root, &file_system.file_system_id);
-        let mut source =
-            open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("root"))
-                .expect("root source");
-        source.put_file_system(&file_system).expect("filesystem");
-        let mut objects = Vec::new();
-        for index in 0..OBJECTS {
-            let mut object = crate::distributed_sifs_bootstrap_objects(local.clone())
-                .into_iter()
-                .next()
-                .expect("bootstrap object");
-            object.object_id =
-                crate::DfsObjectId::from_legacy_named(format!("obj_dirty_earlier_id_{index:04}"))
-                    .expect("object id");
-            object.path = format!("/services/dirty-earlier-{index:04}.txt");
-            source.put_object(&object).expect("legacy object");
-            objects.push(object);
-        }
-        drop(source);
-        objects.sort_by(|left, right| left.object_id.cmp(&right.object_id));
-        let early_object = objects.first().expect("early object").clone();
-
-        // The standalone helper opens one bounded router per pass. No backend
-        // body survives the call, so recovery relies solely on the durable
-        // cursor and journal checkpoints, as after a process crash.
-        let mut cursor_after_mutated_id = None;
-        for _ in 0..32 {
-            let _ = run_test_default_migration_pass(
-                &data_dir,
-                &file_system,
-                &shards,
-                &local,
-                PASS_LIMIT,
-            );
-            if !cursor_path.exists() {
-                continue;
-            }
-            let cursor =
-                crate::metadata_io::read_sobj::<DfsDefaultSifsMigrationCursor>(&cursor_path)
-                    .expect("durable migration cursor");
-            let Some(after) = cursor.after_object_id else {
-                continue;
-            };
-            if after <= early_object.object_id {
-                continue;
-            }
-            let services =
-                open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("services"))
-                    .expect("services backend");
-            if services
-                .get_object(&early_object.object_id)
-                .expect("services lookup")
-                .is_some_and(|object| object.kind != DfsObjectKind::Tombstone)
-            {
-                cursor_after_mutated_id = Some(after);
-                break;
-            }
-        }
-        let cursor_after_mutated_id =
-            cursor_after_mutated_id.expect("catalog cursor must advance past the early object");
-
-        let mut services =
-            open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("services"))
-                .expect("services writer");
-        let mut moved = services
-            .get_object(&early_object.object_id)
-            .expect("services lookup")
-            .expect("migrated early object");
-        moved.path = "/users/replayed-after-cursor.txt".to_string();
-        moved.version =
-            DfsVersion::from_legacy_named("version_replayed_after_cursor").expect("moved version");
-        moved.changed_at_unix_nanos = moved.changed_at_unix_nanos.saturating_add(10_000);
-        moved.tombstone_provenance = None;
-        services
-            .put_object(&moved)
-            .expect("concurrent earlier-ID mutation");
-        drop(services);
-
-        let mut settled = false;
-        for pass in 0..128 {
-            let (report, _, _, _, _) = run_test_default_migration_pass(
-                &data_dir,
-                &file_system,
-                &shards,
-                &local,
-                PASS_LIMIT,
-            );
-            if !report.migration.reached_limit {
-                settled = true;
-                break;
-            }
-            let cursor =
-                crate::metadata_io::read_sobj::<DfsDefaultSifsMigrationCursor>(&cursor_path)
-                    .expect("durable replay cursor");
-            assert!(
-                cursor
-                    .after_object_id
-                    .as_ref()
-                    .is_some_and(|after| after >= &cursor_after_mutated_id),
-                "pass {pass} reset the ordered catalog to replay an earlier dirty ID"
-            );
-        }
-        assert!(settled, "dirty-ID replay must converge after restart");
-
-        let users = open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("users"))
-            .expect("users target");
-        assert_eq!(
-            users
-                .get_object(&moved.object_id)
-                .expect("users lookup")
-                .expect("replayed target"),
-            moved
-        );
-        assert!(
-            crate::metadata_shard_index::object_shard_index_matches(
-                &metadata_root,
-                &moved,
-                &DfsMetadataShardId::new("users"),
-            )
-            .expect("replayed target index")
-        );
-    }
-
-    #[test]
-    fn source_update_after_target_install_is_replayed_before_eviction() {
-        const PASS_LIMIT: usize = 2;
-        let root = sinomo_testdir::TestDir::new("dfs-default-migration-source-update-fence");
-        let data_dir = SinomoDataDir::new(root.join("data"));
-        data_dir.ensure_root_layout().expect("data dir");
-        let local = NodeId::from_legacy_named("node_dfs_source_update_fence").expect("node");
-        let file_system = distributed_sifs(local.clone());
-        let shards = local_default_migration_shards(&file_system.file_system_id, &local);
-        let metadata_root = crate::default_dfs_metadata_shards_root(&data_dir);
-        let cursor_path =
-            default_sifs_migration_cursor_path(&metadata_root, &file_system.file_system_id);
-        let mut source =
-            open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("root"))
-                .expect("root source");
-        source
-            .put_file_system(&file_system)
-            .expect("root filesystem");
-        let mut object = crate::distributed_sifs_bootstrap_objects(local.clone())
-            .into_iter()
-            .next()
-            .expect("bootstrap object");
-        object.object_id =
-            crate::DfsObjectId::from_legacy_named("obj_source_update_fence").expect("object id");
-        object.path = "/services/source-update-fence.txt".to_string();
-        source.put_object(&object).expect("legacy object");
-        drop(source);
-        let mut services =
-            open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("services"))
-                .expect("services target");
-        services
-            .put_file_system(&file_system)
-            .expect("services filesystem");
-        drop(services);
-
-        let (first, _, _, _, _) =
-            run_test_default_migration_pass(&data_dir, &file_system, &shards, &local, PASS_LIMIT);
-        assert!(first.migration.reached_limit);
-        let cursor = crate::metadata_io::read_sobj::<DfsDefaultSifsMigrationCursor>(&cursor_path)
-            .expect("pending source-eviction cursor");
-        assert!(cursor.pending_migration.as_ref().is_some_and(|pending| {
-            matches!(
-                pending.stage,
-                DfsDefaultSifsPendingMigrationStage::SourceEvictions { .. }
-            )
-        }));
-        let services =
-            open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("services"))
-                .expect("installed target");
-        assert_eq!(
-            services
-                .get_object(&object.object_id)
-                .expect("target lookup")
-                .expect("installed target"),
-            object
-        );
-        drop(services);
-
-        let mut source =
-            open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("root"))
-                .expect("concurrent source writer");
-        let mut moved = source
-            .get_object(&object.object_id)
-            .expect("source lookup")
-            .expect("live source");
-        moved.path = "/users/source-update-fence.txt".to_string();
-        moved.version =
-            DfsVersion::from_legacy_named("version_source_update_fence").expect("version");
-        moved.changed_at_unix_nanos = moved.changed_at_unix_nanos.saturating_add(1_000);
-        source.put_object(&moved).expect("concurrent source update");
-        drop(source);
-
-        let _ =
-            run_test_default_migration_pass(&data_dir, &file_system, &shards, &local, PASS_LIMIT);
-        let source = open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("root"))
-            .expect("source after fenced retry");
-        assert_eq!(
-            source
-                .get_object(&moved.object_id)
-                .expect("source lookup after fenced retry")
-                .expect("source update retained"),
-            moved,
-            "a source generation changed after target install must restart instead of being tombstoned"
-        );
-        drop(source);
-
-        let mut settled = false;
-        for _ in 0..64 {
-            let (report, _, _, _, _) = run_test_default_migration_pass(
-                &data_dir,
-                &file_system,
-                &shards,
-                &local,
-                PASS_LIMIT,
-            );
-            if !report.migration.reached_limit {
-                settled = true;
-                break;
-            }
-        }
-        assert!(settled, "restarted exact-source migration must converge");
-        let users = open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("users"))
-            .expect("users target");
-        assert_eq!(
-            users
-                .get_object(&moved.object_id)
-                .expect("users lookup")
-                .expect("moved target"),
-            moved
-        );
-        assert!(
-            crate::metadata_shard_index::object_shard_index_matches(
-                &metadata_root,
-                &moved,
-                &DfsMetadataShardId::new("users"),
-            )
-            .expect("moved target index")
-        );
-    }
-
-    #[test]
-    fn late_source_family_records_reach_target_before_source_eviction() {
-        const PASS_LIMIT: usize = 2;
-        let root = sinomo_testdir::TestDir::new("dfs-default-migration-late-family-fence");
-        let data_dir = SinomoDataDir::new(root.join("data"));
-        data_dir.ensure_root_layout().expect("data dir");
-        let local = NodeId::from_legacy_named("node_dfs_late_family_fence").expect("node");
-        let file_system = distributed_sifs(local.clone());
-        let shards = local_default_migration_shards(&file_system.file_system_id, &local);
-        let metadata_root = crate::default_dfs_metadata_shards_root(&data_dir);
-        let cursor_path =
-            default_sifs_migration_cursor_path(&metadata_root, &file_system.file_system_id);
-        let mut source =
-            open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("root"))
-                .expect("root source");
-        source.put_file_system(&file_system).expect("filesystem");
-        let mut object = crate::distributed_sifs_bootstrap_objects(local.clone())
-            .into_iter()
-            .next()
-            .expect("bootstrap object");
-        object.object_id =
-            crate::DfsObjectId::from_legacy_named("obj_late_family_fence").expect("object id");
-        object.path = "/services/late-family-fence.bin".to_string();
-        source.put_object(&object).expect("legacy object");
-        drop(source);
-        let mut target =
-            open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("services"))
-                .expect("services target");
-        target.put_file_system(&file_system).expect("filesystem");
-        drop(target);
-
-        let (first, _, _, _, _) =
-            run_test_default_migration_pass(&data_dir, &file_system, &shards, &local, PASS_LIMIT);
-        assert!(first.migration.reached_limit);
-        let cursor = crate::metadata_io::read_sobj::<DfsDefaultSifsMigrationCursor>(&cursor_path)
-            .expect("pending source eviction");
-        assert!(cursor.pending_migration.as_ref().is_some_and(|pending| {
-            matches!(
-                pending.stage,
-                DfsDefaultSifsPendingMigrationStage::SourceEvictions { .. }
-            )
-        }));
-
-        let late_version = crate::DfsObjectVersionRecord {
-            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
-            content_durability: None,
-            retention: Default::default(),
-            module_metadata: Default::default(),
-            file_system_id: object.file_system_id.clone(),
-            object_id: object.object_id.clone(),
-            version: DfsVersion::from_legacy_named("version_late_family_fence").expect("version"),
-            content_hash: Some("blake3:late-family-fence".to_string()),
-            size_bytes: Some(17),
-            locations: vec![local.clone()],
-            created_by_event_id: None,
-            created_at: OffsetDateTime::UNIX_EPOCH,
-            visible: true,
-        };
-        let late_intent = crate::DfsWriteIntentRecord {
-            publication: Default::default(),
-            intent_id: "intent_late_family_fence".to_string(),
-            file_system_id: object.file_system_id.clone(),
-            object_id: object.object_id.clone(),
-            base_version: Some(object.version.clone()),
-            target_version: late_version.version.clone(),
-            coordinator_node_id: local.clone(),
-            operation_id: None,
-            operation_order_token: None,
-            owner_epoch: 1,
-            desired_replica_node_ids: vec![local.clone()],
-            policy: crate::DfsReplicationPolicy::new(1, 1).expect("policy"),
-            status: crate::DfsWriteIntentStatus::Staging,
-            content_hash: late_version.content_hash.clone(),
-            object_metadata: None,
-            touch_parent_on_create: false,
-            create_predecessor_object_id: None,
-            created_at: OffsetDateTime::UNIX_EPOCH,
-            updated_at: None,
-        };
-        let mut source =
-            open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("root"))
-                .expect("late source writer");
-        source.put_version(&late_version).expect("late version");
-        source.put_intent(&late_intent).expect("late intent");
-        drop(source);
-
-        let mut settled = false;
-        let mut observed_eviction = false;
-        for pass in 0..32 {
-            let (report, _, _, index_writes, journal_writes) = run_test_default_migration_pass(
-                &data_dir,
-                &file_system,
-                &shards,
-                &local,
-                PASS_LIMIT,
-            );
-            assert!(
-                index_writes.saturating_add(journal_writes) <= PASS_LIMIT,
-                "pass {pass} exceeded the physical mutation cap"
-            );
-            let source =
-                open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("root"))
-                    .expect("source inspection");
-            let target =
-                open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("services"))
-                    .expect("target inspection");
-            let source_object = source
-                .get_object(&object.object_id)
-                .expect("source lookup")
-                .expect("source object or marker");
-            if source_object.kind == DfsObjectKind::Tombstone {
-                observed_eviction = true;
-                assert_eq!(
-                    target
-                        .get_version(&object.object_id, &late_version.version)
-                        .expect("target version"),
-                    Some(late_version.clone()),
-                    "source eviction must be later than the late version install"
-                );
-                assert_eq!(
-                    target
-                        .get_intent(&object.object_id, &late_intent.intent_id)
-                        .expect("target intent"),
-                    Some(late_intent.clone()),
-                    "source eviction must be later than the late intent install"
-                );
-            }
-            if !report.migration.reached_limit {
-                settled = true;
-                break;
-            }
-        }
-        assert!(settled, "late-family replay must converge");
-        assert!(observed_eviction, "source must eventually be evicted");
-    }
-
-    #[test]
-    fn completed_catalog_consumes_canonical_content_and_location_writes_without_object_work() {
-        const PASS_LIMIT: usize = 4;
-        let root = sinomo_testdir::TestDir::new("migration-semantic-content-routing");
-        let data_dir = SinomoDataDir::new(root.join("data"));
-        data_dir.ensure_root_layout().unwrap();
-        let local = NodeId::from_legacy_named("migration-semantic-content-node").unwrap();
-        let file_system = distributed_sifs(local.clone());
-        let shards = local_default_migration_shards(&file_system.file_system_id, &local);
-        let metadata_root = crate::default_dfs_metadata_shards_root(&data_dir);
-        let shard_id = DfsMetadataShardId::new("root");
-        let cursor_path =
-            default_sifs_migration_cursor_path(&metadata_root, &file_system.file_system_id);
-        let mut object = crate::distributed_sifs_bootstrap_objects(local.clone()).remove(0);
-        object.object_id =
-            crate::DfsObjectId::from_legacy_named("semantic-content-object").unwrap();
-        object.path = "/semantic-content-object".into();
-        object.kind = DfsObjectKind::File;
-        let mut writer = open_local_metadata_shard_backend(&data_dir, shard_id.clone()).unwrap();
-        writer.put_file_system(&file_system).unwrap();
-        writer.put_object(&object).unwrap();
-        drop(writer);
-        let (settled, _, _, _, _) =
-            run_test_default_migration_pass(&data_dir, &file_system, &shards, &local, PASS_LIMIT);
-        assert!(!settled.migration.reached_limit);
-        let before: DfsDefaultSifsMigrationCursor =
-            crate::metadata_io::read_sobj(&cursor_path).unwrap();
-        assert!(before.catalog_complete);
-        let before_sequence = before.observed_journal_sequences[&shard_id.0];
-
-        let mut writer = open_local_metadata_shard_backend(&data_dir, shard_id.clone()).unwrap();
-        object
-            .current_locations
-            .push(NodeId::from_legacy_named("semantic-content-new-replica").unwrap());
-        object.current_locations.sort();
-        object.current_locations.dedup();
-        writer.put_object(&object).unwrap();
-        for index in 0..20 {
-            object.version =
-                crate::DfsVersion::from_legacy_named(format!("semantic-content-{index}")).unwrap();
-            object.content_hash = Some(format!("blake3:semantic-content-{index}"));
-            object.content_size_bytes = Some(index + 1);
-            object.changed_at_unix_nanos += 1;
-            writer
-                .put_object_and_version(
-                    &object,
-                    &crate::metadata_records::object_version_record(&object, None),
-                )
-                .unwrap();
-        }
-        let previous_version = object.version.clone();
-        object.version =
-            crate::DfsVersion::from_legacy_named("semantic-content-committed").unwrap();
-        object.content_hash = Some("blake3:semantic-content-committed".into());
-        object.changed_at_unix_nanos += 1;
-        let version = crate::metadata_records::object_version_record(&object, None);
-        let receipt = crate::DfsReplicaReceiptRecord {
-            receipt: sinomo_core::DfsWriteReceipt {
-                file_system_id: object.file_system_id.clone(),
-                object_id: object.object_id.clone(),
-                committed_version: object.version.clone(),
-                owner_node_id: local.clone(),
-                event_id: sinomo_core::events::EventId::from_legacy_named(
-                    "semantic-content-receipt",
-                )
-                .unwrap(),
-            },
-            replica_node_id: local.clone(),
-            content_hash: object.content_hash.clone(),
-            received_at: OffsetDateTime::UNIX_EPOCH,
-        };
-        writer.put_receipt(&receipt).unwrap();
-        writer
-            .commit_visible_version(
-                &previous_version,
-                &object,
-                &version,
-                std::slice::from_ref(&local),
-            )
-            .unwrap();
-        let tail_sequence = writer.journal_last_sequence();
-        let tail = writer
-            .durable_journal_since_limited(before_sequence, 64)
-            .unwrap();
-        assert_eq!(tail.len(), (tail_sequence - before_sequence) as usize);
-        assert!(tail_sequence - before_sequence > PASS_LIMIT as u64);
-        assert!(
-            tail.iter()
-                .all(|entry| !entry.mutation.changes_object_routing())
-        );
-        assert!(tail.iter().any(|entry| matches!(
-            entry.mutation,
-            crate::DfsMetadataMutation::CommitVisibleVersion { .. }
-        )));
-        drop(writer);
-
-        let durable = open_local_metadata_shard_backend(&data_dir, shard_id.clone()).unwrap();
-        assert_eq!(
-            durable.get_object(&object.object_id).unwrap(),
-            Some(object.clone())
-        );
-        assert_eq!(
-            durable
-                .get_version(&object.object_id, &object.version)
-                .unwrap(),
-            Some(version)
-        );
-        assert_eq!(
-            durable
-                .get_receipt_on_shard(&shard_id, &object.object_id, &object.version, &local)
-                .unwrap(),
-            Some(receipt)
-        );
-        assert_eq!(durable.journal_last_sequence(), tail_sequence);
-        drop(durable);
-
-        DEFAULT_SIFS_MIGRATION_JOURNAL_READS.with(|reads| reads.borrow_mut().clear());
-        let (report, _, _, index_writes, journal_writes) =
-            run_test_default_migration_pass(&data_dir, &file_system, &shards, &local, PASS_LIMIT);
-        assert!(!report.migration.reached_limit);
-        assert_eq!(report.migration.scanned_objects, 0);
-        assert_eq!(report.migration.indexed_objects, 0);
-        assert_eq!(report.migration.migrated_objects, 0);
-        assert_eq!((index_writes, journal_writes), (0, 0));
-        let after: DfsDefaultSifsMigrationCursor =
-            crate::metadata_io::read_sobj(&cursor_path).unwrap();
-        assert_eq!(after.observed_journal_sequences[&shard_id.0], tail_sequence);
-        assert!(after.dirty_object_ids.is_empty());
-        DEFAULT_SIFS_MIGRATION_JOURNAL_READS.with(|reads| {
-            for &(processable, requested, returned) in reads.borrow().iter() {
-                assert!(processable <= PASS_LIMIT);
-                assert!(requested <= processable + 1);
-                assert!(returned <= requested);
-            }
-        });
-    }
-
-    #[test]
-    fn completed_catalog_route_changes_repair_index_before_source_eviction_and_keep_deletions() {
-        const PASS_LIMIT: usize = 2;
-        let root = sinomo_testdir::TestDir::new("migration-semantic-route-restart");
-        let data_dir = SinomoDataDir::new(root.join("data"));
-        data_dir.ensure_root_layout().unwrap();
-        let local = NodeId::from_legacy_named("migration-semantic-route-node").unwrap();
-        let file_system = distributed_sifs(local.clone());
-        let shards = local_default_migration_shards(&file_system.file_system_id, &local);
-        let metadata_root = crate::default_dfs_metadata_shards_root(&data_dir);
-        let source_shard = DfsMetadataShardId::new("root");
-        let target_shard = DfsMetadataShardId::new("services");
-        let cursor_path =
-            default_sifs_migration_cursor_path(&metadata_root, &file_system.file_system_id);
-        let mut object = crate::distributed_sifs_bootstrap_objects(local.clone()).remove(0);
-        object.object_id = crate::DfsObjectId::from_legacy_named("semantic-route-object").unwrap();
-        object.path = "/semantic-route-object".into();
-        let mut writer =
-            open_local_metadata_shard_backend(&data_dir, source_shard.clone()).unwrap();
-        writer.put_file_system(&file_system).unwrap();
-        writer.put_object(&object).unwrap();
-        drop(writer);
-        let (settled, _, _, _, _) =
-            run_test_default_migration_pass(&data_dir, &file_system, &shards, &local, PASS_LIMIT);
-        assert!(!settled.migration.reached_limit);
-        let before: DfsDefaultSifsMigrationCursor =
-            crate::metadata_io::read_sobj(&cursor_path).unwrap();
-        assert!(before.catalog_complete);
-
-        // A canonical route change can survive a crash before its disposable
-        // index is published. Retain the completed catalog, lose the hint, and
-        // reopen every backend between bounded passes to exercise that boundary.
-        object.path = "/services/semantic-route-object".into();
-        object.changed_at_unix_nanos += 10;
-        let mut writer =
-            open_local_metadata_shard_backend(&data_dir, source_shard.clone()).unwrap();
-        let route_entry = writer.put_object(&object).unwrap();
-        assert!(route_entry.mutation.changes_object_routing());
-        drop(writer);
-        std::fs::write(
-            crate::metadata_shard_index::object_shard_index_path(&metadata_root, &object.object_id),
-            b"crash damaged disposable routing hint",
-        )
-        .unwrap();
-
-        let mut complete = false;
-        let mut scanned = 0;
-        let mut indexed = 0;
-        for _ in 0..64 {
-            let (report, _, _, index_writes, journal_writes) = run_test_default_migration_pass(
-                &data_dir,
-                &file_system,
-                &shards,
-                &local,
-                PASS_LIMIT,
-            );
-            scanned += report.migration.scanned_objects;
-            indexed += report.migration.indexed_objects;
-            assert!(index_writes + journal_writes <= PASS_LIMIT);
-            let source =
-                open_local_metadata_shard_backend(&data_dir, source_shard.clone()).unwrap();
-            let source_object = source.get_object(&object.object_id).unwrap().unwrap();
-            if source_object.kind == DfsObjectKind::Tombstone {
-                let target =
-                    open_local_metadata_shard_backend(&data_dir, target_shard.clone()).unwrap();
-                assert_eq!(
-                    target.get_object(&object.object_id).unwrap(),
-                    Some(object.clone())
-                );
-                assert_eq!(
-                    crate::metadata_shard_index::read_object_shard_index(
-                        &metadata_root,
-                        &object.object_id
-                    )
-                    .unwrap(),
-                    Some(crate::metadata_shard_index::object_shard_index_record(
-                        &object,
-                        &target_shard
-                    )),
-                    "the target and routing index must be installed before source eviction"
-                );
-            }
-            if !report.migration.reached_limit {
-                complete = true;
-                break;
-            }
-        }
-        assert!(complete);
-        assert!(scanned > 0 && indexed > 0);
-
-        object.kind = DfsObjectKind::Tombstone;
-        object.changed_at_unix_nanos += 10;
-        let mut writer =
-            open_local_metadata_shard_backend(&data_dir, target_shard.clone()).unwrap();
-        let deletion = writer.put_object(&object).unwrap();
-        assert!(deletion.mutation.changes_object_routing());
-        drop(writer);
-        let (deleted, _, _, _, _) =
-            run_test_default_migration_pass(&data_dir, &file_system, &shards, &local, PASS_LIMIT);
-        assert!(!deleted.migration.reached_limit);
-        assert!(deleted.migration.scanned_objects > 0);
-        let reopened = LocalShardedMetadataBackend::new(metadata_root, shards).unwrap();
-        assert_eq!(
-            reopened.get_object(&object.object_id).unwrap(),
-            Some(object)
-        );
-    }
-
-    #[test]
-    fn completed_catalog_drains_non_routing_suffix_beyond_object_budget() {
-        const PASS_LIMIT: usize = 4;
-        let root = sinomo_testdir::TestDir::new("migration-non-routing-journal-budget");
-        let data_dir = SinomoDataDir::new(root.join("data"));
-        data_dir.ensure_root_layout().unwrap();
-        let local = NodeId::from_legacy_named("migration-non-routing-budget-node").unwrap();
-        let file_system = distributed_sifs(local.clone());
-        let shards = local_default_migration_shards(&file_system.file_system_id, &local);
-        let metadata_root = crate::default_dfs_metadata_shards_root(&data_dir);
-        let cursor_path =
-            default_sifs_migration_cursor_path(&metadata_root, &file_system.file_system_id);
-        let mut backend =
-            open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("root")).unwrap();
-        backend.put_file_system(&file_system).unwrap();
-        let mut object = crate::distributed_sifs_bootstrap_objects(local.clone())
-            .into_iter()
-            .next()
-            .unwrap();
-        object.object_id =
-            crate::DfsObjectId::from_legacy_named("non-routing-budget-object").unwrap();
-        object.path = "/non-routing-budget-object".into();
-        backend.put_object(&object).unwrap();
-        drop(backend);
-        let mut completed = false;
-        for _ in 0..128 {
-            run_test_default_migration_pass(&data_dir, &file_system, &shards, &local, PASS_LIMIT);
-            let cursor =
-                crate::metadata_io::read_sobj::<DfsDefaultSifsMigrationCursor>(&cursor_path)
-                    .unwrap();
-            if cursor.catalog_complete
-                && cursor.pending_migration.is_none()
-                && cursor.dirty_object_ids.is_empty()
-            {
-                completed = true;
-                break;
-            }
-        }
-        assert!(completed, "fixture must finish its initial catalog");
-        let before =
-            crate::metadata_io::read_sobj::<DfsDefaultSifsMigrationCursor>(&cursor_path).unwrap();
-        let before_sequence = before.observed_journal_sequences["root"];
-        let mut backend =
-            open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("root")).unwrap();
-        for index in 0..20 {
-            let mut version = crate::metadata_records::object_version_record(&object, None);
-            version.version =
-                crate::DfsVersion::from_legacy_named(format!("non-routing-budget-version-{index}"))
-                    .unwrap();
-            backend.put_version(&version).unwrap();
-        }
-        drop(backend);
-        let (report, _, _, _, _) =
-            run_test_default_migration_pass(&data_dir, &file_system, &shards, &local, PASS_LIMIT);
-        let after =
-            crate::metadata_io::read_sobj::<DfsDefaultSifsMigrationCursor>(&cursor_path).unwrap();
-        assert_eq!(
-            after.observed_journal_sequences["root"] - before_sequence,
-            20,
-            "non-routing records do not spend the object-work budget"
-        );
-        assert!(after.dirty_object_ids.is_empty());
-        assert_eq!(report.migration.migrated_objects, 0);
-    }
-
-    #[test]
-    fn dirty_replay_bounds_journal_entries_even_for_one_repeated_object() {
-        const PASS_LIMIT: usize = 4;
-        let root = sinomo_testdir::TestDir::new("dfs-default-migration-journal-entry-budget");
-        let data_dir = SinomoDataDir::new(root.join("data"));
-        data_dir.ensure_root_layout().expect("data dir");
-        let local = NodeId::from_legacy_named("node_dfs_journal_entry_budget").expect("node");
-        let file_system = distributed_sifs(local.clone());
-        let shards = local_default_migration_shards(&file_system.file_system_id, &local);
-        let metadata_root = crate::default_dfs_metadata_shards_root(&data_dir);
-        let cursor_path =
-            default_sifs_migration_cursor_path(&metadata_root, &file_system.file_system_id);
-        let mut backend =
-            open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("root"))
-                .expect("root backend");
-        backend.put_file_system(&file_system).expect("filesystem");
-        let mut repeated = None;
-        for index in 0..20 {
-            let mut object = crate::distributed_sifs_bootstrap_objects(local.clone())
-                .into_iter()
-                .next()
-                .expect("bootstrap object");
-            object.object_id = crate::DfsObjectId::from_legacy_named(format!(
-                "obj_journal_entry_budget_{index:02}"
-            ))
-            .expect("object id");
-            object.path = format!("/journal-entry-budget-{index:02}");
-            backend.put_object(&object).expect("object");
-            repeated.get_or_insert(object);
-        }
-        drop(backend);
-
-        let (first, _, _, _, _) =
-            run_test_default_migration_pass(&data_dir, &file_system, &shards, &local, PASS_LIMIT);
-        assert!(first.migration.reached_limit);
-        let before = crate::metadata_io::read_sobj::<DfsDefaultSifsMigrationCursor>(&cursor_path)
-            .expect("initial durable cursor");
-        let before_sequence = before
-            .observed_journal_sequences
-            .get("root")
-            .copied()
-            .expect("root journal checkpoint");
-
-        let mut backend =
-            open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("root"))
-                .expect("root writer");
-        let mut repeated = repeated.expect("repeated object");
-        for generation in 1..=20_u64 {
-            repeated.changed_at_unix_nanos =
-                repeated.changed_at_unix_nanos.saturating_add(generation);
-            backend.put_object(&repeated).expect("repeated mutation");
-        }
-        drop(backend);
-
-        let (second, _, _, _, _) =
-            run_test_default_migration_pass(&data_dir, &file_system, &shards, &local, PASS_LIMIT);
-        assert!(second.migration.reached_limit);
-        let after = crate::metadata_io::read_sobj::<DfsDefaultSifsMigrationCursor>(&cursor_path)
-            .expect("bounded replay cursor");
-        let after_sequence = after
-            .observed_journal_sequences
-            .get("root")
-            .copied()
-            .expect("advanced root checkpoint");
-        assert_eq!(
-            after_sequence.saturating_sub(before_sequence),
-            PASS_LIMIT as u64,
-            "repeated mutations of one ID must not bypass the per-pass journal-entry budget"
-        );
-    }
-
-    #[test]
-    fn large_object_family_respects_physical_pass_cap_before_source_eviction() {
-        const FAMILY_RECORDS: usize = 9;
-        const PASS_LIMIT: usize = 5;
-        let root = sinomo_testdir::TestDir::new("dfs-default-migration-large-family");
-        let data_dir = SinomoDataDir::new(root.join("data"));
-        data_dir.ensure_root_layout().expect("data dir");
-        let local = NodeId::from_legacy_named("node_dfs_large_family").expect("node");
-        let file_system = distributed_sifs(local.clone());
-        let shards = local_default_migration_shards(&file_system.file_system_id, &local);
-        let metadata_root = crate::default_dfs_metadata_shards_root(&data_dir);
-        let mut source =
-            open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("root"))
-                .expect("root source");
-        source.put_file_system(&file_system).expect("filesystem");
-        let mut object = crate::distributed_sifs_bootstrap_objects(local.clone())
-            .into_iter()
-            .next()
-            .expect("bootstrap object");
-        object.object_id =
-            crate::DfsObjectId::from_legacy_named("obj_large_migration_family").expect("object id");
-        object.path = "/services/large-family.bin".to_string();
-        source.put_object(&object).expect("legacy object");
-
-        for index in 0..FAMILY_RECORDS {
-            let version =
-                DfsVersion::from_legacy_named(format!("version_large_migration_family_{index:02}"))
-                    .expect("version");
-            source
-                .put_version(&crate::DfsObjectVersionRecord {
-                    metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
-                    content_durability: None,
-                    retention: Default::default(),
-                    module_metadata: Default::default(),
-                    file_system_id: object.file_system_id.clone(),
-                    object_id: object.object_id.clone(),
-                    version: version.clone(),
-                    content_hash: Some(format!("blake3:large-family-{index:02}")),
-                    size_bytes: Some(index as u64),
-                    locations: vec![local.clone()],
-                    created_by_event_id: None,
-                    created_at: OffsetDateTime::UNIX_EPOCH,
-                    visible: true,
-                })
-                .expect("version record");
-            source
-                .put_receipt(&crate::DfsReplicaReceiptRecord {
-                    receipt: sinomo_core::DfsWriteReceipt {
-                        file_system_id: object.file_system_id.clone(),
-                        object_id: object.object_id.clone(),
-                        committed_version: version.clone(),
-                        owner_node_id: object.owner_node_id.clone(),
-                        event_id: sinomo_core::events::EventId::from_legacy_named(format!(
-                            "evt_large_migration_family_{index:02}"
-                        ))
-                        .expect("receipt event"),
-                    },
-                    replica_node_id: NodeId::from_legacy_named(format!(
-                        "node_large_migration_family_replica_{index:02}"
-                    ))
-                    .expect("replica node"),
-                    content_hash: Some(format!("blake3:large-family-{index:02}")),
-                    received_at: OffsetDateTime::UNIX_EPOCH,
-                })
-                .expect("receipt");
-            source
-                .put_intent(&crate::DfsWriteIntentRecord {
-                    publication: Default::default(),
-                    intent_id: format!("intent_large_migration_family_{index:02}"),
-                    file_system_id: object.file_system_id.clone(),
-                    object_id: object.object_id.clone(),
-                    base_version: None,
-                    target_version: version.clone(),
-                    coordinator_node_id: local.clone(),
-                    operation_id: None,
-                    operation_order_token: None,
-                    owner_epoch: 1,
-                    desired_replica_node_ids: vec![local.clone()],
-                    policy: crate::DfsReplicationPolicy::new(1, 1).expect("policy"),
-                    status: crate::DfsWriteIntentStatus::Staging,
-                    content_hash: None,
-                    object_metadata: None,
-                    touch_parent_on_create: false,
-                    create_predecessor_object_id: None,
-                    created_at: OffsetDateTime::UNIX_EPOCH,
-                    updated_at: None,
-                })
-                .expect("intent");
-            source
-                .put_conflict(&crate::DfsConflictRecord {
-                    conflict_id: format!("conflict_large_migration_family_{index:02}"),
-                    file_system_id: object.file_system_id.clone(),
-                    object_id: object.object_id.clone(),
-                    path: object.path.clone(),
-                    base_version: None,
-                    local_version: version.clone(),
-                    remote_version: object.version.clone(),
-                    detected_by_node_id: local.clone(),
-                    reason: "bounded family migration".to_string(),
-                    local_content_hash: None,
-                    remote_content_hash: None,
-                    created_by_intent_id: None,
-                    strategy: None,
-                    status: crate::DfsConflictStatus::Open,
-                    detected_at: OffsetDateTime::UNIX_EPOCH,
-                })
-                .expect("conflict");
-        }
-        drop(source);
-
-        let mut settled = false;
-        let mut source_evicted = false;
-        for pass in 0..64 {
-            let (report, _, buffered, index_writes, journal_writes) =
-                run_test_default_migration_pass(
-                    &data_dir,
-                    &file_system,
-                    &shards,
-                    &local,
-                    PASS_LIMIT,
-                );
-            assert!(
-                index_writes.saturating_add(journal_writes) <= PASS_LIMIT,
-                "pass {pass} exceeded the physical durable-mutation cap: {journal_writes} journal + {index_writes} index"
-            );
-            assert!(report.migration.scanned_objects <= PASS_LIMIT);
-            assert!(
-                buffered <= (PASS_LIMIT + 1).saturating_mul(shards.len()),
-                "pass {pass} buffered an unbounded object family: {buffered}"
-            );
-
-            let target =
-                open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("services"))
-                    .expect("services target");
-            let source =
-                open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("root"))
-                    .expect("source inspection");
-            let source_object = source
-                .get_object(&object.object_id)
-                .expect("source lookup")
-                .expect("source object or marker");
-            if source_object.kind == DfsObjectKind::Tombstone {
-                source_evicted = true;
-                // The bounded copier intentionally installs the object after
-                // its attached records. Export requires an anchored object;
-                // inspect the complete family only once eviction is allowed.
-                let target_family =
-                    crate::metadata_shard_migration::collect_object_metadata_family(
-                        &target,
-                        &object.object_id,
-                        4,
-                        None,
-                    )
-                    .expect("target family");
-                assert_eq!(target_family.versions.len(), FAMILY_RECORDS);
-                assert_eq!(target_family.receipts.len(), FAMILY_RECORDS);
-                assert_eq!(target_family.intents.len(), FAMILY_RECORDS);
-                assert_eq!(target_family.conflicts.len(), FAMILY_RECORDS);
-                let target_object = target
-                    .get_object(&object.object_id)
-                    .expect("target lookup")
-                    .expect("target object before eviction");
-                assert_ne!(target_object.kind, DfsObjectKind::Tombstone);
-                assert!(
-                    crate::metadata_shard_index::object_shard_index_matches(
-                        &metadata_root,
-                        &target_object,
-                        &DfsMetadataShardId::new("services"),
-                    )
-                    .expect("target index before eviction")
-                );
-            }
-            if !report.migration.reached_limit {
-                settled = true;
-                break;
-            }
-        }
-        assert!(settled, "bounded large-family migration must converge");
-        assert!(
-            source_evicted,
-            "the source is evicted only after the complete family becomes durable"
-        );
-    }
-
-    #[test]
-    fn default_migration_pages_large_version_pin_sets_within_the_pass_budget() {
-        const PIN_COUNT: usize = 40;
-        const PASS_LIMIT: usize = 5;
-        let root = sinomo_testdir::TestDir::new("dfs-default-migration-version-pin-pages");
-        let data_dir = SinomoDataDir::new(root.join("data"));
-        data_dir.ensure_root_layout().expect("data dir");
-        let local = NodeId::from_legacy_named("node_dfs_version_pin_pages").expect("node");
-        let file_system = distributed_sifs(local.clone());
-        let shards = local_default_migration_shards(&file_system.file_system_id, &local);
-        let metadata_root = crate::default_dfs_metadata_shards_root(&data_dir);
-        let cursor_path =
-            default_sifs_migration_cursor_path(&metadata_root, &file_system.file_system_id);
-        let mut source =
-            open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("root"))
-                .expect("root source");
-        source.put_file_system(&file_system).expect("filesystem");
-        let mut object = crate::distributed_sifs_bootstrap_objects(local.clone())
-            .into_iter()
-            .next()
-            .expect("bootstrap object");
-        object.object_id =
-            crate::DfsObjectId::from_legacy_named("obj_version_pin_pages").expect("object id");
-        object.path = "/services/version-pin-pages.bin".to_string();
-        source.put_object(&object).expect("legacy object");
-        let version = crate::object_version_record(&object, object.content_size_bytes);
-        source.put_version(&version).expect("pinned version");
-        for index in 0..PIN_COUNT {
-            source
-                .put_version_pin(&crate::DfsMetadataVersionPinRecord {
-                    namespace: None,
-                    file_system_id: object.file_system_id.clone(),
-                    object_id: object.object_id.clone(),
-                    version: version.version.clone(),
-                    pin_id: format!("checkpoint-{index:03}"),
-                    created_at: OffsetDateTime::UNIX_EPOCH,
-                })
-                .expect("put pin")
-                .expect("new pin");
-        }
-        drop(source);
-
-        let mut observed_partial_pin_page = false;
-        for pass in 0..32 {
-            let (report, _, buffered, index_writes, journal_writes) =
-                run_test_default_migration_pass(
-                    &data_dir,
-                    &file_system,
-                    &shards,
-                    &local,
-                    PASS_LIMIT,
-                );
-            assert!(
-                index_writes.saturating_add(journal_writes) <= PASS_LIMIT,
-                "pass {pass} exceeded the physical mutation cap"
-            );
-            assert!(
-                buffered <= (PASS_LIMIT + 1).saturating_mul(shards.len()),
-                "pass {pass} buffered an unbounded pin page"
-            );
-            let target =
-                open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("services"))
-                    .expect("target");
-            let copied = target
-                .version_pins_for_object(&object.object_id)
-                .expect("target pins")
-                .len();
-            if copied > 0 && copied < PIN_COUNT {
-                let cursor =
-                    crate::metadata_io::read_sobj::<DfsDefaultSifsMigrationCursor>(&cursor_path)
-                        .expect("durable migration cursor");
-                assert!(matches!(
-                    cursor.pending_migration.map(|pending| pending.stage),
-                    Some(DfsDefaultSifsPendingMigrationStage::VersionPins { after: Some(_) })
-                ));
-                observed_partial_pin_page = true;
-                break;
-            }
-            assert!(report.migration.reached_limit);
-        }
-        assert!(
-            observed_partial_pin_page,
-            "a large pin set must yield with a durable composite cursor before full materialization"
-        );
-    }
-
-    #[test]
-    fn default_migration_preserves_active_pin_transfer_provenance_exactly() {
-        const PASS_LIMIT: usize = 4;
-        let root = sinomo_testdir::TestDir::new("dfs-default-migration-pin-transfer");
-        let data_dir = SinomoDataDir::new(root.join("data"));
-        data_dir.ensure_root_layout().expect("data dir");
-        let local = NodeId::from_legacy_named("node_dfs_pin_transfer_migration").expect("node");
-        let file_system = distributed_sifs(local.clone());
-        let shards = local_default_migration_shards(&file_system.file_system_id, &local);
-        let mut source =
-            open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("root"))
-                .expect("root source");
-        source.put_file_system(&file_system).expect("filesystem");
-        let mut object = crate::distributed_sifs_bootstrap_objects(local)
-            .into_iter()
-            .next()
-            .expect("bootstrap object");
-        object.object_id =
-            crate::DfsObjectId::from_legacy_named("obj_pin_transfer_migration").expect("object id");
-        object.path = "/services/pin-transfer-migration.bin".to_string();
-        source.put_object(&object).expect("legacy object");
-        let version = crate::object_version_record(&object, object.content_size_bytes);
-        source.put_version(&version).expect("version");
-        let preexisting_pin = crate::DfsMetadataVersionPinRecord {
-            namespace: None,
-            file_system_id: object.file_system_id.clone(),
-            object_id: object.object_id.clone(),
-            version: version.version.clone(),
-            pin_id: "checkpoint-preexisting-before-transfer".to_string(),
-            created_at: OffsetDateTime::UNIX_EPOCH,
-        };
-        source
-            .put_version_pin(&preexisting_pin)
-            .expect("preexisting pin")
-            .expect("new preexisting pin");
-        let copied_pin = crate::DfsMetadataVersionPinRecord {
-            namespace: None,
-            file_system_id: object.file_system_id.clone(),
-            object_id: object.object_id.clone(),
-            version: version.version.clone(),
-            pin_id: "checkpoint-copied-by-transfer".to_string(),
-            created_at: OffsetDateTime::UNIX_EPOCH,
-        };
-        let source_pins = vec![preexisting_pin.clone(), copied_pin.clone()];
-        assert!(
-            source
-                .reconcile_cross_shard_pin_transfer(
-                    "active-transfer-before-topology-change",
-                    &object,
-                    "/legacy/pin-transfer-migration.bin",
-                    std::slice::from_ref(&version),
-                    &source_pins,
-                )
-                .expect("install source transfer")
-        );
-        let expected_transfer = source
-            .cross_shard_pin_transfers_for_object(&object.object_id)
-            .expect("source transfer")
-            .into_iter()
-            .next()
-            .expect("active source transfer");
-        assert_eq!(expected_transfer.source_pins.len(), 2);
-        assert_eq!(
-            expected_transfer.copied_pins,
-            vec![copied_pin.clone()],
-            "the source transfer must distinguish its copied pin from an acknowledged pre-existing pin"
-        );
-        drop(source);
-
-        let mut settled = false;
-        for _ in 0..64 {
-            let (report, _, _, _, _) = run_test_default_migration_pass(
-                &data_dir,
-                &file_system,
-                &shards,
-                &NodeId::from_legacy_named("node_dfs_pin_transfer_migration").expect("node"),
-                PASS_LIMIT,
-            );
-            if !report.migration.reached_limit {
-                settled = true;
-                break;
-            }
-        }
-        assert!(
-            settled,
-            "bounded migration with active transfer must converge"
-        );
-
-        let target =
-            open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("services"))
-                .expect("target");
-        assert_eq!(
-            target
-                .cross_shard_pin_transfers_for_object(&object.object_id)
-                .expect("target transfer"),
-            vec![expected_transfer],
-            "authoritative migration must preserve transfer identity, timestamps, and ownership"
-        );
-        let mut expected_pins = source_pins;
-        expected_pins.sort();
-        let mut target_pins = target
-            .version_pins_for_object(&object.object_id)
-            .expect("target pins");
-        target_pins.sort();
-        assert_eq!(
-            target_pins, expected_pins,
-            "both copied and independently owned acknowledged pins remain durable on the target"
-        );
-
-        let source = open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("root"))
-            .expect("source after eviction");
-        assert!(
-            source
-                .cross_shard_pin_transfers_for_object(&object.object_id)
-                .expect("source transfers after eviction")
-                .is_empty(),
-            "source provenance is removed atomically with source eviction"
-        );
-        assert!(
-            source
-                .version_pins_for_object(&object.object_id)
-                .expect("source pins after eviction")
-                .is_empty(),
-            "source-owned pins are removed atomically with source eviction"
-        );
-    }
-
-    #[test]
-    fn index_only_catalog_mutations_share_the_cursor_budget() {
-        const OBJECTS: usize = 65;
-        const PASS_LIMIT: usize = 7;
-        let root = sinomo_testdir::TestDir::new("dfs-default-migration-index-budget");
-        let data_dir = SinomoDataDir::new(root.join("data"));
-        data_dir.ensure_root_layout().expect("data dir");
-        let local = NodeId::from_legacy_named("node_dfs_index_budget").expect("node");
-        let file_system = distributed_sifs(local.clone());
-        let shards = local_default_migration_shards(&file_system.file_system_id, &local);
-        let mut backend =
-            open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("root"))
-                .expect("root backend");
-        backend.put_file_system(&file_system).expect("filesystem");
-        for index in 0..OBJECTS {
-            let mut object = crate::distributed_sifs_bootstrap_objects(local.clone())
-                .into_iter()
-                .next()
-                .expect("bootstrap object");
-            object.object_id =
-                crate::DfsObjectId::from_legacy_named(format!("obj_index_budget_{index:04}"))
-                    .expect("object id");
-            object.path = format!("/index-budget-{index:04}");
-            backend
-                .put_object(&object)
-                .expect("correctly routed object");
-        }
-        drop(backend);
-
-        let mut total_indexed = 0usize;
-        for _ in 0..32 {
-            let (report, _, _, index_writes, _) = run_test_default_migration_pass(
-                &data_dir,
-                &file_system,
-                &shards,
-                &local,
-                PASS_LIMIT,
-            );
-            assert!(report.migration.scanned_objects <= PASS_LIMIT);
-            assert_eq!(report.migration.migrated_objects, 0);
-            assert!(report.migration.indexed_objects <= PASS_LIMIT);
-            assert_eq!(index_writes, report.migration.indexed_objects);
-            total_indexed = total_indexed.saturating_add(report.migration.indexed_objects);
-            if !report.migration.reached_limit {
-                break;
-            }
-        }
-        assert_eq!(total_indexed, OBJECTS);
-    }
-
-    #[test]
-    fn journal_discontinuity_rejection_allows_snapshot_repair() {
-        assert!(metadata_journal_rejection_allows_snapshot_repair(
-            "metadata journal sequence 1 already exists with a different entry while replaying shard root"
-        ));
-        assert!(metadata_journal_rejection_allows_snapshot_repair(
-            "metadata serialization error: metadata journal batch for shard services starts unseen history at sequence 7722 but durable replay requires 1"
-        ));
-        assert!(metadata_journal_rejection_allows_snapshot_repair(
-            "metadata authority batch for shard root starts unseen history at sequence 9 but durable replay requires sequence 2"
-        ));
-        assert!(metadata_journal_rejection_allows_snapshot_repair(
-            "metadata serialization error: metadata shard root cannot extend prefix 2216 with journal entry root:2216"
-        ));
-        assert!(metadata_journal_rejection_allows_snapshot_repair(
-            "metadata serialization error: metadata journal sequence 14159 is within durable prefix 14162 but is missing while replaying shard root"
-        ));
-        assert!(metadata_journal_rejection_allows_snapshot_repair(
-            "metadata serialization error: metadata journal sequence 468 already exists with different exact bytes while replaying shard users"
-        ));
-        assert!(metadata_journal_rejection_allows_snapshot_repair(
-            "metadata serialization error: DFS metadata table snapshot semantic checksum mismatch"
-        ));
-        assert!(metadata_journal_rejection_allows_snapshot_repair(
-            "metadata serialization error: namespace prepare namespace-request:req-8b5580d0b15098efd9c04e59:namespace_visible-object_bc9da30bdab53c8c0113a91e6134e70eff884c8d7f1a2f92191b9c8104da5c14 object 2tq07ndspq14s8dmf4qyj0wdwf version expectation changed: expected Some(Id(\"276sg6e4bewycnkwcpyas522qq\")), current Some(Id(\"01kyp850yvbxpymhj3tcsyran1\"))"
-        ));
-        assert!(metadata_journal_rejection_allows_snapshot_repair(
-            "metadata serialization error: namespace prepare namespace-request:req-diverged path /target occupant expectation changed: expected None, current Some(Id(\"object-newer\"))"
-        ));
-        assert!(metadata_journal_rejection_allows_snapshot_repair(
-            "metadata serialization error: namespace prepare namespace-request:req-diverged overlaps active prepare namespace-request:req-newer"
-        ));
-        assert!(!metadata_journal_rejection_allows_snapshot_repair(
-            "metadata journal batch for shard services contains entry from shard root"
-        ));
-    }
-
-    #[test]
-    fn semantic_checksum_corrupt_replica_recovers_via_authoritative_snapshot() {
-        let target = sinomo_testdir::TestDir::new("sinomo-dfs-corrupt-replica-recovery");
-        let source_data_dir = SinomoDataDir::new(target.path().join("source"));
-        let receiver_data_dir = SinomoDataDir::new(target.path().join("receiver"));
-        source_data_dir
-            .ensure_root_layout()
-            .expect("source root layout");
-        receiver_data_dir
-            .ensure_root_layout()
-            .expect("receiver root layout");
-        let source_node_id =
-            NodeId::from_legacy_named("node_corrupt_replica_source").expect("source node");
-        let receiver_node_id =
-            NodeId::from_legacy_named("node_corrupt_replica_receiver").expect("receiver node");
-        let shard_id = DfsMetadataShardId::new("root");
-        let file_system = DfsFileSystem::sifs(source_node_id.clone());
-        let authoritative_display_name = file_system.display_name.clone();
-
-        let mut source_backend = LocalSobjMetadataBackend::new(
-            shard_id.clone(),
-            local_dfs_metadata_shard_path(&source_data_dir, &shard_id),
-        )
-        .expect("source backend");
-        source_backend
-            .put_file_system(&file_system)
-            .expect("authoritative filesystem");
-        let source_sequence = source_backend.journal_last_sequence();
-        let authoritative_snapshot = source_backend.export_table_snapshot();
-
-        let receiver_root = local_dfs_metadata_shard_path(&receiver_data_dir, &shard_id);
-        let mut receiver_backend = LocalSobjMetadataBackend::new(shard_id.clone(), &receiver_root)
-            .expect("receiver backend");
-        receiver_backend
-            .replace_with_replicated_snapshot(
-                shard_id.clone(),
-                source_sequence,
-                authoritative_snapshot,
-            )
-            .expect("seed receiver snapshot");
-        drop(receiver_backend);
-
-        let shard = DfsMetadataShardConfig {
-            file_system_id: file_system.file_system_id.clone(),
-            shard_id: shard_id.0.clone(),
-            primary_node_id: source_node_id.clone(),
-            replica_node_ids: vec![receiver_node_id.clone()],
-            epoch: 1,
-            assignment: crate::DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
-            default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
-        };
-        configure_replica_shard(&receiver_data_dir, &receiver_node_id, &shard);
-
-        let mut payloads_by_after_sequence = BTreeMap::new();
-        let target_publish = match prepare_dfs_metadata_journal_target_publish(
-            &mut source_backend,
-            &source_node_id,
-            receiver_node_id.clone(),
-            file_system.file_system_id.clone(),
-            shard_id.clone(),
+        assert_eq!(committed.version, stat.version);
+        assert_eq!(committed.content_hash, stat.content_hash);
+        let command = dfs_metadata_snapshot_install_command(
+            primary_view.metadata_backend_mut().unwrap(),
+            &primary,
+            &receiver,
+            &shard.file_system_id,
             shard.epoch,
-            source_sequence,
-            DfsMetadataJournalReplicationOptions {
-                probe_caught_up_replicas: true,
-                ..DfsMetadataJournalReplicationOptions::default()
-            },
-            &mut payloads_by_after_sequence,
+            &shard_id,
+            "native current snapshot replacement".into(),
         )
-        .expect("prepare caught-up replica probe")
-        {
-            DfsPreparedMetadataJournalTargetPublishResult::Publish { target } => target,
-            DfsPreparedMetadataJournalTargetPublishResult::NoChanges { outcome } => {
-                panic!("caught-up probe unexpectedly skipped: {outcome:?}")
-            }
-        };
-        assert!(target_publish.caught_up_probe);
-        assert_eq!(target_publish.commands.len(), 1);
-        assert!(target_publish.commands[0].batch.entries.is_empty());
+        .unwrap();
+        let expected = primary_view
+            .metadata_backend()
+            .unwrap()
+            .export_shard_table_snapshot(&shard_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(command.snapshot.prefix_proof, expected.prefix_proof);
         assert_eq!(
-            target_publish.commands[0].batch.next_after_sequence,
-            source_sequence
+            command.next_after_sequence,
+            expected.materialized_through_sequence
         );
-
-        let mut warm_transport = LocalReplicaRecoveryTransport {
-            receiver_data_dir: receiver_data_dir.clone(),
-            source_node_id: source_node_id.clone(),
-            target_node_id: receiver_node_id.clone(),
-            authority_context: DfsMetadataReplicaShardContext {
-                local_node_id: receiver_node_id.clone(),
-                shard: shard.clone(),
-                pending_membership_handoff: None,
-            },
-            journal_rejection_reason: None,
-            snapshot_install_calls: 0,
-        };
-        let mut warm_outcomes = Vec::new();
-        execute_prepared_dfs_metadata_journal_target_publish(
-            &source_data_dir,
-            &source_node_id,
-            target_publish.clone(),
-            &mut warm_transport,
-            DfsMetadataJournalReplicationOptions::default(),
-            &mut warm_outcomes,
-        )
-        .expect("healthy caught-up replica probe");
-        assert_eq!(
-            warm_outcomes,
-            vec![DfsMetadataJournalReplicationOutcome::NoChanges {
-                target_node_id: receiver_node_id.clone(),
-                shard_id: shard_id.clone(),
-                after_sequence: source_sequence,
-            }]
+        drop(primary_view);
+        let (peer, _) = runtime.peer_transports(&primary).unwrap();
+        let sender = dfs_metadata_snapshot_install_sender_from_peer_transport(peer);
+        let installed = sender(&receiver, &command, Duration::from_secs(5)).unwrap();
+        assert!(
+            matches!(
+                installed.result,
+                DfsMetadataSnapshotInstallResult::Installed { .. }
+            ),
+            "actual current snapshot install: {installed:?}"
         );
-        assert!(warm_transport.journal_rejection_reason.is_none());
-        assert_eq!(warm_transport.snapshot_install_calls, 0);
-        drop(source_backend);
-
+        runtime.stop_node(&receiver).unwrap();
         let snapshot_path =
             crate::metadata_table_store::metadata_table_snapshot_path(&receiver_root);
-        // Corrupt one current-format record without changing its framing or
-        // stored checksum. Recovery must still request an authoritative image.
-        let reader =
-            sinomo_core::storage::migration::stream::MigrationStreamReader::open(&snapshot_path)
-                .expect("receiver snapshot");
-        let payload_offset = reader.cursor().offset + 8;
-        drop(reader);
-        {
-            use std::io::{Seek, Write};
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&snapshot_path)
+        let _corrupt_bytes = corrupt_current_snapshot(&snapshot_path);
+        assert!(
+            LocalSobjMetadataBackend::open_for_inspection(shard_id.clone(), &receiver_root)
+                .is_err(),
+            "a genuine current-format corrupted snapshot cannot be accepted"
+        );
+        // The existing normal recovery route admits this pinned source image
+        // before the corrupted receiver can complete its startup generation.
+        // Reopen and repair both must succeed under the SAME original budget.
+        runtime
+            .reopen_node_with_startup_action(
+                receiver.clone(),
+                Box::new(|remaining| {
+                    let installed = sender(&receiver, &command, remaining)
+                        .map_err(|error| error.to_string())?;
+                    if !matches!(
+                        installed.result,
+                        DfsMetadataSnapshotInstallResult::Installed {
+                            archived_existing: true
+                        }
+                    ) {
+                        return Err(format!(
+                            "actual current corruption recovery rejected: {installed:?}"
+                        ));
+                    }
+                    Ok(())
+                }),
+            )
+            .unwrap();
+        let mut receiver_view =
+            LocalSobjMetadataBackend::open_for_inspection(shard_id.clone(), &receiver_root)
                 .unwrap();
-            file.seek(std::io::SeekFrom::Start(payload_offset)).unwrap();
-            file.write_all(b"BAD").unwrap();
-            file.sync_all().unwrap();
-        }
-        let open_error = LocalSobjMetadataBackend::new(shard_id.clone(), &receiver_root)
-            .expect_err("semantic checksum corruption must prevent ordinary open");
-        assert!(open_error.to_string().contains("checksum mismatch"));
+        receiver_view.begin_inspection_snapshot().unwrap();
+        let object = receiver_view.get_object(&stat.object_id).unwrap().unwrap();
+        assert_eq!(object.version, stat.version);
+        assert_eq!(object.content_hash, stat.content_hash);
+        assert_eq!(receiver_view.export_table_snapshot(), expected);
+        assert!(receiver_root.join("replica-repair-archives").is_dir());
+        receiver_view.end_inspection_snapshot();
+        drop(receiver_view);
+        drop(sender);
+        runtime.stop_node(&receiver).unwrap();
+        runtime.reopen_node(receiver).unwrap();
+        let mut reader = runtime.client(&primary).unwrap();
+        assert_eq!(
+            reader
+                .posix_read_file_distributed("/native-snapshot-recovery.bin")
+                .unwrap(),
+            b"actual sealed bytes"
+        );
+        drop(reader);
+        runtime.close().unwrap();
+    }
 
-        let mut transport = LocalReplicaRecoveryTransport {
-            receiver_data_dir: receiver_data_dir.clone(),
-            source_node_id: source_node_id.clone(),
-            target_node_id: receiver_node_id.clone(),
-            authority_context: DfsMetadataReplicaShardContext {
-                local_node_id: receiver_node_id.clone(),
-                shard: shard.clone(),
-                pending_membership_handoff: None,
-            },
-            journal_rejection_reason: None,
-            snapshot_install_calls: 0,
+    #[test]
+    fn native_stale_snapshot_cannot_roll_back_an_acknowledged_current_head() {
+        let nodes =
+            crate::test_runtime::DfsTestRuntime::ordered_node_ids("native-stale-snapshot", 3);
+        let mut runtime =
+            crate::test_runtime::DfsTestRuntime::new("native-stale-snapshot", nodes[0].clone())
+                .unwrap();
+        for node in &nodes[1..] {
+            runtime.define_node(node.clone()).unwrap();
+        }
+        runtime.start_nodes().unwrap();
+        let shard = runtime.root_shard().unwrap();
+        let primary = shard.primary_node_id.clone();
+        let receiver = shard.replica_node_ids[0].clone();
+        let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
+        let options = crate::DfsWriteOptions {
+            policy: crate::DfsReplicationPolicy::new(1, 1).unwrap(),
+            replica_candidates: vec![primary.clone()],
+            wait_for_commit: true,
+            foreground_replica_repair: false,
         };
-        let mut outcomes = Vec::new();
-        execute_prepared_dfs_metadata_journal_target_publish(
-            &source_data_dir,
-            &source_node_id,
-            target_publish,
+        let mut writer = runtime.client(&primary).unwrap();
+        let old = writer
+            .posix_write_file("/native-stale-cut.bin", b"old bytes", options.clone())
+            .unwrap();
+        let mut predecessor_view = runtime
+            .metadata_primary_service("/native-stale-cut.bin")
+            .unwrap();
+        assert_eq!(
+            predecessor_view
+                .metadata_backend()
+                .unwrap()
+                .get_object(&old.object_id)
+                .unwrap()
+                .unwrap()
+                .version,
+            old.version
+        );
+        let stale = dfs_metadata_snapshot_install_command(
+            predecessor_view.metadata_backend_mut().unwrap(),
+            &primary,
+            &receiver,
+            &shard.file_system_id,
+            shard.epoch,
+            &shard_id,
+            "native captured predecessor".into(),
+        )
+        .unwrap();
+        drop(predecessor_view);
+        let current = writer
+            .posix_write_file("/native-stale-cut.bin", b"current bytes", options)
+            .unwrap();
+        drop(writer);
+        let mut primary_view = runtime
+            .metadata_primary_service("/native-stale-cut.bin")
+            .unwrap();
+        assert_eq!(
+            primary_view
+                .metadata_backend()
+                .unwrap()
+                .get_object(&current.object_id)
+                .unwrap()
+                .unwrap()
+                .version,
+            current.version
+        );
+        let expected = primary_view
+            .metadata_backend()
+            .unwrap()
+            .export_shard_table_snapshot(&shard_id)
+            .unwrap()
+            .unwrap();
+        assert!(stale.next_after_sequence < expected.materialized_through_sequence);
+        assert!(expected.prefix_proof.is_well_formed());
+        assert_eq!(
+            expected.prefix_proof.journal_sequence,
+            expected.materialized_through_sequence
+        );
+        let (peer, _) = runtime.peer_transports(&primary).unwrap();
+        let sender = dfs_metadata_snapshot_install_sender_from_peer_transport(Arc::clone(&peer));
+        let journal_sender =
+            dfs_metadata_journal_batch_sender_from_peer_transport(runtime.data_dir(&primary), peer);
+        let mut transport = DfsMetadataNodeTransport::new(
+            shard.replica_node_ids.clone(),
+            journal_sender,
+            Arc::clone(&sender),
+        );
+        let convergence_started = Instant::now();
+        let outcomes = replicate_dfs_metadata_shard_to_target(
+            primary_view.metadata_backend_mut().unwrap(),
+            &primary,
+            &receiver,
+            &shard.file_system_id,
+            shard.epoch,
+            &shard_id,
+            0,
             &mut transport,
             DfsMetadataJournalReplicationOptions {
                 attempt_timeout: Duration::from_secs(5),
                 target_timeout: Duration::from_secs(5),
-                ..DfsMetadataJournalReplicationOptions::default()
+                ..Default::default()
             },
-            &mut outcomes,
         )
-        .expect("publisher snapshot repair");
-
-        let rejection_reason = transport
-            .journal_rejection_reason
-            .expect("warm-cache semantic checksum rejection");
-        assert!(rejection_reason.contains("checksum mismatch"));
-        assert!(metadata_journal_rejection_allows_snapshot_repair(
-            &rejection_reason
-        ));
-        assert_eq!(transport.snapshot_install_calls, 1);
-        assert!(matches!(
-            outcomes.as_slice(),
-            [DfsMetadataJournalReplicationOutcome::SnapshotInstalled {
-                target_node_id,
-                shard_id: installed_shard_id,
-                next_after_sequence,
-                archived_existing: true,
-            }] if target_node_id == &receiver_node_id
-                && installed_shard_id == &shard_id
-                && *next_after_sequence == source_sequence
-        ));
-
-        let repaired = LocalSobjMetadataBackend::new(shard_id, &receiver_root)
-            .expect("reopen repaired receiver");
-        let repaired_file_system = repaired
-            .get_file_system(&file_system.file_system_id)
-            .expect("read repaired filesystem")
-            .expect("repaired filesystem");
-        assert_eq!(
-            repaired_file_system.display_name,
-            authoritative_display_name
-        );
-        assert!(receiver_root.join("replica-repair-archives").is_dir());
-    }
-
-    #[test]
-    fn valid_stale_replica_recovers_from_exact_caught_up_probe() {
-        let target = sinomo_testdir::TestDir::new("sinomo-dfs-stale-replica-recovery");
-        let source_data_dir = SinomoDataDir::new(target.path().join("source"));
-        let receiver_data_dir = SinomoDataDir::new(target.path().join("receiver"));
-        source_data_dir
-            .ensure_root_layout()
-            .expect("source root layout");
-        receiver_data_dir
-            .ensure_root_layout()
-            .expect("receiver root layout");
-        let source_node_id =
-            NodeId::from_legacy_named("node_stale_replica_source").expect("source node");
-        let receiver_node_id =
-            NodeId::from_legacy_named("node_stale_replica_receiver").expect("receiver node");
-        let shard_id = DfsMetadataShardId::new("root");
-        let mut file_system = DfsFileSystem::sifs(source_node_id.clone());
-
-        let mut source_backend = LocalSobjMetadataBackend::new(
-            shard_id.clone(),
-            local_dfs_metadata_shard_path(&source_data_dir, &shard_id),
-        )
-        .expect("source backend");
-        source_backend
-            .put_file_system(&file_system)
-            .expect("initial filesystem");
-        let stale_sequence = source_backend.journal_last_sequence();
-        let stale_snapshot = source_backend.export_table_snapshot();
-        file_system.display_name = "authoritative-after-stale-snapshot".to_string();
-        source_backend
-            .put_file_system(&file_system)
-            .expect("updated filesystem");
-        let source_sequence = source_backend.journal_last_sequence();
-        assert!(source_sequence > stale_sequence);
-
-        let receiver_root = local_dfs_metadata_shard_path(&receiver_data_dir, &shard_id);
-        let mut receiver_backend = LocalSobjMetadataBackend::new(shard_id.clone(), &receiver_root)
-            .expect("receiver backend");
-        receiver_backend
-            .replace_with_replicated_snapshot(shard_id.clone(), stale_sequence, stale_snapshot)
-            .expect("seed valid stale receiver");
-        drop(receiver_backend);
-
-        let shard = DfsMetadataShardConfig {
-            file_system_id: file_system.file_system_id.clone(),
-            shard_id: shard_id.0.clone(),
-            primary_node_id: source_node_id.clone(),
-            replica_node_ids: vec![receiver_node_id.clone()],
-            epoch: 1,
-            assignment: crate::DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
-            default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
-        };
-        configure_replica_shard(&receiver_data_dir, &receiver_node_id, &shard);
-        let mut payloads_by_after_sequence = BTreeMap::new();
-        let target_publish = match prepare_dfs_metadata_journal_target_publish(
-            &mut source_backend,
-            &source_node_id,
-            receiver_node_id.clone(),
-            file_system.file_system_id.clone(),
-            shard_id.clone(),
-            shard.epoch,
-            source_sequence,
-            DfsMetadataJournalReplicationOptions {
-                probe_caught_up_replicas: true,
-                ..DfsMetadataJournalReplicationOptions::default()
-            },
-            &mut payloads_by_after_sequence,
-        )
-        .expect("prepare exact caught-up probe")
-        {
-            DfsPreparedMetadataJournalTargetPublishResult::Publish { target } => target,
-            DfsPreparedMetadataJournalTargetPublishResult::NoChanges { outcome } => {
-                panic!("exact caught-up probe unexpectedly skipped: {outcome:?}")
-            }
-        };
-        assert!(target_publish.caught_up_probe);
-        assert!(target_publish.commands[0].verify_prefix_only);
-        drop(source_backend);
-
-        let mut transport = LocalReplicaRecoveryTransport {
-            receiver_data_dir: receiver_data_dir.clone(),
-            source_node_id: source_node_id.clone(),
-            target_node_id: receiver_node_id.clone(),
-            authority_context: DfsMetadataReplicaShardContext {
-                local_node_id: receiver_node_id.clone(),
-                shard: shard.clone(),
-                pending_membership_handoff: None,
-            },
-            journal_rejection_reason: None,
-            snapshot_install_calls: 0,
-        };
-        let mut outcomes = Vec::new();
-        execute_prepared_dfs_metadata_journal_target_publish(
-            &source_data_dir,
-            &source_node_id,
-            target_publish,
-            &mut transport,
-            DfsMetadataJournalReplicationOptions::default(),
-            &mut outcomes,
-        )
-        .expect("repair valid stale replica");
-
-        let rejection_reason = transport
-            .journal_rejection_reason
-            .expect("exact-prefix mismatch rejection");
-        assert!(rejection_reason.contains("metadata journal prefix probe state mismatch"));
-        assert_eq!(transport.snapshot_install_calls, 1);
-        assert!(matches!(
-            outcomes.as_slice(),
-            [DfsMetadataJournalReplicationOutcome::SnapshotInstalled {
-                target_node_id,
-                shard_id: installed_shard_id,
-                next_after_sequence,
-                ..
-            }] if target_node_id == &receiver_node_id
-                && installed_shard_id == &shard_id
-                && *next_after_sequence == source_sequence
-        ));
-
-        let repaired = LocalSobjMetadataBackend::new(shard_id, receiver_root)
-            .expect("reopen repaired receiver");
-        assert_eq!(
-            repaired
-                .get_file_system(&file_system.file_system_id)
-                .expect("read repaired filesystem")
-                .expect("repaired filesystem")
-                .display_name,
-            file_system.display_name
-        );
-    }
-
-    #[test]
-    fn replica_backend_io_open_failure_is_not_snapshot_repair_rejection() {
-        let target = sinomo_testdir::TestDir::new("sinomo-dfs-replica-io-open-error");
-        let data_dir = SinomoDataDir::new(target.path());
-        data_dir.ensure_root_layout().expect("root layout");
-        let source_node_id =
-            NodeId::from_legacy_named("node_replica_io_source").expect("source node");
-        let receiver_node_id =
-            NodeId::from_legacy_named("node_replica_io_receiver").expect("receiver node");
-        let shard_id = DfsMetadataShardId::new("root");
-        let file_system = DfsFileSystem::sifs(source_node_id.clone());
-        let shard = DfsMetadataShardConfig {
-            file_system_id: file_system.file_system_id.clone(),
-            shard_id: shard_id.0.clone(),
-            primary_node_id: source_node_id.clone(),
-            replica_node_ids: vec![receiver_node_id.clone()],
-            epoch: 1,
-            assignment: crate::DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
-            default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
-        };
-        configure_replica_shard(&data_dir, &receiver_node_id, &shard);
-
-        let shard_root = local_dfs_metadata_shard_path(&data_dir, &shard_id);
-        std::fs::create_dir_all(shard_root.parent().expect("metadata parent"))
-            .expect("metadata parent");
-        std::fs::write(&shard_root, b"not a metadata directory")
-            .expect("non-directory shard fixture");
-        let command = dfs_metadata_journal_batch_command(
-            &source_node_id,
-            &receiver_node_id,
-            &file_system.file_system_id,
-            shard.epoch,
-            DfsMetadataJournalBatch {
-                shard_id,
-                entries: Vec::new(),
-                next_after_sequence: 0,
-            },
-        );
-        let authority_context = DfsMetadataReplicaShardContext {
-            local_node_id: receiver_node_id,
-            shard: shard.clone(),
-            pending_membership_handoff: None,
-        };
-        let error = process_cluster_dfs_metadata_journal_batch_with_context(
-            &data_dir,
-            &source_node_id,
-            command,
-            Some(authority_context.clone()),
-        )
-        .expect_err("non-corruption open error must propagate");
-        assert!(matches!(error, DfsError::Metadata { .. }));
+        .unwrap();
+        assert!(outcomes.iter().any(|outcome| matches!(outcome,
+            DfsMetadataJournalReplicationOutcome::Applied { target_node_id, next_after_sequence, .. }
+                if target_node_id == &receiver && *next_after_sequence == expected.materialized_through_sequence
+        )), "selected real receiver must durably acknowledge current head: {outcomes:?}");
+        let remaining = Duration::from_secs(5).saturating_sub(convergence_started.elapsed());
         assert!(
-            !error
-                .to_string()
-                .contains(DFS_METADATA_UNREADABLE_REPLICA_SNAPSHOT_REPAIR_REASON)
+            !remaining.is_zero(),
+            "current-view convergence retains its five-second budget"
         );
-
-        let mut snapshot_source = LocalSobjMetadataBackend::new(
-            DfsMetadataShardId::new("root"),
-            target.path().join("snapshot-source"),
+        let probe = dfs_metadata_caught_up_probe_command(
+            &primary,
+            &receiver,
+            &shard.file_system_id,
+            &shard_id,
+            shard.epoch,
+            expected.materialized_through_sequence,
+            expected.prefix_proof.digest.clone(),
+        );
+        let confirmed = transport
+            .send_metadata_journal_batch(&receiver, &probe, remaining)
+            .unwrap();
+        assert!(
+            matches!(confirmed.result, DfsMetadataJournalBatchResult::Applied),
+            "actual current-view probe: {confirmed:?}"
+        );
+        assert!(confirmed.verified_prefix_only);
+        assert_eq!(
+            confirmed.next_after_sequence,
+            expected.materialized_through_sequence
+        );
+        drop(transport);
+        let current_snapshot = dfs_metadata_snapshot_install_command(
+            primary_view.metadata_backend_mut().unwrap(),
+            &primary,
+            &receiver,
+            &shard.file_system_id,
+            shard.epoch,
+            &shard_id,
+            "actual current image after corrupt stale rejection".into(),
         )
-        .expect("snapshot source");
-        snapshot_source
-            .put_file_system(&file_system)
-            .expect("snapshot filesystem");
-        let snapshot_sequence = snapshot_source.journal_last_sequence();
-        let snapshot = snapshot_source.export_table_snapshot();
-        let snapshot_error = process_cluster_dfs_metadata_snapshot_install_with_context(
-            &data_dir,
-            &source_node_id,
-            DfsMetadataSnapshotInstallCommand {
-                request_id: "replica-io-snapshot".to_string(),
-                source_node_id: source_node_id.clone(),
-                file_system_id: Some(file_system.file_system_id),
-                authority_epoch: Some(shard.epoch),
-                primary_handoff_id: None,
-                shard_id: DfsMetadataShardId::new("root"),
-                next_after_sequence: snapshot_sequence,
-                snapshot,
-                reason: "IO errors must not archive replica state".to_string(),
-            },
-            Some(authority_context),
-        )
-        .expect_err("snapshot install must propagate non-corruption open error");
-        assert!(matches!(snapshot_error, DfsError::Metadata { .. }));
-        assert!(!shard_root.join("replica-repair-archives").exists());
+        .unwrap();
+        assert_eq!(
+            current_snapshot.snapshot.prefix_proof,
+            expected.prefix_proof
+        );
+        drop(primary_view);
+        let receiver_root = local_dfs_metadata_shard_path(runtime.data_dir(&receiver), &shard_id);
+        let before =
+            LocalSobjMetadataBackend::open_for_inspection(shard_id.clone(), &receiver_root)
+                .unwrap();
+        let floor = before
+            .metadata_prefix_ack_floor(&shard_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            floor.journal_sequence,
+            expected.materialized_through_sequence
+        );
+        assert_eq!(floor.durable_prefix_proof, expected.prefix_proof);
+        drop(before);
+        let rejected = sender(&receiver, &stale, Duration::from_secs(5)).unwrap();
+        assert!(
+            matches!(
+                rejected.result,
+                DfsMetadataSnapshotInstallResult::Rejected { .. }
+            ),
+            "actual receiver authority floor forbids predecessor rollback"
+        );
+        let mut reader =
+            LocalSobjMetadataBackend::open_for_inspection(shard_id.clone(), &receiver_root)
+                .unwrap();
+        reader.begin_inspection_snapshot().unwrap();
+        let object = reader.get_object(&current.object_id).unwrap().unwrap();
+        assert_eq!(object.version, current.version);
+        let actual = reader.export_table_snapshot();
+        assert_eq!(actual, expected);
+        reader.end_inspection_snapshot();
+        drop(reader);
+        // Repeat the SAME genuine stale image against an unreadable replica.
+        // The normal native slot must reach its durable floor check before archive.
+        runtime.stop_node(&receiver).unwrap();
+        let snapshot_path =
+            crate::metadata_table_store::metadata_table_snapshot_path(&receiver_root);
+        let damaged = corrupt_current_snapshot(&snapshot_path);
+        assert!(
+            LocalSobjMetadataBackend::open_for_inspection(shard_id.clone(), &receiver_root)
+                .is_err()
+        );
+        let archive = receiver_root.join("replica-repair-archives");
+        assert!(
+            !archive.exists(),
+            "this negative cut starts without repair archives"
+        );
+        let prefix_floor =
+            metadata_cursor::metadata_prefix_ack_floor(&receiver_root, &shard_id).unwrap();
+        let authority_floor =
+            metadata_cursor::metadata_authority_ack_floor(&receiver_root, &shard_id).unwrap();
+        assert_eq!(prefix_floor.as_ref(), Some(&floor));
+        let receiver_data = runtime.data_dir(&receiver).clone();
+        runtime
+            .reopen_node_with_startup_action(
+                receiver.clone(),
+                Box::new(|remaining| {
+                    let began = Instant::now();
+                    let rejection = sender(&receiver, &stale, remaining);
+                    let reason = match rejection {
+                        Ok(response) => match response.result {
+                            DfsMetadataSnapshotInstallResult::Rejected { reason, .. } => reason,
+                            other => panic!("corrupt receiver accepted stale snapshot: {other:?}"),
+                        },
+                        Err(error) => error.to_string(),
+                    };
+                    assert!(
+                        reason.contains("behind locally acknowledged"),
+                        "actual unreadable replacement must reach its durable floor: {reason}"
+                    );
+                    assert_eq!(
+                        std::fs::read(&snapshot_path).unwrap(),
+                        damaged,
+                        "floor rejection preserves the exact corrupt record bytes"
+                    );
+                    assert!(
+                        !archive.exists(),
+                        "floor rejection cannot archive or publish replacement"
+                    );
+                    assert_eq!(
+                        metadata_cursor::metadata_prefix_ack_floor(&receiver_root, &shard_id)
+                            .unwrap(),
+                        prefix_floor
+                    );
+                    assert_eq!(
+                        metadata_cursor::metadata_authority_ack_floor(&receiver_root, &shard_id)
+                            .unwrap(),
+                        authority_floor
+                    );
+                    assert!(
+                        LocalSobjMetadataBackend::open_for_inspection(
+                            shard_id.clone(),
+                            &receiver_root
+                        )
+                        .is_err()
+                    );
+                    let peer = crate::runtime_host::read_daemon_dfs_message_peer_snapshot(
+                        &ClusterPaths::new(&receiver_data),
+                    )
+                    .unwrap()
+                    .unwrap();
+                    let resident = crate::runtime_host::daemon_dfs_bounded_status_resident(
+                        &receiver_data,
+                        &peer,
+                    )
+                    .expect("actual corrupt receiver resident generation");
+                    let status = resident.bounded_status_snapshot().unwrap();
+                    assert!(
+                        status
+                            .bounded_omissions
+                            .iter()
+                            .any(|omission| matches!(omission,
+                    crate::DfsOperatorStatusOmission::NonPrimaryResidentMetadataNotHydrated {
+                        file_system_id, shard_id: unavailable
+                    } if file_system_id == &shard.file_system_id && unavailable == &shard_id)),
+                        "corrupt replica status cannot become an invented complete projection"
+                    );
+                    let remaining = remaining.saturating_sub(began.elapsed());
+                    assert!(
+                        !remaining.is_zero(),
+                        "negative and actual recovery share the original budget"
+                    );
+                    let installed = sender(&receiver, &current_snapshot, remaining)
+                        .map_err(|error| error.to_string())?;
+                    assert!(
+                        matches!(
+                            installed.result,
+                            DfsMetadataSnapshotInstallResult::Installed {
+                                archived_existing: true
+                            }
+                        ),
+                        "the same native ingress admits the genuine current image: {installed:?}"
+                    );
+                    Ok(())
+                }),
+            )
+            .unwrap();
+        let mut recovered =
+            LocalSobjMetadataBackend::open_for_inspection(shard_id.clone(), &receiver_root)
+                .unwrap();
+        recovered.begin_inspection_snapshot().unwrap();
+        assert_eq!(recovered.export_table_snapshot(), expected);
+        assert_eq!(
+            recovered
+                .get_object(&current.object_id)
+                .unwrap()
+                .unwrap()
+                .version,
+            current.version
+        );
+        recovered.end_inspection_snapshot();
+        drop(recovered);
+        drop(sender);
+        runtime.close().unwrap();
     }
 
     #[test]
@@ -17024,9 +8811,9 @@ mod cursor_update_tests {
                 prefix_probe: None,
                 authority_probe: None,
                 durable_replication: None,
-                batch: DfsMetadataJournalBatch {
+                batch: crate::DfsMetadataJournalFrameBatch {
                     shard_id: shard_id.clone(),
-                    entries: Vec::new(),
+                    journal_frames: Vec::new(),
                     next_after_sequence: 1,
                 },
             },
@@ -17042,7 +8829,8 @@ mod cursor_update_tests {
             sinomo_testdir::TestDir::new("sinomo-dfs-replica-ingress-snapshot-source");
         let snapshot = LocalSobjMetadataBackend::new(shard_id.clone(), snapshot_source.path())
             .expect("snapshot source backend")
-            .export_table_snapshot();
+            .export_snapshot_image()
+            .expect("native snapshot image");
         let snapshot_response = process_cluster_dfs_metadata_snapshot_install(
             &data_dir,
             &cluster_paths,
@@ -17055,7 +8843,8 @@ mod cursor_update_tests {
                 primary_handoff_id: None,
                 shard_id,
                 next_after_sequence: 1,
-                snapshot,
+                snapshot: snapshot.descriptor().clone(),
+                image: Some(snapshot),
                 reason: "test unauthorized ingress".to_string(),
             },
         )
@@ -17108,453 +8897,100 @@ mod cursor_update_tests {
             42
         );
     }
-
-    #[test]
-    fn exact_primary_handoff_snapshot_repairs_frozen_promoted_replica() {
-        let target = sinomo_testdir::TestDir::new("sinomo-dfs-primary-handoff-snapshot-repair");
-        let shard_id = DfsMetadataShardId::new("root");
-        let source_node_id = NodeId::from_legacy_named("handoff-snapshot-source").unwrap();
-        let promoted_node_id = NodeId::from_legacy_named("handoff-snapshot-promoted").unwrap();
-        let other_node_id = NodeId::from_legacy_named("handoff-snapshot-other").unwrap();
-        let mut file_system = DfsFileSystem::sifs(source_node_id.clone());
-        file_system.display_name = "primary handoff snapshot repair".to_string();
-
-        let mut source =
-            LocalSobjMetadataBackend::new(shard_id.clone(), target.path().join("source"))
-                .expect("source backend");
-        source
-            .put_file_system(&file_system)
-            .expect("source filesystem");
-        let sequence = source.journal_last_sequence();
-        let snapshot = source.export_table_snapshot();
-        let state_fingerprint =
-            crate::service_sync::metadata_shard_state_fingerprint_at(&source, &shard_id, sequence)
-                .expect("source checkpoint");
-
-        let mut receiver =
-            LocalSobjMetadataBackend::new(shard_id.clone(), target.path().join("receiver"))
-                .expect("receiver backend");
-        receiver
-            .replace_with_replicated_snapshot(shard_id.clone(), sequence, snapshot.clone())
-            .expect("seed promoted replica");
-
-        let retiring = DfsMetadataShardConfig {
-            file_system_id: file_system.file_system_id.clone(),
-            shard_id: shard_id.0.clone(),
-            primary_node_id: source_node_id.clone(),
-            replica_node_ids: vec![promoted_node_id.clone(), other_node_id.clone()],
-            epoch: 7,
-            assignment: crate::DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
-            default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
-        };
-        let desired = DfsMetadataShardConfig {
-            file_system_id: retiring.file_system_id.clone(),
-            shard_id: retiring.shard_id.clone(),
-            primary_node_id: promoted_node_id.clone(),
-            replica_node_ids: vec![other_node_id, source_node_id.clone()],
-            epoch: 8,
-            assignment: retiring.assignment.clone(),
-            namespace_prepare_codec: Default::default(),
-            default_policy: retiring.default_policy.clone(),
-        };
-        let handoff_id = "handoff-snapshot-repair".to_string();
-        receiver
-            .freeze_metadata_shard_for_membership_handoff(&shard_id, &handoff_id, retiring.epoch)
-            .expect("freeze promoted replica")
-            .expect("local shard");
-        let context = DfsMetadataReplicaShardContext {
-            local_node_id: promoted_node_id,
-            shard: retiring.clone(),
-            pending_membership_handoff: Some(DfsMetadataShardMembershipHandoff {
-                handoff_id: handoff_id.clone(),
-                retiring_shard: retiring.clone(),
-                desired_shard: desired,
-                required_prepared_sequence: 0,
-                required_head_watermark: None,
-                retiring_primary_fence: Some(crate::DfsMetadataShardMembershipHandoffFence {
-                    handoff_id: handoff_id.clone(),
-                    primary_node_id: source_node_id.clone(),
-                    journal_sequence: sequence,
-                    state_fingerprint,
-                }),
-            }),
-        };
-        let command = DfsMetadataSnapshotInstallCommand {
-            request_id: "primary-handoff-snapshot-repair".to_string(),
-            source_node_id,
-            file_system_id: Some(retiring.file_system_id),
-            authority_epoch: Some(retiring.epoch),
-            primary_handoff_id: Some(handoff_id),
-            shard_id: shard_id.clone(),
-            next_after_sequence: sequence,
-            snapshot,
-            reason: "repair promoted replica to the exact frozen checkpoint".to_string(),
-        };
-
-        let mut ordinary = command.clone();
-        ordinary.primary_handoff_id = None;
-        let mut outbound = ordinary.clone();
-        let mut sender_context = context.clone();
-        sender_context.local_node_id = outbound.source_node_id.clone();
-        bind_pending_primary_handoff_snapshot_for_target(
-            &sender_context,
-            &context.local_node_id,
-            &mut outbound,
-        );
-        assert_eq!(
-            outbound.primary_handoff_id.as_deref(),
-            command.primary_handoff_id.as_deref(),
-            "the direct publisher must bind the exact promoted-target handoff"
-        );
-        assert!(matches!(
-            process_dfs_metadata_snapshot_install(&mut receiver, Some(&context), ordinary).result,
-            DfsMetadataSnapshotInstallResult::Rejected { ref reason , ..}
-                if reason.contains("frozen for pending membership handoff")
-        ));
-        assert!(matches!(
-            process_dfs_metadata_snapshot_install(&mut receiver, Some(&context), command).result,
-            DfsMetadataSnapshotInstallResult::Installed { .. }
-        ));
-        assert!(
-            receiver
-                .metadata_shard_authoritative_writes_frozen(&shard_id)
-                .expect("promoted replica remains fenced until activation")
-        );
-    }
-
-    #[test]
-    fn exact_primary_handoff_snapshot_preserves_authoritative_gc_after_promotion() {
-        let target = sinomo_testdir::TestDir::new("sinomo-dfs-primary-handoff-snapshot-gc");
-        let shard_id = DfsMetadataShardId::new("root");
-        let source_node_id = NodeId::from_legacy_named("handoff-gc-source").unwrap();
-        let promoted_node_id = NodeId::from_legacy_named("handoff-gc-promoted").unwrap();
-        let other_node_id = NodeId::from_legacy_named("handoff-gc-other").unwrap();
-        let mut file_system = DfsFileSystem::sifs(source_node_id.clone());
-        file_system.display_name = "primary handoff snapshot GC".to_string();
-        let object_id =
-            crate::DfsObjectId::from_legacy_named("object_handoff_gc").expect("object id");
-        let old_version =
-            DfsVersion::from_legacy_named("version_handoff_gc_old").expect("old version");
-        let live_version =
-            DfsVersion::from_legacy_named("version_handoff_gc_live").expect("live version");
-        let live = crate::DfsObjectMetadata {
-            object_id: object_id.clone(),
-            file_system_id: file_system.file_system_id.clone(),
-            path: "/handoff-gc.txt".to_string(),
-            kind: DfsObjectKind::File,
-            tombstone_provenance: None,
-            owner_node_id: source_node_id.clone(),
-            current_locations: vec![source_node_id.clone(), promoted_node_id.clone()],
-            content_hash: None,
-            content_size_bytes: None,
-            link_target_object_id: None,
-            mode: 0o644,
-            uid: 0,
-            gid: 0,
-            accessed_at_unix_nanos: 1,
-            modified_at_unix_nanos: 2,
-            created_at_unix_nanos: 1,
-            changed_at_unix_nanos: 2,
-            version: live_version.clone(),
-            policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
-            created_by_event_id: None,
-            last_modified_by_event_id: None,
-        };
-        let old_version_record = DfsObjectVersionRecord {
-            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
-            content_durability: None,
-            retention: Default::default(),
-            module_metadata: Default::default(),
-            file_system_id: file_system.file_system_id.clone(),
-            object_id: object_id.clone(),
-            version: old_version.clone(),
-            content_hash: None,
-            size_bytes: None,
-            locations: vec![source_node_id.clone()],
-            created_by_event_id: None,
-            created_at: OffsetDateTime::UNIX_EPOCH,
-            visible: true,
-        };
-        let live_version_record = DfsObjectVersionRecord {
-            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
-            content_durability: None,
-            retention: Default::default(),
-            module_metadata: Default::default(),
-            file_system_id: file_system.file_system_id.clone(),
-            object_id: object_id.clone(),
-            version: live_version.clone(),
-            content_hash: None,
-            size_bytes: None,
-            locations: live.current_locations.clone(),
-            created_by_event_id: None,
-            created_at: OffsetDateTime::from_unix_timestamp(1).expect("live version timestamp"),
-            visible: true,
-        };
-        let terminal_intent = crate::DfsWriteIntentRecord {
-            publication: Default::default(),
-            intent_id: "dfs_intent_handoff_gc_1".to_string(),
-            file_system_id: file_system.file_system_id.clone(),
-            object_id: object_id.clone(),
-            base_version: Some(old_version.clone()),
-            target_version: live_version.clone(),
-            coordinator_node_id: source_node_id.clone(),
-            operation_id: None,
-            operation_order_token: None,
-            owner_epoch: 7,
-            desired_replica_node_ids: vec![source_node_id.clone(), promoted_node_id.clone()],
-            policy: crate::DfsReplicationPolicy::confirmed(2).expect("replication policy"),
-            status: crate::DfsWriteIntentStatus::Aborted,
-            content_hash: None,
-            object_metadata: Some(live.clone()),
-            touch_parent_on_create: false,
-            create_predecessor_object_id: None,
-            created_at: OffsetDateTime::UNIX_EPOCH,
-            updated_at: Some(OffsetDateTime::UNIX_EPOCH),
-        };
-
-        let source_root = target.path().join("source");
-        let mut source =
-            LocalSobjMetadataBackend::new(shard_id.clone(), &source_root).expect("source backend");
-        source
-            .put_file_system(&file_system)
-            .expect("source filesystem");
-        source
-            .put_version(&old_version_record)
-            .expect("old source version");
-        source
-            .put_version(&live_version_record)
-            .expect("live source version");
-        source.put_object(&live).expect("live source object");
-        source
-            .put_intent(&terminal_intent)
-            .expect("terminal source intent");
-
-        let pre_gc_sequence = source.journal_last_sequence();
-        let pre_gc_snapshot = source.export_table_snapshot();
-        let receiver_root = target.path().join("receiver");
-        let mut receiver = LocalSobjMetadataBackend::new(shard_id.clone(), &receiver_root)
-            .expect("receiver backend");
-        receiver
-            .replace_with_replicated_snapshot(shard_id.clone(), pre_gc_sequence, pre_gc_snapshot)
-            .expect("seed promoted replica with pre-GC history");
-        assert!(
-            receiver
-                .get_version(&object_id, &old_version)
-                .expect("seeded old version")
-                .is_some()
-        );
-        assert!(
-            receiver
-                .export_table_snapshot()
-                .tables
-                .expect("seeded snapshot tables")
-                .intents
-                .iter()
-                .any(|intent| intent.object_id == object_id
-                    && intent.intent_id == terminal_intent.intent_id)
-        );
-
-        let gc = source
-            .gc_metadata_history_authoritative(crate::DfsMetadataHistoryGcOptions::delete_eligible(
-                Duration::ZERO,
-                1,
-            ))
-            .expect("durable authoritative metadata GC");
-        assert_eq!(gc.removed_version_count, 1);
-        assert_eq!(gc.compacted_intent_count, 1);
-        drop(source);
-
-        let source =
-            LocalSobjMetadataBackend::new(shard_id.clone(), &source_root).expect("reopen source");
-        assert_eq!(
-            source
-                .get_version(&object_id, &old_version)
-                .expect("reopened old version"),
-            None,
-            "durable GC must remove the old version before handoff"
-        );
-        assert!(
-            source
-                .export_table_snapshot()
-                .tables
-                .expect("reopened source tables")
-                .intents
-                .iter()
-                .all(|intent| intent.object_id != object_id
-                    || intent.intent_id != terminal_intent.intent_id),
-            "durable GC must replace the full terminal body"
-        );
-        let expected_receipt = source
-            .get_intent_receipt(&object_id, &terminal_intent.intent_id)
-            .expect("reopened intent receipt")
-            .expect("compact terminal receipt");
-        assert_eq!(
-            source.get_object(&object_id).expect("reopened live object"),
-            Some(live.clone())
-        );
-        assert_eq!(
-            source
-                .get_version(&object_id, &live_version)
-                .expect("reopened live version"),
-            Some(live_version_record.clone())
-        );
-
-        let sequence = source.journal_last_sequence();
-        let snapshot = source.export_table_snapshot();
-        let state_fingerprint =
-            crate::service_sync::metadata_shard_state_fingerprint_at(&source, &shard_id, sequence)
-                .expect("source post-GC checkpoint");
-        let retiring = DfsMetadataShardConfig {
-            file_system_id: file_system.file_system_id.clone(),
-            shard_id: shard_id.0.clone(),
-            primary_node_id: source_node_id.clone(),
-            replica_node_ids: vec![promoted_node_id.clone(), other_node_id.clone()],
-            epoch: 7,
-            assignment: crate::DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
-            default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
-        };
-        let desired = DfsMetadataShardConfig {
-            file_system_id: retiring.file_system_id.clone(),
-            shard_id: retiring.shard_id.clone(),
-            primary_node_id: promoted_node_id.clone(),
-            replica_node_ids: vec![other_node_id, source_node_id.clone()],
-            epoch: 8,
-            assignment: retiring.assignment.clone(),
-            namespace_prepare_codec: Default::default(),
-            default_policy: retiring.default_policy.clone(),
-        };
-        let handoff_id = "handoff-snapshot-gc".to_string();
-        receiver
-            .freeze_metadata_shard_for_membership_handoff(&shard_id, &handoff_id, retiring.epoch)
-            .expect("freeze promoted replica")
-            .expect("local shard");
-        let context = DfsMetadataReplicaShardContext {
-            local_node_id: promoted_node_id,
-            shard: retiring.clone(),
-            pending_membership_handoff: Some(DfsMetadataShardMembershipHandoff {
-                handoff_id: handoff_id.clone(),
-                retiring_shard: retiring.clone(),
-                desired_shard: desired.clone(),
-                required_prepared_sequence: 0,
-                required_head_watermark: None,
-                retiring_primary_fence: Some(crate::DfsMetadataShardMembershipHandoffFence {
-                    handoff_id: handoff_id.clone(),
-                    primary_node_id: source_node_id.clone(),
-                    journal_sequence: sequence,
-                    state_fingerprint,
-                }),
-            }),
-        };
-        let command = DfsMetadataSnapshotInstallCommand {
-            request_id: "primary-handoff-snapshot-gc".to_string(),
-            source_node_id,
-            file_system_id: Some(retiring.file_system_id),
-            authority_epoch: Some(retiring.epoch),
-            primary_handoff_id: Some(handoff_id.clone()),
-            shard_id: shard_id.clone(),
-            next_after_sequence: sequence,
-            snapshot,
-            reason: "install exact post-GC state before promoting replica".to_string(),
-        };
-
-        assert!(matches!(
-            process_dfs_metadata_snapshot_install(&mut receiver, Some(&context), command).result,
-            DfsMetadataSnapshotInstallResult::Installed { .. }
-        ));
-        assert!(
-            receiver
-                .metadata_shard_authoritative_writes_frozen(&shard_id)
-                .expect("receiver remains frozen before activation")
-        );
-        assert_eq!(
-            receiver
-                .get_version(&object_id, &old_version)
-                .expect("post-install old version"),
-            None,
-            "the exact post-GC snapshot must not resurrect pruned history"
-        );
-        assert!(
-            receiver
-                .export_table_snapshot()
-                .tables
-                .expect("post-install receiver tables")
-                .intents
-                .iter()
-                .all(|intent| intent.object_id != object_id
-                    || intent.intent_id != terminal_intent.intent_id)
-        );
-        assert_eq!(
-            receiver
-                .get_intent_receipt(&object_id, &terminal_intent.intent_id)
-                .expect("post-install terminal receipt"),
-            Some(expected_receipt.clone())
-        );
-        assert_eq!(
-            receiver
-                .get_object(&object_id)
-                .expect("post-install live object"),
-            Some(live.clone())
-        );
-        assert_eq!(
-            receiver
-                .get_version(&object_id, &live_version)
-                .expect("post-install live version"),
-            Some(live_version_record.clone())
-        );
-
-        assert!(
-            receiver
-                .clear_metadata_shard_membership_handoff_freeze(&shard_id, &handoff_id, &desired,)
-                .expect("activate promoted metadata authority")
-        );
-        assert!(
-            !receiver
-                .metadata_shard_authoritative_writes_frozen(&shard_id)
-                .expect("promoted metadata authority is writable")
-        );
-        receiver
-            .put_intent(&terminal_intent)
-            .expect("exact retry uses promoted compact receipt");
-        assert!(
-            receiver
-                .export_table_snapshot()
-                .tables
-                .expect("promoted receiver tables")
-                .intents
-                .iter()
-                .all(|intent| intent.object_id != object_id
-                    || intent.intent_id != terminal_intent.intent_id),
-            "an exact retry must not expand the compact terminal body"
-        );
-        assert_eq!(
-            receiver
-                .get_intent_receipt(&object_id, &terminal_intent.intent_id)
-                .expect("promoted terminal receipt"),
-            Some(expected_receipt)
-        );
-        assert_eq!(
-            receiver
-                .get_version(&object_id, &old_version)
-                .expect("promoted old version"),
-            None,
-            "promotion and exact retry must not resurrect pruned history"
-        );
-        assert_eq!(
-            receiver
-                .get_object(&object_id)
-                .expect("promoted live object"),
-            Some(live)
-        );
-        assert_eq!(
-            receiver
-                .get_version(&object_id, &live_version)
-                .expect("promoted live version"),
-            Some(live_version_record)
-        );
-    }
 }
 
 #[cfg(test)]
 mod primary_transfer_wake_tests;
+
+/// Resolve the immutable bodies referenced by the current commit markers.
+/// Compact marker identity alone cannot classify visible effects.
+pub(crate) fn committed_payloads_for_batch(
+    backend: &dyn DfsMetadataBackend,
+    batch: &DfsMetadataJournalBatch,
+) -> Result<Vec<Arc<crate::DfsPreparedOperationPayload>>, DfsError> {
+    let mut payloads = Vec::new();
+    for entry in &batch.entries {
+        let crate::DfsMetadataMutation::CommitPreparedOperationV7 { digest, .. } = &entry.mutation
+        else {
+            continue;
+        };
+        if digest.prepare_sequence >= entry.sequence || digest.shard_id != entry.shard_id {
+            return Err(DfsError::Metadata {
+                message: "commit marker differs from its actual durable prepare scope".into(),
+            });
+        }
+        let inline = batch
+            .entries
+            .iter()
+            .find_map(|prepare| match &prepare.mutation {
+                crate::DfsMetadataMutation::PrepareOperationV7 { record, .. }
+                    if record.digest == *digest && prepare.sequence == digest.prepare_sequence =>
+                {
+                    Some(Arc::clone(&record.payload))
+                }
+                _ => None,
+            });
+        let payload = match inline {
+            Some(payload) => payload,
+            None => {
+                let stored = backend.prepared_operation_payload(&digest.operation_id)?;
+                if let Some(payload) = stored {
+                    payload
+                } else {
+                    let prepare = backend
+                        .journal_batch_for_shard_since_limited(
+                            &digest.shard_id,
+                            digest.prepare_sequence.saturating_sub(1),
+                            1,
+                            usize::MAX,
+                        )?
+                        .and_then(|batch| {
+                            batch
+                                .entries
+                                .into_iter()
+                                .find(|entry| entry.sequence == digest.prepare_sequence)
+                        });
+                    match prepare.map(|entry| entry.mutation) {
+                        Some(crate::DfsMetadataMutation::PrepareOperationV7 { record, .. })
+                            if record.digest == *digest =>
+                        {
+                            record.payload
+                        }
+                        _ => return Err(DfsError::Metadata {
+                            message:
+                                "committed semantic body is unavailable; a scope rescan is required"
+                                    .into(),
+                        }),
+                    }
+                }
+            }
+        };
+        digest.validate_payload(&payload)?;
+        payloads.push(payload);
+    }
+    Ok(payloads)
+}
+
+pub(crate) fn payload_visible_paths(
+    payload: &crate::DfsPreparedOperationPayload,
+) -> BTreeSet<String> {
+    payload
+        .transaction
+        .objects
+        .iter()
+        .map(|object| object.path.clone())
+        .chain(
+            payload
+                .metadata_effects
+                .iter()
+                .filter_map(|effect| match effect {
+                    crate::DfsPreparedMetadataEffect::PutObject { object }
+                    | crate::DfsPreparedMetadataEffect::FinalizeCrossShardSourceEviction {
+                        tombstone: object,
+                        ..
+                    } => Some(object.path.clone()),
+                    _ => None,
+                }),
+        )
+        .collect()
+}

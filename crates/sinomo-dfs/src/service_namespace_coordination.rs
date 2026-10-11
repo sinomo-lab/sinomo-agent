@@ -111,8 +111,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         requester_node_id: &NodeId,
     ) -> Result<Option<String>, DfsError> {
         let source_path = match operation {
-            DfsNamespaceOperation::AdvisoryLockMigrationPrepare { source_path, .. }
-            | DfsNamespaceOperation::AdoptObjectAtPath { source_path, .. }
+            DfsNamespaceOperation::AdoptObjectAtPath { source_path, .. }
             | DfsNamespaceOperation::FinalizeObjectFamilyAdoption { source_path, .. }
             | DfsNamespaceOperation::VerifyObjectFamilyAdoption { source_path, .. }
             | DfsNamespaceOperation::InstallHardlinkTargetFence { source_path, .. }
@@ -188,6 +187,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             DfsNamespaceOperation::LookupPath { path, .. }
             | DfsNamespaceOperation::SyncPath { path }
             | DfsNamespaceOperation::ReconcilePlacement { path, .. }
+            | DfsNamespaceOperation::AbortPendingWrite { path, .. }
             | DfsNamespaceOperation::AdvisoryLock { path, .. }
             | DfsNamespaceOperation::FileSync { path, .. }
             | DfsNamespaceOperation::DirectorySync { path, .. } => {
@@ -472,6 +472,22 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
                 _ => foreign_primary = Some(shard.primary_node_id),
             }
+        }
+        if foreign_primary.is_none()
+            && let Some(destination) = Self::namespace_shards_for_normalized_paths_from_snapshot(
+                file_system_id,
+                &shards,
+                destination_paths.first().map(String::as_str),
+            )?
+            .first()
+            && source_shards
+                .iter()
+                .any(|source| source.shard_id != destination.shard_id)
+        {
+            // One process may own different physical metadata shards. Their
+            // writers and journal cuts still require the existing move saga;
+            // sharing a node cannot make one local transaction atomic.
+            return Ok(Some(destination.primary_node_id.clone()));
         }
         Ok(foreign_primary)
     }

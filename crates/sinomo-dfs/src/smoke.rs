@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use sinomo_core::cluster::ClusterKvPathsExt;
 use sinomo_core::local::SinomoDataDir;
 use sinomo_core::network::ClusterPaths;
 use sinomo_core::node::NodeId;
@@ -8,16 +7,13 @@ use time::OffsetDateTime;
 
 use crate::DfsMessageTransport;
 use crate::{
-    DfsControlPlaneKvClient, DfsError, DfsFileSystemId, DfsMessageSender,
-    DfsMetadataJournalBatchSender, DfsMetadataJournalPublisherHost,
+    DfsError, DfsFileSystemId, DfsMetadataJournalBatchSender, DfsMetadataJournalPublisherHost,
     DfsMetadataJournalReplicationOptions, DfsMetadataJournalReplicationReport,
     DfsMetadataJournalReplicationTransport, DfsMetadataNodeTransport, DfsMetadataShardAssignment,
     DfsMetadataShardConfig, DfsMetadataSnapshotInstallSender, DfsNodeAdvertisement, DfsObjectId,
     DfsPosixError, DfsVersion, DfsWriteOptions, LocalDfsMetadataJournalPublisherHost,
     NetworkedDfsService, NetworkedDfsServiceEvent, SIFS_SERVICES_PATH, SIFS_USERS_PATH,
-    cluster_dfs_metadata_shards, content_services_prefix, discovered_cluster_dfs_peer_node_ids,
-    distributed_sifs, inspect_cluster_aware_dfs_status,
-    open_cluster_dfs_service_with_message_sender_lazy, publish_dfs_metadata_journal_with_host,
+    distributed_sifs, inspect_cluster_aware_dfs_status, publish_dfs_metadata_journal_with_host,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -94,34 +90,11 @@ impl DfsSmokeHost for LocalDfsSmokeHost {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn run_cluster_dfs_smoke(
+pub(crate) fn run_cluster_dfs_smoke_with_runtime_client(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
-    message_sender: DfsMessageSender,
     metadata_sender: DfsMetadataJournalBatchSender,
     snapshot_sender: DfsMetadataSnapshotInstallSender,
-    control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
-    options: DfsSmokeOptions,
-) -> Result<Option<DfsSmokeReport>, DfsError> {
-    run_cluster_dfs_smoke_with_message_sender(
-        data_dir,
-        cluster_paths,
-        message_sender,
-        metadata_sender,
-        snapshot_sender,
-        control_plane,
-        options,
-    )
-}
-
-pub(crate) fn run_cluster_dfs_smoke_with_message_sender(
-    data_dir: &SinomoDataDir,
-    cluster_paths: &ClusterPaths,
-    message_sender: DfsMessageSender,
-    metadata_sender: DfsMetadataJournalBatchSender,
-    snapshot_sender: DfsMetadataSnapshotInstallSender,
-    control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
     options: DfsSmokeOptions,
 ) -> Result<Option<DfsSmokeReport>, DfsError> {
     data_dir
@@ -136,32 +109,43 @@ pub(crate) fn run_cluster_dfs_smoke_with_message_sender(
     let state = sinomo_core::cluster::read_cluster_state_without_kv(cluster_paths)
         .map_err(DfsError::from_network)?;
     let local_node_id = state.local_node_id.clone();
-    let content_advertisements = sinomo_core::kv::read_cluster_kv_prefix_entries(
-        &cluster_paths.kv_paths(),
-        content_services_prefix(),
-    )
-    .map_err(DfsError::from)?
-    .into_iter()
-    .filter_map(|entry| entry.decode::<DfsNodeAdvertisement>().ok())
-    .collect::<Vec<_>>();
+    // Delegate diagnostic effects through the same actual Main as ordinary clients.
+    let mut service =
+        crate::runtime_host::open_dfs_runtime_service(data_dir, None).map_err(|error| {
+            DfsError::Metadata {
+                message: error.to_string(),
+            }
+        })?;
+    let control_plane = service
+        .control_plane
+        .as_deref()
+        .ok_or_else(|| DfsError::Metadata {
+            message: "DFS smoke requires the actual mounted configuration client".into(),
+        })?;
+    let projection = control_plane
+        .write_configuration_projection()?
+        .ok_or_else(|| DfsError::Metadata {
+            message: "DFS smoke current configuration is not ready".into(),
+        })?;
     let content_nodes = dfs_smoke_content_node_ids(
         &local_node_id,
-        content_advertisements,
+        projection.content_advertisements()?,
         OffsetDateTime::now_utc(),
     );
 
     let file_system = distributed_sifs(local_node_id.clone());
-    let metadata_shards = cluster_dfs_metadata_shards(cluster_paths, &file_system.file_system_id)?;
-    let peer_node_ids = discovered_cluster_dfs_peer_node_ids(cluster_paths, &state)?;
+    let metadata_shards = control_plane
+        .cached_metadata_shards(&file_system.file_system_id)?
+        .ok_or_else(|| DfsError::Metadata {
+            message: "DFS smoke current metadata topology is not ready".into(),
+        })?;
+    let peer_node_ids =
+        crate::runtime_host::registered_dfs_runtime_peer_node_ids(control_plane, &state).map_err(
+            |error| DfsError::Metadata {
+                message: error.to_string(),
+            },
+        )?;
     let routable_node_ids = dfs_smoke_routable_node_ids(&state.local_node_id, &peer_node_ids);
-    let mut service = open_cluster_dfs_service_with_message_sender_lazy(
-        data_dir,
-        cluster_paths,
-        local_node_id.clone(),
-        peer_node_ids.clone(),
-        message_sender,
-        control_plane,
-    )?;
     let mut smoke_host = LocalDfsSmokeHost::new(data_dir.clone(), cluster_paths.clone());
     let mut metadata_publisher_host = LocalDfsMetadataJournalPublisherHost::new(data_dir.clone());
     let mut metadata_transport =

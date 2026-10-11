@@ -10,8 +10,8 @@ use std::ops::Bound::{Included, Unbounded};
 use crate::intent::write_intent_status_is_active;
 use crate::metadata_keys::{id_lower_bound, normalize_path};
 use crate::metadata_records::{
-    DfsConflictStatus, DfsMetadataSummary, DfsNamespaceJobStatus, DfsObjectVersionRecord,
-    DfsReplicaReceiptRecord, DfsWriteIntentRecord, DfsWriteIntentStatus,
+    DfsMetadataSummary, DfsNamespaceJobStatus, DfsObjectVersionRecord, DfsReplicaReceiptRecord,
+    DfsWriteIntentRecord, DfsWriteIntentStatus,
 };
 use crate::metadata_tables::DfsMetadataTables;
 use crate::{DfsFileSystemId, DfsObjectId, DfsObjectMetadata, DfsVersion};
@@ -130,21 +130,6 @@ pub(crate) fn repair_root_for_intent(
     latest_deadline.map(RepairRoot::Until)
 }
 
-#[cfg(test)]
-thread_local! {
-    static FULL_METADATA_SUMMARY_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-#[cfg(test)]
-pub(crate) fn reset_full_metadata_summary_scans() {
-    FULL_METADATA_SUMMARY_SCANS.with(|scans| scans.set(0));
-}
-
-#[cfg(test)]
-pub(crate) fn full_metadata_summary_scans() -> usize {
-    FULL_METADATA_SUMMARY_SCANS.with(std::cell::Cell::get)
-}
-
 pub(crate) fn metadata_summary_from_tables<F, E>(
     tables: &DfsMetadataTables,
     mut object_is_countable: F,
@@ -178,8 +163,6 @@ fn metadata_summary_from_tables_scoped<F, E>(
 where
     F: FnMut(&DfsObjectMetadata) -> Result<bool, E>,
 {
-    #[cfg(test)]
-    FULL_METADATA_SUMMARY_SCANS.with(|scans| scans.set(scans.get().saturating_add(1)));
     let file_system_in_scope = |file_system_id: &DfsFileSystemId| {
         file_system_scope.is_none_or(|scope| file_system_id == scope)
     };
@@ -278,14 +261,6 @@ where
             .filter(|intent| {
                 file_system_in_scope(&intent.file_system_id)
                     && write_intent_status_is_active(&intent.status)
-            })
-            .count(),
-        open_conflict_count: tables
-            .conflicts
-            .values()
-            .filter(|conflict| {
-                file_system_in_scope(&conflict.file_system_id)
-                    && conflict.status == DfsConflictStatus::Open
             })
             .count(),
         pending_repair_count,
@@ -402,9 +377,6 @@ pub(crate) fn accumulate_metadata_summary_detail_counts(
     summary.pending_write_count = summary
         .pending_write_count
         .saturating_add(detail.pending_write_count);
-    summary.open_conflict_count = summary
-        .open_conflict_count
-        .saturating_add(detail.open_conflict_count);
     summary.pending_repair_count = summary
         .pending_repair_count
         .saturating_add(detail.pending_repair_count);
@@ -424,13 +396,12 @@ mod tests {
     use super::*;
     use crate::metadata_keys::path_record_for_object;
     use crate::metadata_records::{
-        DfsConflictRecord, DfsConflictStatus, DfsInodeRecord, DfsMetadataTableOp,
-        DfsMetadataTableSnapshot, DfsNamespaceJobKind, DfsNamespaceJobRecord,
-        DfsNamespaceJobStatus, DfsObjectVersionRecord,
+        DfsInodeRecord, DfsMetadataTableOp, DfsMetadataTableSnapshot, DfsNamespaceJobKind,
+        DfsNamespaceJobRecord, DfsNamespaceJobStatus, DfsObjectVersionRecord,
     };
     use crate::metadata_table_store::{
-        LEGACY_METADATA_TABLE_SNAPSHOT_FORMAT_VERSION, METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
-        metadata_tables_from_table_snapshot, metadata_tables_snapshot,
+        METADATA_TABLE_SNAPSHOT_FORMAT_VERSION, metadata_tables_from_table_snapshot,
+        metadata_tables_snapshot,
     };
     use crate::metadata_tables::DfsMetadataTableRollback;
     use crate::{DfsFileSystem, DfsObjectKind};
@@ -438,6 +409,22 @@ mod tests {
     use sinomo_core::node::NodeId;
     use sinomo_core::{DfsObjectPolicy, DfsWriteReceipt};
     use time::OffsetDateTime;
+
+    fn current_snapshot(tables: &DfsMetadataTables) -> DfsMetadataTableSnapshot {
+        let mut snapshot = DfsMetadataTableSnapshot {
+            format_version: METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
+            materialized_through_sequence: 0,
+            tables: Box::new(metadata_tables_snapshot(tables)),
+            semantic_state_fingerprint: String::new(),
+            prefix_proof: crate::metadata_records::dfs_metadata_prefix_proof_genesis(
+                &crate::DfsMetadataShardId::new("summary-test"),
+            ),
+        };
+        snapshot.semantic_state_fingerprint =
+            crate::metadata_records::dfs_metadata_table_snapshot_state_fingerprint(&snapshot)
+                .unwrap();
+        snapshot
+    }
 
     fn node(value: &str) -> NodeId {
         NodeId::from_legacy_named(value).expect("valid node id")
@@ -457,7 +444,6 @@ mod tests {
 
     fn file_system() -> DfsFileSystem {
         DfsFileSystem {
-            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: file_system_id(),
@@ -495,7 +481,6 @@ mod tests {
 
     fn version_record(object: &DfsObjectMetadata) -> DfsObjectVersionRecord {
         DfsObjectVersionRecord {
-            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
             content_durability: None,
             retention: Default::default(),
             module_metadata: Default::default(),
@@ -636,11 +621,11 @@ mod tests {
         tables.apply_with_rollback(
             DfsMetadataTableOp::PutVersionPin {
                 pin: crate::DfsMetadataVersionPinRecord {
-                    namespace: None,
+                    namespace: "module.dfs.history".into(),
                     file_system_id: historical.file_system_id.clone(),
                     object_id: historical.object_id.clone(),
                     version: historical.version.clone(),
-                    pin_id: "checkpoint".into(),
+                    pin_id: crate::content_reference_storage_id("module.dfs.history", "checkpoint"),
                     created_at: OffsetDateTime::UNIX_EPOCH,
                 },
             },
@@ -668,14 +653,7 @@ mod tests {
         assert_status_projection_matches_scan(&tables, "pin rollback");
 
         let restored = metadata_tables_from_table_snapshot(
-            DfsMetadataTableSnapshot {
-                format_version: METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
-                materialized_through_sequence: None,
-                tables: Some(Box::new(metadata_tables_snapshot(&tables))),
-                ops: Vec::new(),
-                semantic_state_fingerprint: None,
-                prefix_proof: None,
-            },
+            current_snapshot(&tables),
             "retained repair expiry snapshot",
         )
         .expect("restore expiry index");
@@ -756,23 +734,6 @@ mod tests {
         let file_system = file_system();
         let object = object();
         let path_record = path_record_for_object(&object);
-        let open_conflict = DfsConflictRecord {
-            conflict_id: "conflict-summary-status".to_string(),
-            file_system_id: object.file_system_id.clone(),
-            object_id: object.object_id.clone(),
-            path: object.path.clone(),
-            base_version: None,
-            local_version: object.version.clone(),
-            remote_version: version("version_summary_remote"),
-            detected_by_node_id: node("node_owner"),
-            reason: "projection test".to_string(),
-            local_content_hash: object.content_hash.clone(),
-            remote_content_hash: Some("blake3:remote".to_string()),
-            created_by_intent_id: None,
-            strategy: None,
-            status: DfsConflictStatus::Open,
-            detected_at: OffsetDateTime::UNIX_EPOCH,
-        };
         let running_job = DfsNamespaceJobRecord {
             job_id: "job-summary-status".to_string(),
             file_system_id: object.file_system_id.clone(),
@@ -807,9 +768,6 @@ mod tests {
             DfsMetadataTableOp::PutReceipt {
                 receipt: receipt(&object, node("node_owner")),
             },
-            DfsMetadataTableOp::PutConflict {
-                conflict: open_conflict.clone(),
-            },
             DfsMetadataTableOp::PutNamespaceJob {
                 job: running_job.clone(),
             },
@@ -820,7 +778,6 @@ mod tests {
             assert_status_projection_matches_scan(&tables, "counter-bearing base replay");
         }
         assert_eq!(tables.metadata_status_summary().pending_repair_count, 1);
-        assert_eq!(tables.metadata_status_summary().open_conflict_count, 1);
         assert_eq!(
             tables.metadata_status_summary().pending_namespace_job_count,
             1
@@ -832,41 +789,26 @@ mod tests {
             1
         );
 
-        let structured = metadata_tables_from_table_snapshot(
-            DfsMetadataTableSnapshot {
-                format_version: METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
-                materialized_through_sequence: None,
-                tables: Some(Box::new(metadata_tables_snapshot(&tables))),
-                ops: Vec::new(),
-                semantic_state_fingerprint: None,
-                prefix_proof: None,
-            },
-            "status projection structured test snapshot",
-        )
-        .expect("restore structured snapshot");
+        let mut snapshot = DfsMetadataTableSnapshot {
+            format_version: METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
+            materialized_through_sequence: 0,
+            tables: Box::new(metadata_tables_snapshot(&tables)),
+            semantic_state_fingerprint: String::new(),
+            prefix_proof: crate::metadata_records::dfs_metadata_prefix_proof_genesis(
+                &crate::DfsMetadataShardId::new("summary-test"),
+            ),
+        };
+        snapshot.semantic_state_fingerprint =
+            crate::metadata_records::dfs_metadata_table_snapshot_state_fingerprint(&snapshot)
+                .unwrap();
+        let structured =
+            metadata_tables_from_table_snapshot(snapshot, "status projection current snapshot")
+                .expect("restore current snapshot");
         assert_eq!(
             structured.metadata_status_summary(),
             tables.metadata_status_summary()
         );
-        assert_status_projection_matches_scan(&structured, "structured snapshot restore");
-
-        let replayed = metadata_tables_from_table_snapshot(
-            DfsMetadataTableSnapshot {
-                format_version: LEGACY_METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
-                materialized_through_sequence: None,
-                tables: None,
-                ops: base_ops,
-                semantic_state_fingerprint: None,
-                prefix_proof: None,
-            },
-            "status projection replay test snapshot",
-        )
-        .expect("restore replay snapshot");
-        assert_eq!(
-            replayed.metadata_status_summary(),
-            tables.metadata_status_summary()
-        );
-        assert_status_projection_matches_scan(&replayed, "legacy operation replay");
+        assert_status_projection_matches_scan(&structured, "current snapshot restore");
 
         tables.apply(DfsMetadataTableOp::PutIntent {
             intent: intent(
@@ -892,11 +834,6 @@ mod tests {
         assert_status_projection_matches_scan(&tables, "repair receipt completion");
         assert_eq!(tables.metadata_status_summary().pending_repair_count, 0);
 
-        let mut resolved_conflict = open_conflict.clone();
-        resolved_conflict.status = DfsConflictStatus::Resolved;
-        tables.apply(DfsMetadataTableOp::PutConflict {
-            conflict: resolved_conflict,
-        });
         let mut failed_job = running_job.clone();
         failed_job.status = DfsNamespaceJobStatus::Failed;
         failed_job.failure_reason = Some("projection test failure".to_string());
@@ -904,7 +841,6 @@ mod tests {
             job: failed_job.clone(),
         });
         assert_status_projection_matches_scan(&tables, "conflict and job terminal transitions");
-        assert_eq!(tables.metadata_status_summary().open_conflict_count, 0);
         assert_eq!(
             tables.metadata_status_summary().pending_namespace_job_count,
             0
@@ -935,12 +871,6 @@ mod tests {
 
         let before_rollback = tables.metadata_status_summary();
         let mut rollback = DfsMetadataTableRollback::default();
-        tables.apply_with_rollback(
-            DfsMetadataTableOp::PutConflict {
-                conflict: open_conflict,
-            },
-            &mut rollback,
-        );
         tables.apply_with_rollback(
             DfsMetadataTableOp::PutNamespaceJob { job: running_job },
             &mut rollback,
@@ -994,14 +924,7 @@ mod tests {
         );
 
         let mut restored = metadata_tables_from_table_snapshot(
-            DfsMetadataTableSnapshot {
-                format_version: METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
-                materialized_through_sequence: None,
-                tables: Some(Box::new(metadata_tables_snapshot(&tables))),
-                ops: Vec::new(),
-                semantic_state_fingerprint: None,
-                prefix_proof: None,
-            },
+            current_snapshot(&tables),
             "deduplicated lock projection snapshot",
         )
         .expect("restore deduplicated lock projection");

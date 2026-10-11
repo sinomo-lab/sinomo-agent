@@ -77,6 +77,10 @@ struct DfsMetadataAuthorityProjection {
     topology_comparison_baseline: bool,
     entries: Vec<KvEntry>,
     metadata_shards_by_file_system: BTreeMap<String, Result<Vec<DfsMetadataShardConfig>, String>>,
+    #[cfg(any(test, feature = "test-support"))]
+    native_evidence: Option<NativeMetadataCacheEvidenceV1>,
+    #[cfg(any(test, feature = "test-support"))]
+    native_evidence_loss_count: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -125,6 +129,13 @@ pub struct DfsMetadataAuthorityState {
     projection_generation: AtomicU64,
     generation: AtomicU64,
     storage_generation: AtomicU64,
+    #[cfg(any(test, feature = "test-support"))]
+    native_source: Mutex<
+        Option<(
+            std::path::PathBuf,
+            std::sync::Weak<crate::runtime_host::DfsDataOwnerLock>,
+        )>,
+    >,
     #[cfg(any(test, feature = "test-support"))]
     projection_rebuild_count: AtomicU64,
     #[cfg(any(test, feature = "test-support"))]
@@ -337,6 +348,23 @@ impl DfsMetadataAuthorityRuntime {
     ) -> Result<Option<Vec<DfsMetadataShardConfig>>, sinomo_core::kv::KvError> {
         self.state
             .cached_metadata_shards(file_system_id, expected_projection_generation)
+    }
+
+    /// One cache-only cut for effect admission. Proof updates may advance the
+    /// projection while preserving these complete configuration rows.
+    pub(crate) fn cached_publication_configuration(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        expected_projection_generation: u64,
+    ) -> Result<
+        Option<(
+            Vec<DfsMetadataShardConfig>,
+            Option<crate::DfsFileSystemConfig>,
+        )>,
+        sinomo_core::kv::KvError,
+    > {
+        self.state
+            .cached_publication_configuration(file_system_id, expected_projection_generation)
     }
 
     pub fn shard_projection_state(
@@ -768,6 +796,13 @@ impl DfsMetadataAuthorityRuntime {
                     .into(),
             });
         };
+        #[cfg(any(test, feature = "test-support"))]
+        if crate::test_runtime::native_configuration_floor_is_denied(self.as_ref()) {
+            return Err(DfsError::Network {
+                message: "native configuration floor is unavailable at the injected read boundary"
+                    .into(),
+            });
+        }
         let floor = host.write_configuration_floor()?;
         if !view.matches_floor(&floor) {
             let mut configuration =
@@ -895,6 +930,8 @@ impl DfsMetadataAuthorityRuntime {
             runtime: Arc::clone(self),
             token,
         };
+        #[cfg(any(test, feature = "test-support"))]
+        crate::test_runtime::pause_native_configuration_rebuild(self.as_ref()).await;
         let mut authority_changed = false;
         let result = async {
             let filesystem = host
@@ -929,10 +966,25 @@ impl DfsMetadataAuthorityRuntime {
                                 .into(),
                     });
                 }
-                authority_changed |= self
-                    .state
-                    .install_authoritative_projection(metadata_projection)
-                    .unwrap_or(false);
+                #[cfg(any(test, feature = "test-support"))]
+                if self.state.native_interest() {
+                    authority_changed |= self
+                        .state
+                        .install_native_observed_projection(metadata_projection, filesystem.clone())
+                        .unwrap_or(false);
+                } else {
+                    authority_changed |= self
+                        .state
+                        .install_authoritative_projection(metadata_projection)
+                        .unwrap_or(false);
+                }
+                #[cfg(not(any(test, feature = "test-support")))]
+                {
+                    authority_changed |= self
+                        .state
+                        .install_authoritative_projection(metadata_projection)
+                        .unwrap_or(false);
+                }
             }
             // The first native ReadIndex initializes the ordinary resident
             // owner. The floor access below itself never opens or replays KV.
@@ -1148,6 +1200,8 @@ impl DfsMetadataAuthorityRuntime {
     ) -> Option<KvRevision> {
         match read {
             Ok(read) => {
+                #[cfg(any(test, feature = "test-support"))]
+                let native_read = self.state.native_interest().then(|| read.clone());
                 let revision = read.authority.revision;
                 match DfsAuthoritativePrefixProjection::complete(
                     DFS_METADATA_AUTHORITY_PREFIX,
@@ -1162,6 +1216,17 @@ impl DfsMetadataAuthorityRuntime {
                             {
                                 return None;
                             }
+                            #[cfg(any(test, feature = "test-support"))]
+                            if let Some(read) = native_read {
+                                self.state
+                                    .install_native_observed_projection(projection, read)
+                                    .unwrap_or(false)
+                            } else {
+                                self.state
+                                    .install_authoritative_projection(projection)
+                                    .unwrap_or(false)
+                            }
+                            #[cfg(not(any(test, feature = "test-support")))]
                             self.state
                                 .install_authoritative_projection(projection)
                                 .unwrap_or(false)
@@ -1269,10 +1334,16 @@ impl DfsMetadataAuthorityState {
                 topology_comparison_baseline: false,
                 entries: Vec::new(),
                 metadata_shards_by_file_system: BTreeMap::new(),
+                #[cfg(any(test, feature = "test-support"))]
+                native_evidence: None,
+                #[cfg(any(test, feature = "test-support"))]
+                native_evidence_loss_count: 0,
             }),
             projection_generation: AtomicU64::new(1),
             generation: AtomicU64::new(1),
             storage_generation: AtomicU64::new(1),
+            #[cfg(any(test, feature = "test-support"))]
+            native_source: Mutex::new(None),
             #[cfg(any(test, feature = "test-support"))]
             projection_rebuild_count: AtomicU64::new(0),
             #[cfg(any(test, feature = "test-support"))]
@@ -1373,6 +1444,59 @@ impl DfsMetadataAuthorityState {
         }
     }
 
+    fn cached_publication_configuration(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        expected_projection_generation: u64,
+    ) -> Result<
+        Option<(
+            Vec<DfsMetadataShardConfig>,
+            Option<crate::DfsFileSystemConfig>,
+        )>,
+        sinomo_core::kv::KvError,
+    > {
+        let projection =
+            self.projection
+                .lock()
+                .map_err(|_| sinomo_core::kv::KvError::AuthorityUnavailable {
+                    detail: "DFS metadata authority projection lock poisoned".into(),
+                })?;
+        if projection.revision.is_none()
+            || self.projection_generation() != expected_projection_generation
+        {
+            return Ok(None);
+        }
+        let shards = match projection
+            .metadata_shards_by_file_system
+            .get(file_system_id.as_str())
+        {
+            Some(Ok(shards)) => shards.clone(),
+            Some(Err(detail)) => {
+                return Err(sinomo_core::kv::KvError::Serialization {
+                    detail: detail.clone(),
+                });
+            }
+            None => Vec::new(),
+        };
+        let key = crate::file_system_config_key(file_system_id);
+        let config = projection
+            .entries
+            .binary_search_by(|entry| entry.key.cmp(&key))
+            .ok()
+            .map(|index| projection.entries[index].decode::<crate::DfsFileSystemConfig>())
+            .transpose()?;
+        #[cfg(any(test, feature = "test-support"))]
+        crate::native_shard_trace::record_metadata_cache_cut(
+            expected_projection_generation,
+            projection.revision,
+            projection.required_revision,
+            &projection.entries,
+            projection.native_evidence.as_ref(),
+            projection.native_evidence_loss_count,
+        );
+        Ok(Some((shards, config)))
+    }
+
     pub fn shard_projection_state(
         &self,
         file_system_id: &DfsFileSystemId,
@@ -1436,12 +1560,22 @@ impl DfsMetadataAuthorityState {
             #[cfg(any(test, feature = "test-support"))]
             self.projection_materialization_count
                 .fetch_add(1, Ordering::AcqRel);
-            DfsAuthoritativePrefixProjection::complete(
+            let retained = DfsAuthoritativePrefixProjection::complete(
                 DFS_METADATA_AUTHORITY_PREFIX,
                 projection.entries.clone(),
                 revision,
             )
-            .ok()
+            .ok()?;
+            #[cfg(any(test, feature = "test-support"))]
+            crate::native_shard_trace::retain_metadata_seed_observation(
+                self.projection_generation(),
+                revision,
+                projection.required_revision,
+                &projection.entries,
+                projection.native_evidence.as_ref(),
+                projection.native_evidence_loss_count,
+            );
+            Some(retained)
         })
     }
 
@@ -1521,6 +1655,10 @@ impl DfsMetadataAuthorityState {
             ) {
                 Self::advance(&self.storage_generation);
             }
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            observed.native_evidence = None;
         }
         observed.revision = Some(revision);
         observed.required_revision = revision;
@@ -1710,6 +1848,45 @@ impl DfsMetadataAuthorityState {
         if prefix_changed {
             Self::advance(&self.projection_generation);
         }
+        #[cfg(any(test, feature = "test-support"))]
+        if !self.native_interest() {
+            observed.native_evidence = None;
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(evidence) = observed.native_evidence.as_mut() {
+            let size = delta
+                .final_key_states
+                .iter()
+                .map(|state| {
+                    state
+                        .key
+                        .len()
+                        .saturating_add(state.entry.as_ref().map_or(0, |entry| entry.value.len()))
+                })
+                .sum::<usize>()
+                .saturating_add(
+                    delta
+                        .events
+                        .iter()
+                        .map(|event| {
+                            event.key.len().saturating_add(match &event.kind {
+                                sinomo_core::kv::KvEventKind::Put { value } => value.len(),
+                                _ => 0,
+                            })
+                        })
+                        .sum::<usize>(),
+                );
+            if evidence.deltas.len() >= 4096
+                || evidence.bytes.saturating_add(size) > 64 * 1024 * 1024
+            {
+                observed.native_evidence = None;
+                observed.native_evidence_loss_count =
+                    observed.native_evidence_loss_count.saturating_add(1);
+            } else {
+                evidence.bytes = evidence.bytes.saturating_add(size);
+                evidence.deltas.push(delta.clone());
+            }
+        }
         observed.revision = Some(delta.revision);
         observed.required_revision = delta.revision;
         if prefix_changed {
@@ -1724,9 +1901,17 @@ impl DfsMetadataAuthorityState {
         required_revision: KvRevision,
     ) {
         let was_valid = observed.revision.take().is_some();
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            observed.native_evidence = None;
+        }
         observed.required_revision = observed.required_revision.max(required_revision);
         observed.topology_comparison_baseline = false;
         observed.entries.clear();
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            observed.native_evidence = None;
+        }
         observed.metadata_shards_by_file_system.clear();
         if was_valid {
             Self::advance(&self.projection_generation);
@@ -1741,6 +1926,10 @@ impl DfsMetadataAuthorityState {
         required_revision: KvRevision,
     ) {
         let was_valid = observed.revision.take().is_some();
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            observed.native_evidence = None;
+        }
         observed.required_revision = observed.required_revision.max(required_revision);
         if was_valid {
             observed.topology_comparison_baseline = true;
@@ -1846,14 +2035,28 @@ mod tests {
         let owner =
             sinomo_core::node::NodeId::from_legacy_named("storage_generation_owner").unwrap();
         let mut config = crate::DfsFileSystemConfig::from(&crate::distributed_sifs(owner));
+        config.subtree_policies.push(crate::DfsSubtreePolicy::new(
+            crate::SIFS_USERS_PATH,
+            sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+            1,
+            1,
+        ));
         let original = config_entry(&config, 1);
         state
             .install_authoritative_projection(projection(1, vec![original.clone()]))
             .unwrap();
         let storage_generation = state.storage_generation();
         let authority_generation = state.generation();
-        config.subtree_policies[2].min_commit_replicas = Some(2);
-        config.subtree_policies[2].desired_replicas = Some(3);
+        let policy = config
+            .subtree_policies
+            .iter_mut()
+            .find(|policy| {
+                policy.path_prefix == crate::SIFS_USERS_PATH
+                    && policy.scope == crate::DfsPlacementScope::Subtree
+            })
+            .expect("explicit users subtree policy");
+        policy.min_commit_replicas = 2;
+        policy.desired_replicas = 3;
         let changed = config_entry(&config, 2);
         let observation = state.observe_delta(&ClusterKvCommittedDelta {
             revision: KvRevision(2),
@@ -1972,6 +2175,12 @@ mod tests {
         let state = DfsMetadataAuthorityState::new();
         let owner = sinomo_core::node::NodeId::from_legacy_named("gap_policy_store_owner").unwrap();
         let mut config = crate::DfsFileSystemConfig::from(&crate::distributed_sifs(owner));
+        config.subtree_policies.push(crate::DfsSubtreePolicy::new(
+            crate::SIFS_USERS_PATH,
+            sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+            1,
+            1,
+        ));
         let shard_key = crate::metadata_shard_key(&config.file_system_id, "root");
         state
             .install_authoritative_projection(projection(
@@ -1984,8 +2193,16 @@ mod tests {
         let file_system_id = config.file_system_id.clone();
         let shard_id = DfsMetadataShardId::new("root");
         assert!(state.shard_projection_state(&file_system_id, &shard_id).1);
-        config.subtree_policies[2].min_commit_replicas = Some(2);
-        config.subtree_policies[2].desired_replicas = Some(3);
+        let policy = config
+            .subtree_policies
+            .iter_mut()
+            .find(|policy| {
+                policy.path_prefix == crate::SIFS_USERS_PATH
+                    && policy.scope == crate::DfsPlacementScope::Subtree
+            })
+            .expect("explicit users subtree policy");
+        policy.min_commit_replicas = 2;
+        policy.desired_replicas = 3;
         let changed = config_entry(&config, 3);
         let observation = state.observe_delta(&ClusterKvCommittedDelta {
             revision: KvRevision(3),
@@ -2156,5 +2373,81 @@ mod tests {
             runtime.try_claim_refresh().is_some(),
             "cancelled refresh ownership must not strand later consumers",
         );
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub(crate) struct NativeMetadataCacheEvidenceV1 {
+    pub original_read: sinomo_core::kv::KvAuthoritativeRead<Vec<KvEntry>>,
+    pub deltas: Vec<ClusterKvCommittedDelta>,
+    #[serde(skip)]
+    bytes: usize,
+}
+#[cfg(any(test, feature = "test-support"))]
+impl DfsMetadataAuthorityRuntime {
+    pub(crate) fn bind_native_observation_root(
+        &self,
+        root: std::path::PathBuf,
+        owner: &Arc<crate::runtime_host::DfsDataOwnerLock>,
+    ) {
+        *self
+            .state
+            .native_source
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some((root, Arc::downgrade(owner)));
+    }
+}
+#[cfg(any(test, feature = "test-support"))]
+impl DfsMetadataAuthorityState {
+    fn native_interest(&self) -> bool {
+        self.native_source
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|(root, owner)| {
+                owner
+                    .upgrade()
+                    .is_some_and(|owner| crate::native_shard_trace::has_root_interest(root, &owner))
+            })
+    }
+    fn install_native_observed_projection(
+        &self,
+        projection: DfsAuthoritativePrefixProjection,
+        read: sinomo_core::kv::KvAuthoritativeRead<Vec<KvEntry>>,
+    ) -> Option<bool> {
+        if !projection.is_complete() {
+            return None;
+        }
+        let size = read
+            .value
+            .iter()
+            .map(|entry| entry.key.len().saturating_add(entry.value.len()))
+            .sum::<usize>();
+        let Ok(mut observed) = self.projection.lock() else {
+            return None;
+        };
+        let changed = self.install_authoritative_projection_locked(&mut observed, projection)?;
+        if size > 64 * 1024 * 1024 {
+            observed.native_evidence_loss_count =
+                observed.native_evidence_loss_count.saturating_add(1);
+            observed.native_evidence = None;
+            return Some(changed);
+        }
+        if observed.revision == Some(read.authority.revision) && observed.entries == read.value {
+            observed.native_evidence = Some(NativeMetadataCacheEvidenceV1 {
+                original_read: read,
+                deltas: Vec::new(),
+                bytes: size,
+            });
+        }
+        Some(changed)
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl NativeMetadataCacheEvidenceV1 {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.bytes
     }
 }

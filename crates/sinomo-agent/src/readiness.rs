@@ -2282,6 +2282,7 @@ fn check_async_update_bounding_smoke() -> AgentReadinessCheck {
     input.async_update = Some(AsyncTaskUpdate {
         kind: "coding.validation".to_string(),
         task_id: TaskId::generate(),
+        tool_call_id: None,
         status: AsyncTaskStatus::Progress,
         summary,
         needs_user_attention: true,
@@ -2901,10 +2902,12 @@ pub fn run_agent_simple_sandbox_active_cancellation_readiness() -> AgentReadines
     let lifecycle_for_sink = Arc::clone(&lifecycle);
     let progress_sink = AgentToolProgressSink::new(move |event| {
         let process = match event {
-            AgentToolProgressEvent::ProcessStarted { process }
-            | AgentToolProgressEvent::ProcessCompleted { process } => Some(process),
+            AgentToolProgressEvent::ProcessStarted { process, .. }
+            | AgentToolProgressEvent::ProcessCompleted { process, .. } => Some(process),
             AgentToolProgressEvent::ProcessOutput { .. }
             | AgentToolProgressEvent::Artifacts { .. }
+            | AgentToolProgressEvent::DetachedStarted { .. }
+            | AgentToolProgressEvent::DetachedCompleted { .. }
             | AgentToolProgressEvent::Message { .. } => None,
         };
         if let Some(process) = process
@@ -4364,6 +4367,7 @@ fn check_tool_pair_integrity_smoke() -> AgentReadinessCheck {
 fn readiness_tool_call_item(tool: &str, step_index: usize, call_index: usize) -> AgentItem {
     AgentItem::ToolCall {
         item_id: TaskId::generate(),
+        tool_call_id: TaskId::generate(),
         step_index,
         call_index,
         call: AgentToolCall {

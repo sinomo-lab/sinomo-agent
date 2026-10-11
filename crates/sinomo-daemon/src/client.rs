@@ -775,6 +775,37 @@ pub async fn send_object_rpc_call_to_target_async_with_cluster_paths_and_options
         .map_err(Into::into)
 }
 
+/// Read-only capability of the normal process-affine object-RPC path.
+/// Candidate is a route hint; only dispatch authenticates and admits a call.
+pub(crate) fn object_rpc_target_availability_with_daemon_paths(
+    daemon_paths: &DaemonPaths,
+    target_node_id: &sinomo_core::node::NodeId,
+    runtime: &tokio::runtime::Handle,
+) -> sinomo_core::network::RoutedAvailability {
+    use sinomo_core::network::RoutedAvailability;
+    let Ok(data_dir) = daemon_data_dir_from_paths(daemon_paths) else {
+        return RoutedAvailability::Unknown;
+    };
+    let paths = sinomo_core::network::ClusterPaths::new(&data_dir);
+    let Ok(state) = sinomo_core::cluster::read_cluster_state_without_kv_cached_shared(&paths)
+    else {
+        return RoutedAvailability::Unknown;
+    };
+    // The routed connector deliberately cannot address local processes. Only
+    // actual dispatch resolves the process-affine main listener.
+    if target_node_id == &state.local_node_id {
+        return RoutedAvailability::Unknown;
+    }
+    let mut host = DaemonObjectRpcAsyncHost::new(runtime, false).with_paths(daemon_paths);
+    sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, &paths).availability(
+        &state,
+        target_node_id,
+        sinomo_core::network::ClusterObjectRpcOptions::new(
+            sinomo_core::network::DaemonRpcTimeouts::default(),
+        ),
+    )
+}
+
 pub(crate) async fn send_object_rpc_call_to_target_async_with_daemon_paths_and_network_error(
     daemon_paths: &DaemonPaths,
     target_node_id: &NodeId,

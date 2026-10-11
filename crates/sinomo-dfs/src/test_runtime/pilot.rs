@@ -20,12 +20,15 @@ use tokio::sync::Semaphore;
 
 #[test]
 fn embedded_runtime_journal_and_snapshot_roundtrip_survive_receiver_reopen() {
-    let nodes = DfsTestRuntime::ordered_node_ids("embedded-replication-roundtrip", 2);
+    let nodes = DfsTestRuntime::ordered_node_ids("embedded-replication-roundtrip", 3);
     let primary = nodes[0].clone();
     let replica = nodes[1].clone();
     let mut runtime =
         DfsTestRuntime::new("embedded-replication-roundtrip", primary.clone()).unwrap();
     runtime.define_node(replica.clone()).unwrap();
+    // A live third metadata replica supplies the real recovery majority while
+    // this receiver is stopped; the Raft profile remains its actual one voter.
+    runtime.define_node(nodes[2].clone()).unwrap();
 
     // Initial topology uses the normal planner before Embedded mount; consume
     // its retained root assignment and default filesystem identity below.
@@ -68,7 +71,7 @@ fn embedded_runtime_journal_and_snapshot_roundtrip_survive_receiver_reopen() {
         );
         let durability = command.durable_replication.as_ref().unwrap();
         let confirmation_id = durability.confirmation_id.clone();
-        let frame_count = durability.journal_frames.len();
+        let frame_count = command.batch.journal_frames.len();
         assert!(frame_count > 0);
         assert!(command.batch.next_after_sequence > journal_head);
         // DfsNodeTransport's actual direct object-RPC lane invokes the real
@@ -101,8 +104,7 @@ fn embedded_runtime_journal_and_snapshot_roundtrip_survive_receiver_reopen() {
         .export_shard_table_snapshot(&shard_id)
         .unwrap()
         .unwrap()
-        .prefix_proof
-        .expect("primary carries its actual exact journal prefix");
+        .prefix_proof;
     assert_eq!(journal_prefix.journal_sequence, journal_head);
     assert!(journal_prefix.is_well_formed());
 
@@ -125,23 +127,23 @@ fn embedded_runtime_journal_and_snapshot_roundtrip_survive_receiver_reopen() {
             .unwrap()
             .unwrap();
         assert_eq!(floor.journal_sequence, journal_head);
-        assert_eq!(floor.durable_prefix_proof, Some(journal_prefix));
+        assert_eq!(floor.durable_prefix_proof, journal_prefix);
     }
 
-    // add_file_system's source-only journal write makes this snapshot a real
-    // successor while the receiver is stopped; no replica ACK is fabricated.
+    // Normal publication obtains genuine source + third-replica metadata ACKs
+    // and an operation-bound native permit while this receiver is stopped.
     let journal_file_system = file_system.clone();
     file_system.display_name = "embedded snapshot roundtrip".to_string();
     primary_client.add_file_system(file_system.clone()).unwrap();
     let snapshot = primary_client
         .metadata_backend()
         .unwrap()
-        .export_shard_table_snapshot(&shard_id)
+        .export_shard_snapshot_image(&shard_id)
         .unwrap()
         .unwrap();
-    let snapshot_head = snapshot.materialized_through_sequence.unwrap();
+    let snapshot_head = snapshot.materialized_through_sequence;
     assert!(snapshot_head > journal_head);
-    let snapshot_prefix = snapshot.prefix_proof.clone().unwrap();
+    let snapshot_prefix = snapshot.prefix_proof.clone();
     assert!(snapshot_prefix.is_well_formed());
     assert_eq!(snapshot_prefix.journal_sequence, snapshot_head);
     let command = DfsMetadataSnapshotInstallCommand {
@@ -152,7 +154,8 @@ fn embedded_runtime_journal_and_snapshot_roundtrip_survive_receiver_reopen() {
         primary_handoff_id: None,
         shard_id: shard_id.clone(),
         next_after_sequence: snapshot_head,
-        snapshot,
+        snapshot: snapshot.descriptor().clone(),
+        image: Some(snapshot),
         reason: "normal Embedded receiver durable snapshot pilot".to_string(),
     };
     // These bounded, fail-closed rules isolate the actual snapshot effect from
@@ -229,11 +232,8 @@ fn embedded_runtime_journal_and_snapshot_roundtrip_survive_receiver_reopen() {
             .export_shard_table_snapshot(&shard_id)
             .unwrap()
             .unwrap();
-        assert_eq!(
-            durable_image.materialized_through_sequence,
-            Some(snapshot_head)
-        );
-        assert_eq!(durable_image.prefix_proof, Some(snapshot_prefix));
+        assert_eq!(durable_image.materialized_through_sequence, snapshot_head);
+        assert_eq!(durable_image.prefix_proof, snapshot_prefix);
     }
     // Release the live source client before the owning facility's teardown.
     drop(primary_client);

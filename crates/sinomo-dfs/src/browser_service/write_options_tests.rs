@@ -1,60 +1,30 @@
-//! Browser write options must retain POSIX policy and durable retry identity.
-
+//! Native browser policy, projection and durable retry contracts.
 use super::*;
-use sinomo_core::kv::{
-    ClusterKvRaftConfigRecord, InProcessKvStore, KvAuthoritativeRead, KvAuthorityBasis,
-    KvAuthorityProof, KvLocalRead, KvRevision, cluster_kv_raft_config_key, encode_kv_value,
-};
-use sinomo_core::network::{InProcessNetwork, InProcessTransport};
-use std::collections::BTreeMap;
-use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-
-type TestService = NetworkedDfsService<InProcessTransport>;
 
 fn node(name: &str) -> sinomo_core::node::NodeId {
     sinomo_core::node::NodeId::from_legacy_named(name).expect("node id")
 }
 
-fn service(root: &Path, local: sinomo_core::node::NodeId) -> TestService {
-    let network = InProcessNetwork::new();
-    let mut service = NetworkedDfsService::new(
-        network.add_node(local),
-        LocalContentStore::new(root.join("content")).expect("content"),
-    )
-    .with_metadata_backend(
-        open_root_local_metadata_backend(root.join("metadata")).expect("metadata"),
-    )
-    .expect("backend");
-    service.bootstrap_distributed_sifs().expect("bootstrap");
-    service
-}
-
-fn legacy_options<T: DfsMessageTransport>(
-    service: &mut NetworkedDfsService<T>,
-    path: &str,
-    candidates: &[sinomo_core::node::NodeId],
-) -> DfsWriteOptions {
-    let policy = service
-        .posix_stat(path)
-        .map(|stat| stat.policy)
-        .unwrap_or(sinomo_core::DfsObjectPolicy::ReplicatedEventual);
-    let (_, _, policy) = service
-        .managed_replication_policy_for_path(path, policy, candidates.len())
-        .expect("legacy options policy");
-    DfsWriteOptions {
-        replica_candidates: sifs_browser_write_candidates(candidates, &policy),
-        policy,
-        wait_for_commit: true,
-        foreground_replica_repair: false,
-    }
+fn native_browser_service(
+    name: &str,
+    local: sinomo_core::node::NodeId,
+) -> (
+    crate::test_support::DfsTestRuntime,
+    NetworkedDfsService<crate::DfsNodeTransport>,
+) {
+    let mut runtime = crate::test_support::DfsTestRuntime::new(name, local.clone()).unwrap();
+    runtime.start_nodes().unwrap();
+    let service = runtime.client(&local).unwrap();
+    (runtime, service)
 }
 
 #[test]
 fn browser_policy_projection_preserves_links_dot_paths_and_namespace_errors() {
-    let root = sinomo_testdir::TestDir::new("browser-policy-paths");
     let local = node("browser_policy_paths");
-    let mut dfs = service(root.path(), local.clone());
+    let (mut runtime, mut dfs) = native_browser_service(
+        "browser_policy_projection_preserves_links_dot_paths_and_namespace_errors",
+        local.clone(),
+    );
     dfs.posix_mkdir_all("/documents/dir").expect("directory");
     let options = DfsWriteOptions::replicated_eventual(vec![local]);
     let file = dfs
@@ -132,13 +102,17 @@ fn browser_policy_projection_preserves_links_dot_paths_and_namespace_errors() {
                 .map_err(|e| e.to_string()),
         );
     }
+    drop(dfs);
+    runtime.close().unwrap();
 }
 
 #[test]
 fn browser_parent_hints_skip_directory_counts_and_preserve_namespace_checks() {
-    let root = sinomo_testdir::TestDir::new("browser-parent-hints");
     let local = node("browser_parent_hints");
-    let mut dfs = service(root.path(), local.clone());
+    let (mut runtime, mut dfs) = native_browser_service(
+        "browser_parent_hints_skip_directory_counts_and_preserve_namespace_checks",
+        local.clone(),
+    );
     dfs.posix_mkdir_all("/documents/dir/child").unwrap();
     let options = DfsWriteOptions::replicated_eventual(vec![local]);
     dfs.posix_write_file("/documents/dir/file", b"body", options.clone())
@@ -184,13 +158,17 @@ fn browser_parent_hints_skip_directory_counts_and_preserve_namespace_checks() {
         registry.remove_job("parent-hint-flight");
     }
     assert_eq!(crate::posix::posix_directory_link_count_calls(), 1);
+    drop(dfs);
+    runtime.close().unwrap();
 }
 
 #[test]
 fn browser_policy_projection_preserves_requested_and_resolved_flight_fences() {
-    let root = sinomo_testdir::TestDir::new("browser-policy-fences");
     let local = node("browser_policy_fences");
-    let mut dfs = service(root.path(), local.clone());
+    let (mut runtime, mut dfs) = native_browser_service(
+        "browser_policy_projection_preserves_requested_and_resolved_flight_fences",
+        local.clone(),
+    );
     dfs.posix_mkdir_all("/documents/target").unwrap();
     let options = DfsWriteOptions::replicated_eventual(vec![local]);
     dfs.posix_write_file("/documents/target/file", b"body", options.clone())
@@ -217,831 +195,605 @@ fn browser_policy_projection_preserves_requested_and_resolved_flight_fences() {
         registry.remove_job("policy-flight");
     }
     assert!(dfs.posix_object_policy("/documents/link").is_ok());
+    drop(dfs);
+    runtime.close().unwrap();
 }
 
-#[derive(Clone, Debug)]
-struct PrefixRecorder {
-    inner: SharedDfsControlPlaneKvClient<InProcessKvStore>,
-    prefixes: Arc<Mutex<Vec<String>>>,
+fn native_browser_runtime(
+    name: &str,
+    count: usize,
+) -> (
+    crate::test_support::DfsTestRuntime,
+    Vec<sinomo_core::node::NodeId>,
+) {
+    let nodes = crate::test_support::DfsTestRuntime::ordered_node_ids(name, count);
+    let mut runtime = crate::test_support::DfsTestRuntime::new(name, nodes[0].clone()).unwrap();
+    for node in &nodes[1..] {
+        runtime.define_node(node.clone()).unwrap();
+    }
+    runtime.start_nodes().unwrap();
+    (runtime, nodes)
 }
 
-impl DfsControlPlaneKvClient for PrefixRecorder {
-    fn get(&self, key: &str) -> Result<Option<KvEntry>, KvError> {
-        self.inner
-            .with_client(|kv| DfsControlPlaneKvClient::get(kv, key))
-    }
-    fn range_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>, KvError> {
-        self.prefixes.lock().unwrap().push(prefix.to_owned());
-        self.inner
-            .with_client(|kv| DfsControlPlaneKvClient::range_prefix(kv, prefix))
-    }
-    fn put(&mut self, key: String, value: Vec<u8>) -> Result<KvRevision, KvError> {
-        self.inner
-            .with_client(|kv| DfsControlPlaneKvClient::put(kv, key, value))
-    }
-    fn txn(&mut self, txn: KvTxn) -> Result<KvTxnResponse, KvError> {
-        self.inner
-            .with_client(|kv| DfsControlPlaneKvClient::txn(kv, txn))
-    }
-}
-
-fn configure_control<T: DfsMessageTransport>(
-    dfs: &NetworkedDfsService<T>,
-    nodes: &[(sinomo_core::node::NodeId, &str)],
-) -> SharedDfsControlPlaneKvClient<InProcessKvStore> {
-    let shared = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
-    shared.with_client(|kv| {
-        let mut control = DfsControlPlaneStore::new(kv);
-        control
-            .put_file_system_config(&DfsFileSystemConfig::from(
-                dfs.metadata()
-                    .filesystems
-                    .get(&sifs_file_system_id())
-                    .unwrap(),
-            ))
+fn native_browser_policy(
+    control: &crate::SharedDfsControlPlaneKvClient<Box<dyn crate::DfsControlPlaneKvClient>>,
+    path: &str,
+    policy: crate::DfsPlacementPolicy,
+) {
+    control.with_client(|kv| {
+        let mut store = DfsControlPlaneStore::new(kv.as_mut());
+        let expected = store
+            .get_file_system_config(&sifs_file_system_id())
+            .unwrap()
             .unwrap();
-        control
-            .put_metadata_shard(&DfsMetadataShardConfig {
-                file_system_id: sifs_file_system_id(),
-                shard_id: "root".into(),
-                primary_node_id: dfs.node_id().clone(),
-                replica_node_ids: Vec::new(),
-                epoch: 1,
-                assignment: DfsMetadataShardAssignment::Root,
-                namespace_prepare_codec: Default::default(),
-                default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
-            })
-            .unwrap();
-        for (node, zone) in nodes {
-            let mut advertisement = DfsNodeAdvertisement::content(node.clone());
-            advertisement.zone = Some((*zone).into());
-            control.advertise_content_service(&advertisement).unwrap();
-            control
-                .advertise_metadata_service(&DfsNodeAdvertisement::metadata(node.clone()))
-                .unwrap();
-        }
+        let mut desired = expected.clone();
+        crate::upsert_placement_rule(
+            &mut desired.subtree_policies,
+            crate::normalize_placement_rule(path, DfsPlacementScope::Subtree, policy).unwrap(),
+        );
+        assert!(
+            store
+                .compare_and_put_file_system_config(Some(&expected), &desired)
+                .unwrap()
+        );
     });
-    shared
+}
+
+fn native_browser_observed_zones(
+    service: &NetworkedDfsService<crate::DfsNodeTransport>,
+) -> std::collections::BTreeMap<sinomo_core::node::NodeId, String> {
+    // Read the normal publisher's retained observation DATA. No test writes
+    // health, capacity, zone, or eligibility into the native control plane.
+    service
+        .control_plane
+        .as_deref()
+        .unwrap()
+        .write_configuration_projection()
+        .unwrap()
+        .unwrap()
+        .content_advertisements()
+        .unwrap()
+        .into_iter()
+        .filter_map(|advertisement| advertisement.zone.map(|zone| (advertisement.node_id, zone)))
+        .collect()
 }
 
 #[test]
 fn browser_options_preserve_policy_and_candidates_without_metadata_advertisement_reads() {
-    let root = sinomo_testdir::TestDir::new("browser-policy-advertisements");
-    let local = node("browser_policy_ads_local");
-    let required = node("browser_policy_ads_required");
-    let forbidden = node("browser_policy_ads_forbidden");
-    let mut dfs = service(root.path(), local.clone());
-    dfs.posix_mkdir_all("/documents").unwrap();
-    let control = configure_control(
-        &dfs,
-        &[
-            (local.clone(), "zone-a"),
-            (required.clone(), "zone-b"),
-            (forbidden.clone(), "zone-c"),
-        ],
-    );
-    let prefixes = Arc::new(Mutex::new(Vec::new()));
-    dfs = dfs.with_control_plane(PrefixRecorder {
-        inner: control.clone(),
-        prefixes: prefixes.clone(),
-    });
-    let candidates = vec![forbidden.clone(), local.clone()];
-    for (consistency, zones) in [
-        (sinomo_core::DfsObjectPolicy::ReplicatedEventual, 0),
-        (sinomo_core::DfsObjectPolicy::ReplicatedConfirmed, 2),
+    let (runtime, nodes) = native_browser_runtime("native-browser-policy-and-candidates", 3);
+    let candidates = vec![nodes[2].clone(), nodes[0].clone()];
+    for (consistency, minimum, zones) in [
+        (sinomo_core::DfsObjectPolicy::ReplicatedEventual, 1, 0),
+        (sinomo_core::DfsObjectPolicy::ReplicatedConfirmed, 2, 2),
     ] {
-        control.with_client(|kv| {
-            let mut store = DfsControlPlaneStore::new(kv);
-            let mut config = store
-                .get_file_system_config(&sifs_file_system_id())
-                .unwrap()
-                .unwrap();
-            let expected_config = config.clone();
-            let mut policy =
-                DfsPlacementPolicy::new(consistency.clone(), if zones == 0 { 1 } else { 2 }, 2)
-                    .unwrap();
-            policy.required_node_ids = vec![required.clone()];
-            policy.forbidden_node_ids = vec![forbidden.clone()];
-            policy.min_distinct_zones = zones;
-            crate::upsert_placement_rule(
-                &mut config.subtree_policies,
-                crate::normalize_placement_rule("/documents", DfsPlacementScope::Subtree, policy)
-                    .unwrap(),
-            );
-            // Generic filesystem publication deliberately preserves current
-            // placement rules. Apply this test's explicit rule edit with exact CAS.
-            assert!(
-                store
-                    .compare_and_put_file_system_config(Some(&expected_config), &config)
-                    .unwrap()
-            );
-            assert_eq!(
-                store
-                    .get_file_system_config(&sifs_file_system_id())
-                    .unwrap()
-                    .unwrap(),
-                config
-            );
-        });
-        let resolved = dfs
-            .resolved_placement_policy_for_path(
-                "/documents/new",
-                sinomo_core::DfsObjectPolicy::ReplicatedEventual,
-                candidates.len(),
-            )
-            .unwrap();
-        assert_eq!(resolved.source_path.as_deref(), Some("/documents"));
-        assert_eq!(resolved.policy.consistency, consistency);
-        assert_eq!(resolved.policy.required_node_ids, vec![required.clone()]);
-        assert_eq!(resolved.policy.forbidden_node_ids, vec![forbidden.clone()]);
-        assert_eq!(resolved.policy.min_distinct_zones, zones);
+        let mut policy = DfsPlacementPolicy::new(consistency, minimum, 2).unwrap();
+        policy.required_node_ids = vec![nodes[1].clone()];
+        policy.forbidden_node_ids = vec![nodes[2].clone()];
+        policy.min_distinct_zones = zones;
+        native_browser_policy(
+            &runtime.shared_control_plane().unwrap(),
+            "/documents",
+            policy,
+        );
+        let (mut service, probe) = runtime.client_with_control_plane_probe(&nodes[0]).unwrap();
+        let observed_zones = native_browser_observed_zones(&service);
+        let actual =
+            sifs_browser_write_options(&mut service, "/documents/new", &candidates).unwrap();
         assert_eq!(
             (
-                resolved.policy.min_commit_replicas,
-                resolved.policy.desired_replicas
+                actual.policy.min_commit_replicas,
+                actual.policy.desired_replicas
             ),
-            (if zones == 0 { 1 } else { 2 }, 2)
+            (minimum, 2)
         );
-        let expected = legacy_options(&mut dfs, "/documents/new", &candidates);
-        prefixes.lock().unwrap().clear();
-        let actual = sifs_browser_write_options(&mut dfs, "/documents/new", &candidates).unwrap();
-        assert_eq!(actual, expected);
-        assert!(
-            !actual.policy.node_zones.is_empty(),
-            "zero minimum also retains durable zone-map identity"
-        );
-        assert_eq!(
-            *prefixes.lock().unwrap(),
-            vec![crate::content_services_prefix().to_string()]
-        );
-        assert!(actual.replica_candidates.contains(&required));
+        assert_eq!(actual.policy.required_node_ids, vec![nodes[1].clone()]);
+        assert_eq!(actual.policy.forbidden_node_ids, vec![nodes[2].clone()]);
+        assert_eq!(actual.policy.min_distinct_zones, zones);
+        assert_eq!(actual.policy.node_zones, observed_zones);
         assert_eq!(
             &actual.replica_candidates[..candidates.len()],
-            candidates.as_slice(),
-            "provider-derived candidate order is unchanged"
+            candidates.as_slice()
         );
-        assert_eq!(actual.policy.required_node_ids, vec![required.clone()]);
-        assert_eq!(actual.policy.forbidden_node_ids, vec![forbidden.clone()]);
-        let selected = vec![local.clone(), required.clone()];
-        crate::validate_replication_plan(&selected, &actual.policy).expect("allowed exact plan");
+        assert!(actual.replica_candidates.contains(&nodes[1]));
+        assert_eq!(probe.point_read_calls(), 0);
+        assert_eq!(probe.prefix_read_calls(), 0);
+        assert_eq!(probe.txn_calls(), 0);
+        let selected = [nodes[0].clone(), nodes[1].clone()];
+        if zones == 0 {
+            crate::validate_replication_plan(&selected, &actual.policy).unwrap();
+        } else {
+            assert!(
+                crate::validate_replication_plan(&selected, &actual.policy).is_err(),
+                "same-process native observations cannot supply independently configured zones"
+            );
+        }
         assert!(
-            crate::validate_replication_plan(&[local.clone(), forbidden.clone()], &actual.policy)
+            crate::validate_replication_plan(&[nodes[0].clone(), nodes[2].clone()], &actual.policy)
                 .is_err()
         );
-        if zones > 0 {
-            assert_eq!(
-                (
-                    actual.policy.min_commit_replicas,
-                    actual.policy.desired_replicas
-                ),
-                (2, 2)
-            );
-            for advertised_zone in [Some("zone-a"), None] {
-                control.with_client(|kv| {
-                    let mut advertisement = DfsNodeAdvertisement::content(required.clone());
-                    advertisement.zone = advertised_zone.map(str::to_owned);
-                    DfsControlPlaneStore::new(kv)
-                        .advertise_content_service(&advertisement)
-                        .unwrap();
-                });
-                let expected_failure_policy =
-                    legacy_options(&mut dfs, "/documents/new", &candidates);
-                let unavailable =
-                    sifs_browser_write_options(&mut dfs, "/documents/new", &candidates).unwrap();
-                assert_eq!(unavailable, expected_failure_policy);
-                assert!(
-                    crate::validate_replication_plan(&selected, &unavailable.policy).is_err(),
-                    "a configured positive zone minimum must still fail with same-zone or missing advertisements"
-                );
-            }
-        }
+    }
+    runtime.close().unwrap();
+}
+
+#[test]
+fn browser_policy_zone_data_keeps_complete_map_and_rejects_unknown_or_shared_zones() {
+    // Pure policy DATA exercises multiple configured zones independently of
+    // same-process native ownership. It publishes no advertisement or ACK.
+    let nodes = [
+        node("zone-data-a"),
+        node("zone-data-b"),
+        node("zone-data-c"),
+    ];
+    let zones = std::collections::BTreeMap::from([
+        (nodes[0].clone(), "east".to_owned()),
+        (nodes[1].clone(), "west".to_owned()),
+        (nodes[2].clone(), "central".to_owned()),
+    ]);
+    for minimum_zones in [0, 2] {
+        let mut policy =
+            DfsPlacementPolicy::new(sinomo_core::DfsObjectPolicy::ReplicatedConfirmed, 2, 2)
+                .unwrap();
+        policy.required_node_ids = vec![nodes[1].clone()];
+        policy.forbidden_node_ids = vec![nodes[2].clone()];
+        policy.min_distinct_zones = minimum_zones;
+        let replication = policy.replication_policy(zones.clone()).unwrap();
+        assert_eq!(replication.node_zones, zones);
+        crate::validate_replication_plan(&[nodes[0].clone(), nodes[1].clone()], &replication)
+            .unwrap();
+        assert!(
+            crate::validate_replication_plan(&[nodes[0].clone(), nodes[2].clone()], &replication)
+                .is_err()
+        );
+    }
+    let mut policy =
+        DfsPlacementPolicy::new(sinomo_core::DfsObjectPolicy::ReplicatedConfirmed, 2, 2).unwrap();
+    policy.min_distinct_zones = 2;
+    for observed in [
+        std::collections::BTreeMap::new(),
+        std::collections::BTreeMap::from([
+            (nodes[0].clone(), "shared".to_owned()),
+            (nodes[1].clone(), "shared".to_owned()),
+        ]),
+    ] {
+        let replication = policy.replication_policy(observed).unwrap();
+        assert!(
+            crate::validate_replication_plan(&[nodes[0].clone(), nodes[1].clone()], &replication)
+                .is_err()
+        );
     }
 }
 
 #[test]
 fn browser_options_keep_confirmed_and_missing_path_defaults() {
-    let root = sinomo_testdir::TestDir::new("browser-policy-consistency");
-    let local = node("browser_policy_consistency");
-    let mut dfs = service(root.path(), local.clone());
-    dfs.posix_mkdir_all("/documents").unwrap();
-    let file = dfs
-        .posix_write_file(
-            "/documents/file",
-            b"body",
-            DfsWriteOptions::replicated_eventual(vec![local.clone()]),
-        )
-        .unwrap();
-    let mut object = dfs
-        .metadata_backend()
-        .unwrap()
-        .get_object(&file.object_id)
-        .unwrap()
-        .unwrap();
-    object.policy = sinomo_core::DfsObjectPolicy::ReplicatedConfirmed;
-    dfs.add_object_metadata(object).unwrap();
-    let candidates = vec![local.clone(), node("browser_policy_consistency_other")];
-    for path in ["/documents/file", "/documents/missing"] {
-        let expected = legacy_options(&mut dfs, path, &candidates);
-        assert_eq!(
-            sifs_browser_write_options(&mut dfs, path, &candidates).unwrap(),
-            expected
-        );
-    }
-    let confirmed = sifs_browser_write_options(&mut dfs, "/documents/file", &candidates).unwrap();
-    assert_eq!(
-        (
-            confirmed.policy.min_commit_replicas,
-            confirmed.policy.desired_replicas
-        ),
-        (2, 2)
+    let (runtime, nodes) = native_browser_runtime("native-browser-confirmed-defaults", 2);
+    native_browser_policy(
+        &runtime.shared_control_plane().unwrap(),
+        "/documents",
+        DfsPlacementPolicy::new(sinomo_core::DfsObjectPolicy::ReplicatedConfirmed, 2, 2).unwrap(),
     );
+    let mut service = runtime.client(&nodes[0]).unwrap();
+    service.posix_mkdir_all("/documents").unwrap();
+    let options = sifs_browser_write_options(&mut service, "/documents/file", &nodes).unwrap();
+    service
+        .posix_write_file("/documents/file", b"actual confirmed bytes", options)
+        .unwrap();
+    assert_eq!(
+        service.posix_stat("/documents/file").unwrap().policy,
+        sinomo_core::DfsObjectPolicy::ReplicatedConfirmed
+    );
+    for path in ["/documents/file", "/documents/missing"] {
+        let actual = sifs_browser_write_options(&mut service, path, &nodes).unwrap();
+        assert_eq!(
+            (
+                actual.policy.min_commit_replicas,
+                actual.policy.desired_replicas
+            ),
+            (2, 2)
+        );
+        assert!(actual.wait_for_commit);
+    }
+    drop(service);
+    runtime.close().unwrap();
 }
 
 #[test]
 fn browser_options_preserve_local_one_replica_and_reject_local_constraints() {
-    let root = sinomo_testdir::TestDir::new("browser-policy-local-contract");
-    let local = node("browser_policy_local_contract");
-    let other = node("browser_policy_local_contract_other");
-    let mut dfs = service(root.path(), local.clone());
-    let path = crate::sifs_node_files_path(&local);
-    let control = configure_control(&dfs, &[(local.clone(), "local-zone")]);
-    dfs = dfs.with_control_plane(control.clone());
+    let (runtime, nodes) = native_browser_runtime("native-browser-local-policy", 2);
+    let mut service = runtime.client(&nodes[0]).unwrap();
+    let path = crate::sifs_node_files_path(&nodes[0]);
     assert_eq!(
-        dfs.posix_object_policy(&path).unwrap(),
+        service.posix_object_policy(&path).unwrap(),
         sinomo_core::DfsObjectPolicy::LocalOwned
     );
-
-    let singleton = vec![local.clone()];
-    let legacy_singleton = legacy_options(&mut dfs, &path, &singleton);
-    let local_options = sifs_browser_write_options(&mut dfs, &path, &singleton).unwrap();
-    assert_eq!(local_options, legacy_singleton);
+    let observed_zones = native_browser_observed_zones(&service);
+    let actual = sifs_browser_write_options(&mut service, &path, &nodes).unwrap();
     assert_eq!(
         (
-            local_options.policy.min_commit_replicas,
-            local_options.policy.desired_replicas
+            actual.policy.min_commit_replicas,
+            actual.policy.desired_replicas
         ),
         (1, 1)
     );
-    assert_eq!(local_options.policy.min_distinct_zones, 0);
-    assert_eq!(
-        local_options
-            .policy
-            .node_zones
-            .get(&local)
-            .map(String::as_str),
-        Some("local-zone"),
-        "zone observations alone are not a local placement constraint"
-    );
-
-    let multiple = vec![local.clone(), other.clone()];
-    let expected_reason = "local placement requires W=1, N=1, and no replica constraints";
-    // Legacy local rules omit counts: their valid implicit default remains
-    // W=1/N=1 even when the cluster exposes multiple candidate nodes. Zone
-    // observations remain available without becoming a local constraint.
-    let (_, _, legacy_policy) = dfs
-        .managed_replication_policy_for_path(
-            &path,
-            sinomo_core::DfsObjectPolicy::LocalOwned,
-            multiple.len(),
-        )
-        .expect("implicit local counts are independent of candidate count");
-    let multiple_options = sifs_browser_write_options(&mut dfs, &path, &multiple)
-        .expect("browser preserves the valid local default");
-    assert_eq!(multiple_options.policy, legacy_policy);
-    assert_eq!(
-        (
-            multiple_options.policy.min_commit_replicas,
-            multiple_options.policy.desired_replicas
-        ),
-        (1, 1)
-    );
-    assert_eq!(
-        multiple_options.policy.node_zones,
-        local_options.policy.node_zones
-    );
-    assert_eq!(
-        multiple_options
-            .policy
-            .node_zones
-            .get(&local)
-            .map(String::as_str),
-        Some("local-zone")
-    );
-
-    let mut explicit_local =
-        crate::DfsSubtreePolicy::legacy(&path, sinomo_core::DfsObjectPolicy::LocalOwned);
-    explicit_local.min_commit_replicas = Some(1);
-    explicit_local.desired_replicas = Some(1);
-    // Include a valid explicit rule followed by each independently invalid
-    // local constraint. Persist exact fixture records, then exercise the same
-    // policy validation both public browser option paths rely on.
-    for constraint in ["none", "required", "forbidden", "zones"] {
-        let mut rule = explicit_local.clone();
+    assert_eq!(actual.policy.min_distinct_zones, 0);
+    assert_eq!(actual.policy.node_zones, observed_zones);
+    for constraint in ["required", "forbidden", "zones"] {
+        let mut policy =
+            DfsPlacementPolicy::new(sinomo_core::DfsObjectPolicy::LocalOwned, 1, 1).unwrap();
         match constraint {
-            "required" => rule.required_node_ids = vec![local.clone()],
-            "forbidden" => rule.forbidden_node_ids = vec![other.clone()],
-            "zones" => rule.min_distinct_zones = 1,
-            _ => {}
+            "required" => policy.required_node_ids = vec![nodes[0].clone()],
+            "forbidden" => policy.forbidden_node_ids = vec![nodes[1].clone()],
+            _ => policy.min_distinct_zones = 1,
         }
-        control.with_client(|kv| {
-            let mut store = DfsControlPlaneStore::new(kv);
-            let expected = store
-                .get_file_system_config(&sifs_file_system_id())
-                .unwrap()
-                .unwrap();
-            let mut desired = expected.clone();
-            crate::upsert_placement_rule(&mut desired.subtree_policies, rule);
-            assert!(
-                store
-                    .compare_and_put_file_system_config(Some(&expected), &desired)
-                    .unwrap()
-            );
-            assert_eq!(
-                store
-                    .get_file_system_config(&sifs_file_system_id())
-                    .unwrap()
-                    .unwrap(),
-                desired
-            );
-        });
-        if constraint == "none" {
-            let legacy = legacy_options(&mut dfs, &path, &multiple);
-            let actual = sifs_browser_write_options(&mut dfs, &path, &multiple).unwrap();
-            assert_eq!(actual, legacy);
-            assert_eq!(
-                (
-                    actual.policy.min_commit_replicas,
-                    actual.policy.desired_replicas
-                ),
-                (1, 1)
-            );
-        } else {
-            let legacy_error = dfs
-                .managed_replication_policy_for_path(
-                    &path,
-                    sinomo_core::DfsObjectPolicy::LocalOwned,
-                    singleton.len(),
-                )
-                .unwrap_err();
-            let actual_error = dfs
-                .managed_write_replication_policy_for_path(
-                    &path,
-                    sinomo_core::DfsObjectPolicy::LocalOwned,
-                    singleton.len(),
-                )
-                .unwrap_err();
-            assert_eq!(actual_error.to_string(), legacy_error.to_string());
-            assert!(
-                legacy_error.to_string().contains(expected_reason),
-                "{constraint}"
-            );
-            assert!(
-                sifs_browser_write_options(&mut dfs, &path, &singleton)
-                    .unwrap_err()
-                    .to_string()
-                    .contains(expected_reason),
-                "{constraint}"
-            );
-        }
+        assert!(
+            crate::normalize_placement_rule(&path, DfsPlacementScope::Subtree, policy).is_err(),
+            "normal current policy admission rejects {constraint} before publishing invalid local rules"
+        );
     }
+    drop(service);
+    runtime.close().unwrap();
 }
 
 #[test]
-fn browser_options_replay_old_committed_operation_after_reopen_without_changing_zone_policy() {
-    let root = sinomo_testdir::TestDir::new("browser-policy-old-replay");
-    let local = node("browser_policy_old_replay");
-    let path = "/documents/old-operation";
-    let operation = "browser-policy-stable-operation";
-    let bytes = vec![0x5c; 4096];
-    let mut dfs = service(root.path(), local.clone());
-    dfs.posix_mkdir_all("/documents").unwrap();
-    let control = configure_control(&dfs, &[(local.clone(), "historical-zone")]);
-    dfs = dfs.with_control_plane(control.clone());
-    let old_options = legacy_options(&mut dfs, path, std::slice::from_ref(&local));
-    assert_eq!(old_options.policy.min_distinct_zones, 0);
-    assert_eq!(
-        old_options.policy.node_zones,
-        BTreeMap::from([(local.clone(), "historical-zone".to_string())])
-    );
-    let created = dfs
-        .posix_create_file_with_operation_id(path, &bytes, old_options.clone(), operation)
-        .expect("original operation with pre-optimization options");
-    let intent_id = crate::intent::stable_write_intent_id(&local, &created.object_id, operation);
-    let original = dfs
+fn browser_options_replay_committed_operation_after_actual_reopen_without_changing_zone_policy() {
+    let (mut runtime, nodes) = native_browser_runtime("native-browser-stable-policy-reopen", 1);
+    let path = "/documents/stable-operation";
+    let operation = "native-browser-stable-operation";
+    let mut service = runtime.client(&nodes[0]).unwrap();
+    service.posix_mkdir_all("/documents").unwrap();
+    let options = sifs_browser_write_options(&mut service, path, &nodes).unwrap();
+    let created = service
+        .posix_create_file_with_operation_id(path, b"exact bytes", options, operation)
+        .unwrap();
+    let intent_id = crate::intent::stable_write_intent_id(&nodes[0], &created.object_id, operation);
+    let original = service
         .metadata_backend()
         .unwrap()
         .get_intent(&created.object_id, &intent_id)
         .unwrap()
         .unwrap();
     assert_eq!(original.status, DfsWriteIntentStatus::Committed);
-    assert_eq!(original.policy, old_options.policy);
-    drop(dfs);
-
-    let mut reopened = service(root.path(), local.clone()).with_control_plane(control);
-    let new_options =
-        sifs_browser_write_options(&mut reopened, path, std::slice::from_ref(&local)).unwrap();
-    assert_eq!(new_options.policy, original.policy);
-    let replay = reopened
-        .posix_create_file_with_operation_id(path, &bytes, new_options.clone(), operation)
-        .expect("lost-response retry through new options after restart");
+    drop(service);
+    runtime.stop_node(&nodes[0]).unwrap();
+    runtime.reopen_node(nodes[0].clone()).unwrap();
+    let mut service = runtime.client(&nodes[0]).unwrap();
+    let options = sifs_browser_write_options(&mut service, path, &nodes).unwrap();
+    let replay = service
+        .posix_create_file_with_operation_id(path, b"exact bytes", options.clone(), operation)
+        .unwrap();
     assert_eq!(
         (replay.object_id, replay.version),
         (created.object_id.clone(), created.version)
     );
-    let after = reopened
-        .metadata_backend()
-        .unwrap()
-        .get_intent(&created.object_id, &intent_id)
-        .unwrap()
-        .unwrap();
     assert_eq!(
-        after, original,
-        "retry must reuse the exact durable identity, not rewrite policy or timestamps"
+        service
+            .metadata_backend()
+            .unwrap()
+            .get_intent(&created.object_id, &intent_id)
+            .unwrap()
+            .unwrap(),
+        original
     );
     assert!(
-        reopened
-            .posix_create_file_with_operation_id(path, b"different", new_options, operation)
-            .is_err(),
-        "stable content identity remains exact"
+        service
+            .posix_create_file_with_operation_id(path, b"changed", options, operation)
+            .is_err()
     );
-    assert_eq!(reopened.posix_read_file(path).unwrap(), bytes);
-}
-
-#[derive(Clone, Debug)]
-struct ProjectionRecorder {
-    inner: SharedDfsControlPlaneKvClient<InProcessKvStore>,
-    view: Arc<Mutex<Arc<DfsWriteConfigurationProjection>>>,
-    floor_available: Arc<AtomicBool>,
-    configuration_pending: Arc<AtomicBool>,
-    prefixes: Arc<Mutex<Vec<String>>>,
-    namespace_notifications: Arc<std::sync::atomic::AtomicUsize>,
-}
-
-impl DfsControlPlaneKvClient for ProjectionRecorder {
-    fn write_configuration_readiness(&self) -> Result<DfsWriteConfigurationReadiness, KvError> {
-        let view = self.write_configuration_projection()?;
-        if self.configuration_pending.load(Ordering::Acquire) {
-            Ok(DfsWriteConfigurationReadiness::Pending)
-        } else {
-            Ok(DfsWriteConfigurationReadiness::Ready(view))
-        }
-    }
-
-    fn write_configuration_projection(
-        &self,
-    ) -> Result<Option<Arc<DfsWriteConfigurationProjection>>, KvError> {
-        if !self.floor_available.load(Ordering::Acquire) {
-            return Err(KvError::AuthorityUnavailable {
-                detail: "test native write configuration floor is unavailable".into(),
-            });
-        }
-        Ok(Some(Arc::clone(&self.view.lock().unwrap())))
-    }
-
-    fn placement_authority_process_identity(&self) -> Option<DfsPlacementAuthorityProcessIdentity> {
-        self.inner
-            .with_client(|kv| kv.placement_authority_process_identity())
-    }
-
-    fn get(&self, key: &str) -> Result<Option<KvEntry>, KvError> {
-        self.inner
-            .with_client(|kv| DfsControlPlaneKvClient::get(kv, key))
-    }
-
-    fn range_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>, KvError> {
-        self.prefixes.lock().unwrap().push(prefix.to_string());
-        self.inner
-            .with_client(|kv| DfsControlPlaneKvClient::range_prefix(kv, prefix))
-    }
-
-    fn range_prefix_authoritative(
-        &mut self,
-        prefix: &str,
-    ) -> Result<DfsAuthoritativePrefixProjection, KvError> {
-        self.prefixes.lock().unwrap().push(prefix.to_string());
-        self.inner
-            .with_client(|kv| kv.range_prefix_authoritative(prefix))
-    }
-
-    fn get_authoritative_consistent(
-        &mut self,
-        keys: &[String],
-    ) -> Result<Vec<Option<KvEntry>>, KvError> {
-        self.inner
-            .with_client(|kv| kv.get_authoritative_consistent(keys))
-    }
-
-    fn get_authoritative_consistent_before(
-        &mut self,
-        keys: &[String],
-        deadline: Instant,
-    ) -> Result<Vec<Option<KvEntry>>, KvError> {
-        self.inner
-            .with_client(|kv| kv.get_authoritative_consistent_before(keys, deadline))
-    }
-
-    fn put(&mut self, key: String, value: Vec<u8>) -> Result<KvRevision, KvError> {
-        self.inner
-            .with_client(|kv| DfsControlPlaneKvClient::put(kv, key, value))
-    }
-
-    fn txn(&mut self, txn: KvTxn) -> Result<KvTxnResponse, KvError> {
-        self.inner
-            .with_client(|kv| DfsControlPlaneKvClient::txn(kv, txn))
-    }
-}
-
-fn projected_configuration(
-    control: &SharedDfsControlPlaneKvClient<InProcessKvStore>,
-    local: &sinomo_core::node::NodeId,
-) -> Arc<DfsWriteConfigurationProjection> {
-    use crate::write_configuration_projection::{
-        DFS_WRITE_CONFIGURATION_PREFIXES, DfsWriteConfigurationState,
-    };
-    let (native, floor) = control.with_client(|kv| {
-        let config_key = cluster_kv_raft_config_key();
-        if DfsControlPlaneKvClient::get(kv, &config_key)
-            .unwrap()
-            .is_none()
-        {
-            let config = ClusterKvRaftConfigRecord {
-                cluster_id: sinomo_core::Id::derived("browser-write-projection", b"cluster"),
-                term: 1,
-                kv_revision: 0,
-                voters: vec![local.clone()],
-                learners: Vec::new(),
-                non_voting: Vec::new(),
-                updated_at: time::OffsetDateTime::UNIX_EPOCH,
-            };
-            DfsControlPlaneKvClient::put(kv, config_key.clone(), encode_kv_value(&config).unwrap())
-                .unwrap();
-        }
-        // Fixture bootstrap captures real configured data once. Warm calls
-        // below return this already-validated immutable publication.
-        let snapshot = kv.try_snapshot().unwrap();
-        let authority = KvAuthorityProof {
-            term: 1,
-            commit_index: snapshot.revision.0 + 1,
-            revision: snapshot.revision,
-            basis: KvAuthorityBasis::CurrentTermQuorum {
-                voter_acks: 1,
-                required_quorum: 1,
-            },
-        };
-        let native = std::array::from_fn(|scope| KvAuthoritativeRead {
-            value: snapshot
-                .prefix_entries(DFS_WRITE_CONFIGURATION_PREFIXES[scope])
-                .cloned()
-                .collect(),
-            authority,
-        });
-        let floor = KvLocalRead {
-            value: snapshot.get(&config_key).cloned(),
-            revision: snapshot.revision,
-            observed_term: 1,
-            applied_index: snapshot.revision.0 + 1,
-            known_leader: Some(local.clone()),
-        };
-        (native, floor)
-    });
-    let mut state = DfsWriteConfigurationState::new();
-    let token = state.begin_refresh();
-    assert!(state.install_bootstrap(token, native, floor).unwrap());
-    state.snapshot().unwrap()
-}
-
-fn put_provider(kv: &mut InProcessKvStore, node_id: &sinomo_core::node::NodeId, eligible: bool) {
-    let mut provider =
-        sinomo_core::service::ServiceInstanceRecord::new("browser-dfs", node_id.clone());
-    if eligible {
-        provider
-            .provider_capabilities
-            .push("dfs.object.transfer".into());
-    }
-    DfsControlPlaneKvClient::put(
-        kv,
-        sinomo_core::service::cluster_service_instance_key(&provider.service_id, node_id),
-        encode_kv_value(&provider).unwrap(),
-    )
-    .unwrap();
-}
-
-fn configure_projection_policy(
-    control: &SharedDfsControlPlaneKvClient<InProcessKvStore>,
-    local: &sinomo_core::node::NodeId,
-    desired: usize,
-) {
-    control.with_client(|kv| {
-        let mut store = DfsControlPlaneStore::new(kv);
-        let mut config = store
-            .get_file_system_config(&sifs_file_system_id())
-            .unwrap()
-            .unwrap();
-        let expected = config.clone();
-        let mut policy =
-            DfsPlacementPolicy::new(sinomo_core::DfsObjectPolicy::ReplicatedEventual, 1, desired)
-                .unwrap();
-        policy.required_node_ids = vec![local.clone()];
-        crate::upsert_placement_rule(
-            &mut config.subtree_policies,
-            crate::normalize_placement_rule("/documents", DfsPlacementScope::Subtree, policy)
-                .unwrap(),
-        );
-        assert!(
-            store
-                .compare_and_put_file_system_config(Some(&expected), &config)
-                .unwrap()
-        );
-    });
-}
-
-struct ProjectionBrowserHost {
-    namespace_notifications: Arc<std::sync::atomic::AtomicUsize>,
-}
-
-impl DfsBrowserServiceHost for ProjectionBrowserHost {
-    fn control_plane_client(
-        &self,
-        _: &ClusterPaths,
-        _: &tokio::runtime::Handle,
-    ) -> Option<Box<dyn DfsControlPlaneKvClient>> {
-        unreachable!()
-    }
-    fn peer_transports(
-        &self,
-        _: &SinomoDataDir,
-        _: &tokio::runtime::Handle,
-    ) -> (Arc<dyn DfsPeerTransport>, Arc<dyn AsyncDfsPeerTransport>) {
-        unreachable!()
-    }
-    fn schedule_metadata_publish(
-        &self,
-        _: &SinomoDataDir,
-        _: &tokio::runtime::Handle,
-        _: Option<&str>,
-    ) {
-        unreachable!()
-    }
-    fn notify_maintenance(&self) {}
-    fn publish_namespace_change(&self, _: sinomo_core::Id, operation: &str, paths: Vec<String>) {
-        assert_eq!(operation, "metadata-committed");
-        assert!(paths.is_empty());
-        self.namespace_notifications.fetch_add(1, Ordering::SeqCst);
-    }
-    fn publish_placement_change(&self, _: sinomo_core::Id, _: &str, _: Vec<String>) {
-        unreachable!()
-    }
-    fn inspect_placement_authority(
-        &self,
-        _: &tokio::runtime::Handle,
-        _: &DfsFileSystemId,
-    ) -> Result<Option<DfsPlacementAuthorityPermitStatus>, ServiceError> {
-        unreachable!()
-    }
-    fn recover_removed_placement_authority(
-        &self,
-        _: &tokio::runtime::Handle,
-        _: &DfsFileSystemId,
-        _: &str,
-        _: bool,
-    ) -> Result<DfsPlacementAuthorityRecoveryOutcome, ServiceError> {
-        unreachable!()
-    }
-    fn break_glass_recover_placement_authority(
-        &self,
-        _: &tokio::runtime::Handle,
-        _: &DfsFileSystemId,
-        _: &str,
-        _: &str,
-    ) -> Result<DfsPlacementAuthorityRecoveryOutcome, ServiceError> {
-        unreachable!()
-    }
-}
-
-fn projection_browser(root: &Path) -> (DfsBrowserBackend, ProjectionRecorder) {
-    let opened = crate::open_mounted_sifs_service(Some(root.to_path_buf())).unwrap();
-    let local = opened.service.node_id().clone();
-    let others = [
-        node("browser_projection_other_a"),
-        node("browser_projection_other_b"),
-    ];
-    let control = configure_control(
-        &opened.service,
-        &[
-            (local.clone(), "zone-a"),
-            (others[0].clone(), "zone-b"),
-            (others[1].clone(), "zone-c"),
-        ],
-    );
-    configure_projection_policy(&control, &local, 1);
-    control.with_client(|kv| {
-        put_provider(kv, &local, true);
-        for other in &others {
-            put_provider(kv, other, true);
-        }
-    });
-    let recorder = ProjectionRecorder {
-        view: Arc::new(Mutex::new(projected_configuration(&control, &local))),
-        inner: control,
-        floor_available: Arc::new(AtomicBool::new(true)),
-        configuration_pending: Arc::new(AtomicBool::new(false)),
-        prefixes: Arc::new(Mutex::new(Vec::new())),
-        namespace_notifications: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-    };
-    let service = opened.service.with_control_plane(recorder.clone());
-    let backend = DfsBrowserBackend {
-        data_dir: SinomoDataDir::new(root),
-        host: Arc::new(ProjectionBrowserHost {
-            namespace_notifications: Arc::clone(&recorder.namespace_notifications),
-        }),
-        node_id: local,
-        service: Mutex::new(service),
-        replica_control_plane: Mutex::new(Some(Box::new(recorder.clone()))),
-        peer_targets_refreshed_at: Mutex::new(None),
-        stat_cache: Mutex::new(HashMap::new()),
-    };
-    (backend, recorder)
-}
-
-fn assert_no_write_provider_prefix_reads(recorder: &ProjectionRecorder) {
-    let prefixes = recorder.prefixes.lock().unwrap();
-    assert!(
-        prefixes.iter().all(|prefix| {
-            !prefix.starts_with(crate::content_services_prefix())
-                && !prefix.starts_with(sinomo_core::service::CLUSTER_SERVICES_KV_PREFIX)
-        }),
-        "warm writes fetched content/provider configuration: {prefixes:?}"
-    );
+    assert_eq!(service.posix_read_file(path).unwrap(), b"exact bytes");
+    drop(service);
+    runtime.close().unwrap();
 }
 
 #[test]
 fn write_configuration_browser_warm_options_and_committed_writes_keep_full_zero_minimum_zones() {
-    let root = sinomo_testdir::TestDir::new("browser-native-write-configuration");
-    let (backend, recorder) = projection_browser(root.path());
-    let path = "/documents/native-write";
-    let expected = {
-        let candidates =
-            crate::discover_mounted_sifs_content_replica_candidates_with_control_plane(
-                &recorder.inner,
-            )
+    // Separate normal fixtures preserve the shared runtime's fixed roster.
+    // The Docker formation gate exercises sequential membership growth.
+    for (name, node_count) in [
+        ("native-browser-warm-solo-configuration", 1),
+        ("native-browser-warm-write-configuration", 3),
+    ] {
+        let (runtime, nodes) = native_browser_runtime(name, node_count);
+        let path = "/services/native-write";
+        let owner = runtime
+            .metadata_primary_service(path)
+            .unwrap()
+            .node_id()
+            .clone();
+        let backend = DfsBrowserBackend::for_component_data_dir(
+            Arc::new(runtime.data_dir(&owner).clone()),
+            &runtime.runtime_handle(),
+        )
+        .unwrap();
+        let (mut service, probe) = runtime.client_with_control_plane_probe(&owner).unwrap();
+        let implicit = service
+            .control_plane
+            .as_deref()
+            .unwrap()
+            .write_configuration_projection()
+            .unwrap()
             .unwrap();
-        let mut service = backend.lock_service().unwrap();
-        let expected = legacy_options(&mut service, path, &candidates);
-        assert_eq!(expected.policy.min_distinct_zones, 0);
-        assert_eq!(expected.policy.node_zones.len(), 3);
-        recorder.prefixes.lock().unwrap().clear();
-        for _ in 0..3 {
-            let candidates =
-                crate::discover_mounted_sifs_content_replica_candidates_with_control_plane(
-                    &recorder,
-                )
+        let config = implicit
+            .file_system_config(&sifs_file_system_id())
+            .unwrap()
+            .unwrap();
+        assert!(config.subtree_policies.iter().all(|rule| {
+            rule.path_prefix != crate::SIFS_USERS_PATH
+                && rule.path_prefix != crate::SIFS_SERVICES_PATH
+        }));
+        let candidates = implicit.content_replica_candidates().unwrap();
+        assert_eq!(
+            candidates.iter().collect::<std::collections::BTreeSet<_>>(),
+            nodes.iter().collect::<std::collections::BTreeSet<_>>()
+        );
+        let implicit_options = sifs_browser_write_options_with_configuration(
+            &mut service,
+            path,
+            &candidates,
+            Some(&implicit),
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                implicit_options.policy.min_commit_replicas,
+                implicit_options.policy.desired_replicas
+            ),
+            (1, node_count.min(2))
+        );
+        let initial_bytes = vec![0x44; 4096];
+        backend
+            .write_file(DaemonDfsBrowserWriteFileRequest {
+                path: path.into(),
+                bytes: initial_bytes.clone(),
+            })
+            .unwrap();
+        {
+            let mut stored = backend.lock_service().unwrap();
+            let stat = stored.posix_stat_distributed(path).unwrap();
+            assert_eq!(
+                stored.posix_read_file_distributed(path).unwrap(),
+                initial_bytes
+            );
+            let intents = stored
+                .metadata_backend()
+                .unwrap()
+                .intents_for_object_version_page(&stat.object_id, &stat.version, None, 16)
                 .unwrap();
+            let actual = intents
+                .intents
+                .iter()
+                .find(|intent| {
+                    intent.status == DfsWriteIntentStatus::Committed
+                        && intent.publication.is_current()
+                })
+                .unwrap();
+            assert_eq!(actual.file_system_id, stat.file_system_id);
+            assert_eq!(actual.object_id, stat.object_id);
+            assert_eq!(actual.target_version, stat.version);
+            assert_eq!(actual.content_hash, stat.content_hash);
+            assert_eq!(actual.policy, implicit_options.policy);
+            assert_eq!(actual.desired_replica_node_ids.len(), node_count.min(2));
+        }
+        assert_eq!(probe.point_read_calls(), 0);
+        assert_eq!(probe.prefix_read_calls(), 0);
+        assert_eq!(probe.txn_calls(), 0);
+        drop(service);
+        let mut policy =
+            DfsPlacementPolicy::new(sinomo_core::DfsObjectPolicy::ReplicatedEventual, 1, 1)
+                .unwrap();
+        policy.required_node_ids = vec![owner.clone()];
+        let expected_rule = crate::normalize_placement_rule(
+            "/services",
+            DfsPlacementScope::Subtree,
+            policy.clone(),
+        )
+        .unwrap();
+        runtime
+            .apply_placement_policy(&owner, "/services", DfsPlacementScope::Subtree, policy)
+            .unwrap();
+        let applied = runtime
+            .shared_control_plane()
+            .unwrap()
+            .with_client(|kv| {
+                DfsControlPlaneStore::new(kv.as_mut())
+                    .get_file_system_config(&sifs_file_system_id())
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            applied
+                .subtree_policies
+                .iter()
+                .filter(|rule| {
+                    rule.path_prefix == expected_rule.path_prefix
+                        && rule.scope == expected_rule.scope
+                })
+                .collect::<Vec<_>>(),
+            vec![&expected_rule]
+        );
+        // Open the next caller after publication, as the normal Apply API specifies.
+        // The earlier held implicit view remains separate, unchanged DATA.
+        let (mut service, probe) = runtime.client_with_control_plane_probe(&owner).unwrap();
+        let observed_zones = native_browser_observed_zones(&service);
+        let expected = sifs_browser_write_options(&mut service, path, &candidates).unwrap();
+        assert_eq!(
+            (
+                expected.policy.min_commit_replicas,
+                expected.policy.desired_replicas
+            ),
+            (1, 1)
+        );
+        assert_eq!(expected.policy.required_node_ids, vec![owner]);
+        assert_eq!(
+            sifs_browser_write_options_with_configuration(
+                &mut service,
+                path,
+                &candidates,
+                Some(&implicit),
+            )
+            .unwrap(),
+            implicit_options
+        );
+        for _ in 0..3 {
             assert_eq!(
                 sifs_browser_write_options(&mut service, path, &candidates).unwrap(),
                 expected
             );
         }
-        expected
-    };
-    let mut versions = Vec::new();
-    for bytes in [vec![0x11; 4096], vec![0x99; 4096]] {
-        backend
-            .write_file(DaemonDfsBrowserWriteFileRequest {
-                path: path.into(),
-                bytes: bytes.clone(),
-            })
-            .unwrap();
-        let service = backend.lock_service().unwrap();
-        let stat = service.posix_stat(path).unwrap();
-        assert_eq!(service.posix_read_file(path).unwrap(), bytes);
-        let metadata = service.metadata_backend().unwrap();
-        let durable = metadata.get_object(&stat.object_id).unwrap().unwrap();
-        assert_eq!(durable.version, stat.version);
-        let intents = metadata
-            .intents_for_object_version_page(&stat.object_id, &stat.version, None, 16)
-            .unwrap();
-        let committed = intents
-            .intents
-            .iter()
-            .find(|intent| intent.status == DfsWriteIntentStatus::Committed)
-            .expect("the visible version has its durable committed intent");
-        assert_eq!(committed.policy, expected.policy);
-        assert_eq!(committed.policy.node_zones.len(), 3);
-        versions.push(stat.version);
+        assert_eq!(probe.point_read_calls(), 0);
+        assert_eq!(probe.prefix_read_calls(), 0);
+        assert_eq!(probe.txn_calls(), 0);
+        assert_eq!(expected.policy.min_distinct_zones, 0);
+        assert_eq!(expected.policy.node_zones, observed_zones);
+        let mut versions = Vec::new();
+        for bytes in [vec![0x11; 4096], vec![0x99; 4096]] {
+            backend
+                .write_file(DaemonDfsBrowserWriteFileRequest {
+                    path: path.into(),
+                    bytes: bytes.clone(),
+                })
+                .unwrap();
+            let mut stored = backend.lock_service().unwrap();
+            let stat = stored.posix_stat_distributed(path).unwrap();
+            assert_eq!(stored.posix_read_file_distributed(path).unwrap(), bytes);
+            let intents = stored
+                .metadata_backend()
+                .unwrap()
+                .intents_for_object_version_page(&stat.object_id, &stat.version, None, 16)
+                .unwrap();
+            let actual = intents
+                .intents
+                .iter()
+                .find(|intent| intent.status == DfsWriteIntentStatus::Committed)
+                .unwrap();
+            assert_eq!(actual.policy, expected.policy);
+            versions.push(stat.version);
+        }
+        assert_ne!(versions[0], versions[1]);
+        drop(service);
+        drop(backend);
+        runtime.close().unwrap();
     }
-    assert_ne!(
-        versions[0], versions[1],
-        "overwrite publishes a new durable version"
+}
+
+#[test]
+fn write_configuration_browser_coherent_updates_keep_retained_view_and_current_policy_separate() {
+    let (runtime, nodes) = native_browser_runtime("native-browser-coherent-current-policy", 3);
+    native_browser_policy(
+        &runtime.shared_control_plane().unwrap(),
+        "/documents",
+        DfsPlacementPolicy::new(sinomo_core::DfsObjectPolicy::ReplicatedEventual, 1, 1).unwrap(),
     );
-    assert_no_write_provider_prefix_reads(&recorder);
-    assert_eq!(recorder.namespace_notifications.load(Ordering::SeqCst), 2);
+    let mut service = runtime.client(&nodes[0]).unwrap();
+    let old = service
+        .control_plane
+        .as_deref()
+        .unwrap()
+        .write_configuration_projection()
+        .unwrap()
+        .unwrap();
+    let old_candidates = old.content_replica_candidates().unwrap();
+    let old_options = sifs_browser_write_options_with_configuration(
+        &mut service,
+        "/documents/coherent",
+        &old_candidates,
+        Some(&old),
+    )
+    .unwrap();
+    let mut policy =
+        DfsPlacementPolicy::new(sinomo_core::DfsObjectPolicy::ReplicatedEventual, 1, 2).unwrap();
+    policy.required_node_ids = vec![nodes[0].clone()];
+    policy.forbidden_node_ids = vec![nodes[2].clone()];
+    policy.min_distinct_zones = 2;
+    native_browser_policy(
+        &runtime.shared_control_plane().unwrap(),
+        "/documents",
+        policy,
+    );
+    assert_eq!(
+        sifs_browser_write_options_with_configuration(
+            &mut service,
+            "/documents/coherent",
+            &old_candidates,
+            Some(&old)
+        )
+        .unwrap(),
+        old_options
+    );
+    let (mut current, probe) = runtime.client_with_control_plane_probe(&nodes[0]).unwrap();
+    let view = current
+        .control_plane
+        .as_deref()
+        .unwrap()
+        .write_configuration_projection()
+        .unwrap()
+        .unwrap();
+    assert!(view.revision() > old.revision());
+    let candidates = view.content_replica_candidates().unwrap();
+    let observed_zones = native_browser_observed_zones(&current);
+    let actual =
+        sifs_browser_write_options(&mut current, "/documents/coherent", &candidates).unwrap();
+    assert_eq!(
+        (
+            actual.policy.min_commit_replicas,
+            actual.policy.desired_replicas,
+            actual.policy.min_distinct_zones
+        ),
+        (1, 2, 2)
+    );
+    assert_eq!(actual.policy.forbidden_node_ids, vec![nodes[2].clone()]);
+    assert_eq!(actual.policy.node_zones, observed_zones);
+    assert!(
+        crate::validate_replication_plan(&[nodes[0].clone(), nodes[1].clone()], &actual.policy)
+            .is_err(),
+        "retained unknown or shared native zones cannot satisfy a two-zone rule"
+    );
+    assert_ne!(actual.policy, old_options.policy);
+    assert_eq!(probe.point_read_calls(), 0);
+    assert_eq!(probe.prefix_read_calls(), 0);
+    drop(current);
+    drop(service);
+    runtime.close().unwrap();
 }
 
 #[test]
 fn write_configuration_browser_pending_preserves_payload_without_parent_intent_or_journal_effects()
 {
-    let root = sinomo_testdir::TestDir::new("browser-pending-configuration-handoff");
-    let (backend, recorder) = projection_browser(root.path());
+    let (runtime, nodes) = native_browser_runtime("native-browser-configuration-gap", 1);
+    let backend = DfsBrowserBackend::for_component_data_dir(
+        Arc::new(runtime.data_dir(&nodes[0]).clone()),
+        &runtime.runtime_handle(),
+    )
+    .unwrap();
+    let key = crate::file_system_config_key(&sifs_file_system_id());
+    let context = runtime.component_context(&nodes[0]).unwrap();
+    let owner = crate::runtime_host::retain_component_data_owner(&context).unwrap();
+    assert!(
+        crate::runtime_host::registered_component_cluster(&context)
+            .unwrap()
+            .is_some()
+    );
+    // Configuration publication uses the normal native KV client independently
+    // of the DFS metadata projection whose real repair read is paused below.
+    let control = crate::SharedDfsControlPlaneKvClient::new(Box::new(
+        crate::runtime_host::DaemonDfsControlPlaneKvClient::new_on_runtime(
+            &ClusterPaths::new(context.data_dir()),
+            context.runtime().unwrap(),
+        ),
+    )
+        as Box<dyn crate::DfsControlPlaneKvClient>);
+    let gap = runtime
+        .lose_configuration_delta_and_pause_rebuild(&nodes[0], key.clone())
+        .unwrap();
+    let first =
+        DfsPlacementPolicy::new(sinomo_core::DfsObjectPolicy::ReplicatedEventual, 1, 1).unwrap();
+    native_browser_policy(&control, "/documents", first.clone());
+    let mut second = first;
+    second.required_node_ids = vec![nodes[0].clone()];
+    native_browser_policy(&control, "/documents", second);
+    gap.wait_rebuild(std::time::Duration::from_secs(5)).unwrap();
+    let actual_lost = gap
+        .dropped_delta()
+        .expect("one real committed delta was withheld");
+    assert!(actual_lost.events.iter().any(|event| event.key == key));
     let parent = "/documents/configuration-handoff/deeper";
     let path = format!("{parent}/file");
     let bytes = vec![0x5a; 4096];
@@ -1050,46 +802,60 @@ fn write_configuration_browser_pending_preserves_payload_without_parent_intent_o
         bytes: bytes.clone(),
     };
     let allocation = request.bytes.as_ptr();
-    let journal_before = backend
+    let before = backend
         .lock_service()
         .unwrap()
         .metadata_backend()
         .unwrap()
         .journal_last_sequence()
         .unwrap();
-    recorder
-        .configuration_pending
-        .store(true, Ordering::Release);
     for _ in 0..2 {
         request = match backend.try_write_file(request).unwrap() {
             DfsBrowserWriteAttempt::ConfigurationPending(original) => original,
-            DfsBrowserWriteAttempt::Complete(_) => panic!("pending configuration admitted a write"),
+            DfsBrowserWriteAttempt::Complete(_) => {
+                panic!("native configuration gap admitted a write")
+            }
         };
+        assert_eq!(request.bytes.as_ptr(), allocation);
         assert_eq!(request.path, path);
         assert_eq!(request.bytes, bytes);
-        assert_eq!(request.bytes.as_ptr(), allocation);
-        assert_eq!(recorder.namespace_notifications.load(Ordering::SeqCst), 0);
         let service = backend.lock_service().unwrap();
         let metadata = service.metadata_backend().unwrap();
-        assert_eq!(metadata.journal_last_sequence().unwrap(), journal_before);
+        assert_eq!(metadata.journal_last_sequence().unwrap(), before);
         for absent in ["/documents/configuration-handoff", parent, path.as_str()] {
             assert!(
                 metadata
                     .get_object_by_path(&sifs_file_system_id(), absent)
                     .unwrap()
-                    .is_none(),
-                "pending configuration created {absent}"
+                    .is_none()
             );
         }
     }
-    recorder
-        .configuration_pending
-        .store(false, Ordering::Release);
+    gap.release();
+    let authority = crate::runtime_host::daemon_dfs_metadata_authority_generation_for_identity(
+        &ClusterPaths::new(runtime.data_dir(&nodes[0])),
+        &sinomo_core::cluster::read_cluster_state_without_kv(&ClusterPaths::new(
+            runtime.data_dir(&nodes[0]),
+        ))
+        .unwrap()
+        .cluster_id,
+        &nodes[0],
+        Some(&runtime.runtime_handle()),
+    )
+    .unwrap();
+    runtime.runtime_handle().block_on(async {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            authority.ensure_write_configuration_ready_async(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    });
     assert!(matches!(
         backend.try_write_file(request).unwrap(),
         DfsBrowserWriteAttempt::Complete(_)
     ));
-    assert_eq!(recorder.namespace_notifications.load(Ordering::SeqCst), 1);
     let service = backend.lock_service().unwrap();
     assert_eq!(service.posix_read_file(&path).unwrap(), bytes);
     let stat = service.posix_stat(&path).unwrap();
@@ -1104,129 +870,74 @@ fn write_configuration_browser_pending_preserves_payload_without_parent_intent_o
             .iter()
             .filter(|intent| intent.status == DfsWriteIntentStatus::Committed)
             .count(),
-        1,
-        "the unchanged original request commits once after readiness returns"
+        1
     );
-    assert_no_write_provider_prefix_reads(&recorder);
+    drop(service);
+    drop(authority);
+    drop(gap);
+    drop(backend);
+    drop(control);
+    drop(owner);
+    drop(context);
+    runtime.close().unwrap();
 }
 
 #[test]
 fn write_configuration_browser_unavailable_native_floor_fails_before_parent_or_file_mutation() {
-    let root = sinomo_testdir::TestDir::new("browser-unavailable-native-configuration");
-    let (backend, recorder) = projection_browser(root.path());
-    let parent = "/services/native-floor-absent/deeper";
+    let (runtime, nodes) = native_browser_runtime("native-browser-floor-return-unavailable", 1);
+    let backend = DfsBrowserBackend::for_component_data_dir(
+        Arc::new(runtime.data_dir(&nodes[0]).clone()),
+        &runtime.runtime_handle(),
+    )
+    .unwrap();
+    let before = backend
+        .lock_service()
+        .unwrap()
+        .metadata_backend()
+        .unwrap()
+        .journal_last_sequence()
+        .unwrap();
+    let fault = runtime.deny_configuration_floor(&nodes[0]).unwrap();
+    let parent = "/documents/native-floor-absent/deeper";
     let path = format!("{parent}/file");
-    recorder.floor_available.store(false, Ordering::Release);
     let error = backend
         .write_file(DaemonDfsBrowserWriteFileRequest {
             path: path.clone(),
             bytes: b"must not publish".to_vec(),
         })
-        .expect_err("unknown native floor rejects before mutation");
+        .unwrap_err();
     assert!(
         error
             .to_string()
-            .contains("native write configuration floor is unavailable")
+            .contains("native configuration floor is unavailable")
     );
     let service = backend.lock_service().unwrap();
     let metadata = service.metadata_backend().unwrap();
-    for absent in ["/services/native-floor-absent", parent, path.as_str()] {
+    assert_eq!(metadata.journal_last_sequence().unwrap(), before);
+    for absent in ["/documents/native-floor-absent", parent, path.as_str()] {
         assert!(
             metadata
                 .get_object_by_path(&sifs_file_system_id(), absent)
                 .unwrap()
-                .is_none(),
-            "rejected preflight created {absent}"
+                .is_none()
         );
     }
-    assert_no_write_provider_prefix_reads(&recorder);
-}
-
-#[test]
-fn write_configuration_browser_coherent_config_provider_and_zone_updates_match_legacy_options() {
-    let root = sinomo_testdir::TestDir::new("browser-native-configuration-change");
-    let (backend, recorder) = projection_browser(root.path());
-    let path = "/documents/coherent-options";
-    let local = backend.node_id.clone();
-    let old = Arc::clone(&recorder.view.lock().unwrap());
-    let old_candidates = old.content_replica_candidates().unwrap();
-    let old_options = {
-        let mut service = backend.lock_service().unwrap();
-        sifs_browser_write_options_with_configuration(
-            &mut service,
-            path,
-            &old_candidates,
-            Some(&old),
-        )
-        .unwrap()
-    };
-    let omitted = node("browser_projection_other_b");
-    recorder.inner.with_client(|kv| {
-        let mut store = DfsControlPlaneStore::new(kv);
-        let mut config = store
-            .get_file_system_config(&sifs_file_system_id())
-            .unwrap()
-            .unwrap();
-        let expected = config.clone();
-        let mut policy =
-            DfsPlacementPolicy::new(sinomo_core::DfsObjectPolicy::ReplicatedEventual, 1, 2)
-                .unwrap();
-        policy.required_node_ids = vec![local.clone()];
-        policy.min_distinct_zones = 2;
-        crate::upsert_placement_rule(
-            &mut config.subtree_policies,
-            crate::normalize_placement_rule("/documents", DfsPlacementScope::Subtree, policy)
-                .unwrap(),
-        );
-        assert!(
-            store
-                .compare_and_put_file_system_config(Some(&expected), &config)
-                .unwrap()
-        );
-        let mut advertisement = DfsNodeAdvertisement::content(node("browser_projection_other_a"));
-        advertisement.zone = Some("updated-zone".into());
-        store.advertise_content_service(&advertisement).unwrap();
-        put_provider(kv, &omitted, false);
-    });
-    let refreshed = projected_configuration(&recorder.inner, &local);
-    assert!(refreshed.revision() > old.revision());
-    let expected_candidates =
-        crate::discover_mounted_sifs_content_replica_candidates_with_control_plane(&recorder.inner)
-            .unwrap();
-    let expected = {
-        let mut service = backend.lock_service().unwrap();
-        legacy_options(&mut service, path, &expected_candidates)
-    };
-    // Publication replaces all three scopes together; a retained old view stays
-    // coherent while current KV configuration is being changed beneath it.
-    {
-        let mut service = backend.lock_service().unwrap();
-        assert_eq!(
-            sifs_browser_write_options_with_configuration(
-                &mut service,
-                path,
-                &old_candidates,
-                Some(&old)
-            )
-            .unwrap(),
-            old_options
-        );
-    }
-    *recorder.view.lock().unwrap() = refreshed;
-    recorder.prefixes.lock().unwrap().clear();
-    let candidates =
-        crate::discover_mounted_sifs_content_replica_candidates_with_control_plane(&recorder)
-            .unwrap();
-    assert_eq!(candidates, expected_candidates);
-    assert!(!candidates.contains(&omitted));
-    let mut service = backend.lock_service().unwrap();
-    let actual = sifs_browser_write_options(&mut service, path, &candidates).unwrap();
-    assert_eq!(actual, expected);
-    assert_eq!(actual.policy.min_distinct_zones, 2);
+    drop(service);
+    drop(fault);
+    backend
+        .write_file(DaemonDfsBrowserWriteFileRequest {
+            path: path.clone(),
+            bytes: b"real normal recovery".to_vec(),
+        })
+        .unwrap();
     assert_eq!(
-        actual.policy.node_zones[&node("browser_projection_other_a")],
-        "updated-zone"
+        backend
+            .lock_service()
+            .unwrap()
+            .posix_read_file(&path)
+            .unwrap(),
+        b"real normal recovery"
     );
-    assert_ne!(actual.policy, old_options.policy);
-    assert_no_write_provider_prefix_reads(&recorder);
+    drop(backend);
+    runtime.close().unwrap();
 }

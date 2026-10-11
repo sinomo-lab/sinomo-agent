@@ -37,6 +37,15 @@ impl ChatHistoryClient {
         self.call(wire::CHAT_HISTORY_LOAD_ROUTE, &request)
     }
 
+    /// The activity (reasoning, tool calls) of the agent operations that
+    /// produced history messages.
+    pub fn activity(
+        &self,
+        request: wire::ChatSessionActivityRequest,
+    ) -> Result<wire::ChatSessionActivityResponse, DaemonApiError> {
+        self.call(wire::CHAT_SESSION_ACTIVITY_ROUTE, &request)
+    }
+
     pub fn channel(
         &self,
         session_id: impl Into<String>,

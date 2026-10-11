@@ -109,33 +109,6 @@ where
     read_sobj(path).map(Some)
 }
 
-pub(crate) fn read_sobj_tree<T>(path: &Path) -> Result<Vec<T>>
-where
-    T: DeserializeOwned,
-{
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let mut records = Vec::new();
-    read_sobj_tree_into(path, &mut records)?;
-    Ok(records)
-}
-
-fn read_sobj_tree_into<T>(path: &Path, records: &mut Vec<T>) -> Result<()>
-where
-    T: DeserializeOwned,
-{
-    for entry in read_dir(path)? {
-        let path = entry.path();
-        if path.is_dir() {
-            read_sobj_tree_into(&path, records)?;
-        } else if path.extension().and_then(|ext| ext.to_str()) == Some("sobj") {
-            records.push(read_sobj(&path)?);
-        }
-    }
-    Ok(())
-}
-
 pub(crate) fn write_sobj_atomic<T>(path: &Path, value: &T) -> Result<()>
 where
     T: Serialize,
@@ -228,82 +201,6 @@ pub(crate) fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         durable_file::DurableAtomicFileOptions::new("tmp", "tmp").sync_all(),
     )
     .map_err(metadata_durable_file_error)
-}
-
-/// One fully written and synced replacement that has not entered the durable
-/// namespace yet.
-///
-/// Staging deliberately does not sync the parent directory: a crash before
-/// installation may discard the private staging name, while a surviving
-/// orphan is never observable through the destination. Installation performs
-/// the atomic replacement and parent-directory sync as one final operation.
-#[cfg(test)]
-#[derive(Debug)]
-pub(crate) struct StagedFileReplacement {
-    staged_path: PathBuf,
-    destination_path: PathBuf,
-    installed: bool,
-}
-
-#[cfg(test)]
-impl StagedFileReplacement {
-    pub(crate) fn install(mut self) -> Result<()> {
-        durable_file::install_staged_file(&self.staged_path, &self.destination_path, true)
-            .map_err(metadata_durable_file_error)?;
-        self.installed = true;
-        Ok(())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn path(&self) -> &Path {
-        &self.staged_path
-    }
-}
-
-#[cfg(test)]
-impl Drop for StagedFileReplacement {
-    fn drop(&mut self) {
-        if !self.installed {
-            let _ = fs::remove_file(&self.staged_path);
-        }
-    }
-}
-
-/// Write and sync a private, same-directory replacement without publishing it.
-///
-/// The caller can do arbitrarily expensive encoding and IO before entering a
-/// higher-level writer critical section, then call [`StagedFileReplacement::install`]
-/// after revalidating the generation it intends to replace.
-#[cfg(test)]
-pub(crate) fn stage_file_replacement(
-    destination_path: &Path,
-    bytes: &[u8],
-    label: &str,
-) -> Result<StagedFileReplacement> {
-    let parent = destination_path.parent().unwrap_or_else(|| Path::new("."));
-    create_dir_all(parent.to_path_buf())?;
-    let destination_name = destination_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("metadata");
-    let staged_path = parent.join(format!(
-        ".{destination_name}.{label}.{}.stage",
-        sinomo_core::Id::generate()
-    ));
-    let mut file = durable_file::create_private_staged_file(&staged_path)
-        .map_err(metadata_durable_file_error)?;
-    if let Err(source) = file.write_all(bytes).and_then(|()| file.sync_all()) {
-        let _ = fs::remove_file(&staged_path);
-        return Err(MetadataBackendError::Io {
-            path: staged_path,
-            source,
-        });
-    }
-    Ok(StagedFileReplacement {
-        staged_path,
-        destination_path: destination_path.to_path_buf(),
-        installed: false,
-    })
 }
 
 pub(crate) fn sync_dir(path: &Path) -> Result<()> {

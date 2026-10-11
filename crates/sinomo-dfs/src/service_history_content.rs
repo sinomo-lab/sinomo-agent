@@ -99,9 +99,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     intent_id,
                 })
             }
-            NetworkedDfsWriteOutcome::Conflict { .. } => Err(history_content_error(
-                "retained publication cannot create a filesystem conflict",
-            )),
         }
     }
 
@@ -170,10 +167,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             || !crate::intent::stable_write_intent_record_matches_routed_write_command(
                 &record, requester, command, &hash,
             )
-            || record
-                .object_metadata
-                .as_ref()
-                .and_then(|object| object.content_size_bytes)
+            || self
+                .retained_intent_target_size(&record)?
                 .is_some_and(|expected| expected != size)
         {
             return Err(DfsError::WriteOperationIdConflict {
@@ -283,7 +278,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .metadata_backend
             .as_ref()
             .ok_or_else(|| history_content_error("retained content requires durable metadata"))?;
-        let mut record = backend
+        let record = backend
             .get_intent(&intent.object_id, &intent.intent_id)?
             .ok_or_else(|| history_content_error("retained publication lost its durable intent"))?;
         if record.publication != intent.publication
@@ -298,9 +293,31 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             history_content_error("retained publication has no canonical object anchor")
         })?;
         let existing = backend.get_version(&intent.object_id, &intent.target_version)?;
-        let transaction_id = format!("file-history-content:{}", intent.intent_id);
-        let prepare_id = format!("namespace:{transaction_id}");
-        let prepared = backend.get_namespace_prepare(&prepare_id)?;
+        let transaction_id = format!("retained-content:{}", intent.intent_id);
+        let prepare_id = format!("retained-write:{}", intent.intent_id);
+        let prepared = backend.prepared_operation_record(&prepare_id)?;
+        if record.status == DfsWriteIntentStatus::Committed {
+            self.coordinator
+                .restore_recorded_committed_intent(&intent.intent_id)?;
+            if !self.retained_file_content_is_live(
+                &intent.object_id,
+                &intent.target_version,
+                &pending.content_hash,
+            )? {
+                self.retire_committed_repair(&intent.intent_id);
+            }
+            return Ok(());
+        }
+        if let Some(prepared) = prepared {
+            if prepared.payload.prepared_intent.as_ref() != Some(&record) {
+                return Err(history_content_error(
+                    "retained retry changed its sealed intent",
+                ));
+            }
+            self.commit_stored_prepared_operation(&prepared.digest)?;
+            self.coordinator.commit_intent(&intent.intent_id)?;
+            return Ok(());
+        }
         let already_captured = existing.as_ref().is_some_and(|version| {
             version.file_system_id == intent.file_system_id
                 && version.content_hash.as_deref() == Some(&pending.content_hash)
@@ -314,7 +331,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             ));
         }
         self.require_file_history_shard_support(&intent.file_system_id, &current.path)?;
-        if !already_captured {
+        if already_captured {
+            return Err(history_content_error(
+                "a retained grant alone cannot prove this write's terminal outcome",
+            ));
+        }
+        {
             let mut captured_object = record
                 .object_metadata
                 .clone()
@@ -351,7 +373,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .map(|receipt| receipt.replica_node_id.clone())
                 .collect();
             let version = DfsObjectVersionRecord {
-                metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
                 content_durability: Some(crate::content_durability::from_intent(intent)),
                 file_system_id: intent.file_system_id.clone(),
                 object_id: intent.object_id.clone(),
@@ -389,41 +410,64 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     .unwrap_or_default(),
             };
             let pin = DfsMetadataVersionPinRecord {
-                namespace: Some(capture.namespace.clone()),
+                namespace: capture.namespace.clone(),
                 file_system_id: intent.file_system_id.clone(),
                 object_id: intent.object_id.clone(),
                 version: intent.target_version.clone(),
                 pin_id: content_reference_storage_id(&capture.namespace, &capture.reference_id),
                 created_at: record.created_at,
             };
-            let transaction =
-                prepared
-                    .map(|prepare| prepare.transaction)
-                    .unwrap_or(DfsNamespaceTransaction {
-                        content_reference_identity: None,
-                        extension_expectations: Vec::new(),
-                        contribution_digest: None,
-                        transaction_id,
-                        file_system_id: intent.file_system_id.clone(),
-                        objects: Vec::new(),
-                        versions: vec![version],
-                        file_version_pins: Some(DfsFileVersionPinMutation {
-                            add: vec![pin],
-                            remove: Vec::new(),
-                        }),
-                        advisory_lock_states: Vec::new(),
-                        created_at: record.created_at,
-                    });
-            self.apply_retained_content_transaction(transaction, receipts)?;
+            let transaction = DfsNamespaceTransaction {
+                content_reference_identity: None,
+                extension_expectations: Vec::new(),
+                contribution_digest: None,
+                transaction_id,
+                file_system_id: intent.file_system_id.clone(),
+                objects: Vec::new(),
+                versions: vec![version],
+                file_version_pins: Some(DfsFileVersionPinMutation {
+                    add: vec![pin],
+                    remove: Vec::new(),
+                }),
+                advisory_lock_states: Vec::new(),
+                created_at: record.created_at,
+            };
+            let scope = self.metadata_effect_scope_for_object(&current, prepare_id)?;
+            let _execution = self.acquire_prepared_execution(&scope)?;
+            let (objects, paths, _) = crate::service_metadata::namespace_prepare_expectations(
+                self.metadata_backend
+                    .as_ref()
+                    .expect("retained backend")
+                    .as_ref(),
+                &scope.shard_id,
+                &transaction,
+            )?;
+            let mut terminal = record.clone();
+            terminal.status = DfsWriteIntentStatus::Committed;
+            terminal.updated_at = Some(OffsetDateTime::now_utc());
+            terminal.object_metadata = transaction.versions[0]
+                .retention_grant(&capture.namespace)
+                .map(|grant| grant.object.as_ref().clone());
+            let durable_nodes = receipts
+                .iter()
+                .map(|receipt| receipt.replica_node_id.clone())
+                .collect();
+            self.publish_prepared_operation(
+                DfsPreparedOperationPayload::for_namespace_transaction(
+                    scope,
+                    objects,
+                    paths,
+                    transaction,
+                    receipts,
+                    Some(record.clone()),
+                    Some(terminal),
+                    durable_nodes,
+                    None,
+                    None,
+                )?,
+            )?;
         }
-        // The durable capture is the commit boundary; recovery may repeat this
-        // bookkeeping without re-creating a pin explicitly released afterward.
-        record.status = DfsWriteIntentStatus::Committed;
-        record.updated_at = Some(OffsetDateTime::now_utc());
-        self.metadata_backend
-            .as_mut()
-            .expect("durable capture backend")
-            .put_intent(&record)?;
+        // The grant, pin, receipts and terminal intent share one digest commit.
         self.coordinator.commit_intent(&intent.intent_id)?;
         if !self.retained_file_content_is_live(
             &intent.object_id,
@@ -435,6 +479,56 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             self.retire_committed_repair(&intent.intent_id);
         }
         Ok(())
+    }
+
+    /// Size DATA belongs to the retained target hash, never the canonical
+    /// identity anchor. No target version exists before W, so use the existing
+    /// hash-addressed source/manifest reader when that row is absent.
+    fn retained_intent_target_size(
+        &self,
+        record: &DfsWriteIntentRecord,
+    ) -> Result<Option<u64>, DfsError> {
+        let Some(hash) = record.content_hash.as_deref() else {
+            return Ok(None);
+        };
+        if let Some(version) = self
+            .metadata_backend
+            .as_ref()
+            .map(|backend| backend.get_version(&record.object_id, &record.target_version))
+            .transpose()?
+            .flatten()
+        {
+            if version.object_id != record.object_id
+                || version.file_system_id != record.file_system_id
+                || version.version != record.target_version
+                || version.content_hash.as_deref() != Some(hash)
+                || version.size_bytes.is_none()
+            {
+                return Err(history_content_error(
+                    "retained intent target version differs from its recorded content identity",
+                ));
+            }
+        }
+        let size = self.pending_write_size_hint(&record.object_id, &record.target_version, hash)?;
+        if let Some(expected) = size {
+            match self.content.open_blob_stream(hash) {
+                Ok(reader) if reader.size_bytes() != expected => {
+                    return Err(history_content_error(
+                        "retained intent target length differs from its hash-addressed durable source",
+                    ));
+                }
+                Ok(_) => {}
+                Err(ContentStoreError::Io { source, .. })
+                    if source.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    // A published version retains its recorded size for normal
+                    // replica fetch/repair. An unpublished missing source has
+                    // no size hint and therefore no executable pending transfer.
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(size)
     }
 
     pub(crate) fn restore_retained_content_intent(
@@ -482,7 +576,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             record.status,
             DfsWriteIntentStatus::Staging | DfsWriteIntentStatus::ReceiptsPending
         );
-        let locally_owned = if active {
+        let locally_owned = if active && self.control_plane.is_some() {
+            // Original actor identity is immutable provenance, not the current
+            // Main's execution permission. The normal configured primary and
+            // exact recorded epoch own recovery, as for current publications.
+            self.local_pending_write_authority_shard(record)?.is_some()
+        } else if active {
             record.coordinator_node_id == self.node_id
         } else {
             self.is_local_metadata_primary_for_object(&anchor)?
@@ -494,7 +593,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 hash,
             )?;
         if !rooted && record.status == DfsWriteIntentStatus::Committed {
-            self.retire_committed_repair(&record.intent_id);
+            self.park_inactive_retained_repair(record)?;
             return Ok(());
         }
         if locally_owned
@@ -506,21 +605,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     | DfsWriteIntentStatus::Committed
             )
         {
-            let version = self
-                .metadata_backend
-                .as_ref()
-                .map(|backend| backend.get_version(&record.object_id, &record.target_version))
-                .transpose()?
-                .flatten();
-            let size = version
-                .and_then(|version| version.size_bytes)
-                .or_else(|| {
-                    record
-                        .object_metadata
-                        .as_ref()
-                        .and_then(|object| object.content_size_bytes)
-                })
-                .unwrap_or(0);
+            let Some(size) = self.retained_intent_target_size(record)? else {
+                // Preserve the durable pending intent without inventing a zero
+                // target length or granting a content receipt/publication.
+                return Ok(());
+            };
             self.writes
                 .pending_writes
                 .entry(record.intent_id.clone())

@@ -131,7 +131,7 @@ pub fn notify_cluster_kv_watchers(paths: &ClusterKvPaths) {
         changed.push(entry.changed.clone());
     }
     for (path, entry) in guard.iter_mut() {
-        if path != &key && path.starts_with(&paths.root) && entry.waiters > 0 {
+        if entry.waiters > 0 && path != &key && path.starts_with(&paths.root) {
             entry.generation = entry.generation.saturating_add(1);
             entry.last_used = tick;
             changed.push(entry.changed.clone());

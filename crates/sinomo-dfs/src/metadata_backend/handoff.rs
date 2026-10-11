@@ -80,7 +80,7 @@ impl LocalSobjMetadataBackend {
             activated_epoch: None,
             journal_sequence,
             state_fingerprint,
-            rebind_prefix_proof: Some(prefix_proof.clone()),
+            rebind_prefix_proof: prefix_proof.clone(),
         };
         write_sobj_atomic(&self.membership_handoff_write_freeze_path(), &freeze)?;
         self.instance_authority_epoch = None;
@@ -135,8 +135,7 @@ impl LocalSobjMetadataBackend {
         activated.activated_epoch = Some(activated_epoch);
         // Primary rebind is the proof-validation boundary. Persist its exact
         // current prefix in the same atomic marker update as activation, so a
-        // later V2 append can restart from this checkpoint instead of replaying
-        // an older (possibly V1) handoff tail.
+        // later current append restarts from the same certified checkpoint.
         if let Some(rebound_prefix_proof) = rebound_prefix_proof {
             if !rebound_prefix_proof.is_well_formed()
                 || rebound_prefix_proof.journal_sequence < activated.journal_sequence
@@ -151,38 +150,17 @@ impl LocalSobjMetadataBackend {
                     activated.journal_sequence
                 )));
             }
-            if let Some(previous) = activated.rebind_prefix_proof.as_ref()
-                && (rebound_prefix_proof.journal_sequence < previous.journal_sequence
-                    || (rebound_prefix_proof.journal_sequence == previous.journal_sequence
-                        && rebound_prefix_proof.digest != previous.digest))
+            let previous = &activated.rebind_prefix_proof;
+            if rebound_prefix_proof.journal_sequence < previous.journal_sequence
+                || (rebound_prefix_proof.journal_sequence == previous.journal_sequence
+                    && rebound_prefix_proof.digest != previous.digest)
             {
                 return Err(MetadataBackendError::Serde(format!(
                     "metadata shard {} membership handoff {} rebound prefix regressed or diverged at sequence {}",
                     self.shard_id.0, handoff_id, rebound_prefix_proof.journal_sequence
                 )));
             }
-            activated.rebind_prefix_proof = Some(rebound_prefix_proof.clone());
-        } else if activated.rebind_prefix_proof.is_none() {
-            let current = self.prefix_proof.as_ref().ok_or_else(|| {
-                MetadataBackendError::Serde(format!(
-                    "metadata shard {} legacy membership handoff {} has no current exact prefix proof",
-                    self.shard_id.0, handoff_id
-                ))
-            })?;
-            if !current.is_well_formed()
-                || current.journal_sequence < activated.journal_sequence
-                || (current.journal_sequence == activated.journal_sequence
-                    && current.digest != activated.state_fingerprint)
-            {
-                return Err(MetadataBackendError::Serde(format!(
-                    "metadata shard {} legacy membership handoff {} cannot bind current prefix {} to marker prefix {}",
-                    self.shard_id.0,
-                    handoff_id,
-                    current.journal_sequence,
-                    activated.journal_sequence
-                )));
-            }
-            activated.rebind_prefix_proof = Some(current.clone());
+            activated.rebind_prefix_proof = rebound_prefix_proof.clone();
         }
         if activated != existing {
             write_sobj_atomic(&self.membership_handoff_write_freeze_path(), &activated)?;
@@ -207,6 +185,7 @@ impl LocalSobjMetadataBackend {
         &mut self,
         handoff_id: &str,
         active_shard: &DfsMetadataShardConfig,
+        checked_prefix: &DfsMetadataPrefixProof,
     ) -> Result<bool> {
         let lock = self.begin_metadata_write_allow_frozen()?;
         let rebound_prefix_proof = self.prefix_proof.clone().ok_or_else(|| {
@@ -226,10 +205,15 @@ impl LocalSobjMetadataBackend {
                 self.journal_last_sequence()
             )));
         }
-        let previous_namespace_prepare_codec = std::mem::replace(
-            &mut self.namespace_prepare_codec,
-            active_shard.namespace_prepare_codec,
-        );
+        if !checked_prefix.is_well_formed() || rebound_prefix_proof != *checked_prefix {
+            return Err(MetadataBackendError::prefix_mismatch(format!(
+                "metadata shard {} membership handoff {} prefix changed before writer rebind: checked sequence {} current sequence {}",
+                self.shard_id.0,
+                handoff_id,
+                checked_prefix.journal_sequence,
+                rebound_prefix_proof.journal_sequence,
+            )));
+        }
         let previous_instance_authority_epoch =
             self.instance_authority_epoch.replace(active_shard.epoch);
         let marker_activated = self.mark_membership_handoff_write_freeze_activated_unlocked(
@@ -240,32 +224,23 @@ impl LocalSobjMetadataBackend {
         match marker_activated {
             Ok(true) => {}
             Ok(false) => {
-                self.namespace_prepare_codec = previous_namespace_prepare_codec;
                 self.instance_authority_epoch = previous_instance_authority_epoch;
                 return Ok(false);
             }
             Err(error) => {
-                self.namespace_prepare_codec = previous_namespace_prepare_codec;
                 self.instance_authority_epoch = previous_instance_authority_epoch;
                 return Err(error);
             }
         }
-        drop(lock);
-
-        // Backend open deliberately defers append-producing recovery while a
-        // freeze survives a crash. The durable activated-generation marker
-        // remains in place throughout recovery. The active prepare codec and
-        // authority epoch are installed together before that marker advances,
-        // so recovery cannot append with the retiring generation's format.
-        // Only this freshly rebound instance can write, while independently
-        // opened stale instances stay fenced. Roll the local binding back if
-        // recovery is incomplete so a later fresh reconciliation must retry it.
-        let recovery = self.recover_deferred_metadata_state();
+        // Rebind owns the actual writer while replaying durable current
+        // decisions. It never authors a new terminal operation for a hidden
+        // prepare, and independently opened retiring instances stay fenced.
+        let recovery = self.recover_unmaterialized_local_journal_entries();
         if let Err(error) = recovery {
-            self.namespace_prepare_codec = previous_namespace_prepare_codec;
             self.instance_authority_epoch = previous_instance_authority_epoch;
             return Err(error);
         }
+        drop(lock);
         Ok(true)
     }
 }

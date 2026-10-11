@@ -312,7 +312,6 @@ impl<T: DfsMessageTransport> DfsAttachmentService<'_, T> {
                     replica_node_ids: vec![],
                     epoch: 0,
                     assignment: DfsMetadataShardAssignment::Root,
-                    namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV3,
                     default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
                 }]
             } else {

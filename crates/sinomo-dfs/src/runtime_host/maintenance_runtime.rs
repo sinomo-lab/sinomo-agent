@@ -310,6 +310,13 @@ async fn run_daemon_dfs_maintenance_tick_kind_inner(
             );
         }
     }
+    // Archived goal dispatch consumes the ordinary current advertisement cut.
+    // Publish it before running callbacks that need real current candidates;
+    // callbacks remain outside service ownership and mutation admission.
+    let namespace_work = super::maintenance_host::run_namespace_reconciliation_work(paths)?;
+    if namespace_work.blocks_ordinary_maintenance {
+        return Ok(DaemonDfsMaintenanceTickOutcome::Deferred);
+    }
     // The normal preflight validates the resulting retained proof, including
     // concurrent filesystem/shard transitions and possibly applied publication.
     let mut metadata_authority_preflight = warm_daemon_dfs_metadata_authority_for_identity_async(
@@ -338,6 +345,7 @@ async fn run_daemon_dfs_maintenance_tick_kind_inner(
             scope = "global", phase = "requested", "dfs-maintenance-owner-state");
     }
     let mut authority_replans = 0;
+    let mut completed_remote_phase = None;
     loop {
         let foreground_preemption =
             daemon_dfs_mutation_scheduler(&data_dir)?.begin_maintenance_interest();
@@ -356,6 +364,19 @@ async fn run_daemon_dfs_maintenance_tick_kind_inner(
             _lifecycle_guard: lifecycle_guard,
             _mutation_admission: mutation_admission,
         } = admission;
+        let mut retained_admission = Some(mutation_admission);
+        let mut publication_scope = match daemon_dfs_data_owner_lock(&DaemonPaths::new(&data_dir))?
+        {
+            Some(owner) => Some(
+                crate::publication_guard::DfsPublicationExecutionScope::enter(
+                    data_dir.root(),
+                    DfsMessageExecutionScope::GlobalExclusive,
+                    &mut retained_admission,
+                    owner,
+                )?,
+            ),
+            None => None,
+        };
         let trace_hold_started = trace_started.map(|_| Instant::now());
         if let Some(started) = trace_started {
             tracing::trace!(target: "sinomo.dfs.perf", owner_id = trace_id.unwrap_or_default(),
@@ -365,8 +386,9 @@ async fn run_daemon_dfs_maintenance_tick_kind_inner(
         }
         let mut deferred_work = None;
         let committed_work_tracker = DfsCommittedWorkTracker::new();
-        let maintenance_result =
-            run_daemon_dfs_maintenance_until_foreground_waits(&foreground_preemption, async {
+        let maintenance_result = run_daemon_dfs_maintenance_until_foreground_waits(
+            &foreground_preemption,
+            Box::pin(async {
                 run_daemon_dfs_maintenance_tick_with_admission(
                     data_dir.clone(),
                     cluster_paths.clone(),
@@ -376,12 +398,17 @@ async fn run_daemon_dfs_maintenance_tick_kind_inner(
                     node_resources,
                     committed_work_tracker.clone(),
                     &mut deferred_work,
+                    &mut completed_remote_phase,
+                    publication_scope
+                        .as_ref()
+                        .map(crate::publication_guard::DfsPublicationExecutionScope::owners),
                     &foreground_preemption,
                 )
                 .await
-            })
-            .instrument(maintenance_span.clone())
-            .await;
+            }),
+        )
+        .instrument(maintenance_span.clone())
+        .await;
         // The cancellable broad generation has been collapsed or destroyed at
         // this point. Return its freed pages while maintenance still owns message
         // admission: trimming after releasing admission can contend on glibc
@@ -401,7 +428,11 @@ async fn run_daemon_dfs_maintenance_tick_kind_inner(
         // single-generation even when a repair or metadata RPC is cancelled to
         // admit foreground work. Those sends are replay-safe; return Deferred
         // below so durable work is retried promptly.
-        drop(mutation_admission);
+        if let Some(scope) = publication_scope.take() {
+            scope.finish()?;
+        }
+        drop(publication_scope);
+        drop(retained_admission);
         drop(lifecycle_guard);
         drop(foreground_preemption);
         if let Some(started) = trace_hold_started {
@@ -457,6 +488,25 @@ async fn run_daemon_dfs_maintenance_tick_kind_inner(
                         .await?;
                     continue;
                 }
+                DaemonDfsMaintenancePreExecution::RemoteNamespacePhase(request, phase) => {
+                    // This is the SAME normal owned phase dispatcher. The broad
+                    // service, backend checkout and all admission guards ended above.
+                    let completed =
+                        super::message_host::dispatch_daemon_dfs_remote_namespace_phase(
+                            &data_dir, phase, runtime,
+                        )
+                        .await?;
+                    completed_remote_phase = Some((request, completed));
+                    metadata_authority_preflight =
+                        warm_daemon_dfs_metadata_authority_for_identity_async(
+                            &cluster_paths,
+                            &preflight_cluster_state.cluster_id,
+                            &preflight_cluster_state.local_node_id,
+                            runtime,
+                        )
+                        .await?;
+                    continue;
+                }
                 DaemonDfsMaintenancePreExecution::Finished(Some(reached_limit)) => {
                     DaemonDfsMaintenanceTickOutcome::Completed { reached_limit }
                 }
@@ -489,13 +539,21 @@ async fn run_daemon_dfs_maintenance_tick_kind_inner(
             // keeps capacity evidence current without a periodic filesystem scan.
             notify_daemon_dfs_storage_environment_dirty(&data_dir);
         }
-        return Ok(outcome);
+        return Ok(if namespace_work.complete {
+            outcome
+        } else {
+            DaemonDfsMaintenanceTickOutcome::Deferred
+        });
     }
 }
 
 #[derive(Debug)]
 pub(super) enum DaemonDfsMaintenancePreExecution {
     Finished(Option<bool>),
+    RemoteNamespacePhase(
+        Box<crate::DfsNamespaceRequestRecord>,
+        Box<crate::source_adoption::RemoteNamespacePhase>,
+    ),
     AuthorityPreflightStale(DaemonDfsAuthorityPreflightStale),
 }
 
@@ -508,6 +566,11 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
     node_resources: sinomo_device::NodeResourceSnapshot,
     committed_work_tracker: DfsCommittedWorkTracker,
     _deferred_work: &mut Option<(Arc<DaemonDfsDetachedSendRuntime>, DfsNodeDetachedSendWorker)>,
+    completed_remote_phase: &mut Option<(
+        Box<crate::DfsNamespaceRequestRecord>,
+        Box<crate::source_adoption::CompletedRemoteNamespacePhase>,
+    )>,
+    publication_owners: Option<Arc<crate::publication_guard::DfsPublicationExecutionOwners>>,
     _foreground_preemption: &DaemonDfsMaintenanceForegroundPreemption,
 ) -> Result<DaemonDfsMaintenancePreExecution, DaemonError> {
     // The scheduler's retained read-only image is useful between probes, but a
@@ -567,6 +630,8 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
         resident_metadata_scope,
         ..
     } = lane;
+    let publication_scope =
+        publication_owners.map(|owners| maintenance_service.publication_execution.install(owners));
     let placement_advertisements = maintenance_service
         .placement_content_candidates()
         .unwrap_or_default();
@@ -625,6 +690,14 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
                     DaemonDfsMaintenanceKind::MountedMutationRecovery => (false, false, false),
                     DaemonDfsMaintenanceKind::Routine => unreachable!("routine handled above"),
                 };
+                let recovery_options = if maintenance_kind == DaemonDfsMaintenanceKind::MountedMutationRecovery {
+                    crate::dfs_mounted_mutation_recovery_tick_options()
+                } else {
+                    daemon_dfs_explicit_disaster_recovery_tick_options(
+                        content_gc_requested,
+                        content_reservation_reconciliation_requested,
+                    )
+                };
                 let request_generation =
                     daemon_dfs_maintenance_reconciliation_generation(&DaemonPaths::new(&data_dir));
                 recovery_handed_off = !content_gc_requested
@@ -635,6 +708,48 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
                         authority_generation_before_maintenance,
                     );
                 if !recovery_handed_off {
+                    // Recovery can publish real prepares. Use the SAME normal
+                    // freeze/ACK/joint-activation/rebind path before hydration.
+                    let recovery_shards = crate::metadata_shards_from_authority_projection(
+                        &authoritative_topology, &crate::sifs_file_system_id(),
+                    ).map_err(DaemonError::from)?;
+                    match maintenance_service.reconcile_pending_metadata_shard_membership_handoffs_until_cancelled(
+                        &recovery_shards, recovery_options.metadata_replication.target_timeout,
+                        &|| {
+                            _foreground_preemption.is_requested()
+                                || metadata_authority_generation
+                                    .retained_complete_prefix_revision_for_generation(
+                                        authority_generation_before_maintenance,
+                                    )
+                                    .is_none()
+                        },
+                    ) {
+                        Ok(Some(_)) => {},
+                        Ok(None) => return Ok(None),
+                        Err(crate::DfsError::MetadataShardMembershipHandoffParked { .. }) => return Ok(None),
+                        Err(error) => return Err(DaemonError::from(error)),
+                    }
+                    // Activation can invalidate the admitted topology cut.
+                    // Leave this recovery generation pending for its normal wake.
+                    if metadata_authority_generation
+                        .retained_complete_prefix_revision_for_generation(authority_generation_before_maintenance)
+                        .is_none()
+                    {
+                        return Ok(None);
+                    }
+                    let backend = maintenance_service.metadata_backend.as_ref()
+                        .ok_or_else(|| DaemonError::from(crate::DfsError::Metadata {
+                            message: "Main recovery requires its actual durable backend".into(),
+                        }))?;
+                    for shard in recovery_shards.iter().filter(|shard|
+                        shard.primary_node_id == cluster_state.local_node_id)
+                    {
+                        if backend.metadata_shard_authoritative_writes_frozen(
+                            &crate::DfsMetadataShardId::new(shard.shard_id.clone()),
+                        ).map_err(DaemonError::from)? {
+                            return Ok(None);
+                        }
+                    }
                     // Unrelated cluster revisions do not invalidate this scan. A
                     // DFS authority change, incomplete proof or foreground waiter
                     // still cancels before the completed local handoff.
@@ -667,16 +782,18 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
                     detached_send_runtime
                         .record_recovery_scan_generation(signature.metadata_storage_generation);
                 }
-                if maintenance_kind == DaemonDfsMaintenanceKind::MountedMutationRecovery {
-                    crate::dfs_mounted_mutation_recovery_tick_options()
-                } else {
-                    daemon_dfs_explicit_disaster_recovery_tick_options(
-                        content_gc_requested,
-                        content_reservation_reconciliation_requested,
-                    )
-                }
+                recovery_options
             }
         };
+        if let Some((request, completed)) = completed_remote_phase.take() {
+            maintenance_service.complete_remote_namespace_phase(*completed)?;
+            maintenance_service.pending_namespace_request_recovery = Some(request);
+            // Resume only the original durable request. Ending this continuation
+            // leaves every other bounded phase for the next ordinary tick, rather
+            // than resetting its work budgets after each remote response.
+            maintenance_service.recover_pending_namespace_requests_bounded(1)?;
+            return Ok(None);
+        }
         // Both kinds now execute the same bounded phases. Recovery has already
         // durably transferred discovered work before this future can yield to
         // foreground RPCs (including replies from its own promotion outbox).
@@ -687,15 +804,30 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
             cluster_state,
             authoritative_topology,
             async_peer_transport,
+            peer_node_ids.clone(),
             execution_exclusions,
             committed_work_tracker,
             options,
         )
         .await
-        .map(Some)
         .map_err(DaemonError::from)
     }
     .await;
+    let remote_namespace_phase =
+        if let Some(phase) = maintenance_service.remote_namespace_phase.take() {
+            let request = maintenance_service
+                .pending_namespace_request_recovery
+                .take()
+                .ok_or_else(|| {
+                    DaemonError::from(crate::DfsError::Metadata {
+                        message: "owned recovery phase has no exact durable request continuation"
+                            .into(),
+                    })
+                })?;
+            Some((request, phase))
+        } else {
+            None
+        };
     if matches!(&maintenance_result, Ok(Some(_)))
         && let Some((generation, jobs)) =
             super::maintenance_host::daemon_dfs_requested_namespace_job_compaction(
@@ -708,13 +840,7 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
         )
         .with_max_removals(jobs.len() as u64)
         .with_namespace_job_ids(jobs);
-        let report = maintenance_service
-            .metadata_backend
-            .as_mut()
-            .ok_or_else(|| DaemonError::Parse {
-                detail: "namespace job compaction requires resident metadata".into(),
-            })?
-            .gc_metadata_history(options)?;
+        let report = maintenance_service.gc_metadata_history(options)?;
         if report.applied_record_count() > 0 {
             maintenance_service.record_message_committed_work(DfsMessageCommittedWork {
                 publish_metadata: true,
@@ -758,7 +884,13 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
     // mirror, collapse routine and disaster-recovery passes back to the same
     // lazy shell over the resident backend. Durable tables and the repair queue
     // reconstruct the released projection on demand.
-    let reusable_service = if matches!(&maintenance_result, Ok(Some(_))) {
+    drop(publication_scope);
+    let preserve_remote_continuation = remote_namespace_phase.is_some();
+    let reusable_service = if preserve_remote_continuation {
+        // Keep the SAME requester, prepared-source and body state. Only its
+        // resident backend lease ends at the existing checked restoration below.
+        Some(maintenance_service)
+    } else if matches!(&maintenance_result, Ok(Some(_))) {
         match maintenance_service.authoritative_write_frozen_shard_count() {
             Ok(0) => {
                 let reset_to_lazy = matches!(
@@ -850,25 +982,42 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
             },
             detached_send_runtime,
         };
-        match restore_daemon_dfs_message_mutation_service_after_maintenance(
+        let restored = restore_daemon_dfs_message_mutation_service_after_maintenance(
             &data_dir,
             &cluster_paths,
             runtime,
             retained,
-        ) {
-            Ok(true) => tracing::debug!(
-                data_root = %data_dir.root().display(),
-                "restored daemon DFS mutation service after maintenance"
-            ),
-            Ok(false) => tracing::info!(
-                data_root = %data_dir.root().display(),
-                "dropped daemon DFS mutation service after maintenance identity changed"
-            ),
-            Err(error) => tracing::warn!(
-                data_root = %data_dir.root().display(),
-                "dropping daemon DFS mutation service after maintenance validation failed: {error}"
-            ),
+        );
+        if preserve_remote_continuation {
+            // No remote dispatch after a failed/foreign restoration. The
+            // existing actor remains the physical source/job custody owner.
+            if !restored? {
+                return Err(DaemonError::from(crate::DfsError::Metadata {
+                    message: "owned namespace recovery could not restore its current service"
+                        .into(),
+                }));
+            }
+        } else {
+            match restored {
+                Ok(true) => tracing::debug!(
+                    data_root = %data_dir.root().display(),
+                    "restored daemon DFS mutation service after maintenance"
+                ),
+                Ok(false) => tracing::info!(
+                    data_root = %data_dir.root().display(),
+                    "dropped daemon DFS mutation service after maintenance identity changed"
+                ),
+                Err(error) => tracing::warn!(
+                    data_root = %data_dir.root().display(),
+                    "dropping daemon DFS mutation service after maintenance validation failed: {error}"
+                ),
+            }
         }
+    }
+    if let Some((request, phase)) = remote_namespace_phase {
+        return Ok(DaemonDfsMaintenancePreExecution::RemoteNamespacePhase(
+            request, phase,
+        ));
     }
     let report = maintenance_result?;
     let Some(report) = report else {
@@ -940,9 +1089,13 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_in_blocking_task(
 ) -> Result<DaemonDfsMaintenanceTickOutcome, DaemonError> {
     let tick_runtime = runtime.clone();
     let data_owner_lock = daemon_dfs_data_owner_lock(&paths)?;
-    tokio::task::spawn_blocking(move || {
-        let _data_owner_lock = data_owner_lock;
-        runtime.block_on(async move {
+    let data_dir = SinomoDataDir::new(daemon_data_dir(&paths)?);
+    let task_owner = registered_dfs_runtime_host(&data_dir)?.ok_or_else(|| DaemonError::Parse {
+        detail: "DFS maintenance has no registered runtime task owner".into(),
+    })?;
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::task::spawn_blocking(move || {
+        let result = runtime.block_on(async move {
             if *shutdown.borrow() {
                 return Ok(DaemonDfsMaintenanceTickOutcome::Deferred);
             }
@@ -954,12 +1107,18 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_in_blocking_task(
                 ) => result,
                 _ = shutdown.changed() => Ok(DaemonDfsMaintenanceTickOutcome::Deferred),
             }
-        })
-    })
-    .await
-    .map_err(|source| DaemonError::Network {
+        });
+        // Match the prior JoinHandle result boundary only after the actual
+        // maintenance future and its retained OS owner have finished.
+        drop(data_owner_lock);
+        let _ = result_tx.send(result);
+    });
+    // A stopped component's outer async task must not detach this running
+    // blocking owner. Retain the same child in the normal host task drain.
+    task_owner.own_task(task);
+    result_rx.await.map_err(|source| DaemonError::Network {
         address: "DFS maintenance".to_string(),
-        detail: format!("DFS maintenance blocking task failed: {source}"),
+        detail: format!("DFS maintenance blocking task ended without a result: {source}"),
     })?
 }
 

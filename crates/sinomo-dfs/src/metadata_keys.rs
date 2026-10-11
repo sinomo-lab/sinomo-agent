@@ -3,8 +3,7 @@
 use time::OffsetDateTime;
 
 use crate::metadata_records::{
-    DfsConflictPageCursor, DfsConflictRecord, DfsConflictScanCursor, DfsDentryPageCursor,
-    DfsDirFragmentId, DfsDirectoryPageCursor, DfsInodeId, DfsMetadataShardId,
+    DfsDentryPageCursor, DfsDirFragmentId, DfsDirectoryPageCursor, DfsInodeId, DfsMetadataShardId,
     DfsMetadataVersionPinPageCursor, DfsMetadataVersionPinRecord, DfsObjectPageCursor,
     DfsObjectVersionPageCursor, DfsObjectVersionRecord, DfsObjectVersionScanCursor, DfsPathRecord,
     DfsReplicaReceiptPageCursor, DfsReplicaReceiptRecord, DfsReplicaReceiptScanCursor,
@@ -81,12 +80,6 @@ pub(crate) fn dirfrag_hash_range(
 
 pub(crate) fn object_page_key(object: &DfsObjectMetadata) -> (&String, &DfsObjectId) {
     (&object.path, &object.object_id)
-}
-
-pub(crate) fn conflict_page_cursor(conflict: &DfsConflictRecord) -> DfsConflictPageCursor {
-    DfsConflictPageCursor {
-        conflict_id: conflict.conflict_id.clone(),
-    }
 }
 
 pub(crate) fn object_version_page_cursor(
@@ -201,17 +194,6 @@ pub(crate) fn write_intent_page_cursor(intent: &DfsWriteIntentRecord) -> DfsWrit
         intent_id: intent.intent_id.clone(),
         shard_id: None,
     }
-}
-
-pub(crate) fn conflict_scan_cursor(conflict: &DfsConflictRecord) -> DfsConflictScanCursor {
-    DfsConflictScanCursor {
-        object_id: conflict.object_id.clone(),
-        conflict_id: conflict.conflict_id.clone(),
-    }
-}
-
-pub(crate) fn conflict_scan_key(conflict: &DfsConflictRecord) -> (DfsObjectId, String) {
-    (conflict.object_id.clone(), conflict.conflict_id.clone())
 }
 
 pub(crate) fn write_intent_scan_key(
@@ -346,12 +328,6 @@ pub(crate) fn local_directory_page_cursor(
         dentry: cursor.dentry.clone(),
         shard_id: None,
     }
-}
-
-pub(crate) fn normalized_node_location_list(nodes: &[NodeId]) -> Vec<NodeId> {
-    let mut nodes = nodes.to_vec();
-    normalize_node_locations(&mut nodes);
-    nodes
 }
 
 pub(crate) fn normalize_node_locations(nodes: &mut Vec<NodeId>) {

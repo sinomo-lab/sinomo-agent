@@ -611,6 +611,9 @@ mod tests {
         last_error: Option<String>,
     ) -> crate::DfsRepairAttemptRecord {
         crate::DfsRepairAttemptRecord {
+            transfer_delivery_state: None,
+            completed_transfer_request_id: None,
+            transfer_kind: None,
             intent_id: "mounted-mutation-test-intent".to_string(),
             object_id: sinomo_core::Id::derived("test.mounted-mutation.client.object", b"object"),
             version: sinomo_core::Id::derived("test.mounted-mutation.client.version", b"version"),
@@ -1358,28 +1361,6 @@ mod wire_tests {
     }
 
     #[test]
-    fn older_browser_list_requests_default_to_lightweight_entries() {
-        let request: DaemonDfsBrowserListRequest = serde_json::from_value(serde_json::json!({
-            "path": "/users"
-        }))
-        .expect("decode legacy list request");
-        assert!(!request.include_metadata);
-    }
-
-    #[test]
-    fn older_browser_entry_metadata_defaults_live_placement_to_none() {
-        let metadata: DaemonDfsBrowserEntryMetadata = serde_json::from_value(serde_json::json!({
-            "object_id": "object-report",
-            "version": "version-1",
-            "modified_at_unix_nanos": 0,
-            "policy": "replicated-eventual",
-            "current_locations": ["node-a"]
-        }))
-        .expect("decode legacy entry metadata");
-        assert!(metadata.placement.is_none());
-    }
-
-    #[test]
     fn conditional_replace_has_a_dedicated_fail_closed_route() {
         assert_ne!(
             DAEMON_DFS_BROWSER_REPLACE_FILE_IF_VERSION_ROUTE,
@@ -1409,34 +1390,7 @@ mod wire_tests {
     }
 
     #[test]
-    fn placement_routes_are_typed_and_inheritance_is_explicit() {
-        for route in [
-            DAEMON_DFS_BROWSER_PLACEMENT_PREVIEW_ROUTE,
-            DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_ROUTE,
-            DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_V2_ROUTE,
-            DAEMON_DFS_BROWSER_PLACEMENT_PROGRESS_ROUTE,
-            DAEMON_DFS_BROWSER_PLACEMENT_ACTIVITY_ROUTE,
-        ] {
-            assert!(DAEMON_DFS_BROWSER_ROUTES.contains(&route));
-        }
-        let request = DaemonDfsBrowserPlacementUpdateRequest {
-            path: "/users/team".to_string(),
-            policy: None,
-            scope: crate::DfsPlacementScope::SelfOnly,
-        };
-        let encoded = serde_json::to_vec(&request).expect("encode placement update");
-        let decoded: DaemonDfsBrowserPlacementUpdateRequest =
-            serde_json::from_slice(&encoded).expect("decode placement update");
-        assert_eq!(decoded, request);
-        assert!(decoded.policy.is_none());
-    }
-
-    #[test]
     fn placement_update_v2_requires_a_preview_token_on_a_dedicated_route() {
-        assert_ne!(
-            DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_V2_ROUTE,
-            DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_ROUTE
-        );
         assert!(DAEMON_DFS_BROWSER_ROUTES.contains(&DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_V2_ROUTE));
 
         let missing_token = serde_json::json!({
@@ -1480,11 +1434,13 @@ mod wire_tests {
             vec![crate::DfsPlacementReconciliationActivityStatus::Retrying]
         );
 
-        let legacy_page: DaemonDfsBrowserPlacementActivityResponse =
-            serde_json::from_value(serde_json::json!({"page": {"activities": []}}))
-                .expect("activity completeness flags are backward-compatible defaults");
-        assert!(!legacy_page.page.partial);
-        assert!(!legacy_page.page.history_truncated);
+        assert!(
+            serde_json::from_value::<DaemonDfsBrowserPlacementActivityResponse>(
+                serde_json::json!({"page": {"activities": []}})
+            )
+            .is_err(),
+            "current activity responses require explicit completeness"
+        );
     }
 
     #[test]
@@ -1526,86 +1482,49 @@ mod wire_tests {
     }
 
     #[test]
-    fn dfs_browser_read_file_wire_preserves_found_and_types_unavailability() {
-        #[derive(Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
-        struct LegacyReadFileResponse {
-            bytes: Vec<u8>,
-        }
-
-        let legacy: DaemonDfsBrowserReadFileResponse =
-            serde_json::from_value(serde_json::json!({"bytes": [1, 2, 3]}))
-                .expect("decode legacy successful read");
-        assert_eq!(
-            legacy.into_result().expect("legacy found bytes"),
-            vec![1, 2, 3]
+    fn dfs_browser_read_file_wire_requires_current_outcomes_and_types_unavailability() {
+        assert!(
+            serde_json::from_value::<DaemonDfsBrowserReadFileResponse>(
+                serde_json::json!({"bytes":[1,2,3]})
+            )
+            .is_err()
         );
-
         let found = DaemonDfsBrowserReadFileResponse::found(vec![4, 5]);
-        let found_wire = serde_json::to_value(&found).expect("encode found response");
-        assert_eq!(found_wire, serde_json::json!({"bytes": [4, 5]}));
-
-        let found_rpc = sinomo_core::network::ObjectRpcResponse::encode_body(
+        let rpc = sinomo_core::network::ObjectRpcResponse::encode_body(
             DAEMON_DFS_BROWSER_READ_FILE_ROUTE,
             &found,
         )
-        .expect("encode current success response");
-        let legacy_found: LegacyReadFileResponse = found_rpc
-            .decode_body()
-            .expect("legacy client decodes current success response");
-        assert_eq!(legacy_found.bytes, vec![4, 5]);
-
-        let legacy_rpc = sinomo_core::network::ObjectRpcResponse::encode_body(
-            DAEMON_DFS_BROWSER_READ_FILE_ROUTE,
-            &LegacyReadFileResponse { bytes: vec![6, 7] },
-        )
-        .expect("encode legacy success response");
-        let current_from_legacy: DaemonDfsBrowserReadFileResponse = legacy_rpc
-            .decode_body()
-            .expect("current client decodes legacy success response");
-        assert_eq!(
-            current_from_legacy
-                .into_result()
-                .expect("legacy response contains bytes"),
-            vec![6, 7]
-        );
-
-        let missing = DaemonDfsBrowserReadFileResponse::not_found("/missing");
-        assert!(matches!(
-            missing.into_result(),
-            Err(DaemonDfsBrowserReadFileFailure::NotFound { ref path }) if path == "/missing"
-        ));
-
+        .unwrap();
+        let decoded: DaemonDfsBrowserReadFileResponse = rpc.decode_body().unwrap();
+        assert_eq!(decoded.into_result().unwrap(), vec![4, 5]);
         let unavailable = DaemonDfsBrowserReadFileResponse::content_unavailable(
-            "/catalog.sobj",
-            "metadata is authoritative; content mirror is incomplete",
+            "/file",
+            "current bytes unavailable",
         );
-        let unavailable_wire =
-            serde_json::to_value(&unavailable).expect("encode unavailable response");
-        assert!(unavailable_wire.get("bytes").is_none());
-        let unavailable_rpc = sinomo_core::network::ObjectRpcResponse::encode_body(
+        let rpc = sinomo_core::network::ObjectRpcResponse::encode_body(
             DAEMON_DFS_BROWSER_READ_FILE_ROUTE,
             &unavailable,
         )
-        .expect("encode unavailable response");
+        .unwrap();
+        let decoded: DaemonDfsBrowserReadFileResponse = rpc.decode_body().unwrap();
         assert!(
-            unavailable_rpc
-                .decode_body::<LegacyReadFileResponse>()
-                .is_err(),
-            "legacy clients must fail closed when bytes are unavailable"
+            matches!(decoded.into_result(), Err(DaemonDfsBrowserReadFileFailure::ContentUnavailable { path, .. }) if path == "/file")
         );
-        let unavailable: DaemonDfsBrowserReadFileResponse = unavailable_rpc
-            .decode_body()
-            .expect("current client decodes typed unavailable response");
-        assert!(matches!(
-            unavailable.into_result(),
-            Err(DaemonDfsBrowserReadFileFailure::ContentUnavailable { ref path, .. })
-                if path == "/catalog.sobj"
-        ));
+        let missing = DaemonDfsBrowserReadFileResponse::not_found("/missing");
+        let rpc = sinomo_core::network::ObjectRpcResponse::encode_body(
+            DAEMON_DFS_BROWSER_READ_FILE_ROUTE,
+            &missing,
+        )
+        .unwrap();
+        let decoded: DaemonDfsBrowserReadFileResponse = rpc.decode_body().unwrap();
+        assert!(
+            matches!(decoded.into_result(), Err(DaemonDfsBrowserReadFileFailure::NotFound { path }) if path == "/missing")
+        );
     }
 
     #[test]
     fn dfs_browser_stat_wire_preserves_success_and_types_confirmed_absence() {
-        let legacy = DaemonDfsBrowserStatResponse {
+        let stat = DaemonDfsBrowserStatResponse {
             file_system_id: "sifs".to_string(),
             object_id: "object-stat-wire".to_string(),
             path: "/present.txt".to_string(),
@@ -1629,35 +1548,16 @@ mod wire_tests {
             placement: None,
         };
 
-        let current = DaemonDfsBrowserStatOutcomeResponse::found(legacy.clone());
-        assert_eq!(
-            serde_json::to_value(&current).expect("encode current stat success"),
-            serde_json::to_value(&legacy).expect("encode legacy stat success")
-        );
-        let current_rpc = sinomo_core::network::ObjectRpcResponse::encode_body(
+        let current = DaemonDfsBrowserStatOutcomeResponse::found(stat.clone());
+        let rpc = sinomo_core::network::ObjectRpcResponse::encode_body(
             DAEMON_DFS_BROWSER_STAT_ROUTE,
             &current,
         )
-        .expect("encode current stat success");
-        let legacy_from_current: DaemonDfsBrowserStatResponse = current_rpc
-            .decode_body()
-            .expect("legacy client decodes current stat success");
-        assert_eq!(legacy_from_current, legacy);
-
-        let legacy_rpc = sinomo_core::network::ObjectRpcResponse::encode_body(
-            DAEMON_DFS_BROWSER_STAT_ROUTE,
-            &legacy,
-        )
-        .expect("encode legacy stat success");
-        let current_from_legacy: DaemonDfsBrowserStatOutcomeResponse = legacy_rpc
-            .decode_body()
-            .expect("current client decodes legacy stat success");
-        assert_eq!(
-            current_from_legacy
-                .into_result()
-                .expect("legacy found stat"),
-            legacy
-        );
+        .unwrap();
+        let decoded: DaemonDfsBrowserStatOutcomeResponse = rpc.decode_body().unwrap();
+        assert_eq!(decoded.into_result().unwrap(), stat);
+        let untagged = serde_json::to_value(&stat).unwrap();
+        assert!(serde_json::from_value::<DaemonDfsBrowserStatOutcomeResponse>(untagged).is_err());
 
         let missing = DaemonDfsBrowserStatOutcomeResponse::not_found("/missing.txt");
         let missing_rpc = sinomo_core::network::ObjectRpcResponse::encode_body(
@@ -1669,7 +1569,7 @@ mod wire_tests {
             missing_rpc
                 .decode_body::<DaemonDfsBrowserStatResponse>()
                 .is_err(),
-            "legacy clients must fail decoding a typed stat failure"
+            "a typed stat failure cannot decode as a success"
         );
         let missing: DaemonDfsBrowserStatOutcomeResponse = missing_rpc
             .decode_body()
@@ -1680,7 +1580,7 @@ mod wire_tests {
                 if path == "/missing.txt"
         ));
 
-        let mut mixed = serde_json::to_value(&legacy).expect("encode legacy stat success");
+        let mut mixed = serde_json::to_value(&current).expect("encode current stat success");
         mixed
             .as_object_mut()
             .expect("stat success is an object")
@@ -1709,156 +1609,64 @@ mod wire_tests {
     }
 
     #[test]
-    fn dfs_browser_prefix_wire_preserves_success_and_fails_closed_across_versions() {
-        #[derive(Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
-        struct LegacyPrefixResponse {
-            bytes: Vec<u8>,
-            truncated: bool,
-        }
-
-        let found = DaemonDfsBrowserReadFilePrefixResponse::found(vec![1, 2, 3], true);
-        let found_wire = serde_json::to_value(&found).expect("encode current prefix success");
-        assert_eq!(
-            found_wire,
-            serde_json::json!({"bytes": [1, 2, 3], "truncated": true})
+    fn dfs_browser_prefix_wire_requires_current_outcomes_and_roundtrips_truncation() {
+        assert!(
+            serde_json::from_value::<DaemonDfsBrowserReadFilePrefixResponse>(
+                serde_json::json!({"bytes":[1,2],"truncated":true})
+            )
+            .is_err()
         );
-        let found_rpc = sinomo_core::network::ObjectRpcResponse::encode_body(
+        let found = DaemonDfsBrowserReadFilePrefixResponse::found(vec![1, 2, 3], true);
+        let rpc = sinomo_core::network::ObjectRpcResponse::encode_body(
             DAEMON_DFS_BROWSER_READ_FILE_PREFIX_ROUTE,
             &found,
         )
-        .expect("encode current prefix success");
-        let legacy_found: LegacyPrefixResponse = found_rpc
-            .decode_body()
-            .expect("legacy client decodes current prefix success");
-        assert_eq!(legacy_found.bytes, vec![1, 2, 3]);
-        assert!(legacy_found.truncated);
-
-        let legacy_rpc = sinomo_core::network::ObjectRpcResponse::encode_body(
-            DAEMON_DFS_BROWSER_READ_FILE_PREFIX_ROUTE,
-            &LegacyPrefixResponse {
-                bytes: vec![4, 5],
-                truncated: false,
-            },
-        )
-        .expect("encode legacy prefix success");
-        let current: DaemonDfsBrowserReadFilePrefixResponse = legacy_rpc
-            .decode_body()
-            .expect("current client decodes legacy prefix success");
-        assert_eq!(
-            current.into_result().expect("legacy prefix success"),
-            (vec![4, 5], false)
-        );
-
+        .unwrap();
+        let decoded: DaemonDfsBrowserReadFilePrefixResponse = rpc.decode_body().unwrap();
+        assert_eq!(decoded.into_result().unwrap(), (vec![1, 2, 3], true));
         let unavailable = DaemonDfsBrowserReadFilePrefixResponse::content_unavailable(
-            "/preview.bin",
-            "metadata is authoritative; content mirror is incomplete",
+            "/prefix",
+            "current bytes unavailable",
         );
-        let unavailable_rpc = sinomo_core::network::ObjectRpcResponse::encode_body(
+        let rpc = sinomo_core::network::ObjectRpcResponse::encode_body(
             DAEMON_DFS_BROWSER_READ_FILE_PREFIX_ROUTE,
             &unavailable,
         )
-        .expect("encode current unavailable prefix");
+        .unwrap();
+        let decoded: DaemonDfsBrowserReadFilePrefixResponse = rpc.decode_body().unwrap();
         assert!(
-            unavailable_rpc
-                .decode_body::<LegacyPrefixResponse>()
-                .is_err(),
-            "legacy clients must fail decoding a typed unavailable prefix"
+            matches!(decoded.into_result(), Err(DaemonDfsBrowserReadFileFailure::ContentUnavailable { path, .. }) if path == "/prefix")
         );
-        let current: DaemonDfsBrowserReadFilePrefixResponse = unavailable_rpc
-            .decode_body()
-            .expect("current client decodes unavailable prefix");
-        assert!(matches!(
-            current.into_result(),
-            Err(DaemonDfsBrowserReadFileFailure::ContentUnavailable { ref path, .. })
-                if path == "/preview.bin"
-        ));
-
-        let missing = DaemonDfsBrowserReadFilePrefixResponse::not_found("/missing-preview.bin");
-        assert!(matches!(
-            missing.into_result(),
-            Err(DaemonDfsBrowserReadFileFailure::NotFound { ref path })
-                if path == "/missing-preview.bin"
-        ));
     }
 
     #[test]
-    fn dfs_browser_bulk_read_wire_preserves_success_and_fails_closed_across_versions() {
-        #[derive(Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
-        struct LegacyFileRead {
-            path: String,
-            bytes: Option<Vec<u8>>,
-            error: Option<String>,
+    fn dfs_browser_bulk_read_wire_requires_current_typed_outcomes() {
+        for item in [
+            DaemonDfsBrowserFileRead::found("/record.json", vec![1, 2, 3]),
+            DaemonDfsBrowserFileRead::not_found("/missing.json"),
+            DaemonDfsBrowserFileRead::content_unavailable(
+                "/unavailable.json",
+                "no readable replica",
+            ),
+        ] {
+            let response = sinomo_core::network::ObjectRpcResponse::encode_body(
+                DAEMON_DFS_BROWSER_READ_FILES_ROUTE,
+                &item,
+            )
+            .unwrap();
+            let decoded: DaemonDfsBrowserFileRead = response.decode_body().unwrap();
+            assert_eq!(decoded, item);
         }
-
-        let found = DaemonDfsBrowserFileRead::found("/record.json", vec![1, 2, 3]);
-        let found_rpc = sinomo_core::network::ObjectRpcResponse::encode_body(
-            DAEMON_DFS_BROWSER_READ_FILES_ROUTE,
-            &found,
-        )
-        .expect("encode current bulk success");
-        let legacy_found: LegacyFileRead = found_rpc
-            .decode_body()
-            .expect("legacy client decodes current bulk success");
-        assert_eq!(
-            legacy_found,
-            LegacyFileRead {
-                path: "/record.json".to_string(),
-                bytes: Some(vec![1, 2, 3]),
-                error: None,
-            }
-        );
-
-        let legacy_rpc = sinomo_core::network::ObjectRpcResponse::encode_body(
-            DAEMON_DFS_BROWSER_READ_FILES_ROUTE,
-            &LegacyFileRead {
-                path: "/legacy.json".to_string(),
-                bytes: Some(vec![4, 5]),
-                error: None,
-            },
-        )
-        .expect("encode legacy bulk success");
-        let current: DaemonDfsBrowserFileRead = legacy_rpc
-            .decode_body()
-            .expect("current client decodes legacy bulk success");
-        assert_eq!(current.into_result().expect("legacy success"), vec![4, 5]);
-
-        let unavailable = DaemonDfsBrowserFileRead::content_unavailable(
-            "/record.json",
-            "authoritative metadata exists but content is not readable",
-        );
-        let unavailable_rpc = sinomo_core::network::ObjectRpcResponse::encode_body(
-            DAEMON_DFS_BROWSER_READ_FILES_ROUTE,
-            &unavailable,
-        )
-        .expect("encode typed bulk unavailability");
-        let legacy_unavailable: LegacyFileRead = unavailable_rpc
-            .decode_body()
-            .expect("legacy client decodes the compatible outer item");
         assert!(
-            legacy_unavailable.bytes.is_none() && legacy_unavailable.error.is_none(),
-            "legacy clients must receive no value that can be mistaken for successful content"
+            serde_json::from_value::<DaemonDfsBrowserFileRead>(
+                serde_json::json!({"path":"/missing-outcome.json"})
+            )
+            .is_err()
         );
-
-        let legacy_error_rpc = sinomo_core::network::ObjectRpcResponse::encode_body(
-            DAEMON_DFS_BROWSER_READ_FILES_ROUTE,
-            &LegacyFileRead {
-                path: "/legacy-missing.json".to_string(),
-                bytes: None,
-                error: Some("SIFS path not found: /legacy-missing.json".to_string()),
-            },
-        )
-        .expect("encode legacy untyped failure");
-        let current: DaemonDfsBrowserFileRead = legacy_error_rpc
-            .decode_body()
-            .expect("current client decodes legacy untyped failure");
         assert!(matches!(
-            current.into_result(),
-            Err(DaemonDfsBrowserReadFileFailure::InvalidResponse { .. })
-        ));
-
-        assert!(matches!(
-            DaemonDfsBrowserFileRead::not_found("/confirmed-missing.json").into_result(),
-            Err(DaemonDfsBrowserReadFileFailure::NotFound { .. })
+            DaemonDfsBrowserFileRead::content_unavailable("/unavailable", "no readable replica")
+                .into_result(),
+            Err(DaemonDfsBrowserReadFileFailure::ContentUnavailable { .. })
         ));
     }
 

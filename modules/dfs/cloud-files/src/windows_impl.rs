@@ -7092,7 +7092,10 @@ fn open_sifs_service(
     let local_node_id = cluster_state
         .as_ref()
         .map(|state| state.local_node_id.clone())
-        .unwrap_or_else(dfs::fallback_dfs_node_id);
+        .ok_or_else(|| CloudFilesModuleError {
+            code: "network".into(),
+            detail: "SIFS requires an initialized node".into(),
+        })?;
     let known_remote_nodes = cluster_state
         .as_ref()
         .map(|state| {

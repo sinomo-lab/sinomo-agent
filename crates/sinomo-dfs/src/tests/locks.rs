@@ -4,7 +4,7 @@ use super::*;
 
 #[test]
 fn sifs_cluster_routes_advisory_locks_and_promotes_fifo_waiters() {
-    let mut cluster = sifs_posix_cluster("sifs-cluster-routed-advisory-lock");
+    let mut cluster = sifs_posix_cluster("sifs-cluster-routed-advisory-lock", "/users");
     let path = "/users/distributed-lock.txt";
     sifs_cluster_routed_posix_write(&mut cluster, path, b"locked bytes");
 
@@ -108,5 +108,5 @@ fn sifs_cluster_routes_advisory_locks_and_promotes_fifo_waiters() {
     ));
 
     assert!(cluster.rejections.is_empty(), "{:?}", cluster.rejections);
-    std::fs::remove_dir_all(&cluster.root).ok();
+    drop(cluster);
 }

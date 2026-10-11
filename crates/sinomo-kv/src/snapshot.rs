@@ -323,6 +323,27 @@ fn read_cluster_kv_local_immutable_view_from_cache(
     })
 }
 
+/// Retain the actual normal cold reader's DATA view across cache eviction.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn read_cluster_kv_local_indexed_view_for_test(
+    paths: &ClusterKvPaths,
+    node_id: &NodeId,
+) -> Result<KvLocalRead<Arc<RaftLocalReadView>>, KvError> {
+    let wal_paths = paths.raft_wal_paths(node_id);
+    let cache = paths.local_cache();
+    match read_cluster_kv_local_immutable_view_from_cache(
+        &cache.materialized,
+        node_id,
+        &wal_paths,
+        None,
+    )? {
+        ClusterKvLocalImmutableSnapshot::View(read) => Ok(read),
+        ClusterKvLocalImmutableSnapshot::RetryResident => Err(KvError::Busy {
+            path: wal_paths.root.display().to_string(),
+        }),
+    }
+}
+
 fn read_cluster_kv_local_immutable_snapshot(
     paths: &ClusterKvPaths,
     node_id: &NodeId,

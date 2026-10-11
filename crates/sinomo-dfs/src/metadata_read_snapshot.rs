@@ -125,8 +125,7 @@ pub(crate) fn refresh_metadata_tables(
     root: &Path,
     tables: &mut DfsMetadataTables,
     table_log_offset: &mut u64,
-    table_log_journal_reference_replay_cost_bytes: &mut u64,
-    table_log_unpriced_namespace_prepare_references: &mut u64,
+
     materialized_through_sequence: &mut u64,
     table_snapshot_fingerprint: &mut Option<MetadataTableSnapshotFingerprint>,
     prefix_proof: &mut Option<DfsMetadataPrefixProof>,
@@ -135,8 +134,6 @@ pub(crate) fn refresh_metadata_tables(
         root,
         tables,
         table_log_offset,
-        table_log_journal_reference_replay_cost_bytes,
-        table_log_unpriced_namespace_prepare_references,
         materialized_through_sequence,
         table_snapshot_fingerprint,
         prefix_proof,
@@ -152,8 +149,7 @@ pub(crate) fn refresh_metadata_tables_lenient(
     root: &Path,
     tables: &mut DfsMetadataTables,
     table_log_offset: &mut u64,
-    table_log_journal_reference_replay_cost_bytes: &mut u64,
-    table_log_unpriced_namespace_prepare_references: &mut u64,
+
     materialized_through_sequence: &mut u64,
     table_snapshot_fingerprint: &mut Option<MetadataTableSnapshotFingerprint>,
     prefix_proof: &mut Option<DfsMetadataPrefixProof>,
@@ -162,8 +158,6 @@ pub(crate) fn refresh_metadata_tables_lenient(
         root,
         tables,
         table_log_offset,
-        table_log_journal_reference_replay_cost_bytes,
-        table_log_unpriced_namespace_prepare_references,
         materialized_through_sequence,
         table_snapshot_fingerprint,
         prefix_proof,
@@ -175,8 +169,7 @@ fn refresh_metadata_tables_with_reader<ReadState>(
     root: &Path,
     tables: &mut DfsMetadataTables,
     table_log_offset: &mut u64,
-    table_log_journal_reference_replay_cost_bytes: &mut u64,
-    table_log_unpriced_namespace_prepare_references: &mut u64,
+
     materialized_through_sequence: &mut u64,
     table_snapshot_fingerprint: &mut Option<MetadataTableSnapshotFingerprint>,
     prefix_proof: &mut Option<DfsMetadataPrefixProof>,
@@ -191,8 +184,6 @@ where
         root,
         tables,
         table_log_offset,
-        table_log_journal_reference_replay_cost_bytes,
-        table_log_unpriced_namespace_prepare_references,
         materialized_through_sequence,
         table_snapshot_fingerprint,
         prefix_proof,
@@ -214,10 +205,7 @@ where
     let state = read_state(root)?;
     *tables = state.tables;
     *table_log_offset = state.table_log_offset;
-    *table_log_journal_reference_replay_cost_bytes =
-        state.table_log_journal_reference_replay_cost_bytes;
-    *table_log_unpriced_namespace_prepare_references =
-        state.table_log_unpriced_namespace_prepare_references;
+
     *materialized_through_sequence = state.materialized_through_sequence.unwrap_or(0);
     *table_snapshot_fingerprint = state.snapshot_fingerprint;
     *prefix_proof = state.prefix_proof;
@@ -228,8 +216,7 @@ fn refresh_metadata_tables_once<ReadState>(
     root: &Path,
     tables: &mut DfsMetadataTables,
     table_log_offset: &mut u64,
-    table_log_journal_reference_replay_cost_bytes: &mut u64,
-    table_log_unpriced_namespace_prepare_references: &mut u64,
+
     materialized_through_sequence: &mut u64,
     table_snapshot_fingerprint: &mut Option<MetadataTableSnapshotFingerprint>,
     prefix_proof: &mut Option<DfsMetadataPrefixProof>,
@@ -242,10 +229,7 @@ where
         let state = read_state(root)?;
         *tables = state.tables;
         *table_log_offset = state.table_log_offset;
-        *table_log_journal_reference_replay_cost_bytes =
-            state.table_log_journal_reference_replay_cost_bytes;
-        *table_log_unpriced_namespace_prepare_references =
-            state.table_log_unpriced_namespace_prepare_references;
+
         *materialized_through_sequence = state.materialized_through_sequence.unwrap_or(0);
         *table_snapshot_fingerprint = state.snapshot_fingerprint;
         *prefix_proof = state.prefix_proof;
@@ -255,8 +239,6 @@ where
         root,
         tables,
         table_log_offset,
-        table_log_journal_reference_replay_cost_bytes,
-        table_log_unpriced_namespace_prepare_references,
         materialized_through_sequence,
         table_snapshot_fingerprint,
         prefix_proof,
@@ -277,10 +259,7 @@ where
         let state = read_state(root)?;
         *tables = state.tables;
         *table_log_offset = state.table_log_offset;
-        *table_log_journal_reference_replay_cost_bytes =
-            state.table_log_journal_reference_replay_cost_bytes;
-        *table_log_unpriced_namespace_prepare_references =
-            state.table_log_unpriced_namespace_prepare_references;
+
         *materialized_through_sequence = state.materialized_through_sequence.unwrap_or(0);
         *table_snapshot_fingerprint = state.snapshot_fingerprint;
         *prefix_proof = state.prefix_proof;
@@ -291,11 +270,7 @@ where
     }
     let replay = replay_incremental_table_suffix(root, &path, *table_log_offset, tables)?;
     *table_log_offset = replay.offset;
-    *table_log_journal_reference_replay_cost_bytes = table_log_journal_reference_replay_cost_bytes
-        .saturating_add(replay.journal_reference_replay_cost_bytes);
-    *table_log_unpriced_namespace_prepare_references =
-        table_log_unpriced_namespace_prepare_references
-            .saturating_add(replay.unpriced_namespace_prepare_references);
+
     if let Some(sequence) = replay.materialized_through_sequence {
         *materialized_through_sequence = (*materialized_through_sequence).max(sequence);
     }
@@ -495,10 +470,7 @@ fn current_tables_snapshot_once<'a>(
                 let state = DfsMetadataTableState {
                     tables,
                     table_log_offset: replay.offset,
-                    table_log_journal_reference_replay_cost_bytes: replay
-                        .journal_reference_replay_cost_bytes,
-                    table_log_unpriced_namespace_prepare_references: replay
-                        .unpriced_namespace_prepare_references,
+
                     materialized_through_sequence: max_optional_sequence(
                         Some(materialized_through_sequence),
                         replay.materialized_through_sequence,
@@ -573,12 +545,7 @@ fn cached_or_advanced_read_snapshot(
                 }
             };
         cache.table_log_offset = replay.offset;
-        cache.table_log_journal_reference_replay_cost_bytes = cache
-            .table_log_journal_reference_replay_cost_bytes
-            .saturating_add(replay.journal_reference_replay_cost_bytes);
-        cache.table_log_unpriced_namespace_prepare_references = cache
-            .table_log_unpriced_namespace_prepare_references
-            .saturating_add(replay.unpriced_namespace_prepare_references);
+
         cache.materialized_through_sequence = max_optional_sequence(
             cache.materialized_through_sequence,
             replay.materialized_through_sequence,
@@ -602,10 +569,7 @@ fn snapshot_from_state<'a>(
             snapshot_fingerprint: state.snapshot_fingerprint.clone(),
             checkpoint_fingerprint,
             table_log_offset: state.table_log_offset,
-            table_log_journal_reference_replay_cost_bytes: state
-                .table_log_journal_reference_replay_cost_bytes,
-            table_log_unpriced_namespace_prepare_references: state
-                .table_log_unpriced_namespace_prepare_references,
+
             materialized_through_sequence: state.materialized_through_sequence,
             snapshot_format_version: state.snapshot_format_version,
             prefix_proof: state.prefix_proof,
@@ -660,8 +624,7 @@ fn reload_metadata_tables_if_snapshot_changed<ReadState>(
     root: &Path,
     tables: &mut DfsMetadataTables,
     table_log_offset: &mut u64,
-    table_log_journal_reference_replay_cost_bytes: &mut u64,
-    table_log_unpriced_namespace_prepare_references: &mut u64,
+
     materialized_through_sequence: &mut u64,
     table_snapshot_fingerprint: &mut Option<MetadataTableSnapshotFingerprint>,
     prefix_proof: &mut Option<DfsMetadataPrefixProof>,
@@ -677,10 +640,7 @@ where
     let state = read_state(root)?;
     *tables = state.tables;
     *table_log_offset = state.table_log_offset;
-    *table_log_journal_reference_replay_cost_bytes =
-        state.table_log_journal_reference_replay_cost_bytes;
-    *table_log_unpriced_namespace_prepare_references =
-        state.table_log_unpriced_namespace_prepare_references;
+
     *materialized_through_sequence = state.materialized_through_sequence.unwrap_or(0);
     *table_snapshot_fingerprint = state.snapshot_fingerprint;
     *prefix_proof = state.prefix_proof;
@@ -695,7 +655,7 @@ mod tests {
 
     use super::*;
     use crate::metadata_records::{
-        DfsMetadataTableBatch, DfsMetadataTableOp, dfs_metadata_prefix_proof_seed,
+        DfsMetadataTableBatch, DfsMetadataTableOp, dfs_metadata_prefix_proof_genesis,
     };
     use crate::metadata_table_store::{
         append_metadata_table_batch, metadata_table_checkpoint_log_path, metadata_table_path,
@@ -705,7 +665,6 @@ mod tests {
 
     fn file_system(label: &str, display_name_bytes: usize) -> DfsFileSystem {
         DfsFileSystem {
-            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: DfsFileSystemId::from_legacy_named(format!("fs_{label}"))
@@ -716,22 +675,119 @@ mod tests {
         }
     }
 
-    fn append_file_system(root: &Path, sequence: u64, file_system: DfsFileSystem) -> u64 {
-        let prefix_proof = dfs_metadata_prefix_proof_seed(
-            &DfsMetadataShardId::new("shard-test"),
-            sequence,
-            &format!("checkpoint-read-fixture-{sequence}"),
-        );
+    fn persist_genesis(root: &Path) {
+        let proof = dfs_metadata_prefix_proof_genesis(&DfsMetadataShardId::new("shard-test"));
+        persist_metadata_table_snapshot(root, &DfsMetadataTables::default(), Some(0), Some(&proof))
+            .unwrap();
+    }
+
+    // Physical table-reader fixtures use genuine current journal frames and
+    // their exact byte-derived prefix. No distributed acknowledgement is minted.
+    fn append_file_system(root: &Path, ordinal: u64, file_system: DfsFileSystem) -> u64 {
+        use crate::metadata_journal::{
+            DfsMetadataJournalFrame, persist_replayed_journal_entries,
+            segmented_journal_entry_at_sequence,
+        };
+        use crate::{
+            DfsPreparedMetadataEffect, DfsPreparedOperationDigest, DfsPreparedOperationPayload,
+            DfsPreparedOperationRecord, DfsPreparedOperationScope, DfsPreparedOperationStatus,
+        };
+        let shard = DfsMetadataShardId::new("shard-test");
+        let prepare_sequence = ordinal * 2 - 1;
+        let commit_sequence = prepare_sequence + 1;
+        let payload = DfsPreparedOperationPayload::for_metadata_effects(
+            DfsPreparedOperationScope {
+                file_system_id: file_system.file_system_id.clone(),
+                shard_id: shard.clone(),
+                owner_epoch: 1,
+                operation_id: format!("read-snapshot:{}:{ordinal}", file_system.file_system_id),
+            },
+            Vec::new(),
+            Vec::new(),
+            vec![DfsPreparedMetadataEffect::PutFileSystem {
+                file_system: file_system.clone(),
+            }],
+            time::OffsetDateTime::UNIX_EPOCH,
+        )
+        .unwrap();
+        let digest = DfsPreparedOperationDigest::at_sequence(&payload, prepare_sequence).unwrap();
+        let record = DfsPreparedOperationRecord {
+            digest: digest.clone(),
+            payload: Arc::new(payload),
+            status: DfsPreparedOperationStatus::Prepared,
+            committed_entry: None,
+        };
+        let prepare = crate::DfsMetadataJournalEntry {
+            shard_id: shard.clone(),
+            sequence: prepare_sequence,
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+            mutation: crate::DfsMetadataMutation::PrepareOperationV7 {
+                file_system_id: file_system.file_system_id.clone(),
+                operation_id: digest.operation_id.clone(),
+                record: Box::new(record.clone()),
+            },
+        };
+        let commit = crate::DfsMetadataJournalEntry {
+            shard_id: shard.clone(),
+            sequence: commit_sequence,
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+            mutation: crate::DfsMetadataMutation::CommitPreparedOperationV7 {
+                file_system_id: file_system.file_system_id.clone(),
+                operation_id: digest.operation_id.clone(),
+                digest: digest.clone(),
+            },
+        };
+        let mut prefix = dfs_metadata_prefix_proof_genesis(&shard);
+        for sequence in 1..prepare_sequence {
+            let entry = segmented_journal_entry_at_sequence(root, sequence)
+                .unwrap()
+                .expect("actual previous frame");
+            prefix = DfsMetadataJournalFrame::encode(&entry)
+                .unwrap()
+                .prefix_proof_after(&prefix)
+                .unwrap();
+        }
+        persist_replayed_journal_entries(root, &[&prepare, &commit], prepare_sequence - 1).unwrap();
+        prefix = DfsMetadataJournalFrame::encode(&prepare)
+            .unwrap()
+            .prefix_proof_after(&prefix)
+            .unwrap();
         append_metadata_table_batch(
             root,
             &DfsMetadataTableBatch {
-                sequence,
-                ops: vec![DfsMetadataTableOp::PutFileSystem { file_system }],
-                prefix_proof: Some(prefix_proof),
-                journal_reference_replay_cost_bytes: 0,
+                sequence: prepare_sequence,
+                ops: vec![DfsMetadataTableOp::PutPreparedOperationV7 {
+                    record: Box::new(record),
+                }],
+                prefix_proof: Some(prefix.clone()),
             },
         )
-        .expect("append metadata table batch")
+        .unwrap();
+        prefix = DfsMetadataJournalFrame::encode(&commit)
+            .unwrap()
+            .prefix_proof_after(&prefix)
+            .unwrap();
+        append_metadata_table_batch(
+            root,
+            &DfsMetadataTableBatch {
+                sequence: commit_sequence,
+                ops: vec![
+                    DfsMetadataTableOp::PutFileSystem { file_system },
+                    DfsMetadataTableOp::CommitPreparedOperationV7 {
+                        digest,
+                        committed_entry: Box::new(
+                            crate::DfsPreparedOperationCommitReference::from_journal_entry(&commit)
+                                .unwrap(),
+                        ),
+                    },
+                ],
+                prefix_proof: Some(prefix),
+            },
+        )
+        .unwrap();
+        // The fixture appends both Prepare and Commit. Callers retain the
+        // complete file boundary, not the byte count of its final batch.
+        fs::metadata(metadata_table_path(root)).unwrap().len()
     }
 
     fn shared_tables(snapshot: DfsMetadataTablesSnapshot<'_>) -> Arc<DfsMetadataTables> {
@@ -747,8 +803,7 @@ mod tests {
         root: &Path,
         checkpoint_file_system: DfsFileSystem,
     ) -> Option<MetadataTableSnapshotFingerprint> {
-        persist_metadata_table_snapshot(root, &DfsMetadataTables::default(), None, None)
-            .expect("persist empty metadata snapshot");
+        persist_genesis(root);
         append_file_system(root, 1, checkpoint_file_system);
         assert!(
             rotate_metadata_table_log_for_checkpoint(root, 0)
@@ -763,13 +818,7 @@ mod tests {
         for cached in [false, true] {
             for append_after_rotation in [false, true] {
                 let root = sinomo_testdir::TestDir::new("metadata-incremental-read-rotation");
-                persist_metadata_table_snapshot(
-                    root.path(),
-                    &DfsMetadataTables::default(),
-                    None,
-                    None,
-                )
-                .unwrap();
+                persist_genesis(root.path());
                 let first = file_system("first", 1);
                 append_file_system(root.path(), 1, first.clone());
                 let loaded = read_metadata_table_state_lenient(root.path()).unwrap();
@@ -807,7 +856,13 @@ mod tests {
                             rotate_metadata_table_log_for_checkpoint(&rotation_root, 0).unwrap()
                         );
                         if append_after_rotation {
-                            append_file_system(&rotation_root, 4, after_rotation);
+                            // Without the cached read there was no third
+                            // operation; append the next contiguous journal pair.
+                            append_file_system(
+                                &rotation_root,
+                                if cached { 4 } else { 3 },
+                                after_rotation,
+                            );
                         }
                     }));
                 });
@@ -850,8 +905,7 @@ mod tests {
     #[test]
     fn table_refresh_rotation_rebases_cursor_and_replay_accounting() {
         let root = sinomo_testdir::TestDir::new("metadata-table-refresh-rotation");
-        persist_metadata_table_snapshot(root.path(), &DfsMetadataTables::default(), None, None)
-            .unwrap();
+        persist_genesis(root.path());
         let first = file_system("first", 1);
         append_file_system(root.path(), 1, first.clone());
         let mut state = read_metadata_table_state_lenient(root.path()).unwrap();
@@ -868,8 +922,6 @@ mod tests {
             root.path(),
             &mut state.tables,
             &mut state.table_log_offset,
-            &mut state.table_log_journal_reference_replay_cost_bytes,
-            &mut state.table_log_unpriced_namespace_prepare_references,
             &mut sequence,
             &mut state.snapshot_fingerprint,
             &mut state.prefix_proof,
@@ -888,20 +940,17 @@ mod tests {
                 .contains_key(&second.file_system_id)
         );
         assert_eq!(state.table_log_offset, 0);
-        assert_eq!(sequence, 2);
+        assert_eq!(sequence, 4);
         assert_eq!(
             state.prefix_proof.as_ref().unwrap().journal_sequence,
             sequence
         );
-        assert_eq!(state.table_log_journal_reference_replay_cost_bytes, 0);
-        assert_eq!(state.table_log_unpriced_namespace_prepare_references, 0);
     }
 
     #[test]
     fn incremental_snapshot_same_generation_cursor_error_remains_fail_closed() {
         let root = sinomo_testdir::TestDir::new("metadata-incremental-corrupt-cursor");
-        persist_metadata_table_snapshot(root.path(), &DfsMetadataTables::default(), None, None)
-            .unwrap();
+        persist_genesis(root.path());
         append_file_system(root.path(), 1, file_system("first", 1));
         let loaded = read_metadata_table_state_lenient(root.path()).unwrap();
         let generation = Some(metadata_table_storage_generation(root.path()).unwrap());
@@ -939,8 +988,7 @@ mod tests {
     fn preprobe_same_generation_shrink_rejects_live_and_advanced_cache_cursors() {
         for cached in [false, true] {
             let root = sinomo_testdir::TestDir::new("metadata-preprobe-shrink");
-            persist_metadata_table_snapshot(root.path(), &DfsMetadataTables::default(), None, None)
-                .unwrap();
+            persist_genesis(root.path());
             let first_len = append_file_system(root.path(), 1, file_system("first", 1));
             let first = read_metadata_table_state_lenient(root.path()).unwrap();
             append_file_system(root.path(), 2, file_system("second", 1));
@@ -995,14 +1043,20 @@ mod tests {
         use crate::DfsMetadataBackend;
 
         let root = sinomo_testdir::TestDir::new("metadata-native-preprobe-shrink");
-        let shard_id = DfsMetadataShardId::new("root");
+        let shard_id = DfsMetadataShardId::new("shard-test");
         let mut writer =
             crate::LocalSobjMetadataBackend::new(shard_id.clone(), root.path()).unwrap();
         let first = file_system("native", 1);
-        writer.put_file_system(&first).unwrap();
+        append_file_system(root.path(), 1, first.clone());
         let mut second = first.clone();
         second.display_name = "updated native display".into();
-        writer.put_file_system(&second).unwrap();
+        append_file_system(root.path(), 2, second.clone());
+        drop(writer);
+        let mut writer = crate::LocalSobjMetadataBackend::new(
+            DfsMetadataShardId::new("shard-test"),
+            root.path(),
+        )
+        .unwrap();
         let mut inspector =
             crate::LocalSobjMetadataBackend::open_for_inspection(shard_id, root.path()).unwrap();
         let journal_head = writer.journal_last_sequence();
@@ -1019,7 +1073,10 @@ mod tests {
         let mut attempted = second;
         attempted.display_name = "must not be published".into();
         assert!(
-            matches!(writer.put_file_system(&attempted), Err(MetadataBackendError::Serde(ref message))
+            matches!(writer.prepare_operation(crate::DfsPreparedOperationPayload::for_metadata_effects(crate::DfsPreparedOperationScope {
+                file_system_id: attempted.file_system_id.clone(), shard_id: DfsMetadataShardId::new("shard-test"), owner_epoch: 1,
+                operation_id: "must-not-append".into(),
+            }, Vec::new(), Vec::new(), vec![crate::DfsPreparedMetadataEffect::PutFileSystem { file_system: attempted }], time::OffsetDateTime::UNIX_EPOCH).unwrap(), None), Err(MetadataBackendError::Serde(ref message))
             if message.contains("without a generation change"))
         );
         assert_eq!(
@@ -1080,8 +1137,7 @@ mod tests {
         let root =
             sinomo_testdir::TestDir::new("sinomo-dfs-metadata-checkpoint-borrow-active-rotation");
         let checkpoint_file_system = file_system("checkpoint", 1);
-        persist_metadata_table_snapshot(root.path(), &DfsMetadataTables::default(), None, None)
-            .expect("persist empty metadata snapshot");
+        persist_genesis(root.path());
         append_file_system(root.path(), 1, checkpoint_file_system.clone());
         let state =
             read_metadata_table_state_lenient(root.path()).expect("load active table generation");
@@ -1132,8 +1188,7 @@ mod tests {
             sinomo_testdir::TestDir::new("sinomo-dfs-metadata-checkpoint-rotation-suffix-race");
         let checkpoint_file_system = file_system("checkpoint", 1);
         let suffix_file_system = file_system("suffix", 1);
-        persist_metadata_table_snapshot(root.path(), &DfsMetadataTables::default(), None, None)
-            .expect("persist empty metadata snapshot");
+        persist_genesis(root.path());
         append_file_system(root.path(), 1, checkpoint_file_system.clone());
         let state =
             read_metadata_table_state_lenient(root.path()).expect("load active table generation");
@@ -1190,8 +1245,7 @@ mod tests {
         );
         let observed_file_system = file_system("observed", 1);
         let unobserved_file_system = file_system("unseen", 1);
-        persist_metadata_table_snapshot(root.path(), &DfsMetadataTables::default(), None, None)
-            .expect("persist empty metadata snapshot");
+        persist_genesis(root.path());
         append_file_system(root.path(), 1, observed_file_system.clone());
         let state =
             read_metadata_table_state_lenient(root.path()).expect("load active table generation");
@@ -1241,8 +1295,7 @@ mod tests {
             "sinomo-dfs-metadata-checkpoint-rotation-replacement-race",
         );
         let original_checkpoint = file_system("original", 1);
-        persist_metadata_table_snapshot(root.path(), &DfsMetadataTables::default(), None, None)
-            .expect("persist empty metadata snapshot");
+        persist_genesis(root.path());
         append_file_system(root.path(), 1, original_checkpoint.clone());
         let state =
             read_metadata_table_state_lenient(root.path()).expect("load active table generation");
@@ -1485,8 +1538,8 @@ mod tests {
             file.write_all(&8u32.to_le_bytes()).unwrap();
             file.write_all(b"not-sobj").unwrap();
         }
-        // A malformed final frame is tolerated as a torn write. Follow it with
-        // a valid frame so this exercises failure after partial suffix replay.
+        // Keep this complete corrupt frame inside the log, after a valid
+        // suffix, so rejection must discard a partially advanced cached view.
         append_file_system(root.path(), 3, third.clone());
         let error = current_tables_snapshot(
             root.path(),
@@ -1500,11 +1553,8 @@ mod tests {
         )
         .err()
         .expect("an interior corrupt frame must fail replay");
-        assert!(
-            error
-                .to_string()
-                .contains("failed to decode metadata table batch")
-        );
+        assert!(matches!(error, MetadataBackendError::Serde(ref message)
+            if message.contains("unsupported current metadata table-log format")));
         assert!(cache.lock().unwrap().is_none());
         assert!(before.file_systems.contains_key(&first.file_system_id));
         assert!(!before.file_systems.contains_key(&second.file_system_id));

@@ -249,7 +249,7 @@ mod independent_adversarial_tests {
                 assignment: crate::DfsMetadataShardAssignment::PathPrefix {
                     prefix: "/users".into(),
                 },
-                namespace_prepare_codec: Default::default(),
+
                 default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
             };
             let runtime = DefaultDfsReconciliationRuntime::new(

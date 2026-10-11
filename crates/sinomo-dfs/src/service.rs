@@ -148,6 +148,44 @@ impl Service for DfsMountedMutationHandoffService {
     }
 }
 
+struct DfsSourceAdoptionService {
+    actor: Arc<crate::source_adoption::DfsSourceAdoptionActor>,
+}
+impl Service for DfsSourceAdoptionService {
+    fn name(&self) -> &'static str {
+        "dfs-source-adoption"
+    }
+    fn routes(&self) -> &'static [&'static str] {
+        &[crate::source_adoption::SOURCE_ADOPTION_ROUTE]
+    }
+    fn route_categories(&self) -> Vec<ServiceRoute> {
+        vec![dfs_service_route(
+            crate::source_adoption::SOURCE_ADOPTION_ROUTE,
+        )]
+    }
+    fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
+        let actor = Arc::clone(&self.actor);
+        Box::pin(async move {
+            let route = crate::source_adoption::SOURCE_ADOPTION_ROUTE;
+            let target = authenticated_dfs_cluster_source_node_id(&ctx, route)?;
+            let request: crate::source_adoption::DfsSourceAdoptionRequest = ctx
+                .decode_request_body_bounded(&request, 4 * 1024 * 1024)
+                .await?;
+            // This actor owns source custody, not a metadata effect. Claim,
+            // validation and release must remain reachable while the normal
+            // target/source metadata continuation is parked.
+            let response = tokio::task::spawn_blocking(move || actor.handle_rpc(&target, request))
+                .await
+                .map_err(|error| {
+                    ServiceError::Service(format!("source custody task failed: {error}"))
+                })?
+                .map_err(service_error)?;
+            ctx.respond_value(route, response)?;
+            Ok(ServiceDisposition::Continue)
+        })
+    }
+}
+
 impl Service for DfsMetricExporterService {
     fn name(&self) -> &'static str {
         "dfs-metric-exporter"
@@ -264,6 +302,18 @@ pub(crate) fn register_services_with_data_plane_host(
 /// control surface, events, and lifecycle resources.
 pub fn component_factory()
 -> Result<sinomo_module::StaticComponentFactory, sinomo_module::ComponentError> {
+    component_factory_with_preparation(None)
+}
+
+pub fn component_factory_with_storage_preparation(
+    provider: crate::DfsStoragePreparationProviderBuilder,
+) -> Result<sinomo_module::StaticComponentFactory, sinomo_module::ComponentError> {
+    component_factory_with_preparation(Some(provider))
+}
+
+fn component_factory_with_preparation(
+    preparation: Option<crate::DfsStoragePreparationProviderBuilder>,
+) -> Result<sinomo_module::StaticComponentFactory, sinomo_module::ComponentError> {
     let descriptor =
         sinomo_module::component_descriptor_from_registration(&crate::dfs_module_registration())?
             .with_offer(sifs_path_access_service_offer())
@@ -303,26 +353,34 @@ pub fn component_factory()
                     &data_dir,
                     context.host_role(),
                 );
-                let mut data_owner = crate::runtime_host::DfsDataOwnerLock::acquire(&paths)
-                    .map_err(|error| sinomo_module::ComponentError::Component {
-                        component_id: caller.component_id.clone(),
-                        detail: error.to_string(),
-                    })?;
-                // Cold layout activation belongs to the DFS lifecycle owner.
-                // No routes, provider stores, browser handles or background
-                // tasks have been constructed at this boundary.
-                data_owner
-                    .activate_content_bindings_before_routes()
-                    .map_err(|error| sinomo_module::ComponentError::Component {
-                        component_id: caller.component_id.clone(),
-                        detail: error.to_string(),
-                    })?;
-                let data_owner = Arc::new(data_owner);
+                let data_owner = match crate::source_adoption::retained_owner_for_mount(context)? {
+                    Some(actual_retained_owner) => actual_retained_owner,
+                    None => Arc::new(crate::runtime_host::DfsDataOwnerLock::acquire(&paths)
+                        .map_err(|error| sinomo_module::ComponentError::Component {
+                            component_id: caller.component_id.clone(), detail: error.to_string(),
+                        })?),
+                };
+                #[cfg(any(test, feature = "test-support"))]
+                let native_trace_mount = crate::native_shard_trace::register_mount(
+                    data_dir.root().to_owned(), scope.shutdown_receiver(), &data_owner,
+                    &ClusterPaths::new(&data_dir),
+                );
                 crate::runtime_host::register_daemon_dfs_data_owner_lock(&paths, &data_owner)
                     .map_err(|error| sinomo_module::ComponentError::Component {
                         component_id: caller.component_id.clone(),
                         detail: error.to_string(),
                     })?;
+                let storage_preparation = preparation.as_ref().map(|provider| {
+                    let lifecycle = scope.shutdown_receiver();
+                    let provider = provider(context, lifecycle.clone())?;
+                    let owner = Arc::clone(&data_owner);
+                    let owned: crate::DfsStoragePreparationProvider = Arc::new(move |root, shard, budget| {
+                        let _actual_owner = Arc::clone(&owner);
+                        provider(root, shard, budget)
+                    });
+                    crate::register_dfs_storage_preparation_provider(data_dir.root().to_owned(), owned, Some(lifecycle))
+                        .map_err(|error| sinomo_module::ComponentError::Component { component_id: caller.component_id.clone(), detail: error.to_string() })
+                }).transpose()?;
                 let events = context.event_client(&caller)?;
                 let host_event_receivers = vec![
                     events
@@ -349,6 +407,24 @@ pub fn component_factory()
                         detail: error.to_string(),
                     },
                 )?;
+                let source_adoption = crate::source_adoption::DfsSourceAdoptionActor::from_component(
+                    context,
+                    Arc::clone(&data_owner),
+                    scope.shutdown_receiver(),
+                )?;
+                builder = builder.register(DfsSourceAdoptionService {
+                    actor: Arc::clone(&source_adoption),
+                });
+                // Recover exact retained captures before strict startup opens
+                // can wait for their already-owned metadata writers.
+                let source_recovery = Arc::clone(&source_adoption);
+                scope.on_host_prepare(move || {
+                    let actor = Arc::clone(&source_recovery);
+                    async move {
+                        actor.wake_reconciliation();
+                        Ok(())
+                    }
+                });
                 crate::runtime_host::replay_daemon_dfs_mounted_mutation_committed_work_on_runtime(
                     &paths, &runtime,
                 )
@@ -376,16 +452,20 @@ pub fn component_factory()
                 // borrow this owner without reopening bootstrap state files.
                 let cluster_paths = ClusterPaths::new(&data_dir);
                 let metadata_authority = match sinomo_core::cluster::read_cluster_state_without_kv_cached_shared(&cluster_paths) {
-                    Ok(state) => Some(crate::runtime_host::daemon_dfs_metadata_authority_generation_for_identity(
+                    Ok(state) => {
+                        #[cfg(any(test, feature = "test-support"))]
+                        native_trace_mount.observe_mounted_identity(&state);
+                        Some(crate::runtime_host::daemon_dfs_metadata_authority_generation_for_identity(
                         &cluster_paths, &state.cluster_id, &state.local_node_id, Some(&runtime),
                     ).map_err(|error| sinomo_module::ComponentError::Component {
                         component_id: caller.component_id.clone(), detail: error.to_string(),
-                    })?),
+                    })?) },
                     Err(sinomo_core::network::NetworkError::ClusterOrphan) => None,
                     Err(error) => return Err(sinomo_module::ComponentError::Component {
                         component_id: caller.component_id.clone(), detail: error.to_string(),
                     }),
                 };
+
                 let browser: Arc<dyn crate::DfsBrowserServiceHost> =
                     Arc::new(crate::runtime_host::RuntimeDfsBrowserServiceHost::new(
                         paths,
@@ -418,13 +498,56 @@ pub fn component_factory()
                         .cloned()
                         .expect("active DFS runtime was already resolved"),
                 });
+                let drain_host = Arc::clone(&host);
+                let drain_source = Arc::clone(&source_adoption);
+                scope.on_task_drain("DFS runtime children and source custody", move |deadline| {
+                    let host = Arc::clone(&drain_host);
+                    let source = Arc::clone(&drain_source);
+                    async move {
+                        host.shutdown_and_wait(deadline).await?;
+                        source.closed_custody_disposition().map(|disposition| {
+                            if disposition == crate::source_adoption::DfsSourceAdoptionCloseDisposition::Retained {
+                                tracing::debug!(target: "sinomo.dfs.source_custody",
+                                    "closed DFS source effects remain in exact retained native custody");
+                            }
+                        }).map_err(|error| error.to_string())
+                    }
+                });
                 let data_dir_for_drop = data_dir.clone();
+                #[cfg(any(test, feature = "test-support"))]
+                let owner_paths_for_drop = crate::runtime_host::DfsRuntimePaths::for_host_role(
+                    &data_dir_for_drop,
+                    context.host_role(),
+                );
                 scope.defer(move || {
+                    #[cfg(any(test, feature = "test-support"))]
+                    crate::runtime_host::trace_dfs_data_owner_references(
+                        &owner_paths_for_drop, "factory-disposer-started",
+                    );
+                    match source_adoption.closed_custody_disposition() {
+                        Ok(crate::source_adoption::DfsSourceAdoptionCloseDisposition::Drained) => {}
+                        Ok(crate::source_adoption::DfsSourceAdoptionCloseDisposition::Retained) => {
+                            // Only the verified registry retains the actual FD.
+                            // Normal remount must still prove fresh effect authority.
+                            tracing::debug!(target: "sinomo.dfs.source_custody",
+                                "disposed DFS host while exact source custody remains retained");
+                        }
+                        Err(error) => {
+                            tracing::error!(%error, "DFS source custody could not close safely");
+                        }
+                    }
                     host.shutdown();
                     crate::browser_service::release_browser_backends(&data_dir_for_drop);
                     crate::runtime_host::unregister_dfs_runtime_host(&data_dir_for_drop);
                     drop(host);
+                    drop(storage_preparation);
+                    #[cfg(any(test, feature = "test-support"))]
+                    drop(native_trace_mount);
                     drop(data_owner);
+                    #[cfg(any(test, feature = "test-support"))]
+                    crate::runtime_host::trace_dfs_data_owner_references(
+                        &owner_paths_for_drop, "factory-explicit-owner-dropped",
+                    );
                 });
             } else {
                 builder = register_services(builder);
@@ -518,7 +641,8 @@ fn dfs_service_route(route: &'static str) -> ServiceRoute {
 fn dfs_route_accepts_request_body(route: &str) -> bool {
     matches!(
         route,
-        crate::DFS_DATA_WRITE_ROUTE
+        DFS_METADATA_SNAPSHOT_INSTALL_ROUTE
+            | crate::DFS_DATA_WRITE_ROUTE
             | crate::DFS_DATA_DISTRIBUTED_WRITE_ROUTE
             | crate::DFS_DATA_NAMESPACE_ROUTE
             | crate::DFS_DATA_STAGE_BLOB_ROUTE
@@ -634,6 +758,7 @@ pub trait DfsDataPlaneHost: Send + Sync {
         authenticated_source_node_id: NodeId,
         command: DfsMetadataSnapshotInstallCommand,
         context: Option<DfsMetadataReplicaShardContext>,
+        body: ObjectRpcIncomingBody,
     ) -> DfsDataPlaneHostFuture<'a, DfsMetadataSnapshotInstallResponse>;
 
     /// Process one authenticated routed DFS message through the host's
@@ -800,18 +925,15 @@ impl Service for DfsService {
                                         .map(ToString::to_string)
                                         .unwrap_or_else(|| "<missing>".to_string())
                                 ),
-                                code: None,
+                                code: crate::DfsMetadataRejectionCode::Other,
                             },
                         };
                         ctx.respond_value(DFS_METADATA_JOURNAL_BATCH_ROUTE, response)?;
                         operation_metrics.succeed();
                         return Ok(ServiceDisposition::Continue);
                     }
-                    let may_have_deferred_materialization = command.durable_replication.is_some()
-                        || command
-                            .authority_probe
-                            .as_ref()
-                            .is_some_and(|probe| probe.durable_journal_ack);
+                    let may_have_deferred_materialization =
+                        command.durable_replication.is_some() || command.authority_probe.is_some();
                     let materialize_shard_id = command.batch.shard_id.clone();
                     let context = authoritative_metadata_replica_shard_context(
                         host.as_deref(),
@@ -871,7 +993,7 @@ impl Service for DfsService {
                     ctx.respond_value(DFS_METADATA_JOURNAL_BATCH_ROUTE, response)?;
                 }
                 DFS_METADATA_SNAPSHOT_INSTALL_ROUTE => {
-                    let command: DfsMetadataSnapshotInstallCommand =
+                    let mut command: DfsMetadataSnapshotInstallCommand =
                         ctx.decode_request_body(&request).await?;
                     let authenticated_source_node_id = authenticated_dfs_cluster_source_node_id(
                         &ctx,
@@ -887,7 +1009,7 @@ impl Service for DfsService {
                                     "authenticated metadata snapshot caller {authenticated_source_node_id} does not match claimed source {}",
                                     command.source_node_id
                                 ),
-                                code: None,
+                                code: crate::DfsMetadataRejectionCode::Other,
                             },
                         };
                         ctx.respond_value(DFS_METADATA_SNAPSHOT_INSTALL_ROUTE, response)?;
@@ -905,6 +1027,12 @@ impl Service for DfsService {
                         command.primary_handoff_id.clone(),
                     )
                     .await?;
+                    if !ctx.has_request_attachment() {
+                        return Err(ServiceError::Service(
+                            "snapshot install requires a native image attachment".into(),
+                        ));
+                    }
+                    let body = ctx.take_request_body();
                     if let Some(host) = host {
                         let response = host
                             .install_metadata_snapshot(
@@ -912,6 +1040,7 @@ impl Service for DfsService {
                                 authenticated_source_node_id,
                                 command,
                                 context,
+                                body,
                             )
                             .await
                             .map_err(service_error)?;
@@ -919,23 +1048,10 @@ impl Service for DfsService {
                         operation_metrics.succeed();
                         return Ok(ServiceDisposition::Continue);
                     }
-                    let data_dir = Arc::clone(&ctx.data_dir);
-                    let response = tokio::task::spawn_blocking(move || {
-                        crate::metadata_replication::process_cluster_dfs_metadata_snapshot_install_with_context(
-                            &data_dir,
-                            &authenticated_source_node_id,
-                            command,
-                            context,
-                        )
-                    })
-                    .await
-                    .map_err(|source| {
-                        ServiceError::Service(format!(
-                            "DFS metadata snapshot task failed: {source}"
-                        ))
-                    })?
-                    .map_err(service_error)?;
-                    ctx.respond_value(DFS_METADATA_SNAPSHOT_INSTALL_ROUTE, response)?;
+                    return Err(ServiceError::Service(
+                        "streamed snapshot install requires its normal owned data-plane host"
+                            .into(),
+                    ));
                 }
                 DFS_INSPECTION_ROUTE => {
                     let inspection: DaemonDfsInspectionRequest =
@@ -1017,6 +1133,7 @@ impl Service for DfsDataPlaneService {
                         if matches!(
                             &head.command.routed_message.message,
                             crate::DfsNetworkMessage::StageBlob(_)
+                                | crate::DfsNetworkMessage::MetadataSnapshotInstall(_)
                                 | crate::DfsNetworkMessage::StageRetainedBlob(_)
                                 | crate::DfsNetworkMessage::RepairRetainedBlob(_)
                                 | crate::DfsNetworkMessage::DistributedWriteRequest(_)
@@ -1234,71 +1351,6 @@ async fn authoritative_metadata_replica_shard_context(
     Ok(Some(context))
 }
 
-#[cfg(test)]
-fn metadata_replica_context_can_skip_authoritative_read(
-    context: Option<&DfsMetadataReplicaShardContext>,
-    file_system_id: &DfsFileSystemId,
-    shard_id: &DfsMetadataShardId,
-    source_node_id: &NodeId,
-    authority_epoch: Option<u64>,
-    primary_handoff_id: Option<&str>,
-) -> bool {
-    primary_handoff_id.is_none()
-        && context.is_some_and(|context| {
-            metadata_replica_context_matches_authority(
-                context,
-                file_system_id,
-                shard_id,
-                source_node_id,
-                authority_epoch,
-                None,
-            ) && metadata_replica_context_has_local_ingest_membership(context)
-        })
-}
-
-#[cfg(test)]
-fn metadata_replica_context_has_local_ingest_membership(
-    context: &DfsMetadataReplicaShardContext,
-) -> bool {
-    context
-        .shard
-        .replica_node_ids
-        .contains(&context.local_node_id)
-        || context
-            .pending_membership_handoff
-            .as_ref()
-            .is_some_and(|handoff| {
-                handoff.retiring_shard == context.shard
-                    && handoff.desired_shard.file_system_id == context.shard.file_system_id
-                    && handoff.desired_shard.shard_id == context.shard.shard_id
-                    && handoff.desired_shard.epoch == context.shard.epoch.saturating_add(1)
-                    && std::iter::once(&handoff.desired_shard.primary_node_id)
-                        .chain(handoff.desired_shard.replica_node_ids.iter())
-                        .any(|node_id| node_id == &context.local_node_id)
-            })
-}
-
-#[cfg(test)]
-fn metadata_replica_context_matches_authority(
-    context: &DfsMetadataReplicaShardContext,
-    file_system_id: &DfsFileSystemId,
-    shard_id: &DfsMetadataShardId,
-    source_node_id: &NodeId,
-    authority_epoch: Option<u64>,
-    primary_handoff_id: Option<&str>,
-) -> bool {
-    context.shard.file_system_id == *file_system_id
-        && context.shard.shard_id == shard_id.0
-        && context.shard.primary_node_id == *source_node_id
-        && authority_epoch == Some(context.shard.epoch)
-        && primary_handoff_id.is_none_or(|handoff_id| {
-            context
-                .pending_membership_handoff
-                .as_ref()
-                .is_some_and(|handoff| handoff.handoff_id == handoff_id)
-        })
-}
-
 fn authenticated_dfs_cluster_source_node_id(
     ctx: &ServiceContext,
     route: &str,
@@ -1318,7 +1370,7 @@ fn authenticated_dfs_cluster_source_node_id(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DFS_OBJECT_RPC_ROUTES, DFS_RPC_CATEGORY};
+    use crate::{DFS_OBJECT_RPC_ROUTES, DFS_RPC_CATEGORY, DfsMetadataJournalFrameBatch};
     use crate::{
         DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsFileSystem, DfsMetadataBackend,
         DfsMetadataJournalBatch, DfsMetadataJournalBatchResponse,
@@ -1396,234 +1448,27 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
-    struct StubDfsDataPlaneHost {
-        status_calls: Mutex<usize>,
-        smoke_calls: Mutex<usize>,
-        inspection_calls: Mutex<usize>,
-        journal_request_ids: Mutex<Vec<String>>,
-        journal_contexts: Mutex<Vec<DfsMetadataReplicaShardContext>>,
-        snapshot_request_ids: Mutex<Vec<String>>,
-        snapshot_contexts: Mutex<Vec<DfsMetadataReplicaShardContext>>,
-        message_request_ids: Mutex<Vec<String>>,
-        message_traceparents: Mutex<Vec<Option<String>>>,
-        shared_content_store: Mutex<Option<Arc<LocalContentStore>>>,
-        retained_metadata_replica_context: Mutex<Option<DfsMetadataReplicaShardContext>>,
-    }
-
-    impl DfsDataPlaneHost for StubDfsDataPlaneHost {
-        fn status<'a>(&'a self) -> DfsDataPlaneHostFuture<'a, DfsOperatorStatus> {
-            Box::pin(async move {
-                *self.status_calls.lock().expect("status calls") += 1;
-                Ok(DfsOperatorStatus {
-                    storage_migrations: Vec::new(),
-                    incomplete_reasons: Vec::new(),
-                    bounded_omissions: Vec::new(),
-                    file_system_count: 0,
-                    object_count: 0,
-                    version_count: 0,
-                    receipt_count: 0,
-                    intent_count: 0,
-                    pending_write_count: 0,
-                    open_conflict_count: 0,
-                    pending_repair_count: 0,
-                    repair_attempt_count: 0,
-                    pending_namespace_job_count: 0,
-                    failed_namespace_job_count: 0,
-                    cross_shard_namespace_lock_count: Some(0),
-                    metadata_shards: Vec::new(),
-                    repair_attempts: Vec::new(),
-                })
-            })
-        }
-
-        fn shared_content_store(
-            &self,
-            _data_dir: &SinomoDataDir,
-        ) -> Result<Option<Arc<LocalContentStore>>, DfsDataPlaneHostError> {
-            Ok(self
-                .shared_content_store
-                .lock()
-                .expect("shared content store")
-                .clone())
-        }
-
-        fn retained_metadata_replica_shard_context<'a>(
-            &'a self,
-            _data_dir: Arc<SinomoDataDir>,
-            _file_system_id: DfsFileSystemId,
-            _shard_id: DfsMetadataShardId,
-        ) -> Option<DfsDataPlaneHostFuture<'a, Option<DfsMetadataReplicaShardContext>>> {
-            let context = self
-                .retained_metadata_replica_context
-                .lock()
-                .expect("retained metadata replica context")
-                .clone();
-            Some(Box::pin(async move { Ok(context) }))
-        }
-
-        fn run_smoke<'a>(&'a self) -> DfsDataPlaneHostFuture<'a, DfsSmokeReport> {
-            Box::pin(async move {
-                *self.smoke_calls.lock().expect("smoke calls") += 1;
-                let local = sinomo_core::node::NodeId::from_legacy_named(
-                    "node_dfs_service_data_plane_local",
-                )
-                .expect("local node");
-                Ok(DfsSmokeReport {
-                    path: "/services/dfs-smoke/service-route.txt".to_string(),
-                    file_system_id: sifs_file_system_id(),
-                    object_id: DfsObjectId::from_legacy_named("obj_dfs_service_data_plane")
-                        .expect("object"),
-                    version: DfsVersion::from_legacy_named("version_dfs_service_data_plane")
-                        .expect("version"),
-                    content_hash: Some("hash".to_string()),
-                    size_bytes: Some(4),
-                    requested_replica_node_ids: vec![local.clone()],
-                    committed_replica_node_ids: vec![local.clone()],
-                    pending_repair_count: 0,
-                    metadata_replication: DfsMetadataJournalReplicationReport {
-                        outcomes: Vec::new(),
-                    },
-                    attempts: vec![DfsSmokeAttempt {
-                        replica_node_ids: vec![local],
-                        path: "/services/dfs-smoke/service-route.txt".to_string(),
-                        committed: true,
-                        detail: "ok".to_string(),
-                    }],
-                })
-            })
-        }
-
-        fn inspect<'a>(
-            &'a self,
-            data_dir: Arc<SinomoDataDir>,
-            request: DaemonDfsInspectionRequest,
-        ) -> DfsDataPlaneHostFuture<'a, DaemonDfsInspectionResponse> {
-            Box::pin(async move {
-                *self.inspection_calls.lock().expect("inspection calls") += 1;
-                dfs_inspection(data_dir.as_ref(), request)
-                    .map_err(|error| DfsDataPlaneHostError::new(error.to_string()))
-            })
-        }
-
-        fn apply_metadata_journal_batch<'a>(
-            &'a self,
-            _data_dir: Arc<SinomoDataDir>,
-            authenticated_source_node_id: NodeId,
-            command: DfsMetadataJournalBatchCommand,
-            context: Option<DfsMetadataReplicaShardContext>,
-        ) -> DfsDataPlaneHostFuture<'a, DfsMetadataJournalBatchResponse> {
-            Box::pin(async move {
-                let valid_context = context.as_ref().is_some_and(|context| {
-                    command.source_node_id.as_ref() == Some(&authenticated_source_node_id)
-                        && command.file_system_id.as_ref() == Some(&context.shard.file_system_id)
-                        && command.batch.shard_id.0 == context.shard.shard_id
-                        && command.authority_epoch == Some(context.shard.epoch)
-                        && context.shard.primary_node_id == authenticated_source_node_id
-                        && metadata_replica_context_has_local_ingest_membership(context)
-                });
-                if !valid_context {
-                    return Ok(DfsMetadataJournalBatchResponse {
-                        request_id: command.request_id,
-                        shard_id: command.batch.shard_id,
-                        next_after_sequence: command.batch.next_after_sequence,
-                        applied_entries: 0,
-                        verified_prefix_only: false,
-                        verified_authority_probe_id: None,
-                        result: crate::DfsMetadataJournalBatchResult::Rejected {
-                            reason: "missing or stale hosted replica context".to_string(),
-                            code: None,
-                        },
-                    });
-                }
-                self.journal_request_ids
-                    .lock()
-                    .expect("journal request ids")
-                    .push(command.request_id.clone());
-                self.journal_contexts
-                    .lock()
-                    .expect("journal contexts")
-                    .push(context.expect("validated journal context"));
-                Ok(DfsMetadataJournalBatchResponse {
-                    request_id: command.request_id,
-                    shard_id: command.batch.shard_id,
-                    next_after_sequence: command.batch.next_after_sequence,
-                    applied_entries: command.batch.entries.len(),
-                    verified_prefix_only: command.verify_prefix_only,
-                    verified_authority_probe_id: None,
-                    result: crate::DfsMetadataJournalBatchResult::Applied,
-                })
-            })
-        }
-
-        fn install_metadata_snapshot<'a>(
-            &'a self,
-            _data_dir: Arc<SinomoDataDir>,
-            authenticated_source_node_id: NodeId,
-            command: DfsMetadataSnapshotInstallCommand,
-            context: Option<DfsMetadataReplicaShardContext>,
-        ) -> DfsDataPlaneHostFuture<'a, DfsMetadataSnapshotInstallResponse> {
-            Box::pin(async move {
-                let valid_context = context.as_ref().is_some_and(|context| {
-                    command.source_node_id == authenticated_source_node_id
-                        && command.file_system_id.as_ref() == Some(&context.shard.file_system_id)
-                        && command.shard_id.0 == context.shard.shard_id
-                        && command.authority_epoch == Some(context.shard.epoch)
-                        && context.shard.primary_node_id == authenticated_source_node_id
-                        && metadata_replica_context_has_local_ingest_membership(context)
-                });
-                if !valid_context {
-                    return Ok(DfsMetadataSnapshotInstallResponse {
-                        request_id: command.request_id,
-                        shard_id: command.shard_id,
-                        next_after_sequence: command.next_after_sequence,
-                        result: DfsMetadataSnapshotInstallResult::Rejected {
-                            reason: "missing or stale hosted replica context".to_string(),
-                            code: None,
-                        },
-                    });
-                }
-                self.snapshot_request_ids
-                    .lock()
-                    .expect("snapshot request ids")
-                    .push(command.request_id.clone());
-                self.snapshot_contexts
-                    .lock()
-                    .expect("snapshot contexts")
-                    .push(context.expect("validated snapshot context"));
-                Ok(DfsMetadataSnapshotInstallResponse {
-                    request_id: command.request_id,
-                    shard_id: command.shard_id,
-                    next_after_sequence: command.next_after_sequence,
-                    result: DfsMetadataSnapshotInstallResult::Installed {
-                        archived_existing: false,
-                    },
-                })
-            })
-        }
-
-        fn handle_message<'a>(
-            &'a self,
-            command: DfsMessageCommand,
-            _attachment: Option<DfsInboundAttachment>,
-            traceparent: Option<String>,
-            _encoded_value_bytes: Option<u64>,
-        ) -> DfsDataPlaneHostFuture<'a, DfsDataPlaneResponse> {
-            Box::pin(async move {
-                self.message_request_ids
-                    .lock()
-                    .expect("message request ids")
-                    .push(command.request_id.clone());
-                self.message_traceparents
-                    .lock()
-                    .expect("message traceparents")
-                    .push(traceparent);
-                Ok(DfsDataPlaneResponse::value(DfsMessageResponse {
-                    request_id: command.request_id,
-                    outbound_messages: Vec::new(),
-                }))
-            })
-        }
+    fn native_surface_fixture(
+        name: &str,
+    ) -> (
+        crate::test_support::DfsTestRuntime,
+        NodeId,
+        Arc<SinomoDataDir>,
+        Arc<crate::runtime_host::DaemonDfsDataPlaneHost>,
+    ) {
+        let node = NodeId::from_legacy_named(name).expect("native surface node");
+        let mut runtime = crate::test_support::DfsTestRuntime::new(name, node.clone())
+            .expect("shared native runtime");
+        runtime.start_nodes().expect("normal embedded lifecycle");
+        let data_dir = Arc::new(runtime.data_dir(&node).clone());
+        let host = Arc::new(crate::runtime_host::DaemonDfsDataPlaneHost::new_on_runtime(
+            crate::runtime_host::DfsRuntimePaths::for_host_role(
+                &data_dir,
+                sinomo_module::ComponentHostRole::Embedded,
+            ),
+            &runtime.runtime_handle(),
+        ));
+        (runtime, node, data_dir, host)
     }
 
     fn temp_data_dir() -> (sinomo_testdir::TestDir, Arc<SinomoDataDir>) {
@@ -1632,20 +1477,20 @@ mod tests {
         (root, data_dir)
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn metric_export_never_cold_opens_metadata_when_resident_status_is_unavailable() {
-        let (_root, data_dir) = temp_data_dir();
-        let mut backend = LocalSobjMetadataBackend::new(
-            DfsMetadataShardId::new("root"),
-            crate::default_dfs_metadata_root(&data_dir),
+        let (mut runtime, service, _) = crate::test_support::current_native_metadata_service(
+            "native-metric-cold-owner",
+            1,
+            "/services",
         )
         .unwrap();
-        backend
-            .put_file_system(&DfsFileSystem::sifs(
-                NodeId::from_legacy_named("metrics_cold_node").unwrap(),
-            ))
-            .unwrap();
-        drop(backend);
+        let node = service.node_id().clone();
+        let data_dir = Arc::new(runtime.data_dir(&node).clone());
+        drop(service);
+        runtime
+            .stop_node(&node)
+            .expect("actual owner stopped before cold metric request");
         for prefix in [None, Some("sinomo.dfs.background")] {
             crate::metadata_backend::reset_metadata_backend_open_calls();
             let request = ObjectRpcRequest::encode_body(
@@ -1668,127 +1513,81 @@ mod tests {
             assert_eq!(
                 result.is_ok(),
                 prefix.is_some(),
-                "unavailable status must remain unavailable"
+                "unavailable resident status stays unavailable"
             );
             assert_eq!(crate::metadata_backend::metadata_backend_open_calls(), 0);
         }
+        runtime.close().unwrap();
     }
 
     #[test]
     fn component_factory_owns_complete_dfs_runtime_surface() {
         use sinomo_module::ComponentFactory as _;
-
-        for host_role in [
-            sinomo_module::ComponentHostRole::Main,
-            sinomo_module::ComponentHostRole::Embedded,
-            sinomo_module::ComponentHostRole::Shadow,
+        let (mut runtime, node, data_dir, _host) =
+            native_surface_fixture("native-component-surface");
+        let registry = runtime
+            .service_registry(&node)
+            .expect("normal mounted registry");
+        let factory = component_factory().expect("DFS component descriptor");
+        let content_root = data_dir.dfs_dir().join("content");
+        assert!(content_root.join("inline-bindings/current.sobj").is_file());
+        let content = crate::LocalContentStore::open_for_inspection(&content_root);
+        assert_eq!(
+            content
+                .stats()
+                .expect("actual active projection")
+                .manifest_count,
+            0
+        );
+        drop(content);
+        let browser_route = registry
+            .route(crate::DAEMON_DFS_BROWSER_STATUS_ROUTE)
+            .expect("normal mounted browser route");
+        let discovery = browser_route
+            .discovery
+            .expect("normal component discovery identity");
+        assert_eq!(discovery.service_id, crate::SIFS_PATH_ACCESS_CAPABILITY);
+        assert_eq!(discovery.interface_id, "sinomo.sifs.path-access");
+        assert_eq!(
+            discovery.provider_capabilities,
+            [crate::SIFS_PATH_ACCESS_CAPABILITY]
+        );
+        for route in [
+            crate::DFS_STATUS_ROUTE,
+            crate::DFS_DATA_READ_ROUTE,
+            crate::DAEMON_DFS_BROWSER_STATUS_ROUTE,
+            crate::DFS_CORE_COMPONENT_ACCESS_ROUTE,
+            crate::DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE,
+            DFS_METRIC_EXPORT_ROUTE,
         ] {
-            let (_root, data_dir) = temp_data_dir();
-            data_dir.ensure_root_layout().expect("data layout");
-            let cluster_paths = ClusterPaths::new(data_dir.as_ref());
-            let state = sinomo_core::ClusterBootstrapState::initialized_locally(
-                sinomo_core::node::ClusterId::from_legacy_named("cluster_dfs_component_factory")
-                    .expect("cluster id"),
-                "DFS component factory",
-                NodeId::from_legacy_named("node_dfs_component_factory").expect("node id"),
-                "DFS component node",
-                "dfs-component-public-key",
-                OffsetDateTime::now_utc(),
-            );
-            sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)
-                .expect("cluster state");
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .enable_all()
-                .build()
-                .expect("runtime");
-            let cluster: Arc<dyn ClusterAccess> = Arc::new(ExactSetMetadataAuthority::new(
-                KvRevision::default(),
-                BTreeMap::new(),
-                None,
-            ));
-            let context = sinomo_module::ComponentContext::new(Arc::clone(&data_dir))
-                .with_host_role(host_role)
-                .with_runtime(runtime.handle().clone())
-                .with_cluster_access(cluster)
-                .with_object_rpc_transport(Arc::new(UnavailableComponentObjectRpc))
-                .with_event_bus(sinomo_module::ComponentEventBus::default());
-            let factory = component_factory().expect("DFS component factory");
-            let scope = factory.mount(&context).expect("mount DFS component");
-
-            let content_root = data_dir.dfs_dir().join("content");
-            if host_role == sinomo_module::ComponentHostRole::Shadow {
-                assert!(!content_root.join("inline-bindings").exists());
-                assert!(!scope.services().owns(crate::DFS_DATA_READ_ROUTE));
-                drop(scope);
-                runtime.shutdown_timeout(Duration::from_secs(1));
-                continue;
-            }
-            assert!(content_root.join("inline-bindings/current.sobj").is_file());
-            let content = crate::LocalContentStore::open_for_inspection(&content_root);
-            assert_eq!(
-                content
-                    .stats()
-                    .expect("active content projection")
-                    .manifest_count,
-                0
-            );
-            drop(content);
-
-            let browser_route = scope
-                .services()
-                .route(crate::DAEMON_DFS_BROWSER_STATUS_ROUTE)
-                .expect("DFS browser status route");
-            let browser_route = sinomo_module::service_route_with_component_identity(
-                browser_route,
-                factory.descriptor(),
-            );
-            let discovery = browser_route
-                .discovery
-                .expect("path-access discovery identity");
-            assert_eq!(discovery.service_id, crate::SIFS_PATH_ACCESS_CAPABILITY);
-            assert_eq!(discovery.interface_id, "sinomo.sifs.path-access");
-            assert_eq!(
-                discovery.provider_capabilities,
-                [crate::SIFS_PATH_ACCESS_CAPABILITY]
-            );
-
-            for route in [
-                crate::DFS_STATUS_ROUTE,
-                crate::DFS_DATA_READ_ROUTE,
-                crate::DAEMON_DFS_BROWSER_STATUS_ROUTE,
-                crate::DFS_CORE_COMPONENT_ACCESS_ROUTE,
-                crate::DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE,
-                DFS_METRIC_EXPORT_ROUTE,
-            ] {
-                assert!(
-                    scope.services().owns(route),
-                    "missing DFS-owned route {route}"
-                );
-            }
-            for route in [
-                crate::DFS_ATTACHMENT_ROUTE,
-                crate::DAEMON_DFS_BROWSER_FILE_HISTORY_PIN_ROUTE,
-                crate::DAEMON_DFS_BROWSER_FILE_HISTORY_LIST_ROUTE,
-                crate::DAEMON_DFS_BROWSER_FILE_HISTORY_READ_ROUTE,
-                crate::DAEMON_DFS_BROWSER_FILE_HISTORY_RESTORE_ROUTE,
-                crate::DAEMON_DFS_BROWSER_FILE_HISTORY_POLICY_ROUTE,
-                crate::DAEMON_DFS_BROWSER_FILE_HISTORY_POLICY_UPDATE_ROUTE,
-            ] {
-                assert!(
-                    !scope.services().owns(route),
-                    "feature route remains core-owned: {route}"
-                );
-            }
-            assert_eq!(factory.descriptor().event_publications.len(), 2);
-            assert_eq!(factory.descriptor().event_subscriptions.len(), 2);
-            drop(scope);
-            runtime.shutdown_timeout(Duration::from_secs(1));
-
-            let paths = crate::runtime_host::DfsRuntimePaths::new(data_dir.as_ref());
-            crate::runtime_host::DfsDataOwnerLock::acquire(&paths)
-                .expect("component drop releases DFS data ownership");
+            assert!(registry.owns(route), "missing actual core route {route}");
         }
+        for route in [
+            crate::DFS_ATTACHMENT_ROUTE,
+            crate::DAEMON_DFS_BROWSER_FILE_HISTORY_PIN_ROUTE,
+            crate::DAEMON_DFS_BROWSER_FILE_HISTORY_LIST_ROUTE,
+            crate::DAEMON_DFS_BROWSER_FILE_HISTORY_READ_ROUTE,
+            crate::DAEMON_DFS_BROWSER_FILE_HISTORY_RESTORE_ROUTE,
+            crate::DAEMON_DFS_BROWSER_FILE_HISTORY_POLICY_ROUTE,
+            crate::DAEMON_DFS_BROWSER_FILE_HISTORY_POLICY_UPDATE_ROUTE,
+        ] {
+            assert!(
+                !registry.owns(route),
+                "feature route remains core-owned {route}"
+            );
+        }
+        assert_eq!(factory.descriptor().event_publications.len(), 2);
+        assert_eq!(factory.descriptor().event_subscriptions.len(), 2);
+        drop(registry);
+        runtime
+            .stop_node(&node)
+            .expect("normal component lifecycle stopped");
+        let owner = crate::runtime_host::DfsDataOwnerLock::acquire(
+            &crate::runtime_host::DfsRuntimePaths::new(&data_dir),
+        )
+        .expect("same retained volume OS lease released");
+        drop(owner);
+        runtime.close().expect("drain shared runtime");
     }
 
     #[test]
@@ -1807,156 +1606,6 @@ mod tests {
             let scope = factory.mount(&context).unwrap();
             assert!(!data_dir.dfs_dir().join("content/inline-bindings").exists());
             drop(scope);
-        }
-    }
-
-    struct ExactSetMetadataAuthorityState {
-        revision: KvRevision,
-        entries: BTreeMap<String, KvEntry>,
-        pending_handoff_mutation: Option<(KvRevision, KvEntry)>,
-    }
-
-    struct ExactSetMetadataAuthority {
-        state: Mutex<ExactSetMetadataAuthorityState>,
-        authoritative_point_calls: AtomicUsize,
-        authoritative_exact_set_calls: AtomicUsize,
-        requested_exact_sets: Mutex<Vec<Vec<String>>>,
-        returned_proof_revisions: Mutex<Vec<KvRevision>>,
-    }
-
-    impl ExactSetMetadataAuthority {
-        fn new(
-            revision: KvRevision,
-            entries: BTreeMap<String, KvEntry>,
-            pending_handoff_mutation: Option<(KvRevision, KvEntry)>,
-        ) -> Self {
-            Self {
-                state: Mutex::new(ExactSetMetadataAuthorityState {
-                    revision,
-                    entries,
-                    pending_handoff_mutation,
-                }),
-                authoritative_point_calls: AtomicUsize::new(0),
-                authoritative_exact_set_calls: AtomicUsize::new(0),
-                requested_exact_sets: Mutex::new(Vec::new()),
-                returned_proof_revisions: Mutex::new(Vec::new()),
-            }
-        }
-    }
-
-    impl ClusterAccess for ExactSetMetadataAuthority {
-        fn kv_get_local(&self, _key: &str) -> Result<KvLocalRead<Option<KvEntry>>, ServiceError> {
-            Err(ServiceError::Service(
-                "unexpected local KV point read in exact-set metadata authority test".to_string(),
-            ))
-        }
-
-        fn kv_range_prefix_local(
-            &self,
-            _prefix: &str,
-        ) -> Result<KvLocalRead<Vec<KvEntry>>, ServiceError> {
-            Err(ServiceError::Service(
-                "unexpected local KV prefix read in exact-set metadata authority test".to_string(),
-            ))
-        }
-
-        fn kv_get_authoritative_async<'a>(
-            &'a self,
-            _key: &'a str,
-        ) -> Pin<
-            Box<
-                dyn Future<Output = Result<KvAuthoritativeRead<Option<KvEntry>>, ServiceError>>
-                    + Send
-                    + 'a,
-            >,
-        > {
-            self.authoritative_point_calls
-                .fetch_add(1, Ordering::SeqCst);
-            Box::pin(async move {
-                Err(ServiceError::Service(
-                    "metadata replica authority must not use sequential point reads".to_string(),
-                ))
-            })
-        }
-
-        fn kv_get_authoritative_exact_set_async<'a>(
-            &'a self,
-            keys: Vec<String>,
-        ) -> Pin<
-            Box<
-                dyn Future<Output = Result<KvAuthoritativeRead<Vec<Option<KvEntry>>>, ServiceError>>
-                    + Send
-                    + 'a,
-            >,
-        > {
-            self.authoritative_exact_set_calls
-                .fetch_add(1, Ordering::SeqCst);
-            self.requested_exact_sets
-                .lock()
-                .expect("requested exact sets")
-                .push(keys.clone());
-            Box::pin(async move {
-                let read = {
-                    let mut state = self.state.lock().expect("exact-set authority state");
-                    let revision = state.revision;
-                    let value = keys
-                        .iter()
-                        .map(|key| state.entries.get(key).cloned())
-                        .collect();
-                    // Linearize the exact set first, then deterministically
-                    // change the live handoff before returning. A sequential
-                    // shard/handoff read would be able to straddle this hook;
-                    // one exact-set proof cannot.
-                    if let Some((next_revision, entry)) = state.pending_handoff_mutation.take() {
-                        state.revision = next_revision;
-                        state.entries.insert(entry.key.clone(), entry);
-                    }
-                    KvAuthoritativeRead {
-                        value,
-                        authority: KvAuthorityProof {
-                            term: 9,
-                            commit_index: revision.0,
-                            revision,
-                            basis: KvAuthorityBasis::CurrentTermQuorum {
-                                voter_acks: 2,
-                                required_quorum: 2,
-                            },
-                        },
-                    }
-                };
-                self.returned_proof_revisions
-                    .lock()
-                    .expect("returned proof revisions")
-                    .push(read.authority.revision);
-                Ok(read)
-            })
-        }
-
-        fn kv_commit_async<'a>(
-            &'a self,
-            _request: KvTxnRequest,
-        ) -> Pin<Box<dyn Future<Output = Result<ClusterKvTxnCommitResult, ServiceError>> + Send + 'a>>
-        {
-            Box::pin(async move {
-                Err(ServiceError::Service(
-                    "unexpected KV commit in exact-set metadata authority test".to_string(),
-                ))
-            })
-        }
-    }
-
-    fn exact_set_metadata_entry<T: serde::Serialize>(
-        key: String,
-        value: &T,
-        revision: KvRevision,
-    ) -> KvEntry {
-        KvEntry {
-            key,
-            value: sinomo_core::kv::encode_kv_value(value).expect("encode exact-set value"),
-            create_revision: revision,
-            modify_revision: revision,
-            version: KvVersion(1),
-            lease_id: None,
         }
     }
 
@@ -1992,7 +1641,7 @@ mod tests {
             replica_node_ids: vec![local_node_id.clone()],
             epoch: 7,
             assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
+
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         sinomo_core::cluster::append_cluster_raft_command(
@@ -2027,303 +1676,63 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn metadata_replica_authority_exact_set_linearizes_handoff_mutation() {
-        let (_root, data_dir) = temp_data_dir();
-        let cluster_paths = ClusterPaths::new(data_dir.as_ref());
-        let local_node_id =
-            NodeId::from_legacy_named("node_dfs_exact_set_local").expect("local node");
-        let primary_node_id =
-            NodeId::from_legacy_named("node_dfs_exact_set_primary").expect("primary node");
-        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
-            sinomo_core::node::ClusterId::from_legacy_named("cluster_dfs_exact_set")
-                .expect("cluster"),
-            "DFS exact-set metadata authority",
-            local_node_id.clone(),
-            "local",
-            "pk-local",
-            OffsetDateTime::now_utc(),
-        );
-        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)
-            .expect("write cluster state");
-        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
-            .expect("write local cluster KV state");
-
-        let file_system_id = sifs_file_system_id();
-        let shard_id = DfsMetadataShardId::new("root");
-        let retiring_shard = DfsMetadataShardConfig {
-            file_system_id: file_system_id.clone(),
-            shard_id: shard_id.0.clone(),
-            primary_node_id: primary_node_id.clone(),
-            replica_node_ids: vec![local_node_id.clone()],
-            epoch: 41,
-            assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
-            default_policy: DfsObjectPolicy::ReplicatedEventual,
-        };
-        let desired_shard = DfsMetadataShardConfig {
-            primary_node_id: local_node_id.clone(),
-            replica_node_ids: vec![primary_node_id.clone()],
-            epoch: retiring_shard.epoch + 1,
-            ..retiring_shard.clone()
-        };
-        let old_handoff = DfsMetadataShardMembershipHandoff {
-            handoff_id: "handoff-exact-set-old".to_string(),
-            retiring_shard: retiring_shard.clone(),
-            desired_shard: desired_shard.clone(),
-            required_prepared_sequence: 0,
-            required_head_watermark: None,
-            retiring_primary_fence: None,
-        };
-        let new_handoff = DfsMetadataShardMembershipHandoff {
-            handoff_id: "handoff-exact-set-new".to_string(),
-            ..old_handoff.clone()
-        };
-        let shard_key = metadata_shard_key(&file_system_id, &shard_id.0);
-        let handoff_key = metadata_shard_membership_handoff_key(&file_system_id, &shard_id.0);
-        let old_revision = KvRevision(17);
-        let new_revision = KvRevision(18);
-        let mut entries = BTreeMap::new();
-        entries.insert(
-            shard_key.clone(),
-            exact_set_metadata_entry(shard_key.clone(), &retiring_shard, old_revision),
-        );
-        entries.insert(
-            handoff_key.clone(),
-            exact_set_metadata_entry(handoff_key.clone(), &old_handoff, old_revision),
-        );
-        let authority = Arc::new(ExactSetMetadataAuthority::new(
-            old_revision,
-            entries,
-            Some((
-                new_revision,
-                exact_set_metadata_entry(handoff_key.clone(), &new_handoff, new_revision),
-            )),
-        ));
-        let cluster: Arc<dyn ClusterAccess> = authority.clone();
-
+        let nodes = crate::test_support::DfsTestRuntime::ordered_node_ids("native-exact-cut", 3);
+        let mut runtime =
+            crate::test_support::DfsTestRuntime::new("native-exact-cut", nodes[0].clone()).unwrap();
+        for node in &nodes[1..] {
+            runtime.define_node(node.clone()).unwrap();
+        }
+        runtime.start_nodes().expect("normal native startup");
+        let data_dir = Arc::new(runtime.data_dir(&nodes[1]).clone());
+        let host = crate::runtime_host::registered_dfs_runtime_host(&data_dir)
+            .unwrap()
+            .expect("actual registered host");
+        let old = runtime.root_shard().expect("actual initial assignment");
+        let cluster = Arc::clone(&host.cluster);
         let old_context = authoritative_metadata_replica_shard_context(
             None,
             Some(Arc::clone(&cluster)),
             Arc::clone(&data_dir),
-            Some(file_system_id.clone()),
-            shard_id.clone(),
-            primary_node_id.clone(),
-            Some(retiring_shard.epoch),
-            Some(old_handoff.handoff_id.clone()),
+            Some(old.file_system_id.clone()),
+            DfsMetadataShardId::new(&old.shard_id),
+            old.primary_node_id.clone(),
+            Some(old.epoch),
+            None,
         )
         .await
-        .expect("old exact-set authority context")
-        .expect("old context");
-        assert_eq!(old_context.shard, retiring_shard);
-        assert_eq!(
-            old_context.pending_membership_handoff,
-            Some(old_handoff.clone()),
-            "the first proof must contain the pre-mutation pair, even though the handoff changed before the RPC returned"
-        );
-        assert!(metadata_replica_context_matches_authority(
-            &old_context,
-            &file_system_id,
-            &shard_id,
-            &primary_node_id,
-            Some(retiring_shard.epoch),
-            Some(&old_handoff.handoff_id),
-        ));
-        assert_eq!(
-            authority
-                .authoritative_exact_set_calls
-                .load(Ordering::SeqCst),
-            1,
-            "one replica validation must establish exactly one authority proof"
-        );
-        assert_eq!(
-            authority.authoritative_point_calls.load(Ordering::SeqCst),
-            0,
-            "replica validation must not issue independently linearized point reads"
-        );
-        assert_eq!(
-            authority
-                .requested_exact_sets
-                .lock()
-                .expect("requested exact sets")
-                .as_slice(),
-            &[vec![shard_key, handoff_key]],
-        );
-        assert_eq!(
-            authority
-                .returned_proof_revisions
-                .lock()
-                .expect("proof revisions")
-                .as_slice(),
-            &[old_revision],
-        );
-
+        .unwrap()
+        .expect("actual pre-handoff cut");
+        assert_eq!(old_context.shard, old);
+        assert!(old_context.pending_membership_handoff.is_none());
+        let installed = runtime
+            .reassign_metadata_shard(
+                &old.file_system_id,
+                &old.shard_id,
+                nodes[1].clone(),
+                vec![nodes[0].clone(), nodes[2].clone()],
+            )
+            .expect("normal freeze/joint acknowledgement/activation");
         let new_context = authoritative_metadata_replica_shard_context(
             None,
             Some(cluster),
             data_dir,
-            Some(file_system_id.clone()),
-            shard_id.clone(),
-            primary_node_id.clone(),
-            Some(retiring_shard.epoch),
-            Some(old_handoff.handoff_id.clone()),
+            Some(old.file_system_id.clone()),
+            DfsMetadataShardId::new(&old.shard_id),
+            old.primary_node_id.clone(),
+            Some(old.epoch),
+            None,
         )
         .await
-        .expect("new exact-set authority context")
-        .expect("new context");
-        assert_eq!(
-            new_context.pending_membership_handoff,
-            Some(new_handoff),
-            "a later proof observes the complete post-mutation revision"
-        );
-        assert!(!metadata_replica_context_matches_authority(
-            &new_context,
-            &file_system_id,
-            &shard_id,
-            &primary_node_id,
-            Some(retiring_shard.epoch),
-            Some(&old_handoff.handoff_id),
-        ));
-        assert_eq!(
-            authority
-                .returned_proof_revisions
-                .lock()
-                .expect("proof revisions")
-                .as_slice(),
-            &[old_revision, new_revision],
-            "no context may combine values from the two revisions"
-        );
-    }
-
-    #[test]
-    fn metadata_replica_local_context_fast_path_requires_exact_authority() {
-        let file_system_id =
-            DfsFileSystemId::from_legacy_named("filesystem_dfs_service_replica_fast_path")
-                .expect("filesystem id");
-        let shard_id = DfsMetadataShardId::new("root");
-        let primary_node_id =
-            NodeId::from_legacy_named("node_dfs_service_replica_fast_path_primary")
-                .expect("primary node");
-        let local_node_id = NodeId::from_legacy_named("node_dfs_service_replica_fast_path_local")
-            .expect("local node");
-        let context = DfsMetadataReplicaShardContext {
-            local_node_id: local_node_id.clone(),
-            shard: DfsMetadataShardConfig {
-                file_system_id: file_system_id.clone(),
-                shard_id: shard_id.0.clone(),
-                primary_node_id: primary_node_id.clone(),
-                replica_node_ids: vec![local_node_id],
-                epoch: 64,
-                assignment: DfsMetadataShardAssignment::Root,
-                namespace_prepare_codec: Default::default(),
-                default_policy: DfsObjectPolicy::ReplicatedEventual,
-            },
-            pending_membership_handoff: None,
-        };
-
-        assert!(metadata_replica_context_matches_authority(
-            &context,
-            &file_system_id,
-            &shard_id,
-            &primary_node_id,
-            Some(64),
-            None,
-        ));
-        assert!(metadata_replica_context_can_skip_authoritative_read(
-            Some(&context),
-            &file_system_id,
-            &shard_id,
-            &primary_node_id,
-            Some(64),
-            None,
-        ));
-        assert!(!metadata_replica_context_matches_authority(
-            &context,
-            &file_system_id,
-            &shard_id,
-            &primary_node_id,
-            Some(63),
-            None,
-        ));
-        assert!(!metadata_replica_context_matches_authority(
-            &context,
-            &file_system_id,
-            &shard_id,
-            &NodeId::from_legacy_named("node_dfs_service_replica_fast_path_stale")
-                .expect("stale node"),
-            Some(64),
-            None,
-        ));
-        assert!(!metadata_replica_context_matches_authority(
-            &context,
-            &file_system_id,
-            &shard_id,
-            &primary_node_id,
-            Some(64),
-            Some("missing-primary-handoff"),
-        ));
-
-        let mut stale_handoff_context = context.clone();
-        stale_handoff_context.pending_membership_handoff =
-            Some(DfsMetadataShardMembershipHandoff {
-                handoff_id: "stale-primary-handoff".to_string(),
-                retiring_shard: context.shard.clone(),
-                desired_shard: DfsMetadataShardConfig {
-                    primary_node_id: context.local_node_id.clone(),
-                    replica_node_ids: vec![primary_node_id.clone()],
-                    epoch: context.shard.epoch + 1,
-                    ..context.shard.clone()
-                },
-                required_prepared_sequence: 0,
-                required_head_watermark: None,
-                retiring_primary_fence: None,
-            });
-        assert!(metadata_replica_context_matches_authority(
-            &stale_handoff_context,
-            &file_system_id,
-            &shard_id,
-            &primary_node_id,
-            Some(64),
-            Some("stale-primary-handoff"),
-        ));
-        assert!(!metadata_replica_context_can_skip_authoritative_read(
-            Some(&stale_handoff_context),
-            &file_system_id,
-            &shard_id,
-            &primary_node_id,
-            Some(64),
-            Some("stale-primary-handoff"),
-        ));
-
-        let mut desired_only_context = stale_handoff_context;
-        desired_only_context.shard.replica_node_ids.clear();
-        desired_only_context
-            .pending_membership_handoff
-            .as_mut()
-            .expect("pending handoff")
-            .retiring_shard
-            .replica_node_ids
-            .clear();
-        assert!(metadata_replica_context_has_local_ingest_membership(
-            &desired_only_context
-        ));
-        assert!(metadata_replica_context_can_skip_authoritative_read(
-            Some(&desired_only_context),
-            &file_system_id,
-            &shard_id,
-            &primary_node_id,
-            Some(64),
-            None,
-        ));
-        desired_only_context.pending_membership_handoff = None;
-        assert!(!metadata_replica_context_can_skip_authoritative_read(
-            Some(&desired_only_context),
-            &file_system_id,
-            &shard_id,
-            &primary_node_id,
-            Some(64),
-            None,
-        ));
+        .unwrap()
+        .expect("actual successor cut");
+        assert_eq!(new_context.shard, installed);
+        assert_eq!(installed.epoch, old.epoch + 1);
+        assert!(new_context.pending_membership_handoff.is_none());
+        assert_ne!(new_context.shard, old_context.shard);
+        drop(host);
+        runtime.close().expect("drain shared native owners");
     }
 
     async fn dispatch_local<B: serde::Serialize>(
@@ -2395,11 +1804,9 @@ mod tests {
 
     #[test]
     fn dfs_service_route_metadata_matches_module_surfaces() {
-        let registry = register_services_with_data_plane_host(
-            ServiceRegistry::builder(),
-            Arc::new(StubDfsDataPlaneHost::default()),
-        )
-        .build();
+        let (runtime, _node, _data_dir, host) = native_surface_fixture("native-route-metadata");
+        let registry =
+            register_services_with_data_plane_host(ServiceRegistry::builder(), host).build();
         let service_routes = registry
             .route_categories()
             .into_iter()
@@ -2469,11 +1876,12 @@ mod tests {
             ServiceBodyMode::Optional,
             "a fetch response carries the requested blob as a streamed request attachment"
         );
+        runtime.close().expect("drain shared native owner");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dfs_direct_read_service_reuses_initialized_content_store() {
-        let (_root, data_dir) = temp_data_dir();
+        let (runtime, _node, data_dir, host) = native_surface_fixture("native-direct-read-cache");
         data_dir.ensure_root_layout().expect("root layout");
         let object_id = DfsObjectId::generate();
         let version = DfsVersion::generate();
@@ -2494,7 +1902,7 @@ mod tests {
             range_offset: None,
             range_max_bytes: None,
         };
-        let service = DfsDataPlaneService::new(Arc::new(StubDfsDataPlaneHost::default()));
+        let service = DfsDataPlaneService::new(host);
         let cache_probe = service.clone();
         let registry = ServiceRegistry::builder().register(service).build();
 
@@ -2526,36 +1934,25 @@ mod tests {
             .content_store_for(&data_dir)
             .expect("second cached content store");
         assert!(Arc::ptr_eq(&first_cached, &second_cached));
+        runtime.close().expect("drain shared native owner");
     }
 
     #[test]
     fn hosted_data_plane_caches_the_host_content_store_reference() {
-        let (_root, data_dir) = temp_data_dir();
-        data_dir.ensure_root_layout().expect("root layout");
-        let shared = Arc::new(
-            LocalContentStore::new(data_dir.dfs_dir().join("content")).expect("content store"),
-        );
-        let host = Arc::new(StubDfsDataPlaneHost::default());
-        *host
-            .shared_content_store
-            .lock()
-            .expect("shared content store") = Some(Arc::clone(&shared));
-        let service = DfsDataPlaneService::new(host.clone());
-
+        let (mut runtime, node, data_dir, host) =
+            native_surface_fixture("native-host-content-cache");
+        let service = DfsDataPlaneService::new(host);
         let selected = service
             .content_store_for(&data_dir)
-            .expect("hosted content store");
-        assert!(Arc::ptr_eq(&selected, &shared));
+            .expect("actual hosted content store");
         assert_eq!(service.cached_content_store_count(), 1);
-
-        *host
-            .shared_content_store
-            .lock()
-            .expect("shared content store") = None;
+        runtime.stop_node(&node).expect("stop actual mounted host");
         let cached = service
             .content_store_for(&data_dir)
             .expect("cached hosted content store");
-        assert!(Arc::ptr_eq(&cached, &shared));
+        assert!(Arc::ptr_eq(&cached, &selected));
+        drop(service);
+        runtime.close().expect("drain native owner");
     }
 
     #[tokio::test]
@@ -2569,199 +1966,99 @@ mod tests {
         let _status: DfsOperatorStatus = response.decode_body().expect("decode status");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn hosted_dfs_status_reuses_the_process_data_plane_host() {
-        let host = Arc::new(StubDfsDataPlaneHost::default());
+        let (mut runtime, node, data_dir, host) = native_surface_fixture("native-host-status");
         let registry =
-            register_services_with_data_plane_host(ServiceRegistry::builder(), host.clone())
-                .build();
-        let (_root, data_dir) = temp_data_dir();
+            register_services_with_data_plane_host(ServiceRegistry::builder(), host).build();
         let (disposition, response) =
-            dispatch_local(&registry, data_dir, DFS_STATUS_ROUTE, &()).await;
+            dispatch_local(&registry, data_dir.clone(), DFS_STATUS_ROUTE, &()).await;
         assert_eq!(disposition, ServiceDisposition::Continue);
-        let status: DfsOperatorStatus = response.decode_body().expect("decode hosted status");
-        assert_eq!(status.object_count, 0);
-        assert_eq!(*host.status_calls.lock().expect("status calls"), 1);
-    }
-
-    #[tokio::test]
-    async fn dfs_status_route_scopes_operational_counts_to_primary_shards() {
-        let registry = register_services(ServiceRegistry::builder()).build();
-        let (_root, data_dir) = temp_data_dir();
-        let cluster_paths = ClusterPaths::new(data_dir.as_ref());
-        let now = OffsetDateTime::now_utc();
-        let local = NodeId::from_legacy_named("node_dfs_status_scope_local").expect("local");
-        let primary = NodeId::from_legacy_named("node_dfs_status_scope_primary").expect("primary");
-        let missing = NodeId::from_legacy_named("node_dfs_status_scope_missing").expect("missing");
-        let cluster_id =
-            sinomo_core::node::ClusterId::from_legacy_named("cluster_dfs_status_scope")
-                .expect("cluster");
-        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
-            cluster_id,
-            "dfs status scope",
-            local.clone(),
-            "local",
-            "pk-local",
-            now,
-        );
-        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("cluster state");
-        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
-            .expect("cluster kv state");
-
-        let file_system = DfsFileSystem::sifs(local.clone());
-        let shard = DfsMetadataShardConfig {
-            file_system_id: file_system.file_system_id.clone(),
-            shard_id: "root".to_string(),
-            primary_node_id: primary,
-            replica_node_ids: vec![local.clone()],
-            epoch: 1,
-            assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
-            default_policy: DfsObjectPolicy::ReplicatedEventual,
-        };
-        let mut cluster_kv = sinomo_core::kv::InProcessKvStore::restore(
-            sinomo_core::kv::read_cluster_kv_cached_snapshot(&cluster_paths.kv_paths())
-                .expect("cluster kv snapshot"),
-        )
-        .expect("cluster kv store");
-        cluster_kv
-            .put_serde(
-                metadata_shard_key(&file_system.file_system_id, "root"),
-                &shard,
-                None,
-            )
-            .expect("shard op");
-        let snapshot = cluster_kv.snapshot().expect("cluster kv snapshot");
-        sinomo_core::kv::write_cluster_kv_snapshot(&cluster_paths.kv_paths(), &snapshot)
-            .expect("write shard config");
-        cluster_paths
-            .kv_paths()
-            .raft_store()
-            .append_command_with_response(
-                &local,
-                sinomo_core::kv::KvCommand::Op(
-                    sinomo_core::kv::KvOp::put_serde(
-                        metadata_shard_key(&file_system.file_system_id, "root"),
-                        &shard,
-                        None,
-                    )
-                    .expect("canonical shard op"),
-                ),
-            )
-            .expect("write canonical shard config");
-
-        let object_id =
-            DfsObjectId::from_legacy_named("obj_dfs_status_scope_repair").expect("object");
-        let version = DfsVersion::from_legacy_named("version_dfs_status_scope").expect("version");
-        let content_hash = "blake3:status-scope".to_string();
-        let mut backend = LocalSobjMetadataBackend::new(
-            DfsMetadataShardId::new("root"),
-            default_dfs_metadata_shards_root(data_dir.as_ref()).join("root"),
-        )
-        .expect("metadata backend");
-        backend.put_file_system(&file_system).expect("filesystem");
-        let object = DfsObjectMetadata {
-            object_id: object_id.clone(),
-            file_system_id: file_system.file_system_id.clone(),
-            path: "/services/cluster-tests/status-scope.txt".to_string(),
-            kind: DfsObjectKind::File,
-            tombstone_provenance: None,
-            owner_node_id: local.clone(),
-            current_locations: vec![local.clone()],
-            content_hash: Some(content_hash.clone()),
-            content_size_bytes: Some(12),
-            link_target_object_id: None,
-            mode: 0o644,
-            uid: 0,
-            gid: 0,
-            accessed_at_unix_nanos: 0,
-            modified_at_unix_nanos: 0,
-            created_at_unix_nanos: 0,
-            changed_at_unix_nanos: 0,
-            version: version.clone(),
-            policy: DfsObjectPolicy::ReplicatedEventual,
-            created_by_event_id: None,
-            last_modified_by_event_id: None,
-        };
-        backend.put_object(&object).expect("object");
-        backend
-            .put_version(&DfsObjectVersionRecord {
-                metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
-                content_durability: None,
-                retention: Default::default(),
-                module_metadata: Default::default(),
-                file_system_id: file_system.file_system_id.clone(),
-                object_id: object_id.clone(),
-                version: version.clone(),
-                content_hash: Some(content_hash.clone()),
-                size_bytes: Some(12),
-                locations: vec![local.clone()],
-                created_by_event_id: None,
-                created_at: now,
-                visible: true,
-            })
-            .expect("version");
-        backend
-            .put_intent(&DfsWriteIntentRecord {
-                publication: Default::default(),
-                intent_id: "intent_dfs_status_scope".to_string(),
-                file_system_id: file_system.file_system_id.clone(),
-                object_id: object_id.clone(),
-                base_version: None,
-                target_version: version.clone(),
-                coordinator_node_id: local.clone(),
-                operation_id: None,
-                operation_order_token: None,
-                owner_epoch: 1,
-                desired_replica_node_ids: vec![local.clone(), missing.clone()],
-                policy: DfsReplicationPolicy::new(1, 2).expect("policy"),
-                status: DfsWriteIntentStatus::Committed,
-                content_hash: Some(content_hash.clone()),
-                object_metadata: Some(object),
-                touch_parent_on_create: false,
-                create_predecessor_object_id: None,
-                created_at: now,
-                updated_at: Some(now),
-            })
-            .expect("intent");
-        backend
-            .put_receipt(&DfsReplicaReceiptRecord {
-                receipt: sinomo_core::DfsWriteReceipt {
-                    file_system_id: file_system.file_system_id.clone(),
-                    object_id: object_id.clone(),
-                    committed_version: version.clone(),
-                    owner_node_id: local.clone(),
-                    event_id: sinomo_core::Id::generate(),
-                },
-                replica_node_id: local,
-                content_hash: Some(content_hash),
-                received_at: now,
-            })
-            .expect("receipt");
-        drop(backend);
-
-        let (disposition, response) =
-            dispatch_local(&registry, Arc::clone(&data_dir), DFS_STATUS_ROUTE, &()).await;
-        assert_eq!(disposition, ServiceDisposition::Continue);
-        let status: DfsOperatorStatus = response.decode_body().expect("decode status");
-        assert_eq!(status.object_count, 1);
-        assert_eq!(status.pending_repair_count, 0);
-
-        let (disposition, response) = dispatch_local(
+        let status: DfsOperatorStatus =
+            response.decode_body().expect("decode actual hosted status");
+        assert!(status.file_system_count > 0);
+        assert!(status.object_count > 0);
+        runtime.stop_node(&node).expect("stop actual data owner");
+        let unavailable = dispatch_with_signer(
             &registry,
             data_dir,
-            DFS_INSPECTION_ROUTE,
-            &DaemonDfsInspectionRequest::Status,
+            DFS_STATUS_ROUTE,
+            &(),
+            ServiceSigner::Local,
         )
         .await;
-        assert_eq!(disposition, ServiceDisposition::Continue);
-        let response: DaemonDfsInspectionResponse =
-            response.decode_body().expect("decode inspection");
-        let DaemonDfsInspectionResponse::Status { status } = response else {
-            panic!("expected status response");
+        assert!(
+            unavailable.is_err(),
+            "closed owner cannot supply a synthetic healthy status"
+        );
+        drop(registry);
+        runtime.close().expect("drain native owner");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dfs_status_route_scopes_operational_counts_to_primary_shards() {
+        let nodes =
+            crate::test_runtime::DfsTestRuntime::ordered_node_ids("native-status-primary-scope", 3);
+        let mut runtime = crate::test_runtime::DfsTestRuntime::new(
+            "native-status-primary-scope",
+            nodes[0].clone(),
+        )
+        .unwrap();
+        for node in &nodes[1..] {
+            runtime.define_node(node.clone()).unwrap();
+        }
+        runtime.start_nodes().unwrap();
+        let users = runtime
+            .metadata_shards()
+            .unwrap()
+            .into_iter()
+            .find(|config| config.shard_id == "users")
+            .unwrap();
+        let target = nodes
+            .iter()
+            .find(|node| **node != users.primary_node_id)
+            .unwrap()
+            .clone();
+        let status = |runtime: &crate::test_runtime::DfsTestRuntime| {
+            let request =
+                ObjectRpcRequest::encode_body(DFS_STATUS_ROUTE, crate::DFS_RPC_CATEGORY, &())
+                    .unwrap();
+            runtime
+                .rpc_request(
+                    &users.primary_node_id,
+                    &target,
+                    request,
+                    Duration::from_secs(5),
+                )
+                .unwrap()
+                .decode_body::<DfsOperatorStatus>()
+                .unwrap()
         };
-        assert_eq!(status.object_count, 1);
-        assert_eq!(status.pending_repair_count, 0);
+        let before = status(&runtime);
+        let mut writer = runtime.client(&users.primary_node_id).unwrap();
+        let object = writer
+            .posix_write_file(
+                "/users/status-scope-file",
+                b"native foreign-authority data",
+                crate::DfsWriteOptions::replicated_eventual(vec![users.primary_node_id.clone()]),
+            )
+            .unwrap();
+        let mut receiver = runtime.client(&target).unwrap();
+        assert_eq!(
+            receiver
+                .posix_stat("/users/status-scope-file")
+                .unwrap()
+                .object_id,
+            object.object_id
+        );
+        let after = status(&runtime);
+        assert_eq!(
+            after.object_count, before.object_count,
+            "a foreign primary's replicated file is not counted as locally owned work"
+        );
+        assert_eq!(after.pending_repair_count, before.pending_repair_count);
+        drop((receiver, writer));
+        runtime.close().unwrap();
     }
 
     #[tokio::test]
@@ -2776,9 +2073,9 @@ mod tests {
             prefix_probe: None,
             authority_probe: None,
             durable_replication: None,
-            batch: DfsMetadataJournalBatch {
+            batch: DfsMetadataJournalFrameBatch {
                 shard_id: DfsMetadataShardId::new("shard-local"),
-                entries: Vec::new(),
+                journal_frames: Vec::new(),
                 next_after_sequence: 0,
             },
         };
@@ -2808,7 +2105,8 @@ mod tests {
             data_dir.root().join("snapshot-source"),
         )
         .expect("source metadata")
-        .export_table_snapshot();
+        .export_snapshot_image()
+        .expect("native snapshot image");
         let command = DfsMetadataSnapshotInstallCommand {
             request_id: "req-snapshot-1".to_string(),
             source_node_id: sinomo_core::node::NodeId::from_legacy_named("node_snapshot_source")
@@ -2818,7 +2116,8 @@ mod tests {
             primary_handoff_id: None,
             shard_id: DfsMetadataShardId::new("shard-snapshot-local"),
             next_after_sequence: 7,
-            snapshot,
+            snapshot: snapshot.descriptor().clone(),
+            image: Some(snapshot),
             reason: "service test".to_string(),
         };
 
@@ -2838,225 +2137,118 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn hosted_replica_routes_use_direct_authorized_host_methods() {
-        let host = Arc::new(StubDfsDataPlaneHost::default());
-        let registry =
-            register_services_with_data_plane_host(ServiceRegistry::builder(), host.clone())
-                .build();
-        let (_root, data_dir) = temp_data_dir();
-        let primary =
-            NodeId::from_legacy_named("node_dfs_hosted_replica_primary").expect("primary");
-        let local = NodeId::from_legacy_named("node_dfs_hosted_replica_local").expect("local");
-        let signer = ServiceSigner::Remote {
-            node_id: primary.to_string(),
-            public_key: "pk-dfs-hosted-replica-primary".to_string(),
-        };
-        let cluster_paths = ClusterPaths::new(data_dir.as_ref());
-        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
-            sinomo_core::node::ClusterId::from_legacy_named("cluster_dfs_hosted_replica")
-                .expect("cluster"),
-            "hosted replica service test",
-            local.clone(),
-            "local",
-            "pk-local",
-            OffsetDateTime::now_utc(),
-        );
-        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)
-            .expect("write cluster state");
-        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
-            .expect("cluster kv state");
-        let shard = DfsMetadataShardConfig {
-            file_system_id: sifs_file_system_id(),
-            shard_id: "root".to_string(),
-            primary_node_id: primary.clone(),
-            replica_node_ids: vec![local.clone()],
-            epoch: 1,
-            assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
-            default_policy: DfsObjectPolicy::ReplicatedEventual,
-        };
-        *host
-            .retained_metadata_replica_context
-            .lock()
-            .expect("retained metadata replica context") = Some(DfsMetadataReplicaShardContext {
-            local_node_id: local.clone(),
-            shard: shard.clone(),
-            pending_membership_handoff: None,
-        });
-        let mut cluster_kv = sinomo_core::kv::InProcessKvStore::restore(
-            sinomo_core::kv::read_cluster_kv_cached_snapshot(&cluster_paths.kv_paths())
-                .expect("cluster kv snapshot"),
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_replica_routes_ingest_exact_frames_and_reject_changed_source_and_epoch() {
+        let (runtime, mut source, config) = crate::test_support::current_native_metadata_service(
+            "native-host-replica-routes",
+            2,
+            "/",
         )
-        .expect("cluster kv store");
-        cluster_kv
-            .put_serde(
-                metadata_shard_key(&shard.file_system_id, &shard.shard_id),
-                &shard,
-                None,
+        .unwrap();
+        let primary = config.primary_node_id.clone();
+        let receiver = config.replica_node_ids[0].clone();
+        source
+            .posix_write_file(
+                "/native-host-replica-data",
+                b"actual native durable content",
+                crate::DfsWriteOptions::replicated_eventual(vec![primary.clone()]),
             )
-            .expect("shard op");
-        let kv_snapshot = cluster_kv.snapshot().expect("cluster kv snapshot");
-        sinomo_core::kv::write_cluster_kv_snapshot(&cluster_paths.kv_paths(), &kv_snapshot)
-            .expect("write shard config");
-        let journal = DfsMetadataJournalBatchCommand {
-            request_id: "hosted-replica-journal".to_string(),
+            .unwrap();
+        let shard = DfsMetadataShardId::new(config.shard_id.clone());
+        let backend = source.metadata_backend().unwrap();
+        let selected = backend
+            .journal_batch_for_shard_since_limited(&shard, 0, 128, 16 * 1024 * 1024)
+            .unwrap()
+            .unwrap();
+        let frames = backend.journal_frames_for_batch(&selected).unwrap();
+        assert!(!frames.is_empty());
+        let snapshot = backend
+            .export_shard_table_snapshot(&shard)
+            .unwrap()
+            .unwrap();
+        let command = DfsMetadataJournalBatchCommand {
+            request_id: "native-exact-host-journal".into(),
             source_node_id: Some(primary.clone()),
-            file_system_id: Some(sifs_file_system_id()),
-            authority_epoch: Some(1),
+            file_system_id: Some(config.file_system_id.clone()),
+            authority_epoch: Some(config.epoch),
             verify_prefix_only: false,
             prefix_probe: None,
             authority_probe: None,
-            durable_replication: None,
-            batch: DfsMetadataJournalBatch {
-                shard_id: DfsMetadataShardId::new("root"),
-                entries: Vec::new(),
-                next_after_sequence: 11,
+            durable_replication: Some(crate::DfsMetadataDurableReplication {
+                confirmation_id: "native-exact-host-journal".into(),
+                background_publication: false,
+            }),
+            batch: DfsMetadataJournalFrameBatch {
+                shard_id: shard.clone(),
+                next_after_sequence: selected.next_after_sequence,
+                journal_frames: frames,
             },
         };
-        let (_, response) = dispatch_with_signer(
-            &registry,
-            Arc::clone(&data_dir),
+        let request = ObjectRpcRequest::encode_body(
             DFS_METADATA_JOURNAL_BATCH_ROUTE,
-            &journal,
-            signer.clone(),
+            DFS_RPC_CATEGORY,
+            &command,
         )
-        .await
-        .expect("hosted journal route");
-        let response: DfsMetadataJournalBatchResponse = response.decode_body().expect("journal");
-        assert_eq!(response.request_id, journal.request_id);
+        .unwrap();
+        let response: DfsMetadataJournalBatchResponse = runtime
+            .rpc_request(&primary, &receiver, request, Duration::from_secs(5))
+            .unwrap()
+            .decode_body()
+            .unwrap();
         assert!(matches!(
             response.result,
             crate::DfsMetadataJournalBatchResult::Applied
         ));
-
-        let snapshot_backend = LocalSobjMetadataBackend::new(
-            DfsMetadataShardId::new("snapshot-source"),
-            data_dir.root().join("hosted-snapshot-source"),
-        )
-        .expect("snapshot source");
-        let snapshot = DfsMetadataSnapshotInstallCommand {
-            request_id: "hosted-replica-snapshot".to_string(),
-            source_node_id: primary.clone(),
-            file_system_id: Some(sifs_file_system_id()),
-            authority_epoch: Some(1),
-            primary_handoff_id: None,
-            shard_id: DfsMetadataShardId::new("root"),
-            next_after_sequence: 12,
-            snapshot: snapshot_backend.export_table_snapshot(),
-            reason: "hosted route test".to_string(),
-        };
-        let (_, response) = dispatch_with_signer(
-            &registry,
-            Arc::clone(&data_dir),
-            DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
-            &snapshot,
-            signer.clone(),
-        )
-        .await
-        .expect("hosted snapshot route");
-        let response: DfsMetadataSnapshotInstallResponse =
-            response.decode_body().expect("snapshot");
-        assert_eq!(response.request_id, snapshot.request_id);
-        assert!(matches!(
-            response.result,
-            DfsMetadataSnapshotInstallResult::Installed { .. }
-        ));
-
-        let claimed =
-            NodeId::from_legacy_named("node_dfs_hosted_replica_claimed").expect("claimed");
-        let mut mismatched_journal = journal.clone();
-        mismatched_journal.request_id = "hosted-replica-journal-mismatch".to_string();
-        mismatched_journal.source_node_id = Some(claimed.clone());
-        let (_, response) = dispatch_with_signer(
-            &registry,
-            Arc::clone(&data_dir),
+        assert_eq!(response.next_after_sequence, selected.next_after_sequence);
+        let mut changed_source = command.clone();
+        changed_source.request_id = "native-changed-source".into();
+        changed_source.source_node_id = Some(NodeId::generate());
+        let request = ObjectRpcRequest::encode_body(
             DFS_METADATA_JOURNAL_BATCH_ROUTE,
-            &mismatched_journal,
-            signer.clone(),
+            DFS_RPC_CATEGORY,
+            &changed_source,
         )
-        .await
-        .expect("hosted journal mismatch response");
-        let response: DfsMetadataJournalBatchResponse = response.decode_body().expect("journal");
+        .unwrap();
+        let response: DfsMetadataJournalBatchResponse = runtime
+            .rpc_request(&primary, &receiver, request, Duration::from_secs(5))
+            .unwrap()
+            .decode_body()
+            .unwrap();
         assert!(matches!(
             response.result,
             crate::DfsMetadataJournalBatchResult::Rejected { .. }
         ));
-
-        let mut mismatched_snapshot = snapshot.clone();
-        mismatched_snapshot.request_id = "hosted-replica-snapshot-mismatch".to_string();
-        mismatched_snapshot.source_node_id = claimed;
-        let (_, response) = dispatch_with_signer(
-            &registry,
-            Arc::clone(&data_dir),
-            DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
-            &mismatched_snapshot,
-            signer,
-        )
-        .await
-        .expect("hosted snapshot mismatch response");
-        let response: DfsMetadataSnapshotInstallResponse =
-            response.decode_body().expect("snapshot");
-        assert!(matches!(
-            response.result,
-            DfsMetadataSnapshotInstallResult::Rejected { .. }
-        ));
-
-        let mut missing_context_journal = journal.clone();
-        missing_context_journal.request_id = "hosted-replica-journal-missing-context".to_string();
-        missing_context_journal.file_system_id = Some(
-            DfsFileSystemId::from_legacy_named("filesystem_dfs_hosted_replica_missing")
-                .expect("missing filesystem"),
-        );
-        let (_, response) = dispatch_with_signer(
-            &registry,
-            Arc::clone(&data_dir),
+        let mut changed_epoch = command;
+        changed_epoch.request_id = "native-changed-epoch".into();
+        changed_epoch.authority_epoch = Some(config.epoch + 1);
+        let request = ObjectRpcRequest::encode_body(
             DFS_METADATA_JOURNAL_BATCH_ROUTE,
-            &missing_context_journal,
-            ServiceSigner::Remote {
-                node_id: primary.to_string(),
-                public_key: "pk-dfs-hosted-replica-primary".to_string(),
-            },
+            DFS_RPC_CATEGORY,
+            &changed_epoch,
         )
-        .await
-        .expect("hosted missing context response");
-        let response: DfsMetadataJournalBatchResponse = response.decode_body().expect("journal");
+        .unwrap();
+        let response: DfsMetadataJournalBatchResponse = runtime
+            .rpc_request(&primary, &receiver, request, Duration::from_secs(5))
+            .unwrap()
+            .decode_body()
+            .unwrap();
         assert!(matches!(
             response.result,
             crate::DfsMetadataJournalBatchResult::Rejected { .. }
         ));
+        let receiver_view = runtime.client(&receiver).unwrap();
         assert_eq!(
-            host.journal_request_ids
-                .lock()
-                .expect("journal request ids")
-                .as_slice(),
-            ["hosted-replica-journal"]
+            receiver_view
+                .metadata_backend()
+                .unwrap()
+                .metadata_prefix_proof(&shard)
+                .unwrap(),
+            Some(snapshot.prefix_proof)
         );
-        assert_eq!(
-            host.snapshot_request_ids
-                .lock()
-                .expect("snapshot request ids")
-                .as_slice(),
-            ["hosted-replica-snapshot"]
-        );
-        let journal_contexts = host.journal_contexts.lock().expect("journal contexts");
-        let snapshot_contexts = host.snapshot_contexts.lock().expect("snapshot contexts");
-        assert_eq!(
-            journal_contexts.as_slice(),
-            &[DfsMetadataReplicaShardContext {
-                local_node_id: local.clone(),
-                shard: shard.clone(),
-                pending_membership_handoff: None,
-            }]
-        );
-        assert_eq!(snapshot_contexts.as_slice(), journal_contexts.as_slice());
-        assert!(
-            host.message_request_ids
-                .lock()
-                .expect("message request ids")
-                .is_empty(),
-            "replica control-plane routes must not enter the routed message host"
-        );
+        drop((receiver_view, source));
+        runtime
+            .close()
+            .expect("all native receivers and owners stopped");
     }
 
     #[tokio::test]
@@ -3079,9 +2271,9 @@ mod tests {
             prefix_probe: None,
             authority_probe: None,
             durable_replication: None,
-            batch: DfsMetadataJournalBatch {
+            batch: DfsMetadataJournalFrameBatch {
                 shard_id: DfsMetadataShardId::new("root"),
-                entries: Vec::new(),
+                journal_frames: Vec::new(),
                 next_after_sequence: 0,
             },
         };
@@ -3116,7 +2308,12 @@ mod tests {
             primary_handoff_id: None,
             shard_id: DfsMetadataShardId::new("root"),
             next_after_sequence: 0,
-            snapshot: snapshot_backend.export_table_snapshot(),
+            snapshot: snapshot_backend
+                .export_snapshot_image()
+                .unwrap()
+                .descriptor()
+                .clone(),
+            image: Some(snapshot_backend.export_snapshot_image().unwrap()),
             reason: "service caller identity test".to_string(),
         };
         let (disposition, response) = dispatch_with_signer(
@@ -3205,58 +2402,83 @@ mod tests {
         assert!(matches!(result, DaemonDfsInspectionResponse::Status { .. }));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn hosted_dfs_inspection_reuses_the_process_host() {
-        let host = Arc::new(StubDfsDataPlaneHost::default());
+        let (mut runtime, node, data_dir, host) = native_surface_fixture("native-host-inspection");
         let registry =
-            register_services_with_data_plane_host(ServiceRegistry::builder(), host.clone())
-                .build();
-        let (_test_root, test_data_dir) = temp_data_dir();
-        let (disposition, response) = dispatch_local(
+            register_services_with_data_plane_host(ServiceRegistry::builder(), host).build();
+        let request = DaemonDfsInspectionRequest::Status;
+        let (disposition, response) =
+            dispatch_local(&registry, data_dir.clone(), DFS_INSPECTION_ROUTE, &request).await;
+        assert_eq!(disposition, ServiceDisposition::Continue);
+        let result: DaemonDfsInspectionResponse =
+            response.decode_body().expect("decode actual inspection");
+        let DaemonDfsInspectionResponse::Status { status } = result else {
+            panic!("expected hosted status");
+        };
+        assert!(status.file_system_count > 0);
+        assert!(status.object_count > 0);
+        runtime.stop_node(&node).expect("stop actual owner");
+        let unavailable = dispatch_with_signer(
             &registry,
-            test_data_dir,
+            data_dir,
             DFS_INSPECTION_ROUTE,
-            &DaemonDfsInspectionRequest::Status,
+            &request,
+            ServiceSigner::Local,
         )
         .await;
-        assert_eq!(disposition, ServiceDisposition::Continue);
-        let result: DaemonDfsInspectionResponse = response.decode_body().expect("decode");
-        assert!(matches!(result, DaemonDfsInspectionResponse::Status { .. }));
-        assert_eq!(*host.inspection_calls.lock().expect("inspection calls"), 1);
+        assert!(
+            unavailable.is_err(),
+            "inspection cannot reopen a closed process owner"
+        );
+        drop(registry);
+        runtime.close().expect("drain native owner");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dfs_data_plane_routes_delegate_to_host() {
-        let host = Arc::new(StubDfsDataPlaneHost::default());
-        let registry =
-            register_data_plane_services(ServiceRegistry::builder(), host.clone()).build();
+        let (runtime, local, data_dir, host) = native_surface_fixture("native-data-plane-dispatch");
+        let registry = register_data_plane_services(ServiceRegistry::builder(), host).build();
         assert!(registry.owns(DFS_SMOKE_ROUTE));
-        assert!(!registry.owns("/dfs/message"));
         assert!(registry.owns(crate::DFS_DATA_READ_ROUTE));
         assert!(registry.owns(DFS_DIRECT_READ_ROUTE));
-
-        let (disposition, smoke_response) = {
-            let (_root, data_dir) = temp_data_dir();
-            dispatch_local(&registry, data_dir, DFS_SMOKE_ROUTE, &()).await
-        };
+        assert!(!registry.owns("/dfs/message"));
+        assert!(!registry.owns("/dfs/protocol/frame"));
+        let (disposition, smoke_response) =
+            dispatch_local(&registry, data_dir.clone(), DFS_SMOKE_ROUTE, &()).await;
         assert_eq!(disposition, ServiceDisposition::Continue);
-        let smoke: DfsSmokeReport = smoke_response.decode_body().expect("decode smoke");
-        assert_eq!(smoke.path, "/services/dfs-smoke/service-route.txt");
-        assert_eq!(*host.smoke_calls.lock().expect("smoke calls"), 1);
-
-        let local =
-            sinomo_core::node::NodeId::from_legacy_named("node_dfs_service_data_plane_frame_local")
-                .expect("local node");
-        let typed_command = DfsMessageCommand {
-            request_id: "message-route-1".to_string(),
+        let smoke: DfsSmokeReport = smoke_response.decode_body().expect("decode native smoke");
+        assert!(
+            smoke
+                .attempts
+                .iter()
+                .any(|attempt| attempt.committed && attempt.path == smoke.path)
+        );
+        assert!(smoke.committed_replica_node_ids.contains(&local));
+        let mut client = runtime.client(&local).expect("actual native smoke reader");
+        let actual = client
+            .posix_stat(&smoke.path)
+            .expect("actual committed smoke path");
+        assert_eq!(actual.object_id, smoke.object_id);
+        assert_eq!(actual.version, smoke.version);
+        let bytes = client
+            .posix_read_file(&smoke.path)
+            .expect("actual committed smoke bytes");
+        assert!(!bytes.is_empty());
+        assert_eq!(Some(bytes.len() as u64), smoke.size_bytes);
+        assert_eq!(Some(crate::content_hash(&bytes)), smoke.content_hash);
+        drop(client);
+        let object_id = DfsObjectId::generate();
+        let command = DfsMessageCommand {
+            request_id: "message-route-1".into(),
             routed_message: crate::DfsRoutedMessage {
                 source_node_id: local.clone(),
                 target_node_id: local.clone(),
                 frame_id: 2,
                 message_id: 2,
                 message: crate::DfsNetworkMessage::ReadRequest(crate::DfsReadRequest {
-                    request_id: "message-read-1".to_string(),
-                    object_id: DfsObjectId::generate(),
+                    request_id: "message-read-1".into(),
+                    object_id: object_id.clone(),
                     version: None,
                     content_hash: None,
                     content_size_bytes: None,
@@ -3265,61 +2487,51 @@ mod tests {
                 }),
             },
         };
-        let (_test_root, test_data_dir) = temp_data_dir();
-        let (disposition, message_response) = dispatch_with_signer(
+        let (disposition, response) = dispatch_with_signer(
             &registry,
-            test_data_dir.clone(),
+            data_dir,
             crate::DFS_DATA_READ_ROUTE,
-            &typed_command,
+            &command,
             ServiceSigner::LocalNode {
                 node_id: local.to_string(),
-                public_key: "pk-dfs-service-data-plane-local".to_string(),
+                public_key: format!("pk-{local}"),
             },
         )
         .await
-        .expect("authenticated data-plane dispatch");
+        .expect("actual native read dispatch");
         assert_eq!(disposition, ServiceDisposition::Continue);
-        let message: crate::DfsMessageResponse =
-            message_response.decode_body().expect("decode message");
-        assert_eq!(message.request_id, "message-route-1");
-        assert!(message.outbound_messages.is_empty());
-
-        assert_eq!(
-            host.message_request_ids
-                .lock()
-                .expect("message request ids")
-                .as_slice(),
-            ["message-route-1"]
-        );
-        assert_eq!(
-            host.message_traceparents
-                .lock()
-                .expect("message traceparents")
-                .as_slice(),
-            [Some(
-                "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01".to_string()
-            )]
-        );
-        assert!(!registry.owns("/dfs/protocol/frame"));
+        let reply: crate::DfsMessageResponse = response.decode_body().expect("decode native reply");
+        assert_eq!(reply.request_id, command.request_id);
+        assert_eq!(reply.outbound_messages.len(), 1);
+        let frame = &reply.outbound_messages[0];
+        assert_eq!(frame.source_node_id, local);
+        assert_eq!(frame.target_node_id, local);
+        let crate::DfsNetworkMessage::ReadResponse(read) = &frame.message else {
+            panic!("expected real read response");
+        };
+        assert_eq!(read.object_id, object_id);
+        assert_eq!(read.request_id, "message-read-1");
+        assert_eq!(read.result, crate::DfsReadResult::NotFound);
+        drop(registry);
+        runtime.close().expect("drain native owner");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dfs_data_plane_route_binds_authenticated_caller_to_routed_source() {
-        let host = Arc::new(StubDfsDataPlaneHost::default());
+        let (runtime, authenticated, data_dir, host) =
+            native_surface_fixture("native-data-plane-source-binding");
+        let before = host.status().await.expect("actual before status");
         let registry =
             register_data_plane_services(ServiceRegistry::builder(), host.clone()).build();
-        let claimed = NodeId::from_legacy_named("node_dfs_data_plane_claimed").expect("claimed");
-        let authenticated =
-            NodeId::from_legacy_named("node_dfs_data_plane_authenticated").expect("authenticated");
         let command = DfsMessageCommand {
-            request_id: "message-route-source-mismatch".to_string(),
+            request_id: "message-route-source-mismatch".into(),
             routed_message: crate::DfsRoutedMessage {
-                source_node_id: claimed.clone(),
+                source_node_id: NodeId::generate(),
                 target_node_id: authenticated.clone(),
                 frame_id: 3,
                 message_id: 3,
                 message: crate::DfsNetworkMessage::ReadRequest(crate::DfsReadRequest {
-                    request_id: "message-read-source-mismatch".to_string(),
+                    request_id: "message-read-source-mismatch".into(),
                     object_id: DfsObjectId::generate(),
                     version: None,
                     content_hash: None,
@@ -3329,26 +2541,25 @@ mod tests {
                 }),
             },
         };
-        let (_root, data_dir) = temp_data_dir();
         let error = dispatch_with_signer(
             &registry,
             data_dir,
             crate::DFS_DATA_READ_ROUTE,
             &command,
-            ServiceSigner::Remote {
+            ServiceSigner::LocalNode {
                 node_id: authenticated.to_string(),
-                public_key: "pk-dfs-data-plane-authenticated".to_string(),
+                public_key: format!("pk-{authenticated}"),
             },
         )
         .await
-        .expect_err("mismatched routed source must be rejected before host dispatch");
+        .expect_err("mismatched routed source must be rejected before real host dispatch");
         assert!(error.to_string().contains("does not match claimed source"));
-        assert!(
-            host.message_request_ids
-                .lock()
-                .expect("message request ids")
-                .is_empty(),
-            "an impersonated routed source must not reach the DFS message host"
-        );
+        let after = host.status().await.expect("actual after status");
+        assert_eq!(before.object_count, after.object_count);
+        assert_eq!(before.version_count, after.version_count);
+        assert_eq!(before.pending_write_count, after.pending_write_count);
+        drop(registry);
+        drop(host);
+        runtime.close().expect("drain native owner");
     }
 }

@@ -738,14 +738,12 @@ fn sandbox_http_fetch_recording_persists_transport_failure() {
 
 #[test]
 fn sandbox_http_exchange_record_persists_to_sifs_logs() {
-    let runtime_root = unique_test_dir("sinomo-sandbox-http-exchange-sifs");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_http_exchange").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(runtime_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sandbox_http_exchange_record_persists_to_sifs_logs",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let mut store = SifsSandboxInstanceStore::new(dfs);
     let manifest = store
         .create(
@@ -775,7 +773,9 @@ fn sandbox_http_exchange_record_persists_to_sifs_logs() {
         load_http_exchange_record(&mut sandbox_fs, &command_id, &request_id).expect("load"),
         record
     );
-    fs::remove_dir_all(runtime_root).ok();
+
+    drop(sandbox_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]

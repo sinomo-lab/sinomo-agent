@@ -203,42 +203,92 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .as_nanos()
                 .min(u64::MAX as u128) as u64,
         };
-        let applied = self
-            .metadata_backend
-            .as_mut()
+        let scope = self.metadata_effect_scope_for_object(
+            &object,
+            format!("advisory-lock:{}", sinomo_core::Id::generate()),
+        )?;
+        let _execution = self.acquire_prepared_execution(&scope)?;
+        let backend = self.metadata_backend.as_ref().ok_or_else(|| {
+            DfsPosixError::Dfs(DfsError::Metadata {
+                message: "distributed advisory locks require current durable metadata".into(),
+            })
+        })?;
+        let before = backend
+            .export_shard_table_snapshot(&scope.shard_id)?
             .ok_or_else(|| {
                 DfsPosixError::Dfs(DfsError::Metadata {
-                    message: "distributed advisory locks require a durable metadata backend"
-                        .to_string(),
+                    message: "advisory-lock publication has no exact current shard cut".into(),
                 })
-            })?
-            .apply_advisory_lock_command(
+            })?;
+        let existing =
+            backend.get_advisory_lock_state(&object.file_system_id, &object.object_id)?;
+        let transition = crate::transition_advisory_lock_state(
+            existing.as_ref(),
+            &object.file_system_id,
+            &object.object_id,
+            context,
+            &command,
+        )
+        .map_err(|error| {
+            DfsPosixError::Dfs(DfsError::Metadata {
+                message: error.to_string(),
+            })
+        })?;
+        if transition.changed {
+            let current = backend.get_object_on_shard(&scope.shard_id, &object.object_id)?;
+            let occupant = backend.get_object_by_path_on_shard(
+                &scope.shard_id,
                 &object.file_system_id,
-                &object.object_id,
-                context,
-                command,
+                &object.path,
             )?;
+            let mut payload = crate::DfsPreparedOperationPayload::for_metadata_effects(
+                scope.clone(),
+                vec![crate::DfsNamespaceObjectVersionExpectation {
+                    object_id: object.object_id.clone(),
+                    expected_version: current.map(|row| row.version),
+                }],
+                vec![crate::DfsNamespacePathOccupantExpectation {
+                    path: object.path.clone(),
+                    expected_object_id: occupant.map(|row| row.object_id),
+                }],
+                vec![crate::DfsPreparedMetadataEffect::PutAdvisoryLockState {
+                    state: transition.state,
+                }],
+                time::OffsetDateTime::now_utc(),
+            )?;
+            payload.expected_journal_sequence = Some(before.prefix_proof.journal_sequence);
+            self.publish_prepared_operation(payload)?;
+        }
+        let applied_shard_id = scope.shard_id;
+        let durable_through_sequence = self
+            .metadata_backend
+            .as_ref()
+            .expect("lock backend")
+            .export_shard_table_snapshot(&applied_shard_id)?
+            .expect("actual lock shard")
+            .prefix_proof
+            .journal_sequence;
 
         // Replicate and freshly verify the journal prefix containing the
         // transition before exposing its outcome. This also covers unchanged
         // queries and idempotent retries: they must not trust a stale isolated
         // primary merely because no new journal entry was appended.
         let metadata_target = self.capture_metadata_quorum_sync_target(&object)?;
-        if metadata_target.shard_id != applied.shard_id
-            || metadata_target.journal_sequence < applied.durable_through_sequence
+        if metadata_target.shard_id != applied_shard_id
+            || metadata_target.journal_sequence < durable_through_sequence
         {
             return Err(DfsPosixError::Dfs(DfsError::Metadata {
                 message: format!(
                     "advisory-lock transition durable at {}:{} but sync captured {}:{}",
-                    applied.shard_id.0,
-                    applied.durable_through_sequence,
+                    applied_shard_id.0,
+                    durable_through_sequence,
                     metadata_target.shard_id.0,
                     metadata_target.journal_sequence
                 ),
             }));
         }
         self.sync_metadata_shard_to_quorum(&metadata_target, timeout)?;
-        let mut outcome = applied.outcome;
+        let mut outcome = transition.outcome;
         observe_advisory_lock_outcome_at(&mut outcome, dfs_now_unix_nanos());
         Ok(outcome)
     }
@@ -459,50 +509,36 @@ mod tests {
                 .expect("define lock replica");
         }
         runtime.start_nodes().expect("mount normal DFS receivers");
-        let shard = runtime.root_shard().expect("normal planned root shard");
+        let mut setup = runtime.client(&primary).expect("normal fixture writer");
+        let stat = setup
+            .posix_write_file(
+                "/lock-authority.txt",
+                b"lock bytes",
+                crate::DfsWriteOptions {
+                    policy: crate::DfsReplicationPolicy::new(1, 1).unwrap(),
+                    replica_candidates: vec![primary.clone()],
+                    wait_for_commit: true,
+                    foreground_replica_repair: false,
+                },
+            )
+            .expect("normal immutable publication");
+        let object = setup
+            .metadata_backend()
+            .unwrap()
+            .get_object(&stat.object_id)
+            .unwrap()
+            .unwrap();
+        drop(setup);
         for replica in &replica_node_ids {
             if !acknowledged_nodes.contains(replica) {
-                // A configured but stopped receiver cannot contribute an ACK.
                 runtime
                     .stop_node(replica)
                     .expect("stop unavailable lock replica");
             }
         }
-        let object = DfsObjectMetadata {
-            object_id: DfsObjectId::from_legacy_named("object_lock_authority").expect("object"),
-            file_system_id: shard.file_system_id.clone(),
-            path: "/lock-authority.txt".to_string(),
-            kind: DfsObjectKind::File,
-            tombstone_provenance: None,
-            owner_node_id: primary.clone(),
-            current_locations: vec![primary.clone()],
-            content_hash: Some("blake3:lock-authority".to_string()),
-            content_size_bytes: Some(1),
-            link_target_object_id: None,
-            mode: 0o644,
-            uid: 0,
-            gid: 0,
-            accessed_at_unix_nanos: 1,
-            modified_at_unix_nanos: 1,
-            created_at_unix_nanos: 1,
-            changed_at_unix_nanos: 1,
-            version: DfsVersion::from_legacy_named("version_lock_authority").expect("version"),
-            policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
-            created_by_event_id: None,
-            last_modified_by_event_id: None,
-        };
-        let (mut service, txn_calls) = runtime
+        let (service, txn_calls) = runtime
             .client_with_control_plane_probe(&primary)
             .expect("normal foreground DFS lock client");
-        service
-            .metadata_backend
-            .as_mut()
-            .expect("real primary metadata backend")
-            .put_object(&object)
-            .expect("object metadata");
-        service
-            .hydrate_from_metadata_backend()
-            .expect("hydrate seeded lock object");
         (runtime, service, object, txn_calls)
     }
 

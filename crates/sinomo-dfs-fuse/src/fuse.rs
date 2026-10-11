@@ -5651,6 +5651,9 @@ mod errno_tests {
 
     fn test_mount_open_repair_record() -> dfs::DfsRepairAttemptRecord {
         dfs::DfsRepairAttemptRecord {
+            transfer_delivery_state: None,
+            completed_transfer_request_id: None,
+            transfer_kind: None,
             intent_id: "fuse-mount-open-intent".to_string(),
             object_id: test_object_id("fusemountopenobject"),
             version: dfs::DfsVersion::from_legacy_named("fuse_mount_open_version")

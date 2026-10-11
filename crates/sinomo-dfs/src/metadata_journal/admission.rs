@@ -35,7 +35,6 @@ struct Certificate {
 struct Admission {
     certificate: Option<Certificate>,
     uncertain: bool,
-    pending_semantic_floor: Option<crate::metadata_records::DfsMetadataPrefixAckFloor>,
 }
 
 static ADMISSION: OnceLock<Mutex<BTreeMap<PathBuf, Admission>>> = OnceLock::new();
@@ -150,7 +149,6 @@ pub(crate) fn current_owned_materialized_prefix(
         return Ok(None);
     };
     if state.uncertain
-        || state.pending_semantic_floor.is_some()
         || certificate.shard_id != *shard_id
         || certificate.generation != current
         || !can_reuse(&current)
@@ -307,7 +305,6 @@ pub(crate) fn invalidate(root: &Path) -> Result<()> {
         Admission {
             certificate: None,
             uncertain: true,
-            pending_semantic_floor: None,
         },
     );
     Ok(())
@@ -333,9 +330,6 @@ pub(crate) fn record_certified(
         .get_or_init(|| Mutex::new(BTreeMap::new()))
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    let pending_semantic_floor = states
-        .get_mut(&key)
-        .and_then(|state| state.pending_semantic_floor.take());
     states.insert(
         key,
         Admission {
@@ -346,7 +340,6 @@ pub(crate) fn record_certified(
                 prefix,
             }),
             uncertain: false,
-            pending_semantic_floor,
         },
     );
     Ok(())
@@ -381,17 +374,6 @@ pub(crate) fn certify_for_write(root: &Path, shard_id: &DfsMetadataShardId) -> R
     Ok(next_sequence)
 }
 
-pub(crate) fn has_pending_semantic_floor(root: &Path) -> Result<bool> {
-    let key = owner_key(root)?;
-    let states = ADMISSION
-        .get_or_init(|| Mutex::new(BTreeMap::new()))
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    Ok(states
-        .get(&key)
-        .is_some_and(|state| state.pending_semantic_floor.is_some()))
-}
-
 pub(crate) fn validate_materialized_prefix(
     root: &Path,
     shard_id: &DfsMetadataShardId,
@@ -420,54 +402,6 @@ pub(crate) fn validate_materialized_prefix(
             "materialized metadata prefix is ahead of certified journal/checkpoint sources".into(),
         ));
     }
-    let pending_semantic_floor = states
-        .get(&key)
-        .and_then(|state| state.pending_semantic_floor.clone());
-    drop(states);
-    if let Some(floor) = pending_semantic_floor {
-        let snapshot = certified_materialized_snapshot(root, floor.journal_sequence, prefix)?
-            .ok_or_else(|| {
-                MetadataBackendError::replica_diverged(
-                    "restored metadata is missing the retained semantic acknowledgement state"
-                        .into(),
-                )
-            })?;
-        if !crate::metadata_records::dfs_metadata_table_snapshot_matches_checkpoint(
-            &snapshot,
-            floor.journal_sequence,
-            &floor.state_fingerprint,
-        )
-        .map_err(|error| MetadataBackendError::Serde(error.to_string()))?
-        {
-            return Err(MetadataBackendError::replica_diverged(
-                "restored metadata differs from retained semantic acknowledgement".into(),
-            ));
-        }
-        if let Some(state) = ADMISSION
-            .get()
-            .expect("admission initialized")
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .get_mut(&key)
-        {
-            state.pending_semantic_floor = None;
-        }
-    }
-    Ok(())
-}
-
-pub(super) fn defer_semantic_floor_validation(
-    root: &Path,
-    floor: &crate::metadata_records::DfsMetadataPrefixAckFloor,
-) -> Result<()> {
-    let key = owner_key(root)?;
-    ADMISSION
-        .get_or_init(|| Mutex::new(BTreeMap::new()))
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .entry(key)
-        .or_default()
-        .pending_semantic_floor = Some(floor.clone());
     Ok(())
 }
 
@@ -508,20 +442,10 @@ mod tests {
     fn owned_checkpoint_keeps_stronger_certified_deferred_prefix() {
         let root = empty_owner("journal-admission-owned-deferred-prefix");
         let shard = DfsMetadataShardId::new("services");
-        let mut prefix =
-            crate::metadata_records::dfs_metadata_prefix_proof_seed(&shard, 0, "empty");
+        let mut prefix = crate::metadata_records::dfs_metadata_prefix_proof_genesis(&shard);
         let mut proofs = Vec::new();
         for sequence in 1..=2 {
-            let entry = DfsMetadataJournalEntry {
-                shard_id: shard.clone(),
-                sequence,
-                created_at: time::OffsetDateTime::UNIX_EPOCH,
-                mutation: DfsMetadataMutation::PutFileSystem {
-                    file_system_id: crate::DfsFileSystemId::from_legacy_named("admission-deferred")
-                        .unwrap(),
-                    file_system: None,
-                },
-            };
+            let entry = super::super::tests::test_journal_entry(sequence);
             let frame = DfsMetadataJournalFrame::encode(&entry).unwrap();
             append_segmented_journal_frame_with_record_bytes(root.path(), &frame).unwrap();
             prefix = frame.prefix_proof_after(&prefix).unwrap();
@@ -547,58 +471,20 @@ mod tests {
     fn owned_materialization_cannot_change_equal_height_certified_prefix() {
         let root = empty_owner("journal-admission-owned-conflicting-prefix");
         let shard = DfsMetadataShardId::new("services");
-        let original =
-            crate::metadata_records::dfs_metadata_prefix_proof_seed(&shard, 1, "original");
-        let conflicting =
-            crate::metadata_records::dfs_metadata_prefix_proof_seed(&shard, 1, "conflicting");
+        let genesis = crate::metadata_records::dfs_metadata_prefix_proof_genesis(&shard);
+        let entry = super::super::tests::test_journal_entry(1);
+        let original = DfsMetadataJournalFrame::encode(&entry)
+            .unwrap()
+            .prefix_proof_after(&genesis)
+            .unwrap();
+        let mut alternate = entry.clone();
+        alternate.created_at += time::Duration::seconds(1);
+        let conflicting = DfsMetadataJournalFrame::encode(&alternate)
+            .unwrap()
+            .prefix_proof_after(&genesis)
+            .unwrap();
         record_certified(root.path(), &shard, 2, Some(original.clone())).unwrap();
         assert!(record_owned_materialization(root.path(), &shard, 2, Some(conflicting)).is_err());
         validate_materialized_prefix(root.path(), &shard, Some(&original)).unwrap();
-    }
-
-    #[test]
-    fn deferred_semantic_floor_survives_owned_materialization_and_recertification() {
-        let root = empty_owner("journal-admission-deferred-semantic-floor");
-        let shard = DfsMetadataShardId::new("services");
-        let prefix = crate::metadata_records::dfs_metadata_prefix_proof_seed(&shard, 1, "prefix");
-        let tables = crate::metadata_tables::DfsMetadataTables::default();
-        crate::metadata_table_store::persist_metadata_table_snapshot(
-            root.path(),
-            &tables,
-            Some(1),
-            Some(&prefix),
-        )
-        .unwrap();
-        record_certified(root.path(), &shard, 2, Some(prefix.clone())).unwrap();
-        let mut floor = crate::metadata_records::DfsMetadataPrefixAckFloor {
-            shard_id: shard.clone(),
-            journal_sequence: 1,
-            state_fingerprint: format!("blake3:{}", "f".repeat(64)),
-            durable_prefix_proof: None,
-        };
-        defer_semantic_floor_validation(root.path(), &floor).unwrap();
-        record_owned_materialization(root.path(), &shard, 2, Some(prefix.clone())).unwrap();
-        assert!(validate_materialized_prefix(root.path(), &shard, Some(&prefix)).is_err());
-        record_certified(root.path(), &shard, 2, Some(prefix.clone())).unwrap();
-        assert!(validate_materialized_prefix(root.path(), &shard, Some(&prefix)).is_err());
-        let snapshot = certified_materialized_snapshot(root.path(), 1, Some(&prefix))
-            .unwrap()
-            .unwrap();
-        floor.state_fingerprint =
-            crate::metadata_records::dfs_metadata_table_snapshot_state_fingerprint(&snapshot)
-                .unwrap();
-        defer_semantic_floor_validation(root.path(), &floor).unwrap();
-        validate_materialized_prefix(root.path(), &shard, Some(&prefix)).unwrap();
-        assert!(
-            ADMISSION
-                .get()
-                .unwrap()
-                .lock()
-                .unwrap()
-                .get(&owner_key(root.path()).unwrap())
-                .unwrap()
-                .pending_semantic_floor
-                .is_none()
-        );
     }
 }

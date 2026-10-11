@@ -22,7 +22,7 @@ pub(crate) fn dfs_metadata_replication_can_wait_for_maintenance(
         .is_some_and(|replication| {
             replication.background_publication
                 && !replication.confirmation_id.is_empty()
-                && !replication.journal_frames.is_empty()
+                && !command.batch.journal_frames.is_empty()
         })
         && command.source_node_id.as_ref() == Some(authenticated_source_node_id)
         && command.file_system_id.is_some()
@@ -30,7 +30,7 @@ pub(crate) fn dfs_metadata_replication_can_wait_for_maintenance(
         && !command.verify_prefix_only
         && command.prefix_probe.is_none()
         && command.authority_probe.is_none()
-        && command.batch.entries.is_empty()
+        && !command.batch.journal_frames.is_empty()
         && command.request_id
             == format!(
                 "dfs_meta_{}_{}_{}",
@@ -67,7 +67,7 @@ pub(crate) fn dfs_metadata_prefix_probe_is_verification_only(
             )
         && command.authority_probe.is_none()
         && command.durable_replication.is_none()
-        && command.batch.entries.is_empty()
+        && command.batch.journal_frames.is_empty()
 }
 
 pub(crate) const DFS_AUTHORITY_PROJECTION_MAX_SCOPES: usize =
@@ -86,6 +86,9 @@ pub(crate) struct DfsAuthoritativeProjectionCache {
     pub revision: KvRevision,
     pub exact_entries: BTreeMap<String, Option<KvEntry>>,
     pub prefix_entries: BTreeMap<String, Vec<KvEntry>>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub native_retained_seed:
+        Option<std::sync::Arc<crate::native_shard_trace::NativeRetainedMetadataSeed>>,
 }
 
 impl Default for DfsAuthoritativeProjectionCache {
@@ -95,6 +98,8 @@ impl Default for DfsAuthoritativeProjectionCache {
             revision: KvRevision::ZERO,
             exact_entries: BTreeMap::new(),
             prefix_entries: BTreeMap::new(),
+            #[cfg(any(test, feature = "test-support"))]
+            native_retained_seed: None,
         }
     }
 }
@@ -103,6 +108,10 @@ impl DfsAuthoritativeProjectionCache {
     pub fn clear_scopes(&mut self) {
         self.exact_entries.clear();
         self.prefix_entries.clear();
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            self.native_retained_seed = None;
+        }
     }
 
     pub fn begin_generation(&mut self) {

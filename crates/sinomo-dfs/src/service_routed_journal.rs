@@ -189,7 +189,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         result: &DfsDistributedWriteResult,
         after_sequence: Option<u64>,
         max_batches: usize,
-    ) -> Result<Vec<DfsMetadataJournalBatch>, DfsError> {
+    ) -> Result<Vec<DfsMetadataJournalFrameBatch>, DfsError> {
         let Some(after_sequence) = after_sequence else {
             return Ok(Vec::new());
         };
@@ -235,7 +235,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         max_batches: usize,
         max_entries_per_batch: usize,
         max_encoded_bytes_per_batch: usize,
-    ) -> Result<Vec<DfsMetadataJournalBatch>, DfsError> {
+    ) -> Result<Vec<DfsMetadataJournalFrameBatch>, DfsError> {
         let requested_after = after_sequence;
         let mut batches = Vec::new();
         for _ in 0..max_batches {
@@ -252,9 +252,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 break;
             }
             after_sequence = batch.next_after_sequence;
-            batches.push(batch);
+            let backend = self
+                .metadata_backend
+                .as_deref()
+                .ok_or_else(|| DfsError::Metadata {
+                    message: "routed journal response requires its actual durable backend".into(),
+                })?;
+            batches.push(
+                crate::metadata_replication::prepare_dfs_metadata_journal_frame_batch(
+                    backend, &batch,
+                )?,
+            );
         }
-        let entries: usize = batches.iter().map(|batch| batch.entries.len()).sum();
+        let entries: usize = batches.iter().map(|batch| batch.journal_frames.len()).sum();
         if entries >= DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT
             || (requested_after == 0 && entries > 0)
         {
@@ -276,35 +286,39 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         primary_node_id: &NodeId,
         validated_authority_shard: &DfsMetadataShardConfig,
-        batch: &DfsMetadataJournalBatch,
+        frames: &DfsMetadataJournalFrameBatch,
     ) -> Result<(), DfsError> {
+        let batch = frames.decoded()?;
         let permit = self.validate_routed_response_journal_batch(
             primary_node_id,
             validated_authority_shard,
-            batch,
+            &batch,
         )?;
         if let Some(backend) = self.metadata_backend.as_mut() {
-            let applied_entries =
-                match backend.apply_journal_batch_with_replica_permit(&permit, batch) {
-                    Ok(applied_entries) => applied_entries,
-                    Err(error) => {
-                        let reason = error.to_string();
-                        if error.rejection_code().allows_snapshot_repair() {
-                            self.await_routed_snapshot_refresh(
-                                validated_authority_shard,
-                                &batch.shard_id,
-                            )?;
-                            self.request_metadata_snapshot_repair_from_primary(
-                                primary_node_id,
-                                &batch.shard_id,
-                                batch.next_after_sequence,
-                                reason,
-                            )?;
-                            return Ok(());
-                        }
-                        return Err(error.into());
+            let applied_entries = match backend.persist_journal_frames_with_replica_permit_report(
+                &permit,
+                &frames.header(),
+                &frames.journal_frames,
+            ) {
+                Ok(report) => report.applied_entries(),
+                Err(error) => {
+                    let reason = error.to_string();
+                    if error.rejection_code().allows_snapshot_repair() {
+                        self.await_routed_snapshot_refresh(
+                            validated_authority_shard,
+                            &batch.shard_id,
+                        )?;
+                        self.request_metadata_snapshot_repair_from_primary(
+                            primary_node_id,
+                            &batch.shard_id,
+                            batch.next_after_sequence,
+                            reason,
+                        )?;
+                        return Ok(());
                     }
-                };
+                    return Err(error.into());
+                }
+            };
             // Routed reads and write responses can advance this process's
             // durable replica directly, outside the ordinary inbound journal
             // handler. Retain the same daemon-owned progress edge before the
@@ -325,10 +339,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             // same observation path as ordinary inbound replica batches;
             // refresh affected objects to retire a routed writer's optimistic
             // projection from the final durable view, without replaying intents.
-            self.refresh_metadata_journal_batch_objects_from_backend(batch)?;
-            self.observe_replicated_metadata_journal_batch(batch)?;
+            self.refresh_metadata_journal_batch_objects_from_backend(&batch)?;
+            self.observe_replicated_metadata_journal_batch(&batch)?;
         } else {
-            self.apply_metadata_journal_batch_to_service_state(batch)?;
+            return Err(DfsError::Metadata {
+                message: "routed replica replay requires a durable backend".into(),
+            });
         }
         Ok(())
     }

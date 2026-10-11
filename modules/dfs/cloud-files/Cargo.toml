@@ -51,5 +51,6 @@ windows = { version = "0.62.2", features = [
 ] }
 
 [dev-dependencies]
+sinomo-runtime = { workspace = true, features = ["dfs-test-support"] }
 time.workspace = true
 tokio.workspace = true

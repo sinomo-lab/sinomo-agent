@@ -55,13 +55,11 @@ struct DfsRepairQueueLogBatch {
     operations: Vec<DfsRepairQueueOperation>,
 }
 
-/// On-disk snapshot envelope. The defaulted floor reads the legacy
-/// `DfsRepairAttemptSnapshot` representation without migration IO.
+/// Current restart checkpoint for the sequenced repair accelerator.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DfsRepairQueueSnapshotFile {
-    #[serde(default)]
     records: Vec<DfsRepairAttemptRecord>,
-    #[serde(default)]
     applied_through_sequence: u64,
 }
 
@@ -102,6 +100,7 @@ impl DfsRepairQueuePageObservation {
     }
 }
 
+#[derive(Clone, Debug)]
 pub(crate) enum DfsRepairQueuePageReconcileOutcome {
     Applied {
         removed_target_count: usize,
@@ -661,6 +660,152 @@ impl LocalDfsRepairQueueStore {
         })
     }
 
+    /// Read actual typed rows for one owner's targets at the same current cut.
+    /// Missing keys supply no delivery or settlement evidence.
+    pub(crate) fn records_for_targets(
+        &self,
+        intent_id: &str,
+        targets: &[NodeId],
+    ) -> Result<Vec<DfsRepairAttemptRecord>, DfsError> {
+        let mut state = self.lock_state()?;
+        state.refresh_from_disk()?;
+        Ok(targets
+            .iter()
+            .filter_map(|target| {
+                state
+                    .records
+                    .get(&DfsRepairQueueKey {
+                        intent_id: intent_id.to_owned(),
+                        missing_replica_node_id: target.clone(),
+                    })
+                    .cloned()
+            })
+            .collect())
+    }
+
+    /// Observe only actual transfer targets under the SAME maintenance token.
+    /// Delivery completion does not acknowledge a scan or create absent rows.
+    pub(crate) fn observe_transfer_targets(
+        &self,
+        intent_id: &str,
+        targets: &[NodeId],
+    ) -> Result<(Vec<DfsRepairAttemptRecord>, DfsRepairQueuePageObservation), DfsError> {
+        let mut state = self.lock_state()?;
+        state.refresh_from_disk()?;
+        let records = targets
+            .iter()
+            .filter_map(|target| {
+                state
+                    .records
+                    .get(&DfsRepairQueueKey {
+                        intent_id: intent_id.to_owned(),
+                        missing_replica_node_id: target.clone(),
+                    })
+                    .cloned()
+            })
+            .collect::<Vec<_>>();
+        let observation = DfsRepairQueuePageObservation {
+            queue: state.observation(),
+            advances_scan: false,
+            after: state.maintenance_cursor.clone(),
+            records: records.clone(),
+        };
+        Ok((records, observation))
+    }
+
+    /// Set one SAME fully observed transfer through the existing page checkpoint.
+    /// Concurrent changes and removals win; missing rows supply no new custody.
+    pub(crate) fn checkpoint_transfer_record(
+        &self,
+        before: &DfsRepairAttemptRecord,
+        desired: &DfsRepairAttemptRecord,
+    ) -> Result<bool, DfsError> {
+        validate_stable_repair_identity(before, desired)?;
+        if DfsRepairQueueKey::from_record(before) != DfsRepairQueueKey::from_record(desired)
+            || before.transfer_kind.is_none()
+            || before.transfer_kind != desired.transfer_kind
+            || before.transfer_request_id.is_none()
+            || before.completed_transfer_request_id.is_some()
+        {
+            return Ok(false);
+        }
+        let (records, observation) = self.observe_transfer_targets(
+            &before.intent_id,
+            std::slice::from_ref(&before.missing_replica_node_id),
+        )?;
+        if records.as_slice() != std::slice::from_ref(before) {
+            return Ok(false);
+        }
+        Ok(matches!(
+            self.reconcile_maintenance_page(
+                &observation,
+                0,
+                std::slice::from_ref(before),
+                std::slice::from_ref(desired),
+                &[],
+                &[]
+            )?,
+            DfsRepairQueuePageReconcileOutcome::Applied { .. }
+        ))
+    }
+
+    /// A validated live owner may wake only its exact settled observations.
+    /// This changes scheduling DATA through the existing Set/log/fsync family;
+    /// it grants no transfer authority and never creates a missing queue row.
+    pub(crate) fn wake_observed_settled_records(
+        &self,
+        observed: &[DfsRepairAttemptRecord],
+        next_retry_unix_nanos: u64,
+    ) -> Result<Vec<DfsRepairAttemptRecord>, DfsError> {
+        self.wake_observed_scheduling_records_if(
+            observed,
+            next_retry_unix_nanos,
+            &crate::repair::retained_repair_schedule_can_wake,
+        )
+    }
+
+    /// The same observed Set/log CAS with an explicit scheduling-only selector.
+    pub(crate) fn wake_observed_scheduling_records_if(
+        &self,
+        observed: &[DfsRepairAttemptRecord],
+        next_retry_unix_nanos: u64,
+        eligible: &dyn Fn(&DfsRepairAttemptRecord) -> bool,
+    ) -> Result<Vec<DfsRepairAttemptRecord>, DfsError> {
+        if observed.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut state = self.lock_state()?;
+        state.refresh_from_disk()?;
+        let mut before = BTreeMap::new();
+        for record in observed {
+            let key = DfsRepairQueueKey::from_record(record);
+            if let Some(previous) = before.insert(key, record)
+                && previous != record
+            {
+                return Err(DfsError::Metadata {
+                    message: "retained scheduling wake has conflicting exact observations".into(),
+                });
+            }
+        }
+        let mut operations = Vec::new();
+        for (key, record) in &before {
+            if state.records.get(key) == Some(*record) && eligible(record) {
+                let mut updated = (*record).clone();
+                updated.next_retry_unix_nanos = next_retry_unix_nanos;
+                if updated != **record {
+                    operations.push(DfsRepairQueueOperation::Set { record: updated });
+                }
+            }
+        }
+        state.append_operations(operations)?;
+        // Return the actual current rows, including a newer concurrent claim.
+        // Removed rows stay absent; the activation cannot re-enroll them.
+        Ok(before
+            .keys()
+            .filter_map(|key| state.records.get(key).cloned())
+            .collect())
+    }
+
     /// Maintenance observes external changes through exact streamed content
     /// fingerprints while retaining the hot decoded queue when bytes match.
     pub(crate) fn view_for_maintenance(
@@ -1039,9 +1184,7 @@ impl LocalDfsRepairQueueStore {
         })
     }
 
-    /// Atomically replace the materialized queue through the same sequenced
-    /// log used by foreground deltas. This is retained for compatibility with
-    /// callers that previously rewrote `DfsRepairAttemptSnapshot` directly.
+    /// Reconcile a complete desired queue through the normal sequenced log.
     pub fn replace_records(
         &self,
         desired_records: &[DfsRepairAttemptRecord],
@@ -1440,13 +1583,15 @@ fn repair_queue_active_log_path(snapshot_path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::maintenance::DfsRepairAttemptSnapshot;
     use crate::{DfsObjectId, DfsVersion};
     use std::fs::OpenOptions;
     use std::io::Write as _;
 
     fn record(name: &str, target: &str, attempts: u32) -> DfsRepairAttemptRecord {
         DfsRepairAttemptRecord {
+            transfer_delivery_state: None,
+            completed_transfer_request_id: None,
+            transfer_kind: None,
             intent_id: format!("intent-{name}"),
             object_id: DfsObjectId::from_legacy_named(format!("object-{name}")).expect("object"),
             version: DfsVersion::from_legacy_named(format!("version-{name}")).expect("version"),
@@ -2213,6 +2358,319 @@ mod tests {
         assert!(!store.inner.lock().unwrap().resync_on_load);
     }
 
+    // Queue scheduling DATA and actual Set/reopen only: no transport,
+    // publication owner, quorum, healthy response or effect permission.
+    fn settled_parked_record(name: &str, target: &str) -> DfsRepairAttemptRecord {
+        let mut row = record(name, target, 3);
+        row.transfer_kind = Some(sinomo_api::dfs::maintenance::DfsRepairTransferKind::Repair);
+        row.transfer_delivery_state =
+            Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent);
+        row.next_retry_unix_nanos = u64::MAX;
+        row
+    }
+
+    #[test]
+    fn retained_activation_wake_persists_only_scheduling_and_reopens() {
+        let root = sinomo_testdir::TestDir::new("retained-wake-persist-DATA");
+        let path = root.join("repair-attempts.sobj");
+        let store = LocalDfsRepairQueueStore::new(&path);
+        let parked = settled_parked_record("parked", "node-parked-DATA");
+        let mut sibling = settled_parked_record("sibling", "node-sibling-DATA");
+        sibling.next_retry_unix_nanos = 60_000;
+        store
+            .append_enqueues([parked.clone(), sibling.clone()])
+            .unwrap();
+        let mut expected = parked.clone();
+        expected.next_retry_unix_nanos = 42;
+        let updated = store.wake_observed_settled_records(&[parked], 42).unwrap();
+        assert_eq!(updated, vec![expected.clone()]);
+        let reopened = reopen(&path).view().unwrap();
+        assert_eq!(reopened.head_sequence, 2);
+        let actual = reopened
+            .records
+            .iter()
+            .find(|row| row.intent_id == expected.intent_id)
+            .unwrap();
+        assert_eq!(
+            actual, &expected,
+            "all custody/identity/diagnostic fields remain unchanged"
+        );
+        assert_eq!(
+            reopened
+                .records
+                .iter()
+                .find(|row| row.intent_id == sibling.intent_id),
+            Some(&sibling)
+        );
+    }
+
+    #[test]
+    fn retained_activation_wake_preserves_newer_named_and_unknown_claims() {
+        let root = sinomo_testdir::TestDir::new("retained-wake-concurrent-DATA");
+        for unknown_kind in [false, true] {
+            let path = root.join(if unknown_kind {
+                "unknown.sobj"
+            } else {
+                "named.sobj"
+            });
+            let store = LocalDfsRepairQueueStore::new(&path);
+            let observed = settled_parked_record("concurrent", "node-concurrent-DATA");
+            store.append_enqueues([observed.clone()]).unwrap();
+            let mut current = observed.clone();
+            if unknown_kind {
+                current.transfer_kind = None;
+                current.completed_transfer_request_id = Some("prior-DATA-completion".into());
+            } else {
+                current.transfer_request_id = Some("newer-named-DATA-claim".into());
+                current.transfer_delivery_state = None;
+                current.in_flight = true;
+            }
+            store
+                .append_operations(vec![DfsRepairQueueOperation::Set {
+                    record: current.clone(),
+                }])
+                .unwrap();
+            assert_eq!(
+                store
+                    .wake_observed_settled_records(&[observed], 42)
+                    .unwrap(),
+                vec![current.clone()],
+                "stale whole-row observations return the newer current custody"
+            );
+            let actual = reopen(&path).view().unwrap();
+            assert_eq!(
+                actual.head_sequence, 2,
+                "rejected wake appends no scheduling frame"
+            );
+            assert_eq!(actual.records, vec![current]);
+        }
+    }
+
+    #[test]
+    fn retained_activation_wake_keeps_removed_target_absent() {
+        let root = sinomo_testdir::TestDir::new("retained-wake-removed-DATA");
+        let path = root.join("repair-attempts.sobj");
+        let store = LocalDfsRepairQueueStore::new(&path);
+        let observed = settled_parked_record("removed", "node-removed-DATA");
+        store.append_enqueues([observed.clone()]).unwrap();
+        store
+            .append_operations(vec![DfsRepairQueueOperation::Remove {
+                key: DfsRepairQueueKey::from_record(&observed),
+            }])
+            .unwrap();
+        assert!(
+            store
+                .wake_observed_settled_records(&[observed], 42)
+                .unwrap()
+                .is_empty()
+        );
+        let actual = reopen(&path).view().unwrap();
+        assert_eq!(actual.head_sequence, 2);
+        assert!(
+            actual.records.is_empty(),
+            "wake cannot re-enroll a removed target"
+        );
+    }
+
+    #[test]
+    fn retained_activation_wake_preserves_unknown_and_blocked_scheduling() {
+        let root = sinomo_testdir::TestDir::new("retained-wake-ineligible-DATA");
+        for fault in [
+            "null-kind",
+            "unknown-delivery",
+            "named",
+            "in-flight",
+            "lost-authority",
+            "connectivity",
+            "existing-backoff",
+        ] {
+            let path = root.join(format!("{fault}.sobj"));
+            let store = LocalDfsRepairQueueStore::new(&path);
+            let mut observed = settled_parked_record(fault, "node-ineligible-DATA");
+            match fault {
+                "null-kind" => {
+                    observed.transfer_kind = None;
+                    observed.completed_transfer_request_id =
+                        Some("historical-DATA-completion".into());
+                }
+                "unknown-delivery" => observed.transfer_delivery_state = None,
+                "named" => observed.transfer_request_id = Some("retained-DATA-claim".into()),
+                "in-flight" => observed.in_flight = true,
+                "lost-authority" => {
+                    observed.last_error =
+                        Some("source is not current metadata shard primary".into())
+                }
+                "connectivity" => {
+                    observed.last_error = Some(
+                        crate::maintenance::DFS_REPAIR_EXECUTION_BLOCKED_BY_CONNECTIVITY.into(),
+                    )
+                }
+                "existing-backoff" => observed.next_retry_unix_nanos = 60_000,
+                _ => unreachable!(),
+            }
+            store.append_enqueues([observed.clone()]).unwrap();
+            assert!(!crate::repair::retained_repair_schedule_can_wake(&observed));
+            assert_eq!(
+                store
+                    .wake_observed_settled_records(&[observed.clone()], 42)
+                    .unwrap(),
+                vec![observed.clone()]
+            );
+            let actual = reopen(&path).view().unwrap();
+            assert_eq!(actual.head_sequence, 1, "ineligible wake appends no frame");
+            assert_eq!(actual.records, vec![observed]);
+        }
+    }
+
+    #[test]
+    fn transfer_checkpoint_preserves_newer_claims_removal_and_unknown_kind() {
+        use sinomo_api::dfs::maintenance::DfsRepairTransferKind;
+        use sinomo_core::network::NetworkDeliveryState;
+        let root = sinomo_testdir::TestDir::new("transfer-checkpoint-CAS-DATA");
+        for fault in ["exact", "changed", "removed", "null-kind", "wrong-key"] {
+            let path = root.join(format!("{fault}.sobj"));
+            let store = LocalDfsRepairQueueStore::new(&path);
+            let mut before = record("claim", "transfer-target-DATA", 1);
+            before.transfer_kind = Some(DfsRepairTransferKind::Repair);
+            before.transfer_request_id = Some("actual-DATA-request".into());
+            before.transfer_delivery_state = Some(NetworkDeliveryState::PossiblyApplied);
+            before.in_flight = true;
+            if fault == "null-kind" {
+                before.transfer_kind = None;
+            }
+            store.append_enqueues([before.clone()]).unwrap();
+            let (rows, observed) = store
+                .observe_transfer_targets(
+                    &before.intent_id,
+                    std::slice::from_ref(&before.missing_replica_node_id),
+                )
+                .unwrap();
+            assert_eq!(rows, vec![before.clone()]);
+            assert!(!observed.advances_scan);
+            let mut current = before.clone();
+            if fault == "changed" {
+                current.transfer_request_id = Some("newer-DATA-request".into());
+                current.transfer_delivery_state = None;
+                store
+                    .append_operations(vec![DfsRepairQueueOperation::Set {
+                        record: current.clone(),
+                    }])
+                    .unwrap();
+            } else if fault == "removed" {
+                store
+                    .append_operations(vec![DfsRepairQueueOperation::Remove {
+                        key: DfsRepairQueueKey::from_record(&before),
+                    }])
+                    .unwrap();
+            }
+            let head = store.view().unwrap().head_sequence;
+            let mut desired = before.clone();
+            desired.in_flight = false;
+            desired.transfer_request_id = None;
+            desired.completed_transfer_request_id = Some("actual-DATA-request".into());
+            if fault == "wrong-key" {
+                desired.intent_id = "foreign-DATA-intent".into();
+            }
+            assert_eq!(
+                store.checkpoint_transfer_record(&before, &desired).unwrap(),
+                fault == "exact"
+            );
+            let actual = reopen(&path).view().unwrap();
+            if fault == "exact" {
+                assert_eq!(actual.records, vec![desired]);
+                assert_eq!(actual.head_sequence, head + 1);
+            } else if fault == "removed" {
+                assert!(
+                    actual.records.is_empty(),
+                    "completion cannot re-enroll a removal"
+                );
+                assert_eq!(actual.head_sequence, head);
+            } else {
+                assert_eq!(actual.records, vec![current]);
+                assert_eq!(actual.head_sequence, head, "rejected Set appends no frame");
+            }
+        }
+    }
+
+    #[test]
+    fn connectivity_wake_persists_only_exact_settled_rows_and_preserves_concurrent_custody() {
+        let root = sinomo_testdir::TestDir::new("connectivity-wake-CAS-DATA");
+        let wake = &crate::repair::connectivity_repair_schedule_can_wake;
+        for fault in [
+            "settled",
+            "null-kind",
+            "unknown",
+            "possibly-applied",
+            "named",
+            "inflight",
+            "changed",
+            "removed",
+        ] {
+            let path = root.join(format!("{fault}.sobj"));
+            let store = LocalDfsRepairQueueStore::new(&path);
+            let mut observed = settled_parked_record(fault, "node-connectivity-wake-DATA");
+            observed.last_error =
+                Some(crate::maintenance::DFS_REPAIR_EXECUTION_BLOCKED_BY_CONNECTIVITY.into());
+            match fault {
+                "null-kind" => observed.transfer_kind = None,
+                "unknown" => observed.transfer_delivery_state = None,
+                "possibly-applied" => {
+                    observed.transfer_delivery_state =
+                        Some(sinomo_core::network::NetworkDeliveryState::PossiblyApplied)
+                }
+                "named" => {
+                    observed.transfer_request_id = Some("actual-unresolved-DATA-claim".into())
+                }
+                "inflight" => observed.in_flight = true,
+                _ => {}
+            }
+            observed.completed_transfer_request_id = None;
+            store.append_enqueues([observed.clone()]).unwrap();
+            let mut current = observed.clone();
+            if fault == "changed" {
+                current.transfer_request_id = Some("newer-DATA-claim".into());
+                current.transfer_delivery_state = None;
+                current.in_flight = true;
+                store
+                    .append_operations(vec![DfsRepairQueueOperation::Set {
+                        record: current.clone(),
+                    }])
+                    .unwrap();
+            } else if fault == "removed" {
+                store
+                    .append_operations(vec![DfsRepairQueueOperation::Remove {
+                        key: DfsRepairQueueKey::from_record(&observed),
+                    }])
+                    .unwrap();
+            }
+            let head = store.view().unwrap().head_sequence;
+            let rows = store
+                .wake_observed_scheduling_records_if(&[observed.clone()], 42, wake)
+                .unwrap();
+            let actual = reopen(&path).view().unwrap();
+            if fault == "settled" {
+                current.next_retry_unix_nanos = 42;
+                assert_eq!(rows, vec![current.clone()]);
+                assert_eq!(actual.records, vec![current]);
+                assert_eq!(
+                    actual.head_sequence,
+                    head + 1,
+                    "one real Set frame durably wakes scheduling only"
+                );
+            } else if fault == "removed" {
+                assert!(rows.is_empty() && actual.records.is_empty());
+                assert_eq!(actual.head_sequence, head, "a removed row cannot re-enroll");
+            } else {
+                assert_eq!(rows, vec![current.clone()]);
+                assert_eq!(actual.records, vec![current]);
+                assert_eq!(
+                    actual.head_sequence, head,
+                    "uncertain or changed custody appends no wake frame"
+                );
+            }
+        }
+    }
+
     #[test]
     fn repair_queue_replays_enqueue_set_and_remove_in_order() {
         let root = sinomo_testdir::TestDir::new("dfs-repair-queue-replay");
@@ -2488,35 +2946,6 @@ mod tests {
             .expect("replay snapshot and suffix");
         assert_eq!(view.head_sequence, 2);
         assert_eq!(view.records, vec![alpha, beta]);
-    }
-
-    #[test]
-    fn repair_queue_reads_legacy_snapshot_at_sequence_zero() {
-        let root = sinomo_testdir::TestDir::new("dfs-repair-queue-legacy-snapshot");
-        let snapshot_path = root.join("repair-attempts.sobj");
-        let legacy = record("legacy", "node-legacy", 2);
-        write_sobj_atomic(
-            &snapshot_path,
-            &DfsRepairAttemptSnapshot {
-                records: vec![legacy.clone()],
-            },
-        )
-        .expect("legacy snapshot");
-        let store = reopen(&snapshot_path);
-        let initial = store.view().expect("legacy view");
-        assert_eq!(initial.head_sequence, 0);
-        assert_eq!(initial.records, vec![legacy.clone()]);
-        let fresh = record("fresh", "node-fresh", 0);
-        store
-            .append_enqueues([fresh.clone()])
-            .expect("append fresh");
-        assert_eq!(
-            reopen(&snapshot_path)
-                .view()
-                .expect("legacy plus log")
-                .records,
-            vec![fresh, legacy]
-        );
     }
 
     #[test]

@@ -59,6 +59,8 @@ impl DfsCloudFilesEndpointTransport {
                 dfs::DfsNetworkMessage::NamespaceRequest(_)
                     | dfs::DfsNetworkMessage::StableNamespaceReconciliationRequest(_)
                     | dfs::DfsNetworkMessage::DistributedWriteRequest(_)
+                    | dfs::DfsNetworkMessage::RetainedWriteRequest(_)
+                    | dfs::DfsNetworkMessage::ExclusiveCreateRequest(_)
                     | dfs::DfsNetworkMessage::StableWriteReconciliationRequest(_)
             )
     }
@@ -197,6 +199,17 @@ impl DfsTransportIdentity for DfsCloudFilesEndpointTransport {
 }
 
 impl DfsMessageTransport for DfsCloudFilesEndpointTransport {
+    fn take_namespace_response(
+        &mut self,
+        request_id: &str,
+    ) -> Result<Option<DfsRoutedMessage>, NetworkError> {
+        let position = self.incoming_messages.iter().position(|message| {
+            matches!(&message.message, dfs::DfsNetworkMessage::NamespaceResponse(response)
+                if response.request_id == request_id)
+        });
+        Ok(position.and_then(|position| self.incoming_messages.remove(position)))
+    }
+
     fn delegates_local_namespace_authority(&self) -> bool {
         self.daemon_peer.is_some()
     }
@@ -229,254 +242,314 @@ impl DfsMessageTransport for DfsCloudFilesEndpointTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sinomo_runtime::network::{ObjectRpcCall, ObjectRpcResponse, ObjectRpcResult};
-    use std::sync::Mutex;
+    use dfs::test_support::{DfsTestNamespaceReadCapture, DfsTestRuntime};
 
-    struct AuthorityPeer {
-        objects: BTreeSet<String>,
-        current: Option<dfs::DfsObjectMetadata>,
-        calls: Mutex<Vec<dfs::DfsNamespaceOperation>>,
+    const ROOT: &str = "/services/cloud-files-endpoint";
+    const DOCUMENT: &str = "/services/cloud-files-endpoint/document.txt";
+
+    struct PrimaryFixture {
+        runtime: DfsTestRuntime,
+        service: dfs::NetworkedDfsService<DfsCloudFilesEndpointTransport>,
+        reads: DfsTestNamespaceReadCapture,
+        local: NodeId,
+        shard: dfs::DfsMetadataShardConfig,
+        old: dfs::DfsObjectMetadata,
+        current: dfs::DfsObjectMetadata,
+        durable_head: u64,
+        feed_cursors: Vec<dfs::DfsNamespaceChangeCursor>,
     }
-
-    struct UnexpectedPeer;
-
-    impl DfsPeerTransport for UnexpectedPeer {
-        fn call_object_rpc(
-            &self,
-            _target: &NodeId,
-            _call: ObjectRpcCall,
-            _options: DfsObjectRpcSendOptions,
-        ) -> Result<ObjectRpcResult, dfs::DfsPeerTransportError> {
-            Err(dfs::DfsPeerTransportError::new("unexpected peer send"))
+    impl PrimaryFixture {
+        fn close(self) {
+            drop(self.reads);
+            drop(self.service);
+            self.runtime.close().expect("normal native shutdown");
         }
-    }
-
-    impl DfsPeerTransport for AuthorityPeer {
-        fn call_object_rpc(
-            &self,
-            target: &NodeId,
-            call: ObjectRpcCall,
-            _options: DfsObjectRpcSendOptions,
-        ) -> Result<ObjectRpcResult, dfs::DfsPeerTransportError> {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("peer runtime");
-            let body = runtime
-                .block_on(call.body.collect_to_vec(1024 * 1024))
-                .expect("request body");
-            let command: dfs::DfsMessageCommand =
-                sinomo_module_api::decode_sobj(&body).expect("typed DFS request");
-            let routed = command.routed_message;
-            let mut server = dfs::DfsNodeServedMessageTransport::new_with_peer_transport_for_nodes(
-                target.clone(),
-                Vec::new(),
-                Arc::new(UnexpectedPeer),
-                Duration::from_secs(1),
-            );
-            server.begin_message(&routed).expect("serve request");
-            assert_eq!(&routed.target_node_id, target);
-            let dfs::DfsNetworkMessage::NamespaceRequest(request) = routed.message else {
-                panic!("only namespace requests may reach the authority fixture");
-            };
-            if routed.source_node_id == *target {
-                assert!(
-                    !request.include_metadata_journal_batches,
-                    "a delegated client must not replay its primary's own journal"
-                );
-                assert!(request.metadata_journal_after_sequences.is_empty());
-            }
-            self.calls
-                .lock()
-                .expect("calls")
-                .push(request.operation.clone());
-            let (object, result) = match request.operation {
-                dfs::DfsNamespaceOperation::LookupPath { ref path, .. } => {
-                    let object = self
-                        .current
-                        .as_ref()
-                        .filter(|object| object.path == *path)
-                        .cloned()
-                        .or_else(|| {
-                            self.objects
-                                .contains(path)
-                                .then(|| dfs::directory_object(path, target.clone()))
-                        });
-                    (object, None)
-                }
-                dfs::DfsNamespaceOperation::PollNamespaceChanges { ref request } => {
-                    let mut cursor = request.cursor.clone();
-                    cursor.after_sequence = 42;
-                    (
-                        None,
-                        Some(dfs::DfsPosixCoordinationResult::NamespaceChanges(
-                            dfs::DfsNamespaceChangePollResponse {
-                                batch: dfs::DfsNamespaceChangeBatch {
-                                    next_cursor: cursor,
-                                    events: Vec::new(),
-                                    journal_head_sequence: 42,
-                                    has_more: false,
-                                },
-                            },
-                        )),
-                    )
-                }
-                ref operation => panic!("unexpected namespace operation {operation:?}"),
-            };
-            let returned = dfs::DfsRoutedMessage {
-                source_node_id: target.clone(),
-                target_node_id: routed.source_node_id,
-                frame_id: routed.frame_id + 1,
-                message_id: routed.message_id + 1,
-                message: dfs::DfsNetworkMessage::NamespaceResponse(dfs::DfsNamespaceResponse {
-                    request_id: request.request_id,
-                    result: dfs::DfsNamespaceResult::Applied,
-                    synced_path_object: object,
-                    synced_path_objects: Vec::new(),
-                    metadata_journal_batches: Vec::new(),
-                    metadata_journal_has_more: Some(false),
-                    posix_coordination_result: result,
-                }),
-            };
-            let returned_target = returned.target_node_id.clone();
-            server
-                .send_routed_call(&returned_target, dfs::DfsRoutedCall::value(returned))
-                .expect("reply to served caller");
-            let outbound_messages = server.finish_message();
-            assert_eq!(
-                outbound_messages.len(),
-                1,
-                "same-node replies belong to the RPC caller"
-            );
-            let response = dfs::DfsMessageResponse {
-                request_id: command.request_id,
-                outbound_messages,
-            };
-            Ok(ObjectRpcResult::value(
-                ObjectRpcResponse::encode_body(dfs::DFS_DATA_NAMESPACE_RESPONSE_ROUTE, &response)
-                    .expect("typed response"),
-            ))
-        }
-    }
-
-    fn primary_service(
-        label: &str,
-    ) -> (
-        dfs::NetworkedDfsService<DfsCloudFilesEndpointTransport>,
-        Arc<AuthorityPeer>,
-        std::path::PathBuf,
-    ) {
-        let local = NodeId::from_legacy_named("cloud-files-local-primary").expect("node");
-        let root = std::env::temp_dir().join(format!("cloud-files-{label}-{}", NodeId::generate()));
-        let mut old = dfs::directory_object("/document.txt", local.clone());
-        old.kind = dfs::DfsObjectKind::File;
-        old.version = dfs::DfsVersion::from_legacy_named("old-version").expect("version");
-        old.content_hash = Some("blake3:old".into());
-        old.content_size_bytes = Some(3);
-        let mut current = old.clone();
-        current.version = dfs::DfsVersion::from_legacy_named("current-version").expect("version");
-        current.content_hash = Some("blake3:current".into());
-        current.content_size_bytes = Some(7);
-        let peer = Arc::new(AuthorityPeer {
-            objects: BTreeSet::from(["/".into()]),
-            current: Some(current),
-            calls: Mutex::new(Vec::new()),
-        });
-        let mut service = dfs::NetworkedDfsService::new(
-            DfsCloudFilesEndpointTransport::new(local.clone(), Vec::new(), Some(peer.clone())),
-            dfs::LocalContentStore::new(root.join("content")).expect("content"),
-        );
-        service
-            .add_file_system(dfs::distributed_sifs(local.clone()))
-            .expect("filesystem");
-        service
-            .add_object_metadata(dfs::directory_object("/", local.clone()))
-            .expect("root");
-        service
-            .add_object_metadata(old)
-            .expect("stale private metadata");
-        let control =
-            dfs::SharedDfsControlPlaneKvClient::new(sinomo_runtime::kv::InProcessKvStore::new());
-        control.with_client(|kv| {
-            dfs::DfsControlPlaneStore::new(kv)
-                .put_metadata_shard(&dfs::DfsMetadataShardConfig {
-                    file_system_id: dfs::sifs_file_system_id(),
-                    shard_id: "root".into(),
-                    primary_node_id: local,
-                    replica_node_ids: Vec::new(),
-                    epoch: 1,
-                    assignment: dfs::DfsMetadataShardAssignment::Root,
-                    namespace_prepare_codec: Default::default(),
-                    default_policy: sinomo_runtime::core::DfsObjectPolicy::ReplicatedEventual,
+        fn requests(&self) -> Vec<dfs::DfsNamespaceCommand> {
+            self.reads
+                .records()
+                .into_iter()
+                .map(|message| {
+                    assert_eq!(message.source_node_id, self.local);
+                    assert_eq!(message.target_node_id, self.local);
+                    let dfs::DfsNetworkMessage::NamespaceRequest(request) = message.message else {
+                        panic!("capture retains only actual namespace read heads");
+                    };
+                    assert_eq!(request.requesting_node_id, self.local);
+                    assert!(
+                        !request.include_metadata_journal_batches,
+                        "same-node delegated reads cannot ingest the owner's journal"
+                    );
+                    assert!(request.metadata_journal_after_sequences.is_empty());
+                    request
                 })
-                .expect("authority shard")
-        });
-        service = service.with_control_plane(control);
+                .collect()
+        }
+    }
+
+    fn primary_service(label: &str, with_private_backend: bool) -> PrimaryFixture {
+        let (runtime, nodes) =
+            DfsTestRuntime::start_cluster(label, 1).expect("normal Main fixture");
+        let local = nodes[0].clone();
+        let mut main = runtime.client(&local).expect("normal registered client");
+        main.posix_mkdir_all(ROOT)
+            .expect("normal directory publication");
+        let configs = runtime.metadata_shards().expect("actual assignments");
+        let feed_shards = dfs::dfs_namespace_change_shards_for_subtree(
+            &runtime.file_system().file_system_id,
+            ROOT,
+            &configs,
+        )
+        .expect("actual subtree feed scopes");
+        let initial_cursors = feed_shards
+            .iter()
+            .map(|config| dfs::DfsNamespaceChangeCursor::from_shard_config(config, 0))
+            .collect::<Vec<_>>();
+        let shard = dfs::select_metadata_shard_config_for_path(
+            &runtime.file_system().file_system_id,
+            &configs,
+            DOCUMENT,
+        )
+        .expect("validated routing")
+        .expect("actual owning scope");
+        assert_eq!(shard.primary_node_id, local);
+        let (peer, _) = runtime
+            .peer_transports(&local)
+            .expect("normal native peer adapter");
+        let control_plane = runtime
+            .control_plane_client()
+            .expect("same registered native control-plane factory");
+        let mut service = dfs::NetworkedDfsService::new(
+            DfsCloudFilesEndpointTransport::new(local.clone(), Vec::new(), Some(peer)),
+            dfs::LocalContentStore::new(runtime.data_dir(&local).dfs_dir().join("content"))
+                .expect("actual current content store"),
+        )
+        .with_boxed_control_plane(control_plane);
+        if with_private_backend {
+            // Match the production Cloud Files opener. Main still owns every
+            // mutation; this client's ordinary completion reads the durable
+            // backend into its private metadata projection.
+            let backend = dfs::open_local_sharded_metadata_backend(
+                dfs::default_dfs_metadata_shards_root(&runtime.data_dir(&local)),
+                configs,
+            )
+            .expect("normal Cloud Files metadata backend");
+            service = service
+                .with_boxed_metadata_backend_lazy(Box::new(backend))
+                .expect("normal lazy Cloud Files backend attachment");
+            service
+                .bootstrap_distributed_sifs()
+                .expect("delegated configuration bootstrap");
+        }
         crate::windows_sync::configure_cloud_files_mounted_read_policy(&mut service);
-        (service, peer, root)
+        let options = dfs::DfsWriteOptions::replicated_eventual(vec![local.clone()]);
+        let old_stat = if with_private_backend {
+            service
+                .posix_write_file(DOCUMENT, b"old", options.clone())
+                .expect("ordinary Cloud Files write through Main")
+        } else {
+            main.posix_write_file(DOCUMENT, b"old", options.clone())
+                .expect("original native Main write")
+        };
+        let old = main
+            .metadata_backend()
+            .expect("actual client backend")
+            .get_object_on_shard(
+                &dfs::DfsMetadataShardId::new(shard.shard_id.clone()),
+                &old_stat.object_id,
+            )
+            .expect("actual old durable object read")
+            .expect("actual old durable object");
+        assert_eq!(old.version, old_stat.version);
+        if with_private_backend {
+            assert_eq!(
+                service.metadata().object(&old.object_id),
+                Some(&old),
+                "ordinary Cloud write completion must earn its private projection"
+            );
+        } else {
+            assert!(service.metadata_backend().is_none());
+        }
+        let current_stat = main
+            .posix_write_file(DOCUMENT, b"current", options)
+            .expect("current native Main write");
+        let current = main
+            .metadata_backend()
+            .expect("actual client backend")
+            .get_object_on_shard(
+                &dfs::DfsMetadataShardId::new(shard.shard_id.clone()),
+                &current_stat.object_id,
+            )
+            .expect("actual current durable object read")
+            .expect("actual current durable object");
+        assert_ne!(old.version, current.version);
+        assert_eq!(current.version, current_stat.version);
+        assert_eq!(
+            main.posix_read_file(DOCUMENT)
+                .expect("native content readback"),
+            b"current"
+        );
+        if with_private_backend {
+            assert_eq!(
+                service.metadata().object(&old.object_id),
+                Some(&old),
+                "a separate Main write must leave the earned private view stale"
+            );
+        }
+        let baseline = main
+            .poll_namespace_changes_for_subtree(
+                shard.file_system_id.clone(),
+                ROOT,
+                &initial_cursors,
+            )
+            .expect("actual resident feed");
+        assert_eq!(baseline.len(), feed_shards.len());
+        assert!(baseline.iter().all(|batch| !batch.rescan_required()));
+        let owning_batches = baseline
+            .iter()
+            .filter(|batch| batch.next_cursor.shard_id.0 == shard.shard_id)
+            .collect::<Vec<_>>();
+        assert_eq!(owning_batches.len(), 1, "exact owning-shard feed batch");
+        let durable_head = owning_batches[0].journal_head_sequence;
+        let feed_cursors = baseline
+            .iter()
+            .map(|batch| batch.next_cursor.clone())
+            .collect::<Vec<_>>();
+        assert!(durable_head > 0);
+        let reads = runtime
+            .capture_namespace_reads(&local, 32)
+            .expect("actual read-head observer");
+        drop(main);
+        PrimaryFixture {
+            runtime,
+            service,
+            reads,
+            local,
+            shard,
+            old,
+            current,
+            durable_head,
+            feed_cursors,
+        }
     }
 
     #[test]
     fn local_primary_stat_reads_current_daemon_generation_over_private_metadata() {
-        let (mut service, peer, root) = primary_service("local-stat");
-        let stat = service
-            .posix_lstat_distributed("/document.txt")
-            .expect("authoritative stat");
+        let mut fixture = primary_service("cloud-files-local-stat", true);
         assert_eq!(
-            stat.version.to_string(),
-            NodeId::from_legacy_named("current-version")
-                .expect("version")
-                .to_string()
+            fixture
+                .service
+                .metadata()
+                .object(&fixture.old.object_id)
+                .unwrap()
+                .version,
+            fixture.old.version
         );
-        assert_eq!(stat.content_hash.as_deref(), Some("blake3:current"));
+        let stat = fixture
+            .service
+            .posix_lstat_distributed(DOCUMENT)
+            .expect("authoritative stat");
+        assert_eq!(stat.version, fixture.current.version);
+        assert_eq!(stat.content_hash, fixture.current.content_hash);
         assert_eq!(stat.size_bytes, Some(7));
-        assert!(
-            peer.calls
-                .lock()
-                .expect("calls")
-                .iter()
-                .all(|operation| matches!(
-                    operation,
-                    dfs::DfsNamespaceOperation::LookupPath { .. }
-                ))
-        );
-        drop(service);
-        std::fs::remove_dir_all(root).expect("cleanup");
+        let requests = fixture.requests();
+        assert!(!requests.is_empty());
+        assert!(requests.iter().all(|request| matches!(
+            &request.operation,
+            dfs::DfsNamespaceOperation::LookupPath { .. }
+        )));
+        fixture.close();
     }
 
     #[test]
     fn local_primary_feed_reads_resident_daemon_head_and_queues_only_response() {
-        let (mut service, peer, root) = primary_service("local-feed");
-        let cursor = dfs::DfsNamespaceChangeCursor {
-            file_system_id: dfs::sifs_file_system_id(),
-            shard_id: dfs::DfsMetadataShardId::new("root"),
-            authority_epoch: 1,
-            after_sequence: 1,
-        };
-        let batches = service
-            .poll_namespace_changes_for_subtree(dfs::sifs_file_system_id(), "/", &[cursor])
-            .expect("daemon feed");
-        assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0].next_cursor.after_sequence, 42);
-        assert_eq!(batches[0].journal_head_sequence, 42);
-        assert!(matches!(
-            peer.calls.lock().expect("calls").as_slice(),
-            [dfs::DfsNamespaceOperation::PollNamespaceChanges { .. }]
-        ));
-        drop(service);
-        std::fs::remove_dir_all(root).expect("cleanup");
+        let mut fixture = primary_service("cloud-files-local-feed", false);
+        let batches = fixture
+            .service
+            .poll_namespace_changes_for_subtree(
+                fixture.shard.file_system_id.clone(),
+                ROOT,
+                &fixture.feed_cursors,
+            )
+            .expect("actual daemon feed");
+        assert_eq!(batches.len(), fixture.feed_cursors.len());
+        assert!(batches.iter().all(|batch| !batch.rescan_required()));
+        for cursor in &fixture.feed_cursors {
+            let returned = batches
+                .iter()
+                .filter(|batch| batch.next_cursor.shard_id == cursor.shard_id)
+                .collect::<Vec<_>>();
+            assert_eq!(returned.len(), 1, "retain every actual subtree response");
+            assert_eq!(
+                returned[0].next_cursor.file_system_id,
+                cursor.file_system_id
+            );
+            assert_eq!(
+                returned[0].next_cursor.authority_epoch,
+                cursor.authority_epoch
+            );
+            assert!(returned[0].journal_head_sequence >= cursor.after_sequence);
+            assert_eq!(
+                returned[0].next_cursor.after_sequence,
+                returned[0].journal_head_sequence
+            );
+        }
+        let owning_batches = batches
+            .iter()
+            .filter(|batch| batch.next_cursor.shard_id.0 == fixture.shard.shard_id)
+            .collect::<Vec<_>>();
+        assert_eq!(owning_batches.len(), 1);
+        let owning_head = owning_batches[0].journal_head_sequence;
+        assert!(owning_head >= fixture.durable_head);
+        let requests = fixture.requests();
+        assert_eq!(requests.len(), fixture.feed_cursors.len());
+        assert!(requests.iter().all(|request| matches!(
+            &request.operation,
+            dfs::DfsNamespaceOperation::PollNamespaceChanges { .. }
+        )));
+        let PrimaryFixture {
+            runtime,
+            service,
+            reads,
+            local,
+            shard,
+            ..
+        } = fixture;
+        let transport = service.into_transport();
+        assert!(
+            transport.incoming_messages.is_empty(),
+            "normal routed poll consumes its sole response"
+        );
+        let metadata_root = runtime
+            .data_dir(&local)
+            .dfs_dir()
+            .join("metadata")
+            .join(&shard.shard_id);
+        let anchor = dfs::read_metadata_candidate(&metadata_root)
+            .expect("actual current snapshot anchor")
+            .prefix_proof;
+        let physical = dfs::inspect_metadata_prefix_descendant(
+            &metadata_root,
+            &dfs::DfsMetadataShardId::new(shard.shard_id),
+            &anchor,
+        )
+        .expect("pinned physical prefix inspection")
+        .expect("verified actual snapshot descendant");
+        assert!(physical.journal_sequence >= owning_head);
+        drop(reads);
+        drop(transport);
+        runtime.close().expect("normal native shutdown");
     }
 
     #[test]
     fn delegated_same_node_namespace_call_does_not_request_replica_replay() {
-        let (mut service, peer, root) = primary_service("local-no-replay");
-        let local = NodeId::from_legacy_named("cloud-files-local-primary").expect("node");
-        service
+        let mut fixture = primary_service("cloud-files-local-no-replay", false);
+        fixture
+            .service
             .route_namespace_operation_to_metadata_primary_with_timeout_and_options(
-                dfs::sifs_file_system_id(),
-                local,
+                fixture.shard.file_system_id.clone(),
+                fixture.local.clone(),
                 dfs::DfsNamespaceOperation::LookupPath {
-                    path: "/document.txt".into(),
+                    path: DOCUMENT.into(),
                     inline_range: None,
                 },
                 Duration::from_secs(1),
@@ -484,8 +557,268 @@ mod tests {
                 true,
             )
             .expect("resident-primary result without client replica ingest");
-        assert_eq!(peer.calls.lock().expect("calls").len(), 1);
-        drop(service);
-        std::fs::remove_dir_all(root).expect("cleanup");
+        let requests = fixture.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            matches!(&requests[0].operation, dfs::DfsNamespaceOperation::LookupPath { path, .. }
+            if path == DOCUMENT)
+        );
+        assert!(!requests[0].include_metadata_journal_batches);
+        assert!(requests[0].metadata_journal_after_sequences.is_empty());
+        assert!(fixture.service.metadata_backend().is_none());
+        fixture.close();
+    }
+    #[test]
+    fn same_node_endpoint_exclusive_write_uses_main_and_preserves_exact_retry() {
+        let mut fixture = primary_service("cloud-files-native-exclusive", true);
+        let path = format!("{ROOT}/exclusive.txt");
+        let operation = "cloud-files-exclusive-operation";
+        let options = dfs::DfsWriteOptions::replicated_eventual(vec![fixture.local.clone()]);
+        let before_rpc = fixture.runtime.rpc_observations().len();
+        let created = fixture
+            .service
+            .posix_create_file_with_operation_id(&path, b"old", options.clone(), operation)
+            .expect("ordinary exclusive create must reach the actual Main");
+        let mut main = fixture
+            .runtime
+            .client(&fixture.local)
+            .expect("actual Main client");
+        let durable = main
+            .metadata_backend()
+            .unwrap()
+            .get_object_on_shard(
+                &dfs::DfsMetadataShardId::new(fixture.shard.shard_id.clone()),
+                &created.object_id,
+            )
+            .unwrap()
+            .expect("Main's actual durable exclusive object");
+        assert_eq!(durable.version, created.version);
+        assert_eq!(durable.content_hash, fixture.old.content_hash);
+        assert_eq!(durable.content_size_bytes, Some(3));
+        assert_eq!(main.posix_read_file(&path).unwrap(), b"old");
+        let hash = durable.content_hash.as_deref().unwrap();
+        assert_eq!(main.content().read_blob(hash).unwrap(), b"old");
+
+        let replay = fixture
+            .service
+            .posix_create_file_with_operation_id(&path, b"old", options.clone(), operation)
+            .expect("same original operation replays its actual Main completion");
+        assert_eq!(replay.object_id, created.object_id);
+        assert_eq!(replay.version, created.version);
+        assert_eq!(replay.content_hash, created.content_hash);
+        let conflict = fixture
+            .service
+            .posix_create_file_with_operation_id(
+                &path,
+                b"old",
+                options,
+                "another-exclusive-operation",
+            )
+            .expect_err("another operation cannot replace an existing path");
+        assert!(matches!(conflict, dfs::DfsPosixError::AlreadyExists { .. }));
+        let after = main
+            .metadata_backend()
+            .unwrap()
+            .get_object_on_shard(
+                &dfs::DfsMetadataShardId::new(fixture.shard.shard_id.clone()),
+                &created.object_id,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(after, durable);
+
+        let history = main
+            .metadata_backend()
+            .unwrap()
+            .object_write_intent_history(&created.object_id)
+            .unwrap();
+        let intent_id = history
+            .intents
+            .iter()
+            .find(|record| record.operation_id.as_deref() == Some(operation))
+            .map(|record| record.intent_id.clone())
+            .or_else(|| {
+                history
+                    .receipts
+                    .iter()
+                    .find(|record| record.operation_id.as_deref() == Some(operation))
+                    .map(|record| record.intent_id.clone())
+            })
+            .expect("actual Main retains this original operation");
+        let intent = main
+            .metadata_backend()
+            .unwrap()
+            .get_intent(&created.object_id, &intent_id)
+            .unwrap()
+            .unwrap();
+        assert!(intent.publication.is_current());
+        assert_eq!(intent.status, dfs::DfsWriteIntentStatus::Committed);
+        assert_eq!(intent.file_system_id, fixture.shard.file_system_id);
+        assert_eq!(intent.coordinator_node_id, fixture.local);
+        assert_eq!(intent.owner_epoch, fixture.shard.epoch);
+        assert_eq!(intent.target_version, created.version);
+        assert_eq!(intent.content_hash, durable.content_hash);
+        let observations = fixture.runtime.rpc_observations();
+        let completed = observations
+            .iter()
+            .skip(before_rpc)
+            .find(|event| {
+                event.source == fixture.local
+                    && event.target == fixture.local
+                    && event.route == dfs::DFS_DATA_DISTRIBUTED_WRITE_ROUTE
+                    && event.origin == dfs::test_support::DfsTestRpcOrigin::RegisteredHost
+                    && event.phase == dfs::test_support::DfsTestRpcPhase::Completed
+            })
+            .expect("real same-node Main RPC completed; no local private execution");
+        assert!(
+            observations
+                .iter()
+                .any(|event| event.call_id == completed.call_id
+                    && event.source == completed.source
+                    && event.target == completed.target
+                    && event.route == completed.route
+                    && event.phase == dfs::test_support::DfsTestRpcPhase::BeforeDispatch)
+        );
+        assert_eq!(fixture.runtime.observation_dropped_count(), 0);
+        drop(main);
+        fixture.close();
+    }
+
+    #[test]
+    fn same_node_endpoint_retained_write_uses_main_without_replacing_current_head() {
+        let mut fixture = primary_service("cloud-files-native-retained", true);
+        let options = dfs::DfsWriteOptions::replicated_eventual(vec![fixture.local.clone()]);
+        let request = dfs::DfsPreservedContentRequest {
+            path: DOCUMENT.into(),
+            file_system_id: fixture.current.file_system_id.clone(),
+            object_id: fixture.current.object_id.clone(),
+            publication: dfs::DfsRetainedContentPublication {
+                namespace: "org.sinomo.endpoint.regression".into(),
+                reference_id: "retained-endpoint-body".into(),
+                metadata: None,
+            },
+            operation_id: "cloud-files-retained-operation".into(),
+        };
+        let before_rpc = fixture.runtime.rpc_observations().len();
+        let dfs::DfsPreservedContentOutcome::Retained { identity } = fixture
+            .service
+            .preserve_content_revision(request.clone(), &b"old"[..], options.clone())
+            .expect("ordinary retained reader must reach actual Main")
+        else {
+            panic!("actual W1 must publish the retained version");
+        };
+        let mut main = fixture
+            .runtime
+            .client(&fixture.local)
+            .expect("actual Main client");
+        let version = main
+            .metadata_backend()
+            .unwrap()
+            .get_version(&identity.object_id, &identity.version)
+            .unwrap()
+            .expect("actual Main's retained immutable version");
+        assert_ne!(identity.version, fixture.current.version);
+        assert_eq!(version.file_system_id, fixture.current.file_system_id);
+        assert_eq!(version.object_id, fixture.current.object_id);
+        assert_eq!(version.content_hash, fixture.old.content_hash);
+        assert_eq!(version.size_bytes, Some(3));
+        let grant = version
+            .retention_grant(&request.publication.namespace)
+            .expect("actual retained publication owns its namespace grant");
+        assert_eq!(grant.object.file_system_id, identity.file_system_id);
+        assert_eq!(grant.object.object_id, identity.object_id);
+        assert_eq!(grant.object.version, identity.version);
+        assert_eq!(grant.object.content_hash, version.content_hash);
+        assert_eq!(grant.object.content_size_bytes, version.size_bytes);
+        let hash = version.content_hash.as_deref().unwrap();
+        assert_eq!(main.content().read_blob(hash).unwrap(), b"old");
+        let canonical = main
+            .metadata_backend()
+            .unwrap()
+            .get_object_on_shard(
+                &dfs::DfsMetadataShardId::new(fixture.shard.shard_id.clone()),
+                &identity.object_id,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(canonical, fixture.current);
+        assert_eq!(main.posix_read_file(DOCUMENT).unwrap(), b"current");
+        let replay = fixture
+            .service
+            .preserve_content_revision(request.clone(), &b"old"[..], options)
+            .expect("same original retained operation replays the actual receipt");
+        assert_eq!(
+            replay,
+            dfs::DfsPreservedContentOutcome::Retained {
+                identity: identity.clone()
+            }
+        );
+        let after = main
+            .metadata_backend()
+            .unwrap()
+            .get_object_on_shard(
+                &dfs::DfsMetadataShardId::new(fixture.shard.shard_id.clone()),
+                &identity.object_id,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(after, canonical);
+        let history = main
+            .metadata_backend()
+            .unwrap()
+            .object_write_intent_history(&identity.object_id)
+            .unwrap();
+        let intent_id = history
+            .intents
+            .iter()
+            .find(|record| record.operation_id.as_deref() == Some(request.operation_id.as_str()))
+            .map(|record| record.intent_id.clone())
+            .or_else(|| {
+                history
+                    .receipts
+                    .iter()
+                    .find(|record| {
+                        record.operation_id.as_deref() == Some(request.operation_id.as_str())
+                    })
+                    .map(|record| record.intent_id.clone())
+            })
+            .expect("actual Main retains original retained command identity");
+        let intent = main
+            .metadata_backend()
+            .unwrap()
+            .get_intent(&identity.object_id, &intent_id)
+            .unwrap()
+            .unwrap();
+        assert!(!intent.publication.is_current());
+        assert_eq!(intent.status, dfs::DfsWriteIntentStatus::Committed);
+        assert_eq!(intent.file_system_id, identity.file_system_id);
+        assert_eq!(intent.coordinator_node_id, fixture.local);
+        assert_eq!(intent.owner_epoch, fixture.shard.epoch);
+        assert_eq!(intent.target_version, identity.version);
+        assert_eq!(intent.content_hash, version.content_hash);
+        let observations = fixture.runtime.rpc_observations();
+        let completed = observations
+            .iter()
+            .skip(before_rpc)
+            .find(|event| {
+                event.source == fixture.local
+                    && event.target == fixture.local
+                    && event.route == dfs::DFS_DATA_DISTRIBUTED_WRITE_ROUTE
+                    && event.origin == dfs::test_support::DfsTestRpcOrigin::RegisteredHost
+                    && event.phase == dfs::test_support::DfsTestRpcPhase::Completed
+            })
+            .expect("real same-node retained Main RPC completed");
+        assert!(
+            observations
+                .iter()
+                .any(|event| event.call_id == completed.call_id
+                    && event.source == completed.source
+                    && event.target == completed.target
+                    && event.route == completed.route
+                    && event.phase == dfs::test_support::DfsTestRpcPhase::BeforeDispatch)
+        );
+        let _observed_read_heads = fixture.requests();
+        drop(main);
+        fixture.close();
     }
 }

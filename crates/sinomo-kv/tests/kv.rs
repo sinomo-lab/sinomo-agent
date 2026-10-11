@@ -14253,6 +14253,10 @@ mod tests {
             .expect("install large durable snapshot");
         }
 
+        let read = read_cluster_kv_local_indexed_view_for_test(&paths, &node_id)
+            .expect("actual normal cold indexed reader");
+        let view = read.value;
+
         let point = read_cluster_kv_local_entry(&paths, &node_id, "/large/11999")
             .expect("cold indexed point read")
             .value
@@ -14262,18 +14266,21 @@ mod tests {
             .expect("indexed prefix read");
         assert_eq!(prefix.value.len(), 100);
 
-        let identity = raft_view_identity(&wal_paths).expect("durable identity");
-        let view =
-            cache_lookup_raft_view(&wal_paths, &node_id, identity).expect("indexed cold-read view");
         assert_eq!(
             view.snapshot_materializations_for_test(),
             0,
             "point and prefix reads must not materialize the complete keyspace"
         );
-        let snapshot =
-            read_cluster_kv_local_snapshot(&paths, &node_id).expect("full snapshot request");
-        assert_eq!(snapshot.value.entries.len(), 12_000);
+        // The bounded LRU is not the caller's custody. Materialize the exact
+        // returned indexed view, even if unrelated native readers evict it.
+        let snapshot = view
+            .try_snapshot()
+            .expect("full snapshot of returned DATA view");
+        assert_eq!(snapshot.entries.len(), 12_000);
         assert_eq!(view.snapshot_materializations_for_test(), 1);
+        let ordinary = read_cluster_kv_local_snapshot(&paths, &node_id)
+            .expect("ordinary full snapshot request");
+        assert_eq!(ordinary.value.entries, snapshot.entries);
     }
 
     #[test]

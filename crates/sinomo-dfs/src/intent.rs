@@ -2,9 +2,9 @@ use sinomo_core::{Id, node::NodeId};
 use time::OffsetDateTime;
 
 use crate::{
-    DfsConflictReadView, DfsConflictRecord, DfsDistributedError, DfsDistributedWriteCommand,
-    DfsObjectId, DfsObjectMetadata, DfsVersion, DfsWriteIntentRecord, DfsWriteIntentState,
-    DfsWriteIntentStatus, DistributedWriteIntent, content_hash,
+    DfsDistributedError, DfsDistributedWriteCommand, DfsObjectId, DfsObjectMetadata, DfsVersion,
+    DfsWriteIntentRecord, DfsWriteIntentState, DfsWriteIntentStatus, DistributedWriteIntent,
+    content_hash,
 };
 
 /// Durable authority-local identity for one caller-owned write operation.
@@ -28,8 +28,8 @@ pub(crate) fn stable_write_intent_id(
 /// Extract the monotonic token carried by current caller-owned operation ids.
 ///
 /// The prefix remains caller-defined; only the final lowercase ULID component
-/// participates in retention floors. Legacy opaque ids deliberately return
-/// `None` and fail closed after their bounded compatibility history expires.
+/// participates in retention floors. IDs without that token provide no ordered
+/// admission evidence once their exact retained receipt is collected.
 pub fn stable_operation_order_token(operation_id: &str) -> Option<String> {
     let candidate = operation_id.rsplit('_').next().unwrap_or(operation_id);
     Id::new(candidate.to_string())
@@ -69,39 +69,6 @@ pub(crate) fn routed_write_command_content_hash(command: &DfsDistributedWriteCom
         .unwrap_or_else(|| content_hash(&command.bytes))
 }
 
-pub(crate) fn distributed_intent_matches_routed_write_command(
-    intent: &DistributedWriteIntent,
-    requester_node_id: &NodeId,
-    command: &DfsDistributedWriteCommand,
-) -> bool {
-    intent.publication == command.publication
-        && intent.file_system_id == command.request.file_system_id
-        && intent.object_id == command.request.object_id
-        && intent.base_version == command.expected_base_version
-        && intent.target_version == command.request.target_version
-        && intent.requesting_node_id == *requester_node_id
-        && command.request.requesting_node_id == *requester_node_id
-        // Primary-side normalization may inject the object's owner and widen
-        // the effective policy. Reusing a stronger plan is safe; reusing an
-        // intent that omits a requested node or weakens either threshold is
-        // not.
-        && command
-            .desired_replica_nodes
-            .iter()
-            .all(|node_id| intent.desired_replica_nodes.contains(node_id))
-        && intent.policy.min_commit_replicas >= command.policy.min_commit_replicas
-        && intent.policy.desired_replicas >= command.policy.desired_replicas
-        // The durable flag is gated by whether the authority actually created
-        // a transient object. Existing-object writes may therefore carry a
-        // caller `true` while the intent correctly stores `false`; the inverse
-        // would lose a required create side effect and is not an exact replay.
-        && (!intent.touch_parent_on_create || command.touch_parent_on_create)
-        && matches!(
-            intent.state,
-            DfsWriteIntentState::AwaitingReceipts | DfsWriteIntentState::Committed
-        )
-}
-
 /// Match the durable fields which define a caller-owned operation replay.
 ///
 /// The observed base version is deliberately excluded. A blind-write retry
@@ -123,35 +90,6 @@ pub(crate) fn stable_distributed_intent_matches_routed_write_command(
         && matches!(
             intent.state,
             DfsWriteIntentState::AwaitingReceipts | DfsWriteIntentState::Committed
-        )
-}
-
-pub(crate) fn write_intent_record_matches_routed_write_command(
-    record: &DfsWriteIntentRecord,
-    requester_node_id: &NodeId,
-    command: &DfsDistributedWriteCommand,
-    expected_content_hash: &str,
-) -> bool {
-    record.publication == command.publication
-        && record.file_system_id == command.request.file_system_id
-        && record.object_id == command.request.object_id
-        && record.base_version == command.expected_base_version
-        && record.target_version == command.request.target_version
-        && record.coordinator_node_id == *requester_node_id
-        && command.request.requesting_node_id == *requester_node_id
-        && record.content_hash.as_deref() == Some(expected_content_hash)
-        && command
-            .desired_replica_nodes
-            .iter()
-            .all(|node_id| record.desired_replica_node_ids.contains(node_id))
-        && record.policy.min_commit_replicas >= command.policy.min_commit_replicas
-        && record.policy.desired_replicas >= command.policy.desired_replicas
-        && (!record.touch_parent_on_create || command.touch_parent_on_create)
-        && matches!(
-            record.status,
-            DfsWriteIntentStatus::Staging
-                | DfsWriteIntentStatus::ReceiptsPending
-                | DfsWriteIntentStatus::Committed
         )
 }
 
@@ -210,7 +148,6 @@ fn write_intent_status(state: &DfsWriteIntentState) -> DfsWriteIntentStatus {
         DfsWriteIntentState::AwaitingReceipts => DfsWriteIntentStatus::ReceiptsPending,
         DfsWriteIntentState::Committed => DfsWriteIntentStatus::Committed,
         DfsWriteIntentState::Rejected => DfsWriteIntentStatus::Rejected,
-        DfsWriteIntentState::Conflict => DfsWriteIntentStatus::Conflict,
         DfsWriteIntentState::Aborted => DfsWriteIntentStatus::Aborted,
     }
 }
@@ -263,7 +200,6 @@ fn distributed_intent_state_from_status(status: &DfsWriteIntentStatus) -> DfsWri
         }
         DfsWriteIntentStatus::Committed => DfsWriteIntentState::Committed,
         DfsWriteIntentStatus::Rejected => DfsWriteIntentState::Rejected,
-        DfsWriteIntentStatus::Conflict => DfsWriteIntentState::Conflict,
         DfsWriteIntentStatus::Aborted => DfsWriteIntentState::Aborted,
     }
 }
@@ -284,22 +220,6 @@ pub(crate) fn distributed_error_is_stale_or_concurrent_write(error: &DfsDistribu
             | DfsDistributedError::DuplicateIntent { .. }
             | DfsDistributedError::PendingIntentConflict { .. }
     )
-}
-
-impl From<DfsConflictRecord> for DfsConflictReadView {
-    fn from(conflict: DfsConflictRecord) -> Self {
-        Self {
-            conflict_id: conflict.conflict_id,
-            base_version: conflict.base_version,
-            local_version: conflict.local_version,
-            remote_version: conflict.remote_version,
-            detected_by_node_id: conflict.detected_by_node_id,
-            reason: conflict.reason,
-            local_content_hash: conflict.local_content_hash,
-            remote_content_hash: conflict.remote_content_hash,
-            status: conflict.status,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -332,6 +252,7 @@ mod stable_operation_tests {
         let target_version = stable_write_target_version(requester, object_id, operation_id);
         DfsDistributedWriteCommand {
             publication: Default::default(),
+            patch: None,
             request_id: operation_id.to_string(),
             request: DfsWriteRequest {
                 file_system_id: file_system_id(),

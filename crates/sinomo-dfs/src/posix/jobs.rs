@@ -16,8 +16,8 @@ use crate::posix_model::{
     DfsNamespaceJobFailure, DfsNamespaceJobMaintenanceReport, DfsPosixError, Result,
 };
 use crate::posix_path::{
-    hidden_alias_tombstone_path, normalize_posix_path,
-    normalize_posix_path_with_trailing_directory, parent_posix_path, subtree_prefix,
+    normalize_posix_path, normalize_posix_path_with_trailing_directory, parent_posix_path,
+    subtree_prefix,
 };
 use crate::{
     DfsMessageCommittedWork, DfsMessageTransport, DfsNamespaceJobFrame, DfsNamespaceJobKind,
@@ -85,6 +85,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         max_steps: usize,
     ) -> Result<DfsNamespaceJobRecord> {
         let _namespace_plan = self.namespace_execution.begin_planning();
+        self.check_cancelled("namespace job resume")?;
         let Some(job) = self.namespace_job(job_id)? else {
             return Err(DfsPosixError::NotFound {
                 path: job_id.to_string(),
@@ -92,6 +93,22 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         };
         if job.status != DfsNamespaceJobStatus::Running {
             return Ok(job);
+        }
+        if self.transport.delegates_local_namespace_authority()
+            && let Some(primary) = self.routed_namespace_primary_for_path(&job.root_path)?
+        {
+            return self.route_namespace_job_operation(
+                primary,
+                DfsNamespaceOperation::ResumeNamespaceJobBounded {
+                    job_id: job.job_id.clone(),
+                    path: job.root_path.clone(),
+                    max_steps: u64::try_from(max_steps).map_err(|_| {
+                        DfsPosixError::InvalidPath {
+                            path: "namespace job step budget exceeds u64".into(),
+                        }
+                    })?,
+                },
+            );
         }
         match job.kind {
             DfsNamespaceJobKind::ContentCopy => self
@@ -162,6 +179,42 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         }
                     },
                     Err(error) => {
+                        if self.remote_namespace_phase.is_some() {
+                            // Stop at this actual phase; a later job must not
+                            // replace its owned source custody. Join its durable
+                            // origin using the existing exact request predicate.
+                            let origin = job.origin.as_ref().ok_or_else(|| {
+                                DfsPosixError::Dfs(crate::DfsError::Metadata {
+                                    message: "remote job recovery has no durable request origin"
+                                        .into(),
+                                })
+                            })?;
+                            let request = self
+                                .metadata_backend
+                                .as_ref()
+                                .expect("metadata backend checked above")
+                                .get_namespace_request(
+                                    &origin.requester_node_id,
+                                    &origin.request_id,
+                                )?
+                                .ok_or_else(|| {
+                                    DfsPosixError::Dfs(crate::DfsError::Metadata {
+                                        message: "remote job recovery lost its durable request"
+                                            .into(),
+                                    })
+                                })?;
+                            if request.file_system_id != job.file_system_id
+                                || !origin.matches_request(&request)
+                                || request.status != crate::DfsNamespaceRequestStatus::Pending
+                            {
+                                return Err(DfsPosixError::Dfs(crate::DfsError::Metadata {
+                                    message: "remote job recovery differs from its durable request"
+                                        .into(),
+                                }));
+                            }
+                            self.pending_namespace_request_recovery = Some(Box::new(request));
+                            return Err(error);
+                        }
                         let reason = error.to_string();
                         let latest = self.namespace_job(&job.job_id)?.unwrap_or(job);
                         match latest.status {
@@ -170,7 +223,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                     report.completed_job_count.saturating_add(1);
                             }
                             DfsNamespaceJobStatus::Running
-                                if namespace_job_kind_is_cross_shard(&latest.kind) =>
+                                if namespace_job_kind_is_cross_shard(&latest.kind)
+                                    || matches!(
+                                        &error,
+                                        DfsPosixError::Dfs(crate::DfsError::Cancelled { .. })
+                                    ) =>
                             {
                                 report.remaining_running_job_count =
                                     report.remaining_running_job_count.saturating_add(1);
@@ -372,13 +429,123 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(backend.get_namespace_job(job_id)?)
     }
 
-    pub(crate) fn persist_namespace_job(&mut self, job: &DfsNamespaceJobRecord) -> Result<()> {
-        let persisted = if let Some(backend) = self.metadata_backend.as_mut() {
-            backend.put_namespace_job(job)?;
-            true
+    /// Publish complete current job DATA through the ordinary prepared kernel.
+    /// Callers must establish their import/application authority separately;
+    /// this method still acquires the actual current owning-shard guard.
+    pub fn publish_namespace_job_data(
+        &mut self,
+        job: &DfsNamespaceJobRecord,
+    ) -> Result<crate::DfsPreparedOperationDigest> {
+        if job.status != DfsNamespaceJobStatus::Running {
+            return Err(DfsPosixError::Dfs(crate::DfsError::Metadata {
+                message: "namespace job DATA publication requires a running current job".into(),
+            }));
+        }
+        let binding = blake3::hash(&serde_json::to_vec(job).map_err(|error| {
+            DfsPosixError::Dfs(crate::DfsError::Metadata {
+                message: error.to_string(),
+            })
+        })?)
+        .to_hex()
+        .to_string();
+        let operation_id = format!("namespace-job-data-v7:{binding}");
+        let mut route = crate::posix_object::new_posix_metadata_object(
+            &self.node_id,
+            &job.root_path,
+            DfsObjectKind::Directory,
+        );
+        route.file_system_id = job.file_system_id.clone();
+        let scope = self.metadata_effect_scope_for_object(&route, operation_id.clone())?;
+        let _execution = self.acquire_prepared_execution(&scope)?;
+        let backend = self.metadata_backend.as_ref().ok_or_else(|| {
+            DfsPosixError::Dfs(crate::DfsError::Metadata {
+                message: "job publication requires a durable current backend".into(),
+            })
+        })?;
+        let stored = backend.prepared_operation_record(&operation_id)?;
+        if let Some(stored) = stored.as_ref() {
+            if stored.file_system_id != job.file_system_id
+                || stored.shard_id != scope.shard_id
+                || stored
+                    .metadata_effects
+                    .iter()
+                    .filter_map(|effect| effect.namespace_jobs())
+                    .collect::<Vec<_>>()
+                    != vec![job]
+            {
+                return Err(DfsPosixError::Dfs(crate::DfsError::Metadata {
+                    message: "job DATA retry changes its actual stored body or scope".into(),
+                }));
+            }
+            if stored.status == crate::DfsPreparedOperationStatus::Committed {
+                return Ok(stored.digest.clone());
+            }
+        } else if backend
+            .get_namespace_job(&job.job_id)?
+            .is_some_and(|existing| existing != *job)
+        {
+            return Err(DfsPosixError::Dfs(crate::DfsError::Metadata {
+                message: "job DATA collides with an unproven current job generation".into(),
+            }));
+        }
+        let payload = if let Some(stored) = stored {
+            (*stored.payload).clone()
         } else {
-            false
+            crate::DfsPreparedOperationPayload::for_metadata_effects(
+                scope,
+                Vec::new(),
+                Vec::new(),
+                vec![crate::DfsPreparedMetadataEffect::PutNamespaceJob { job: job.clone() }],
+                job.updated_at,
+            )?
         };
+        let digest = self.prepare_payload_for_publication(payload)?;
+        self.commit_stored_prepared_operation(&digest)?;
+        self.record_message_committed_work(DfsMessageCommittedWork {
+            publish_metadata: true,
+            namespace_maintenance: true,
+            repair_maintenance: false,
+            metadata_replica_progress: false,
+            metadata_materialization: false,
+            semantic_changes: false,
+        });
+        Ok(digest)
+    }
+
+    pub(crate) fn persist_namespace_job(&mut self, job: &DfsNamespaceJobRecord) -> Result<()> {
+        let existing = self
+            .metadata_backend
+            .as_ref()
+            .ok_or_else(|| {
+                DfsPosixError::Dfs(crate::DfsError::Metadata {
+                    message: "namespace jobs require current durable metadata".into(),
+                })
+            })?
+            .get_namespace_job(&job.job_id)?;
+        if existing.as_ref() != Some(job) {
+            let mut route = crate::posix_object::new_posix_metadata_object(
+                &self.node_id,
+                &job.root_path,
+                DfsObjectKind::Directory,
+            );
+            route.file_system_id = job.file_system_id.clone();
+            let scope = self.metadata_effect_scope_for_object(
+                &route,
+                format!(
+                    "namespace-job:{}:{}",
+                    job.job_id,
+                    sinomo_core::Id::generate()
+                ),
+            )?;
+            let _execution = self.acquire_prepared_execution(&scope)?;
+            self.publish_metadata_effects_on_shard(
+                scope,
+                Vec::new(),
+                Vec::new(),
+                vec![crate::DfsPreparedMetadataEffect::PutNamespaceJob { job: job.clone() }],
+            )?;
+        }
+        let persisted = true;
         if persisted {
             // The backend row is the durable owner for a resumable namespace
             // saga. Retain its publication and one reactive maintenance edge
@@ -604,10 +771,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     )?;
                     return Ok(true);
                 }
-                let alias_tombstone = self.tombstone_path_object_at(
-                    alias.clone(),
-                    hidden_alias_tombstone_path(&alias.object_id),
-                );
+                let hidden_path = self.hidden_alias_tombstone_path_on_destination_shard(
+                    &alias_path,
+                    &alias.object_id,
+                )?;
+                let alias_tombstone = self.tombstone_path_object_at(alias.clone(), hidden_path);
 
                 let mut old_path_tombstone = object.clone();
                 old_path_tombstone.object_id = DfsObjectId::generate();

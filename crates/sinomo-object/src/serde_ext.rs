@@ -114,6 +114,10 @@ where
     T: Serialize + ?Sized,
     O: SobjOutput + ?Sized,
 {
+    // Erase the concrete output once, before it enters the serde type graph.
+    // This stack adapter also accepts an already-unsized SobjOutput caller.
+    let mut output = BorrowedSobjOutput(out);
+    let out: &mut dyn SobjOutput = &mut output;
     let start = out.len();
     if let Err(error) = append_bytes_inner(out, value, version_id, length_mode) {
         out.truncate(start);
@@ -122,15 +126,32 @@ where
     Ok(start..out.len())
 }
 
-fn append_bytes_inner<T, O>(
-    out: &mut O,
+/// Forward only output mechanics; serialization specializes for the value alone.
+struct BorrowedSobjOutput<'a, O: SobjOutput + ?Sized>(&'a mut O);
+
+impl<O: SobjOutput + ?Sized> SobjOutput for BorrowedSobjOutput<'_, O> {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+    fn append(&mut self, bytes: &[u8], context: &'static str) -> Result<()> {
+        self.0.append(bytes, context)
+    }
+    fn patch(&mut self, offset: usize, bytes: &[u8]) -> Result<()> {
+        self.0.patch(offset, bytes)
+    }
+    fn truncate(&mut self, len: usize) {
+        self.0.truncate(len)
+    }
+}
+
+fn append_bytes_inner<T>(
+    out: &mut dyn SobjOutput,
     value: &T,
     version_id: u16,
     length_mode: LengthMode,
 ) -> Result<()>
 where
     T: Serialize + ?Sized,
-    O: SobjOutput + ?Sized,
 {
     let start = out.len();
     out.append(MAGIC, "serde document magic")?;
@@ -343,10 +364,9 @@ fn element_type_id(element_type: &ElementType) -> Result<u8> {
 }
 
 /// Writes a standalone element (`type_id` byte + value bytes) for `value` into `out`.
-fn serialize_element_into<T, O>(out: &mut O, mode: LengthMode, value: &T) -> Result<()>
+fn serialize_element_into<T>(out: &mut dyn SobjOutput, mode: LengthMode, value: &T) -> Result<()>
 where
     T: Serialize + ?Sized,
-    O: SobjOutput + ?Sized,
 {
     let type_id_offset = out.len();
     output_write_u8(out, 0, "serde element type id")?; // patched once the type is known
@@ -357,16 +377,16 @@ where
 
 /// serde `Serializer` that writes a value's bytes straight into `out` and returns
 /// the value's `ElementType` (so a containing list/optional/element can frame it).
-struct ByteSerializer<'a, O: SobjOutput + ?Sized> {
-    out: &'a mut O,
+struct ByteSerializer<'a> {
+    out: &'a mut dyn SobjOutput,
     mode: LengthMode,
 }
 
-impl<'a, O: SobjOutput + ?Sized> ByteSerializer<'a, O> {
+impl<'a> ByteSerializer<'a> {
     fn builtin(
         self,
         type_id: TypeId,
-        write: impl FnOnce(&mut O) -> Result<()>,
+        write: impl FnOnce(&mut dyn SobjOutput) -> Result<()>,
     ) -> Result<ElementType> {
         write(self.out)?;
         Ok(ElementType::Builtin(type_id))
@@ -562,16 +582,16 @@ fn probe_element_type<T: Serialize + ?Sized>(value: &T) -> Result<ElementType> {
     value.serialize(TypeProbeSerializer)
 }
 
-impl<'a, O: SobjOutput + ?Sized> ser::Serializer for ByteSerializer<'a, O> {
+impl<'a> ser::Serializer for ByteSerializer<'a> {
     type Ok = ElementType;
     type Error = Error;
-    type SerializeSeq = ByteSeqSerializer<'a, O>;
-    type SerializeTuple = ByteSeqSerializer<'a, O>;
-    type SerializeTupleStruct = ByteSeqSerializer<'a, O>;
-    type SerializeTupleVariant = ByteVariantSeqSerializer<'a, O>;
-    type SerializeMap = ByteMapSerializer<'a, O>;
-    type SerializeStruct = ByteStructSerializer<'a, O>;
-    type SerializeStructVariant = ByteVariantStructSerializer<'a, O>;
+    type SerializeSeq = ByteSeqSerializer<'a>;
+    type SerializeTuple = ByteSeqSerializer<'a>;
+    type SerializeTupleStruct = ByteSeqSerializer<'a>;
+    type SerializeTupleVariant = ByteVariantSeqSerializer<'a>;
+    type SerializeMap = ByteMapSerializer<'a>;
+    type SerializeStruct = ByteStructSerializer<'a>;
+    type SerializeStructVariant = ByteVariantStructSerializer<'a>;
 
     fn serialize_bool(self, v: bool) -> Result<ElementType> {
         self.builtin(TypeId::Boolean, |out| {
@@ -703,11 +723,11 @@ impl<'a, O: SobjOutput + ?Sized> ser::Serializer for ByteSerializer<'a, O> {
         Ok(ElementType::Object)
     }
 
-    fn serialize_seq(self, len: Option<usize>) -> Result<ByteSeqSerializer<'a, O>> {
+    fn serialize_seq(self, len: Option<usize>) -> Result<ByteSeqSerializer<'a>> {
         Ok(ByteSeqSerializer::new(self.out, self.mode, len))
     }
 
-    fn serialize_tuple(self, len: usize) -> Result<ByteSeqSerializer<'a, O>> {
+    fn serialize_tuple(self, len: usize) -> Result<ByteSeqSerializer<'a>> {
         self.serialize_seq(Some(len))
     }
 
@@ -715,7 +735,7 @@ impl<'a, O: SobjOutput + ?Sized> ser::Serializer for ByteSerializer<'a, O> {
         self,
         _name: &'static str,
         len: usize,
-    ) -> Result<ByteSeqSerializer<'a, O>> {
+    ) -> Result<ByteSeqSerializer<'a>> {
         self.serialize_seq(Some(len))
     }
 
@@ -725,7 +745,7 @@ impl<'a, O: SobjOutput + ?Sized> ser::Serializer for ByteSerializer<'a, O> {
         _variant_index: u32,
         variant: &'static str,
         _len: usize,
-    ) -> Result<ByteVariantSeqSerializer<'a, O>> {
+    ) -> Result<ByteVariantSeqSerializer<'a>> {
         // `{ variant: [ .. ] }`: outer object header, then the list value.
         output_write_length(self.out, self.mode, 1)?;
         output_write_string(self.out, self.mode, variant)?;
@@ -735,7 +755,7 @@ impl<'a, O: SobjOutput + ?Sized> ser::Serializer for ByteSerializer<'a, O> {
         })
     }
 
-    fn serialize_map(self, _len: Option<usize>) -> Result<ByteMapSerializer<'a, O>> {
+    fn serialize_map(self, _len: Option<usize>) -> Result<ByteMapSerializer<'a>> {
         let length_offset = self.out.len();
         output_write_length(self.out, self.mode, 0)?; // patched in `end`
         let keys = try_hashset_with_capacity(_len.unwrap_or(0), "serde map keys")?;
@@ -749,11 +769,7 @@ impl<'a, O: SobjOutput + ?Sized> ser::Serializer for ByteSerializer<'a, O> {
         })
     }
 
-    fn serialize_struct(
-        self,
-        _name: &'static str,
-        len: usize,
-    ) -> Result<ByteStructSerializer<'a, O>> {
+    fn serialize_struct(self, _name: &'static str, len: usize) -> Result<ByteStructSerializer<'a>> {
         output_write_length(self.out, self.mode, len as u64)?;
         Ok(ByteStructSerializer {
             out: self.out,
@@ -770,7 +786,7 @@ impl<'a, O: SobjOutput + ?Sized> ser::Serializer for ByteSerializer<'a, O> {
         _variant_index: u32,
         variant: &'static str,
         len: usize,
-    ) -> Result<ByteVariantStructSerializer<'a, O>> {
+    ) -> Result<ByteVariantStructSerializer<'a>> {
         // `{ variant: { .. } }`: outer object header, then the inner object value.
         output_write_length(self.out, self.mode, 1)?;
         output_write_string(self.out, self.mode, variant)?;
@@ -794,16 +810,16 @@ impl<'a, O: SobjOutput + ?Sized> ser::Serializer for ByteSerializer<'a, O> {
 
 /// Streams a homogeneous sequence into `out` as `list<element_type>`. Inspect
 /// the first element's descriptor, then write every value directly into `out`.
-struct ByteSeqSerializer<'a, O: SobjOutput + ?Sized> {
-    out: &'a mut O,
+struct ByteSeqSerializer<'a> {
+    out: &'a mut dyn SobjOutput,
     mode: LengthMode,
     element_type: Option<ElementType>,
     length_offset: usize,
     count: u64,
 }
 
-impl<'a, O: SobjOutput + ?Sized> ByteSeqSerializer<'a, O> {
-    fn new(out: &'a mut O, mode: LengthMode, _len: Option<usize>) -> Self {
+impl<'a> ByteSeqSerializer<'a> {
+    fn new(out: &'a mut dyn SobjOutput, mode: LengthMode, _len: Option<usize>) -> Self {
         Self {
             out,
             mode,
@@ -865,7 +881,7 @@ impl<'a, O: SobjOutput + ?Sized> ByteSeqSerializer<'a, O> {
     }
 }
 
-impl<'a, O: SobjOutput + ?Sized> SerializeSeq for ByteSeqSerializer<'a, O> {
+impl<'a> SerializeSeq for ByteSeqSerializer<'a> {
     type Ok = ElementType;
     type Error = Error;
 
@@ -878,7 +894,7 @@ impl<'a, O: SobjOutput + ?Sized> SerializeSeq for ByteSeqSerializer<'a, O> {
     }
 }
 
-impl<'a, O: SobjOutput + ?Sized> SerializeTuple for ByteSeqSerializer<'a, O> {
+impl<'a> SerializeTuple for ByteSeqSerializer<'a> {
     type Ok = ElementType;
     type Error = Error;
 
@@ -891,7 +907,7 @@ impl<'a, O: SobjOutput + ?Sized> SerializeTuple for ByteSeqSerializer<'a, O> {
     }
 }
 
-impl<'a, O: SobjOutput + ?Sized> SerializeTupleStruct for ByteSeqSerializer<'a, O> {
+impl<'a> SerializeTupleStruct for ByteSeqSerializer<'a> {
     type Ok = ElementType;
     type Error = Error;
 
@@ -905,11 +921,11 @@ impl<'a, O: SobjOutput + ?Sized> SerializeTupleStruct for ByteSeqSerializer<'a, 
 }
 
 /// Tuple-enum-variant: a list value wrapped in a single-field object.
-struct ByteVariantSeqSerializer<'a, O: SobjOutput + ?Sized> {
-    inner: ByteSeqSerializer<'a, O>,
+struct ByteVariantSeqSerializer<'a> {
+    inner: ByteSeqSerializer<'a>,
 }
 
-impl<'a, O: SobjOutput + ?Sized> SerializeTupleVariant for ByteVariantSeqSerializer<'a, O> {
+impl<'a> SerializeTupleVariant for ByteVariantSeqSerializer<'a> {
     type Ok = ElementType;
     type Error = Error;
 
@@ -924,8 +940,8 @@ impl<'a, O: SobjOutput + ?Sized> SerializeTupleVariant for ByteVariantSeqSeriali
 }
 
 /// Streams a map into `out` as an object (`length` + `key + element` pairs).
-struct ByteMapSerializer<'a, O: SobjOutput + ?Sized> {
-    out: &'a mut O,
+struct ByteMapSerializer<'a> {
+    out: &'a mut dyn SobjOutput,
     mode: LengthMode,
     length_offset: usize,
     count: u64,
@@ -933,7 +949,7 @@ struct ByteMapSerializer<'a, O: SobjOutput + ?Sized> {
     keys: HashSet<String>,
 }
 
-impl<'a, O: SobjOutput + ?Sized> SerializeMap for ByteMapSerializer<'a, O> {
+impl<'a> SerializeMap for ByteMapSerializer<'a> {
     type Ok = ElementType;
     type Error = Error;
 
@@ -1017,16 +1033,16 @@ impl<'a> InlineKeySet<'a> {
 
 /// Streams a struct into `out` as an object. The field count is known up front, so
 /// the object length is written immediately and each field is appended in place.
-struct ByteStructSerializer<'a, O: SobjOutput + ?Sized> {
-    out: &'a mut O,
+struct ByteStructSerializer<'a> {
+    out: &'a mut dyn SobjOutput,
     mode: LengthMode,
     expected_fields: usize,
     written_fields: usize,
     keys: InlineKeySet<'static>,
 }
 
-impl<'a, O: SobjOutput + ?Sized> ByteStructSerializer<'a, O> {
-    fn field<T: Serialize + ?Sized>(&mut self, key: &'static str, value: &T) -> Result<()> {
+impl<'a> ByteStructSerializer<'a> {
+    fn begin_field(&mut self, key: &'static str) -> Result<()> {
         if self.written_fields >= self.expected_fields {
             return Err(Error::Serde(
                 "struct serialized more fields than declared".to_string(),
@@ -1035,7 +1051,11 @@ impl<'a, O: SobjOutput + ?Sized> ByteStructSerializer<'a, O> {
         if !self.keys.insert(key, "serde struct keys")? {
             return duplicate_key_error(key);
         }
-        output_write_string(self.out, self.mode, key)?;
+        output_write_string(self.out, self.mode, key)
+    }
+
+    fn field<T: Serialize + ?Sized>(&mut self, key: &'static str, value: &T) -> Result<()> {
+        self.begin_field(key)?;
         serialize_element_into(self.out, self.mode, value)?;
         self.written_fields += 1;
         Ok(())
@@ -1052,7 +1072,7 @@ impl<'a, O: SobjOutput + ?Sized> ByteStructSerializer<'a, O> {
     }
 }
 
-impl<'a, O: SobjOutput + ?Sized> SerializeStruct for ByteStructSerializer<'a, O> {
+impl<'a> SerializeStruct for ByteStructSerializer<'a> {
     type Ok = ElementType;
     type Error = Error;
 
@@ -1070,11 +1090,11 @@ impl<'a, O: SobjOutput + ?Sized> SerializeStruct for ByteStructSerializer<'a, O>
 }
 
 /// Struct-enum-variant: an inner object wrapped in a single-field object.
-struct ByteVariantStructSerializer<'a, O: SobjOutput + ?Sized> {
-    inner: ByteStructSerializer<'a, O>,
+struct ByteVariantStructSerializer<'a> {
+    inner: ByteStructSerializer<'a>,
 }
 
-impl<'a, O: SobjOutput + ?Sized> SerializeStructVariant for ByteVariantStructSerializer<'a, O> {
+impl<'a> SerializeStructVariant for ByteVariantStructSerializer<'a> {
     type Ok = ElementType;
     type Error = Error;
 
@@ -1094,7 +1114,117 @@ impl<'a, O: SobjOutput + ?Sized> SerializeStructVariant for ByteVariantStructSer
 /// Whether the next value to read carries its own 1-byte `type_id` tag (a standalone
 /// element: payload, object field, enum payload) or is a bare value whose type is
 /// already known from the surrounding container (a list element / optional inner).
-enum Shape {
+/// Private cursor capability shared by contiguous and ownership-bearing input.
+/// Borrowed leaves belong to the complete document; owned leaves belong to the
+/// chunk decoder's existing bounded per-value allocation.
+pub(super) enum SobjText<'de> {
+    Borrowed(&'de str),
+    Owned(String),
+}
+pub(super) enum SobjBytes<'de> {
+    Borrowed(&'de [u8]),
+    Owned(Vec<u8>),
+}
+pub(super) trait SobjInput<'de> {
+    fn read_u8(&mut self) -> Result<u8>;
+    fn read_u16(&mut self) -> Result<u16>;
+    fn read_u32(&mut self) -> Result<u32>;
+    fn read_i32(&mut self) -> Result<i32>;
+    fn read_u64(&mut self) -> Result<u64>;
+    fn read_i64(&mut self) -> Result<i64>;
+    fn read_text(&mut self) -> Result<SobjText<'de>>;
+    fn read_blob(&mut self) -> Result<SobjBytes<'de>>;
+    fn read_container_len(&mut self) -> Result<usize>;
+    fn read_element_type(&mut self) -> Result<ElementType>;
+    fn skip_padding(&mut self) -> Result<()>;
+    fn enter_nesting(&mut self) -> Result<usize>;
+    fn restore_nesting(&mut self, previous: usize);
+    fn borrowed_keys(&self) -> bool;
+    #[cfg(test)]
+    fn nesting_depth(&self) -> usize;
+}
+macro_rules! forward_input_numbers {
+    () => {
+        fn read_u8(&mut self) -> Result<u8> {
+            Self::read_u8(self)
+        }
+        fn read_u16(&mut self) -> Result<u16> {
+            Self::read_u16(self)
+        }
+        fn read_u32(&mut self) -> Result<u32> {
+            Self::read_u32(self)
+        }
+        fn read_i32(&mut self) -> Result<i32> {
+            Self::read_i32(self)
+        }
+        fn read_u64(&mut self) -> Result<u64> {
+            Self::read_u64(self)
+        }
+        fn read_i64(&mut self) -> Result<i64> {
+            Self::read_i64(self)
+        }
+        fn read_container_len(&mut self) -> Result<usize> {
+            Self::read_container_len(self)
+        }
+    };
+}
+pub(super) use forward_input_numbers;
+impl<'de, 'a: 'de> SobjInput<'de> for Reader<'a> {
+    forward_input_numbers!();
+    fn read_text(&mut self) -> Result<SobjText<'de>> {
+        Reader::read_string(self).map(SobjText::Borrowed)
+    }
+    fn read_blob(&mut self) -> Result<SobjBytes<'de>> {
+        Reader::read_bytes(self).map(SobjBytes::Borrowed)
+    }
+    fn read_element_type(&mut self) -> Result<ElementType> {
+        read_element_type(self)
+    }
+    fn skip_padding(&mut self) -> Result<()> {
+        Reader::skip_padding(self);
+        Ok(())
+    }
+    fn enter_nesting(&mut self) -> Result<usize> {
+        crate::enter_decode_nesting(&mut self.nesting_depth, self.limits.max_nesting_depth)
+    }
+    fn restore_nesting(&mut self, previous: usize) {
+        self.nesting_depth = previous;
+    }
+    fn borrowed_keys(&self) -> bool {
+        true
+    }
+    #[cfg(test)]
+    fn nesting_depth(&self) -> usize {
+        self.nesting_depth
+    }
+}
+/// An entered depth obligation, with no input alias or visitor type.
+/// Complete it after the visitor's Result, including an ordinary error. It
+/// intentionally has no Drop: the prior decoder left depth entered on panic.
+struct InputNesting(usize);
+impl InputNesting {
+    fn begin(reader: &mut dyn SobjInput<'_>) -> Result<Self> {
+        reader.enter_nesting().map(Self)
+    }
+    fn finish(self, reader: &mut dyn SobjInput<'_>) {
+        reader.restore_nesting(self.0);
+    }
+}
+
+// Existing focused depth/error/panic witnesses exercise the same shared
+// begin/end obligation without retaining a production visitor/closure graph.
+#[cfg(test)]
+pub(super) fn with_input_nesting<'de, T>(
+    reader: &mut dyn SobjInput<'de>,
+    decode: impl FnOnce(&mut dyn SobjInput<'de>) -> Result<T>,
+) -> Result<T> {
+    let nesting = InputNesting::begin(reader)?;
+    let result = decode(reader);
+    nesting.finish(reader);
+    result
+}
+
+pub(super) enum Shape {
     Element,
     Typed(ElementType),
 }
@@ -1116,17 +1246,17 @@ fn element_type_type_id(element_type: &ElementType) -> Result<TypeId> {
 }
 
 /// serde `Deserializer` that reads a single value directly out of the byte stream.
-struct SobjDeserializer<'r, 'a> {
-    reader: &'r mut Reader<'a>,
-    shape: Shape,
+pub(super) struct SobjDeserializer<'r, 'de> {
+    pub(super) reader: &'r mut dyn SobjInput<'de>,
+    pub(super) shape: Shape,
 }
 
-impl<'r, 'a> SobjDeserializer<'r, 'a> {
+impl<'r, 'de> SobjDeserializer<'r, 'de> {
     /// Resolves the value's `TypeId`, consuming the tag byte for a standalone element.
-    fn type_id(reader: &mut Reader<'a>, shape: &Shape) -> Result<TypeId> {
+    fn type_id(reader: &mut dyn SobjInput<'de>, shape: &Shape) -> Result<TypeId> {
         match shape {
             Shape::Element => {
-                reader.skip_padding();
+                reader.skip_padding()?;
                 let byte = reader.read_u8()?;
                 let type_id = TypeId::from_byte(byte)?;
                 if type_id == TypeId::Padding {
@@ -1139,33 +1269,35 @@ impl<'r, 'a> SobjDeserializer<'r, 'a> {
     }
 }
 
-struct SobjStrDeserializer<'a> {
-    value: &'a str,
+/// A document borrow may escape in the target. A transient chunk key may not.
+enum SobjStr<'value, 'de> {
+    Borrowed(&'de str),
+    Transient(&'value str),
+}
+struct SobjStrDeserializer<'value, 'de> {
+    value: SobjStr<'value, 'de>,
     context: &'static str,
 }
-
-impl<'de, 'a> de::Deserializer<'de> for SobjStrDeserializer<'a>
-where
-    'a: 'de,
-{
+impl<'de> de::Deserializer<'de> for SobjStrDeserializer<'_, 'de> {
     type Error = Error;
-
     fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
-        visitor.visit_borrowed_str(self.value)
+        match self.value {
+            SobjStr::Borrowed(value) => visitor.visit_borrowed_str(value),
+            SobjStr::Transient(value) => visitor.visit_str(value),
+        }
     }
-
     fn deserialize_str<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
-        visitor.visit_borrowed_str(self.value)
+        self.deserialize_any(visitor)
     }
-
     fn deserialize_string<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
-        visitor.visit_string(try_string_from_str(self.value, self.context)?)
+        let value = match self.value {
+            SobjStr::Borrowed(value) | SobjStr::Transient(value) => value,
+        };
+        visitor.visit_string(try_string_from_str(value, self.context)?)
     }
-
     fn deserialize_identifier<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
-        visitor.visit_borrowed_str(self.value)
+        self.deserialize_any(visitor)
     }
-
     serde::forward_to_deserialize_any! {
         bool i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 char bytes byte_buf
         option unit unit_struct newtype_struct seq tuple tuple_struct map struct
@@ -1174,13 +1306,12 @@ where
 }
 
 /// Reads a value of the resolved `type_id` from `reader`, driving the serde visitor.
-fn deserialize_value<'de, 'a, V>(
-    reader: &mut Reader<'a>,
+fn deserialize_value<'de, V>(
+    reader: &mut dyn SobjInput<'de>,
     type_id: TypeId,
     visitor: V,
 ) -> Result<V::Value>
 where
-    'a: 'de,
     V: Visitor<'de>,
 {
     match type_id {
@@ -1192,45 +1323,24 @@ where
         TypeId::Uint8 => visitor.visit_u8(reader.read_u8()?),
         TypeId::Int8 => visitor.visit_i8(reader.read_u8()? as i8),
         TypeId::Uint16 => visitor.visit_u16(reader.read_u16()?),
-        TypeId::Int16 => {
-            let bytes = reader.take(2)?;
-            visitor.visit_i16(i16::from_le_bytes([bytes[0], bytes[1]]))
-        }
+        TypeId::Int16 => visitor.visit_i16(reader.read_u16()? as i16),
         TypeId::Uint32 => visitor.visit_u32(reader.read_u32()?),
         TypeId::Int32 => visitor.visit_i32(reader.read_i32()?),
         TypeId::Uint64 => visitor.visit_u64(reader.read_u64()?),
         TypeId::Int64 => visitor.visit_i64(reader.read_i64()?),
-        TypeId::Float => {
-            let bytes = reader.take(4)?;
-            visitor.visit_f32(f32::from_le_bytes(
-                bytes.try_into().map_err(|_| Error::UnexpectedEof)?,
-            ))
+        TypeId::Float => visitor.visit_f32(f32::from_bits(reader.read_u32()?)),
+        TypeId::Double => visitor.visit_f64(f64::from_bits(reader.read_u64()?)),
+        TypeId::String => match reader.read_text()? {
+            SobjText::Borrowed(value) => visitor.visit_borrowed_str(value),
+            SobjText::Owned(value) => visitor.visit_string(value),
+        },
+        TypeId::Bytes => match reader.read_blob()? {
+            SobjBytes::Borrowed(value) => visitor.visit_borrowed_bytes(value),
+            SobjBytes::Owned(value) => visitor.visit_byte_buf(value),
+        },
+        TypeId::Object | TypeId::List | TypeId::Optional => {
+            deserialize_container_value(reader, type_id, visitor)
         }
-        TypeId::Double => {
-            let bytes = reader.take(8)?;
-            visitor.visit_f64(f64::from_le_bytes(
-                bytes.try_into().map_err(|_| Error::UnexpectedEof)?,
-            ))
-        }
-        TypeId::String => visitor.visit_borrowed_str(reader.read_string()?),
-        TypeId::Bytes => visitor.visit_borrowed_bytes(reader.read_bytes()?),
-        TypeId::Object => reader.with_nesting(|reader| {
-            let remaining = reader.read_container_len()?;
-            visitor.visit_map(ObjectMapAccess {
-                reader,
-                remaining,
-                keys: InlineKeySet::default(),
-            })
-        }),
-        TypeId::List => reader.with_nesting(|reader| {
-            let element_type = read_element_type(reader)?;
-            let remaining = reader.read_container_len()?;
-            visitor.visit_seq(ListSeqAccess {
-                reader,
-                element_type,
-                remaining,
-            })
-        }),
         // serde never serializes a fixed-size `array` (only `list`s), so serde-encoded
         // data never contains one. Externally-built array payloads must be read
         // through the dynamic `Value`/`from_value` API instead.
@@ -1238,25 +1348,73 @@ where
             "array values are not supported by serde decoding; use the dynamic Value API"
                 .to_owned(),
         )),
-        TypeId::Optional => reader.with_nesting(|reader| {
-            let element_type = read_element_type(reader)?;
-            match reader.read_u8()? {
-                0 => visitor.visit_none(),
-                1 => visitor.visit_some(SobjDeserializer {
-                    reader,
-                    shape: Shape::Typed(element_type),
-                }),
-                other => Err(Error::InvalidBoolean(other)),
-            }
-        }),
         TypeId::Padding | TypeId::Document => Err(Error::UnsupportedTypeId(type_id.byte())),
     }
 }
 
-impl<'de, 'r, 'a> de::Deserializer<'de> for SobjDeserializer<'r, 'a>
+/// Keep recursive container visitors behind one explicit call boundary.
+/// Primitive borrowed/owned decoding stays in the caller; map/sequence/option
+/// traversal uses the same input and access types without inlining each nested
+/// derived Deserialize graph into its parent visitor.
+#[inline(never)]
+fn deserialize_container_value<'de, V>(
+    reader: &mut dyn SobjInput<'de>,
+    type_id: TypeId,
+    visitor: V,
+) -> Result<V::Value>
 where
-    'a: 'de,
+    V: Visitor<'de>,
 {
+    match type_id {
+        TypeId::Object => {
+            let nesting = InputNesting::begin(reader)?;
+            let result = (|| {
+                let remaining = reader.read_container_len()?;
+                let keys = SobjMapKeys::new(reader, remaining)?;
+                visitor.visit_map(ObjectMapAccess {
+                    reader: &mut *reader,
+                    remaining,
+                    keys,
+                })
+            })();
+            nesting.finish(reader);
+            result
+        }
+        TypeId::List => {
+            let nesting = InputNesting::begin(reader)?;
+            let result = (|| {
+                let element_type = reader.read_element_type()?;
+                let remaining = reader.read_container_len()?;
+                visitor.visit_seq(ListSeqAccess {
+                    reader: &mut *reader,
+                    element_type,
+                    remaining,
+                })
+            })();
+            nesting.finish(reader);
+            result
+        }
+        TypeId::Optional => {
+            let nesting = InputNesting::begin(reader)?;
+            let result = (|| {
+                let element_type = reader.read_element_type()?;
+                match reader.read_u8()? {
+                    0 => visitor.visit_none(),
+                    1 => visitor.visit_some(SobjDeserializer {
+                        reader: &mut *reader,
+                        shape: Shape::Typed(element_type),
+                    }),
+                    other => Err(Error::InvalidBoolean(other)),
+                }
+            })();
+            nesting.finish(reader);
+            result
+        }
+        _ => Err(Error::UnsupportedTypeId(type_id.byte())),
+    }
+}
+
+impl<'de> de::Deserializer<'de> for SobjDeserializer<'_, 'de> {
     type Error = Error;
 
     fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
@@ -1269,7 +1427,10 @@ where
         let SobjDeserializer { reader, shape } = self;
         let type_id = Self::type_id(reader, &shape)?;
         match type_id {
-            TypeId::String => visitor.visit_borrowed_str(reader.read_string()?),
+            TypeId::String => match reader.read_text()? {
+                SobjText::Borrowed(value) => visitor.visit_borrowed_str(value),
+                SobjText::Owned(value) => visitor.visit_string(value),
+            },
             _ => Err(Error::Serde("expected string".to_owned())),
         }
     }
@@ -1279,7 +1440,11 @@ where
         let type_id = Self::type_id(reader, &shape)?;
         match type_id {
             TypeId::String => {
-                visitor.visit_string(try_string_from_str(reader.read_string()?, "serde string")?)
+                let value = match reader.read_text()? {
+                    SobjText::Borrowed(value) => try_string_from_str(value, "serde string")?,
+                    SobjText::Owned(value) => value,
+                };
+                visitor.visit_string(value)
             }
             _ => Err(Error::Serde("expected string".to_owned())),
         }
@@ -1289,7 +1454,10 @@ where
         let SobjDeserializer { reader, shape } = self;
         let type_id = Self::type_id(reader, &shape)?;
         match type_id {
-            TypeId::Bytes => visitor.visit_borrowed_bytes(reader.read_bytes()?),
+            TypeId::Bytes => match reader.read_blob()? {
+                SobjBytes::Borrowed(value) => visitor.visit_borrowed_bytes(value),
+                SobjBytes::Owned(value) => visitor.visit_byte_buf(value),
+            },
             _ => Err(Error::Serde("expected bytes".to_owned())),
         }
     }
@@ -1299,10 +1467,15 @@ where
         let type_id = Self::type_id(reader, &shape)?;
         match type_id {
             TypeId::Bytes => {
-                let bytes = reader.read_bytes()?;
-                let mut owned = try_vec_with_capacity(bytes.len(), "serde byte buffer")?;
-                try_extend_from_slice(&mut owned, bytes, "serde byte buffer")?;
-                visitor.visit_byte_buf(owned)
+                let bytes = match reader.read_blob()? {
+                    SobjBytes::Borrowed(bytes) => {
+                        let mut owned = try_vec_with_capacity(bytes.len(), "serde byte buffer")?;
+                        try_extend_from_slice(&mut owned, bytes, "serde byte buffer")?;
+                        owned
+                    }
+                    SobjBytes::Owned(bytes) => bytes,
+                };
+                visitor.visit_byte_buf(bytes)
             }
             _ => Err(Error::Serde("expected bytes".to_owned())),
         }
@@ -1312,19 +1485,29 @@ where
         let SobjDeserializer { reader, shape } = self;
         let type_id = Self::type_id(reader, &shape)?;
         match type_id {
-            TypeId::Optional => reader.with_nesting(|reader| {
-                read_element_type(reader)?;
-                match reader.read_u8()? {
-                    0 => visitor.visit_unit(),
-                    other => Err(Error::InvalidBoolean(other)),
-                }
-            }),
-            TypeId::Object => reader.with_nesting(|reader| {
-                if reader.read_container_len()? != 0 {
-                    return Err(Error::Serde("expected unit".to_owned()));
-                }
-                visitor.visit_unit()
-            }),
+            TypeId::Optional => {
+                let nesting = InputNesting::begin(reader)?;
+                let result = (|| {
+                    reader.read_element_type()?;
+                    match reader.read_u8()? {
+                        0 => visitor.visit_unit(),
+                        other => Err(Error::InvalidBoolean(other)),
+                    }
+                })();
+                nesting.finish(reader);
+                result
+            }
+            TypeId::Object => {
+                let nesting = InputNesting::begin(reader)?;
+                let result = (|| {
+                    if reader.read_container_len()? != 0 {
+                        return Err(Error::Serde("expected unit".to_owned()));
+                    }
+                    visitor.visit_unit()
+                })();
+                nesting.finish(reader);
+                result
+            }
             _ => Err(Error::Serde("expected unit".to_owned())),
         }
     }
@@ -1345,6 +1528,9 @@ where
         visitor.visit_newtype_struct(self)
     }
 
+    // Enum payloads re-enter the same recursive container decoder. Preserve
+    // the call boundary instead of expanding every derived variant in callers.
+    #[inline(never)]
     fn deserialize_enum<V: Visitor<'de>>(
         self,
         _name: &'static str,
@@ -1354,22 +1540,26 @@ where
         let SobjDeserializer { reader, shape } = self;
         let type_id = Self::type_id(reader, &shape)?;
         match type_id {
-            TypeId::String => {
-                let variant = reader.read_string()?;
-                visitor.visit_enum(EnumValueAccess {
-                    variant,
-                    value: None,
-                })
-            }
-            TypeId::Object => reader.with_nesting(|reader| {
-                if reader.read_container_len()? != 1 {
-                    return Err(Error::Serde(
-                        "expected single-field object for enum variant".to_owned(),
-                    ));
-                }
-                let variant = reader.read_string()?;
-                visitor.visit_enum(StreamEnumAccess { reader, variant })
+            TypeId::String => visitor.visit_enum(UnitEnumAccess {
+                variant: reader.read_text()?,
             }),
+            TypeId::Object => {
+                let nesting = InputNesting::begin(reader)?;
+                let result = (|| {
+                    if reader.read_container_len()? != 1 {
+                        return Err(Error::Serde(
+                            "expected single-field object for enum variant".to_owned(),
+                        ));
+                    }
+                    let variant = reader.read_text()?;
+                    visitor.visit_enum(StreamEnumAccess {
+                        reader: &mut *reader,
+                        variant,
+                    })
+                })();
+                nesting.finish(reader);
+                result
+            }
             _ => Err(Error::Serde("expected enum representation".to_owned())),
         }
     }
@@ -1380,58 +1570,83 @@ where
     }
 }
 
-struct ObjectMapAccess<'r, 'a> {
-    reader: &'r mut Reader<'a>,
-    remaining: usize,
-    keys: InlineKeySet<'a>,
+enum SobjMapKeys<'de> {
+    Borrowed(InlineKeySet<'de>),
+    Owned(HashSet<String>),
 }
-
-impl<'de, 'r, 'a> MapAccess<'de> for ObjectMapAccess<'r, 'a>
-where
-    'a: 'de,
-{
+impl<'de> SobjMapKeys<'de> {
+    fn new(reader: &dyn SobjInput<'de>, remaining: usize) -> Result<Self> {
+        if reader.borrowed_keys() {
+            Ok(Self::Borrowed(InlineKeySet::default()))
+        } else {
+            Ok(Self::Owned(try_hashset_with_capacity(
+                remaining,
+                "streamed serde object keys",
+            )?))
+        }
+    }
+}
+struct ObjectMapAccess<'r, 'de> {
+    reader: &'r mut dyn SobjInput<'de>,
+    remaining: usize,
+    keys: SobjMapKeys<'de>,
+}
+impl<'de> MapAccess<'de> for ObjectMapAccess<'_, 'de> {
     type Error = Error;
-
     fn next_key_seed<K: DeserializeSeed<'de>>(&mut self, seed: K) -> Result<Option<K::Value>> {
         if self.remaining == 0 {
             return Ok(None);
         }
         self.remaining -= 1;
-        let key = self.reader.read_string()?;
-        if !self.keys.insert(key, "serde object keys")? {
-            return duplicate_key_error(key);
+        match (self.reader.read_text()?, &mut self.keys) {
+            (SobjText::Borrowed(key), SobjMapKeys::Borrowed(keys)) => {
+                if !keys.insert(key, "serde object keys")? {
+                    return duplicate_key_error(key);
+                }
+                seed.deserialize(SobjStrDeserializer {
+                    value: SobjStr::Borrowed(key),
+                    context: "object key",
+                })
+                .map(Some)
+            }
+            (SobjText::Owned(key), SobjMapKeys::Owned(keys)) => {
+                if keys.contains(&key) {
+                    return duplicate_key_error(&key);
+                }
+                let value = seed.deserialize(SobjStrDeserializer {
+                    value: SobjStr::Transient(&key),
+                    context: "object key",
+                })?;
+                keys.insert(key);
+                Ok(Some(value))
+            }
+            _ => Err(Error::TypeMismatch),
         }
-        seed.deserialize(SobjStrDeserializer {
-            value: key,
-            context: "object key",
-        })
-        .map(Some)
     }
-
+    // Keep the nested derived value graph out of the enclosing visitor.
+    #[inline(never)]
     fn next_value_seed<V: DeserializeSeed<'de>>(&mut self, seed: V) -> Result<V::Value> {
         seed.deserialize(SobjDeserializer {
             reader: &mut *self.reader,
             shape: Shape::Element,
         })
     }
-
     fn size_hint(&self) -> Option<usize> {
         Some(self.remaining)
     }
 }
 
-struct ListSeqAccess<'r, 'a> {
-    reader: &'r mut Reader<'a>,
+struct ListSeqAccess<'r, 'de> {
+    reader: &'r mut dyn SobjInput<'de>,
     element_type: ElementType,
     remaining: usize,
 }
 
-impl<'de, 'r, 'a> SeqAccess<'de> for ListSeqAccess<'r, 'a>
-where
-    'a: 'de,
-{
+impl<'de> SeqAccess<'de> for ListSeqAccess<'_, 'de> {
     type Error = Error;
 
+    // Keep the nested derived value graph out of the enclosing visitor.
+    #[inline(never)]
     fn next_element_seed<T: DeserializeSeed<'de>>(&mut self, seed: T) -> Result<Option<T::Value>> {
         if self.remaining == 0 {
             return Ok(None);
@@ -1451,31 +1666,29 @@ where
 
 /// Enum variant access for the single-field-object representation; the variant's
 /// payload is the next element in the stream.
-struct StreamEnumAccess<'r, 'a> {
-    reader: &'r mut Reader<'a>,
-    variant: &'a str,
+struct StreamEnumAccess<'r, 'de> {
+    reader: &'r mut dyn SobjInput<'de>,
+    variant: SobjText<'de>,
 }
 
-impl<'de, 'r, 'a> EnumAccess<'de> for StreamEnumAccess<'r, 'a>
-where
-    'a: 'de,
-{
+impl<'de> EnumAccess<'de> for StreamEnumAccess<'_, 'de> {
     type Error = Error;
     type Variant = Self;
 
     fn variant_seed<V: DeserializeSeed<'de>>(self, seed: V) -> Result<(V::Value, Self::Variant)> {
+        let value = match &self.variant {
+            SobjText::Borrowed(value) => SobjStr::Borrowed(*value),
+            SobjText::Owned(value) => SobjStr::Transient(value),
+        };
         let variant = seed.deserialize(SobjStrDeserializer {
-            value: self.variant,
+            value,
             context: "enum variant",
         })?;
         Ok((variant, self))
     }
 }
 
-impl<'de, 'r, 'a> VariantAccess<'de> for StreamEnumAccess<'r, 'a>
-where
-    'a: 'de,
-{
+impl<'de> VariantAccess<'de> for StreamEnumAccess<'_, 'de> {
     type Error = Error;
 
     fn unit_variant(self) -> Result<()> {
@@ -1491,6 +1704,7 @@ where
         .map(|_| ())
     }
 
+    #[inline(never)]
     fn newtype_variant_seed<T: DeserializeSeed<'de>>(self, seed: T) -> Result<T::Value> {
         seed.deserialize(SobjDeserializer {
             reader: self.reader,
@@ -1498,6 +1712,7 @@ where
         })
     }
 
+    #[inline(never)]
     fn tuple_variant<V: Visitor<'de>>(self, _len: usize, visitor: V) -> Result<V::Value> {
         de::Deserializer::deserialize_any(
             SobjDeserializer {
@@ -1508,6 +1723,7 @@ where
         )
     }
 
+    #[inline(never)]
     fn struct_variant<V: Visitor<'de>>(
         self,
         _fields: &'static [&'static str],
@@ -1520,6 +1736,68 @@ where
             },
             visitor,
         )
+    }
+}
+
+struct UnitEnumAccess<'de> {
+    variant: SobjText<'de>,
+}
+struct UnitVariantAccess {
+    borrowed: bool,
+}
+impl<'de> EnumAccess<'de> for UnitEnumAccess<'de> {
+    type Error = Error;
+    type Variant = UnitVariantAccess;
+    fn variant_seed<V: DeserializeSeed<'de>>(self, seed: V) -> Result<(V::Value, Self::Variant)> {
+        let (value, borrowed) = match &self.variant {
+            SobjText::Borrowed(value) => (SobjStr::Borrowed(*value), true),
+            SobjText::Owned(value) => (SobjStr::Transient(value), false),
+        };
+        let variant = seed.deserialize(SobjStrDeserializer {
+            value,
+            context: "enum variant",
+        })?;
+        Ok((variant, UnitVariantAccess { borrowed }))
+    }
+}
+impl<'de> VariantAccess<'de> for UnitVariantAccess {
+    type Error = Error;
+    fn unit_variant(self) -> Result<()> {
+        Ok(())
+    }
+    fn newtype_variant_seed<T: DeserializeSeed<'de>>(self, _seed: T) -> Result<T::Value> {
+        Err(Error::Serde(
+            if self.borrowed {
+                "expected newtype variant payload"
+            } else {
+                "expected unit enum variant"
+            }
+            .into(),
+        ))
+    }
+    fn tuple_variant<V: Visitor<'de>>(self, _len: usize, _visitor: V) -> Result<V::Value> {
+        Err(Error::Serde(
+            if self.borrowed {
+                "expected tuple variant payload"
+            } else {
+                "expected unit enum variant"
+            }
+            .into(),
+        ))
+    }
+    fn struct_variant<V: Visitor<'de>>(
+        self,
+        _fields: &'static [&'static str],
+        _visitor: V,
+    ) -> Result<V::Value> {
+        Err(Error::Serde(
+            if self.borrowed {
+                "expected struct variant payload"
+            } else {
+                "expected unit enum variant"
+            }
+            .into(),
+        ))
     }
 }
 
@@ -2219,7 +2497,7 @@ where
             return Ok(None);
         };
         seed.deserialize(SobjStrDeserializer {
-            value: field.key.as_str(),
+            value: SobjStr::Borrowed(field.key.as_str()),
             context: "object key",
         })
         .map(Some)
@@ -2388,7 +2666,7 @@ where
 
     fn variant_seed<V: DeserializeSeed<'de>>(self, seed: V) -> Result<(V::Value, Self::Variant)> {
         let variant = seed.deserialize(SobjStrDeserializer {
-            value: self.variant,
+            value: SobjStr::Borrowed(self.variant),
             context: "enum variant",
         })?;
         Ok((variant, self))
@@ -2504,6 +2782,14 @@ mod streaming_tests {
                 .to_bytes()
                 .expect("tree encode");
             assert_same_wire(&streamed, &tree, mode);
+            // Exercise the existing unsized output API through the same native
+            // Vec owner. This must preserve both the document and its prefix.
+            let mut output = b"prefix".to_vec();
+            let sink: &mut dyn SobjOutput = &mut output;
+            let range = append_bytes_to_output(sink, value, 1, mode).expect("erased output encode");
+            assert_eq!(range, 6..output.len());
+            assert_eq!(&output[..6], b"prefix");
+            assert_same_wire(&output[range], &tree, mode);
             let decoded: T = from_bytes(&streamed).expect("decode");
             assert_eq!(&decoded, value, "round-trip mismatch (mode {mode:?})");
             let chunked: T = from_chunk_iter_with_options(
@@ -2522,6 +2808,11 @@ mod streaming_tests {
             let error = append_bytes(&mut output, &Some(value), 1, mode)
                 .expect_err("invalid optional payload");
             assert_eq!(error, expected, "length mode {mode:?}");
+            assert_eq!(output, b"prefix");
+            let sink: &mut dyn SobjOutput = &mut output;
+            let error = append_bytes_to_output(sink, &Some(value), 1, mode)
+                .expect_err("invalid optional through erased output");
+            assert_eq!(error, expected, "erased length mode {mode:?}");
             assert_eq!(output, b"prefix");
         }
     }
@@ -2698,7 +2989,7 @@ mod streaming_tests {
         let map = ObjectMapAccess {
             reader: &mut map_reader,
             remaining: 7,
-            keys: InlineKeySet::default(),
+            keys: SobjMapKeys::Borrowed(InlineKeySet::default()),
         };
         assert_eq!(map.size_hint(), Some(7));
 

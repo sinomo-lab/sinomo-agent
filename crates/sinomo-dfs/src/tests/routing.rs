@@ -2,222 +2,459 @@
 
 use super::*;
 
-#[test]
-fn routed_namespace_complete_single_response_batch_avoids_follow_up_sync() {
-    let writer = NodeId::from_legacy_named("node_routed_sync_writer").expect("writer");
-    let primary = NodeId::from_legacy_named("node_routed_sync_primary").expect("primary");
-    let file_system_id = sifs_file_system_id();
-    let root = temp_root("routed_namespace_sync_synced_path_backlog");
-    let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
-    control_plane.with_client(|kv| {
-        DfsControlPlaneStore::new(kv)
-            .put_metadata_shard(&DfsMetadataShardConfig {
-                file_system_id: file_system_id.clone(),
-                shard_id: "services".to_string(),
-                primary_node_id: primary.clone(),
-                replica_node_ids: vec![writer.clone()],
-                epoch: 1,
-                assignment: DfsMetadataShardAssignment::PathPrefix {
-                    prefix: "/services".to_string(),
-                },
-                namespace_prepare_codec: Default::default(),
-                default_policy: DfsObjectPolicy::ReplicatedEventual,
-            })
-            .expect("metadata shard");
-    });
-    let primary_sender: DfsMessageSender = Arc::new(|target_node_id, command, _timeout| {
-        Err(DfsPeerTransportError::new(format!(
-            "unexpected primary-side send to {target_node_id} for {}",
-            command.request_id
-        )))
-    });
-    let primary_transport = DfsNodeServedMessageTransport::new_with_message_sender(
-        primary.clone(),
-        vec![writer.clone()],
-        primary_sender,
-        sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
-    );
-    let primary_backend = LocalSobjMetadataBackend::new(
-        DfsMetadataShardId::new("services"),
-        root.join("primary-metadata"),
-    )
-    .expect("primary metadata backend");
-    let mut primary_service = NetworkedDfsService::new(
-        primary_transport,
-        LocalContentStore::new(root.join("primary-content")).expect("primary content"),
-    )
-    .with_control_plane(control_plane.clone())
-    .with_metadata_backend(primary_backend)
-    .expect("primary metadata");
-    primary_service
-        .bootstrap_distributed_sifs()
-        .expect("primary bootstrap");
-    let services_shard_id = DfsMetadataShardId::new("services");
-    let bootstrap_sequence = primary_service
-        .metadata_backend()
-        .expect("primary metadata backend")
-        .journal_last_sequence()
-        .expect("primary bootstrap journal head");
-    let bootstrap_snapshot = primary_service
-        .metadata_backend()
-        .expect("primary metadata backend")
-        .export_shard_table_snapshot(&services_shard_id)
-        .expect("primary bootstrap snapshot")
-        .expect("services bootstrap snapshot");
-    for index in 0..(DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT + 8) {
-        let mut object = file_metadata(primary.clone());
-        object.object_id =
-            DfsObjectId::from_legacy_named(format!("obj_routed_sync_backlog_{index}"))
-                .expect("object");
-        object.path = format!("/services/backlog-seed-{index}.txt");
-        object.version =
-            DfsVersion::from_legacy_named(format!("version_routed_sync_{index}")).expect("version");
-        object.content_hash = Some(format!("blake3:routed-sync-{index}"));
-        object.content_size_bytes = Some(index as u64);
-        object.policy = DfsObjectPolicy::ReplicatedEventual;
-        primary_service
-            .add_object_metadata(object)
-            .expect("primary backlog object");
-    }
-    let primary_service = Arc::new(Mutex::new(primary_service));
-    let namespace_calls = Arc::new(Mutex::new(Vec::new()));
-    let mkdir_all_response_batches = Arc::new(Mutex::new(Vec::new()));
-    let mkdir_all_response_has_more = Arc::new(Mutex::new(Vec::new()));
-    let primary_for_sender = primary.clone();
-    let primary_service_for_sender = Arc::clone(&primary_service);
-    let namespace_calls_for_sender = Arc::clone(&namespace_calls);
-    let mkdir_all_response_batches_for_sender = Arc::clone(&mkdir_all_response_batches);
-    let mkdir_all_response_has_more_for_sender = Arc::clone(&mkdir_all_response_has_more);
-    let writer_sender: DfsMessageSender = Arc::new(move |target_node_id, command, _timeout| {
-        if target_node_id != &primary_for_sender {
-            return Err(DfsPeerTransportError::new(format!(
-                "unexpected target {target_node_id}"
-            )));
-        }
-        std::thread::sleep(Duration::from_millis(10));
-        let capture_mkdir_all_response = match &command.routed_message.message {
-            DfsNetworkMessage::NamespaceRequest(namespace) => {
-                matches!(&namespace.operation, DfsNamespaceOperation::MkdirAll { .. })
+fn native_pending_routed_write(
+    name: &str,
+) -> (
+    crate::test_runtime::DfsTestRuntime,
+    NetworkedDfsService<DfsNodeTransport>,
+    DfsWriteRequest,
+    DfsVersion,
+    Vec<u8>,
+    Vec<NodeId>,
+    String,
+    DfsDistributedWriteResponse,
+) {
+    let (runtime, primary, _, requester, base, _) =
+        native_read_fixture(name, 1, false, b"actual routed predecessor".to_vec());
+    let nodes = vec![primary.clone(), requester.clone()];
+    let path = base.path.clone();
+    let mut placement =
+        DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedConfirmed, 2, 2).unwrap();
+    placement.required_node_ids = nodes.clone();
+    runtime
+        .apply_placement_policy(&primary, &path, DfsPlacementScope::Subtree, placement)
+        .unwrap();
+    deny_native_read_repair(&runtime, &primary, &requester);
+    let mut client = runtime.client(&requester).unwrap();
+    let request = DfsWriteRequest {
+        file_system_id: base.file_system_id,
+        object_id: base.object_id,
+        target_version: crate::namespace::next_version(&base.version),
+        requesting_node_id: requester.clone(),
+    };
+    let bytes = vec![0x74; 2 * 1024 * 1024 + 73];
+    let operation = sinomo_core::Id::generate().to_string();
+    let mut policy = DfsReplicationPolicy::new(2, 2).unwrap();
+    policy.required_node_ids = nodes.clone();
+    let outcome = client
+        .write_distributed_bytes_with_base(
+            request.clone(),
+            Some(base.version.clone()),
+            bytes.clone(),
+            nodes.clone(),
+            policy,
+            DfsDistributedWriteOptions {
+                operation_id: Some(operation.clone()),
+                ..DfsDistributedWriteOptions::default()
+            },
+        )
+        .unwrap();
+    assert!(matches!(outcome, NetworkedDfsWriteOutcome::Pending { .. }));
+    assert!(client.writes.pending_routed_writes.contains_key(&operation));
+    let queued = client.transport.drain_incoming_messages().unwrap();
+    let response = queued
+        .into_iter()
+        .find_map(|routed| {
+            if routed.source_node_id != primary || routed.target_node_id != requester {
+                return None;
             }
-            _ => false,
-        };
-        if let DfsNetworkMessage::NamespaceRequest(namespace) = &command.routed_message.message {
-            let label = match &namespace.operation {
-                DfsNamespaceOperation::MkdirAll { .. } => "mkdir-all",
-                DfsNamespaceOperation::SyncPath { .. } => "sync-path",
-                _ => "other-namespace",
+            let DfsNetworkMessage::DistributedWriteResponse(response) = routed.message else {
+                return None;
             };
-            namespace_calls_for_sender
-                .lock()
-                .expect("namespace calls")
-                .push(label.to_string());
+            (response.request_id == operation && response.object_id == request.object_id)
+                .then_some(response)
+        })
+        .expect("normal routed request produced its own native response");
+    assert!(matches!(
+        &response.result,
+        DfsDistributedWriteResult::Outcome {
+            outcome: NetworkedDfsWriteOutcome::Pending { .. }
         }
-        let result = primary_service_for_sender
-            .lock()
-            .expect("primary service")
-            .process_message_command(command.clone())
-            .map_err(|error| DfsPeerTransportError::new(error.to_string()))?;
-        if capture_mkdir_all_response {
-            let mut captured_batches = mkdir_all_response_batches_for_sender
-                .lock()
-                .expect("mkdir-all response batches");
-            for outbound in &result.response.outbound_messages {
-                let DfsNetworkMessage::NamespaceResponse(response) = &outbound.message else {
-                    continue;
-                };
-                mkdir_all_response_has_more_for_sender
-                    .lock()
-                    .expect("mkdir-all response continuation")
-                    .push(response.metadata_journal_has_more);
-                for batch in &response.metadata_journal_batches {
-                    let encoded_bytes =
-                        crate::metadata_journal::metadata_journal_batch_encoded_len(batch)
-                            .map_err(|error| DfsPeerTransportError::new(error.to_string()))?;
-                    captured_batches.push((batch.entries.len(), encoded_bytes));
-                }
-            }
-        }
-        Ok(result.response)
-    });
-    let writer_transport = DfsNodeTransport::with_message_sender_for_nodes(
-        writer.clone(),
-        vec![primary.clone()],
-        Duration::from_millis(20),
-        writer_sender,
-    );
-    let mut writer_backend =
-        LocalSobjMetadataBackend::new(services_shard_id.clone(), root.join("writer-metadata"))
-            .expect("writer metadata backend");
-    writer_backend
-        .replace_with_replicated_snapshot(services_shard_id, bootstrap_sequence, bootstrap_snapshot)
-        .expect("seed writer from replicated bootstrap prefix");
-    let mut writer_service = NetworkedDfsService::new(
-        writer_transport,
-        LocalContentStore::new(root.join("writer-content")).expect("writer content"),
+    ));
+    (
+        runtime,
+        client,
+        request,
+        base.version,
+        bytes,
+        nodes,
+        operation,
+        response,
     )
-    .with_control_plane(control_plane)
-    .with_metadata_backend(writer_backend)
-    .expect("attach writer metadata replica");
-    writer_service
-        .posix_mkdir_all("/services/routed-sync-backlog/new-dir")
-        .expect("routed mkdir should drain bounded response backlog");
+}
 
-    assert_eq!(
-        DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_ENTRY_LIMIT, 2048,
-        "namespace catch-up should request the larger entry cap"
-    );
-    assert_eq!(
-        DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_BYTE_LIMIT, DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT,
-        "namespace catch-up must retain the ordinary 4 MiB encoded-byte bound"
-    );
-    let response_batches = mkdir_all_response_batches
-        .lock()
-        .expect("mkdir-all response batches")
+fn complete_native_routed_write(
+    runtime: &crate::test_runtime::DfsTestRuntime,
+    client: &mut NetworkedDfsService<DfsNodeTransport>,
+    request: &DfsWriteRequest,
+    base: &DfsVersion,
+    bytes: &[u8],
+    nodes: &[NodeId],
+    operation: &str,
+) -> (NodeId, DfsDistributedWriteResponse) {
+    let primary = client.writes.pending_routed_writes[operation]
+        .primary_node_id
         .clone();
+    let config = client.writes.pending_routed_writes[operation]
+        .authority_shard
+        .clone();
+    runtime.clear_faults();
+    let mut owner = runtime.client(&primary).unwrap();
+    owner.hydrate_from_metadata_backend().unwrap();
+    owner.retry_pending_repairs().unwrap();
+    owner.process_incoming().unwrap();
+    owner.flush_detached_transport_sends().unwrap();
+    owner
+        .replicate_metadata_shard_to_configured_replicas(&config.file_system_id, &config.shard_id)
+        .unwrap();
+    owner.process_incoming().unwrap();
+    let actual = owner
+        .metadata_backend()
+        .unwrap()
+        .get_object(&request.object_id)
+        .unwrap()
+        .unwrap();
     assert_eq!(
-        response_batches.len(),
-        DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_BATCH_LIMIT,
-        "the namespace response should still carry only one journal batch"
+        actual.content_hash.as_deref(),
+        Some(content_hash(bytes).as_str())
     );
-    let (entry_count, encoded_bytes) = response_batches[0];
-    assert!(
-        entry_count > DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
-        "the namespace response should pack past the ordinary 512-entry cap"
-    );
-    assert!(
-        entry_count <= DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_ENTRY_LIMIT,
-        "the namespace response exceeded its 2048-entry cap"
-    );
-    assert!(
-        encoded_bytes <= DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_BYTE_LIMIT,
-        "the namespace response exceeded its 4 MiB encoded-byte cap"
-    );
-    assert_eq!(
-        *mkdir_all_response_has_more
-            .lock()
-            .expect("mkdir-all response continuation"),
-        vec![Some(false)],
-        "the authority should explicitly report that the single batch covered its journal tail"
-    );
+    drop(owner);
+    let mut policy = DfsReplicationPolicy::new(2, 2).unwrap();
+    policy.required_node_ids = nodes.to_vec();
+    // Replay the SAME real operation through ordinary dispatch. Only its
+    // actual committed receipt may generate the terminal response.
+    client
+        .write_distributed_bytes_with_base(
+            request.clone(),
+            Some(base.clone()),
+            bytes.to_vec(),
+            nodes.to_vec(),
+            policy,
+            DfsDistributedWriteOptions {
+                operation_id: Some(operation.into()),
+                ..DfsDistributedWriteOptions::default()
+            },
+        )
+        .unwrap();
+    let response = client
+        .transport
+        .drain_incoming_messages()
+        .unwrap()
+        .into_iter()
+        .find_map(|routed| {
+            if routed.source_node_id != primary || routed.target_node_id != *client.node_id() {
+                return None;
+            }
+            let DfsNetworkMessage::DistributedWriteResponse(response) = routed.message else {
+                return None;
+            };
+            (response.request_id == operation
+                && response.object_id == request.object_id
+                && matches!(
+                    &response.result,
+                    DfsDistributedWriteResult::Outcome {
+                        outcome: NetworkedDfsWriteOutcome::Committed { .. }
+                    }
+                ))
+            .then_some(response)
+        })
+        .expect("actual native stable replay returns its exact committed result");
+    (primary, response)
+}
 
-    let calls = namespace_calls.lock().expect("namespace calls").clone();
-    assert_eq!(
-        calls.first().map(String::as_str),
-        Some("mkdir-all"),
-        "the mutating operation should be sent first"
+#[test]
+fn routed_write_response_tracks_remote_intent_alias() {
+    let (runtime, mut client, request, base, bytes, nodes, operation, pending_response) =
+        native_pending_routed_write("native-routed-alias");
+    let primary = client.writes.pending_routed_writes[&operation]
+        .primary_node_id
+        .clone();
+    let DfsDistributedWriteResult::Outcome {
+        outcome: NetworkedDfsWriteOutcome::Pending { intent_id, .. },
+    } = &pending_response.result
+    else {
+        unreachable!()
+    };
+    let alias = intent_id.clone();
+    client
+        .handle_distributed_write_response(primary.clone(), pending_response.clone())
+        .unwrap();
+    assert!(
+        matches!(client.write_outcome(&operation).unwrap(), NetworkedDfsWriteOutcome::Pending { intent_id, .. } if intent_id == alias)
     );
     assert!(
-        !calls.iter().any(|call| call == "sync-path"),
-        "a complete one-batch response must not trigger a redundant follow-up sync"
+        client.writes.pending_routed_writes[&operation]
+            .command
+            .is_some()
     );
     assert!(
-        writer_service
-            .posix_stat(&format!(
-                "/services/backlog-seed-{}.txt",
-                DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT + 7
-            ))
-            .is_ok(),
-        "latest backlog entry should be visible after routed mkdir returns"
+        client.writes.pending_routed_writes[&alias]
+            .command
+            .is_none()
+    );
+    let mut rejected = pending_response;
+    rejected.result = DfsDistributedWriteResult::Rejected {
+        reason: "exclusive retry observed the pending create".into(),
+        current_primary_node_id: None,
+    };
+    assert!(matches!(
+        client
+            .handle_distributed_write_response(primary.clone(), rejected)
+            .unwrap(),
+        NetworkedDfsServiceEvent::RemoteResponseDiscarded { .. }
+    ));
+    assert!(matches!(
+        client.write_outcome(&alias).unwrap(),
+        NetworkedDfsWriteOutcome::Pending { .. }
+    ));
+    let (actual_primary, terminal) = complete_native_routed_write(
+        &runtime,
+        &mut client,
+        &request,
+        &base,
+        &bytes,
+        &nodes,
+        &operation,
+    );
+    assert_eq!(actual_primary, primary);
+    let DfsDistributedWriteResult::Outcome {
+        outcome:
+            NetworkedDfsWriteOutcome::Committed {
+                intent_id,
+                version,
+                content_hash: hash,
+                ..
+            },
+    } = &terminal.result
+    else {
+        unreachable!()
+    };
+    assert_eq!(intent_id, &alias);
+    assert_eq!(hash, &content_hash(&bytes));
+    let actual_version = version.clone();
+    client
+        .handle_distributed_write_response(primary, terminal)
+        .unwrap();
+    assert!(
+        client
+            .writes
+            .pending_routed_writes
+            .values()
+            .all(|pending| pending.command.is_none())
+    );
+    assert!(
+        matches!(client.take_write_outcome(&alias).unwrap(), NetworkedDfsWriteOutcome::Committed { version, .. } if version == actual_version)
+    );
+    assert!(client.writes.pending_routed_writes.is_empty());
+    drop(client);
+    runtime.close().unwrap();
+}
+
+#[test]
+fn routed_write_stale_pending_response_does_not_downgrade_completion() {
+    let (runtime, mut client, request, base, bytes, nodes, operation, pending_response) =
+        native_pending_routed_write("native-routed-late-pending");
+    let primary = client.writes.pending_routed_writes[&operation]
+        .primary_node_id
+        .clone();
+    client
+        .handle_distributed_write_response(primary.clone(), pending_response.clone())
+        .unwrap();
+    let (actual_primary, terminal) = complete_native_routed_write(
+        &runtime,
+        &mut client,
+        &request,
+        &base,
+        &bytes,
+        &nodes,
+        &operation,
+    );
+    assert_eq!(actual_primary, primary);
+    let DfsDistributedWriteResult::Outcome {
+        outcome: NetworkedDfsWriteOutcome::Committed {
+            intent_id, version, ..
+        },
+    } = &terminal.result
+    else {
+        unreachable!()
+    };
+    let alias = intent_id.clone();
+    let actual_version = version.clone();
+    client
+        .handle_distributed_write_response(primary.clone(), terminal)
+        .unwrap();
+    assert!(matches!(
+        client
+            .handle_distributed_write_response(primary, pending_response)
+            .unwrap(),
+        NetworkedDfsServiceEvent::RemoteResponseDiscarded { .. }
+    ));
+    for id in [&operation, &alias] {
+        assert!(
+            matches!(client.write_outcome(id).unwrap(), NetworkedDfsWriteOutcome::Committed { intent_id, version, .. } if intent_id == alias && version == actual_version)
+        );
+    }
+    drop(client);
+    runtime.close().unwrap();
+}
+
+#[test]
+fn local_write_outcome_wins_over_stale_routed_alias_shadow() {
+    let (runtime, mut client, request, base, bytes, nodes, operation, pending_response) =
+        native_pending_routed_write("native-local-committed-before-routed-reply");
+    let primary = client.writes.pending_routed_writes[&operation]
+        .primary_node_id
+        .clone();
+    client
+        .handle_distributed_write_response(primary, pending_response)
+        .unwrap();
+    let (_, terminal) = complete_native_routed_write(
+        &runtime,
+        &mut client,
+        &request,
+        &base,
+        &bytes,
+        &nodes,
+        &operation,
+    );
+    let DfsDistributedWriteResult::Outcome {
+        outcome:
+            NetworkedDfsWriteOutcome::Committed {
+                intent_id,
+                version,
+                content_hash: hash,
+                ..
+            },
+    } = &terminal.result
+    else {
+        unreachable!()
+    };
+    let pending = &client.writes.pending_routed_writes[intent_id];
+    assert!(
+        pending.result.is_none(),
+        "the actual terminal response has not been consumed"
+    );
+    assert_eq!(pending.remote_intent_id.as_ref(), Some(intent_id));
+    assert!(
+        matches!(client.write_outcome(intent_id).unwrap(), NetworkedDfsWriteOutcome::Committed { intent_id: actual_intent, version: actual_version, content_hash: actual_hash, .. }
+        if actual_intent == *intent_id && actual_version == *version && actual_hash == *hash)
+    );
+    drop(client);
+    runtime.close().unwrap();
+}
+
+#[test]
+fn native_routed_namespace_replays_a_bounded_actual_backlog() {
+    let nodes = crate::test_runtime::DfsTestRuntime::ordered_node_ids("native-routing-backlog", 3);
+    let mut runtime =
+        crate::test_runtime::DfsTestRuntime::new("native-routing-backlog", nodes[0].clone())
+            .unwrap();
+    for node in &nodes[1..] {
+        runtime.define_node(node.clone()).unwrap();
+    }
+    runtime.start_nodes().unwrap();
+    let shard = runtime
+        .metadata_shards()
+        .unwrap()
+        .into_iter()
+        .find(|shard| shard.shard_id == "services")
+        .unwrap();
+    let primary = shard.primary_node_id.clone();
+    let mut source = runtime.client(&primary).unwrap();
+    for index in 0..(DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT / 2 + 8) {
+        source
+            .posix_write_file(
+                &format!("/services/native-backlog-{index}.bin"),
+                &(index as u64).to_le_bytes(),
+                DfsWriteOptions::replicated_eventual(vec![primary.clone()]),
+            )
+            .unwrap();
+    }
+    drop(source);
+    let current_shard = runtime
+        .metadata_shards()
+        .unwrap()
+        .into_iter()
+        .find(|shard| shard.shard_id == "services")
+        .unwrap();
+    let requester = nodes
+        .iter()
+        .find(|node| **node != current_shard.primary_node_id)
+        .unwrap()
+        .clone();
+    let global_observations_before = runtime.rpc_observations().len();
+    let global_dropped_before = runtime.observation_dropped_count();
+    let capture = runtime
+        .capture_namespace_requests(&current_shard.primary_node_id, 32)
+        .unwrap();
+    let mut client = runtime.client(&requester).unwrap();
+    client
+        .posix_mkdir_all("/services/native-after-backlog/deep")
+        .unwrap();
+    let rows = client.posix_list_dir_distributed("/services").unwrap();
+    assert!(rows.iter().any(|row| row.name == "native-after-backlog"));
+    let actual = client
+        .metadata_backend()
+        .unwrap()
+        .journal_batch_for_shard_since_limited(
+            &DfsMetadataShardId::new("services"),
+            0,
+            DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_ENTRY_LIMIT,
+            DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_BYTE_LIMIT,
+        )
+        .unwrap()
+        .unwrap();
+    assert!(actual.entries.len() > DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT);
+    assert!(actual.entries.len() <= DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_ENTRY_LIMIT);
+    for entry in actual.entries {
+        assert!(matches!(
+            entry.mutation,
+            DfsMetadataMutation::PrepareOperationV7 { .. }
+                | DfsMetadataMutation::CommitPreparedOperationV7 { .. }
+        ));
+    }
+    // This window observes only real post-backlog Main dispatches. Its records()
+    // checks zero omissions independently of the long-lived transport vector.
+    let requests = capture.records();
+    let exact_owner_request = |message: &crate::DfsRoutedMessage| {
+        if message.source_node_id != requester
+            || message.target_node_id != current_shard.primary_node_id
+        {
+            return false;
+        }
+        let DfsNetworkMessage::NamespaceRequest(request) = &message.message else {
+            return false;
+        };
+        request.requesting_node_id == requester
+            && request.file_system_id == current_shard.file_system_id
+            && request.authority_shards == vec![current_shard.clone()]
+    };
+    assert!(
+        requests
+            .iter()
+            .filter(|message| exact_owner_request(message))
+            .any(|message| {
+                matches!(&message.message, DfsNetworkMessage::NamespaceRequest(request)
+            if matches!(&request.operation, DfsNamespaceOperation::MkdirAll { path }
+                if path == "/services/native-after-backlog/deep"))
+            })
+    );
+    assert!(requests.iter().filter(|message| exact_owner_request(message)).any(|message| {
+        matches!(&message.message, DfsNetworkMessage::NamespaceRequest(request)
+            if matches!(&request.operation, DfsNamespaceOperation::MetadataQuery { query }
+                if query.file_system_id == current_shard.file_system_id
+                    && query.shard_id.0 == current_shard.shard_id
+                    && query.epoch == current_shard.epoch
+                    && matches!(&query.selection, crate::DfsMetadataSelection::DirectoryPage { path, .. }
+                        if path == "/services")))
+    }));
+    let global_dropped_after = runtime.observation_dropped_count();
+    drop(client);
+    let coverage = runtime.close_with_namespace_capture(capture).unwrap();
+    assert_eq!(coverage.namespace_omitted, Some(0));
+    println!(
+        "backlog observation coverage: before_records={global_observations_before} before_dropped={global_dropped_before} after_dropped={global_dropped_after} final={}",
+        serde_json::to_string(&coverage).unwrap()
     );
 }
 
@@ -243,7 +480,7 @@ fn dfs_peer_rpc_helpers_preserve_route_contracts() {
         receipt_count: 4,
         intent_count: 5,
         pending_write_count: 6,
-        open_conflict_count: 7,
+
         pending_repair_count: 8,
         repair_attempt_count: 0,
         pending_namespace_job_count: 9,
@@ -326,9 +563,9 @@ fn dfs_peer_rpc_helpers_preserve_route_contracts() {
         prefix_probe: None,
         authority_probe: None,
         durable_replication: None,
-        batch: DfsMetadataJournalBatch {
+        batch: DfsMetadataJournalFrameBatch {
             shard_id: shard_id.clone(),
-            entries: Vec::new(),
+            journal_frames: Vec::new(),
             next_after_sequence: 7,
         },
     };
@@ -365,7 +602,8 @@ fn dfs_peer_rpc_helpers_preserve_route_contracts() {
     let snapshot_root = temp_root("rpc_helper_snapshot");
     let snapshot = LocalSobjMetadataBackend::new(shard_id.clone(), &snapshot_root)
         .expect("metadata backend")
-        .export_table_snapshot();
+        .export_snapshot_image()
+        .expect("native snapshot image");
     let snapshot_command = DfsMetadataSnapshotInstallCommand {
         request_id: "snapshot-request".to_string(),
         source_node_id: local.clone(),
@@ -374,7 +612,8 @@ fn dfs_peer_rpc_helpers_preserve_route_contracts() {
         primary_handoff_id: None,
         shard_id: shard_id.clone(),
         next_after_sequence: 9,
-        snapshot,
+        snapshot: snapshot.descriptor().clone(),
+        image: Some(snapshot),
         reason: "test".to_string(),
     };
     let snapshot_request =
@@ -665,1101 +904,65 @@ fn networked_dfs_builds_routed_messages_without_transport_send() {
 }
 
 #[test]
-fn routed_write_response_tracks_remote_intent_alias() {
-    let requester =
-        NodeId::from_legacy_named("node_routed_write_alias_requester").expect("requester");
-    let primary = NodeId::from_legacy_named("node_routed_write_alias_primary").expect("primary");
-    let object_id = DfsObjectId::from_legacy_named("obj_routed_write_alias").expect("object");
-    let version = DfsVersion::from_legacy_named("version_routed_write_alias").expect("version");
-    let root = temp_root("routed-write-alias");
-    let authority_shard = test_routed_authority_shard(&primary, 1);
-    let mut dfs = NetworkedDfsService::new(
-        crate::test_runtime::DfsTestRuntime::local_transport(requester.clone()),
-        LocalContentStore::new(root.join("content")).expect("content"),
-    )
-    .with_control_plane(test_routed_authority_control_plane(&authority_shard));
-    dfs.writes.pending_routed_writes.insert(
-        "dfs_net_req_1".to_string(),
-        test_pending_routed_write(
-            "dfs_net_req_1",
-            &requester,
-            &object_id,
-            &primary,
-            authority_shard,
-        ),
-    );
-
-    dfs.handle_distributed_write_response(
-        primary.clone(),
-        DfsDistributedWriteResponse {
-            request_id: "dfs_net_req_1".to_string(),
-            object_id: object_id.clone(),
-            result: DfsDistributedWriteResult::Outcome {
-                outcome: NetworkedDfsWriteOutcome::Pending {
-                    intent_id: "intent_remote_alias".to_string(),
-                    durable_receipts: 1,
-                    required_receipts: 2,
-                },
-            },
-            metadata_journal_batches: Vec::new(),
-        },
-    )
-    .expect("pending response");
-
-    assert!(matches!(
-        dfs.write_outcome("dfs_net_req_1").expect("request outcome"),
-        NetworkedDfsWriteOutcome::Pending {
-            intent_id,
-            durable_receipts: 1,
-            required_receipts: 2,
-        } if intent_id == "intent_remote_alias"
+fn local_owned_read_is_routed_to_owner_node() {
+    let name = "native-local-owned-routed-read";
+    let (runtime, mut owner_dfs, config) =
+        crate::test_support::current_native_metadata_service(name, 2, "/services").unwrap();
+    let owner = config.primary_node_id;
+    let remote = crate::test_runtime::DfsTestRuntime::ordered_node_ids(name, 2)
+        .into_iter()
+        .find(|node| *node != owner)
+        .unwrap();
+    let path = "/services/native-local-owned-read";
+    let mut fs = runtime.file_system();
+    fs.subtree_policies.push(DfsSubtreePolicy::new(
+        path,
+        DfsObjectPolicy::LocalOwned,
+        1,
+        1,
     ));
-    assert!(
-        dfs.writes
-            .pending_routed_writes
-            .contains_key("intent_remote_alias")
-    );
-    assert!(
-        dfs.writes.pending_routed_writes["dfs_net_req_1"]
-            .command
-            .is_some(),
-        "the canonical request retains its retry command while unresolved"
-    );
-    assert!(
-        dfs.writes.pending_routed_writes["intent_remote_alias"]
-            .command
-            .is_none(),
-        "a remote intent alias must not clone the full routed command"
-    );
-
-    let event = dfs
-        .handle_distributed_write_response(
-            primary.clone(),
-            DfsDistributedWriteResponse {
-                request_id: "dfs_net_req_1".to_string(),
-                object_id: object_id.clone(),
-                result: DfsDistributedWriteResult::Rejected {
-                    reason: "exclusive retry observed the pending create".to_string(),
-                    current_primary_node_id: None,
-                },
-                metadata_journal_batches: Vec::new(),
-            },
-        )
-        .expect("stale retry rejection");
-    assert!(matches!(
-        event,
-        NetworkedDfsServiceEvent::RemoteResponseDiscarded { .. }
-    ));
-    assert!(matches!(
-        dfs.write_outcome("intent_remote_alias")
-            .expect("intent remains pending"),
-        NetworkedDfsWriteOutcome::Pending { .. }
-    ));
-
-    dfs.handle_distributed_write_response(
-        primary,
-        DfsDistributedWriteResponse {
-            request_id: "intent_remote_alias".to_string(),
-            object_id,
-            result: DfsDistributedWriteResult::Outcome {
-                outcome: NetworkedDfsWriteOutcome::Committed {
-                    intent_id: "intent_remote_alias".to_string(),
-                    version: version.clone(),
-                    content_hash: "blake3:routed-write-alias".to_string(),
-                    repair_jobs: Vec::new(),
-                },
-            },
-            metadata_journal_batches: Vec::new(),
-        },
-    )
-    .expect("committed response");
-
-    assert!(
-        dfs.writes
-            .pending_routed_writes
-            .values()
-            .all(|pending| pending.command.is_none()),
-        "terminal routed-write state must release every command body"
-    );
-    assert!(matches!(
-        dfs.take_write_outcome("intent_remote_alias")
-            .expect("alias outcome"),
-        NetworkedDfsWriteOutcome::Committed {
-            intent_id,
-            version: committed_version,
-            ..
-        } if intent_id == "intent_remote_alias" && committed_version == version
-    ));
-    assert!(
-        dfs.writes.pending_routed_writes.is_empty(),
-        "consuming the terminal outcome must remove the request and its aliases"
-    );
-
-    std::fs::remove_dir_all(root).ok();
-}
-
-#[test]
-fn routed_write_stale_pending_response_does_not_downgrade_completion() {
-    let requester =
-        NodeId::from_legacy_named("node_routed_write_stale_requester").expect("requester");
-    let primary = NodeId::from_legacy_named("node_routed_write_stale_primary").expect("primary");
-    let object_id = DfsObjectId::from_legacy_named("obj_routed_write_stale").expect("object");
-    let version = DfsVersion::from_legacy_named("version_routed_write_stale").expect("version");
-    let root = temp_root("routed-write-stale-pending");
-    let authority_shard = test_routed_authority_shard(&primary, 1);
-    let mut dfs = NetworkedDfsService::new(
-        crate::test_runtime::DfsTestRuntime::local_transport(requester.clone()),
-        LocalContentStore::new(root.join("content")).expect("content"),
-    )
-    .with_control_plane(test_routed_authority_control_plane(&authority_shard));
-    dfs.writes.pending_routed_writes.insert(
-        "dfs_net_req_1".to_string(),
-        test_pending_routed_write(
-            "dfs_net_req_1",
-            &requester,
-            &object_id,
-            &primary,
-            authority_shard,
-        ),
-    );
-
-    dfs.handle_distributed_write_response(
-        primary.clone(),
-        DfsDistributedWriteResponse {
-            request_id: "dfs_net_req_1".to_string(),
-            object_id: object_id.clone(),
-            result: DfsDistributedWriteResult::Outcome {
-                outcome: NetworkedDfsWriteOutcome::Committed {
-                    intent_id: "intent_remote_alias".to_string(),
-                    version: version.clone(),
-                    content_hash: "blake3:routed-write-stale".to_string(),
-                    repair_jobs: Vec::new(),
-                },
-            },
-            metadata_journal_batches: Vec::new(),
-        },
-    )
-    .expect("committed response");
-
-    dfs.handle_distributed_write_response(
-        primary,
-        DfsDistributedWriteResponse {
-            request_id: "dfs_net_req_1".to_string(),
-            object_id,
-            result: DfsDistributedWriteResult::Outcome {
-                outcome: NetworkedDfsWriteOutcome::Pending {
-                    intent_id: "intent_remote_alias".to_string(),
-                    durable_receipts: 1,
-                    required_receipts: 2,
-                },
-            },
-            metadata_journal_batches: Vec::new(),
-        },
-    )
-    .expect("stale pending response");
-
-    assert!(matches!(
-        dfs.write_outcome("dfs_net_req_1")
-            .expect("request outcome"),
-        NetworkedDfsWriteOutcome::Committed {
-            intent_id,
-            version: committed_version,
-            ..
-        } if intent_id == "intent_remote_alias" && committed_version == version
-    ));
-    assert!(matches!(
-        dfs.write_outcome("intent_remote_alias")
-            .expect("alias outcome"),
-        NetworkedDfsWriteOutcome::Committed {
-            intent_id,
-            version: committed_version,
-            ..
-        } if intent_id == "intent_remote_alias" && committed_version == version
-    ));
-
-    std::fs::remove_dir_all(root).ok();
-}
-
-#[test]
-fn local_write_outcome_wins_over_stale_routed_alias_shadow() {
-    let local = NodeId::from_legacy_named("node_local_shadow_writer").expect("local");
-    let replica = NodeId::from_legacy_named("node_local_shadow_replica").expect("replica");
-    let primary = NodeId::from_legacy_named("node_local_shadow_primary").expect("primary");
-    let object_id = DfsObjectId::from_legacy_named("obj_local_shadow").expect("object");
-    let version_1 = DfsVersion::from_legacy_named("version_local_shadow_1").expect("version");
-    let version_2 = DfsVersion::from_legacy_named("version_local_shadow_2").expect("version");
-    let root = temp_root("local-write-shadowed-by-routed-alias");
-    let mut dfs = NetworkedDfsService::new(
-        crate::test_runtime::DfsTestRuntime::local_transport(local.clone()),
-        LocalContentStore::new(root.join("content")).expect("content"),
-    );
-    let file_system_id = sifs_file_system_id();
-    dfs.add_file_system(DfsFileSystem {
-        metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
-        retention_policies: Default::default(),
-        module_metadata: Default::default(),
-        file_system_id: file_system_id.clone(),
-        display_name: "sifs".to_string(),
-        owner_node_id: local.clone(),
-        subtree_policies: Vec::new(),
-    })
-    .expect("filesystem");
-    dfs.add_object_metadata(DfsObjectMetadata {
-        object_id: object_id.clone(),
-        file_system_id: file_system_id.clone(),
-        path: "/services/local-shadow.txt".to_string(),
-        kind: DfsObjectKind::File,
-        tombstone_provenance: None,
-        owner_node_id: local.clone(),
-        current_locations: vec![local.clone()],
-        content_hash: Some(content_hash(b"old local shadow bytes")),
-        content_size_bytes: Some(b"old local shadow bytes".len() as u64),
-        link_target_object_id: None,
-        mode: 0o644,
-        uid: 0,
-        gid: 0,
-        accessed_at_unix_nanos: 0,
-        modified_at_unix_nanos: 0,
-        created_at_unix_nanos: 0,
-        changed_at_unix_nanos: 0,
-        version: version_1,
-        policy: DfsObjectPolicy::ReplicatedEventual,
-        created_by_event_id: None,
-        last_modified_by_event_id: None,
-    })
-    .expect("object metadata");
-
-    let write = dfs
-        .write_distributed_eventual(
-            DfsWriteRequest {
-                file_system_id,
-                object_id: object_id.clone(),
-                target_version: version_2.clone(),
-                requesting_node_id: local.clone(),
-            },
-            b"new local shadow bytes".to_vec(),
-            vec![local.clone(), replica],
-            DfsReplicationPolicy::new(1, 2).expect("policy"),
-        )
-        .expect("local write");
-    let NetworkedDfsWriteOutcome::Committed { intent_id, .. } = write else {
-        panic!("expected committed local write, got {write:?}");
-    };
-    dfs.writes.pending_routed_writes.insert(
-        intent_id.clone(),
-        PendingRoutedWrite {
-            canonical_request_id: "dfs_net_req_shadow".to_string(),
-            object_id: object_id.clone(),
-            primary_node_id: primary.clone(),
-            authority_shard: test_routed_authority_shard(&primary, 1),
-            command: Some(test_routed_write_command(
-                "dfs_net_req_shadow",
-                &local,
-                &object_id,
-            )),
-            attachment_bytes: None,
-            authority_redirects_remaining: DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT,
-            remote_intent_id: Some(intent_id.clone()),
-            durable_receipts: 1,
-            required_receipts: 2,
-            result: None,
-            compact_retained_at: None,
-        },
-    );
-
-    assert!(matches!(
-        dfs.write_outcome(&intent_id).expect("shadowed outcome"),
-        NetworkedDfsWriteOutcome::Committed {
-            intent_id: committed_intent_id,
-            version,
-            ..
-        } if committed_intent_id == intent_id && version == version_2
-    ));
-
-    std::fs::remove_dir_all(root).ok();
-}
-
-#[test]
-fn empty_routed_write_uses_an_ordinary_value_call() {
-    let requester =
-        NodeId::from_legacy_named("node_empty_routed_requester").expect("requester node");
-    let primary = NodeId::from_legacy_named("node_empty_routed_primary").expect("primary node");
-    let root = temp_root("empty-routed-value-call");
-    let calls = Arc::new(Mutex::new(Vec::new()));
-    let mut service = test_service(
-        RecordingRoutedCallTransport {
-            local_node_id: requester.clone(),
-            calls: Arc::clone(&calls),
-        },
-        LocalContentStore::new(root.join("content")).expect("content store"),
-    );
-    let path = "/users/empty-routed-value";
-    let object =
-        crate::posix_object::new_posix_metadata_object(&requester, path, DfsObjectKind::File);
-    let target_version = crate::namespace::next_version(&object.version);
-    let shard = DfsMetadataShardConfig {
-        file_system_id: object.file_system_id.clone(),
-        shard_id: "root".to_string(),
-        primary_node_id: primary.clone(),
-        replica_node_ids: vec![requester.clone()],
-        epoch: 7,
-        assignment: DfsMetadataShardAssignment::Root,
-        namespace_prepare_codec: Default::default(),
-        default_policy: DfsObjectPolicy::ReplicatedEventual,
-    };
-
-    let outcome = service
-        .route_distributed_bytes(
-            DfsWriteRequest {
-                file_system_id: object.file_system_id.clone(),
-                object_id: object.object_id.clone(),
-                target_version,
-                requesting_node_id: requester.clone(),
-            },
-            Some(object.version.clone()),
-            Vec::new(),
-            vec![requester],
-            DfsReplicationPolicy::new(1, 1).expect("replication policy"),
-            object,
-            shard,
-            DfsDistributedWriteOptions {
-                publication: Default::default(),
-                touch_parent_on_create: true,
-                creation: DfsWriteCreation::Exclusive,
-                repair: DfsWriteRepair::Foreground,
-                dispatch: DfsWriteDispatch::AwaitResponse,
-                replay_response_journal: false,
-                operation_id: None,
-            },
-        )
-        .expect("route empty write");
-    assert!(matches!(outcome, NetworkedDfsWriteOutcome::Pending { .. }));
-
-    let calls = calls.lock().expect("recorded routed calls");
-    assert_eq!(calls.len(), 1);
-    let (target_node_id, call) = &calls[0];
-    assert_eq!(target_node_id, &primary);
-    assert!(
-        call.attachment.is_none(),
-        "zero-byte content must not produce an attachment-shaped RPC head"
-    );
-    let DfsNetworkMessage::ExclusiveCreateRequest(command) = &call.message.message else {
-        panic!(
-            "expected routed exclusive create, got {:?}",
-            call.message.message
-        );
-    };
-    assert!(command.bytes.is_empty());
-    assert_eq!(command.content_hash, None);
-    assert_eq!(command.content_size_bytes, None);
-    assert!(!command.requester_blob_pre_staged);
-    assert!(command.exclusive_create);
-
-    std::fs::remove_dir_all(root).ok();
-}
-
-#[test]
-fn posix_routed_strict_write_prefers_metadata_primary_replica() {
-    let root = temp_root("posix-routed-strict-prefers-primary");
-    let writer =
-        NodeId::from_legacy_named("node_posix_routed_primary_pref_writer").expect("writer");
-    let primary =
-        NodeId::from_legacy_named("node_posix_routed_primary_pref_primary").expect("primary");
-    let replica =
-        NodeId::from_legacy_named("node_posix_routed_primary_pref_replica").expect("replica");
-    let file_system = file_system(primary.clone());
-    let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
-    let shard = DfsMetadataShardConfig {
-        file_system_id: file_system.file_system_id.clone(),
-        shard_id: "root".to_string(),
-        primary_node_id: primary.clone(),
-        replica_node_ids: vec![writer.clone()],
-        epoch: 1,
-        assignment: DfsMetadataShardAssignment::Root,
-        namespace_prepare_codec: Default::default(),
-        default_policy: DfsObjectPolicy::ReplicatedEventual,
-    };
-    control_plane.with_client(|kv| {
-        let mut control = DfsControlPlaneStore::new(kv);
-        control
-            .put_file_system_config(&DfsFileSystemConfig::from(&file_system))
-            .expect("filesystem config");
-        control.put_metadata_shard(&shard).expect("metadata shard");
-    });
-
-    let captured_desired = Arc::new(Mutex::new(None::<Vec<NodeId>>));
-    let captured_desired_for_sender = Arc::clone(&captured_desired);
-    let sender: DfsMessageSender = Arc::new(move |_target_node_id, command, _timeout| {
-        if let DfsNetworkMessage::DistributedWriteRequest(command) = &command.routed_message.message
-        {
-            *captured_desired_for_sender.lock().expect("capture") =
-                Some(command.desired_replica_nodes.clone());
-        }
-        Ok(DfsMessageResponse {
-            request_id: command.request_id.clone(),
-            outbound_messages: Vec::new(),
-        })
-    });
-    let transport =
-        node_transport_with_attachment_sender(writer.clone(), vec![primary.clone()], sender);
-    let mut object = file_metadata(primary.clone());
-    object.file_system_id = file_system.file_system_id.clone();
-    object.path = "/routed-primary-preferred.txt".to_string();
-    object.policy = DfsObjectPolicy::ReplicatedEventual;
-    object.current_locations = vec![writer.clone()];
-    let writer_content = LocalContentStore::new(root.join("writer-content")).expect("content");
-    let metadata = seeded_durable_metadata_replica(
-        root.join("writer-metadata"),
-        vec![shard],
-        &file_system,
-        &object,
-    );
-    let mut dfs = NetworkedDfsService::new(transport, writer_content)
-        .with_control_plane(control_plane)
-        .with_metadata_backend(metadata)
-        .expect("attach writer metadata replica");
-    dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
-
-    dfs.posix_write_file(
-        "/routed-primary-preferred.txt",
-        b"strict routed POSIX write prefers primary",
-        DfsWriteOptions {
-            policy: DfsReplicationPolicy::new(2, 2).expect("policy"),
-            replica_candidates: vec![writer.clone(), replica.clone()],
-            wait_for_commit: false,
-            foreground_replica_repair: true,
-        },
-    )
-    .expect("pending routed write returns stat for existing object");
-
-    assert_eq!(
-        captured_desired.lock().expect("capture").clone(),
-        Some(vec![writer, primary]),
-        "routed strict POSIX write should choose the metadata primary as the second replica"
-    );
-
-    std::fs::remove_dir_all(root).ok();
-}
-
-#[test]
-fn posix_routed_write_sends_attachment_without_local_persistence() {
-    let root = temp_root("posix-routed-value");
-    let writer = NodeId::from_legacy_named("node_posix_routed_inline_writer").expect("writer");
-    let primary = NodeId::from_legacy_named("node_posix_routed_inline_primary").expect("primary");
-    let file_system = file_system(primary.clone());
-    let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
-    let shard = DfsMetadataShardConfig {
-        file_system_id: file_system.file_system_id.clone(),
-        shard_id: "root".to_string(),
-        primary_node_id: primary.clone(),
-        replica_node_ids: vec![writer.clone()],
-        epoch: 1,
-        assignment: DfsMetadataShardAssignment::Root,
-        namespace_prepare_codec: Default::default(),
-        default_policy: DfsObjectPolicy::ReplicatedEventual,
-    };
-    control_plane.with_client(|kv| {
-        let mut control = DfsControlPlaneStore::new(kv);
-        control
-            .put_file_system_config(&DfsFileSystemConfig::from(&file_system))
-            .expect("filesystem config");
-        control.put_metadata_shard(&shard).expect("metadata shard");
-    });
-
-    let captured_command = Arc::new(Mutex::new(None::<DfsDistributedWriteCommand>));
-    let captured_command_for_sender = Arc::clone(&captured_command);
-    let sender: DfsMessageSender = Arc::new(move |_target_node_id, command, _timeout| {
-        if let DfsNetworkMessage::DistributedWriteRequest(write_command) =
-            &command.routed_message.message
-        {
-            *captured_command_for_sender.lock().expect("capture") = Some(write_command.clone());
-        }
-        Ok(DfsMessageResponse {
-            request_id: command.request_id.clone(),
-            outbound_messages: Vec::new(),
-        })
-    });
-    let transport =
-        node_transport_with_attachment_sender(writer.clone(), vec![primary.clone()], sender);
-    let mut object = file_metadata(primary.clone());
-    object.file_system_id = file_system.file_system_id.clone();
-    object.path = "/routed-value.txt".to_string();
-    object.policy = DfsObjectPolicy::ReplicatedEventual;
-    object.current_locations = vec![writer.clone()];
-    let writer_content = LocalContentStore::new(root.join("writer-content")).expect("content");
-    let metadata = seeded_durable_metadata_replica(
-        root.join("writer-metadata"),
-        vec![shard],
-        &file_system,
-        &object,
-    );
-    let mut dfs = NetworkedDfsService::new(transport, writer_content)
-        .with_control_plane(control_plane)
-        .with_metadata_backend(metadata)
-        .expect("attach writer metadata replica");
-    dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
-
-    let bytes = b"materialized routed POSIX bytes".to_vec();
-    let expected_hash = content_hash(&bytes);
-    dfs.posix_write_file(
-        "/routed-value.txt",
-        &bytes,
-        DfsWriteOptions {
-            policy: DfsReplicationPolicy::new(2, 2).expect("policy"),
-            replica_candidates: vec![writer.clone(), primary.clone()],
-            wait_for_commit: false,
-            foreground_replica_repair: true,
-        },
-    )
-    .expect("pending routed write returns stat for existing object");
-
-    let command = captured_command
-        .lock()
-        .expect("capture")
-        .clone()
-        .expect("captured routed write command");
-    assert_eq!(command.bytes, bytes);
-    assert_eq!(command.content_hash, None);
-    assert_eq!(command.content_size_bytes, None);
-    assert_eq!(command.desired_replica_nodes, vec![writer.clone(), primary]);
-    assert!(
-        !dfs.content
-            .has_blob(&expected_hash)
-            .expect("writer blob probe"),
-        "the remote-primary sender must not persist the payload before streaming it"
-    );
-
-    std::fs::remove_dir_all(root).ok();
-}
-
-#[test]
-fn staged_write_routes_keep_their_durable_requester_in_the_replica_plan() {
-    for mode in ["reader", "conditional", "bytes"] {
-        let conditional = mode == "conditional";
-        let root = temp_root("posix-staged-reader-value");
-        let writer = NodeId::from_legacy_named("node_posix_staged_reader_writer").expect("writer");
-        let primary =
-            NodeId::from_legacy_named("node_posix_staged_reader_primary").expect("primary");
-        let file_system = file_system(primary.clone());
-        let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
-        let shard = DfsMetadataShardConfig {
-            file_system_id: file_system.file_system_id.clone(),
-            shard_id: "root".to_string(),
-            primary_node_id: primary.clone(),
-            replica_node_ids: vec![writer.clone()],
-            epoch: 1,
-            assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
-            default_policy: DfsObjectPolicy::ReplicatedEventual,
-        };
-        control_plane.with_client(|kv| {
-            let mut control = DfsControlPlaneStore::new(kv);
-            control
-                .put_file_system_config(&DfsFileSystemConfig::from(&file_system))
-                .expect("filesystem config");
-            control.put_metadata_shard(&shard).expect("metadata shard");
-        });
-
-        let captured_command = Arc::new(Mutex::new(None::<DfsDistributedWriteCommand>));
-        let captured_command_for_sender = Arc::clone(&captured_command);
-        let sender: DfsMessageSender = Arc::new(move |_target_node_id, command, _timeout| {
-            if let DfsNetworkMessage::DistributedWriteRequest(write_command) =
-                &command.routed_message.message
-            {
-                *captured_command_for_sender.lock().expect("capture") = Some(write_command.clone());
-            }
-            Ok(DfsMessageResponse {
-                request_id: command.request_id.clone(),
-                outbound_messages: Vec::new(),
-            })
-        });
-        let transport =
-            node_transport_with_attachment_sender(writer.clone(), vec![primary.clone()], sender);
-        let mut object = file_metadata(primary.clone());
-        object.file_system_id = file_system.file_system_id.clone();
-        object.path = "/routed-value.txt".to_string();
-        object.policy = DfsObjectPolicy::ReplicatedEventual;
-        object.current_locations = vec![writer.clone()];
-        let writer_content = LocalContentStore::new(root.join("writer-content")).expect("content");
-        if mode == "bytes" {
-            let previous = writer_content
-                .put_object_version(object.object_id.as_str(), object.version.as_str(), b"base")
-                .expect("seed existing file content");
-            object.content_hash = Some(previous.content_hash);
-            object.content_size_bytes = Some(previous.size_bytes);
-        }
-        let metadata = seeded_durable_metadata_replica(
-            root.join("writer-metadata"),
-            vec![shard],
-            &file_system,
-            &object,
-        );
-        let mut dfs = NetworkedDfsService::new(transport, writer_content)
-            .with_control_plane(control_plane)
-            .with_metadata_backend(metadata)
-            .expect("attach writer metadata replica");
-        dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
-
-        let bytes = b"durable staged CAS bytes".to_vec();
-        let expected_hash = content_hash(&bytes);
-        let mut options = DfsWriteOptions {
-            policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
-            replica_candidates: vec![writer.clone(), primary.clone()],
-            wait_for_commit: false,
-            foreground_replica_repair: false,
-        };
-        if mode == "bytes" {
-            options.policy.required_node_ids.push(writer.clone());
-            dfs.posix_write_file("/routed-value.txt", &bytes, options)
-        } else if conditional {
-            dfs.posix_replace_file_if_version_from_reader_with_operation_id(
-                "/routed-value.txt",
-                &object.object_id,
-                &object.version,
-                std::io::Cursor::new(bytes.clone()),
-                options,
-                "stable-staged-cas",
-            )
-        } else {
-            dfs.posix_write_file_from_reader(
-                "/routed-value.txt",
-                std::io::Cursor::new(bytes.clone()),
-                options,
-            )
-        }
-        .expect("pending routed write returns stat for existing object");
-
-        let command = captured_command
-            .lock()
-            .expect("capture")
-            .clone()
-            .expect("captured routed write command");
-        assert!(command.requester_blob_pre_staged);
-        assert!(
-            command.metadata_journal_after_sequence.is_some(),
-            "public reader writes retain namespace replay"
-        );
-        assert!(command.bytes.is_empty());
-        assert_eq!(command.content_hash.as_ref(), Some(&expected_hash));
-        if conditional {
-            assert_eq!(command.desired_replica_nodes, vec![writer]);
-        } else {
-            // Ordinary writes also apply the filesystem's managed replica
-            // policy, which can require additional copies.
-            assert!(command.desired_replica_nodes.contains(&writer));
-        }
-        assert!(
-            dfs.content.has_blob(&expected_hash).unwrap(),
-            "the declared replica actually owns the durable bytes"
-        );
-
-        std::fs::remove_dir_all(root).ok();
-    }
-}
-
-#[test]
-fn internal_cas_requires_commit_without_requesting_namespace_replay() {
-    let root = temp_root("internal-cas-no-replay");
-    let writer = NodeId::from_legacy_named("node_internal_cas_writer").expect("writer");
-    let primary = NodeId::from_legacy_named("node_internal_cas_primary").expect("primary");
-    let file_system = file_system(primary.clone());
-    let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
-    let shard = DfsMetadataShardConfig {
-        file_system_id: file_system.file_system_id.clone(),
-        shard_id: "root".to_string(),
-        primary_node_id: primary.clone(),
-        replica_node_ids: vec![writer.clone()],
-        epoch: 1,
-        assignment: DfsMetadataShardAssignment::Root,
-        namespace_prepare_codec: Default::default(),
-        default_policy: DfsObjectPolicy::ReplicatedEventual,
-    };
-    control_plane.with_client(|kv| {
-        let mut control = DfsControlPlaneStore::new(kv);
-        control
-            .put_file_system_config(&DfsFileSystemConfig::from(&file_system))
-            .expect("filesystem config");
-        control.put_metadata_shard(&shard).expect("metadata shard");
-    });
-
-    let mut object = file_metadata(primary.clone());
-    object.file_system_id = file_system.file_system_id.clone();
-    object.path = "/routed-value.txt".to_string();
-    object.policy = DfsObjectPolicy::ReplicatedEventual;
-    object.current_locations = vec![writer.clone()];
-    let lookup_object = object.clone();
-    let captured_command = Arc::new(Mutex::new(None::<DfsDistributedWriteCommand>));
-    let captured_command_for_sender = Arc::clone(&captured_command);
-    let sender: DfsMessageSender = Arc::new(move |_target_node_id, command, _timeout| {
-        if let DfsNetworkMessage::DistributedWriteRequest(write_command) =
-            &command.routed_message.message
-        {
-            *captured_command_for_sender.lock().expect("capture") = Some(write_command.clone());
-            return Err(DfsPeerTransportError::with_delivery_state(
-                "simulated unavailable authority",
-                Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent),
-            ));
-        }
-        if let DfsNetworkMessage::NamespaceRequest(request) = &command.routed_message.message {
-            if let DfsNamespaceOperation::LookupPaths { paths } = &request.operation {
-                return Ok(DfsMessageResponse {
-                    request_id: command.request_id.clone(),
-                    outbound_messages: vec![DfsRoutedMessage {
-                        source_node_id: command.routed_message.target_node_id.clone(),
-                        target_node_id: command.routed_message.source_node_id.clone(),
-                        frame_id: command.routed_message.frame_id,
-                        message_id: command.routed_message.message_id,
-                        message: DfsNetworkMessage::NamespaceResponse(DfsNamespaceResponse {
-                            request_id: request.request_id.clone(),
-                            result: DfsNamespaceResult::Applied,
-                            synced_path_object: None,
-                            synced_path_objects: if paths.contains(&lookup_object.path) {
-                                vec![lookup_object.clone()]
-                            } else {
-                                vec![]
-                            },
-                            metadata_journal_batches: vec![],
-                            metadata_journal_has_more: Some(false),
-                            posix_coordination_result: None,
-                        }),
-                    }],
-                });
-            }
-        }
-        Ok(DfsMessageResponse {
-            request_id: command.request_id.clone(),
-            outbound_messages: Vec::new(),
-        })
-    });
-    let transport =
-        node_transport_with_attachment_sender(writer.clone(), vec![primary.clone()], sender);
-    let writer_content = LocalContentStore::new(root.join("writer-content")).expect("content");
-    let metadata = seeded_durable_metadata_replica(
-        root.join("writer-metadata"),
-        vec![shard],
-        &file_system,
-        &object,
-    );
-    let mut dfs = NetworkedDfsService::new(transport, writer_content)
-        .with_control_plane(control_plane)
-        .with_metadata_backend(metadata)
-        .expect("attach writer metadata replica");
-    dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
-
-    let bytes = b"durable staged CAS bytes".to_vec();
-    let expected_hash = content_hash(&bytes);
-    dfs.posix_write_internal_file_from_reader(
-        "/routed-value.txt",
-        std::io::Cursor::new(bytes.clone()),
-        DfsWriteOptions {
-            policy: DfsReplicationPolicy::new(1, 1).unwrap(),
-            replica_candidates: vec![writer.clone(), primary.clone()],
-            wait_for_commit: false,
-            foreground_replica_repair: false,
-        },
-        Some((&object.object_id, &object.version)),
-        "internal-cas-no-replay",
-    )
-    .expect_err("an internal write must not claim success without the authority's commit receipt");
-
-    let command = captured_command
-        .lock()
-        .expect("capture")
-        .clone()
-        .expect("captured routed write command");
-    assert!(command.requester_blob_pre_staged);
-    assert_eq!(command.metadata_journal_after_sequence, None);
-    assert!(command.bytes.is_empty());
-    assert_eq!(command.content_hash.as_ref(), Some(&expected_hash));
-    assert_eq!(command.desired_replica_nodes, vec![writer]);
-    assert!(
-        dfs.content.has_blob(&expected_hash).unwrap(),
-        "the declared replica actually owns the durable bytes"
-    );
-
-    std::fs::remove_dir_all(root).ok();
-}
-
-#[test]
-fn posix_routed_multimegabyte_write_uses_same_attachment_path() {
-    let root = temp_root("posix-routed-multimegabyte-value");
-    let writer = NodeId::from_legacy_named("node_posix_routed_manifest_writer").expect("writer");
-    let primary = NodeId::from_legacy_named("node_posix_routed_manifest_primary").expect("primary");
-    let file_system = file_system(primary.clone());
-    let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
-    let shard = DfsMetadataShardConfig {
-        file_system_id: file_system.file_system_id.clone(),
-        shard_id: "root".to_string(),
-        primary_node_id: primary.clone(),
-        replica_node_ids: vec![writer.clone()],
-        epoch: 1,
-        assignment: DfsMetadataShardAssignment::Root,
-        namespace_prepare_codec: Default::default(),
-        default_policy: DfsObjectPolicy::ReplicatedEventual,
-    };
-    control_plane.with_client(|kv| {
-        let mut control = DfsControlPlaneStore::new(kv);
-        control
-            .put_file_system_config(&DfsFileSystemConfig::from(&file_system))
-            .expect("filesystem config");
-        control.put_metadata_shard(&shard).expect("metadata shard");
-    });
-
-    let captured_command = Arc::new(Mutex::new(None::<DfsDistributedWriteCommand>));
-    let captured_command_for_sender = Arc::clone(&captured_command);
-    let sender: DfsMessageSender = Arc::new(move |_target_node_id, command, _timeout| {
-        if let DfsNetworkMessage::DistributedWriteRequest(write_command) =
-            &command.routed_message.message
-        {
-            *captured_command_for_sender.lock().expect("capture") = Some(write_command.clone());
-        }
-        Ok(DfsMessageResponse {
-            request_id: command.request_id.clone(),
-            outbound_messages: Vec::new(),
-        })
-    });
-    let transport =
-        node_transport_with_attachment_sender(writer.clone(), vec![primary.clone()], sender);
-    let mut object = file_metadata(primary.clone());
-    object.file_system_id = file_system.file_system_id.clone();
-    object.path = "/routed-multimegabyte-value.bin".to_string();
-    object.policy = DfsObjectPolicy::ReplicatedEventual;
-    object.current_locations = vec![writer.clone()];
-    let writer_content = LocalContentStore::new(root.join("writer-content")).expect("content");
-    let metadata = seeded_durable_metadata_replica(
-        root.join("writer-metadata"),
-        vec![shard],
-        &file_system,
-        &object,
-    );
-    let mut dfs = NetworkedDfsService::new(transport, writer_content)
-        .with_control_plane(control_plane)
-        .with_metadata_backend(metadata)
-        .expect("attach writer metadata replica");
-    dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
-
-    let bytes = vec![0x57; 2 * 1024 * 1024 + 8192];
-    let expected_hash = content_hash(&bytes);
-    dfs.posix_write_file(
-        "/routed-multimegabyte-value.bin",
-        &bytes,
-        DfsWriteOptions {
-            policy: DfsReplicationPolicy::new(2, 2).expect("policy"),
-            replica_candidates: vec![writer.clone(), primary.clone()],
-            wait_for_commit: false,
-            foreground_replica_repair: true,
-        },
-    )
-    .expect("pending routed write returns stat for existing object");
-
-    let command = captured_command
-        .lock()
-        .expect("capture")
-        .clone()
-        .expect("captured routed write command");
-    assert_eq!(command.bytes, bytes);
-    assert_eq!(command.content_hash, None);
-    assert_eq!(command.content_size_bytes, None);
-    assert_eq!(command.desired_replica_nodes, vec![writer, primary]);
-    assert!(
-        !dfs.content
-            .has_blob(&expected_hash)
-            .expect("writer blob probe"),
-        "large remote-primary writes must stream without a sender-side blob copy"
-    );
-
-    std::fs::remove_dir_all(root).ok();
-}
-
-#[test]
-fn posix_remote_primary_deferred_write_carries_streamed_payload() {
-    let root = temp_root("posix-remote-primary-deferred-materialized");
-    let writer = NodeId::from_legacy_named("node_posix_remote_deferred_materialized_writer")
-        .expect("writer");
-    let primary = NodeId::from_legacy_named("node_posix_remote_deferred_materialized_primary")
-        .expect("primary");
-    let file_system = file_system(primary.clone());
-    let shard = DfsMetadataShardConfig {
-        file_system_id: file_system.file_system_id.clone(),
-        shard_id: "root".to_string(),
-        primary_node_id: primary.clone(),
-        replica_node_ids: vec![writer.clone()],
-        epoch: 1,
-        assignment: DfsMetadataShardAssignment::Root,
-        namespace_prepare_codec: Default::default(),
-        default_policy: DfsObjectPolicy::ReplicatedEventual,
-    };
-    let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
-    control_plane.with_client(|kv| {
-        let mut control = DfsControlPlaneStore::new(kv);
-        control
-            .put_file_system_config(&DfsFileSystemConfig::from(&file_system))
-            .expect("filesystem config");
-        control.put_metadata_shard(&shard).expect("metadata shard");
-    });
-
-    let captured_command = Arc::new(Mutex::new(None::<DfsDistributedWriteCommand>));
-    let captured_command_for_sender = Arc::clone(&captured_command);
-    let sender: DfsMessageSender = Arc::new(move |_target_node_id, command, _timeout| {
-        if let DfsNetworkMessage::DistributedWriteRequest(write_command) =
-            &command.routed_message.message
-        {
-            *captured_command_for_sender.lock().expect("capture") = Some(write_command.clone());
-        }
-        Ok(DfsMessageResponse {
-            request_id: command.request_id.clone(),
-            outbound_messages: Vec::new(),
-        })
-    });
-    let transport =
-        node_transport_with_attachment_sender(writer.clone(), vec![primary.clone()], sender);
-    let path = "/routed-deferred-materialized.bin";
-    let mut object = file_metadata(primary.clone());
-    object.file_system_id = file_system.file_system_id.clone();
-    object.path = path.to_string();
-    object.policy = DfsObjectPolicy::ReplicatedEventual;
-    object.current_locations = vec![writer.clone()];
-    let writer_content = LocalContentStore::new(root.join("writer-content")).expect("content");
-    let metadata =
-        seeded_durable_metadata_replica(root.join("metadata"), vec![shard], &file_system, &object);
-    let mut dfs = NetworkedDfsService::new(transport, writer_content)
-        .with_control_plane(control_plane)
-        .with_metadata_backend(metadata)
-        .expect("attach metadata backend");
-    dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
-
-    let bytes = b"deferred remote primary write uses the materialized value path".to_vec();
-    let expected_hash = content_hash(&bytes);
-    let stat = dfs
+    owner_dfs.add_file_system(fs).unwrap();
+    let stat = owner_dfs
         .posix_write_file(
             path,
-            &bytes,
-            DfsWriteOptions {
-                policy: DfsReplicationPolicy::new(1, 2).expect("policy"),
-                replica_candidates: vec![writer.clone(), primary.clone()],
-                wait_for_commit: false,
-                foreground_replica_repair: false,
-            },
+            b"owned bytes",
+            DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
         )
-        .expect("pending routed write returns stat for existing object");
-
+        .unwrap();
+    let mut reader = runtime.client(&remote).unwrap();
     assert_eq!(
-        stat.content_hash, None,
-        "the sender cannot report a content identity before the primary's one-pass ingest completes"
+        reader
+            .request_remote_object_read_without_cache(&stat.object_id)
+            .unwrap(),
+        vec![owner.clone()]
     );
-    let command = captured_command
-        .lock()
-        .expect("capture")
-        .clone()
-        .expect("captured routed write command");
-    assert_eq!(command.bytes, bytes);
-    assert_eq!(
-        command.content_hash, None,
-        "materialized remote-primary POSIX writes should not require a follow-up blob fetch"
-    );
-    assert_eq!(command.content_size_bytes, None);
-    assert_eq!(command.desired_replica_nodes, vec![writer, primary]);
-    assert!(
-        command.metadata_journal_after_sequence.is_some(),
-        "deferred POSIX writes need bounded response journal replay when callers publish metadata"
-    );
-    assert!(
-        dfs.flush_detached_transport_sends().is_ok(),
-        "remote-primary POSIX writes must not leave detached sends behind"
-    );
-    assert!(
-        !command.foreground_replica_repair,
-        "deferred publish must preserve nonforeground repair mode"
-    );
-    assert!(
-        !dfs.content
-            .has_blob(&expected_hash)
-            .expect("writer blob probe"),
-        "deferred remote-primary writes must not first persist on the sender"
-    );
-
-    std::fs::remove_dir_all(root).ok();
-}
-
-#[test]
-fn local_owned_read_is_routed_to_owner_node() {
-    let root = temp_root("local-owned-read-routed-to-owner");
-    let owner = NodeId::from_legacy_named("node_desktop").expect("node");
-    let remote = NodeId::from_legacy_named("node_mobile").expect("node");
-    let network = InProcessNetwork::new();
-    let mut owner_dfs = NetworkedDfsService::new(
-        network.add_node(owner.clone()),
-        LocalContentStore::new(root.join("owner-content")).expect("owner content"),
-    );
-    let mut remote_dfs = NetworkedDfsService::new(
-        network.add_node(remote.clone()),
-        LocalContentStore::new(root.join("remote-content")).expect("remote content"),
-    );
-    let metadata = file_metadata(owner.clone());
-    let object_id = metadata.object_id.clone();
-
-    owner_dfs
-        .add_file_system(file_system(owner.clone()))
-        .expect("owner filesystem");
-    remote_dfs
-        .add_file_system(file_system(owner.clone()))
-        .expect("remote filesystem");
-    owner_dfs
-        .put_local_object_version(metadata, b"owned bytes")
-        .expect("seed owner object");
-    remote_dfs
-        .add_object_metadata(
-            owner_dfs
-                .metadata()
-                .object(&object_id)
-                .expect("owner metadata")
-                .clone(),
-        )
-        .expect("replicate metadata");
-
-    assert_eq!(
-        remote_dfs
-            .request_remote_object_read_without_cache(&object_id)
-            .expect("read routes"),
-        vec![owner.clone()],
-    );
-    let request_id = remote_dfs
+    let request_id = reader
         .reads
         .pending_reads
         .keys()
         .next()
-        .expect("pending owner read")
+        .expect("actual pending read")
         .clone();
-
-    let owner_events = owner_dfs.process_incoming().expect("owner handles read");
-    assert!(matches!(
-        &owner_events[..],
-        [NetworkedDfsServiceEvent::RemoteReadServed {
-            requester_node_id,
-            result: DfsReadResult::Found(_),
-            ..
-        }] if requester_node_id == &remote
-    ));
-
-    let remote_events = remote_dfs
-        .process_incoming()
-        .expect("remote receives read response");
-    assert!(matches!(
-        &remote_events[..],
-        [NetworkedDfsServiceEvent::RemoteReadCompleted {
-            request_id: received_request_id,
-            source_node_id,
-            result: DfsReadResult::Found(DfsReadData { bytes, .. }),
-            ..
-        }] if received_request_id == &request_id
-            && source_node_id == &owner
-            && bytes == b"owned bytes"
-    ));
+    let events = reader.process_incoming().unwrap();
+    assert!(events.iter().any(|event| matches!(event,
+        NetworkedDfsServiceEvent::RemoteReadCompleted {
+            request_id: actual, source_node_id,
+            result: DfsReadResult::Found(DfsReadData { bytes, .. }), ..
+        } if actual == &request_id && source_node_id == &owner && bytes == b"owned bytes")));
+    assert!(
+        !runtime
+            .rpc_observations()
+            .iter()
+            .any(|event| event.target == remote && event.route == DFS_DATA_STAGE_BLOB_ROUTE)
+    );
+    drop(reader);
+    drop(owner_dfs);
+    runtime.close().unwrap();
 }
 
 #[test]
 fn replicated_eventual_write_is_routed_to_metadata_primary_and_committed() {
-    let mut cluster = sifs_posix_cluster("routed-primary-write-commit");
+    let mut cluster = sifs_posix_cluster("routed-primary-write-commit", "/users");
     let path = "/users/routed-primary-write.txt";
     sifs_cluster_primary_posix_write(&mut cluster, path, b"old bytes");
     let original_hash = content_hash(b"old bytes");
@@ -1831,85 +1034,15 @@ fn replicated_eventual_write_is_routed_to_metadata_primary_and_committed() {
 
 #[test]
 fn sharded_lazy_reader_refreshes_after_remote_primary_overwrite() {
-    let root = temp_root("sifs-sharded-lazy-reader-remote-primary");
-    let primary_node = NodeId::from_legacy_named("node_sifs_lazy_remote_primary").expect("primary");
-    let writer_node = NodeId::from_legacy_named("node_sifs_lazy_remote_writer").expect("writer");
-    let shards = sifs_two_primary_shard_configs(
-        &primary_node,
-        &primary_node,
-        1,
-        vec![writer_node.clone()],
-        vec![writer_node.clone()],
-    );
-    let shared_kv = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
-    shared_kv.with_client(|kv| {
-        let mut control = DfsControlPlaneStore::new(kv);
-        control
-            .put_file_system_config(&DfsFileSystemConfig::from(&distributed_sifs(
-                primary_node.clone(),
-            )))
-            .expect("sifs filesystem config");
-        for shard in &shards {
-            control.put_metadata_shard(shard).expect("metadata shard");
-        }
-    });
-    let network = InProcessNetwork::new();
-    let primary_root = root.join("primary");
-    let writer_root = root.join("writer");
-    let mut primary = NetworkedDfsService::new(
-        network.add_node(primary_node.clone()),
-        LocalContentStore::new(primary_root.join("content")).expect("primary content"),
-    )
-    .with_control_plane(shared_kv.clone())
-    .with_metadata_backend_lazy(
-        open_local_sharded_metadata_backend(primary_root.join("metadata"), shards.clone())
-            .expect("primary metadata"),
-    )
-    .expect("primary metadata backend");
-    let mut writer = NetworkedDfsService::new(
-        network.add_node(writer_node.clone()),
-        LocalContentStore::new(writer_root.join("content")).expect("writer content"),
-    )
-    .with_control_plane(shared_kv.clone())
-    .with_metadata_backend_lazy(
-        open_local_sharded_metadata_backend(writer_root.join("metadata"), shards.clone())
-            .expect("writer metadata"),
-    )
-    .expect("writer metadata backend");
-    primary
-        .bootstrap_distributed_sifs()
-        .expect("primary bootstrap");
-
-    let deadline = Instant::now() + SIFS_CLUSTER_PUMP_DEADLINE;
-    loop {
-        primary
-            .replicate_configured_metadata_shards(&sifs_file_system_id())
-            .expect("primary publish");
-        primary.process_incoming().expect("primary pump");
-        writer.process_incoming().expect("writer pump");
-        if writer.posix_stat(SIFS_SERVICES_PATH).is_ok() {
-            break;
-        }
-        if Instant::now() >= deadline {
-            panic!("writer did not learn SIFS services namespace");
-        }
-        std::thread::sleep(SIFS_CLUSTER_PUMP_IDLE_SLEEP);
-    }
-    writer
-        .bootstrap_distributed_sifs()
-        .expect("writer bootstrap");
-
-    let stop_primary = Arc::new(AtomicBool::new(false));
-    let primary_stop = Arc::clone(&stop_primary);
-    let primary_thread = std::thread::spawn(move || {
-        let mut primary = primary;
-        while !primary_stop.load(Ordering::SeqCst) {
-            primary.process_incoming().expect("primary pump");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        primary
-    });
-
+    let name = "native-lazy-reader-remote-primary";
+    let (runtime, primary, config) =
+        crate::test_support::current_native_metadata_service(name, 2, "/services").unwrap();
+    let primary_node = config.primary_node_id;
+    let writer_node = crate::test_runtime::DfsTestRuntime::ordered_node_ids(name, 2)
+        .into_iter()
+        .find(|node| *node != primary_node)
+        .unwrap();
+    let mut writer = runtime.client(&writer_node).unwrap();
     let path = "/services/current-read-remote-primary.txt";
     let old = b"old remote primary reader payload".to_vec();
     let new = b"new remote primary reader payload".to_vec();
@@ -1919,72 +1052,42 @@ fn sharded_lazy_reader_refreshes_after_remote_primary_overwrite() {
             &old,
             DfsWriteOptions::replicated_eventual(vec![writer_node.clone()]),
         )
-        .expect("initial remote-primary write");
-
-    let stale_metadata = writer.metadata().clone();
-    let mut reader = NetworkedDfsService::new(
-        network.add_node(writer_node.clone()),
-        LocalContentStore::new(writer_root.join("content")).expect("reader content"),
-    );
-    for file_system in stale_metadata.filesystems.values().cloned() {
-        reader
-            .add_file_system(file_system)
-            .expect("seed reader filesystem");
-    }
-    for object in stale_metadata.objects.values().cloned() {
-        reader
-            .add_object_metadata(object)
-            .expect("seed reader metadata");
-    }
-    let mut reader = reader.with_control_plane(shared_kv);
-    assert_eq!(
-        reader
-            .posix_read_file_distributed(path)
-            .expect("reader old payload"),
-        old
-    );
-
+        .unwrap();
+    let mut reader = runtime.client(&writer_node).unwrap();
+    let mut stale_stream = reader.posix_open_file_stream(path).unwrap();
     let replacement = writer
         .posix_write_file(
             path,
             &new,
             DfsWriteOptions::replicated_eventual(vec![writer_node]),
         )
-        .expect("remote-primary overwrite");
-
-    let mut stale_stream = reader
-        .posix_open_file_stream(path)
-        .expect("reader retained local stream");
+        .unwrap();
     let mut stale = Vec::new();
-    stale_stream
-        .reader
-        .read_to_end(&mut stale)
-        .expect("read retained local stream");
-    assert_eq!(stale, old, "the fixture must retain the pre-overwrite view");
-
-    let mut current_stream = reader
-        .posix_open_current_file_stream(path)
-        .expect("open current local stream after authoritative lookup");
+    stale_stream.reader.read_to_end(&mut stale).unwrap();
+    assert_eq!(
+        stale, old,
+        "opened content retains its actual pre-overwrite generation"
+    );
+    let mut current_stream = reader.posix_open_current_file_stream(path).unwrap();
     assert_eq!(current_stream.object_id, replacement.object_id);
     assert_eq!(current_stream.version, replacement.version);
     let mut current = Vec::new();
-    current_stream
-        .reader
-        .read_to_end(&mut current)
-        .expect("read current local stream");
+    current_stream.reader.read_to_end(&mut current).unwrap();
     assert_eq!(
         current, new,
-        "current-metadata stream must keep using local exact-version content"
+        "fresh authority selects the current exact local body"
     );
-
-    stop_primary.store(true, Ordering::SeqCst);
-    primary_thread.join().expect("primary thread");
-    std::fs::remove_dir_all(&root).ok();
+    drop(current_stream);
+    drop(stale_stream);
+    drop(reader);
+    drop(writer);
+    drop(primary);
+    runtime.close().unwrap();
 }
 
 #[test]
 fn sifs_cluster_posix_routed_create_is_read_your_write_on_writer() {
-    let mut cluster = sifs_posix_cluster("sifs-cluster-ryw");
+    let mut cluster = sifs_posix_cluster("sifs-cluster-ryw", "/users");
     let path = "/users/read-your-write.txt";
     let bytes = b"hello from the writer node";
 
@@ -2017,12 +1120,12 @@ fn sifs_cluster_posix_routed_create_is_read_your_write_on_writer() {
         "writer directory listing must contain the routed write: {entries:?}"
     );
 
-    std::fs::remove_dir_all(&cluster.root).ok();
+    drop(cluster);
 }
 
 #[test]
 fn sifs_cluster_posix_routed_write_is_visible_on_primary() {
-    let mut cluster = sifs_posix_cluster("sifs-cluster-primary-vis");
+    let mut cluster = sifs_posix_cluster("sifs-cluster-primary-vis", "/users");
     let path = "/users/primary-visibility.txt";
     let bytes = b"routed bytes visible on the primary";
 
@@ -2052,12 +1155,12 @@ fn sifs_cluster_posix_routed_write_is_visible_on_primary() {
     let read = sifs_cluster_fetch_for_local_read(&mut cluster, |c| &mut c.primary, path);
     assert_eq!(read, bytes.to_vec());
 
-    std::fs::remove_dir_all(&cluster.root).ok();
+    drop(cluster);
 }
 
 #[test]
 fn sifs_cluster_posix_routed_overwrite_advances_version_monotonically() {
-    let mut cluster = sifs_posix_cluster("sifs-cluster-overwrite");
+    let mut cluster = sifs_posix_cluster("sifs-cluster-overwrite", "/users");
     let path = "/users/overwrite.txt";
     let first = b"first version".to_vec();
     let second = b"the second, longer version of the content".to_vec();
@@ -2102,12 +1205,12 @@ fn sifs_cluster_posix_routed_overwrite_advances_version_monotonically() {
     );
     assert_eq!(primary_stat.size_bytes, Some(third.len() as u64));
 
-    std::fs::remove_dir_all(&cluster.root).ok();
+    drop(cluster);
 }
 
 #[test]
 fn sifs_cluster_posix_routed_create_updates_parent_directory_mtime_cluster_wide() {
-    let mut cluster = sifs_posix_cluster("sifs-cluster-parent-mtime");
+    let mut cluster = sifs_posix_cluster("sifs-cluster-parent-mtime", "/users");
     let parent = "/users";
     let path = "/users/parent-mtime.txt";
     let bytes = b"parent mtime must advance everywhere";
@@ -2159,12 +1262,12 @@ fn sifs_cluster_posix_routed_create_updates_parent_directory_mtime_cluster_wide(
         cluster.rejections
     );
 
-    std::fs::remove_dir_all(&cluster.root).ok();
+    drop(cluster);
 }
 
 #[test]
 fn sifs_cluster_retried_pending_routed_create_preserves_parent_mtime_touch() {
-    let mut cluster = sifs_posix_cluster("sifs-cluster-retried-create-parent-mtime");
+    let mut cluster = sifs_posix_cluster("sifs-cluster-retried-create-parent-mtime", "/users");
     let parent = "/users";
     let path = "/users/retried-parent-mtime.txt";
     let bytes = b"retried pending create must retain parent touch";
@@ -2263,7 +1366,7 @@ fn sifs_cluster_retried_pending_routed_create_preserves_parent_mtime_touch() {
     );
     assert_eq!(writer_parent.version, primary_parent.version);
 
-    std::fs::remove_dir_all(&cluster.root).ok();
+    drop(cluster);
 }
 
 #[test]
@@ -2271,7 +1374,7 @@ fn sifs_cluster_posix_routed_namespace_ops_have_read_your_write_semantics() {
     // Namespace mutations from a non-primary node route to the metadata shard
     // primary and replay the primary's journal before returning, so every
     // blocking POSIX call observes its own effect locally.
-    let cluster = sifs_posix_cluster("sifs-cluster-ns-ryw");
+    let cluster = sifs_posix_cluster("sifs-cluster-ns-ryw", "/users");
     let SifsPosixCluster {
         root,
         primary_node: _,
@@ -2281,6 +1384,7 @@ fn sifs_cluster_posix_routed_namespace_ops_have_read_your_write_semantics() {
         mut writer,
         mut observer,
         rejections: _,
+        _runtime,
     } = cluster;
 
     let stop_primary = Arc::new(AtomicBool::new(false));
@@ -2640,77 +1744,70 @@ fn sifs_cluster_posix_routed_namespace_ops_have_read_your_write_semantics() {
         "routed namespace ops must keep replica journals aligned: {rejections:?}"
     );
 
-    std::fs::remove_dir_all(&root).ok();
+    drop(_runtime);
 }
 
 #[test]
 fn sifs_cluster_posix_mkdir_all_remote_primary_falls_back_when_local_chain_exists() {
-    let root = temp_root("sifs-mkdir-all-local-chain");
-    let local_node =
-        NodeId::from_legacy_named("node_sifs_mkdir_all_local_chain_local").expect("local");
-    let remote_primary =
-        NodeId::from_legacy_named("node_sifs_mkdir_all_local_chain_remote").expect("remote");
-    let shards = sifs_two_primary_shard_configs(
-        &local_node,
-        &remote_primary,
-        1,
-        vec![remote_primary.clone()],
-        vec![local_node.clone()],
+    let name = "native-mkdir-all-local-chain";
+    let (runtime, mut primary, config) =
+        crate::test_support::current_native_metadata_service(name, 2, "/services").unwrap();
+    let primary_node = config.primary_node_id;
+    let observer = crate::test_runtime::DfsTestRuntime::ordered_node_ids(name, 2)
+        .into_iter()
+        .find(|node| *node != primary_node)
+        .unwrap();
+    let path = "/services/native-existing-chain";
+    primary.posix_mkdir_all(path).unwrap();
+    primary.posix_sync_directory(path).unwrap();
+    let mut local = runtime.client(&observer).unwrap();
+    assert_eq!(
+        local.posix_stat(path).unwrap().kind,
+        DfsObjectKind::Directory
     );
-    let shared_kv = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
-    shared_kv.with_client(|kv| {
-        let mut control = DfsControlPlaneStore::new(kv);
-        control
-            .put_file_system_config(&DfsFileSystemConfig::from(&distributed_sifs(
-                local_node.clone(),
-            )))
-            .expect("sifs filesystem config");
-        for shard in &shards {
-            control.put_metadata_shard(shard).expect("shard config");
-        }
+    let shard = DfsMetadataShardId::new(config.shard_id);
+    let before = primary
+        .metadata_backend()
+        .unwrap()
+        .metadata_prefix_proof(&shard)
+        .unwrap();
+    runtime.install_fault(crate::test_runtime::FaultRule {
+        source: Some(observer.clone()),
+        target: Some(primary_node),
+        route: None,
+        call_id: None,
+        origin: Some(crate::test_runtime::RpcOrigin::RegisteredHost),
+        remaining_hits: 32,
+        action: crate::test_runtime::FaultAction::BudgetExhausted,
     });
-
-    let network = InProcessNetwork::new();
-    let mut local = NetworkedDfsService::new(
-        network.add_node(local_node.clone()),
-        LocalContentStore::new(root.join("content")).expect("content"),
-    )
-    .with_control_plane(shared_kv)
-    .with_metadata_backend(
-        open_local_sharded_metadata_backend(root.join("metadata"), shards)
-            .expect("sharded metadata"),
-    )
-    .expect("metadata backend");
     local
-        .bootstrap_distributed_sifs()
-        .expect("bootstrap local mirror");
-    for stale_path in [SIFS_SERVICES_PATH, "/services/dfs-smoke"] {
-        let stale = crate::posix_object::new_posix_metadata_object(
-            &local_node,
-            stale_path,
-            DfsObjectKind::Directory,
-        );
-        let stale_id = stale.object_id.clone();
-        local
-            .add_transient_object_metadata(stale)
-            .expect("seed stale local replicated chain");
-        local.transient_metadata_object_ids.remove(&stale_id);
-    }
-
+        .posix_mkdir_all(path)
+        .expect("the actual locally mirrored existing chain is idempotent");
     local
-        .posix_mkdir_all("/services/dfs-smoke")
-        .expect("idempotent mkdir_all should not require remote primary");
-    local
-        .posix_mkdir_all_without_local_replay("/services/dfs-smoke")
-        .expect("idempotent mkdir_all without replay should not require remote primary");
-
-    std::fs::remove_dir_all(&root).ok();
+        .posix_mkdir_all_without_local_replay(path)
+        .expect("the actual existing chain needs no replay or remote mutation");
+    assert_eq!(
+        primary
+            .metadata_backend()
+            .unwrap()
+            .metadata_prefix_proof(&shard)
+            .unwrap(),
+        before
+    );
+    drop(local);
+    drop(primary);
+    runtime.clear_faults();
+    runtime.close().unwrap();
 }
 
 #[test]
 fn sifs_cluster_routed_mkdir_all_allows_immediate_child_mkdir() {
     let cluster = sifs_two_primary_cluster("sifs-routed-mkdir-all-child");
     let SifsTwoPrimaryCluster {
+        shared_kv,
+        services_primary_node,
+        users_primary_node,
+        _runtime,
         root,
         users_primary,
         services_primary,
@@ -2752,6 +1849,9 @@ fn sifs_cluster_routed_mkdir_all_allows_immediate_child_mkdir() {
 fn sifs_cluster_routed_lookup_under_split_prefix_uses_exact_path_primary() {
     let cluster = sifs_two_primary_cluster("sifs-routed-lookup-split-prefix");
     let SifsTwoPrimaryCluster {
+        shared_kv,
+        users_primary_node,
+        _runtime,
         root,
         mut services_primary,
         mut replica,
@@ -2989,7 +2089,7 @@ fn exercise_routed_child_create_with_removed_parent(foreground_replica_repair: b
         cluster.replica.posix_stat(child),
         Err(DfsPosixError::NotFound { .. })
     ));
-    std::fs::remove_dir_all(&cluster.root).ok();
+    cluster.close();
 }
 
 #[test]
@@ -3006,6 +2106,10 @@ fn sifs_cluster_bulk_local_eventual_remote_primary_large_batch_is_fully_visible(
     });
 
     let SifsTwoPrimaryCluster {
+        shared_kv,
+        services_primary_node,
+        users_primary_node,
+        _runtime,
         root,
         mut users_primary,
         services_primary,
@@ -3109,6 +2213,8 @@ fn sifs_cluster_bulk_local_eventual_remote_primary_large_batch_is_fully_visible(
 fn sifs_remote_primary_deferred_publish_write_persists_for_fresh_replica_reader() {
     let cluster = sifs_two_primary_cluster("sifs-remote-primary-deferred-fresh");
     let SifsTwoPrimaryCluster {
+        shared_kv,
+        _runtime,
         root,
         users_primary_node,
         services_primary_node,
@@ -3182,332 +2288,13 @@ fn sifs_remote_primary_deferred_publish_write_persists_for_fresh_replica_reader(
 }
 
 #[test]
-fn local_eventual_prepare_race_preserves_typed_conflict_in_routed_response() {
-    let root = temp_root("local-eventual-prepare-race-conflict");
-    let primary = NodeId::from_legacy_named("node_prepare_race_primary").expect("primary");
-    let requester = NodeId::from_legacy_named("node_prepare_race_requester").expect("requester");
-    let shards = sifs_two_primary_shard_configs(
-        &primary,
-        &primary,
-        1,
-        vec![requester.clone()],
-        vec![requester.clone()],
-    );
-    let mut kv = InProcessKvStore::new();
-    {
-        let mut control = DfsControlPlaneStore::new(&mut kv);
-        control
-            .put_file_system_config(&DfsFileSystemConfig::from(&distributed_sifs(
-                primary.clone(),
-            )))
-            .expect("sifs filesystem config");
-        for shard in &shards {
-            control.put_metadata_shard(shard).expect("metadata shard");
-        }
-    }
-
-    let network = InProcessNetwork::new();
-    let _requester_transport = network.add_node(requester.clone());
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(primary.clone()),
-        LocalContentStore::new(root.join("content")).expect("content"),
-    )
-    .with_control_plane(kv)
-    .with_metadata_backend(
-        open_local_sharded_metadata_backend(root.join("metadata"), shards)
-            .expect("metadata backend"),
-    )
-    .expect("metadata backend attach");
-    dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
-
-    let path = "/services/prepare-race.bin";
-    let object_id =
-        DfsObjectId::from_legacy_named("obj_prepare_race").expect("prepare-race object");
-    let base_version =
-        DfsVersion::from_legacy_named("version_prepare_race_base").expect("base version");
-    let target_version =
-        DfsVersion::from_legacy_named("version_prepare_race_target").expect("target version");
-    let raced_version =
-        DfsVersion::from_legacy_named("version_prepare_race_winner").expect("winner version");
-    let mut current = DfsObjectMetadata {
-        object_id: object_id.clone(),
-        file_system_id: sifs_file_system_id(),
-        path: path.to_string(),
-        kind: DfsObjectKind::File,
-        tombstone_provenance: None,
-        owner_node_id: requester.clone(),
-        current_locations: vec![requester.clone()],
-        content_hash: Some(content_hash(b"prepare-race base")),
-        content_size_bytes: Some(b"prepare-race base".len() as u64),
-        link_target_object_id: None,
-        mode: 0o644,
-        uid: 0,
-        gid: 0,
-        accessed_at_unix_nanos: 1,
-        modified_at_unix_nanos: 1,
-        created_at_unix_nanos: 1,
-        changed_at_unix_nanos: 1,
-        version: base_version.clone(),
-        policy: DfsObjectPolicy::ReplicatedEventual,
-        created_by_event_id: None,
-        last_modified_by_event_id: Some(EventId::generate()),
-    };
-    dfs.metadata_backend
-        .as_mut()
-        .expect("metadata backend")
-        .put_object(&current)
-        .expect("seed current object");
-    dfs.metadata
-        .add_object(current.clone())
-        .expect("seed current service object");
-
-    let target_event_id = EventId::generate();
-    let mut target = current.clone();
-    target.version = target_version.clone();
-    target.content_hash = Some(content_hash(b"prepare-race target"));
-    target.content_size_bytes = Some(b"prepare-race target".len() as u64);
-    target.modified_at_unix_nanos = 2;
-    target.changed_at_unix_nanos = 2;
-    target.last_modified_by_event_id = Some(target_event_id.clone());
-    let versions = vec![object_version_record(&target, target.content_size_bytes)];
-    let transaction = DfsNamespaceTransaction {
-        content_reference_identity: None,
-        extension_expectations: Vec::new(),
-        contribution_digest: None,
-        file_version_pins: None,
-        transaction_id: namespace_transaction_id_for_batch(
-            "visible-batch",
-            &sifs_file_system_id(),
-            std::slice::from_ref(&target),
-            &versions,
-        ),
-        file_system_id: sifs_file_system_id(),
-        objects: vec![target.clone()],
-        versions,
-        advisory_lock_states: Vec::new(),
-        created_at: OffsetDateTime::UNIX_EPOCH,
-    };
-    let writes = vec![DfsLocalEventualBatchWriteProof {
-        expected_base_version: Some(base_version.clone()),
-        expected_parent_object_id: None,
-        expected_parent_version: None,
-        receipt: DfsReplicaReceiptRecord {
-            receipt: DfsWriteReceipt {
-                file_system_id: sifs_file_system_id(),
-                object_id: object_id.clone(),
-                committed_version: target_version.clone(),
-                owner_node_id: primary.clone(),
-                event_id: target_event_id,
-            },
-            replica_node_id: requester.clone(),
-            content_hash: target.content_hash.clone(),
-            received_at: OffsetDateTime::UNIX_EPOCH,
-        },
-    }];
-
-    current.version = raced_version.clone();
-    current.content_hash = Some(content_hash(b"prepare-race winner"));
-    current.content_size_bytes = Some(b"prepare-race winner".len() as u64);
-    current.modified_at_unix_nanos = 3;
-    current.changed_at_unix_nanos = 3;
-    current.last_modified_by_event_id = Some(EventId::generate());
-    let raced = current;
-    let _hook = crate::service_metadata::install_namespace_prepare_after_expectations_test_hook(
-        move |backend| {
-            backend
-                .put_object(&raced)
-                .expect("install concurrent winner after expectation capture");
-        },
-    );
-
-    let command = DfsNamespaceCommand {
-        request_id: "dfs_net_req_prepare_race_conflict".to_string(),
-        file_system_id: sifs_file_system_id(),
-        requesting_node_id: requester.clone(),
-        include_metadata_journal_batches: false,
-        metadata_journal_after_sequences: Vec::new(),
-        authority_shards: Vec::new(),
-        operation: DfsNamespaceOperation::CommitLocalEventualBatch {
-            transaction: transaction.clone(),
-            writes,
-        },
-    };
-    let event = dfs
-        .handle_namespace_request(requester, command)
-        .expect("serve raced local-eventual batch");
-    let (reason, posix_error) = match event {
-        NetworkedDfsServiceEvent::RemoteNamespaceServed {
-            result:
-                DfsNamespaceResult::Rejected {
-                    reason,
-                    posix_error,
-                    ..
-                },
-            ..
-        } => (reason, posix_error),
-        other => panic!("expected typed prepare conflict, got {other:?}"),
-    };
-    assert!(matches!(
-        &posix_error,
-        Some(DfsNamespacePosixError::Conflict {
-            path: conflict_path,
-            reason,
-        }) if conflict_path == path
-            && reason.contains(base_version.as_str())
-            && reason.contains(raced_version.as_str())
-    ));
-    assert!(matches!(
-        crate::posix_model::posix_error_for_namespace_rejection(reason, posix_error),
-        DfsPosixError::Conflict {
-            path: conflict_path,
-            ..
-        } if conflict_path == path
-    ));
-    assert_eq!(
-        dfs.metadata_backend
-            .as_ref()
-            .expect("metadata backend")
-            .get_object(&object_id)
-            .expect("current object lookup")
-            .expect("current object")
-            .version,
-        raced_version,
-        "the rejected target must not overwrite the concurrent winner"
-    );
-    assert!(
-        dfs.metadata_backend
-            .as_ref()
-            .expect("metadata backend")
-            .get_namespace_transaction(&transaction.transaction_id)
-            .expect("transaction lookup")
-            .is_none(),
-        "a precondition conflict must reject before journaling the transaction"
-    );
-
-    std::fs::remove_dir_all(root).ok();
-}
-
-#[test]
-fn routed_local_eventual_batch_preserves_stale_child_as_typed_conflict() {
-    let root = temp_root("local-eventual-batch-stale-child-conflict");
-    let primary = NodeId::from_legacy_named("node_stale_child_primary").expect("primary");
-    let requester = NodeId::from_legacy_named("node_stale_child_requester").expect("requester");
-    let file_system = file_system(primary.clone());
-    let mut current = file_metadata(requester.clone());
-    current.file_system_id = file_system.file_system_id.clone();
-    current.object_id = DfsObjectId::from_legacy_named("object_stale_child").expect("object id");
-    current.path = "/services/stale-child.txt".to_string();
-    current.policy = DfsObjectPolicy::ReplicatedEventual;
-    current.content_hash = Some(content_hash(b"authority-current"));
-    current.content_size_bytes = Some(17);
-    current.version =
-        DfsVersion::from_legacy_named("version_stale_child_current").expect("version");
-
-    let mut backend =
-        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("metadata"))
-            .expect("metadata backend");
-    backend.put_file_system(&file_system).expect("filesystem");
-    backend.put_object(&current).expect("current child");
-
-    let mut proposed = current.clone();
-    proposed.version =
-        DfsVersion::from_legacy_named("version_stale_child_proposed").expect("version");
-    proposed.content_hash = Some(content_hash(b"stale-proposal"));
-    proposed.content_size_bytes = Some(14);
-    proposed.modified_at_unix_nanos = 2;
-    proposed.changed_at_unix_nanos = 2;
-    proposed.last_modified_by_event_id = Some(EventId::generate());
-    let transaction = DfsNamespaceTransaction {
-        content_reference_identity: None,
-        extension_expectations: Vec::new(),
-        contribution_digest: None,
-        file_version_pins: None,
-        transaction_id: "transaction-stale-child".to_string(),
-        file_system_id: file_system.file_system_id.clone(),
-        objects: vec![proposed.clone()],
-        versions: vec![object_version_record(
-            &proposed,
-            proposed.content_size_bytes,
-        )],
-        advisory_lock_states: Vec::new(),
-        created_at: OffsetDateTime::UNIX_EPOCH,
-    };
-    let writes = vec![DfsLocalEventualBatchWriteProof {
-        expected_base_version: Some(
-            DfsVersion::from_legacy_named("version_stale_child_observed").expect("version"),
-        ),
-        expected_parent_object_id: None,
-        expected_parent_version: None,
-        receipt: DfsReplicaReceiptRecord {
-            receipt: DfsWriteReceipt {
-                file_system_id: file_system.file_system_id.clone(),
-                object_id: proposed.object_id.clone(),
-                committed_version: proposed.version.clone(),
-                owner_node_id: primary.clone(),
-                event_id: proposed
-                    .last_modified_by_event_id
-                    .clone()
-                    .expect("write event"),
-            },
-            replica_node_id: requester.clone(),
-            content_hash: proposed.content_hash.clone(),
-            received_at: OffsetDateTime::UNIX_EPOCH,
-        },
-    }];
-
-    let network = InProcessNetwork::new();
-    let _requester_transport = network.add_node(requester.clone());
-    let mut service = NetworkedDfsService::new(
-        network.add_node(primary),
-        LocalContentStore::new(root.join("content")).expect("content"),
-    )
-    .with_metadata_backend(backend)
-    .expect("metadata-backed service");
-    let event = service
-        .handle_namespace_request(
-            requester.clone(),
-            DfsNamespaceCommand {
-                request_id: "request-stale-child".to_string(),
-                file_system_id: file_system.file_system_id.clone(),
-                requesting_node_id: requester,
-                include_metadata_journal_batches: false,
-                metadata_journal_after_sequences: Vec::new(),
-                authority_shards: Vec::new(),
-                operation: DfsNamespaceOperation::CommitLocalEventualBatch {
-                    transaction,
-                    writes,
-                },
-            },
-        )
-        .expect("stale child response");
-
-    assert!(matches!(
-        event,
-        NetworkedDfsServiceEvent::RemoteNamespaceServed {
-            result: DfsNamespaceResult::Rejected {
-                posix_error: Some(DfsNamespacePosixError::Conflict { ref path, .. }),
-                ..
-            },
-            ..
-        } if path == &current.path
-    ));
-    assert_eq!(
-        service
-            .metadata_backend()
-            .expect("metadata backend")
-            .get_object(&current.object_id)
-            .expect("current child"),
-        Some(current),
-        "stale validation must not mutate authoritative metadata"
-    );
-
-    std::fs::remove_dir_all(root).ok();
-}
-
-#[test]
 fn sifs_cluster_posix_services_routed_rename_then_unlink_is_read_your_write() {
     let cluster = sifs_two_primary_cluster("sifs-services-rename-unlink-ryw");
     let SifsTwoPrimaryCluster {
+        shared_kv,
+        services_primary_node,
+        users_primary_node,
+        _runtime,
         root,
         users_primary,
         services_primary,
@@ -3585,115 +2372,71 @@ fn sifs_cluster_posix_services_routed_rename_then_unlink_is_read_your_write() {
 
 #[test]
 fn late_routed_responses_are_discarded_without_failing_the_event_loop() {
-    let root = temp_root("late-routed-responses-discarded");
-    let local = NodeId::from_legacy_named("node_late_response_local").expect("local");
-    let stranger = NodeId::from_legacy_named("node_late_response_stranger").expect("stranger");
-    let object_id = DfsObjectId::from_legacy_named("obj_late_response").expect("object");
-    let mut dfs = NetworkedDfsService::new(
-        crate::test_runtime::DfsTestRuntime::local_transport(local.clone()),
-        LocalContentStore::new(root.join("content")).expect("content"),
-    );
-
-    // A write response for a request this node no longer tracks.
-    let event = dfs
-        .handle_distributed_write_response(
-            stranger.clone(),
-            DfsDistributedWriteResponse {
-                request_id: "dfs_net_req_untracked".to_string(),
-                object_id: object_id.clone(),
-                result: DfsDistributedWriteResult::Rejected {
-                    reason: "too late".to_string(),
-                    current_primary_node_id: None,
-                },
-                metadata_journal_batches: Vec::new(),
-            },
-        )
-        .expect("late write response must not error");
+    let (runtime, mut client, request, _, _, _, operation, actual) =
+        native_pending_routed_write("native-late-routed-response");
+    let primary = client.writes.pending_routed_writes[&operation]
+        .primary_node_id
+        .clone();
+    let mut untracked = actual.clone();
+    untracked.request_id = sinomo_core::Id::generate().to_string();
     assert!(matches!(
-        event,
+        client
+            .handle_distributed_write_response(primary.clone(), untracked)
+            .unwrap(),
         NetworkedDfsServiceEvent::RemoteResponseDiscarded { .. }
     ));
-
-    // A namespace response for an untracked request.
-    let event = dfs
-        .handle_namespace_response(
-            stranger.clone(),
-            DfsNamespaceResponse {
-                request_id: "dfs_net_req_untracked_ns".to_string(),
-                result: DfsNamespaceResult::Applied,
-                synced_path_object: None,
-                synced_path_objects: Vec::new(),
-                metadata_journal_batches: Vec::new(),
-                metadata_journal_has_more: None,
-                posix_coordination_result: None,
-            },
-        )
-        .expect("late namespace response must not error");
     assert!(matches!(
-        event,
+        client
+            .handle_namespace_response(
+                primary.clone(),
+                DfsNamespaceResponse {
+                    request_id: sinomo_core::Id::generate().to_string(),
+                    committed_work: Default::default(),
+                    result: DfsNamespaceResult::Applied,
+                    synced_path_object: None,
+                    synced_path_objects: Vec::new(),
+                    metadata_journal_batches: Vec::new(),
+                    metadata_journal_has_more: false,
+                    posix_coordination_result: None,
+                }
+            )
+            .unwrap(),
         NetworkedDfsServiceEvent::RemoteResponseDiscarded { .. }
     ));
-
-    // A response from the wrong primary for a tracked request.
-    let primary = NodeId::from_legacy_named("node_late_response_primary").expect("primary");
-    dfs.writes.pending_routed_writes.insert(
-        "dfs_net_req_tracked".to_string(),
-        test_pending_routed_write(
-            "dfs_net_req_tracked",
-            &local,
-            &object_id,
-            &primary,
-            test_routed_authority_shard(&primary, 1),
-        ),
-    );
-    let event = dfs
-        .handle_distributed_write_response(
-            stranger,
-            DfsDistributedWriteResponse {
-                request_id: "dfs_net_req_tracked".to_string(),
-                object_id,
-                result: DfsDistributedWriteResult::Rejected {
-                    reason: "spoofed".to_string(),
-                    current_primary_node_id: None,
-                },
-                metadata_journal_batches: Vec::new(),
-            },
-        )
-        .expect("mismatched response must not error");
+    let pending = client.writes.pending_routed_writes[&operation].clone();
+    let wrong_source = client.node_id().clone();
+    assert_ne!(wrong_source, primary);
     assert!(matches!(
-        event,
+        client
+            .handle_distributed_write_response(wrong_source, actual.clone())
+            .unwrap(),
         NetworkedDfsServiceEvent::RemoteResponseDiscarded { .. }
     ));
-    // The tracked request stays pending for the real primary.
+    assert_eq!(client.writes.pending_routed_writes[&operation], pending);
+    let mut rejected = actual;
+    let path = pending
+        .command
+        .as_ref()
+        .unwrap()
+        .object_metadata
+        .as_ref()
+        .unwrap()
+        .path
+        .clone();
+    rejected.result = DfsDistributedWriteResult::Rejected {
+        reason: format!("path {path} is moving between metadata shards; retry the operation"),
+        current_primary_node_id: None,
+    };
+    assert_eq!(rejected.object_id, request.object_id);
+    client
+        .handle_distributed_write_response(primary, rejected)
+        .unwrap();
     assert!(
-        dfs.writes
-            .pending_routed_writes
-            .contains_key("dfs_net_req_tracked")
+        matches!(client.write_outcome(&operation), Err(DfsError::Busy { path: busy }) if busy == path)
     );
-
-    // A routed-write rejection caused by an in-flight cross-shard move keeps
-    // its retriable Busy class across the string-typed wire result.
-    dfs.handle_distributed_write_response(
-        primary,
-        DfsDistributedWriteResponse {
-            request_id: "dfs_net_req_tracked".to_string(),
-            object_id: DfsObjectId::from_legacy_named("obj_late_response").expect("object"),
-            result: DfsDistributedWriteResult::Rejected {
-                reason:
-                    "path /users/moving.txt is moving between metadata shards; retry the operation"
-                        .to_string(),
-                current_primary_node_id: None,
-            },
-            metadata_journal_batches: Vec::new(),
-        },
-    )
-    .expect("busy rejection response");
-    assert!(matches!(
-        dfs.write_outcome("dfs_net_req_tracked"),
-        Err(DfsError::Busy { path }) if path == "/users/moving.txt"
-    ));
-
-    std::fs::remove_dir_all(root).ok();
+    drop(client);
+    runtime.clear_faults();
+    runtime.close().unwrap();
 }
 
 #[test]
@@ -3704,6 +2447,7 @@ fn sifs_non_replica_routed_create_is_listed_after_blocking_write() {
         primary,
         observer_node,
         mut observer,
+        _runtime,
         ..
     } = cluster;
 
@@ -3747,323 +2491,16 @@ fn sifs_non_replica_routed_create_is_listed_after_blocking_write() {
 
     stop_primary.store(true, Ordering::SeqCst);
     primary_thread.join().expect("primary thread");
-    std::fs::remove_dir_all(&root).ok();
-}
-
-#[test]
-fn sifs_routed_write_refreshes_stale_receiver_control_plane() {
-    let root = temp_root("sifs-write-refresh-stale-receiver");
-    let old_primary_node =
-        NodeId::from_legacy_named("node_sifs_write_refresh_old_primary").expect("old primary");
-    let current_primary_node = NodeId::from_legacy_named("node_sifs_write_refresh_current_primary")
-        .expect("current primary");
-    let requester_node =
-        NodeId::from_legacy_named("node_sifs_write_refresh_requester").expect("requester");
-
-    let network = InProcessNetwork::new();
-    let shard_config = |primary: &NodeId, epoch: u64| DfsMetadataShardConfig {
-        file_system_id: sifs_file_system_id(),
-        shard_id: "root".to_string(),
-        primary_node_id: primary.clone(),
-        replica_node_ids: vec![old_primary_node.clone(), current_primary_node.clone()],
-        epoch,
-        assignment: DfsMetadataShardAssignment::Root,
-        namespace_prepare_codec: Default::default(),
-        default_policy: DfsObjectPolicy::ReplicatedEventual,
-    };
-    let put_control_plane = |kv_client: &SharedDfsControlPlaneKvClient<InProcessKvStore>,
-                             primary: &NodeId,
-                             epoch: u64| {
-        kv_client.with_client(|kv| {
-            let mut control = DfsControlPlaneStore::new(kv);
-            control
-                .put_file_system_config(&DfsFileSystemConfig::from(&distributed_sifs(
-                    current_primary_node.clone(),
-                )))
-                .expect("filesystem config");
-            control
-                .put_metadata_shard(&shard_config(primary, epoch))
-                .expect("shard config");
-        });
-    };
-
-    let kv_current = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
-    put_control_plane(&kv_current, &current_primary_node, 2);
-    let kv_old_primary = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
-    put_control_plane(&kv_old_primary, &current_primary_node, 2);
-    let kv_requester = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
-    put_control_plane(&kv_requester, &old_primary_node, 1);
-    let stale_requester_snapshot = kv_requester
-        .with_client(|kv| kv.try_snapshot())
-        .expect("stale requester control-plane snapshot");
-    put_control_plane(&kv_requester, &current_primary_node, 2);
-
-    let refreshes = Arc::new(AtomicUsize::new(0));
-
-    let mut old_primary = sifs_posix_cluster_node(
-        &network,
-        &kv_old_primary,
-        &root,
-        "old-primary",
-        old_primary_node.clone(),
-    );
-    let mut current_primary = sifs_posix_cluster_node(
-        &network,
-        &kv_old_primary,
-        &root,
-        "current-primary",
-        current_primary_node.clone(),
-    );
-    let mut requester = sifs_posix_cluster_node(
-        &network,
-        &kv_requester,
-        &root,
-        "requester",
-        requester_node.clone(),
-    );
-    requester =
-        requester.with_boxed_control_plane(Box::new(RefreshingDfsControlPlaneKvClient::new(
-            InProcessKvStore::restore(stale_requester_snapshot)
-                .expect("restore stale requester control plane"),
-            kv_requester.clone(),
-            Arc::new(AtomicUsize::new(0)),
-        )));
-    current_primary
-        .bootstrap_distributed_sifs()
-        .expect("current primary SIFS bootstrap");
-
-    let parent_stop = Arc::new(AtomicBool::new(false));
-    let old_parent_stop = Arc::clone(&parent_stop);
-    let old_parent_thread = std::thread::spawn(move || {
-        let mut node = old_primary;
-        while !old_parent_stop.load(Ordering::SeqCst) {
-            node.process_incoming().expect("old primary parent pump");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        node
-    });
-    let current_parent_stop = Arc::clone(&parent_stop);
-    let current_parent_thread = std::thread::spawn(move || {
-        let mut node = current_primary;
-        while !current_parent_stop.load(Ordering::SeqCst) {
-            node.process_incoming()
-                .expect("current primary parent pump");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        node
-    });
-    requester
-        .posix_mkdir_all("/users")
-        .expect("requester creates parent through current primary");
-    parent_stop.store(true, Ordering::SeqCst);
-    old_primary = old_parent_thread.join().expect("old primary parent thread");
-    current_primary = current_parent_thread
-        .join()
-        .expect("current primary parent thread");
-
-    let mut stale_current_store = InProcessKvStore::new();
-    {
-        let mut control = DfsControlPlaneStore::new(&mut stale_current_store);
-        control
-            .put_file_system_config(&DfsFileSystemConfig::from(&distributed_sifs(
-                current_primary_node.clone(),
-            )))
-            .expect("stale receiver filesystem config");
-        control
-            .put_metadata_shard(&shard_config(&old_primary_node, 1))
-            .expect("stale receiver shard config");
-    }
-    let refreshing_current_control = RefreshingDfsControlPlaneKvClient::new(
-        stale_current_store,
-        kv_current,
-        Arc::clone(&refreshes),
-    );
-    current_primary =
-        current_primary.with_boxed_control_plane(Box::new(refreshing_current_control));
-
-    let stop = Arc::new(AtomicBool::new(false));
-    let old_stop = Arc::clone(&stop);
-    let old_thread = std::thread::spawn(move || {
-        let mut node = old_primary;
-        while !old_stop.load(Ordering::SeqCst) {
-            node.process_incoming().expect("old primary pump");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-    });
-    let current_stop = Arc::clone(&stop);
-    let current_thread = std::thread::spawn(move || {
-        let mut node = current_primary;
-        while !current_stop.load(Ordering::SeqCst) {
-            node.process_incoming().expect("current primary pump");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-    });
-
-    let path = "/users/write-refreshes-stale-receiver.txt";
-    let bytes = b"stale receiver refreshes control plane".to_vec();
-    requester
-        .posix_write_file(
-            path,
-            &bytes,
-            DfsWriteOptions::replicated_eventual(vec![requester_node, current_primary_node]),
-        )
-        .expect("routed write refreshes stale receiver control plane");
-    assert!(
-        refreshes.load(Ordering::SeqCst) > 0,
-        "current primary should refresh its stale control-plane view"
-    );
-
-    stop.store(true, Ordering::SeqCst);
-    old_thread.join().expect("old primary thread");
-    current_thread.join().expect("current primary thread");
-    std::fs::remove_dir_all(&root).ok();
-}
-
-#[test]
-fn sifs_routed_lookup_rejects_uncorroborated_redirect_chain() {
-    let root = temp_root("sifs-lookup-redirect-refreshes-primary");
-    let old_primary =
-        NodeId::from_legacy_named("node_sifs_lookup_refresh_old_primary").expect("old primary");
-    let intermediate_primary =
-        NodeId::from_legacy_named("node_sifs_lookup_refresh_mid_primary").expect("mid primary");
-    let current_primary =
-        NodeId::from_legacy_named("node_sifs_lookup_refresh_current_primary").expect("primary");
-    let requester_node =
-        NodeId::from_legacy_named("node_sifs_lookup_refresh_requester").expect("requester");
-
-    let network = InProcessNetwork::new();
-    let shard_config = |primary: &NodeId, epoch: u64| DfsMetadataShardConfig {
-        file_system_id: sifs_file_system_id(),
-        shard_id: "root".to_string(),
-        primary_node_id: primary.clone(),
-        replica_node_ids: vec![
-            old_primary.clone(),
-            intermediate_primary.clone(),
-            current_primary.clone(),
-        ],
-        epoch,
-        assignment: DfsMetadataShardAssignment::Root,
-        namespace_prepare_codec: Default::default(),
-        default_policy: DfsObjectPolicy::ReplicatedEventual,
-    };
-    let put_control_plane = |kv_client: &SharedDfsControlPlaneKvClient<InProcessKvStore>,
-                             primary: &NodeId,
-                             epoch: u64| {
-        kv_client.with_client(|kv| {
-            let mut control = DfsControlPlaneStore::new(kv);
-            control
-                .put_file_system_config(&DfsFileSystemConfig::from(&distributed_sifs(
-                    current_primary.clone(),
-                )))
-                .expect("filesystem config");
-            control
-                .put_metadata_shard(&shard_config(primary, epoch))
-                .expect("shard config");
-        });
-    };
-
-    let kv_old = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
-    put_control_plane(&kv_old, &intermediate_primary, 2);
-    let kv_intermediate = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
-    put_control_plane(&kv_intermediate, &old_primary, 2);
-    let kv_current = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
-    put_control_plane(&kv_current, &current_primary, 3);
-    let kv_requester = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
-    put_control_plane(&kv_requester, &old_primary, 1);
-
-    let old_node =
-        sifs_posix_cluster_node(&network, &kv_old, &root, "old-primary", old_primary.clone());
-    let intermediate_node = sifs_posix_cluster_node(
-        &network,
-        &kv_intermediate,
-        &root,
-        "intermediate-primary",
-        intermediate_primary.clone(),
-    );
-    let mut current_node = sifs_posix_cluster_node(
-        &network,
-        &kv_current,
-        &root,
-        "current-primary",
-        current_primary.clone(),
-    );
-    let mut requester =
-        sifs_posix_cluster_node(&network, &kv_requester, &root, "requester", requester_node);
-    let stale_requester_snapshot = kv_requester
-        .with_client(|kv| kv.try_snapshot())
-        .expect("stale requester control-plane snapshot");
-    put_control_plane(&kv_requester, &current_primary, 3);
-    requester =
-        requester.with_boxed_control_plane(Box::new(RefreshingDfsControlPlaneKvClient::new(
-            InProcessKvStore::restore(stale_requester_snapshot)
-                .expect("restore stale requester control plane"),
-            kv_requester.clone(),
-            Arc::new(AtomicUsize::new(0)),
-        )));
-
-    current_node
-        .bootstrap_distributed_sifs()
-        .expect("current primary SIFS bootstrap");
-    let path = "/users/lookup-refreshes-primary.txt";
-    let bytes = b"routed lookup reselects refreshed primary".to_vec();
-    current_node
-        .posix_mkdir_all("/users")
-        .expect("current primary creates parent");
-    current_node
-        .posix_write_file(
-            path,
-            &bytes,
-            DfsWriteOptions::replicated_eventual(vec![current_primary.clone()]),
-        )
-        .expect("current primary writes file");
-
-    let stop = Arc::new(AtomicBool::new(false));
-    let old_stop = Arc::clone(&stop);
-    let old_thread = std::thread::spawn(move || {
-        let mut node = old_node;
-        while !old_stop.load(Ordering::SeqCst) {
-            node.process_incoming().expect("old primary pump");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-    });
-    let intermediate_stop = Arc::clone(&stop);
-    let intermediate_thread = std::thread::spawn(move || {
-        let mut node = intermediate_node;
-        while !intermediate_stop.load(Ordering::SeqCst) {
-            node.process_incoming().expect("intermediate primary pump");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-    });
-    let current_stop = Arc::clone(&stop);
-    let current_thread = std::thread::spawn(move || {
-        let mut node = current_node;
-        while !current_stop.load(Ordering::SeqCst) {
-            node.process_incoming().expect("current primary pump");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-    });
-
-    let error = requester
-        .posix_stat_distributed(path)
-        .expect_err("lookup must reject an intermediate primary not corroborated by refresh");
-    assert!(
-        error.to_string().contains("uncorroborated")
-            || error.to_string().contains("current affected assignment"),
-        "unexpected redirect rejection: {error}"
-    );
-
-    stop.store(true, Ordering::SeqCst);
-    old_thread.join().expect("old primary thread");
-    intermediate_thread
-        .join()
-        .expect("intermediate primary thread");
-    current_thread.join().expect("current primary thread");
-    std::fs::remove_dir_all(&root).ok();
+    drop(_runtime);
 }
 
 #[test]
 fn sifs_cross_primary_dot_paths_route_to_the_resolved_namespace() {
     let SifsTwoPrimaryCluster {
+        shared_kv,
+        services_primary_node,
+        users_primary_node,
+        _runtime,
         root,
         replica_node,
         users_primary,
@@ -4098,5 +2535,104 @@ fn sifs_cross_primary_dot_paths_route_to_the_resolved_namespace() {
     let (read, survivor) = result.expect("dot paths resolve before shard admission");
     assert_eq!(read, b"resolved target");
     assert_eq!(survivor, b"must survive");
-    std::fs::remove_dir_all(root).ok();
+    _runtime
+        .close()
+        .expect("normal embedded DFS fixture shutdown");
+}
+
+#[test]
+fn native_routed_stale_unlink_preserves_typed_conflict_and_actual_winner() {
+    let mut cluster = sifs_two_primary_cluster("native-routed-stale-unlink");
+    let path = "/services/stale-caller";
+    let first = cluster
+        .replica
+        .posix_write_file(
+            path,
+            b"first generation",
+            DfsWriteOptions::replicated_eventual(vec![cluster.replica_node.clone()]),
+        )
+        .unwrap();
+    let winner = cluster
+        .services_primary
+        .posix_write_file(
+            path,
+            b"actual concurrent winner",
+            DfsWriteOptions::replicated_eventual(vec![cluster.services_primary_node.clone()]),
+        )
+        .unwrap();
+    let error = cluster
+        .replica
+        .posix_unlink_if_generation(
+            path,
+            sinomo_core::Id::generate().to_string(),
+            DfsNamespaceObjectPrecondition {
+                object_id: first.object_id,
+                version: first.version,
+            },
+        )
+        .unwrap_err();
+    assert!(
+        matches!(error, DfsPosixError::Conflict { ref path, .. } if path == "/services/stale-caller")
+    );
+    assert_eq!(
+        cluster.replica.posix_stat(path).unwrap().version,
+        winner.version
+    );
+    assert_eq!(
+        cluster.replica.posix_read_file(path).unwrap(),
+        b"actual concurrent winner"
+    );
+    cluster.close();
+}
+
+#[test]
+fn native_routed_stale_rename_cannot_replace_a_current_generation() {
+    let mut cluster = sifs_two_primary_cluster("native-routed-stale-rename");
+    let from = "/services/stale-rename-source";
+    let to = "/services/stale-rename-target";
+    let first = cluster
+        .replica
+        .posix_write_file(
+            from,
+            b"first generation",
+            DfsWriteOptions::replicated_eventual(vec![cluster.replica_node.clone()]),
+        )
+        .unwrap();
+    let winner = cluster
+        .services_primary
+        .posix_write_file(
+            from,
+            b"winning generation",
+            DfsWriteOptions::replicated_eventual(vec![cluster.services_primary_node.clone()]),
+        )
+        .unwrap();
+    let error = cluster
+        .replica
+        .posix_rename_if_generation(
+            from,
+            to,
+            sinomo_core::Id::generate().to_string(),
+            DfsNamespaceObjectPrecondition {
+                object_id: first.object_id,
+                version: first.version,
+            },
+            DfsNamespaceDestinationPrecondition::Absent,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(error, DfsPosixError::Conflict { ref path, .. } if path == "/services/stale-rename-source")
+    );
+    assert_eq!(
+        cluster.replica.posix_stat(from).unwrap().version,
+        winner.version
+    );
+    assert!(matches!(
+        cluster.replica.posix_stat(to),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+    assert_eq!(
+        cluster.replica.posix_read_file(from).unwrap(),
+        b"winning generation"
+    );
+    cluster.close();
 }

@@ -57,6 +57,8 @@ pub mod r1 {
     #[cfg(feature = "host")]
     pub use sinomo_dfs_history as dfs_history;
     #[cfg(feature = "host")]
+    pub use sinomo_dfs_migration as dfs_migration;
+    #[cfg(feature = "host")]
     pub use sinomo_dfs_nfs as dfs_nfs;
     #[cfg(feature = "host")]
     pub use sinomo_eval as eval;
@@ -147,7 +149,7 @@ pub use r1::{
     rollout, rollout_host, sandbox, sandbox_simple, storage, supervision, test, vfs,
 };
 #[cfg(feature = "host")]
-pub use r1::{dfs_attachments, dfs_history, dfs_nfs};
+pub use r1::{dfs_attachments, dfs_history, dfs_migration, dfs_nfs};
 pub use r1::{events, kv, local, network, node, service};
 
 #[cfg(all(test, feature = "host"))]

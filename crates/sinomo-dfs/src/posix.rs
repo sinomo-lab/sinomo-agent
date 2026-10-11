@@ -75,9 +75,7 @@ use crate::namespace::{
     initial_version, namespace_transaction_id_for_batch, namespace_transaction_id_for_object,
     next_version,
 };
-use crate::posix_model::{
-    DfsPosixCreateAttrs, DfsPosixError, DfsStat, DfsWriteOptions, Result, read_conflict_error,
-};
+use crate::posix_model::{DfsPosixCreateAttrs, DfsPosixError, DfsStat, DfsWriteOptions, Result};
 use crate::posix_object::{
     apply_posix_create_attrs, inherit_posix_create_attrs, new_posix_metadata_object,
     recreated_posix_metadata_object, set_object_create_timestamps,
@@ -516,7 +514,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // Do not replace that policy-approved replica with a metadata primary
         // that receives only a manifest; that discards the available receipt
         // and forces a redundant network fetch before the write can commit.
+        // A metadata ingress copy does not change LocalOwned content custody.
         if !local_content_staged
+            && object.policy != DfsObjectPolicy::LocalOwned
             && let Some(shard) = self.select_metadata_shard_for_object(object)?
             && shard.primary_node_id != self.node_id
             && !options
@@ -568,13 +568,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     pub fn bootstrap_distributed_sifs(&mut self) -> Result<()> {
         let _namespace_plan = self.namespace_execution.begin_planning();
-        // A durable completed handoff does not mutate process-local authority
-        // bindings in service handles opened before or after activation. Every
-        // bootstrap path must therefore verify the exact active assignment,
-        // completion proof, and local marker before its first authoritative
-        // namespace mutation. Keeping this transition here makes it impossible
-        // for a caller to accidentally open a fresh lane and skip the rebind.
-        self.rebind_completed_local_metadata_shard_membership_handoffs(&sifs_file_system_id())?;
         let fallback_file_system = crate::namespace::distributed_sifs(self.node_id.clone());
         let file_system_id = fallback_file_system.file_system_id.clone();
         let (file_system, configured_shards) = if let Some(kv) = self.control_plane.as_mut() {
@@ -591,6 +584,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         } else {
             (fallback_file_system, None)
         };
+        if self.transport.delegates_local_namespace_authority() {
+            // The resident Main owns bootstrap completion, rebind and retry.
+            // A client needs the filesystem projection to route its first
+            // request, but opening it grants no local mutation admission.
+            self.clear_metadata_lookup_cache();
+            self.metadata.add_file_system(file_system);
+            self.clear_metadata_lookup_cache();
+            return Ok(());
+        }
+        // A durable completed handoff does not mutate process-local authority
+        // bindings in service handles opened before or after activation. The
+        // owning bootstrap lane verifies the exact assignment, completion proof
+        // and local marker before its first authoritative namespace mutation.
+        self.rebind_completed_local_metadata_shard_membership_handoffs(&sifs_file_system_id())?;
         let bootstrap_owner_node_id = file_system.owner_node_id.clone();
         if configured_shards.is_some() {
             // Cluster KV is the source of filesystem configuration. Register
@@ -626,35 +633,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 if shard.primary_node_id != self.node_id {
                     continue;
                 }
-                // A shard-primary bootstrap can start from journal genesis.
-                // Seed the configured filesystem on this exact shard before
-                // the first lookup: backend lookup intentionally rejects an
-                // unknown filesystem, and using the broad sharded ensure here
-                // would author the same entry on sibling replica shards.
-                let backend = self.metadata_backend.as_mut().ok_or_else(|| {
-                    DfsPosixError::Dfs(DfsError::Metadata {
-                        message: format!(
-                            "clustered SIFS bootstrap for shard {} requires a durable metadata backend",
-                            shard.shard_id
-                        ),
-                    })
-                })?;
-                backend.ensure_file_system_on_shard(
-                    &crate::DfsMetadataShardId::new(shard.shard_id),
-                    self.metadata
-                        .filesystems
-                        .get(&file_system_id)
-                        .ok_or_else(|| {
-                            DfsPosixError::Dfs(DfsError::Metadata {
-                                message: "clustered SIFS bootstrap lost its configured filesystem"
-                                    .to_string(),
-                            })
-                        })?,
-                )?;
+                // The common prepared body initializes this exact shard's
+                // filesystem together with its first namespace anchors.
             }
             // Clustered bootstrap objects are shard anchors. Their parent can
             // legitimately live on a shard that is not opened locally (or,
-            // during a partial rollout, is not configured yet), so the
+            // while a current shard is initializing), so the
             // ordinary tombstone-ancestor walk would route `/_anchor` through
             // `/` and turn an exact local-shard bootstrap into
             // `UnknownFileSystem`. The anchor itself is still checked on its
@@ -668,22 +652,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             };
             match existing {
                 None => self.add_object_metadata(object)?,
-                // Early SIFS metadata predates persisted POSIX modes. A zero
-                // mode on a runtime-owned bootstrap directory makes the
-                // entire FUSE namespace untraversable under
-                // `DefaultPermissions`. Repair only the fixed bootstrap set;
-                // ordinary directories retain a deliberate chmod(000).
-                Some(existing)
-                    if existing.kind == DfsObjectKind::Directory
-                        && existing.mode == 0
-                        && existing.version == initial_version()
-                        && existing.accessed_at_unix_nanos == 0
-                        && existing.modified_at_unix_nanos == 0
-                        && existing.created_at_unix_nanos == 0
-                        && existing.changed_at_unix_nanos == 0 =>
-                {
-                    self.posix_set_mode(&object.path, object.mode)?;
-                }
                 Some(_) => {}
             }
         }
@@ -2105,7 +2073,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             let outcome = self.read_object_metadata_or_fetch_remote_without_cache(&object)?;
             let target =
-                self.symlink_target_from_distributed_read_outcome(&resolution_path, outcome)?;
+                metadata::symlink_target_from_distributed_read_outcome(&resolution_path, outcome)?;
             resolution_path = resolve_posix_symlink_target(&resolution_path, &target)?;
             let mut target_lookup = self.exact_authoritative_bulk_lookup(
                 file_system_id,
@@ -2812,12 +2780,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .iter()
                 .map(|object| object.path.clone())
                 .collect::<BTreeSet<_>>();
-            let record_durability = self.control_plane.is_none()
-                || selected_shard.as_ref().is_some_and(|shard| {
-                    shard
-                        .namespace_prepare_codec
-                        .supports_file_history_mutations()
-                });
             let proofs_by_object = writes
                 .iter()
                 .map(|write| (&write.receipt.receipt.object_id, write))
@@ -2827,9 +2789,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .map(|object| {
                     let mut version =
                         crate::object_version_record(object, object.content_size_bytes);
-                    if record_durability
-                        && let Some(proof) = proofs_by_object.get(&object.object_id)
-                    {
+                    if let Some(proof) = proofs_by_object.get(&object.object_id) {
                         version.content_durability = Some(
                             crate::content_durability::from_local_receipt(&proof.receipt),
                         );
@@ -3378,8 +3338,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
         };
         let committed_locations = candidates.clone();
+        #[cfg(any(test, feature = "test-support"))]
+        let mut observed_content_shard = None;
         let remote_metadata_primary = match self.select_metadata_shard_for_object(&object) {
-            Ok(Some(shard)) => shard.primary_node_id != self.node_id,
+            Ok(Some(shard)) => {
+                #[cfg(any(test, feature = "test-support"))]
+                {
+                    observed_content_shard =
+                        Some(crate::DfsMetadataShardId::new(shard.shard_id.clone()));
+                }
+                shard.primary_node_id != self.node_id
+            }
             Ok(None) => false,
             Err(error) => {
                 if transient_create {
@@ -3410,6 +3379,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
             }
         };
+        #[cfg(any(test, feature = "test-support"))]
+        if let (Some(shard), Some(manifest)) = (observed_content_shard.as_ref(), manifest.as_ref())
+        {
+            self.observe_native_content_persistence(
+                shard,
+                &object.file_system_id,
+                manifest,
+                crate::native_shard_trace::NativeContentPersistenceKindV1::BlobOnly,
+            );
+        }
         let content_elapsed = content_started.elapsed();
         let content_size_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
         let distributed_started = Instant::now();
@@ -3422,7 +3401,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let outcome = if streamed_remote_primary_write {
             self.write_distributed_bytes_with_base(
                 request,
-                Some(object.version.clone()),
+                (!transient_create).then(|| object.version.clone()),
                 bytes.to_vec(),
                 candidates,
                 options.policy,
@@ -3456,7 +3435,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .expect("local metadata-primary write published a blob-only manifest");
             self.write_distributed_manifest_with_candidates(
                 request,
-                Some(object.version.clone()),
+                (!transient_create).then(|| object.version.clone()),
                 manifest.content_hash.clone(),
                 manifest.size_bytes,
                 candidates,
@@ -3464,7 +3443,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 DfsDistributedWriteOptions {
                     publication: Default::default(),
                     touch_parent_on_create,
-                    creation: DfsWriteCreation::Upsert,
+                    creation: if exclusive_create {
+                        DfsWriteCreation::Exclusive
+                    } else {
+                        DfsWriteCreation::Upsert
+                    },
                     repair: if options.foreground_replica_repair {
                         DfsWriteRepair::Foreground
                     } else {
@@ -3522,6 +3505,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 content_hash,
                 repair_jobs,
             } => {
+                if self.transport.delegates_local_namespace_authority() && !remote_metadata_primary
+                {
+                    // Main owns the committed object and parent update. Its
+                    // validated reply retired the planning overlay; use the
+                    // actual durable head rather than rebuilding that overlay.
+                    let authoritative = self.stat_target_for_path(&path)?;
+                    return self.stat_object_for_path(&authoritative, &path);
+                }
                 let mut committed_object = object.clone();
                 committed_object.version = version;
                 committed_object.content_hash = Some(content_hash);
@@ -3541,6 +3532,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 self.add_transient_object_metadata(committed_object.clone())?;
                 if transient_create
                     && touch_parent_on_create
+                    && !self.transport.delegates_local_namespace_authority()
                     && !self
                         .coordinator
                         .intent(&intent_id)
@@ -3604,6 +3596,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 self.add_transient_object_metadata(pending_object.clone())?;
                 if transient_create
                     && touch_parent_on_create
+                    && !self.transport.delegates_local_namespace_authority()
                     && !self
                         .coordinator
                         .intent(&intent_id)
@@ -3662,15 +3655,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     intent_id,
                     durable_receipts,
                     required_receipts,
-                })
-            }
-            NetworkedDfsWriteOutcome::Conflict { conflict } => {
-                if transient_create {
-                    self.remove_transient_object_metadata(&object.object_id);
-                }
-                Err(DfsPosixError::Conflict {
-                    path,
-                    reason: conflict.reason,
                 })
             }
         }
@@ -3858,10 +3842,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         .collect();
                     self.stat_object_for_path(&object, &path)
                 }
-                NetworkedDfsWriteOutcome::Conflict { conflict } => Err(DfsPosixError::Conflict {
-                    path,
-                    reason: conflict.reason,
-                }),
+
                 NetworkedDfsWriteOutcome::Pending {
                     intent_id,
                     durable_receipts,
@@ -3926,7 +3907,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 reason: "restore destination resolution changed".into(),
             });
         }
-        if self.routed_namespace_primary_for_path(path)?.is_some() {
+        if self
+            .routed_namespace_primary_for_path(path)?
+            .is_some_and(|primary| primary != self.node_id)
+        {
             return Err(DfsPosixError::Dfs(DfsError::Distributed { message: "restore destination authority moved; resume its durable job on the current primary".into() }));
         }
         options.wait_for_commit = true;
@@ -4152,7 +4136,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             match input.into_quarantined(&self.content) {
                 Ok(blob) => self.write_stable_quarantined_distributed_blob(
                     request,
-                    Some(object.version.clone()),
+                    (!transient_create).then(|| object.version.clone()),
                     blob,
                     candidates,
                     options.policy,
@@ -4183,7 +4167,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             })?;
             self.write_stable_distributed_reader(
                 request,
-                Some(object.version.clone()),
+                (!transient_create).then(|| object.version.clone()),
                 reader,
                 candidates,
                 options.policy,
@@ -4205,8 +4189,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 },
             )
         } else {
-            self.write_distributed_reader_with_candidates(
+            self.write_distributed_reader_with_base(
                 request,
+                (!transient_create).then(|| object.version.clone()),
                 reader,
                 candidates,
                 options.policy,
@@ -4254,6 +4239,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 content_hash,
                 repair_jobs,
             } => {
+                if self.transport.delegates_local_namespace_authority()
+                    && self.is_local_metadata_primary_for_object(&object)?
+                {
+                    let authoritative = self.stat_target_for_path(&path)?;
+                    return self.stat_object_for_path(&authoritative, &path);
+                }
                 let mut committed_object = object.clone();
                 committed_object.version = version;
                 committed_object.content_hash = Some(content_hash);
@@ -4278,6 +4269,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 // replica's journal sequence space from the primary's stream.
                 if transient_create
                     && touch_parent_on_create
+                    && !self.transport.delegates_local_namespace_authority()
                     && !self
                         .coordinator
                         .intent(&intent_id)
@@ -4360,15 +4352,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     intent_id,
                     durable_receipts,
                     required_receipts,
-                })
-            }
-            NetworkedDfsWriteOutcome::Conflict { conflict } => {
-                if transient_create {
-                    self.remove_transient_object_metadata(&object.object_id);
-                }
-                Err(DfsPosixError::Conflict {
-                    path,
-                    reason: conflict.reason,
                 })
             }
         }
@@ -4500,10 +4483,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     durable_receipts,
                     required_receipts,
                 }),
-                NetworkedDfsWriteOutcome::Conflict { conflict } => Err(DfsPosixError::Conflict {
-                    path,
-                    reason: conflict.reason,
-                }),
             };
         }
 
@@ -4517,9 +4496,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 return Err(DfsError::Busy { path }.into());
             }
             NetworkedDfsReadOutcome::NotFound => return Err(DfsPosixError::NotFound { path }),
-            NetworkedDfsReadOutcome::Conflicted { conflicts, .. } => {
-                return Err(read_conflict_error(path, conflicts));
-            }
         };
         let mut overlay = RangedWriteOverlayReader::new(current, offset, reader);
         let outcome = self.write_distributed_reader_with_base(
@@ -4576,10 +4552,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 intent_id,
                 durable_receipts,
                 required_receipts,
-            }),
-            NetworkedDfsWriteOutcome::Conflict { conflict } => Err(DfsPosixError::Conflict {
-                path,
-                reason: conflict.reason,
             }),
         }
     }
@@ -4720,12 +4692,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         required_receipts,
                     });
                 }
-                NetworkedDfsWriteOutcome::Conflict { conflict } => {
-                    return Err(DfsPosixError::Conflict {
-                        path,
-                        reason: conflict.reason,
-                    });
-                }
             }
         }
         let mut current = match self.read_current_object_or_fetch_remote(&object.object_id)? {
@@ -4738,9 +4704,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 return Err(DfsError::Busy { path }.into());
             }
             NetworkedDfsReadOutcome::NotFound => return Err(DfsPosixError::NotFound { path }),
-            NetworkedDfsReadOutcome::Conflicted { conflicts, .. } => {
-                return Err(read_conflict_error(path, conflicts));
-            }
         };
         let start = usize::try_from(offset).map_err(|_| DfsPosixError::InvalidPath {
             path: format!("{path}@{offset}"),
@@ -4806,10 +4769,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 intent_id,
                 durable_receipts,
                 required_receipts,
-            }),
-            NetworkedDfsWriteOutcome::Conflict { conflict } => Err(DfsPosixError::Conflict {
-                path,
-                reason: conflict.reason,
             }),
         }
     }
@@ -4886,9 +4845,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 return Err(DfsError::Busy { path }.into());
             }
             NetworkedDfsReadOutcome::NotFound => return Err(DfsPosixError::NotFound { path }),
-            NetworkedDfsReadOutcome::Conflicted { conflicts, .. } => {
-                return Err(read_conflict_error(path, conflicts));
-            }
         };
         let len = usize::try_from(len).map_err(|_| DfsPosixError::InvalidPath {
             path: format!("{path}@len={len}"),
@@ -4955,10 +4911,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 intent_id,
                 durable_receipts,
                 required_receipts,
-            }),
-            NetworkedDfsWriteOutcome::Conflict { conflict } => Err(DfsPosixError::Conflict {
-                path,
-                reason: conflict.reason,
             }),
         }
     }

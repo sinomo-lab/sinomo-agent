@@ -4,8 +4,13 @@ use super::*;
 
 #[test]
 fn immutable_fetch_inspection_never_creates_or_recertifies_an_owner() {
-    let root = temp_root("dfs-immutable-fetch-owner-proof");
-    let data_dir = SinomoDataDir::new(root.join("data"));
+    let local =
+        crate::test_support::DfsTestRuntime::ordered_node_ids("dfs-immutable-fetch-owner-proof", 1)
+            .remove(0);
+    let mut native =
+        crate::test_support::DfsTestRuntime::new("dfs-immutable-fetch-owner-proof", local.clone())
+            .unwrap();
+    let data_dir = native.data_dir(&local).clone();
     let shard_id = crate::DfsMetadataShardId::new("root");
     let metadata_root = crate::default_dfs_metadata_shards_root(&data_dir)
         .join(crate::metadata_keys::key_segment(&shard_id.0));
@@ -21,10 +26,25 @@ fn immutable_fetch_inspection_never_creates_or_recertifies_an_owner() {
         !metadata_root.exists(),
         "read admission must not create a metadata root"
     );
-    let local = NodeId::from_legacy_named("fetch-proof-owner").unwrap();
-    let mut writer =
-        crate::LocalSobjMetadataBackend::new(shard_id.clone(), &metadata_root).unwrap();
-    writer.put_file_system(&distributed_sifs(local)).unwrap();
+    native.start_nodes().unwrap();
+    let mut client = native.client(&local).unwrap();
+    client
+        .posix_write_file(
+            "/immutable-inspection",
+            b"actual owned bytes",
+            crate::DfsWriteOptions {
+                policy: crate::DfsReplicationPolicy::new(1, 1).unwrap(),
+                replica_candidates: vec![local.clone()],
+                wait_for_commit: true,
+                foreground_replica_repair: false,
+            },
+        )
+        .unwrap();
+    drop(client);
+    let scheduler = daemon_dfs_mutation_scheduler(&data_dir).unwrap();
+    let admission = crate::test_runtime::executor()
+        .block_on(scheduler.admit(&DfsMessageExecutionScope::GlobalExclusive))
+        .unwrap();
     assert!(inspect().unwrap().flatten().is_some());
     let guard = crate::metadata_lock::metadata_write_lock(
         metadata_root.clone(),
@@ -52,96 +72,68 @@ fn immutable_fetch_inspection_never_creates_or_recertifies_an_owner() {
         .is_none(),
         "observational reads must not clear uncertainty"
     );
+    drop(admission);
+    native.close().unwrap();
 }
 
 #[test]
 fn verified_blob_fetch_serves_while_global_maintenance_owns_metadata() {
-    let root = temp_root("dfs-verified-fetch-content-lane");
-    let data_root = root.join("data");
-    let data_dir = SinomoDataDir::new(&data_root);
-    let paths = DaemonPaths::with_root(data_root.join("daemon"));
-    let owner = Arc::new(DaemonDataOwnerLock::acquire(&paths).unwrap());
-    register_daemon_dfs_data_owner_lock(&paths, &owner).unwrap();
-    let local = NodeId::from_legacy_named("verified-fetch-local").unwrap();
-    let remote = NodeId::from_legacy_named("verified-fetch-remote").unwrap();
-    write_test_cluster_state_with_remote_endpoint(&data_root, &local, &remote, "127.0.0.1:9");
+    let local =
+        crate::test_support::DfsTestRuntime::ordered_node_ids("dfs-verified-fetch-content-lane", 1)
+            .remove(0);
+    let mut native =
+        crate::test_support::DfsTestRuntime::new("dfs-verified-fetch-content-lane", local.clone())
+            .unwrap();
+    native.start_nodes().unwrap();
+    let data_dir = native.data_dir(&local).clone();
+    let paths = DaemonPaths::with_root(data_dir.root().join("daemon"));
     let cluster_paths = ClusterPaths::new(&data_dir);
-    let runtime = daemon_test_runtime("dfs-verified-fetch-content-lane");
-    let file_system = distributed_sifs(local.clone());
-    let config = DfsFileSystemConfig::from(&file_system);
-    let shard = DfsMetadataShardConfig {
-        file_system_id: file_system.file_system_id.clone(),
-        shard_id: "root".into(),
-        primary_node_id: local.clone(),
-        replica_node_ids: Vec::new(),
-        epoch: 1,
-        assignment: DfsMetadataShardAssignment::Root,
-        namespace_prepare_codec: Default::default(),
-        default_policy: DfsObjectPolicy::ReplicatedEventual,
-    };
-    append_cluster_raft_command(
-        &cluster_paths,
-        &local,
-        sinomo_core::kv::KvCommand::Txn(sinomo_core::kv::KvTxn {
-            compares: Vec::new(),
-            failure: Vec::new(),
-            success: vec![
-                sinomo_core::kv::KvOp::put_serde(
-                    file_system_config_key(&config.file_system_id),
-                    &config,
-                    None,
-                )
-                .unwrap(),
-                sinomo_core::kv::KvOp::put_serde(
-                    metadata_shard_key(&config.file_system_id, "root"),
-                    &shard,
-                    None,
-                )
-                .unwrap(),
-            ],
-        }),
-    )
-    .unwrap();
+    let runtime = crate::test_runtime::executor();
     let bytes = b"leased immutable fetch bytes";
-    let mut object = pending_object_metadata_for_test(
-        DfsObjectId::from_legacy_named("verified-fetch-object").unwrap(),
-        config.file_system_id.clone(),
-        DfsVersion::from_legacy_named("verified-fetch-version").unwrap(),
-        local.clone(),
-        "/services/verified-fetch",
-    );
-    object.content_hash = Some(crate::content_store::content_hash(bytes));
-    object.content_size_bytes = Some(bytes.len() as u64);
-    let mut intent = pending_write_intent_for_test(
-        "verified-fetch-intent",
-        object.file_system_id.clone(),
-        object.object_id.clone(),
-        object.version.clone(),
-        remote.clone(),
-        vec![local.clone()],
-        1,
-    );
-    intent.content_hash = object.content_hash.clone();
-    intent.object_metadata = Some(object.clone());
-    let shard_id = crate::DfsMetadataShardId::new("root");
-    let metadata_root = crate::default_dfs_metadata_shards_root(&data_dir)
-        .join(crate::metadata_keys::key_segment(&shard_id.0));
-    let mut writer =
-        crate::LocalSobjMetadataBackend::new(shard_id.clone(), &metadata_root).unwrap();
-    writer.put_file_system(&file_system).unwrap();
-    writer.put_object(&object).unwrap();
-    writer.put_intent(&intent).unwrap();
-    let content = crate::LocalContentStore::new(data_dir.dfs_dir().join("content")).unwrap();
-    content
-        .put_object_version(object.object_id.as_str(), object.version.as_str(), bytes)
+    let mut client = native.client(&local).unwrap();
+    let stat = client
+        .posix_write_file(
+            "/verified-fetch",
+            bytes,
+            crate::DfsWriteOptions {
+                policy: crate::DfsReplicationPolicy::new(1, 1).unwrap(),
+                replica_candidates: vec![local.clone()],
+                wait_for_commit: true,
+                foreground_replica_repair: false,
+            },
+        )
         .unwrap();
-    drop(writer);
+    let object = client
+        .metadata_backend()
+        .unwrap()
+        .get_object(&stat.object_id)
+        .unwrap()
+        .unwrap();
+    let intent = client
+        .metadata_backend()
+        .unwrap()
+        .intents_for_object(&stat.object_id)
+        .unwrap()
+        .into_iter()
+        .find(|intent| {
+            intent.target_version == stat.version
+                && intent.status == crate::DfsWriteIntentStatus::Committed
+        })
+        .expect("actual sealed committed write outcome");
+    let shard = native.root_shard().unwrap();
+    let remote = intent.coordinator_node_id.clone();
+    assert_eq!(
+        remote, local,
+        "native write retained its actual coordinator"
+    );
+    let forged_primary = NodeId::generate();
+    drop(client);
     // Warm the actual global resident generation before maintenance takes it.
     handle_daemon_dfs_message_on_runtime(
         &paths,
         test_dfs_message_command(
             "verified-fetch-warm",
-            test_dfs_lookup_routed_message(&remote, &local, 1, "/services/verified-fetch"),
+            test_dfs_lookup_routed_message(&remote, &local, 1, "/verified-fetch"),
         ),
         runtime.handle(),
     )
@@ -220,7 +212,9 @@ fn verified_blob_fetch_serves_while_global_maintenance_owns_metadata() {
             0 => unproven.intent_id = "unknown-intent".into(),
             1 => unproven.authority_shard = None,
             2 => unproven.authority_shard.as_mut().unwrap().epoch = 0,
-            _ => unproven.authority_shard.as_mut().unwrap().primary_node_id = remote.clone(),
+            _ => {
+                unproven.authority_shard.as_mut().unwrap().primary_node_id = forged_primary.clone()
+            }
         }
         assert!(
             prepare_daemon_dfs_verified_blob_fetch(
@@ -352,115 +346,128 @@ fn verified_blob_fetch_serves_while_global_maintenance_owns_metadata() {
         bytes,
         "reader must retain its content lease after service eviction"
     );
+    native.close().unwrap();
 }
 
 #[test]
 fn committed_placement_policy_retains_resident_lanes_and_updates_configuration() {
-    let root = temp_root("dfs-policy-retains-store-owner");
-    let data_root = root.join("data");
-    let data_dir = SinomoDataDir::new(&data_root);
-    let paths = DaemonPaths::with_root(data_root.join("daemon"));
-    let owner = Arc::new(DaemonDataOwnerLock::acquire(&paths).unwrap());
-    register_daemon_dfs_data_owner_lock(&paths, &owner).unwrap();
-    let local = NodeId::from_legacy_named("policy-store-owner-local").unwrap();
-    let remote = NodeId::from_legacy_named("policy-store-owner-remote").unwrap();
-    write_test_cluster_state_with_remote_endpoint(&data_root, &local, &remote, "127.0.0.1:9");
+    let nodes =
+        crate::test_support::DfsTestRuntime::ordered_node_ids("dfs-policy-retains-store-owner", 2);
+    let local = nodes[0].clone();
+    let remote = nodes[1].clone();
+    let mut native =
+        crate::test_support::DfsTestRuntime::new("dfs-policy-retains-store-owner", local.clone())
+            .unwrap();
+    native.define_node(remote.clone()).unwrap();
+    native.start_nodes().unwrap();
+    let data_dir = native.data_dir(&local).clone();
+    let paths = DaemonPaths::with_root(data_dir.root().join("daemon"));
     let cluster_paths = ClusterPaths::new(&data_dir);
-    let runtime = daemon_test_runtime("dfs-policy-retains-store-owner");
-    let file_system = distributed_sifs(local.clone());
-    let mut config = DfsFileSystemConfig::from(&file_system);
-    let mut shard = DfsMetadataShardConfig {
-        file_system_id: file_system.file_system_id.clone(),
-        shard_id: "root".into(),
-        primary_node_id: local.clone(),
-        replica_node_ids: Vec::new(),
-        epoch: 1,
-        assignment: DfsMetadataShardAssignment::Root,
-        namespace_prepare_codec: Default::default(),
-        default_policy: DfsObjectPolicy::ReplicatedEventual,
-    };
-    append_cluster_raft_command(
-        &cluster_paths,
-        &local,
-        sinomo_core::kv::KvCommand::Txn(sinomo_core::kv::KvTxn {
-            compares: Vec::new(),
-            success: vec![
-                sinomo_core::kv::KvOp::put_serde(
-                    file_system_config_key(&config.file_system_id),
-                    &config,
-                    None,
-                )
-                .unwrap(),
-                sinomo_core::kv::KvOp::put_serde(
-                    metadata_shard_key(&config.file_system_id, "root"),
-                    &shard,
-                    None,
-                )
-                .unwrap(),
-            ],
-            failure: Vec::new(),
-        }),
-    )
-    .unwrap();
+    let runtime = crate::test_runtime::executor();
+    let control = native.shared_control_plane().unwrap();
+    let mut config = control
+        .with_client(|kv| {
+            crate::DfsControlPlaneStore::new(kv.as_mut())
+                .get_file_system_config(&native.file_system().file_system_id)
+        })
+        .unwrap()
+        .expect("actual current filesystem configuration");
+    let shard = native.root_shard().unwrap();
     let lookup = |frame| {
         handle_daemon_dfs_message_on_runtime(
             &paths,
             test_dfs_message_command(
                 format!("policy-store-lookup-{frame}"),
-                test_dfs_lookup_routed_message(&remote, &local, frame, "/services/absent"),
+                test_dfs_lookup_routed_message(&remote, &local, frame, "/absent"),
             ),
             runtime.handle(),
         )
         .unwrap()
     };
     lookup(1);
-    let (first_lane, scan_owner, first_signature) = {
-        let cache = daemon_dfs_message_service_cache().lock().unwrap();
-        let entry = cache.get(&data_dir.root()).unwrap();
-        assert!(entry.resident_metadata_initialized && entry.resident_metadata_backend.is_some());
-        (
-            Arc::clone(entry.primary_service.as_ref().unwrap()),
-            Arc::clone(&entry.write_intent_maintenance_scan),
-            entry.signature.clone(),
-        )
-    };
-    let opens = daemon_dfs_test_message_service_lane_open_count(&data_dir);
-    config.subtree_policies[2].min_commit_replicas = Some(2);
-    config.subtree_policies[2].desired_replicas = Some(3);
-    append_cluster_raft_command(
-        &cluster_paths,
-        &local,
-        sinomo_core::kv::KvCommand::Op(
-            sinomo_core::kv::KvOp::put_serde(
-                file_system_config_key(&config.file_system_id),
-                &config,
-                None,
+    let first = {
+        let cache_slot = daemon_dfs_message_service_cache()
+            .root(&data_dir.root())
+            .expect("actual root cache slot");
+        let cache = cache_slot.lock().unwrap();
+        cache.as_ref().map(|entry| {
+            (
+                entry.primary_service.clone(),
+                Arc::clone(&entry.write_intent_maintenance_scan),
+                entry.signature.clone(),
+                entry.resident_metadata_initialized && entry.resident_metadata_backend.is_some(),
             )
-            .unwrap(),
-        ),
+        })
+    };
+    let (first_lane, scan_owner, first_signature, initialized) =
+        first.expect("mounted cache entry");
+    assert!(initialized);
+    let first_lane = first_lane.expect("actual primary service");
+    let opens = daemon_dfs_test_message_service_lane_open_count(&data_dir);
+    let expected_config = config.clone();
+    let path = "/services";
+    crate::upsert_placement_rule(
+        &mut config.subtree_policies,
+        crate::DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedConfirmed, 2, 2)
+            .unwrap()
+            .into_rule(path.into(), crate::DfsPlacementScope::SelfOnly),
+    );
+    let mut placement_client = native.client(&local).unwrap();
+    let candidates = placement_client.placement_content_candidates().unwrap();
+    drop(placement_client);
+    let job = crate::control_plane::build_placement_reconciliation_job(
+        "native-policy-retains-store-owner".into(),
+        &config,
+        path.into(),
+        crate::DfsPlacementScope::SelfOnly,
+        std::collections::BTreeSet::new(),
+        candidates,
+        None,
+        crate::metadata_records::dfs_now_unix_nanos(),
     )
     .unwrap();
+    assert!(
+        control
+            .with_client(|kv| {
+                crate::DfsControlPlaneStore::new(kv.as_mut()).compare_and_put_placement_update(
+                    &expected_config,
+                    &config,
+                    &job,
+                )
+            })
+            .unwrap(),
+        "normal placement Apply commits its actual checked policy transition"
+    );
     lookup(2);
-    {
-        let cache = daemon_dfs_message_service_cache().lock().unwrap();
-        let entry = cache.get(&data_dir.root()).unwrap();
-        assert!(Arc::ptr_eq(
-            &first_lane,
-            entry.primary_service.as_ref().unwrap()
-        ));
-        assert!(Arc::ptr_eq(
-            &scan_owner,
-            &entry.write_intent_maintenance_scan
-        ));
-        assert!(
-            entry.signature.metadata_authority_generation
-                > first_signature.metadata_authority_generation
-        );
-        assert_eq!(
-            entry.signature.metadata_storage_generation,
-            first_signature.metadata_storage_generation
-        );
-    }
+    let after_policy = {
+        let cache_slot = daemon_dfs_message_service_cache()
+            .root(&data_dir.root())
+            .expect("actual root cache slot");
+        let cache = cache_slot.lock().unwrap();
+        cache.as_ref().map(|entry| {
+            (
+                entry.primary_service.clone(),
+                Arc::clone(&entry.write_intent_maintenance_scan),
+                entry.signature.clone(),
+            )
+        })
+    };
+    // Assertions run after the shared cache lock is released, so a failed
+    // behavioral check cannot poison unrelated mounted owners.
+    let (policy_lane, policy_scan, policy_signature) = after_policy.expect("mounted cache entry");
+    assert!(Arc::ptr_eq(
+        &first_lane,
+        &policy_lane.expect("actual primary service")
+    ));
+    assert!(Arc::ptr_eq(&scan_owner, &policy_scan));
+    assert!(
+        policy_signature.metadata_authority_generation
+            > first_signature.metadata_authority_generation
+    );
+    assert_eq!(
+        policy_signature.metadata_storage_generation,
+        first_signature.metadata_storage_generation
+    );
     assert_eq!(
         daemon_dfs_test_message_service_lane_open_count(&data_dir),
         opens
@@ -506,19 +513,11 @@ fn committed_placement_policy_retains_resident_lanes_and_updates_configuration()
         &retained.lane.service.write_intent_maintenance_scan
     ));
     config.display_name = "Updated during maintenance".into();
-    append_cluster_raft_command(
-        &cluster_paths,
-        &local,
-        sinomo_core::kv::KvCommand::Op(
-            sinomo_core::kv::KvOp::put_serde(
-                file_system_config_key(&config.file_system_id),
-                &config,
-                None,
-            )
-            .unwrap(),
-        ),
-    )
-    .unwrap();
+    control
+        .with_client(|kv| {
+            crate::DfsControlPlaneStore::new(kv.as_mut()).put_file_system_config(&config)
+        })
+        .unwrap();
     assert!(
         restore_daemon_dfs_message_mutation_service_after_maintenance(
             &data_dir,
@@ -532,32 +531,36 @@ fn committed_placement_policy_retains_resident_lanes_and_updates_configuration()
     drop(admission);
 
     // A real assignment/epoch transition still replaces the physical owner.
-    shard.epoch += 1;
-    append_cluster_raft_command(
-        &cluster_paths,
-        &local,
-        sinomo_core::kv::KvCommand::Op(
-            sinomo_core::kv::KvOp::put_serde(
-                metadata_shard_key(&config.file_system_id, "root"),
-                &shard,
-                None,
-            )
-            .unwrap(),
-        ),
-    )
-    .unwrap();
+    assert!(
+        !shard.replica_node_ids.is_empty(),
+        "actual native membership transition requires old peers"
+    );
+    native
+        .reassign_metadata_shard(
+            &config.file_system_id,
+            &shard.shard_id,
+            local.clone(),
+            Vec::new(),
+        )
+        .unwrap();
     lookup(3);
-    {
-        let cache = daemon_dfs_message_service_cache().lock().unwrap();
-        let entry = cache.get(&data_dir.root()).unwrap();
-        assert!(
-            entry.signature.metadata_storage_generation
-                > first_signature.metadata_storage_generation
-        );
-        assert!(!Arc::ptr_eq(
-            &scan_owner,
-            &entry.write_intent_maintenance_scan
-        ));
-    }
+    let after_handoff = {
+        let cache_slot = daemon_dfs_message_service_cache()
+            .root(&data_dir.root())
+            .expect("actual root cache slot");
+        let cache = cache_slot.lock().unwrap();
+        cache.as_ref().map(|entry| {
+            (
+                entry.signature.clone(),
+                Arc::clone(&entry.write_intent_maintenance_scan),
+            )
+        })
+    };
+    let (handoff_signature, handoff_scan) = after_handoff.expect("mounted cache entry");
+    assert!(
+        handoff_signature.metadata_storage_generation > first_signature.metadata_storage_generation
+    );
+    assert!(!Arc::ptr_eq(&scan_owner, &handoff_scan));
     evict_daemon_dfs_message_service_cache(&data_dir).unwrap();
+    native.close().unwrap();
 }

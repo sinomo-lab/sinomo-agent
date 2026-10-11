@@ -83,13 +83,27 @@ pub fn prepare_cluster_kv_raft_proposals(
             proposals.len()
         ];
     }
+    let group_span = tracing::trace_span!(
+        target: "sinomo.perf", "kv.group.prepare",
+        stage = "kv.group.prepare", root = %paths.root.display(), node = %node_id,
+        request_ids = ?proposals.iter().map(|p| &p.request.request_id).collect::<Vec<_>>(),
+        request_count = proposals.len(),
+    );
+    let _group = group_span.enter();
     let deadline = proposals.iter().map(|p| p.deadline).max().unwrap();
-    let sequence = match lock_cluster_kv_commit_sequence(
-        paths,
-        deadline.saturating_duration_since(Instant::now()),
-    ) {
-        Ok(lock) => lock,
-        Err(error) => return vec![Err(error); proposals.len()],
+    let sequence = {
+        let _phase = tracing::trace_span!(
+            target: "sinomo.perf", "kv.group.sequence_wait",
+            stage = "kv.group.sequence_wait",
+        )
+        .entered();
+        match lock_cluster_kv_commit_sequence(
+            paths,
+            deadline.saturating_duration_since(Instant::now()),
+        ) {
+            Ok(lock) => lock,
+            Err(error) => return vec![Err(error); proposals.len()],
+        }
     };
     let mut storage = ClusterKvRaftLocalCommandStorage::new_with_operation_deadline(
         paths.raft_store(),
@@ -151,6 +165,11 @@ impl<F: FnMut(&str) -> bool> ClusterKvRaftLocalCommandStorage<F> {
     {
         let mut results = vec![None; proposals.len()];
         let mut eligible = Vec::new();
+        let replay_phase = tracing::trace_span!(
+            target: "sinomo.perf", "kv.group.replay_preflight",
+            stage = "kv.group.replay_preflight",
+        )
+        .entered();
         for (i, p) in proposals.iter().enumerate() {
             self.operation_deadline = Some(p.deadline);
             let checked = self
@@ -170,6 +189,7 @@ impl<F: FnMut(&str) -> bool> ClusterKvRaftLocalCommandStorage<F> {
                 Err(error) => results[i] = Some(Err(error)),
             }
         }
+        drop(replay_phase);
         self.release_session_for_quorum();
         for (i, result) in results.iter().enumerate() {
             if let Some(Err(error)) = result {
@@ -199,11 +219,18 @@ impl<F: FnMut(&str) -> bool> ClusterKvRaftLocalCommandStorage<F> {
             .min()
             .unwrap();
         let ledger_started = Instant::now();
-        let receipts = crate::request::mark_cluster_kv_requests_submitted_together(
-            self.store.paths(),
-            &requests,
-            deadline,
-        );
+        let receipts = {
+            let _phase = tracing::trace_span!(
+                target: "sinomo.perf", "kv.group.submitted_ledger",
+                stage = "kv.group.submitted_ledger",
+            )
+            .entered();
+            crate::request::mark_cluster_kv_requests_submitted_together(
+                self.store.paths(),
+                &requests,
+                deadline,
+            )
+        };
         metrics::histogram!("sinomo.kv.group_commit.ledger.us").record(duration_us(ledger_started));
         let receipts = match receipts {
             Ok(receipts) => receipts,
@@ -219,6 +246,11 @@ impl<F: FnMut(&str) -> bool> ClusterKvRaftLocalCommandStorage<F> {
         let mut rejected = Vec::new();
         let mut retain_resident = None;
         let mut original_log_len = None;
+        let staging_phase = tracing::trace_span!(
+            target: "sinomo.perf", "kv.group.recheck_and_stage",
+            stage = "kv.group.recheck_and_stage",
+        )
+        .entered();
         for (i, receipt) in eligible.into_iter().zip(receipts) {
             let receipt = match receipt {
                 Ok(receipt) => receipt,
@@ -263,6 +295,7 @@ impl<F: FnMut(&str) -> bool> ClusterKvRaftLocalCommandStorage<F> {
                 }
             }
         }
+        drop(staging_phase);
         if staged
             .iter()
             .any(|(i, _)| Instant::now() >= proposals[*i].deadline)
@@ -291,7 +324,14 @@ impl<F: FnMut(&str) -> bool> ClusterKvRaftLocalCommandStorage<F> {
                 .as_mut()
                 .expect("staged entries retain resident ownership");
             let started = Instant::now();
-            let persisted = write_wal(&node.paths.wal, &entries);
+            let persisted = {
+                let _phase = tracing::trace_span!(
+                    target: "sinomo.perf", "kv.group.wal_persistence",
+                    stage = "kv.group.wal_persistence", entries = entries.len(),
+                )
+                .entered();
+                write_wal(&node.paths.wal, &entries)
+            };
             metrics::histogram!("sinomo.kv.group_commit.wal.us").record(duration_us(started));
             metrics::histogram!("sinomo.kv.group_commit.entries").record(entries.len() as f64);
             match persisted {

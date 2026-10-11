@@ -3,11 +3,11 @@
 //! requests while running tools keep going.
 
 use sinomo_agent::*;
-use sinomo_lm::{LanguageModelError, LanguageModelRequest, LanguageModelResponse};
+use sinomo_lm::{ModelScript, ScriptedExpectation, ScriptedProvider, ScriptedReply};
 use sinomo_runtime::{events::SessionId, node::NodeId};
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicBool, Ordering},
     mpsc,
 };
 use std::time::{Duration, Instant};
@@ -32,29 +32,15 @@ fn input(session_id: SessionId) -> AgentLoopInput {
     }
 }
 
-/// Calls the tool on its first request and answers afterwards.
-#[derive(Clone, Default)]
-struct ToolThenAnswer(Arc<AtomicUsize>);
-
-impl InteractionModel for ToolThenAnswer {
-    fn complete(
-        &self,
-        _: &LanguageModelRequest,
-    ) -> Result<LanguageModelResponse, LanguageModelError> {
-        let content = if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
-            TOOL_CALL
-        } else {
-            ANSWER
-        };
-        Ok(LanguageModelResponse {
-            provider: "fixture".into(),
-            model: "fixture".into(),
-            content: content.into(),
-            items: Vec::new(),
-            tool_calls: Vec::new(),
-            usage: None,
-        })
+/// Calls the tool on the first request; `answers` later requests answer.
+fn tool_then_answer(answers: usize) -> ScriptedProvider {
+    let mut script = ModelScript::new()
+        .expect(ScriptedExpectation::last_user_contains("Do the work."))
+        .reply(ScriptedReply::new().text(TOOL_CALL));
+    for _ in 0..answers {
+        script = script.reply(ScriptedReply::new().text(ANSWER));
     }
+    ScriptedProvider::new(script)
 }
 
 /// Blocks until released, ignoring cancellation, then reports success.
@@ -127,9 +113,8 @@ fn pause_lets_the_running_tool_finish_and_starts_no_new_model_request() {
     let (started_tx, started_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
     let finished = Arc::new(AtomicBool::new(false));
-    let model = ToolThenAnswer::default();
-    let requests = Arc::clone(&model.0);
-    let agent = Agent::new(model, "fixture", "fixture")
+    let model = tool_then_answer(1);
+    let agent = Agent::new(model.clone(), "fixture", "fixture")
         .with_config(AgentConfig::new("fixture", "fixture").with_max_steps(5))
         .with_tool_registry(AgentToolRegistry::new().with_tool(GatedTool {
             started: started_tx,
@@ -154,7 +139,7 @@ fn pause_lets_the_running_tool_finish_and_starts_no_new_model_request() {
         "the running tool must finish"
     );
     assert_eq!(
-        requests.load(Ordering::SeqCst),
+        model.request_count(),
         1,
         "no model request may start after the pause"
     );
@@ -184,14 +169,16 @@ fn pause_lets_the_running_tool_finish_and_starts_no_new_model_request() {
         .submit_op(AgentOp::continue_turn(turn_input))
         .unwrap();
     runtime.join_active_turn().unwrap();
-    assert_eq!(requests.load(Ordering::SeqCst), 2, "the continuation ran");
+    assert_eq!(model.request_count(), 2, "the continuation ran");
     assert!(!runtime.session_snapshot().unwrap().is_paused());
+    model.assert_finished();
 }
 
 #[test]
 fn abort_cancels_the_running_turn_and_its_tool() {
     let (started_tx, started_rx) = mpsc::channel();
-    let agent = Agent::new(ToolThenAnswer::default(), "fixture", "fixture")
+    let model = tool_then_answer(0);
+    let agent = Agent::new(model.clone(), "fixture", "fixture")
         .with_config(AgentConfig::new("fixture", "fixture").with_max_steps(5))
         .with_tool_registry(AgentToolRegistry::new().with_tool(CooperativeTool {
             started: started_tx,
@@ -218,6 +205,7 @@ fn abort_cancels_the_running_turn_and_its_tool() {
         Some(AgentToolStatus::Cancelled)
     );
     assert!(runtime.active_turn().unwrap().is_none());
+    model.assert_finished();
 }
 
 #[test]
@@ -270,7 +258,8 @@ fn interrupt_is_pause_and_cancel_stops_the_turn() {
     let (started_tx, started_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
     let finished = Arc::new(AtomicBool::new(false));
-    let agent = Agent::new(ToolThenAnswer::default(), "fixture", "fixture")
+    let model = tool_then_answer(0);
+    let agent = Agent::new(model.clone(), "fixture", "fixture")
         .with_config(AgentConfig::new("fixture", "fixture").with_max_steps(5))
         .with_tool_registry(AgentToolRegistry::new().with_tool(GatedTool {
             started: started_tx,
@@ -289,10 +278,12 @@ fn interrupt_is_pause_and_cancel_stops_the_turn() {
     assert!(finished.load(Ordering::SeqCst));
     assert!(runtime.session_snapshot().unwrap().is_paused());
     assert!(runtime.control_snapshot().unwrap().paused);
+    model.assert_finished();
 
     // Cancel stops a running tool and does not pause.
     let (started_tx, started_rx) = mpsc::channel();
-    let agent = Agent::new(ToolThenAnswer::default(), "fixture", "fixture")
+    let model = tool_then_answer(0);
+    let agent = Agent::new(model.clone(), "fixture", "fixture")
         .with_config(AgentConfig::new("fixture", "fixture").with_max_steps(5))
         .with_tool_registry(AgentToolRegistry::new().with_tool(CooperativeTool {
             started: started_tx,
@@ -313,4 +304,5 @@ fn interrupt_is_pause_and_cancel_stops_the_turn() {
             .map(|(status, _)| status.clone()),
         Some(AgentToolStatus::Cancelled)
     );
+    model.assert_finished();
 }

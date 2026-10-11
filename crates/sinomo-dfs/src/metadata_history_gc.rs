@@ -13,14 +13,12 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use crate::intent::write_intent_status_is_active;
-use crate::metadata_namespace_transaction::namespace_transaction_recovery_is_complete;
-use crate::metadata_receipt::replay_receipt_matches_existing;
 use crate::metadata_records::{
-    DfsConflictStatus, DfsMetadataShardId, DfsNamespacePrepareStatus, DfsNamespaceRequestStatus,
-    DfsObjectVersionRecord, DfsWriteIntentRecord, DfsWriteIntentStatus,
+    DfsMetadataShardId, DfsNamespaceRequestStatus, DfsObjectVersionRecord,
+    DfsPreparedOperationRecord, DfsPreparedOperationStatus, DfsWriteIntentRecord,
+    DfsWriteIntentStatus,
 };
 use crate::metadata_tables::DfsMetadataTables;
-use crate::metadata_visible_commit::visible_commit_should_recover;
 use crate::protocol::DfsNamespaceDestinationPrecondition;
 use crate::{DfsFileSystemId, DfsNamespaceOperation, DfsObjectId, DfsVersion};
 
@@ -201,29 +199,18 @@ pub struct DfsMetadataHistoryGcReport {
     pub materialized_retained_repair_owner_count: u64,
     #[serde(default)]
     pub removed_retained_repair_owner_count: u64,
-    /// Policy witnesses held until the shard supports retained repair owners.
-    #[serde(default)]
-    pub retained_repair_policy_witness_count: u64,
     pub eligible_intent_receipt_count: u64,
     pub removed_intent_receipt_count: u64,
-    pub eligible_conflict_count: u64,
-    pub removed_conflict_count: u64,
-    pub eligible_visible_commit_count: u64,
-    pub removed_visible_commit_count: u64,
     pub eligible_namespace_job_count: u64,
     pub compacted_namespace_job_count: u64,
-    pub eligible_namespace_transaction_count: u64,
-    pub compacted_namespace_transaction_count: u64,
-    pub eligible_namespace_prepare_count: u64,
-    pub compacted_namespace_prepare_count: u64,
+    pub eligible_prepared_operation_count: u64,
+    pub removed_prepared_operation_count: u64,
     pub eligible_namespace_request_count: u64,
     pub compacted_namespace_request_count: u64,
     pub eligible_namespace_job_receipt_count: u64,
     pub removed_namespace_job_receipt_count: u64,
     pub eligible_namespace_transaction_receipt_count: u64,
     pub removed_namespace_transaction_receipt_count: u64,
-    pub eligible_namespace_prepare_receipt_count: u64,
-    pub removed_namespace_prepare_receipt_count: u64,
     pub eligible_namespace_request_receipt_count: u64,
     pub removed_namespace_request_receipt_count: u64,
     pub retained_recovery_root_count: u64,
@@ -247,15 +234,11 @@ impl DfsMetadataHistoryGcReport {
             .saturating_add(self.eligible_receipt_count)
             .saturating_add(self.eligible_intent_count)
             .saturating_add(self.eligible_intent_receipt_count)
-            .saturating_add(self.eligible_conflict_count)
-            .saturating_add(self.eligible_visible_commit_count)
             .saturating_add(self.eligible_namespace_job_count)
-            .saturating_add(self.eligible_namespace_transaction_count)
-            .saturating_add(self.eligible_namespace_prepare_count)
+            .saturating_add(self.eligible_prepared_operation_count)
             .saturating_add(self.eligible_namespace_request_count)
             .saturating_add(self.eligible_namespace_job_receipt_count)
             .saturating_add(self.eligible_namespace_transaction_receipt_count)
-            .saturating_add(self.eligible_namespace_prepare_receipt_count)
             .saturating_add(self.eligible_namespace_request_receipt_count)
     }
 
@@ -266,15 +249,11 @@ impl DfsMetadataHistoryGcReport {
             .saturating_add(self.materialized_retained_repair_owner_count)
             .saturating_add(self.removed_retained_repair_owner_count)
             .saturating_add(self.removed_intent_receipt_count)
-            .saturating_add(self.removed_conflict_count)
-            .saturating_add(self.removed_visible_commit_count)
             .saturating_add(self.compacted_namespace_job_count)
-            .saturating_add(self.compacted_namespace_transaction_count)
-            .saturating_add(self.compacted_namespace_prepare_count)
+            .saturating_add(self.removed_prepared_operation_count)
             .saturating_add(self.compacted_namespace_request_count)
             .saturating_add(self.removed_namespace_job_receipt_count)
             .saturating_add(self.removed_namespace_transaction_receipt_count)
-            .saturating_add(self.removed_namespace_prepare_receipt_count)
             .saturating_add(self.removed_namespace_request_receipt_count)
     }
 
@@ -320,45 +299,24 @@ impl DfsMetadataHistoryGcReport {
         self.removed_retained_repair_owner_count = self
             .removed_retained_repair_owner_count
             .saturating_add(other.removed_retained_repair_owner_count);
-        self.retained_repair_policy_witness_count = self
-            .retained_repair_policy_witness_count
-            .saturating_add(other.retained_repair_policy_witness_count);
         self.eligible_intent_receipt_count = self
             .eligible_intent_receipt_count
             .saturating_add(other.eligible_intent_receipt_count);
         self.removed_intent_receipt_count = self
             .removed_intent_receipt_count
             .saturating_add(other.removed_intent_receipt_count);
-        self.eligible_conflict_count = self
-            .eligible_conflict_count
-            .saturating_add(other.eligible_conflict_count);
-        self.removed_conflict_count = self
-            .removed_conflict_count
-            .saturating_add(other.removed_conflict_count);
-        self.eligible_visible_commit_count = self
-            .eligible_visible_commit_count
-            .saturating_add(other.eligible_visible_commit_count);
-        self.removed_visible_commit_count = self
-            .removed_visible_commit_count
-            .saturating_add(other.removed_visible_commit_count);
         self.eligible_namespace_job_count = self
             .eligible_namespace_job_count
             .saturating_add(other.eligible_namespace_job_count);
         self.compacted_namespace_job_count = self
             .compacted_namespace_job_count
             .saturating_add(other.compacted_namespace_job_count);
-        self.eligible_namespace_transaction_count = self
-            .eligible_namespace_transaction_count
-            .saturating_add(other.eligible_namespace_transaction_count);
-        self.compacted_namespace_transaction_count = self
-            .compacted_namespace_transaction_count
-            .saturating_add(other.compacted_namespace_transaction_count);
-        self.eligible_namespace_prepare_count = self
-            .eligible_namespace_prepare_count
-            .saturating_add(other.eligible_namespace_prepare_count);
-        self.compacted_namespace_prepare_count = self
-            .compacted_namespace_prepare_count
-            .saturating_add(other.compacted_namespace_prepare_count);
+        self.eligible_prepared_operation_count = self
+            .eligible_prepared_operation_count
+            .saturating_add(other.eligible_prepared_operation_count);
+        self.removed_prepared_operation_count = self
+            .removed_prepared_operation_count
+            .saturating_add(other.removed_prepared_operation_count);
         self.eligible_namespace_request_count = self
             .eligible_namespace_request_count
             .saturating_add(other.eligible_namespace_request_count);
@@ -377,12 +335,6 @@ impl DfsMetadataHistoryGcReport {
         self.removed_namespace_transaction_receipt_count = self
             .removed_namespace_transaction_receipt_count
             .saturating_add(other.removed_namespace_transaction_receipt_count);
-        self.eligible_namespace_prepare_receipt_count = self
-            .eligible_namespace_prepare_receipt_count
-            .saturating_add(other.eligible_namespace_prepare_receipt_count);
-        self.removed_namespace_prepare_receipt_count = self
-            .removed_namespace_prepare_receipt_count
-            .saturating_add(other.removed_namespace_prepare_receipt_count);
         self.eligible_namespace_request_receipt_count = self
             .eligible_namespace_request_receipt_count
             .saturating_add(other.eligible_namespace_request_receipt_count);
@@ -441,25 +393,11 @@ pub(crate) enum DfsMetadataHistoryRemoval {
         object_id: DfsObjectId,
         intent_id: String,
     },
-    Conflict {
-        file_system_id: DfsFileSystemId,
-        object_id: DfsObjectId,
-        conflict_id: String,
-    },
-    VisibleCommit {
-        file_system_id: DfsFileSystemId,
-        object_id: DfsObjectId,
-        version: DfsVersion,
-    },
     NamespaceJob {
         file_system_id: DfsFileSystemId,
         job_id: String,
     },
-    NamespaceTransaction {
-        file_system_id: DfsFileSystemId,
-        transaction_id: String,
-    },
-    NamespacePrepare {
+    PreparedOperation {
         file_system_id: DfsFileSystemId,
         operation_id: String,
     },
@@ -475,10 +413,6 @@ pub(crate) enum DfsMetadataHistoryRemoval {
     NamespaceTransactionReceipt {
         file_system_id: DfsFileSystemId,
         transaction_id: String,
-    },
-    NamespacePrepareReceipt {
-        file_system_id: DfsFileSystemId,
-        operation_id: String,
     },
     NamespaceRequestReceipt {
         file_system_id: DfsFileSystemId,
@@ -599,27 +533,9 @@ pub(crate) fn metadata_history_stats_from_tables(
     );
     push_stats(
         &mut stats,
-        "conflicts",
-        tables.conflicts.values(),
-        |record| Some(offset_datetime_nanos(record.detected_at)),
-    );
-    push_stats(
-        &mut stats,
         "advisory-lock-states",
         tables.advisory_lock_states.values(),
         |_| None,
-    );
-    push_stats(
-        &mut stats,
-        "visible-commits",
-        tables.visible_commits.values(),
-        |record| Some(offset_datetime_nanos(record.created_at)),
-    );
-    push_stats(
-        &mut stats,
-        "namespace-transactions",
-        tables.namespace_transactions.values(),
-        |record| Some(offset_datetime_nanos(record.created_at)),
     );
     push_stats(
         &mut stats,
@@ -629,15 +545,9 @@ pub(crate) fn metadata_history_stats_from_tables(
     );
     push_stats(
         &mut stats,
-        "namespace-prepares",
-        tables.namespace_prepares.values(),
+        "prepared-operations-v7",
+        tables.prepared_operations_v7.values(),
         |record| Some(offset_datetime_nanos(record.transaction.created_at)),
-    );
-    push_stats(
-        &mut stats,
-        "namespace-prepare-receipts",
-        tables.namespace_prepare_receipts.values(),
-        |record| Some(offset_datetime_nanos(record.retained_at)),
     );
     push_stats(
         &mut stats,
@@ -696,7 +606,6 @@ pub(crate) fn plan_metadata_history_gc(
     tables: &DfsMetadataTables,
     options: &DfsMetadataHistoryGcOptions,
     snapshot_size_bytes: Option<u64>,
-    supports_retained_repair_owners: bool,
 ) -> Result<DfsMetadataHistoryGcPlan, crate::MetadataBackendError> {
     let now = options
         .now_unix_nanos
@@ -717,6 +626,7 @@ pub(crate) fn plan_metadata_history_gc(
         .collect::<BTreeSet<_>>();
     report.retained_explicit_pin_count = explicit_pins.len() as u64;
     let mut protected_versions = explicit_pins;
+    let mut prepared_content_hashes = BTreeSet::new();
     protected_versions.extend(
         crate::file_history::policy_retained_versions(tables, now)
             .into_iter()
@@ -788,23 +698,6 @@ pub(crate) fn plan_metadata_history_gc(
         ));
     }
 
-    for conflict in tables
-        .conflicts
-        .values()
-        .filter(|conflict| conflict.status == DfsConflictStatus::Open)
-    {
-        for version in conflict
-            .base_version
-            .iter()
-            .chain([&conflict.local_version, &conflict.remote_version])
-        {
-            protected_versions.insert(DfsMetadataVersionIdentity::new(
-                conflict.object_id.clone(),
-                version.clone(),
-            ));
-        }
-    }
-
     let restore_intent_roots = restore_job_intent_roots(tables);
     for intent in tables.intents.values() {
         let is_recovery_root = intent_is_recovery_root(
@@ -841,31 +734,10 @@ pub(crate) fn plan_metadata_history_gc(
         ));
     }
 
-    for commit in tables.visible_commits.values() {
-        let current_is_expected = tables
-            .objects
-            .get(&commit.committed_object.object_id)
-            .is_some_and(|object| object.version == commit.expected_version);
-        if current_is_expected || visible_commit_should_recover(tables, commit) {
-            protected_versions.insert(DfsMetadataVersionIdentity::new(
-                commit.committed_object.object_id.clone(),
-                commit.expected_version.clone(),
-            ));
-            protected_versions.insert(DfsMetadataVersionIdentity::new(
-                commit.visible_version.object_id.clone(),
-                commit.visible_version.version.clone(),
-            ));
-        }
-    }
-
-    for transaction in tables.namespace_transactions.values() {
-        protect_namespace_transaction_versions(&mut protected_versions, transaction);
-    }
-    for prepare in tables
-        .namespace_prepares
-        .values()
-        .filter(|prepare| namespace_prepare_is_recovery_root(tables, prepare))
-    {
+    for prepare in tables.prepared_operations_v7.values().filter(|prepare| {
+        prepare.status == DfsPreparedOperationStatus::Prepared
+            || prepared_operation_has_live_dependency(tables, prepare)
+    }) {
         for expected in &prepare.expected_object_versions {
             if let Some(version) = expected.expected_version.as_ref() {
                 protected_versions.insert(DfsMetadataVersionIdentity::new(
@@ -874,7 +746,11 @@ pub(crate) fn plan_metadata_history_gc(
                 ));
             }
         }
-        protect_namespace_transaction_versions(&mut protected_versions, &prepare.transaction);
+        protect_prepared_operation(
+            &mut protected_versions,
+            &mut prepared_content_hashes,
+            prepare,
+        );
         for receipt in &prepare.content_receipts {
             protected_versions.insert(DfsMetadataVersionIdentity::new(
                 receipt.receipt.object_id.clone(),
@@ -920,6 +796,49 @@ pub(crate) fn plan_metadata_history_gc(
                 report.retained_latest_version_count =
                     report.retained_latest_version_count.saturating_add(1);
             }
+        }
+    }
+
+    // A live metadata-only successor carries its original data-generation
+    // binding. Keep that exact same-object version and its W receipts until
+    // every current/retained/recovery root using it is gone. The worklist adds
+    // only recorded dependencies of already protected versions; unrelated
+    // historical byte generations receive no new root.
+    let mut data_generation_roots = protected_versions.iter().cloned().collect::<Vec<_>>();
+    while let Some(identity) = data_generation_roots.pop() {
+        let Some(version) = tables
+            .versions
+            .get(&(identity.object_id.clone(), identity.version.clone()))
+        else {
+            continue;
+        };
+        let Some(plan) = version.content_durability.as_ref() else {
+            continue;
+        };
+        let source =
+            DfsMetadataVersionIdentity::new(version.object_id.clone(), plan.source_version.clone());
+        let recorded_source = tables
+            .versions
+            .get(&(source.object_id.clone(), source.version.clone()))
+            .ok_or_else(|| {
+                crate::MetadataBackendError::Serde(format!(
+                    "protected revision {}/{} has no recorded data-generation witness {}",
+                    version.object_id, version.version, plan.source_version
+                ))
+            })?;
+        if recorded_source.file_system_id != version.file_system_id
+            || recorded_source.object_id != version.object_id
+            || recorded_source.version != plan.source_version
+            || recorded_source.content_hash != version.content_hash
+            || recorded_source.size_bytes != version.size_bytes
+        {
+            return Err(crate::MetadataBackendError::Serde(
+                "protected revision's recorded data-generation witness changes content identity"
+                    .into(),
+            ));
+        }
+        if protected_versions.insert(source.clone()) {
+            data_generation_roots.push(source);
         }
     }
 
@@ -970,10 +889,6 @@ pub(crate) fn plan_metadata_history_gc(
         if let Some(owner) =
             retained_repair_owner_before_compaction(tables, &receipt.to_intent_record())?
         {
-            if !supports_retained_repair_owners {
-                report.retained_repair_policy_witness_count += 1;
-                continue;
-            }
             owners_before_removal.insert(
                 (receipt.object_id.clone(), receipt.intent_id.clone()),
                 owner,
@@ -1042,10 +957,6 @@ pub(crate) fn plan_metadata_history_gc(
             continue;
         }
         if let Some(owner) = retained_repair_owner_before_compaction(tables, intent)? {
-            if !supports_retained_repair_owners {
-                report.retained_repair_policy_witness_count += 1;
-                continue;
-            }
             owners_before_removal
                 .insert((intent.object_id.clone(), intent.intent_id.clone()), owner);
         }
@@ -1056,50 +967,6 @@ pub(crate) fn plan_metadata_history_gc(
                 file_system_id: intent.file_system_id.clone(),
                 object_id: intent.object_id.clone(),
                 intent_id: intent.intent_id.clone(),
-            },
-        });
-    }
-
-    for conflict in tables
-        .conflicts
-        .values()
-        .filter(|conflict| conflict.status != DfsConflictStatus::Open)
-    {
-        let retained_at = offset_datetime_nanos(conflict.detected_at);
-        if retain_young(retained_at, now, options.min_history_age_nanos, &mut report) {
-            continue;
-        }
-        report.eligible_conflict_count = report.eligible_conflict_count.saturating_add(1);
-        candidates.push(RemovalCandidate {
-            retained_at_unix_nanos: retained_at,
-            removal: DfsMetadataHistoryRemoval::Conflict {
-                file_system_id: conflict.file_system_id.clone(),
-                object_id: conflict.object_id.clone(),
-                conflict_id: conflict.conflict_id.clone(),
-            },
-        });
-    }
-
-    for ((object_id, version), commit) in &tables.visible_commits {
-        let current_is_expected = tables
-            .objects
-            .get(object_id)
-            .is_some_and(|object| object.version == commit.expected_version);
-        if current_is_expected || visible_commit_should_recover(tables, commit) {
-            continue;
-        }
-        let retained_at = offset_datetime_nanos(commit.created_at);
-        if retain_young(retained_at, now, options.min_history_age_nanos, &mut report) {
-            continue;
-        }
-        report.eligible_visible_commit_count =
-            report.eligible_visible_commit_count.saturating_add(1);
-        candidates.push(RemovalCandidate {
-            retained_at_unix_nanos: retained_at,
-            removal: DfsMetadataHistoryRemoval::VisibleCommit {
-                file_system_id: commit.committed_object.file_system_id.clone(),
-                object_id: object_id.clone(),
-                version: version.clone(),
             },
         });
     }
@@ -1130,43 +997,25 @@ pub(crate) fn plan_metadata_history_gc(
         });
     }
 
-    for transaction in tables
-        .namespace_transactions
-        .values()
-        .filter(|transaction| namespace_transaction_recovery_is_complete(tables, transaction))
-    {
-        let retained_at = offset_datetime_nanos(transaction.created_at);
+    for prepared in tables.prepared_operations_v7.values().filter(|prepared| {
+        prepared.status != DfsPreparedOperationStatus::Prepared
+            && !prepared_operation_has_live_dependency(tables, prepared)
+    }) {
+        let retained_at = prepared
+            .committed_entry
+            .as_ref()
+            .map(|entry| offset_datetime_nanos(entry.created_at))
+            .unwrap_or_else(|| offset_datetime_nanos(prepared.transaction.created_at));
         if retain_young(retained_at, now, options.min_history_age_nanos, &mut report) {
             continue;
         }
-        report.eligible_namespace_transaction_count = report
-            .eligible_namespace_transaction_count
-            .saturating_add(1);
+        report.eligible_prepared_operation_count =
+            report.eligible_prepared_operation_count.saturating_add(1);
         candidates.push(RemovalCandidate {
             retained_at_unix_nanos: retained_at,
-            removal: DfsMetadataHistoryRemoval::NamespaceTransaction {
-                file_system_id: transaction.file_system_id.clone(),
-                transaction_id: transaction.transaction_id.clone(),
-            },
-        });
-    }
-
-    for prepare in tables
-        .namespace_prepares
-        .values()
-        .filter(|prepare| !namespace_prepare_is_recovery_root(tables, prepare))
-    {
-        let retained_at = offset_datetime_nanos(prepare.transaction.created_at);
-        if retain_young(retained_at, now, options.min_history_age_nanos, &mut report) {
-            continue;
-        }
-        report.eligible_namespace_prepare_count =
-            report.eligible_namespace_prepare_count.saturating_add(1);
-        candidates.push(RemovalCandidate {
-            retained_at_unix_nanos: retained_at,
-            removal: DfsMetadataHistoryRemoval::NamespacePrepare {
-                file_system_id: prepare.file_system_id.clone(),
-                operation_id: prepare.operation_id.clone(),
+            removal: DfsMetadataHistoryRemoval::PreparedOperation {
+                file_system_id: prepared.file_system_id.clone(),
+                operation_id: prepared.operation_id.clone(),
             },
         });
     }
@@ -1225,23 +1074,6 @@ pub(crate) fn plan_metadata_history_gc(
             removal: DfsMetadataHistoryRemoval::NamespaceTransactionReceipt {
                 file_system_id: receipt.file_system_id.clone(),
                 transaction_id: receipt.transaction_id.clone(),
-            },
-        });
-    }
-
-    for receipt in tables.namespace_prepare_receipts.values() {
-        let retained_at = offset_datetime_nanos(receipt.retained_at);
-        if retain_young(retained_at, now, options.min_history_age_nanos, &mut report) {
-            continue;
-        }
-        report.eligible_namespace_prepare_receipt_count = report
-            .eligible_namespace_prepare_receipt_count
-            .saturating_add(1);
-        candidates.push(RemovalCandidate {
-            retained_at_unix_nanos: retained_at,
-            removal: DfsMetadataHistoryRemoval::NamespacePrepareReceipt {
-                file_system_id: receipt.file_system_id.clone(),
-                operation_id: receipt.operation_id.clone(),
             },
         });
     }
@@ -1363,25 +1195,15 @@ pub(crate) fn plan_metadata_history_gc(
                 report.removed_intent_receipt_count =
                     report.removed_intent_receipt_count.saturating_add(1);
             }
-            DfsMetadataHistoryRemoval::Conflict { .. } => {
-                report.removed_conflict_count = report.removed_conflict_count.saturating_add(1);
-            }
-            DfsMetadataHistoryRemoval::VisibleCommit { .. } => {
-                report.removed_visible_commit_count =
-                    report.removed_visible_commit_count.saturating_add(1);
-            }
+
             DfsMetadataHistoryRemoval::NamespaceJob { .. } => {
                 report.compacted_namespace_job_count =
                     report.compacted_namespace_job_count.saturating_add(1);
             }
-            DfsMetadataHistoryRemoval::NamespaceTransaction { .. } => {
-                report.compacted_namespace_transaction_count = report
-                    .compacted_namespace_transaction_count
-                    .saturating_add(1);
-            }
-            DfsMetadataHistoryRemoval::NamespacePrepare { .. } => {
-                report.compacted_namespace_prepare_count =
-                    report.compacted_namespace_prepare_count.saturating_add(1);
+
+            DfsMetadataHistoryRemoval::PreparedOperation { .. } => {
+                report.removed_prepared_operation_count =
+                    report.removed_prepared_operation_count.saturating_add(1);
             }
             DfsMetadataHistoryRemoval::NamespaceRequest { .. } => {
                 report.compacted_namespace_request_count =
@@ -1396,11 +1218,7 @@ pub(crate) fn plan_metadata_history_gc(
                     .removed_namespace_transaction_receipt_count
                     .saturating_add(1);
             }
-            DfsMetadataHistoryRemoval::NamespacePrepareReceipt { .. } => {
-                report.removed_namespace_prepare_receipt_count = report
-                    .removed_namespace_prepare_receipt_count
-                    .saturating_add(1);
-            }
+
             DfsMetadataHistoryRemoval::NamespaceRequestReceipt { .. } => {
                 report.removed_namespace_request_receipt_count = report
                     .removed_namespace_request_receipt_count
@@ -1423,6 +1241,7 @@ pub(crate) fn plan_metadata_history_gc(
                 .values()
                 .filter_map(|object| object.content_hash.clone()),
         )
+        .chain(prepared_content_hashes)
         .collect();
     report.protected_version_count = protected_versions.len() as u64;
     Ok(DfsMetadataHistoryGcPlan {
@@ -1542,50 +1361,10 @@ pub(crate) fn metadata_content_protection_from_tables(
             intent.target_version.clone(),
         ));
     }
-    for conflict in tables.conflicts.values() {
-        for version in conflict
-            .base_version
-            .iter()
-            .chain([&conflict.local_version, &conflict.remote_version])
-        {
-            versions.insert(DfsMetadataVersionIdentity::new(
-                conflict.object_id.clone(),
-                version.clone(),
-            ));
-        }
-        content_hashes.extend(
-            conflict
-                .local_content_hash
-                .iter()
-                .chain(conflict.remote_content_hash.iter())
-                .cloned(),
-        );
-    }
-    for commit in tables.visible_commits.values() {
-        versions.insert(DfsMetadataVersionIdentity::new(
-            commit.visible_version.object_id.clone(),
-            commit.visible_version.version.clone(),
-        ));
-        if let Some(content_hash) = commit.visible_version.content_hash.as_ref() {
-            content_hashes.insert(content_hash.clone());
-        }
-    }
-    for transaction in tables.namespace_transactions.values() {
-        protect_namespace_transaction_versions(&mut versions, transaction);
-        content_hashes.extend(
-            transaction
-                .objects
-                .iter()
-                .filter_map(|object| object.content_hash.clone())
-                .chain(
-                    transaction
-                        .versions
-                        .iter()
-                        .filter_map(|version| version.content_hash.clone()),
-                ),
-        );
-    }
-    for prepare in tables.namespace_prepares.values() {
+    for prepare in tables.prepared_operations_v7.values().filter(|prepared| {
+        prepared.status == DfsPreparedOperationStatus::Prepared
+            || prepared_operation_has_live_dependency(tables, prepared)
+    }) {
         for expected in &prepare.expected_object_versions {
             if let Some(version) = expected.expected_version.as_ref() {
                 versions.insert(DfsMetadataVersionIdentity::new(
@@ -1594,7 +1373,7 @@ pub(crate) fn metadata_content_protection_from_tables(
                 ));
             }
         }
-        protect_namespace_transaction_versions(&mut versions, &prepare.transaction);
+        protect_prepared_operation(&mut versions, &mut content_hashes, prepare);
         content_hashes.extend(
             prepare
                 .transaction
@@ -1625,21 +1404,7 @@ pub(crate) fn metadata_content_protection_from_tables(
     }
     for job in tables.namespace_jobs.values() {
         protect_namespace_job_versions(&mut versions, job);
-        for frame in &job.pending_frames {
-            let content_hash = match frame {
-                crate::DfsNamespaceJobFrame::CrossShardAdopt { moved_object, .. }
-                | crate::DfsNamespaceJobFrame::CrossShardComplete { moved_object, .. } => {
-                    moved_object.content_hash.as_ref()
-                }
-                crate::DfsNamespaceJobFrame::CrossShardHardlinkAdopt { alias, .. } => {
-                    alias.content_hash.as_ref()
-                }
-                _ => None,
-            };
-            if let Some(content_hash) = content_hash {
-                content_hashes.insert(content_hash.clone());
-            }
-        }
+        protect_namespace_job_content_hashes(&mut content_hashes, job);
     }
     DfsMetadataContentProtection {
         versions: versions.into_iter().collect(),
@@ -1651,28 +1416,14 @@ fn namespace_job_has_pending_request_witness(
     tables: &DfsMetadataTables,
     job: &crate::DfsNamespaceJobRecord,
 ) -> bool {
-    if let Some(origin) = job.origin.as_ref() {
-        return tables
+    job.origin.as_ref().is_some_and(|origin| {
+        tables
             .namespace_requests
             .get(&(origin.requester_node_id.clone(), origin.request_id.clone()))
             .is_some_and(|request| {
                 request.status == DfsNamespaceRequestStatus::Pending
                     && origin.matches_request(request)
-            });
-    }
-    // Legacy jobs do not carry an exact request link. Retain them whenever any
-    // pending request could plausibly use the path/time witness.
-    tables.namespace_requests.values().any(|request| {
-        request.status == DfsNamespaceRequestStatus::Pending
-            && request.file_system_id == job.file_system_id
-            && request.created_at <= job.created_at
-            && legacy_namespace_job_matches_operation(
-                &job.kind,
-                &job.job_id,
-                &job.root_path,
-                job.target_path.as_deref(),
-                &request.operation,
-            )
+            })
     })
 }
 
@@ -1680,96 +1431,41 @@ fn namespace_job_receipt_has_pending_request_witness(
     tables: &DfsMetadataTables,
     receipt: &crate::DfsNamespaceJobReceipt,
 ) -> bool {
-    if let Some(origin) = receipt.origin.as_ref() {
-        return tables
+    receipt.origin.as_ref().is_some_and(|origin| {
+        tables
             .namespace_requests
             .get(&(origin.requester_node_id.clone(), origin.request_id.clone()))
             .is_some_and(|request| {
                 request.status == DfsNamespaceRequestStatus::Pending
                     && origin.matches_request(request)
-            });
-    }
-    tables.namespace_requests.values().any(|request| {
-        request.status == DfsNamespaceRequestStatus::Pending
-            && request.file_system_id == receipt.file_system_id
-            && request.created_at <= receipt.created_at
-            && legacy_namespace_job_matches_operation(
-                &receipt.kind,
-                &receipt.job_id,
-                &receipt.root_path,
-                receipt.target_path.as_deref(),
-                &request.operation,
-            )
+            })
     })
-}
-
-fn legacy_namespace_job_matches_operation(
-    kind: &crate::DfsNamespaceJobKind,
-    job_id: &str,
-    root_path: &str,
-    target_path: Option<&str>,
-    operation: &DfsNamespaceOperation,
-) -> bool {
-    match operation {
-        DfsNamespaceOperation::ResumeNamespaceJobBounded {
-            job_id: request_job_id,
-            ..
-        } => request_job_id == job_id,
-        DfsNamespaceOperation::ClearDirRecursive { path } => {
-            kind == &crate::DfsNamespaceJobKind::ClearDirectoryRecursive && path == root_path
-        }
-        DfsNamespaceOperation::Hardlink {
-            existing_path,
-            link_path,
-        } => {
-            kind == &crate::DfsNamespaceJobKind::HardlinkAcrossShardPrimaries
-                && existing_path == root_path
-                && target_path == Some(link_path.as_str())
-        }
-        DfsNamespaceOperation::Unlink { path }
-        | DfsNamespaceOperation::ConditionalUnlink { path, .. } => {
-            kind == &crate::DfsNamespaceJobKind::HardlinkAliasMutationAcrossShardPrimaries
-                && path == root_path
-                && target_path == Some(path.as_str())
-        }
-        DfsNamespaceOperation::Rename { from, to }
-        | DfsNamespaceOperation::ConditionalRename { from, to, .. }
-        | DfsNamespaceOperation::RenameDirectoryBounded { from, to, .. } => {
-            matches!(
-                kind,
-                crate::DfsNamespaceJobKind::RenameDirectory
-                    | crate::DfsNamespaceJobKind::RenameObjectAcrossShardPrimaries
-                    | crate::DfsNamespaceJobKind::HardlinkAliasMutationAcrossShardPrimaries
-                    | crate::DfsNamespaceJobKind::RenameDirectoryAcrossShardPrimaries
-            ) && from == root_path
-                && target_path == Some(to.as_str())
-        }
-        _ => false,
-    }
 }
 
 fn namespace_request_receipt_has_prepare_dependency(
     tables: &DfsMetadataTables,
     receipt: &crate::DfsNamespaceRequestReceipt,
 ) -> bool {
-    tables.namespace_prepares.values().any(|prepare| {
-        prepare.status != DfsNamespacePrepareStatus::Aborted
-            && (prepare
-                .completed_request
+    tables.prepared_operations_v7.values().any(|prepare| {
+        !matches!(
+            prepare.status,
+            DfsPreparedOperationStatus::Aborted | DfsPreparedOperationStatus::Superseded
+        ) && (prepare
+            .completed_request
+            .as_ref()
+            .is_some_and(|completion| {
+                completion.requester_node_id == receipt.requester_node_id
+                    && completion.request_id == receipt.request_id
+                    && receipt.matches_completed_request(completion)
+            })
+            || prepare
+                .completed_request_completion
                 .as_ref()
                 .is_some_and(|completion| {
                     completion.requester_node_id == receipt.requester_node_id
                         && completion.request_id == receipt.request_id
-                        && receipt.matches_completed_request(completion)
-                })
-                || prepare
-                    .completed_request_completion
-                    .as_ref()
-                    .is_some_and(|completion| {
-                        completion.requester_node_id == receipt.requester_node_id
-                            && completion.request_id == receipt.request_id
-                            && receipt.matches_completion(completion)
-                    }))
+                        && receipt.matches_completion(completion)
+                }))
     })
 }
 
@@ -1805,15 +1501,12 @@ fn intent_is_recovery_root(
     if write_intent_status_is_active(&intent.status) {
         return true;
     }
-    if tables
-        .conflicts
-        .values()
-        .any(|conflict| conflict.created_by_intent_id.as_deref() == Some(intent.intent_id.as_str()))
-        || tables
-            .namespace_prepares
-            .values()
-            .any(|prepare| prepare.operation_id == format!("namespace:create:{}", intent.intent_id))
-    {
+    if tables.prepared_operations_v7.values().any(|prepared| {
+        prepared.status == DfsPreparedOperationStatus::Prepared
+            && prepared.prepared_intent.as_ref().is_some_and(|owner| {
+                owner.object_id == intent.object_id && owner.intent_id == intent.intent_id
+            })
+    }) {
         return true;
     }
     if intent.status != DfsWriteIntentStatus::Committed {
@@ -1892,61 +1585,335 @@ fn intent_is_recovery_root(
         .any(|node_id| !receipt_nodes.contains(node_id))
 }
 
-fn namespace_prepare_is_recovery_root(
+/// Revalidates GC against the actual writer-held current table cut. The GC
+/// operation's own removal footprint is excluded; all other live roots remain.
+pub(crate) fn version_is_protected_from_history_gc(
     tables: &DfsMetadataTables,
-    prepare: &crate::DfsNamespacePrepareRecord,
+    object_id: &DfsObjectId,
+    version: &DfsVersion,
+    excluding_operation_id: &str,
 ) -> bool {
-    match prepare.status {
-        DfsNamespacePrepareStatus::Prepared => true,
-        DfsNamespacePrepareStatus::Aborted => false,
-        DfsNamespacePrepareStatus::Committed => {
-            !namespace_transaction_recovery_is_complete(tables, &prepare.transaction)
-                || prepare.content_receipts.iter().any(|receipt| {
-                    !tables
-                        .receipts
-                        .get(&(
-                            receipt.receipt.object_id.clone(),
-                            receipt.receipt.committed_version.clone(),
-                            receipt.replica_node_id.clone(),
-                        ))
-                        .is_some_and(|existing| replay_receipt_matches_existing(existing, receipt))
-                })
-                || prepare
+    let identity = DfsMetadataVersionIdentity::new(object_id.clone(), version.clone());
+    let now = metadata_history_now_unix_nanos();
+    let mut protected = crate::file_history::policy_retained_versions(tables, now)
+        .into_iter()
+        .map(|(object_id, version)| DfsMetadataVersionIdentity::new(object_id, version))
+        .collect::<BTreeSet<_>>();
+    protected.extend(
+        tables
+            .version_pins
+            .values()
+            .map(|pin| DfsMetadataVersionIdentity::new(pin.object_id.clone(), pin.version.clone())),
+    );
+    for transfer in tables.cross_shard_pin_transfers.values() {
+        protected.insert(DfsMetadataVersionIdentity::new(
+            transfer.object_id.clone(),
+            transfer.target_version.clone(),
+        ));
+        protected.extend(
+            transfer
+                .source_pins
+                .iter()
+                .chain(&transfer.copied_pins)
+                .map(|pin| {
+                    DfsMetadataVersionIdentity::new(pin.object_id.clone(), pin.version.clone())
+                }),
+        );
+    }
+    let retained_repair_roots = protected
+        .iter()
+        .filter(|identity| {
+            tables
+                .versions
+                .get(&(identity.object_id.clone(), identity.version.clone()))
+                .is_some_and(|version| version.has_retention_grant())
+        })
+        .cloned()
+        .collect();
+    for object in tables.objects.values() {
+        if object.kind == crate::DfsObjectKind::Tombstone {
+            let retained_family = tables.versions.values().any(|version| {
+                version.object_id == object.object_id
+                    && version.version != object.version
+                    && version.has_retention_grant()
+            });
+            if !retained_family || object.tombstone_provenance.is_some() {
+                continue;
+            }
+        }
+        protected.insert(DfsMetadataVersionIdentity::new(
+            object.object_id.clone(),
+            object.version.clone(),
+        ));
+    }
+    let restore_roots = restore_job_intent_roots(tables);
+    for intent in tables.intents.values() {
+        let recovery =
+            intent_is_recovery_root(tables, intent, &retained_repair_roots, &restore_roots);
+        if recovery && let Some(base) = &intent.base_version {
+            protected.insert(DfsMetadataVersionIdentity::new(
+                intent.object_id.clone(),
+                base.clone(),
+            ));
+        }
+        if recovery
+            || (!write_intent_status_is_active(&intent.status)
+                && !intent.publication.is_retained_repair())
+        {
+            protected.insert(DfsMetadataVersionIdentity::new(
+                intent.object_id.clone(),
+                intent.target_version.clone(),
+            ));
+        }
+    }
+    for receipt in tables.intent_receipts.values() {
+        protected.insert(DfsMetadataVersionIdentity::new(
+            receipt.object_id.clone(),
+            receipt.target_version.clone(),
+        ));
+    }
+    for prepared in tables.prepared_operations_v7.values().filter(|prepared| {
+        prepared.operation_id != excluding_operation_id
+            && (prepared.status == DfsPreparedOperationStatus::Prepared
+                || prepared_operation_has_live_dependency(tables, prepared))
+    }) {
+        for expected in &prepared.expected_object_versions {
+            if let Some(version) = &expected.expected_version {
+                protected.insert(DfsMetadataVersionIdentity::new(
+                    expected.object_id.clone(),
+                    version.clone(),
+                ));
+            }
+        }
+        protect_prepared_operation(&mut protected, &mut BTreeSet::new(), prepared);
+        for receipt in &prepared.content_receipts {
+            protected.insert(DfsMetadataVersionIdentity::new(
+                receipt.receipt.object_id.clone(),
+                receipt.receipt.committed_version.clone(),
+            ));
+        }
+    }
+    for request in tables.namespace_requests.values().filter(|request| {
+        request.status == DfsNamespaceRequestStatus::Pending
+            && request.operation_id != excluding_operation_id
+    }) {
+        protect_namespace_operation_versions(&mut protected, &request.operation);
+    }
+    for job in tables.namespace_jobs.values() {
+        protect_namespace_job_versions(&mut protected, job);
+    }
+    protected.contains(&identity)
+}
+
+fn protect_namespace_job_content_hashes(
+    hashes: &mut BTreeSet<String>,
+    job: &crate::DfsNamespaceJobRecord,
+) {
+    for frame in &job.pending_frames {
+        let hash = match frame {
+            crate::DfsNamespaceJobFrame::CrossShardAdopt { moved_object, .. }
+            | crate::DfsNamespaceJobFrame::CrossShardComplete { moved_object, .. } => {
+                moved_object.content_hash.as_ref()
+            }
+            crate::DfsNamespaceJobFrame::CrossShardHardlinkAdopt { alias, .. } => {
+                alias.content_hash.as_ref()
+            }
+            _ => None,
+        };
+        hashes.extend(hash.cloned());
+    }
+}
+
+fn protect_prepared_operation(
+    versions: &mut BTreeSet<DfsMetadataVersionIdentity>,
+    hashes: &mut BTreeSet<String>,
+    prepared: &DfsPreparedOperationRecord,
+) {
+    protect_namespace_transaction_versions(versions, &prepared.transaction);
+    hashes.extend(
+        prepared
+            .transaction
+            .objects
+            .iter()
+            .filter_map(|object| object.content_hash.clone())
+            .chain(
+                prepared
+                    .transaction
+                    .versions
+                    .iter()
+                    .filter_map(|version| version.content_hash.clone()),
+            ),
+    );
+    for intent in prepared
+        .prepared_intent
+        .iter()
+        .chain(prepared.terminal_intent.iter())
+    {
+        if let Some(base) = intent.base_version.as_ref() {
+            versions.insert(DfsMetadataVersionIdentity::new(
+                intent.object_id.clone(),
+                base.clone(),
+            ));
+        }
+        versions.insert(DfsMetadataVersionIdentity::new(
+            intent.object_id.clone(),
+            intent.target_version.clone(),
+        ));
+        hashes.extend(intent.content_hash.iter().cloned());
+    }
+    for effect in &prepared.metadata_effects {
+        use crate::DfsPreparedMetadataEffect as Effect;
+        match effect {
+            Effect::PutObject { object } => {
+                versions.insert(DfsMetadataVersionIdentity::new(
+                    object.object_id.clone(),
+                    object.version.clone(),
+                ));
+                hashes.extend(object.content_hash.iter().cloned());
+            }
+            Effect::PutVersion { version } => {
+                versions.insert(DfsMetadataVersionIdentity::new(
+                    version.object_id.clone(),
+                    version.version.clone(),
+                ));
+                hashes.extend(version.content_hash.iter().cloned());
+            }
+            Effect::RemoveVersion { object_id, version }
+            | Effect::RemoveVersionPin {
+                object_id, version, ..
+            }
+            | Effect::RemoveReceipt {
+                object_id, version, ..
+            } => {
+                versions.insert(DfsMetadataVersionIdentity::new(
+                    object_id.clone(),
+                    version.clone(),
+                ));
+            }
+            Effect::PutVersionPin { pin } => {
+                versions.insert(DfsMetadataVersionIdentity::new(
+                    pin.object_id.clone(),
+                    pin.version.clone(),
+                ));
+            }
+            Effect::PutReceipt { receipt } => {
+                versions.insert(DfsMetadataVersionIdentity::new(
+                    receipt.receipt.object_id.clone(),
+                    receipt.receipt.committed_version.clone(),
+                ));
+                hashes.extend(receipt.content_hash.iter().cloned());
+            }
+            Effect::PutIntent { intent } => {
+                versions.insert(DfsMetadataVersionIdentity::new(
+                    intent.object_id.clone(),
+                    intent.target_version.clone(),
+                ));
+                if let Some(base) = &intent.base_version {
+                    versions.insert(DfsMetadataVersionIdentity::new(
+                        intent.object_id.clone(),
+                        base.clone(),
+                    ));
+                }
+                hashes.extend(intent.content_hash.iter().cloned());
+            }
+            Effect::PutIntentReceipt { receipt } => {
+                versions.insert(DfsMetadataVersionIdentity::new(
+                    receipt.object_id.clone(),
+                    receipt.target_version.clone(),
+                ));
+                hashes.extend(receipt.content_hash.iter().cloned());
+            }
+            Effect::ReconcileCrossShardPinTransfer {
+                versions: captured,
+                transfer,
+            } => {
+                for version in captured {
+                    versions.insert(DfsMetadataVersionIdentity::new(
+                        version.object_id.clone(),
+                        version.version.clone(),
+                    ));
+                    hashes.extend(version.content_hash.iter().cloned());
+                }
+                versions.insert(DfsMetadataVersionIdentity::new(
+                    transfer.object_id.clone(),
+                    transfer.target_version.clone(),
+                ));
+                for pin in transfer.source_pins.iter().chain(&transfer.copied_pins) {
+                    versions.insert(DfsMetadataVersionIdentity::new(
+                        pin.object_id.clone(),
+                        pin.version.clone(),
+                    ));
+                }
+            }
+            Effect::FinalizeCrossShardSourceEviction {
+                tombstone,
+                removed_pins,
+                removed_pin_transfers,
+            } => {
+                versions.insert(DfsMetadataVersionIdentity::new(
+                    tombstone.object_id.clone(),
+                    tombstone.version.clone(),
+                ));
+                for pin in removed_pins {
+                    versions.insert(DfsMetadataVersionIdentity::new(
+                        pin.object_id.clone(),
+                        pin.version.clone(),
+                    ));
+                }
+                for transfer in removed_pin_transfers {
+                    versions.insert(DfsMetadataVersionIdentity::new(
+                        transfer.object_id.clone(),
+                        transfer.target_version.clone(),
+                    ));
+                    for pin in transfer.source_pins.iter().chain(&transfer.copied_pins) {
+                        versions.insert(DfsMetadataVersionIdentity::new(
+                            pin.object_id.clone(),
+                            pin.version.clone(),
+                        ));
+                    }
+                }
+            }
+            Effect::PutNamespaceJob { job } => {
+                protect_namespace_job_versions(versions, job);
+                protect_namespace_job_content_hashes(hashes, job);
+            }
+            Effect::PutNamespaceRequest { request } => {
+                protect_namespace_operation_versions(versions, &request.operation);
+                protect_namespace_operation_content_hashes(hashes, &request.operation);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn prepared_operation_has_live_dependency(
+    tables: &DfsMetadataTables,
+    prepared: &DfsPreparedOperationRecord,
+) -> bool {
+    let matches_request = |request: &crate::DfsNamespaceRequestRecord| {
+        request.file_system_id == prepared.file_system_id
+            && request.status == DfsNamespaceRequestStatus::Pending
+            && (request.operation_id == prepared.operation_id
+                || prepared
                     .completed_request
                     .as_ref()
                     .is_some_and(|completion| {
-                        let key = (
-                            completion.requester_node_id.clone(),
-                            completion.request_id.clone(),
-                        );
-                        !tables.namespace_requests.get(&key).is_some_and(|request| {
-                            request.status == DfsNamespaceRequestStatus::Completed
-                                && request.operation_id == completion.operation_id
-                                && request.command_digest == completion.command_digest
-                                && request.result == completion.result
-                                && request.posix_coordination_result
-                                    == completion.posix_coordination_result
-                        }) && !tables
-                            .namespace_request_receipts
-                            .get(&key)
-                            .is_some_and(|receipt| receipt.matches_completed_request(completion))
+                        completion.requester_node_id == request.requester_node_id
+                            && completion.request_id == request.request_id
                     })
-                || prepare
+                || prepared
                     .completed_request_completion
                     .as_ref()
                     .is_some_and(|completion| {
-                        let key = completion.request_key();
-                        !tables
-                            .namespace_requests
-                            .get(&key)
-                            .is_some_and(|request| completion.matches_completed_request(request))
-                            && !tables
-                                .namespace_request_receipts
-                                .get(&key)
-                                .is_some_and(|receipt| receipt.matches_completion(completion))
-                    })
-        }
-    }
+                        completion.requester_node_id == request.requester_node_id
+                            && completion.request_id == request.request_id
+                    }))
+    };
+    tables.namespace_requests.values().any(matches_request)
+        || tables.namespace_jobs.values().any(|job| job.file_system_id == prepared.file_system_id
+            && job.status == crate::DfsNamespaceJobStatus::Running
+            && prepared.metadata_effects.iter().any(|effect| matches!(effect,
+                crate::DfsPreparedMetadataEffect::PutNamespaceJob { job: captured } if captured.job_id == job.job_id)))
 }
 
 fn protect_namespace_operation_versions(
@@ -2033,7 +2000,6 @@ fn protect_namespace_operation_versions(
             receipts,
             intents,
             intent_receipts,
-            conflicts,
             ..
         } => {
             protected.insert(DfsMetadataVersionIdentity::new(
@@ -2069,18 +2035,6 @@ fn protect_namespace_operation_versions(
                     receipt.object_id.clone(),
                     receipt.target_version.clone(),
                 ));
-            }
-            for conflict in conflicts {
-                for version in conflict
-                    .base_version
-                    .iter()
-                    .chain([&conflict.local_version, &conflict.remote_version])
-                {
-                    protected.insert(DfsMetadataVersionIdentity::new(
-                        conflict.object_id.clone(),
-                        version.clone(),
-                    ));
-                }
             }
         }
         DfsNamespaceOperation::AdoptHardlinkAlias { alias, .. } => {
@@ -2129,7 +2083,6 @@ fn protect_namespace_operation_content_hashes(
             receipts,
             intents,
             intent_receipts,
-            conflicts,
             ..
         } => {
             protected.extend(
@@ -2156,14 +2109,7 @@ fn protect_namespace_operation_content_hashes(
                         intent_receipts
                             .iter()
                             .filter_map(|receipt| receipt.content_hash.clone()),
-                    )
-                    .chain(conflicts.iter().flat_map(|conflict| {
-                        conflict
-                            .local_content_hash
-                            .iter()
-                            .chain(conflict.remote_content_hash.iter())
-                            .cloned()
-                    })),
+                    ),
             );
         }
         DfsNamespaceOperation::AdoptHardlinkAlias { alias, .. } => {
@@ -2305,16 +2251,9 @@ fn intent_receipt_retention_record_count(
         .values()
         .map(|floors| usize_to_u64_saturating(floors.len()))
         .fold(0_u64, u64::saturating_add);
-    let exact_opaque_id_count = retention
-        .evicted_opaque_intent_ids_by_object
-        .values()
-        .map(|intent_ids| usize_to_u64_saturating(intent_ids.len()))
-        .fold(0_u64, u64::saturating_add);
-    generated_floor_count
-        .saturating_add(exact_opaque_id_count)
-        .saturating_add(usize_to_u64_saturating(
-            retention.opaque_intent_history_evicted_object_ids.len(),
-        ))
+    generated_floor_count.saturating_add(usize_to_u64_saturating(
+        retention.opaque_intent_history_evicted_object_ids.len(),
+    ))
 }
 
 fn namespace_receipt_retention_record_count(
@@ -2357,14 +2296,14 @@ mod tests {
         options: &super::DfsMetadataHistoryGcOptions,
         snapshot_size_bytes: Option<u64>,
     ) -> super::DfsMetadataHistoryGcPlan {
-        super::plan_metadata_history_gc(shard_id, tables, options, snapshot_size_bytes, true)
+        super::plan_metadata_history_gc(shard_id, tables, options, snapshot_size_bytes)
             .expect("valid GC plan")
     }
 
     use super::*;
     use crate::{
-        DfsConflictRecord, DfsCrossShardPinTransferRecord, DfsMetadataVersionPinRecord,
-        DfsNamespaceJobKind, DfsNamespaceJobOrigin, DfsNamespaceJobRecord, DfsNamespaceJobStatus,
+        DfsCrossShardPinTransferRecord, DfsMetadataVersionPinRecord, DfsNamespaceJobKind,
+        DfsNamespaceJobOrigin, DfsNamespaceJobRecord, DfsNamespaceJobStatus,
         DfsNamespaceRequestRecord, DfsNamespaceResult, DfsObjectKind, DfsObjectMetadata,
         DfsReplicationPolicy, DfsWriteIntentRecord,
     };
@@ -2401,7 +2340,6 @@ mod tests {
         created_at_seconds: i64,
     ) -> DfsObjectVersionRecord {
         DfsObjectVersionRecord {
-            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
             content_durability: None,
             retention: Default::default(),
             module_metadata: Default::default(),
@@ -2487,6 +2425,41 @@ mod tests {
         })
     }
 
+    fn prepared_record(
+        operation_id: &str,
+        effects: Vec<crate::DfsPreparedMetadataEffect>,
+        status: DfsPreparedOperationStatus,
+    ) -> DfsPreparedOperationRecord {
+        let payload = crate::DfsPreparedOperationPayload::for_metadata_effects(
+            crate::DfsPreparedOperationScope {
+                file_system_id: file_system_id(),
+                shard_id: DfsMetadataShardId::new("shard_roots"),
+                owner_epoch: 1,
+                operation_id: operation_id.into(),
+            },
+            Vec::new(),
+            Vec::new(),
+            effects,
+            timestamp(1),
+        )
+        .unwrap();
+        let digest = crate::DfsPreparedOperationDigest::at_sequence(&payload, 1).unwrap();
+        let committed_entry = (status == DfsPreparedOperationStatus::Committed).then(|| {
+            Box::new(crate::DfsPreparedOperationCommitReference {
+                shard_id: digest.shard_id.clone(),
+                sequence: 2,
+                created_at: timestamp(2),
+                digest: digest.clone(),
+            })
+        });
+        DfsPreparedOperationRecord {
+            digest,
+            payload: std::sync::Arc::new(payload),
+            status,
+            committed_entry,
+        }
+    }
+
     fn namespace_request(
         requester_node_id: NodeId,
         request_id: &str,
@@ -2562,15 +2535,6 @@ mod tests {
                 object_id("obj_stats_opaque_first"),
                 object_id("obj_stats_opaque_second"),
             ]);
-        tables
-            .intent_receipt_retention
-            .evicted_opaque_intent_ids_by_object
-            .entry(first_object.clone())
-            .or_default()
-            .extend([
-                "dfs_write_op_stats_first".to_string(),
-                "dfs_write_op_stats_second".to_string(),
-            ]);
 
         use crate::metadata_records::DfsNamespaceReceiptOrderKey;
         tables.namespace_receipt_retention.transaction_floor = Some(DfsNamespaceReceiptOrderKey {
@@ -2604,11 +2568,14 @@ mod tests {
             .insert(node("node_stats_requester_opaque"));
 
         let pin = DfsMetadataVersionPinRecord {
-            namespace: None,
+            namespace: "module.dfs.history".into(),
             file_system_id: file_system_id(),
             object_id: first_object.clone(),
             version: version("version_stats_pinned"),
-            pin_id: "checkpoint:stats".to_string(),
+            pin_id: crate::content_reference_storage_id(
+                "module.dfs.history",
+                &("checkpoint:stats".to_string()),
+            ),
             created_at: timestamp(4),
         };
         tables.version_pins.insert(
@@ -2634,8 +2601,8 @@ mod tests {
         };
         let intent_retention = table("intent-receipt-retention");
         assert_eq!(
-            intent_retention.record_count, 7,
-            "each nested object/coordinator floor, exact opaque id, and legacy opaque object is one retained entry"
+            intent_retention.record_count, 5,
+            "each nested object/coordinator floor and opaque object marker is one retained entry"
         );
         assert_eq!(
             intent_retention.estimated_serialized_bytes,
@@ -2661,7 +2628,7 @@ mod tests {
             Some(offset_datetime_nanos(timestamp(4)))
         );
         assert!(stats.collection_authorized);
-        assert_eq!(stats.total_record_count, 14);
+        assert_eq!(stats.total_record_count, 12);
     }
 
     #[test]
@@ -2675,6 +2642,86 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(report.oldest_eligible_record_unix_nanos, Some(10));
+    }
+
+    #[test]
+    fn metadata_history_gc_preserves_pending_body_and_collects_terminal_v7_rows() {
+        let mut tables = DfsMetadataTables::default();
+        for (id, status) in [
+            ("pending", DfsPreparedOperationStatus::Prepared),
+            ("committed", DfsPreparedOperationStatus::Committed),
+            ("aborted", DfsPreparedOperationStatus::Aborted),
+            ("superseded", DfsPreparedOperationStatus::Superseded),
+        ] {
+            let record = prepared_record(id, Vec::new(), status);
+            record.validate().unwrap();
+            tables.prepared_operations_v7.insert(id.into(), record);
+        }
+        let plan = plan_metadata_history_gc(
+            DfsMetadataShardId::new("shard_roots"),
+            &tables,
+            &options(),
+            None,
+        );
+        assert_eq!(plan.report.eligible_prepared_operation_count, 3);
+        assert_eq!(plan.report.removed_prepared_operation_count, 3);
+        assert!(plan.removals.iter().all(|removal| !matches!(removal, DfsMetadataHistoryRemoval::PreparedOperation { operation_id, .. } if operation_id == "pending")));
+        let limited = plan_metadata_history_gc(
+            DfsMetadataShardId::new("shard_roots"),
+            &tables,
+            &options().with_max_removals(1),
+            None,
+        );
+        assert_eq!(limited.removals.len(), 1);
+        assert!(limited.report.max_removals_reached);
+        let dry = plan_metadata_history_gc(
+            DfsMetadataShardId::new("shard_roots"),
+            &tables,
+            &DfsMetadataHistoryGcOptions::dry_run(Duration::ZERO, 0).with_now_unix_nanos(u64::MAX),
+            None,
+        );
+        assert!(dry.removals.is_empty());
+        assert_eq!(dry.report.eligible_prepared_operation_count, 3);
+    }
+
+    #[test]
+    fn metadata_history_gc_retains_terminal_body_until_exact_pending_request_settles() {
+        let mut tables = DfsMetadataTables::default();
+        let mut request = namespace_request(
+            node("current_request_owner"),
+            "current_request",
+            DfsNamespaceRequestStatus::Pending,
+        );
+        request.operation_id = "linked-operation".into();
+        let key = (
+            request.requester_node_id.clone(),
+            request.request_id.clone(),
+        );
+        tables.namespace_requests.insert(key.clone(), request);
+        let record = prepared_record(
+            "linked-operation",
+            Vec::new(),
+            DfsPreparedOperationStatus::Committed,
+        );
+        tables
+            .prepared_operations_v7
+            .insert(record.operation_id.clone(), record);
+        let before = plan_metadata_history_gc(
+            DfsMetadataShardId::new("shard_roots"),
+            &tables,
+            &options(),
+            None,
+        );
+        assert_eq!(before.report.eligible_prepared_operation_count, 0);
+        tables.namespace_requests.get_mut(&key).unwrap().status =
+            DfsNamespaceRequestStatus::Completed;
+        let after = plan_metadata_history_gc(
+            DfsMetadataShardId::new("shard_roots"),
+            &tables,
+            &options(),
+            None,
+        );
+        assert_eq!(after.report.eligible_prepared_operation_count, 1);
     }
 
     #[test]
@@ -2732,11 +2779,14 @@ mod tests {
             current_object(&object_id, &current_version),
         );
         let copied_pin = DfsMetadataVersionPinRecord {
-            namespace: None,
+            namespace: "module.dfs.history".into(),
             file_system_id: file_system_id(),
             object_id: object_id.clone(),
             version: copied_pin_version.clone(),
-            pin_id: "checkpoint:active-transfer".to_string(),
+            pin_id: crate::content_reference_storage_id(
+                "module.dfs.history",
+                &("checkpoint:active-transfer".to_string()),
+            ),
             created_at: timestamp(2),
         };
         let acknowledged_pin_version = version("acknowledged-pin");
@@ -2745,11 +2795,14 @@ mod tests {
             version_record(&object_id, &acknowledged_pin_version, 2),
         );
         let acknowledged_pin = DfsMetadataVersionPinRecord {
-            namespace: None,
+            namespace: "module.dfs.history".into(),
             file_system_id: file_system_id(),
             object_id: object_id.clone(),
             version: acknowledged_pin_version.clone(),
-            pin_id: "checkpoint:acknowledged-transfer".to_string(),
+            pin_id: crate::content_reference_storage_id(
+                "module.dfs.history",
+                &("checkpoint:acknowledged-transfer".to_string()),
+            ),
             created_at: timestamp(3),
         };
         tables.version_pins.insert(
@@ -2816,7 +2869,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_history_gc_retains_open_conflict_and_active_intent_version_roots() {
+    fn metadata_history_gc_retains_pending_body_and_active_intent_version_roots() {
         let mut tables = DfsMetadataTables::default();
 
         let conflict_object_id = object_id("obj_history_conflict");
@@ -2832,27 +2885,19 @@ mod tests {
         ] {
             insert_version(&mut tables, &conflict_object_id, version, created_at);
         }
-        let conflict = DfsConflictRecord {
-            conflict_id: "conflict_history_open".to_string(),
-            file_system_id: file_system_id(),
-            object_id: conflict_object_id.clone(),
-            path: "/conflict".to_string(),
-            base_version: Some(conflict_base.clone()),
-            local_version: conflict_local.clone(),
-            remote_version: conflict_remote.clone(),
-            detected_by_node_id: node("node_detector"),
-            reason: "test conflict root".to_string(),
-            local_content_hash: None,
-            remote_content_hash: None,
-            created_by_intent_id: None,
-            strategy: None,
-            status: DfsConflictStatus::Open,
-            detected_at: timestamp(1),
-        };
-        tables.conflicts.insert(
-            (conflict_object_id.clone(), conflict.conflict_id.clone()),
-            conflict,
+        let prepared = prepared_record(
+            "operation-protected-versions",
+            [&conflict_base, &conflict_local, &conflict_remote]
+                .into_iter()
+                .map(|version| crate::DfsPreparedMetadataEffect::PutVersion {
+                    version: version_record(&conflict_object_id, version, 1),
+                })
+                .collect(),
+            DfsPreparedOperationStatus::Prepared,
         );
+        tables
+            .prepared_operations_v7
+            .insert(prepared.operation_id.clone(), prepared);
 
         let intent_object_id = object_id("obj_history_intent");
         let intent_base = version("version_intent_base");
@@ -2906,7 +2951,8 @@ mod tests {
         }
         assert!(!plan.removals.iter().any(|removal| matches!(
             removal,
-            DfsMetadataHistoryRemoval::Intent { .. } | DfsMetadataHistoryRemoval::Conflict { .. }
+            DfsMetadataHistoryRemoval::Intent { .. }
+                | DfsMetadataHistoryRemoval::PreparedOperation { .. }
         )));
     }
 
@@ -2918,6 +2964,13 @@ mod tests {
         let mut historical = current_object(&object_id, &old_version);
         historical.content_hash = Some("blake3:retained".into());
         let mut version = crate::metadata_records::object_version_record(&historical, Some(1));
+        version.content_durability = Some(Box::new(crate::DfsContentDurability {
+            source_version: old_version.clone(),
+            coordinator_node_id: node("node_owner"),
+            owner_epoch: 0,
+            desired_replica_node_ids: vec![node("node_owner"), node("node_offline")],
+            policy: DfsReplicationPolicy::new(1, 2).unwrap(),
+        }));
         version.retention.insert(
             "vendor.retained".into(),
             crate::DfsRevisionRetentionState {
@@ -2938,11 +2991,11 @@ mod tests {
             current_object(&object_id, &self::version("retained_repair_current")),
         );
         let pin = DfsMetadataVersionPinRecord {
-            namespace: None,
+            namespace: "module.dfs.history".into(),
             file_system_id: file_system_id(),
             object_id: object_id.clone(),
             version: old_version.clone(),
-            pin_id: "checkpoint".into(),
+            pin_id: crate::content_reference_storage_id("module.dfs.history", "checkpoint"),
             created_at: timestamp(1),
         };
         tables.version_pins.insert(
@@ -3113,46 +3166,32 @@ mod tests {
         let remote_version = version("version_content_remote");
         let transaction_version = version("version_content_transaction");
         let mut tables = DfsMetadataTables::default();
-        let conflict = DfsConflictRecord {
-            conflict_id: "conflict_content_roots".to_string(),
-            file_system_id: file_system_id(),
-            object_id: object_id.clone(),
-            path: "/content-roots".to_string(),
-            base_version: None,
-            local_version,
-            remote_version,
-            detected_by_node_id: node("node_detector"),
-            reason: "content roots".to_string(),
-            local_content_hash: Some("blake3:conflict-local-only".to_string()),
-            remote_content_hash: Some("blake3:conflict-remote-only".to_string()),
-            created_by_intent_id: None,
-            strategy: None,
-            status: DfsConflictStatus::Open,
-            detected_at: timestamp(1),
-        };
-        tables
-            .conflicts
-            .insert((object_id.clone(), conflict.conflict_id.clone()), conflict);
         let mut transaction_object = current_object(&object_id, &version("version_content_object"));
         transaction_object.content_hash = Some("blake3:transaction-object-only".to_string());
         let mut transaction_version_record = version_record(&object_id, &transaction_version, 3);
         transaction_version_record.content_hash =
             Some("blake3:transaction-version-only".to_string());
-        let transaction = crate::DfsNamespaceTransaction {
-            content_reference_identity: None,
-            contribution_digest: None,
-            extension_expectations: Vec::new(),
-            file_version_pins: None,
-            transaction_id: "transaction_content_roots".to_string(),
-            file_system_id: file_system_id(),
-            objects: vec![transaction_object],
-            versions: vec![transaction_version_record],
-            advisory_lock_states: Vec::new(),
-            created_at: timestamp(3),
-        };
+        let mut local = version_record(&object_id, &local_version, 1);
+        local.content_hash = Some("blake3:conflict-local-only".into());
+        let mut remote = version_record(&object_id, &remote_version, 2);
+        remote.content_hash = Some("blake3:conflict-remote-only".into());
+        let prepared = prepared_record(
+            "operation-content-roots",
+            vec![
+                crate::DfsPreparedMetadataEffect::PutObject {
+                    object: transaction_object,
+                },
+                crate::DfsPreparedMetadataEffect::PutVersion {
+                    version: transaction_version_record,
+                },
+                crate::DfsPreparedMetadataEffect::PutVersion { version: local },
+                crate::DfsPreparedMetadataEffect::PutVersion { version: remote },
+            ],
+            DfsPreparedOperationStatus::Prepared,
+        );
         tables
-            .namespace_transactions
-            .insert(transaction.transaction_id.clone(), transaction);
+            .prepared_operations_v7
+            .insert(prepared.operation_id.clone(), prepared);
 
         let protection = metadata_content_protection_from_tables(&tables);
         for content_hash in [
@@ -3256,7 +3295,7 @@ mod tests {
         young.completed_at = Some(timestamp(99));
         let mut running = completed_namespace_job("running", completed_origin);
         running.status = crate::DfsNamespaceJobStatus::Running;
-        let legacy = completed_namespace_job("legacy", None);
+
         let pending = completed_namespace_job(
             "pending",
             Some(crate::DfsNamespaceJobOrigin::from_request(&owner)),
@@ -3265,13 +3304,13 @@ mod tests {
             (owner.requester_node_id.clone(), owner.request_id.clone()),
             owner,
         );
-        for job in [failed.clone(), unselected, young, running, pending, legacy] {
+        for job in [failed.clone(), unselected, young, running, pending] {
             tables.namespace_jobs.insert(job.job_id.clone(), job);
         }
         let scoped = DfsMetadataHistoryGcOptions::delete_eligible(Duration::from_secs(10), 1)
             .with_now_unix_nanos(100_000_000_000)
             .with_namespace_job_ids(
-                ["selected-failed", "young", "running", "pending", "legacy"].map(String::from),
+                ["selected-failed", "young", "running", "pending"].map(String::from),
             );
         let plan =
             plan_metadata_history_gc(DfsMetadataShardId::new("scope"), &tables, &scoped, None);
@@ -3285,111 +3324,5 @@ mod tests {
             plan.removals.is_empty(),
             "an empty explicit scope cannot expand into generic history GC"
         );
-    }
-
-    #[test]
-    fn metadata_history_gc_conservatively_retains_legacy_job_for_matching_pending_request() {
-        let request = namespace_request(
-            node("node_namespace_legacy"),
-            "request_namespace_legacy",
-            DfsNamespaceRequestStatus::Pending,
-        );
-        let job = completed_namespace_job("job_namespace_legacy", None);
-        let mut tables = DfsMetadataTables::default();
-        tables.namespace_requests.insert(
-            (
-                request.requester_node_id.clone(),
-                request.request_id.clone(),
-            ),
-            request,
-        );
-        tables
-            .namespace_jobs
-            .insert(job.job_id.clone(), job.clone());
-
-        let plan = plan_metadata_history_gc(
-            DfsMetadataShardId::new("shard_namespace"),
-            &tables,
-            &options(),
-            None,
-        );
-
-        assert!(!namespace_job_is_selected(&plan, &job.job_id));
-        assert_eq!(plan.report.compacted_namespace_job_count, 0);
-    }
-
-    #[test]
-    fn metadata_history_gc_retains_legacy_clear_and_hardlink_job_evidence_for_pending_requests() {
-        let cases = [
-            (
-                "clear",
-                DfsNamespaceJobKind::ClearDirectoryRecursive,
-                "/tree",
-                None,
-                DfsNamespaceOperation::ClearDirRecursive {
-                    path: "/tree".to_string(),
-                },
-            ),
-            (
-                "hardlink",
-                DfsNamespaceJobKind::HardlinkAcrossShardPrimaries,
-                "/source",
-                Some("/target"),
-                DfsNamespaceOperation::Hardlink {
-                    existing_path: "/source".to_string(),
-                    link_path: "/target".to_string(),
-                },
-            ),
-        ];
-        for (case, kind, root_path, target_path, operation) in cases {
-            let mut request = namespace_request(
-                node(&format!("node_namespace_legacy_{case}")),
-                &format!("request_namespace_legacy_{case}"),
-                DfsNamespaceRequestStatus::Pending,
-            );
-            request.operation = operation;
-            let mut job = completed_namespace_job(&format!("job_namespace_legacy_{case}"), None);
-            job.kind = kind;
-            job.root_path = root_path.to_string();
-            job.target_path = target_path.map(str::to_string);
-            let receipt = crate::DfsNamespaceJobReceipt::from_job(&job, timestamp(4))
-                .expect("terminal legacy job receipt");
-            let mut tables = DfsMetadataTables::default();
-            tables.namespace_requests.insert(
-                (
-                    request.requester_node_id.clone(),
-                    request.request_id.clone(),
-                ),
-                request,
-            );
-            tables
-                .namespace_jobs
-                .insert(job.job_id.clone(), job.clone());
-            tables
-                .namespace_job_receipts
-                .insert(receipt.job_id.clone(), receipt);
-
-            let plan = plan_metadata_history_gc(
-                DfsMetadataShardId::new("shard_namespace"),
-                &tables,
-                &options(),
-                None,
-            );
-
-            assert!(
-                !namespace_job_is_selected(&plan, &job.job_id),
-                "legacy {case} job must remain as pending-request evidence"
-            );
-            assert!(
-                !plan.removals.iter().any(|removal| matches!(
-                    removal,
-                    DfsMetadataHistoryRemoval::NamespaceJobReceipt {
-                        job_id: selected_job_id,
-                        ..
-                    } if selected_job_id == &job.job_id
-                )),
-                "legacy {case} job receipt must remain as pending-request evidence"
-            );
-        }
     }
 }

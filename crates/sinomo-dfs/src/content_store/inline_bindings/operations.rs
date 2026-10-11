@@ -9,7 +9,7 @@ pub(in crate::content_store) fn open_verified_inline_payload(
     size_bytes: u64,
     content_hash: &str,
 ) -> Result<fs::File> {
-    if size_bytes > PACKED_BLOB_SMALL_LIMIT_BYTES {
+    if size_bytes > INLINE_BLOB_SMALL_LIMIT_BYTES {
         return Err(inline_error(
             "inline payload exceeds its bounded representation",
         ));
@@ -58,16 +58,24 @@ impl LocalContentStore {
                 if source.kind() == io::ErrorKind::NotFound
                     && !self.content_reservation_writer_initialized =>
             {
+                if self.root.exists()
+                    && fs::read_dir(&self.root)
+                        .map_err(|source| ContentStoreError::Io {
+                            path: self.root.clone(),
+                            source,
+                        })?
+                        .next()
+                        .is_some()
+                {
+                    return Err(ContentStoreError::UnsupportedStorageFormat {
+                        root: self.root.clone(),
+                    });
+                }
                 return Ok(None);
             }
             Err(source) => return Err(ContentStoreError::Io { path, source }),
         };
         let sentinel = decode_content_reservation_batch_sentinel(&bytes)?;
-        if sentinel.format_version == 1
-            && sentinel.marker == CONTENT_RESERVATION_BATCH_SENTINEL_MARKER
-        {
-            return Ok(None);
-        }
         validate_content_reservation_batch_sentinel(&sentinel)?;
         Ok((sentinel.content_binding_layout == INLINE_BINDING_LAYOUT).then_some(sentinel))
     }
@@ -105,6 +113,38 @@ impl LocalContentStore {
             force,
         )?;
         Ok(Some(state.view.clone()))
+    }
+
+    pub(in crate::content_store) fn inline_manifest_for_content(
+        &self,
+        object_id: &str,
+        hash: &str,
+        size: u64,
+    ) -> Result<Option<ContentManifest>> {
+        let _owner = self.content_mutation_guard()?;
+        let Some(sentinel) = self.inline_sentinel_unlocked()? else {
+            return Ok(None);
+        };
+        let mut state = self
+            .inline_store
+            .owner
+            .state
+            .lock()
+            .map_err(|_| inline_error("resident binding mutex poisoned"))?;
+        refresh_resident(
+            &self.inline_store.owner.root,
+            &sentinel.store_incarnation,
+            &mut state,
+            false,
+        )?;
+        let manifest = state
+            .view
+            .content_versions
+            .get(&(object_id.into(), hash.into(), size))
+            .and_then(|versions| versions.last())
+            .and_then(|version| state.view.live_manifest(object_id, version))
+            .cloned();
+        Ok(manifest)
     }
 
     pub(in crate::content_store) fn inline_version_state(
@@ -212,22 +252,20 @@ impl LocalContentStore {
 
     /// Re-adopt a hash that the authoritative overlay previously retired.
     /// This record intentionally has no version manifest: blob-only APIs keep
-    /// their public contract while a stale legacy copy cannot clear a tombstone.
+    /// their public contract while a stale stored copy cannot clear a tombstone.
     pub(in crate::content_store) fn try_restore_inline_blob(
         &self,
         hash: &str,
         bytes: &[u8],
     ) -> Result<bool> {
         let _owner = self.content_mutation_guard()?;
-        if !self.inline_blob_deleted(hash)? {
+        if bytes.len() as u64 > INLINE_BLOB_SMALL_LIMIT_BYTES {
             return Ok(false);
         }
-        if bytes.len() as u64 > PACKED_BLOB_SMALL_LIMIT_BYTES {
-            return Err(inline_error(
-                "retired inline hash exceeds the small-content bound",
-            ));
-        }
         ensure_bytes_match_hash(hash, bytes)?;
+        if self.inline_blob_entry(hash)?.is_some() && self.open_inline_blob(hash, 0, 0)?.is_some() {
+            return Ok(true);
+        }
         self.ensure_quota_delta(ContentStoreQuotaDelta {
             blob_bytes: bytes.len() as u64,
             ..ContentStoreQuotaDelta::default()
@@ -257,27 +295,6 @@ impl LocalContentStore {
             ..ContentStoreStatsDelta::default()
         })?;
         Ok(true)
-    }
-
-    /// Raw copies for one identity. Retain every legacy duplicate for the
-    /// causal proof, without cloning the unrelated live inline inventory.
-    /// Caller owns both mutation and reservation locks.
-    pub(super) fn reservation_copies_for_identity_unlocked(
-        &self,
-        identity: &ContentStoreReservationIdentity,
-    ) -> Result<Vec<ContentStoreReservationRecord>> {
-        let mut copies = self
-            .read_legacy_content_reservation_inventory_unlocked()?
-            .all_copies
-            .into_iter()
-            .filter(|record| &record.identity == identity)
-            .collect::<Vec<_>>();
-        if let Some(InlineReservationState::Live(record)) =
-            self.inline_reservation_state(identity)?
-        {
-            copies.push(record);
-        }
-        Ok(copies)
     }
 
     pub(in crate::content_store) fn inline_reservation_state(
@@ -382,7 +399,7 @@ impl LocalContentStore {
         version: &str,
         bytes: &[u8],
     ) -> Result<Option<ContentManifest>> {
-        if bytes.len() as u64 > PACKED_BLOB_SMALL_LIMIT_BYTES {
+        if bytes.len() as u64 > INLINE_BLOB_SMALL_LIMIT_BYTES {
             return Ok(None);
         }
         let _owner = self.content_mutation_guard()?;
@@ -417,15 +434,6 @@ impl LocalContentStore {
         };
         let published_at = match self.inline_version_state(object_id, version)? {
             Some(InlineVersionState::Live(entry)) => entry.published_at_unix_nanos,
-            _ if existing.is_some() => self
-                .manifest_path(object_id, version)
-                .metadata()
-                .and_then(|metadata| metadata.modified())
-                .map(system_time_nanos_since_epoch_saturating)
-                .map_err(|source| ContentStoreError::Io {
-                    path: self.manifest_path(object_id, version),
-                    source,
-                })?,
             _ => system_time_nanos_since_epoch_saturating(SystemTime::now()),
         };
         let encoded_manifest_bytes = encode_manifest(&manifest)?.len() as u64;
@@ -459,18 +467,19 @@ impl LocalContentStore {
         // Generic staging/retry is a renewal even for an identical tuple. Clear
         // its old absence epoch and keep grace monotonic across clock rollback.
         self.remove_manifest_absence_observation(&identity)?;
-        let previous_reservation_time = self
-            .reservation_copies_for_identity_unlocked(&identity)?
-            .iter()
-            .map(|record| record.reserved_at_unix_nanos)
-            .max();
+        let previous_reservation_time =
+            self.inline_reservation_state(&identity)?
+                .and_then(|state| match state {
+                    InlineReservationState::Live(record) => Some(record.reserved_at_unix_nanos),
+                    InlineReservationState::Released => None,
+                });
         let reservation = if manifest.content_hash == intrinsic_empty_content_hash() {
             None
         } else {
             Some(ContentStoreReservationRecord {
                 identity,
                 reserved_at_unix_nanos: refreshed_reservation_timestamp(previous_reservation_time),
-                causal_stamp: Some(reservation_guard.sentinel.stamp()),
+                causal_stamp: reservation_guard.sentinel.stamp(),
             })
         };
         let reuse_payload = self.inline_blob_entry(&manifest.content_hash)?.is_some()
@@ -531,9 +540,6 @@ impl LocalContentStore {
             &sentinel.store_incarnation,
             &mut state,
         )?;
-        if !state.view.reservations.contains_key(&record.identity) {
-            return Ok(false);
-        }
         let mut renewed = record.clone();
         if let Some(InlineReservationState::Live(previous)) =
             state.view.reservations.get(&record.identity)
@@ -606,18 +612,265 @@ impl LocalContentStore {
             },
             &[],
         )?;
+        drop(state);
+        self.evict_stream_manifest(&self.manifest_path(object_id, version));
         Ok(true)
     }
 
-    pub(in crate::content_store) fn inline_legacy_manifest_published(
+    pub(in crate::content_store) fn inline_manifest_published(
         &self,
         manifest: &ContentManifest,
     ) -> Result<()> {
         let _owner = self.content_mutation_guard()?;
-        let Some(sentinel) = self.inline_sentinel_unlocked()? else {
-            return Ok(());
+        let reservation = self.lock_content_reservations_for_write()?;
+        let identity = ContentStoreReservationIdentity {
+            object_id: manifest.object_id.clone(),
+            version: manifest.version.clone(),
+            content_hash: manifest.content_hash.clone(),
         };
-        let _reservation = self.lock_content_reservations_for_write()?;
+        let record = if manifest.content_hash == intrinsic_empty_content_hash() {
+            None
+        } else {
+            Some(ContentStoreReservationRecord {
+                identity: identity.clone(),
+                reserved_at_unix_nanos: refreshed_reservation_timestamp(
+                    self.inline_reservation_state(&identity)?
+                        .and_then(|state| match state {
+                            InlineReservationState::Live(record) => {
+                                Some(record.reserved_at_unix_nanos)
+                            }
+                            InlineReservationState::Released => None,
+                        }),
+                ),
+                causal_stamp: reservation.sentinel.stamp(),
+            })
+        };
+        let mut state = self
+            .inline_store
+            .owner
+            .state
+            .lock()
+            .map_err(|_| inline_error("resident binding mutex poisoned"))?;
+        append_operation(
+            &self.inline_store.owner.root,
+            &reservation.sentinel,
+            &mut state,
+            InlineOperation::ExternalBinding {
+                manifest: manifest.clone(),
+                published_at_unix_nanos: system_time_nanos_since_epoch_saturating(SystemTime::now()),
+                reservation: record,
+            },
+            &[],
+        )?;
+        drop(state);
+        self.evict_stream_manifest(&self.manifest_path(&manifest.object_id, &manifest.version));
+        Ok(())
+    }
+}
+
+#[cfg(feature = "storage-conversion")]
+pub struct ContentStoreStagingWriter {
+    store: LocalContentStore,
+    _owner: fs::File,
+}
+
+#[cfg(feature = "storage-conversion")]
+impl std::ops::Deref for ContentStoreStagingWriter {
+    type Target = LocalContentStore;
+    fn deref(&self) -> &LocalContentStore {
+        &self.store
+    }
+}
+
+#[cfg(feature = "storage-conversion")]
+impl ContentStoreStagingWriter {
+    /// Opens an existing candidate or begins from an empty current catalog.
+    /// A populated ordinary store cannot acquire this staging capability.
+    pub fn open_candidate(root: &Path) -> Result<Self> {
+        // This capability constructs only current output. Invoking the source
+        // preparation provider here recursively enters its own converter.
+        // The shared initializer still rejects every unmarked nonempty/legacy
+        // root and validates any retained current initialization identity.
+        let store = LocalContentStore::initialize_current(root.to_owned())?;
+        let path = store.root.join("catalog-staging-owner.lock");
+        let existed = path.is_file();
+        if !existed
+            && (store
+                .inline_binding_view()?
+                .is_some_and(|view| view.sequence != 0)
+                || store.scan_blob_stats()?.0 != 0)
+        {
+            return Err(inline_error(
+                "an ordinary populated catalog cannot become a staging candidate",
+            ));
+        }
+        let owner = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(!existed)
+            .truncate(false)
+            .open(&path)
+            .map_err(|source| ContentStoreError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        owner
+            .try_lock_exclusive()
+            .map_err(|source| ContentStoreError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        owner.sync_all().map_err(|source| ContentStoreError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        sync_dir(&store.root)?;
+        Ok(Self {
+            store,
+            _owner: owner,
+        })
+    }
+}
+
+/// Current catalog rows for constructing a private conversion candidate.
+/// Every row is appended through the normal owner, stamp, and framed writer.
+#[cfg(feature = "storage-conversion")]
+#[derive(Clone, Debug)]
+pub enum ContentStoreStagingRow {
+    Manifest {
+        manifest: ContentManifest,
+        published_at_unix_nanos: u64,
+    },
+    VersionTombstone {
+        object_id: String,
+        version: String,
+        content_hash: String,
+    },
+    Blob {
+        content_hash: String,
+        bytes: Vec<u8>,
+        published_at_unix_nanos: u64,
+    },
+    BlobTombstone {
+        content_hash: String,
+    },
+    RetentionRoot {
+        identity: ContentStoreReservationIdentity,
+        not_before: u64,
+    },
+    RetentionRelease(ContentStoreReservationIdentity),
+}
+
+#[cfg(feature = "storage-conversion")]
+impl ContentStoreStagingWriter {
+    pub fn apply_storage_staging_row(&self, row: ContentStoreStagingRow) -> Result<()> {
+        let _owner = self.content_mutation_guard()?;
+        if let ContentStoreStagingRow::RetentionRoot {
+            identity,
+            not_before,
+        } = &row
+        {
+            return self.ensure_content_reservation_not_before(identity, *not_before);
+        }
+        let reservation = self.lock_content_reservations_for_write()?;
+        let cache_key = match &row {
+            ContentStoreStagingRow::Manifest { manifest, .. } => {
+                Some(self.manifest_path(&manifest.object_id, &manifest.version))
+            }
+            ContentStoreStagingRow::VersionTombstone {
+                object_id, version, ..
+            } => Some(self.manifest_path(object_id, version)),
+            _ => None,
+        };
+        let (operation, payload) = match row {
+            ContentStoreStagingRow::Manifest {
+                manifest,
+                published_at_unix_nanos,
+            } => {
+                if !self.manifest_content_available(&manifest)? {
+                    return Err(inline_error("staged manifest has no exact durable content"));
+                }
+                (
+                    InlineOperation::RestoreVersion {
+                        manifest,
+                        published_at_unix_nanos,
+                    },
+                    Vec::new(),
+                )
+            }
+            ContentStoreStagingRow::VersionTombstone {
+                object_id,
+                version,
+                content_hash,
+            } => (
+                InlineOperation::DeleteVersion {
+                    object_id,
+                    version,
+                    content_hash,
+                },
+                Vec::new(),
+            ),
+            ContentStoreStagingRow::Blob {
+                content_hash,
+                bytes,
+                published_at_unix_nanos,
+            } => {
+                ensure_bytes_match_hash(&content_hash, &bytes)?;
+                (
+                    InlineOperation::Blob {
+                        content_hash,
+                        size_bytes: bytes.len() as u64,
+                        published_at_unix_nanos,
+                    },
+                    bytes,
+                )
+            }
+            ContentStoreStagingRow::BlobTombstone { content_hash } => {
+                (InlineOperation::RemoveBlob { content_hash }, Vec::new())
+            }
+            ContentStoreStagingRow::RetentionRelease(identity) => {
+                (InlineOperation::Release(identity), Vec::new())
+            }
+            ContentStoreStagingRow::RetentionRoot { .. } => unreachable!(),
+        };
+        let mut state = self
+            .inline_store
+            .owner
+            .state
+            .lock()
+            .map_err(|_| inline_error("resident binding mutex poisoned"))?;
+        append_operation(
+            &self.inline_store.owner.root,
+            &reservation.sentinel,
+            &mut state,
+            operation,
+            &payload,
+        )?;
+        drop(state);
+        if let Some(path) = cache_key {
+            self.evict_stream_manifest(&path);
+        }
+        self.quota_stats_initialized.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    pub fn storage_staging_version_owned(&self, object_id: &str, version: &str) -> Result<bool> {
+        Ok(self.inline_version_state(object_id, version)?.is_some())
+    }
+}
+
+#[cfg(feature = "storage-conversion")]
+impl ContentStoreStagingWriter {
+    pub fn storage_staging_manifest_page(
+        &self,
+        after: Option<&(String, String)>,
+        limit: usize,
+    ) -> Result<Vec<ContentManifest>> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let _owner = self.content_mutation_guard()?;
+        let sentinel = self
+            .inline_sentinel_unlocked()?
+            .ok_or_else(|| inline_error("staging catalog is absent"))?;
         let mut state = self
             .inline_store
             .owner
@@ -629,50 +882,16 @@ impl LocalContentStore {
             &sentinel.store_incarnation,
             &mut state,
         )?;
-        if matches!(
-            state
-                .view
-                .versions
-                .get(&(manifest.object_id.clone(), manifest.version.clone())),
-            Some(InlineVersionState::Deleted { .. })
-        ) {
-            // A prior attempt may have renamed the legacy manifest and then
-            // failed its parent barrier. The log must not certify that visible
-            // name as a durable replacement until this retry resynchronizes it.
-            let path = self.manifest_path(&manifest.object_id, &manifest.version);
-            let decoded = decode_manifest_for_path(&read_file(&path)?, &path)?;
-            if decoded != *manifest {
-                return Err(inline_error("legacy publication changed before adoption"));
-            }
-            let mut file = fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&path)
-                .map_err(|source| ContentStoreError::Io {
-                    path: path.clone(),
-                    source,
-                })?;
-            durable_file::sync_open_file(&mut file, &path, durable_file::DurableFileSync::All)
-                .map_err(content_durable_file_error)?;
-            if let Some(version_dir) = path.parent() {
-                sync_dir(version_dir)?;
-                if let Some(object_dir) = version_dir.parent() {
-                    sync_dir(object_dir)?;
-                }
-            }
-            sync_dir(&self.root.join("objects"))?;
-            append_operation(
-                &self.inline_store.owner.root,
-                &sentinel,
-                &mut state,
-                InlineOperation::LegacyManifest {
-                    object_id: manifest.object_id.clone(),
-                    version: manifest.version.clone(),
-                    content_hash: manifest.content_hash.clone(),
-                },
-                &[],
-            )?;
-        }
-        Ok(())
+        let bounds = (after.map_or(Unbounded, Excluded), Unbounded);
+        Ok(state
+            .view
+            .versions
+            .range(bounds)
+            .filter_map(|(_, row)| match row {
+                InlineVersionState::Live(entry) => Some(entry.manifest.clone()),
+                _ => None,
+            })
+            .take(limit)
+            .collect())
     }
 }

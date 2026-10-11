@@ -28,11 +28,6 @@ pub type DfsVersion = dfs::DfsVersion;
 pub type DfsOperatorStatus = dfs::DfsOperatorStatus;
 pub type DfsOperatorObjectView = dfs::DfsOperatorObjectView;
 pub type DfsOperatorInspectionCursor = dfs::DfsOperatorInspectionCursor;
-pub type DfsConflictRecord = dfs::DfsConflictRecord;
-pub type DfsOperatorConflictPage = dfs::DfsOperatorConflictPage;
-pub type DfsOperatorConflictVersionsReport = dfs::DfsOperatorConflictVersionsReport;
-pub type DfsOperatorConflictResolutionReport = dfs::DfsOperatorConflictResolutionReport;
-pub type DfsOperatorUseConflictVersionReport = dfs::DfsOperatorUseConflictVersionReport;
 pub type DfsOperatorRepairView = dfs::DfsOperatorRepairView;
 pub type DfsOperatorRepairPage = dfs::DfsOperatorRepairPage;
 
@@ -166,7 +161,7 @@ pub struct SifsObjectHealth {
     pub version_count: usize,
     pub receipt_count: usize,
     pub intent_count: usize,
-    pub open_conflict_count: usize,
+
     pub pending_repair_count: usize,
     pub missing_replica_nodes: Vec<String>,
 }
@@ -177,7 +172,7 @@ pub struct SifsHealthSummary {
     pub object_count: usize,
     pub version_count: usize,
     pub pending_write_count: usize,
-    pub open_conflict_count: usize,
+
     pub pending_repair_count: usize,
     pub pending_namespace_job_count: usize,
     pub failed_namespace_job_count: usize,
@@ -864,60 +859,6 @@ impl DfsOperatorClient {
         }
     }
 
-    pub fn conflicts_page(
-        &self,
-        file_system_id: Option<DfsFileSystemId>,
-        object_id: Option<DfsObjectId>,
-        limit: usize,
-        cursor: Option<DfsOperatorInspectionCursor>,
-    ) -> Result<DfsOperatorConflictPage, String> {
-        match self.rpc(dfs::DaemonDfsInspectionRequest::Conflicts {
-            file_system_id,
-            object_id,
-            limit: Some(limit),
-            cursor,
-        })? {
-            dfs::DaemonDfsInspectionResponse::Conflicts {
-                conflicts,
-                next_cursor,
-            } => Ok(DfsOperatorConflictPage {
-                conflicts,
-                next_cursor,
-            }),
-            response => Err(unexpected_operator_response("conflicts", &response)),
-        }
-    }
-
-    pub fn conflict_versions(
-        &self,
-        object_id: DfsObjectId,
-        conflict_ids: Vec<String>,
-    ) -> Result<Option<DfsOperatorConflictVersionsReport>, String> {
-        match self.rpc(dfs::DaemonDfsInspectionRequest::ConflictVersions {
-            object_id,
-            conflict_ids,
-        })? {
-            dfs::DaemonDfsInspectionResponse::ConflictVersions { report } => Ok(report),
-            response => Err(unexpected_operator_response("conflict-versions", &response)),
-        }
-    }
-
-    pub fn resolve_conflicts(
-        &self,
-        file_system_id: Option<DfsFileSystemId>,
-        object_id: Option<DfsObjectId>,
-        conflict_ids: Vec<String>,
-    ) -> Result<DfsOperatorConflictResolutionReport, String> {
-        match self.rpc(dfs::DaemonDfsInspectionRequest::ResolveConflicts {
-            file_system_id,
-            object_id,
-            conflict_ids,
-        })? {
-            dfs::DaemonDfsInspectionResponse::ResolveConflicts { report } => Ok(report),
-            response => Err(unexpected_operator_response("resolve-conflicts", &response)),
-        }
-    }
-
     /// Restore explicitly retained content through the same durable API as SIFS.
     pub fn restore_file_history(
         &self,
@@ -1118,7 +1059,7 @@ fn health_from_rpc(health: api::DaemonDfsBrowserObjectHealth) -> SifsObjectHealt
         version_count: health.version_count,
         receipt_count: health.receipt_count,
         intent_count: health.intent_count,
-        open_conflict_count: health.open_conflict_count,
+
         pending_repair_count: health.pending_repair_count,
         missing_replica_nodes: health.missing_replica_nodes,
     }
@@ -1130,7 +1071,7 @@ fn health_summary(health: api::DaemonDfsBrowserHealthSummary) -> SifsHealthSumma
         object_count: health.object_count,
         version_count: health.version_count,
         pending_write_count: health.pending_write_count,
-        open_conflict_count: health.open_conflict_count,
+
         pending_repair_count: health.pending_repair_count,
         pending_namespace_job_count: health.pending_namespace_job_count,
         failed_namespace_job_count: health.failed_namespace_job_count,
@@ -1166,7 +1107,6 @@ fn agent_state_label(state: &dfs::DfsAgentObjectState) -> &'static str {
         dfs::DfsAgentObjectState::Current => "current",
         dfs::DfsAgentObjectState::PendingWrite => "pending-write",
         dfs::DfsAgentObjectState::PendingRepair => "pending-repair",
-        dfs::DfsAgentObjectState::Conflicted => "conflicted",
         dfs::DfsAgentObjectState::MetadataOnly => "metadata-only",
     }
 }

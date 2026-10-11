@@ -4,9 +4,8 @@ use crate::dfs::*;
 use serde::Deserialize;
 use serde::Serialize;
 use sinomo_core::node::NodeId;
-use std::collections::BTreeSet;
 
-/// A DFS operator inspection request (status / filesystem / path / object / conflicts /
+/// A DFS operator inspection request (status / filesystem / path / object /
 /// repair). Host-agnostic contract: the same request drives in-process and daemon paths.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(tag = "type", rename_all = "kebab-case")]
@@ -22,33 +21,8 @@ pub enum DaemonDfsInspectionRequest {
     Object {
         object_id: DfsObjectId,
     },
-    Conflicts {
-        file_system_id: Option<DfsFileSystemId>,
-        object_id: Option<DfsObjectId>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        limit: Option<usize>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        cursor: Option<DfsOperatorInspectionCursor>,
-    },
-    ResolveConflicts {
-        file_system_id: Option<DfsFileSystemId>,
-        object_id: Option<DfsObjectId>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        conflict_ids: Vec<String>,
-    },
-    ConflictVersions {
-        object_id: DfsObjectId,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        conflict_ids: Vec<String>,
-    },
-    /// Retired metadata-only mutation. Kept for explicit rejection of older
-    /// callers; restoration uses DfsFileHistoryRestoreRequest on its own route.
-    UseConflictVersion {
-        object_id: DfsObjectId,
-        version: DfsVersion,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        conflict_ids: Vec<String>,
-    },
+
+    /// Inspect bounded repair work without mutating metadata.
     Repair {
         file_system_id: Option<DfsFileSystemId>,
         object_id: Option<DfsObjectId>,
@@ -75,20 +49,7 @@ pub enum DaemonDfsInspectionResponse {
     Object {
         object: Option<DfsOperatorObjectView>,
     },
-    Conflicts {
-        conflicts: Vec<DfsConflictRecord>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        next_cursor: Option<DfsOperatorInspectionCursor>,
-    },
-    ResolveConflicts {
-        report: DfsOperatorConflictResolutionReport,
-    },
-    ConflictVersions {
-        report: Option<DfsOperatorConflictVersionsReport>,
-    },
-    UseConflictVersion {
-        report: DfsOperatorUseConflictVersionReport,
-    },
+
     Repair {
         repairs: Vec<DfsOperatorRepairView>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -104,7 +65,7 @@ pub enum DfsOperatorStatusMetric {
     ReceiptCount,
     IntentCount,
     PendingWriteCount,
-    OpenConflictCount,
+
     PendingRepairCount,
     RepairAttemptCount,
     PendingNamespaceJobCount,
@@ -126,7 +87,6 @@ pub enum DfsOperatorStatusOmission {
         /// cross-shard namespace-lock counts were all zero. Union emptiness is
         /// exact even though historical placement can make a positive summed
         /// cardinality ambiguous.
-        #[serde(default, skip_serializing_if = "bool_is_false")]
         cross_shard_namespace_locks_zero_proven: bool,
     },
     /// Status deliberately did not replay a cold node-local repair queue.
@@ -171,7 +131,7 @@ impl DfsOperatorStatusOmission {
         }
     }
 
-    pub fn legacy_reason(&self) -> String {
+    pub fn reason(&self) -> String {
         match self {
             Self::HistoricalRoutingTopology {
                 generation_count, ..
@@ -204,7 +164,6 @@ impl DfsOperatorStatusOmission {
                 ReceiptCount,
                 IntentCount,
                 PendingWriteCount,
-                OpenConflictCount,
                 PendingRepairCount,
                 PendingNamespaceJobCount,
                 FailedNamespaceJobCount,
@@ -215,7 +174,6 @@ impl DfsOperatorStatusOmission {
                 ReceiptCount,
                 IntentCount,
                 PendingWriteCount,
-                OpenConflictCount,
                 PendingRepairCount,
                 PendingNamespaceJobCount,
                 FailedNamespaceJobCount,
@@ -235,13 +193,9 @@ impl DfsOperatorStatusOmission {
     }
 }
 
-fn bool_is_false(value: &bool) -> bool {
-    !*value
-}
-
 impl std::fmt::Display for DfsOperatorStatusOmission {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.legacy_reason())
+        formatter.write_str(&self.reason())
     }
 }
 
@@ -250,16 +204,12 @@ pub struct DfsOperatorStatus {
     /// Node-local physical migrations; counts describe metadata records, not files.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub storage_migrations: Vec<sinomo_core::storage::migration::MigrationJob>,
-    /// Human-readable compatibility mirrors for every unavailable observation.
-    /// New readers use [`Self::blocking_incomplete_reasons`] so typed bounded
-    /// omissions do not masquerade as corruption. Old readers remain
-    /// fail-closed because producers continue to mirror omissions here.
+    /// Errors that prevent a complete, authoritative observation.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub incomplete_reasons: Vec<String>,
     /// Deliberate, bounded omissions that keep status from hydrating or
     /// scanning production-sized durable state. These remain operator-visible
     /// but are not themselves evidence of a DFS invariant violation.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bounded_omissions: Vec<DfsOperatorStatusOmission>,
     pub file_system_count: usize,
     pub object_count: usize,
@@ -267,7 +217,6 @@ pub struct DfsOperatorStatus {
     pub receipt_count: usize,
     pub intent_count: usize,
     pub pending_write_count: usize,
-    pub open_conflict_count: usize,
     pub pending_repair_count: usize,
     #[serde(default)]
     pub repair_attempt_count: usize,
@@ -276,8 +225,8 @@ pub struct DfsOperatorStatus {
     #[serde(default)]
     pub failed_namespace_job_count: usize,
     /// Unique effective `(filesystem, root path)` cross-shard namespace locks
-    /// retained by running durable jobs. `None` fails closed when an older
-    /// daemon or bounded omission cannot provide this incremental metric.
+    /// retained by running durable jobs. `None` fails closed when an bounded
+    /// omission cannot provide this incremental metric.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cross_shard_namespace_lock_count: Option<usize>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -287,21 +236,8 @@ pub struct DfsOperatorStatus {
 }
 
 impl DfsOperatorStatus {
-    /// Return only incomplete observations which are not exact legacy mirrors
-    /// of a typed bounded omission. An old payload has no typed omissions, so
-    /// every legacy reason remains blocking. Likewise, an unmatched reason in
-    /// a new payload fails closed.
     pub fn blocking_incomplete_reasons(&self) -> Vec<&str> {
-        let bounded_legacy_reasons = self
-            .bounded_omissions
-            .iter()
-            .map(DfsOperatorStatusOmission::legacy_reason)
-            .collect::<BTreeSet<_>>();
-        self.incomplete_reasons
-            .iter()
-            .map(String::as_str)
-            .filter(|reason| !bounded_legacy_reasons.contains(*reason))
-            .collect()
+        self.incomplete_reasons.iter().map(String::as_str).collect()
     }
 
     pub fn push_bounded_omission(&mut self, omission: DfsOperatorStatusOmission) {
@@ -310,14 +246,6 @@ impl DfsOperatorStatus {
             .contains(&DfsOperatorStatusMetric::CrossShardNamespaceLockCount)
         {
             self.cross_shard_namespace_lock_count = None;
-        }
-        let legacy_reason = omission.legacy_reason();
-        if !self
-            .incomplete_reasons
-            .iter()
-            .any(|reason| reason == &legacy_reason)
-        {
-            self.incomplete_reasons.push(legacy_reason);
         }
         if !self.bounded_omissions.contains(&omission) {
             self.bounded_omissions.push(omission);
@@ -329,7 +257,6 @@ impl DfsOperatorStatus {
 pub struct DfsOperatorFileSystemView {
     pub file_system: DfsFileSystem,
     pub object_count: usize,
-    pub open_conflict_count: usize,
     pub pending_repair_count: usize,
 }
 
@@ -339,7 +266,6 @@ pub struct DfsOperatorObjectView {
     pub versions: Vec<DfsObjectVersionRecord>,
     pub receipts: Vec<DfsReplicaReceiptRecord>,
     pub intents: Vec<DfsWriteIntentRecord>,
-    pub conflicts: Vec<DfsConflictRecord>,
     pub repairs: Vec<DfsOperatorRepairView>,
     pub agent_state: DfsAgentObjectState,
 }
@@ -352,62 +278,6 @@ pub struct DfsOperatorRepairView {
     pub version: DfsVersion,
     pub content_hash: Option<String>,
     pub missing_replica_node_id: NodeId,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct DfsOperatorConflictPage {
-    pub conflicts: Vec<DfsConflictRecord>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub next_cursor: Option<DfsOperatorInspectionCursor>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct DfsOperatorConflictResolutionReport {
-    pub removed: Vec<DfsConflictRecord>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub not_found_conflict_ids: Vec<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct DfsOperatorConflictVersionsReport {
-    pub object: DfsObjectMetadata,
-    pub conflicts: Vec<DfsConflictRecord>,
-    pub versions: Vec<DfsOperatorConflictVersionView>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct DfsOperatorConflictVersionView {
-    pub version: DfsVersion,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content_hash: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub size_bytes: Option<u64>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub locations: Vec<NodeId>,
-    pub visible: bool,
-    pub current: bool,
-    pub stored: bool,
-    pub roles: Vec<DfsOperatorConflictVersionRole>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct DfsOperatorConflictVersionRole {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub conflict_id: Option<String>,
-    pub role: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content_hash: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct DfsOperatorUseConflictVersionReport {
-    pub previous_object: DfsObjectMetadata,
-    pub committed_object: DfsObjectMetadata,
-    pub selected_version: DfsObjectVersionRecord,
-    pub changed: bool,
-    pub removed: Vec<DfsConflictRecord>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub not_found_conflict_ids: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -431,9 +301,6 @@ pub struct DfsOperatorInspectionCursor {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum DfsOperatorInspectionItemCursor {
-    Conflict {
-        conflict_id: String,
-    },
     Repair {
         intent_id: String,
         version: DfsVersion,
@@ -447,7 +314,7 @@ pub enum DfsAgentObjectState {
     Current,
     PendingWrite,
     PendingRepair,
-    Conflicted,
+
     MetadataOnly,
 }
 

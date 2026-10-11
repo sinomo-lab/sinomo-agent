@@ -1,4 +1,4 @@
-//! Core extension authority, exact retry and legacy-encoding regressions.
+//! Core extension authority and exact retry through the current kernel.
 use super::*;
 
 fn metadata_value(generation: u32) -> DfsModuleMetadataValue {
@@ -19,64 +19,51 @@ fn identity(version: &DfsObjectVersionRecord) -> DfsRevisionReference {
 fn semantic_fixture(
     root: &Path,
 ) -> (
+    crate::test_runtime::DfsTestRuntime,
     NetworkedDfsService<crate::DfsNodeTransport>,
     DfsObjectMetadata,
     DfsObjectVersionRecord,
 ) {
-    let owner = NodeId::from_legacy_named("semantic-extension-owner").unwrap();
-    let mut object = file_metadata(owner.clone());
-    object.path = "/services/semantic-source.txt".into();
-    let content = LocalContentStore::new(root.join("content")).unwrap();
-    let manifest = content
-        .put_object_version(
-            object.object_id.as_str(),
-            object.version.as_str(),
+    let (runtime, owner) = crate::test_runtime::DfsTestRuntime::start_single_node_in_data_dir(
+        "native-semantic-extension",
+        SinomoDataDir::new(root),
+    )
+    .unwrap();
+    let mut dfs = runtime.client(&owner).unwrap();
+    let stat = dfs
+        .posix_write_file(
+            "/services/semantic-source.txt",
             b"immutable source bytes",
+            DfsWriteOptions::replicated_eventual(vec![owner]),
         )
         .unwrap();
-    object.content_hash = Some(manifest.content_hash);
-    object.content_size_bytes = Some(manifest.size_bytes);
-    let version = DfsObjectVersionRecord {
-        metadata_format: DfsRevisionMetadataFormat::NamespacedV6,
+    let object = dfs
+        .metadata_backend
+        .as_ref()
+        .unwrap()
+        .get_object(&stat.object_id)
+        .unwrap()
+        .unwrap();
+    let reference = DfsRevisionReference {
         file_system_id: object.file_system_id.clone(),
         object_id: object.object_id.clone(),
         version: object.version.clone(),
-        content_hash: object.content_hash.clone(),
-        size_bytes: object.content_size_bytes,
-        locations: object.current_locations.clone(),
-        created_by_event_id: object.last_modified_by_event_id.clone(),
-        created_at: OffsetDateTime::UNIX_EPOCH,
-        visible: true,
-        retention: BTreeMap::new(),
-        module_metadata: BTreeMap::from([("vendor.other".into(), metadata_value(0))]),
-        content_durability: None,
     };
-    let mut backend = LocalSobjMetadataBackend::new(
-        DfsMetadataShardId::new("semantic-root"),
-        root.join("metadata"),
-    )
-    .unwrap();
-    backend.set_namespace_prepare_codec(DfsMetadataNamespacePrepareCodec::PackedV6);
-    backend
-        .put_file_system(&DfsFileSystem {
-            metadata_format: DfsRevisionMetadataFormat::NamespacedV6,
-            file_system_id: object.file_system_id.clone(),
-            display_name: "Semantic extension fixture".into(),
-            owner_node_id: owner.clone(),
-            subtree_policies: Vec::new(),
-            retention_policies: BTreeMap::new(),
-            module_metadata: BTreeMap::new(),
-        })
-        .unwrap();
-    backend.put_object_and_version(&object, &version).unwrap();
-    let mut dfs = NetworkedDfsService::new(
-        crate::test_runtime::DfsTestRuntime::local_transport(owner),
-        content,
-    )
-    .with_metadata_backend(backend)
-    .unwrap();
-    dfs.bootstrap_distributed_sifs().unwrap();
-    (dfs, object, version)
+    let mut initialize = contribution(
+        &mut dfs,
+        reference.clone(),
+        "initialize-unrelated-metadata",
+        None,
+        Some(metadata_value(0)),
+    );
+    initialize.namespace = "vendor.other".into();
+    dfs.apply_atomic_contribution(initialize).unwrap();
+    let version = read_version(&dfs, &reference);
+    assert!(
+        version.content_durability.is_some(),
+        "fixture must retain the genuine local write's durability grant"
+    );
+    (runtime, dfs, object, version)
 }
 
 fn read_version<T: DfsMessageTransport>(
@@ -91,12 +78,150 @@ fn read_version<T: DfsMessageTransport>(
         .unwrap()
 }
 
-fn contribution(
+fn publish_semantic_effects<T: DfsMessageTransport>(
+    dfs: &mut NetworkedDfsService<T>,
+    fs: &DfsFileSystemId,
+    effects: Vec<DfsPreparedMetadataEffect>,
+) {
+    let config = dfs
+        .namespace_shards_for_exact_paths(fs, ["/services/semantic-source.txt"])
+        .unwrap()
+        .remove(0);
+    let backend = dfs.metadata_backend.as_ref().unwrap();
+    let mut objects = BTreeMap::new();
+    let mut paths = BTreeMap::new();
+    let mut versions = Vec::new();
+    for effect in &effects {
+        for object in effect.affected_object_ids() {
+            let current = backend.get_object(&object).unwrap();
+            objects.insert(
+                object.clone(),
+                DfsNamespaceObjectVersionExpectation {
+                    object_id: object,
+                    expected_version: current.map(|object| object.version),
+                },
+            );
+        }
+        if let DfsPreparedMetadataEffect::PutObject { object } = effect {
+            let current = backend.get_object_by_path(fs, &object.path).unwrap();
+            paths.insert(
+                object.path.clone(),
+                DfsNamespacePathOccupantExpectation {
+                    path: object.path.clone(),
+                    expected_object_id: current.map(|object| object.object_id),
+                },
+            );
+        }
+        if let DfsPreparedMetadataEffect::PutVersion { version } = effect {
+            versions.push(DfsRevisionMetadataExpectation {
+                object_id: version.object_id.clone(),
+                version: version.version.clone(),
+                expected: backend
+                    .get_version(&version.object_id, &version.version)
+                    .unwrap()
+                    .map(Box::new),
+            });
+        }
+    }
+    let mut payload = DfsPreparedOperationPayload::for_metadata_effects(
+        DfsPreparedOperationScope {
+            file_system_id: fs.clone(),
+            shard_id: DfsMetadataShardId::new(config.shard_id.clone()),
+            owner_epoch: config.epoch,
+            operation_id: format!("semantic-fixture:{}", sinomo_core::Id::generate()),
+        },
+        objects.into_values().collect(),
+        paths.into_values().collect(),
+        effects,
+        OffsetDateTime::now_utc(),
+    )
+    .unwrap();
+    payload.transaction.extension_expectations = versions;
+    crate::test_support::publish_current_payload(dfs, payload).unwrap();
+}
+
+fn publish_semantic_transaction<T: DfsMessageTransport>(
+    dfs: &mut NetworkedDfsService<T>,
+    transaction: DfsNamespaceTransaction,
+) -> Result<(), DfsError> {
+    let config = dfs
+        .namespace_shards_for_exact_paths(
+            &transaction.file_system_id,
+            ["/services/semantic-source.txt"],
+        )?
+        .remove(0);
+    let backend = dfs.metadata_backend.as_ref().unwrap();
+    let expected_objects = transaction
+        .objects
+        .iter()
+        .map(|object| object.object_id.clone())
+        .chain(
+            transaction
+                .versions
+                .iter()
+                .map(|version| version.object_id.clone()),
+        )
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|object_id| {
+            Ok(DfsNamespaceObjectVersionExpectation {
+                expected_version: backend
+                    .get_object(&object_id)?
+                    .map(|current| current.version),
+                object_id,
+            })
+        })
+        .collect::<Result<Vec<_>, MetadataBackendError>>()?;
+    let expected_paths = transaction
+        .objects
+        .iter()
+        .map(|object| {
+            Ok(DfsNamespacePathOccupantExpectation {
+                path: object.path.clone(),
+                expected_object_id: backend
+                    .get_object_by_path(&object.file_system_id, &object.path)?
+                    .map(|current| current.object_id),
+            })
+        })
+        .collect::<Result<Vec<_>, MetadataBackendError>>()?;
+    let payload = DfsPreparedOperationPayload::for_namespace_transaction(
+        DfsPreparedOperationScope {
+            file_system_id: transaction.file_system_id.clone(),
+            shard_id: DfsMetadataShardId::new(config.shard_id.clone()),
+            owner_epoch: config.epoch,
+            operation_id: format!("semantic-transaction:{}", transaction.transaction_id),
+        },
+        expected_objects,
+        expected_paths,
+        transaction,
+        Vec::new(),
+        None,
+        None,
+        Vec::new(),
+        None,
+        None,
+    )?;
+    crate::test_support::publish_current_payload(dfs, payload)
+}
+
+fn contribution<T: DfsMessageTransport>(
+    dfs: &mut NetworkedDfsService<T>,
     reference: DfsRevisionReference,
     _label: &str,
     expected_metadata: Option<DfsModuleMetadataValue>,
     metadata: Option<DfsModuleMetadataValue>,
 ) -> DfsAtomicContribution {
+    let head = dfs
+        .metadata_backend
+        .as_ref()
+        .unwrap()
+        .get_object(&reference.object_id)
+        .unwrap()
+        .expect("actual original current head");
+    let config = dfs
+        .namespace_shards_for_exact_paths(&reference.file_system_id, [head.path.as_str()])
+        .unwrap()
+        .remove(0);
     let operation_id = sinomo_core::Id::generate();
     let created_at = OffsetDateTime::from_unix_timestamp_nanos(
         i128::from(operation_id.timestamp_millis()) * 1_000_000,
@@ -108,11 +233,15 @@ fn contribution(
         operation_id: operation_id.to_string(),
         created_at,
         expected_heads: vec![DfsContributionHeadExpectation {
-            object_id: reference.object_id.clone(),
-            version: reference.version.clone(),
-            path: "/services/semantic-source.txt".into(),
+            object_id: head.object_id,
+            version: head.version,
+            path: head.path,
         }],
-        authority: None,
+        authority: Some(DfsContributionAuthorityExpectation {
+            shard_id: DfsMetadataShardId::new(config.shard_id),
+            primary_node_id: config.primary_node_id,
+            owner_epoch: config.epoch,
+        }),
         updates: vec![DfsRevisionMetadataContribution {
             identity: reference,
             expected_metadata,
@@ -122,47 +251,8 @@ fn contribution(
 }
 
 #[test]
-fn legacy_pin_requests_preserve_canonical_bytes_and_field_order() {
-    let reference = DfsRevisionReference {
-        file_system_id: sifs_file_system_id(),
-        object_id: DfsObjectId::from_legacy_named("semantic-legacy-object").unwrap(),
-        version: DfsVersion::from_legacy_named("semantic-legacy-version").unwrap(),
-    };
-    for operation in [
-        DfsFileHistoryPinOperation::Capture {
-            pin_id: "checkpoint".into(),
-        },
-        DfsFileHistoryPinOperation::Pin {
-            pin_id: "independent-pin".into(),
-        },
-        DfsFileHistoryPinOperation::Unpin {
-            pin_id: "independent-pin".into(),
-        },
-    ] {
-        let legacy = DfsFileHistoryPinRequest {
-            path: "/services/legacy.txt".into(),
-            identity: reference.clone(),
-            operation,
-            operation_id: "stable-legacy-pin".into(),
-        };
-        let original = serde_json::to_vec(&legacy).unwrap();
-        let decoded: DfsContentReferenceRequest = serde_json::from_slice(&original).unwrap();
-        assert_eq!(decoded.wire_format, DfsContentReferenceFormat::Legacy);
-        assert_eq!(decoded.namespace, "module.dfs.history");
-        assert_eq!(serde_json::to_vec(&decoded).unwrap(), original);
-        // This comparison protects the identity used by old durable receipts,
-        // rather than merely proving that both encodings decode successfully.
-        assert_eq!(
-            blake3::hash(&original),
-            blake3::hash(&serde_json::to_vec(&decoded).unwrap())
-        );
-    }
-}
-
-#[test]
 fn new_reference_requests_preserve_explicit_namespace_and_opaque_metadata() {
     let request = DfsContentReferenceRequest {
-        wire_format: DfsContentReferenceFormat::NamespacedV6,
         namespace: "vendor.semantic".into(),
         path: "/services/new.txt".into(),
         identity: DfsRevisionReference {
@@ -179,10 +269,10 @@ fn new_reference_requests_preserve_explicit_namespace_and_opaque_metadata() {
     let bytes = serde_json::to_vec(&request).unwrap();
     let wire: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(wire["namespace"], "vendor.semantic");
-    assert_eq!(wire["operation"]["pin_id"], "derived-index");
+    assert_eq!(wire["operation"]["reference_id"], "derived-index");
     assert!(wire["operation"].get("metadata").is_some());
     let decoded: DfsContentReferenceRequest = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(decoded.wire_format, DfsContentReferenceFormat::NamespacedV6);
+
     assert_eq!(decoded, request);
     assert_eq!(serde_json::to_vec(&decoded).unwrap(), bytes);
 }
@@ -190,11 +280,10 @@ fn new_reference_requests_preserve_explicit_namespace_and_opaque_metadata() {
 #[test]
 fn maximum_length_reference_can_be_reconciled_and_released() {
     let root = temp_root("semantic-reference-qualified-key-bound");
-    let (mut dfs, object, version) = semantic_fixture(&root);
+    let (_runtime, mut dfs, object, version) = semantic_fixture(&root);
     let reference_id = "r".repeat(256);
     let namespace = "vendor.semantic";
     let request = DfsContentReferenceRequest {
-        wire_format: DfsContentReferenceFormat::NamespacedV6,
         namespace: namespace.into(),
         path: object.path,
         identity: identity(&version),
@@ -219,22 +308,26 @@ fn maximum_length_reference_can_be_reconciled_and_released() {
         !dfs.content_reference_present(&release).unwrap(),
         "the qualified key must remain reconcilable after release"
     );
+
+    drop(dfs);
+    _runtime.close().unwrap();
 }
 
 #[test]
 fn atomic_module_metadata_preserves_foreign_namespace_and_immutable_content() {
     let root = temp_root("semantic-contribution-preserves-content");
-    let (mut dfs, object, before) = semantic_fixture(&root);
+    let (_runtime, mut dfs, object, before) = semantic_fixture(&root);
     let reference = identity(&before);
     let committed = DfsCommittedWorkTracker::new();
     dfs.set_committed_work_tracker(committed.clone());
-    dfs.apply_atomic_contribution(contribution(
+    let fresh = contribution(
+        &mut dfs,
         reference.clone(),
         "metadata-create",
         None,
         Some(metadata_value(1)),
-    ))
-    .unwrap();
+    );
+    dfs.apply_atomic_contribution(fresh).unwrap();
     assert!(
         committed.take().semantic_changes,
         "metadata-only publication must retain its owner wake before a response is built"
@@ -266,22 +359,48 @@ fn atomic_module_metadata_preserves_foreign_namespace_and_immutable_content() {
         dfs.posix_read_file(&object.path).unwrap(),
         b"immutable source bytes"
     );
+
+    drop(dfs);
+    _runtime.close().unwrap();
 }
 
 #[test]
 fn stale_revision_expectation_rejects_the_complete_transaction_before_mutation() {
     let root = temp_root("semantic-expectation-is-atomic");
-    let (mut dfs, object, first) = semantic_fixture(&root);
-    let mut second = first.clone();
-    second.object_id = DfsObjectId::from_legacy_named("semantic-second-object").unwrap();
-    second.version = DfsVersion::from_legacy_named("semantic-second-version").unwrap();
-    let backend = dfs.metadata_backend.as_mut().unwrap();
-    backend.put_version(&second).unwrap();
+    let (_runtime, mut dfs, object, first) = semantic_fixture(&root);
+    let second_stat = dfs
+        .posix_write_file(
+            "/services/semantic-second.txt",
+            b"second immutable source bytes",
+            DfsWriteOptions::replicated_eventual(vec![dfs.node_id().clone()]),
+        )
+        .unwrap();
+    let second_reference = DfsRevisionReference {
+        file_system_id: second_stat.file_system_id,
+        object_id: second_stat.object_id,
+        version: second_stat.version,
+    };
+    let mut initialize = contribution(
+        &mut dfs,
+        second_reference.clone(),
+        "second-original-metadata",
+        None,
+        Some(metadata_value(0)),
+    );
+    initialize.namespace = "vendor.other".into();
+    dfs.apply_atomic_contribution(initialize).unwrap();
+    let mut second = read_version(&dfs, &second_reference);
     let expected_second = second.clone();
-    second
-        .module_metadata
-        .insert("vendor.other".into(), metadata_value(9));
-    backend.put_version(&second).unwrap();
+    let mut changed = contribution(
+        &mut dfs,
+        second_reference.clone(),
+        "second-intervening-metadata",
+        Some(metadata_value(0)),
+        Some(metadata_value(9)),
+    );
+    changed.namespace = "vendor.other".into();
+    dfs.apply_atomic_contribution(changed).unwrap();
+    second = read_version(&dfs, &second_reference);
     let mut first_update = first.clone();
     first_update
         .module_metadata
@@ -315,9 +434,8 @@ fn stale_revision_expectation_rejects_the_complete_transaction_before_mutation()
         advisory_lock_states: Vec::new(),
         created_at: OffsetDateTime::UNIX_EPOCH,
     };
-    let error = backend
-        .apply_namespace_transaction(&transaction)
-        .unwrap_err();
+    let error = publish_semantic_transaction(&mut dfs, transaction.clone()).unwrap_err();
+    let backend = dfs.metadata_backend.as_ref().unwrap();
     assert!(
         error
             .to_string()
@@ -342,7 +460,7 @@ fn stale_revision_expectation_rejects_the_complete_transaction_before_mutation()
     );
     assert!(
         backend
-            .get_namespace_transaction(&transaction.transaction_id)
+            .get_namespace_transaction_receipt(&transaction.transaction_id)
             .unwrap()
             .is_none()
     ); // Fresh observations admit the same kind of batch, proving the earlier
@@ -353,7 +471,8 @@ fn stale_revision_expectation_rejects_the_complete_transaction_before_mutation()
     fresh.versions[1]
         .module_metadata
         .insert("vendor.other".into(), metadata_value(9));
-    backend.apply_namespace_transaction(&fresh).unwrap();
+    publish_semantic_transaction(&mut dfs, fresh).unwrap();
+    let backend = dfs.metadata_backend.as_ref().unwrap();
     for version in [&first, &second] {
         let current = backend
             .get_version(&version.object_id, &version.version)
@@ -368,36 +487,42 @@ fn stale_revision_expectation_rejects_the_complete_transaction_before_mutation()
         backend.get_object(&object.object_id).unwrap().unwrap().mode,
         0o600
     );
+
+    drop(dfs);
+    _runtime.close().unwrap();
 }
 
 #[test]
 fn admitted_contribution_retry_does_not_revert_intervening_metadata() {
     let root = temp_root("semantic-exact-contribution-retry");
-    let (mut dfs, _, before) = semantic_fixture(&root);
+    let (_runtime, mut dfs, object, before) = semantic_fixture(&root);
     let reference = identity(&before);
     let admitted = contribution(
+        &mut dfs,
         reference.clone(),
         "exact-retry",
         None,
         Some(metadata_value(1)),
     );
     dfs.apply_atomic_contribution(admitted.clone()).unwrap();
-    dfs.apply_atomic_contribution(contribution(
+    let fresh = contribution(
+        &mut dfs,
         reference.clone(),
         "later-edit",
         Some(metadata_value(1)),
         Some(metadata_value(2)),
-    ))
-    .unwrap();
-    let mut intervening = read_version(&dfs, &reference);
-    intervening
-        .module_metadata
-        .insert("vendor.other".into(), metadata_value(8));
-    dfs.metadata_backend
-        .as_mut()
-        .unwrap()
-        .put_version(&intervening)
-        .unwrap();
+    );
+    dfs.apply_atomic_contribution(fresh).unwrap();
+    let mut foreign = contribution(
+        &mut dfs,
+        reference.clone(),
+        "intervening-foreign-metadata",
+        Some(metadata_value(0)),
+        Some(metadata_value(8)),
+    );
+    foreign.namespace = "vendor.other".into();
+    dfs.apply_atomic_contribution(foreign).unwrap();
+    let intervening = read_version(&dfs, &reference);
     dfs.apply_atomic_contribution(admitted.clone())
         .expect("same admitted input remains successful after later edits");
     assert_eq!(
@@ -412,20 +537,42 @@ fn admitted_contribution_retry_does_not_revert_intervening_metadata() {
         "same operation id cannot name different inputs"
     );
     assert_eq!(read_version(&dfs, &reference), intervening);
+
+    drop(dfs);
+    _runtime.close().unwrap();
 }
 
 #[test]
 fn contribution_rechecks_the_original_head_under_the_actual_writer() {
     let root = temp_root("semantic-contribution-head-cas");
-    let (mut dfs, object, before) = semantic_fixture(&root);
+    let (_runtime, mut dfs, object, before) = semantic_fixture(&root);
     let reference = identity(&before);
-    let admitted = contribution(reference.clone(), "head-cas", None, Some(metadata_value(1)));
-    let mut moved = object.clone();
-    moved.version = DfsVersion::from_legacy_named("semantic-head-after-move").unwrap();
-    let expected_moved = moved.clone();
+    let admitted = contribution(
+        &mut dfs,
+        reference.clone(),
+        "head-cas",
+        None,
+        Some(metadata_value(1)),
+    );
+    let expected_moved = Arc::new(Mutex::new(None));
+    let observed = Arc::clone(&expected_moved);
+    let path = object.path.clone();
+    let owner = object.owner_node_id.clone();
+    let mut concurrent = _runtime.client(&owner).unwrap();
     let _hook = crate::service_metadata::install_namespace_prepare_after_expectations_test_hook(
-        move |backend| {
-            backend.put_object(&moved).unwrap();
+        move |_backend| {
+            let stat = concurrent
+                .posix_write_file(
+                    &path,
+                    b"intervening native write",
+                    DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
+                )
+                .unwrap();
+            *observed.lock().unwrap() = concurrent
+                .metadata_backend()
+                .unwrap()
+                .get_object(&stat.object_id)
+                .unwrap();
         },
     );
     assert!(dfs.apply_atomic_contribution(admitted).is_err());
@@ -436,17 +583,22 @@ fn contribution_rechecks_the_original_head_under_the_actual_writer() {
             .unwrap()
             .get_object(&object.object_id)
             .unwrap(),
-        Some(expected_moved),
+        expected_moved.lock().unwrap().clone(),
         "an intervening head update must survive failed contribution admission"
     );
+
+    drop(_hook);
+    drop(dfs);
+    _runtime.close().unwrap();
 }
 
 #[test]
 fn contribution_requires_complete_distinct_original_head_expectations() {
     let root = temp_root("semantic-contribution-head-shape");
-    let (mut dfs, _, before) = semantic_fixture(&root);
+    let (_runtime, mut dfs, _, before) = semantic_fixture(&root);
     let reference = identity(&before);
     let valid = contribution(
+        &mut dfs,
         reference.clone(),
         "head-shape",
         None,
@@ -464,23 +616,23 @@ fn contribution_requires_complete_distinct_original_head_expectations() {
     stale.expected_heads[0].version = DfsVersion::from_legacy_named("semantic-stale-head").unwrap();
     assert!(dfs.apply_atomic_contribution(stale).is_err());
     assert_eq!(read_version(&dfs, &reference), before);
+
+    drop(dfs);
+    _runtime.close().unwrap();
 }
 
 #[test]
 fn contribution_retry_context_roundtrips_through_json_and_sobj() {
     let root = temp_root("semantic-contribution-context-wire");
-    let (_, object, before) = semantic_fixture(&root);
-    let mut request = contribution(
+    let (_runtime, mut dfs, _object, before) = semantic_fixture(&root);
+    let request = contribution(
+        &mut dfs,
         identity(&before),
         "context-wire",
         Some(metadata_value(1)),
         Some(metadata_value(2)),
     );
-    request.authority = Some(DfsContributionAuthorityExpectation {
-        shard_id: DfsMetadataShardId::new("services"),
-        primary_node_id: object.current_locations[0].clone(),
-        owner_epoch: 3,
-    });
+    assert!(request.authority.is_some());
     let json = serde_json::to_vec(&request).unwrap();
     assert_eq!(
         serde_json::from_slice::<DfsAtomicContribution>(&json).unwrap(),
@@ -498,38 +650,51 @@ fn contribution_retry_context_roundtrips_through_json_and_sobj() {
         sinomo_core::object::serde_ext::from_bytes::<DfsAtomicContribution>(&bytes).unwrap(),
         request
     );
+
+    drop(dfs);
+    _runtime.close().unwrap();
 }
 
 #[test]
 fn contribution_to_an_old_object_does_not_require_ownership_of_its_reused_path() {
     let root = temp_root("semantic-contribution-reused-locator");
-    let (mut dfs, object, before) = semantic_fixture(&root);
-    let mut deleted = object.clone();
-    deleted.kind = DfsObjectKind::Tombstone;
-    deleted.version = DfsVersion::from_legacy_named("semantic-deleted-head").unwrap();
-    deleted.content_hash = None;
-    deleted.content_size_bytes = None;
-    let mut replacement = object.clone();
-    replacement.object_id = DfsObjectId::from_legacy_named("semantic-reused-new-object").unwrap();
-    replacement.version = DfsVersion::from_legacy_named("semantic-reused-new-head").unwrap();
-    let mut replacement_revision = before.clone();
-    replacement_revision.object_id = replacement.object_id.clone();
-    replacement_revision.version = replacement.version.clone();
-    {
-        let backend = dfs.metadata_backend.as_mut().unwrap();
-        backend.put_object(&deleted).unwrap();
-        backend
-            .put_object_and_version(&replacement, &replacement_revision)
-            .unwrap();
-    }
+    let (_runtime, mut dfs, object, before) = semantic_fixture(&root);
+    dfs.posix_unlink(&object.path).unwrap();
+    let deleted = dfs
+        .metadata_backend
+        .as_ref()
+        .unwrap()
+        .get_object(&object.object_id)
+        .unwrap()
+        .expect("actual canonical tombstone");
+    assert_eq!(deleted.kind, DfsObjectKind::Tombstone);
+    let recreated = dfs
+        .posix_write_file(
+            &object.path,
+            b"immutable source bytes",
+            DfsWriteOptions::replicated_eventual(vec![object.owner_node_id.clone()]),
+        )
+        .unwrap();
+    let replacement = dfs
+        .metadata_backend
+        .as_ref()
+        .unwrap()
+        .get_object(&recreated.object_id)
+        .unwrap()
+        .unwrap();
+    assert_ne!(
+        replacement.object_id, object.object_id,
+        "the replacement is a real new path occupant"
+    );
     let reference = identity(&before);
-    let mut request = contribution(
+    let request = contribution(
+        &mut dfs,
         reference.clone(),
         "reused-locator",
         None,
         Some(metadata_value(1)),
     );
-    request.expected_heads[0].version = deleted.version;
+    assert_eq!(request.expected_heads[0].version, deleted.version);
     dfs.apply_atomic_contribution(request).unwrap();
     assert_eq!(
         read_version(&dfs, &reference)
@@ -546,14 +711,18 @@ fn contribution_to_an_old_object_does_not_require_ownership_of_its_reused_path()
         Some(replacement),
         "an old object's metadata contribution cannot mutate the new path occupant"
     );
+
+    drop(dfs);
+    _runtime.close().unwrap();
 }
 
 #[test]
 fn expired_contribution_cannot_restamp_its_original_timestamp() {
     let root = temp_root("semantic-contribution-expired-retry");
-    let (mut dfs, _, before) = semantic_fixture(&root);
+    let (mut _runtime, mut dfs, _, before) = semantic_fixture(&root);
     let reference = identity(&before);
     let mut admitted = contribution(
+        &mut dfs,
         reference.clone(),
         "expired-original",
         None,
@@ -562,40 +731,61 @@ fn expired_contribution_cannot_restamp_its_original_timestamp() {
     admitted.created_at = OffsetDateTime::UNIX_EPOCH;
     admitted.operation_id = "00000000000000000000000000".into();
     dfs.apply_atomic_contribution(admitted.clone()).unwrap();
-    // Return this namespace to its original value, so only durable replay
-    // evidence or its expiry floor can prevent the old operation reapplying.
-    dfs.apply_atomic_contribution(contribution(
-        reference.clone(),
-        "clear-after-original",
-        Some(metadata_value(1)),
-        None,
-    ))
-    .unwrap();
-    assert_eq!(read_version(&dfs, &reference), before);
     let transaction_id = format!(
         "metadata-contribution:vendor.semantic:{}",
         admitted.operation_id
     );
-    let first_now = u64::try_from(OffsetDateTime::now_utc().unix_timestamp_nanos()).unwrap();
-    let first = dfs
+    let record = dfs
         .metadata_backend
-        .as_mut()
+        .as_ref()
         .unwrap()
-        .gc_metadata_history(
-            DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 4096)
-                .with_now_unix_nanos(first_now)
-                .with_max_removals(4096),
-        )
-        .unwrap();
-    assert!(first.compacted_namespace_transaction_count >= 1);
+        .prepared_operation_record(&format!("namespace:{transaction_id}"))
+        .unwrap()
+        .expect("actual committed contribution body");
+    assert_eq!(record.status, DfsPreparedOperationStatus::Committed);
+    let digest = record.digest.clone();
+    let original_commit = record.committed_entry.clone();
+    // Return this namespace to its original value, so only durable replay
+    // evidence or its expiry floor can prevent the old operation reapplying.
+    let fresh = contribution(
+        &mut dfs,
+        reference.clone(),
+        "clear-after-original",
+        Some(metadata_value(1)),
+        None,
+    );
+    dfs.apply_atomic_contribution(fresh).unwrap();
+    assert_eq!(read_version(&dfs, &reference), before);
+    publish_semantic_effects(
+        &mut dfs,
+        &before.file_system_id,
+        vec![DfsPreparedMetadataEffect::RemovePreparedOperation {
+            digest: digest.clone(),
+        }],
+    );
     assert!(
         dfs.metadata_backend
             .as_ref()
             .unwrap()
-            .get_namespace_transaction(&transaction_id)
+            .prepared_operation_record(&digest.operation_id)
             .unwrap()
             .is_none()
     );
+    let snapshot = dfs
+        .metadata_backend
+        .as_ref()
+        .unwrap()
+        .export_shard_table_snapshot(&digest.shard_id)
+        .unwrap()
+        .unwrap();
+    let witness = snapshot
+        .tables
+        .prepared_operation_evictions
+        .iter()
+        .find(|witness| witness.digest.operation_id == digest.operation_id)
+        .expect("exact current terminal witness");
+    assert_eq!(witness.digest, digest);
+    assert_eq!(witness.committed_entry, original_commit);
     assert!(
         dfs.metadata_backend
             .as_ref()
@@ -607,15 +797,13 @@ fn expired_contribution_cannot_restamp_its_original_timestamp() {
     dfs.apply_atomic_contribution(admitted.clone())
         .expect("compact exact proof remains successful");
     assert_eq!(read_version(&dfs, &reference), before);
-    dfs.metadata_backend
-        .as_mut()
-        .unwrap()
-        .gc_metadata_history(
-            DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 4096)
-                .with_now_unix_nanos(first_now.saturating_add(1))
-                .with_max_removals(4096),
-        )
-        .unwrap();
+    let now = u64::try_from(OffsetDateTime::now_utc().unix_timestamp_nanos()).unwrap();
+    dfs.gc_metadata_history(
+        DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 4096)
+            .with_now_unix_nanos(now)
+            .with_max_removals(4096),
+    )
+    .unwrap();
     assert!(
         dfs.metadata_backend
             .as_ref()
@@ -629,32 +817,25 @@ fn expired_contribution_cannot_restamp_its_original_timestamp() {
     let error = dfs.apply_atomic_contribution(restamped).unwrap_err();
     assert!(error.to_string().contains("timestamp"), "{error}");
     let error = dfs.apply_atomic_contribution(admitted.clone()).unwrap_err();
-    assert!(error.to_string().contains("history expired"), "{error}");
+    assert!(error.to_string().contains("terminally evicted"), "{error}");
     assert_eq!(read_version(&dfs, &reference), before);
+    let node = dfs.node_id().clone();
     drop(dfs);
-    let mut reopened = NetworkedDfsService::new(
-        crate::test_runtime::DfsTestRuntime::local_transport(
-            NodeId::from_legacy_named("semantic-extension-owner").unwrap(),
-        ),
-        LocalContentStore::new(root.join("content")).unwrap(),
-    )
-    .with_metadata_backend(
-        LocalSobjMetadataBackend::new(
-            DfsMetadataShardId::new("semantic-root"),
-            root.join("metadata"),
-        )
-        .unwrap(),
-    )
-    .unwrap();
+    _runtime.stop_node(&node).unwrap();
+    _runtime.reopen_node(node.clone()).unwrap();
+    let mut reopened = _runtime.client(&node).unwrap();
     let error = reopened.apply_atomic_contribution(admitted).unwrap_err();
-    assert!(error.to_string().contains("history expired"), "{error}");
+    assert!(error.to_string().contains("terminally evicted"), "{error}");
     assert_eq!(read_version(&reopened, &reference), before);
+
+    drop(reopened);
+    _runtime.close().unwrap();
 }
 
 #[test]
 fn missing_object_or_deleted_object_with_a_live_reference_is_not_gc_authority() {
     let root = temp_root("semantic-lifecycle-deletion-proof");
-    let (mut dfs, object, mut retained) = semantic_fixture(&root);
+    let (_runtime, mut dfs, object, retained) = semantic_fixture(&root);
     let absent = DfsObjectId::from_legacy_named("semantic-missing-object").unwrap();
     let missing = dfs
         .object_lifecycle(&object.file_system_id, &absent)
@@ -664,37 +845,18 @@ fn missing_object_or_deleted_object_with_a_live_reference_is_not_gc_authority() 
         !missing.reclaimable,
         "absence cannot authorize source reclamation"
     );
-    retained.retention.insert(
-        "vendor.semantic".into(),
-        DfsRevisionRetentionState {
-            order: 1,
-            grant: Some(Box::new(DfsRevisionRetentionGrant {
-                object: Box::new(object.clone()),
-                granted_at_unix_nanos: 1,
-                origin: DfsRetentionGrantOrigin::ExplicitOperation,
-                minimum: None,
-            })),
+    let reference = DfsContentReferenceRequest {
+        namespace: "vendor.semantic".into(),
+        path: object.path.clone(),
+        identity: identity(&retained),
+        operation: DfsContentReferenceOperation::CaptureCurrent {
+            reference_id: "independent-consumer".into(),
+            metadata: None,
         },
-    );
-    let pin = DfsMetadataVersionPinRecord {
-        namespace: Some("vendor.semantic".into()),
-        file_system_id: object.file_system_id.clone(),
-        object_id: object.object_id.clone(),
-        version: retained.version.clone(),
-        pin_id: content_reference_storage_id("vendor.semantic", "independent-consumer"),
-        created_at: OffsetDateTime::UNIX_EPOCH,
+        operation_id: sinomo_core::Id::generate().to_string(),
     };
-    let mut deleted = object.clone();
-    deleted.kind = DfsObjectKind::Tombstone;
-    deleted.version = DfsVersion::from_legacy_named("semantic-source-deleted").unwrap();
-    deleted.content_hash = None;
-    deleted.content_size_bytes = None;
-    {
-        let backend = dfs.metadata_backend.as_mut().unwrap();
-        backend.put_version(&retained).unwrap();
-        backend.put_version_pin(&pin).unwrap();
-        backend.put_object(&deleted).unwrap();
-    }
+    dfs.retain_content_revision(reference.clone()).unwrap();
+    dfs.posix_unlink(&object.path).unwrap();
     let protected = dfs
         .object_lifecycle(&object.file_system_id, &object.object_id)
         .unwrap();
@@ -713,16 +875,14 @@ fn missing_object_or_deleted_object_with_a_live_reference_is_not_gc_authority() 
         panic!("the independent generic reference must authorize retained bytes");
     };
     assert_eq!(data.bytes, b"immutable source bytes");
-    dfs.metadata_backend
-        .as_mut()
-        .unwrap()
-        .remove_version_pin(
-            &pin.file_system_id,
-            &pin.object_id,
-            &pin.version,
-            &pin.pin_id,
-        )
-        .unwrap();
+    dfs.retain_content_revision(DfsContentReferenceRequest {
+        operation: DfsContentReferenceOperation::Release {
+            reference_id: "independent-consumer".into(),
+        },
+        operation_id: sinomo_core::Id::generate().to_string(),
+        ..reference
+    })
+    .unwrap();
     assert!(
         dfs.object_lifecycle(&object.file_system_id, &object.object_id)
             .unwrap()
@@ -734,4 +894,7 @@ fn missing_object_or_deleted_object_with_a_live_reference_is_not_gc_authority() 
             .is_err(),
         "a leftover content manifest cannot authorize an unprotected revision"
     );
+
+    drop(dfs);
+    _runtime.close().unwrap();
 }

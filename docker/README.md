@@ -445,65 +445,29 @@ The JSON report preserves both the pending request and the final assignment.
 This is completed-content handoff coverage; it does not inject a failure during
 incomplete content replication.
 
-## Storage migration acceptance
+## Storage conversion acceptance
 
-Use a disposable cluster running an older executable to create the source data:
+DFS opens the current native storage format. `sinomo-dfs-migration` owns
+retained-format decoding and incremental conversion. The ordinary component
+factory registers one storage preparation provider while retaining its actual
+data owner; that provider prepares metadata and content roots before routes
+are admitted. A pending conversion is a typed startup condition. Every cluster
+node must upgrade to the current protocol before it can participate.
 
-```sh
-python3 docker/test-storage-migrations.py prepare \
-  --project "$SINOMO_TEST_PROJECT" --binary "$SINOMO_BASELINE_BINARY" \
-  --inspector-binary "$SINOMO_CANDIDATE_BINARY" \
-  --artifacts target/storage-migration-before
-```
+Use disposable, operator-owned volumes for upgrade acceptance. Retain the
+baseline executable hash, current file identities, retained history identities,
+and the source data. Replace executables while those nodes are stopped, then
+verify actual converter progress and inspect current root schema and certified
+prefixes before accepting the candidate. Confirm ordinary current reads,
+retained reads, writes, and exact recovery replay after restart with the history
+acceptance driver. Keep converter execution evidence separate from successful
+network reads and from current protocol capability reports.
 
-Upgrade that owned project to the candidate while preserving its data volumes.
-Refresh the bootstrap mount and any installed main/shadow executable copies;
-recreate containers when bind-mounted executable files change. Then run:
-
-```sh
-python3 docker/test-storage-migrations.py verify \
-  --project "$SINOMO_TEST_PROJECT" --binary "$SINOMO_CANDIDATE_BINARY" \
-  --fixture target/storage-migration-before/fixture.json \
-  --artifacts target/storage-migration-after
-```
-
-Both phases accept `--compose-override` for an explicit network configuration.
-Preparation supports old SOBJ document versions one through three and the
-genuine pre-change `SMIGLOG1` stream with inner format three. For a stream
-baseline, `--inspector-binary` is required: the candidate is staged temporarily
-only to run its bounded read-only header probe. Preparation verifies the old
-main/shadow executable hashes before and after, records the inspector hash and
-raw prefixes, and rejects a floor-six or unchecked stream baseline. It never
-uses the candidate to author the fixture data.
-The verifier waits for the capability-fenced namespace codec transitions before
-running the standard readiness/mutation gates: a running new process alone does
-not mean every shard has activated its new writer contract. It checks executable
-hashes, old-format source snapshots, retained
-content from a deleted file, unchanged current file identity, current-format
-writes, completed migration jobs, and current physical snapshot headers.
-New grant authoring requires PackedV6 on every assigned metadata peer. The
-verifier preserves the legacy fixture's `SOBJ` input header and checks both
-legacy target-three migration jobs and completed target-six reader-floor jobs.
-The `cluster.dfs.metadata-snapshot-reader-floor` probe uses the core owner's
-bounded checksummed header reader to validate the installed inner format and
-generation on all six nodes. The unchanged `SMIGLOG1` outer magic alone is
-insufficient evidence of floor six.
-Each node must have a checked floor-six snapshot. Authenticated replica
-snapshot installation validates the transferred prefix and publishes that
-floor directly, so a node may have no local migration job. The verifier
-validates every observed target-six job's owner, identity, terminal status and
-record counts, and separately requires at least one completed local bounded
-floor-six migration across the cluster. Physical installation and local
-migration execution remain distinct evidence.
-Verification also performs a full SIGKILL/restart and checks retained reads and
-exact recovery replay and the inner reader floors afterward. Its standard readiness and convergence gates
-are unchanged. The verifier itself never installs binaries or resets volumes.
-
-A stopped-cluster binary replacement is persistence/recovery evidence, not
-mixed-version rolling-upgrade or availability acceptance. The process-death
-tests in the storage/DFS crates exercise interruption inside migration batches;
-the [storage migration guide](../docs/developer/storage-migrations.md) describes
-the standalone million-record benchmark and its limits.
+The source converters have filesystem interruption and bounded-record tests in
+the migration crate. Running those checks validates that source boundary; cluster
+acceptance also requires actual converter reports from every owned node. Preserve
+failed or unavailable inspection results instead of treating readiness as a
+physical conversion receipt.
 
 ## Opt-in profiling sidecar
 

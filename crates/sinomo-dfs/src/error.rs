@@ -42,6 +42,17 @@ pub enum DfsError {
     ContentStore { message: String },
     #[error("distributed DFS error: {message}")]
     Distributed { message: String },
+    /// Raft votes and content receipts cannot substitute for an exact durable
+    /// metadata-prepare recovery quorum.
+    #[error(
+        "metadata shard {shard_id} recovery quorum unavailable: verified {verified}, required {required}"
+    )]
+    MetadataRecoveryQuorumUnavailable {
+        file_system_id: DfsFileSystemId,
+        shard_id: String,
+        required: usize,
+        verified: usize,
+    },
     #[error(
         "DFS write operation {operation_id} for object {object_id} was already bound to a different payload"
     )]
@@ -74,6 +85,13 @@ pub enum DfsError {
         handoff_id: String,
         retiring_epoch: u64,
         desired_epoch: u64,
+    },
+    #[error(
+        "metadata storage preparation at {root:?} remains pending after {processed_records} records"
+    )]
+    StoragePreparationPending {
+        root: std::path::PathBuf,
+        processed_records: usize,
     },
     #[error("metadata backend error: {message}")]
     Metadata { message: String },
@@ -235,8 +253,17 @@ pub(crate) fn routed_write_rejection_error(reason: &str) -> DfsError {
 
 impl From<ContentStoreError> for DfsError {
     fn from(error: ContentStoreError) -> Self {
-        Self::ContentStore {
-            message: error.to_string(),
+        match error {
+            ContentStoreError::StoragePreparationPending {
+                root,
+                processed_records,
+            } => Self::StoragePreparationPending {
+                root,
+                processed_records,
+            },
+            error => Self::ContentStore {
+                message: error.to_string(),
+            },
         }
     }
 }
@@ -252,6 +279,13 @@ impl From<DfsDistributedError> for DfsError {
 impl From<MetadataBackendError> for DfsError {
     fn from(error: MetadataBackendError) -> Self {
         match error {
+            MetadataBackendError::StoragePreparationPending {
+                root,
+                processed_records,
+            } => Self::StoragePreparationPending {
+                root,
+                processed_records,
+            },
             error @ MetadataBackendError::Rejected { .. } => Self::MetadataRejection {
                 code: error.rejection_code(),
                 message: error.to_string(),

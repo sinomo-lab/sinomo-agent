@@ -1,0 +1,50 @@
+{
+  "description": "The model reads a TODO list, checks off an item with edit_file, and confirms. The workspace allows writes.",
+  "workspace": {
+    "files": {
+      "TODO.md": "- [ ] write release notes\n- [ ] tag v1.4\n"
+    },
+    "allow_writes": true
+  },
+  "turns": ["Mark 'write release notes' as done in TODO.md."],
+  "script": {
+    "exchanges": [
+      {
+        "expect": [{ "tool_offered": "read_file" }, { "tool_offered": "edit_file" }],
+        "reply": {
+          "stream": [{ "tool_call": { "name": "read_file", "input": { "path": "TODO.md" } } }]
+        }
+      },
+      {
+        "expect": [{ "contains": "- [ ] write release notes" }],
+        "reply": {
+          "stream": [
+            { "text": "Checking it off." },
+            {
+              "tool_call": {
+                "name": "edit_file",
+                "input": {
+                  "path": "TODO.md",
+                  "old_text": "- [ ] write release notes",
+                  "new_text": "- [x] write release notes"
+                }
+              }
+            }
+          ]
+        }
+      },
+      {
+        "expect": [{ "tool_output_for": "edit_file" }],
+        "reply": {
+          "stream": [
+            { "text": "{\"response_mode\":\"answer\",\"text\":\"Done: 'write release notes' is checked off.\",\"tool_calls\":[],\"background_handoff\":null,\"next_state\":\"listening\"}" }
+          ]
+        }
+      }
+    ]
+  },
+  "expect": {
+    "answer_contains": "checked off",
+    "files": { "TODO.md": "- [x] write release notes\n- [ ] tag v1.4" }
+  }
+}

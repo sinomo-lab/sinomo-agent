@@ -146,24 +146,51 @@ fn response_delivery_rejects_one_oversized_journal_without_consuming_custody() {
     };
     let payload_bytes = MAX_INBOX_BYTES + 1;
     let shard = crate::DfsMetadataShardId::new("root");
-    response
-        .metadata_journal_batches
-        .push(crate::DfsMetadataJournalBatch {
+    let payload = crate::DfsPreparedOperationPayload::for_metadata_effects(
+        crate::DfsPreparedOperationScope {
+            file_system_id: crate::sifs_file_system_id(),
+            shard_id: shard.clone(),
+            owner_epoch: 1,
+            operation_id: "delivery-oversized-body".into(),
+        },
+        Vec::new(),
+        Vec::new(),
+        vec![crate::DfsPreparedMetadataEffect::PutFileSystem {
+            file_system: crate::DfsFileSystem {
+                file_system_id: crate::sifs_file_system_id(),
+                owner_node_id: NodeId::from_legacy_named("delivery-primary").unwrap(),
+                display_name: "x".repeat(payload_bytes),
+                subtree_policies: Vec::new(),
+                retention_policies: Default::default(),
+                module_metadata: Default::default(),
+            },
+        }],
+        time::OffsetDateTime::UNIX_EPOCH,
+    )
+    .unwrap();
+    let digest = crate::DfsPreparedOperationDigest::at_sequence(&payload, 1).unwrap();
+    response.metadata_journal_batches.push(
+        crate::test_support::structural_journal_frame_batch(crate::DfsMetadataJournalBatch {
             shard_id: shard.clone(),
             next_after_sequence: 1,
             entries: vec![crate::DfsMetadataJournalEntry {
                 shard_id: shard,
                 sequence: 1,
                 created_at: time::OffsetDateTime::UNIX_EPOCH,
-                mutation: crate::DfsMetadataMutation::PutObject {
+                mutation: crate::DfsMetadataMutation::PrepareOperationV7 {
                     file_system_id: crate::sifs_file_system_id(),
-                    object_id: response.object_id.clone(),
-                    path: "x".repeat(payload_bytes),
-                    object: None,
-                    routing_change: None,
+                    operation_id: payload.operation_id.clone(),
+                    record: Box::new(crate::DfsPreparedOperationRecord {
+                        digest,
+                        payload: Arc::new(payload),
+                        status: crate::DfsPreparedOperationStatus::Prepared,
+                        committed_entry: None,
+                    }),
                 },
             }],
-        });
+        })
+        .unwrap(),
+    );
     // The journal string alone exceeds the real byte limit. Supplying that
     // conservative wire-size lower bound exercises production custody directly,
     // without allowing the test-only encoder's own limits to cause the failure.

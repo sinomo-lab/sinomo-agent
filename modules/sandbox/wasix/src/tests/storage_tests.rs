@@ -3,14 +3,12 @@ use std::sync::{Arc, Mutex};
 
 #[test]
 fn sifs_create_publishes_complete_generation_behind_stable_symlink_and_external_fence() {
-    let runtime_root = unique_test_dir("sinomo-sandbox-generation-layout");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_generation_layout").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(runtime_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_create_publishes_complete_generation_behind_stable_symlink_and_external_fence",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id = SandboxId::from_legacy_named("sandbox_generation_layout").expect("sandbox");
     let mut store = SifsSandboxInstanceStore::new(dfs);
     let candidate = SandboxInstanceManifest::new(
@@ -62,106 +60,108 @@ fn sifs_create_publishes_complete_generation_behind_stable_symlink_and_external_
         store.load(&sandbox_id).expect("load").workspace_root,
         stable
     );
-    fs::remove_dir_all(runtime_root).ok();
+
+    drop(store);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
 fn destroy_finalization_stops_on_lease_loss_and_cannot_walk_a_recreated_control_root() {
-    let runtime_root = unique_test_dir("sinomo-sandbox-destroy-finalize-fence");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_destroy_finalize_fence").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id.clone()),
-        LocalContentStore::new(runtime_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
-    let sandbox_id =
-        SandboxId::from_legacy_named("sandbox_destroy_finalize_fence").expect("sandbox");
-    let toolchain = SandboxToolchainId::from_legacy_named("toolchain_busybox").expect("toolchain");
-    let mut store = SifsSandboxInstanceStore::new(dfs);
-    store
-        .create(
-            sandbox_id.clone(),
-            toolchain.clone(),
-            OffsetDateTime::UNIX_EPOCH,
-        )
-        .expect("create");
-    let checkpoint_tree = format!("{}/checkpoints/deep/a/b", sandbox_control_root(&sandbox_id));
-    store
-        .dfs
-        .posix_mkdir_all(&checkpoint_tree)
-        .expect("checkpoint tree");
-    store
-        .dfs
-        .posix_write_file(
-            &format!("{checkpoint_tree}/state"),
-            b"checkpoint",
-            DfsWriteOptions::replicated_eventual(vec![node_id]),
-        )
-        .expect("checkpoint state");
-
-    let destroying = store
-        .prepare_destroy(&sandbox_id, OffsetDateTime::now_utc())
-        .expect("prepare destroy");
-    let destroy_txn = destroying
-        .pending_reconciliation
-        .as_ref()
-        .expect("destroy transaction")
-        .transaction_id
-        .clone();
-    store
-        .apply_destroy(&sandbox_id, &destroy_txn)
-        .expect("remove incarnation generation");
-    let mut checkpoints = 0usize;
-    let interrupted = store.finalize_destroy_with_checkpoints(&sandbox_id, &destroy_txn, || {
-        checkpoints += 1;
-        if checkpoints == 3 {
-            return Err(SandboxStoreError::Io {
-                path: sandbox_control_root(&sandbox_id),
-                detail: "test lease lost".to_string(),
-            });
-        }
-        Ok(())
-    });
-    assert!(interrupted.is_err(), "lease loss must stop finalization");
-    assert!(matches!(
-        store.load(&sandbox_id),
-        Err(SandboxStoreError::ReconciliationPending { .. })
-    ));
-
-    store
-        .finalize_destroy(&sandbox_id, &destroy_txn)
-        .expect("new lease resumes exact destroy");
-    let recreated = store
-        .create(sandbox_id.clone(), toolchain, OffsetDateTime::now_utc())
-        .expect("same id can be recreated after finalization");
-    let stale_finalize = store
-        .finalize_destroy(&sandbox_id, &destroy_txn)
-        .expect_err("old destroy transaction cannot enter a recreated control root");
-    assert!(
-        stale_finalize.to_string().contains("is not pending"),
-        "unexpected stale destroy error: {stale_finalize}"
-    );
-    assert!(
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "destroy_finalization_stops_on_lease_loss_and_cannot_walk_a_recreated_control_root",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
+    {
+        let sandbox_id =
+            SandboxId::from_legacy_named("sandbox_destroy_finalize_fence").expect("sandbox");
+        let toolchain =
+            SandboxToolchainId::from_legacy_named("toolchain_busybox").expect("toolchain");
+        let mut store = SifsSandboxInstanceStore::new(dfs);
+        store
+            .create(
+                sandbox_id.clone(),
+                toolchain.clone(),
+                OffsetDateTime::UNIX_EPOCH,
+            )
+            .expect("create");
+        let checkpoint_tree = format!("{}/checkpoints/deep/a/b", sandbox_control_root(&sandbox_id));
         store
             .dfs
-            .posix_lstat_distributed(&sandbox_instance_root(&sandbox_id))
-            .is_ok()
-    );
-    assert!(recreated.pending_reconciliation.is_none());
-    fs::remove_dir_all(runtime_root).ok();
+            .posix_mkdir_all(&checkpoint_tree)
+            .expect("checkpoint tree");
+        store
+            .dfs
+            .posix_write_file(
+                &format!("{checkpoint_tree}/state"),
+                b"checkpoint",
+                DfsWriteOptions::replicated_eventual(vec![node_id]),
+            )
+            .expect("checkpoint state");
+
+        let destroying = store
+            .prepare_destroy(&sandbox_id, OffsetDateTime::now_utc())
+            .expect("prepare destroy");
+        let destroy_txn = destroying
+            .pending_reconciliation
+            .as_ref()
+            .expect("destroy transaction")
+            .transaction_id
+            .clone();
+        store
+            .apply_destroy(&sandbox_id, &destroy_txn)
+            .expect("remove incarnation generation");
+        let mut checkpoints = 0usize;
+        let interrupted =
+            store.finalize_destroy_with_checkpoints(&sandbox_id, &destroy_txn, || {
+                checkpoints += 1;
+                if checkpoints == 3 {
+                    return Err(SandboxStoreError::Io {
+                        path: sandbox_control_root(&sandbox_id),
+                        detail: "test lease lost".to_string(),
+                    });
+                }
+                Ok(())
+            });
+        assert!(interrupted.is_err(), "lease loss must stop finalization");
+        assert!(matches!(
+            store.load(&sandbox_id),
+            Err(SandboxStoreError::ReconciliationPending { .. })
+        ));
+
+        store
+            .finalize_destroy(&sandbox_id, &destroy_txn)
+            .expect("new lease resumes exact destroy");
+        let recreated = store
+            .create(sandbox_id.clone(), toolchain, OffsetDateTime::now_utc())
+            .expect("same id can be recreated after finalization");
+        let stale_finalize = store
+            .finalize_destroy(&sandbox_id, &destroy_txn)
+            .expect_err("old destroy transaction cannot enter a recreated control root");
+        assert!(
+            stale_finalize.to_string().contains("is not pending"),
+            "unexpected stale destroy error: {stale_finalize}"
+        );
+        assert!(
+            store
+                .dfs
+                .posix_lstat_distributed(&sandbox_instance_root(&sandbox_id))
+                .is_ok()
+        );
+        assert!(recreated.pending_reconciliation.is_none());
+    }
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
 fn legacy_directory_migration_preserves_checkpoint_resume_and_stable_refs() {
-    let runtime_root = unique_test_dir("sinomo-sandbox-legacy-layout");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_legacy_layout").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id.clone()),
-        LocalContentStore::new(runtime_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "legacy_directory_migration_preserves_checkpoint_resume_and_stable_refs",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let sandbox_id = SandboxId::from_legacy_named("sandbox_legacy_layout").expect("sandbox");
     let checkpoint_id = SandboxCheckpointId::from_legacy_named("legacy_checkpoint").expect("cp");
     let stable = sandbox_instance_root(&sandbox_id);
@@ -244,7 +244,9 @@ fn legacy_directory_migration_preserves_checkpoint_resume_and_stable_refs() {
             .expect("stable resumed file"),
         b"checkpoint"
     );
-    fs::remove_dir_all(runtime_root).ok();
+
+    drop(store);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -282,14 +284,12 @@ fn command_outputs_persist_through_local_sandbox_filesystem() {
 
 #[test]
 fn command_outputs_persist_through_sifs_sandbox_filesystem() {
-    let runtime_root = unique_test_dir("sinomo-sandbox-command-outputs-sifs");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_command_outputs").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(runtime_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "command_outputs_persist_through_sifs_sandbox_filesystem",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let mut store = SifsSandboxInstanceStore::new(dfs);
     let manifest = store
         .create(
@@ -325,7 +325,9 @@ fn command_outputs_persist_through_sifs_sandbox_filesystem() {
         load_command_record(&mut sandbox_fs, &record.command_id).expect("record"),
         record
     );
-    fs::remove_dir_all(runtime_root).ok();
+
+    drop(sandbox_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -453,14 +455,12 @@ fn failed_command_record_events_append_raw_output_before_status() {
 
 #[test]
 fn command_record_events_append_from_sifs_sandbox_logs() {
-    let runtime_root = unique_test_dir("sinomo-sandbox-command-events-sifs");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_command_events").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id.clone()),
-        LocalContentStore::new(runtime_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "command_record_events_append_from_sifs_sandbox_logs",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let mut store = SifsSandboxInstanceStore::new(dfs);
     let manifest = store
         .create(
@@ -506,7 +506,9 @@ fn command_record_events_append_from_sifs_sandbox_logs() {
         events[2].event.payload["command_id"],
         record.command_id.to_string()
     );
-    fs::remove_dir_all(runtime_root).ok();
+
+    drop(sandbox_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -628,15 +630,12 @@ fn sandbox_workspace_sync_copies_local_tree_to_sifs() {
             b"fn main() {}\n",
         )
         .expect("write file");
-
-    let runtime_root = unique_test_dir("sinomo-sandbox-sync-local-to-sifs");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sync_local_to_sifs").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(runtime_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sandbox_workspace_sync_copies_local_tree_to_sifs",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let mut store = SifsSandboxInstanceStore::new(dfs);
     let manifest = store
         .create(
@@ -662,19 +661,19 @@ fn sandbox_workspace_sync_copies_local_tree_to_sifs() {
             .is_dir
     );
     fs::remove_dir_all(local_root).ok();
-    fs::remove_dir_all(runtime_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
 fn sandbox_workspace_sync_replaces_local_tree_from_sifs() {
-    let runtime_root = unique_test_dir("sinomo-sandbox-sync-sifs-to-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sync_sifs_to_local").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(runtime_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sandbox_workspace_sync_replaces_local_tree_from_sifs",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let mut store = SifsSandboxInstanceStore::new(dfs);
     let manifest = store
         .create(
@@ -725,7 +724,9 @@ fn sandbox_workspace_sync_replaces_local_tree_from_sifs() {
         SandboxFsError::NotFound { .. }
     ));
     fs::remove_dir_all(local_root).ok();
-    fs::remove_dir_all(runtime_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -827,14 +828,12 @@ fn sandbox_workspace_sync_fetches_remote_sifs_source_content() {
 
 #[test]
 fn sandbox_workspace_sync_preserves_sifs_symlinks() {
-    let runtime_root = unique_test_dir("sinomo-sandbox-sync-sifs-symlink-to-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sync_sifs_symlink").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(runtime_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sandbox_workspace_sync_preserves_sifs_symlinks",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let mut store = SifsSandboxInstanceStore::new(dfs);
     let manifest = store
         .create(
@@ -877,19 +876,19 @@ fn sandbox_workspace_sync_preserves_sifs_symlinks() {
     );
 
     fs::remove_dir_all(local_root).ok();
-    fs::remove_dir_all(runtime_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
 fn sandbox_workspace_sync_preserves_sifs_file_metadata() {
-    let runtime_root = unique_test_dir("sinomo-sandbox-sync-sifs-metadata-to-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sync_sifs_metadata").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(runtime_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sandbox_workspace_sync_preserves_sifs_file_metadata",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let mut store = SifsSandboxInstanceStore::new(dfs);
     let manifest = store
         .create(
@@ -934,20 +933,20 @@ fn sandbox_workspace_sync_preserves_sifs_file_metadata() {
     assert_eq!(dir_metadata.modified_at_unix_nanos, 88_888);
 
     fs::remove_dir_all(local_root).ok();
-    fs::remove_dir_all(runtime_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
 #[cfg(unix)]
 fn sandbox_workspace_sync_preserves_sifs_hardlinks() {
-    let runtime_root = unique_test_dir("sinomo-sandbox-sync-sifs-hardlink-to-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sync_sifs_hardlink").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(runtime_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sandbox_workspace_sync_preserves_sifs_hardlinks",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let mut store = SifsSandboxInstanceStore::new(dfs);
     let manifest = store
         .create(
@@ -980,20 +979,20 @@ fn sandbox_workspace_sync_preserves_sifs_hardlinks() {
     );
 
     fs::remove_dir_all(local_root).ok();
-    fs::remove_dir_all(runtime_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
 #[cfg(unix)]
 fn sandbox_workspace_sync_preserves_sifs_hardlinked_symlinks() {
-    let runtime_root = unique_test_dir("sinomo-sandbox-sync-sifs-hardlinked-symlink-to-local");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sync_sifs_hardlinked_symlink").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(runtime_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sandbox_workspace_sync_preserves_sifs_hardlinked_symlinks",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let mut store = SifsSandboxInstanceStore::new(dfs);
     let manifest = store
         .create(
@@ -1040,7 +1039,9 @@ fn sandbox_workspace_sync_preserves_sifs_hardlinked_symlinks() {
     );
 
     fs::remove_dir_all(local_root).ok();
-    fs::remove_dir_all(runtime_root).ok();
+
+    drop(sifs_fs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]

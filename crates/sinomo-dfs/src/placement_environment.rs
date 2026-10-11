@@ -73,16 +73,16 @@ fn default_allocation_weight() -> u32 {
 }
 
 impl DfsContentLocationConfig {
-    pub fn legacy(root: impl Into<PathBuf>) -> Self {
+    pub fn default_for_root(root: impl Into<PathBuf>) -> Self {
         Self {
-            location_id: "legacy-default".to_string(),
+            location_id: "default".to_string(),
             label: "Default content store".to_string(),
             root: root.into(),
             lifecycle: DfsContentLocationLifecycle::Active,
             reserved_free_bytes: DEFAULT_DFS_STORAGE_RESERVE_BYTES,
             max_dfs_bytes: None,
             allocation_weight: 1,
-            configuration_generation: 0,
+            configuration_generation: 1,
         }
     }
 }
@@ -522,6 +522,12 @@ impl DfsDeviceHealthMonitor {
                     .unwrap_or(time::Duration::minutes(15)),
         );
 
+        // Cached startup reads have no physical storage sample yet. Publish
+        // that unknown DATA conservatively without treating it as an observed
+        // unhealthy baseline for recovery hysteresis.
+        if self.last_sampled_at.is_none() {
+            return desired;
+        }
         if self.last_advertisement_evaluated_sequence == Some(snapshot.sequence)
             && let Some(current) = self.advertised.clone()
         {
@@ -1540,6 +1546,47 @@ mod tests {
     }
 
     #[test]
+    fn unsampled_cache_does_not_delay_first_actual_storage_observation() {
+        let root = sinomo_testdir::TestDir::new("dfs-health-first-physical-sample");
+        let mut monitor = DfsDeviceHealthMonitor::new(
+            node("first-physical-sample"),
+            vec![DfsContentLocationConfig::default_for_root(
+                root.to_path_buf(),
+            )],
+        );
+        let now = OffsetDateTime::now_utc();
+        let unknown = monitor.aggregate_advertisement(None, now);
+        assert!(!unknown.accepts_content);
+        assert_eq!(
+            unknown.storage_freshness,
+            DfsObservationFreshness::NeverSampled
+        );
+        assert!(monitor.advertised.is_none());
+        assert!(monitor.pending_advertisement.is_none());
+        assert!(monitor.last_advertisement_evaluated_sequence.is_none());
+        let sampled = monitor.sample_with_resources(
+            now,
+            DfsNetworkMetering::Unknown,
+            DfsResourcePressure::Normal,
+        );
+        let first = monitor.aggregate_advertisement(None, now);
+        assert_eq!(
+            first.accepts_content,
+            sampled
+                .content_locations
+                .iter()
+                .any(
+                    |location| location.lifecycle == DfsContentLocationLifecycle::Active
+                        && location.writable
+                        && location.health != DfsHealthState::Critical
+                )
+        );
+        assert_eq!(first.advertisement_generation, sampled.sequence);
+        assert_eq!(monitor.advertised.as_ref(), Some(&first));
+        assert!(monitor.pending_advertisement.is_none());
+    }
+
+    #[test]
     fn aggregate_advertisement_counts_locations_but_keeps_one_node_identity() {
         let root = sinomo_testdir::TestDir::new("dfs-health-multiple-locations");
         let first = root.join("first");
@@ -1576,7 +1623,7 @@ mod tests {
         std::fs::create_dir_all(&content).expect("content location");
         let mut monitor = DfsDeviceHealthMonitor::new(
             node("metering-transition"),
-            vec![DfsContentLocationConfig::legacy(content.clone())],
+            vec![DfsContentLocationConfig::default_for_root(content.clone())],
         );
         let sampled_at = OffsetDateTime::now_utc();
         let initial = monitor.sample(sampled_at, DfsNetworkMetering::Unmetered);
@@ -1603,8 +1650,10 @@ mod tests {
         let content = root.join("content");
         std::fs::create_dir_all(&content).expect("content location");
         let local = node("advisory-transition");
-        let mut monitor =
-            DfsDeviceHealthMonitor::new(local, vec![DfsContentLocationConfig::legacy(content)]);
+        let mut monitor = DfsDeviceHealthMonitor::new(
+            local,
+            vec![DfsContentLocationConfig::default_for_root(content)],
+        );
         let now = OffsetDateTime::now_utc();
         monitor.sample(now, DfsNetworkMetering::Unmetered);
         let initial = monitor.aggregate_advertisement(None, now);

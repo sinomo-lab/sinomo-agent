@@ -33,7 +33,6 @@ fn content_reference_request(
     };
     Ok(DfsContentReferenceRequest {
         namespace: HISTORY_MODULE_ID.into(),
-        wire_format: DfsContentReferenceFormat::NamespacedV6,
         path: request.path.clone(),
         identity: request.identity.clone(),
         operation_id: request.operation_id.clone(),
@@ -85,7 +84,6 @@ impl<T: DfsMessageTransport> DfsHistoryService<'_, T> {
                 ));
             }
             let mut desired = current.clone();
-            desired.metadata_format = DfsRevisionMetadataFormat::NamespacedV6;
             if request.policy.is_empty() {
                 desired.retention_policies.remove(HISTORY_MODULE_ID);
             } else {
@@ -124,7 +122,6 @@ impl<T: DfsMessageTransport> DfsHistoryService<'_, T> {
             base_version: request.base_version,
         };
         let publication = DfsRetainedContentPublication {
-            metadata_format: DfsRevisionMetadataFormat::NamespacedV6,
             namespace: HISTORY_MODULE_ID.into(),
             reference_id: request.pin_id,
             metadata: Some(DfsModuleMetadataValue {
@@ -155,9 +152,9 @@ impl<T: DfsMessageTransport> DfsHistoryService<'_, T> {
             .map_err(|error| history_error(error.to_string()))?;
         let reference = content_reference_request(&request)?;
         let mut ambiguous_outcome = None;
-        // Terminal proof precedes both metadata inspection and new-write codec
-        // gates. Neither collection nor a still-v3 upgrade configuration may
-        // turn an exact completed retry into a fresh semantic operation.
+        // Reconcile the exact terminal outcome before inspecting a revision
+        // or planning another effect. Collection or changed configuration
+        // cannot turn a completed retry into a fresh semantic operation.
         if self.core.is_distributed() {
             let operation = DfsNamespaceOperation::ContentReference {
                 request: reference.clone(),
@@ -227,9 +224,8 @@ impl<T: DfsMessageTransport> DfsHistoryService<'_, T> {
         if missing_history_capture || canonical_path_changed {
             // An exact terminal outcome outlives both its source and its path.
             // The existing owner-routed read-only protocol authenticates the
-            // requester and checks the complete command digest, including the
-            // isolated legacy wire form. Only its typed Applied proof bypasses
-            // the module's fresh-operation precondition.
+            // requester and checks the complete command digest. Its typed
+            // Applied proof satisfies the module's retry precondition.
             if let Some(reason) = ambiguous_outcome {
                 return Err(history_error(reason));
             }

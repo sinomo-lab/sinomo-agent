@@ -8,9 +8,7 @@
 use super::{POSIX_LIST_DIR_COLLECT_PAGE_SIZE, now_unix_nanos};
 use crate::metadata_pages::try_walk_metadata_pages;
 use crate::namespace::next_version;
-use crate::posix_model::{
-    DfsDirEntry, DfsDirEntryPage, DfsPosixError, DfsStat, Result, read_conflict_error,
-};
+use crate::posix_model::{DfsDirEntry, DfsDirEntryPage, DfsPosixError, DfsStat, Result};
 use crate::posix_path::{join_posix_path, normalize_posix_path, posix_path_is_at_or_under_prefix};
 use crate::{
     DfsDirectoryPageCursor, DfsMessageTransport, DfsObjectId, DfsObjectKind, DfsObjectMetadata,
@@ -205,9 +203,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             NetworkedDfsReadOutcome::PendingReplication { .. }
             | NetworkedDfsReadOutcome::NotConfirmed { .. }
             | NetworkedDfsReadOutcome::NotFound => Err(DfsPosixError::NotFound { path }),
-            NetworkedDfsReadOutcome::Conflicted { conflicts, .. } => {
-                Err(read_conflict_error(path, conflicts))
-            }
         }
     }
 
@@ -225,7 +220,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Err(DfsPosixError::NotSymlink { path });
         }
         let outcome = self.read_object_metadata_or_fetch_remote_without_cache(&object)?;
-        self.symlink_target_from_distributed_read_outcome(&path, outcome)
+        super::metadata::symlink_target_from_distributed_read_outcome(&path, outcome)
     }
 
     pub fn posix_readlink_update_access(&mut self, path: &str) -> Result<String> {
@@ -415,6 +410,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_list_dir_distributed(&mut self, path: &str) -> Result<Vec<DfsDirEntry>> {
+        if self.transport.delegates_local_namespace_authority() {
+            let mut entries = Vec::new();
+            try_walk_metadata_pages(|after| {
+                let page = self.posix_list_dir_distributed_page(
+                    path,
+                    after,
+                    POSIX_LIST_DIR_COLLECT_PAGE_SIZE,
+                )?;
+                entries.extend(page.entries);
+                Ok::<_, DfsPosixError>(page.next_cursor)
+            })?;
+            entries.sort_by(|left, right| left.name.cmp(&right.name));
+            return Ok(entries);
+        }
         let _namespace_plan = self.namespace_execution.begin_planning();
         let path = self.resolve_posix_dot_components_distributed(path)?;
         self.with_local_primary_metadata_read_snapshot(&path, |service, shard_snapshot| {
@@ -450,6 +459,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<DfsDirEntryPage> {
         let _namespace_plan = self.namespace_execution.begin_planning();
         let path = self.resolve_existing_posix_path_distributed(path, true)?;
+        if self.transport.delegates_local_namespace_authority() {
+            let opened = self.posix_namespace_lstat_distributed(&path)?;
+            return self.owner_directory_page(&opened, after, max_entries, true);
+        }
         if self.local_metadata_replica_can_list_resolved_dir(&path)? {
             return self.posix_list_resolved_dir_page(&path, after, max_entries);
         }
@@ -475,6 +488,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 path: opened.path.clone(),
             });
         }
+        if self.transport.delegates_local_namespace_authority() {
+            let page = self.owner_directory_page(&opened, after, max_entries, false)?;
+            return Ok((opened, page));
+        }
         if let Some(shard) = self.routed_namespace_shard_for_path(&opened.path)?
             && !self.is_local_metadata_replica_for_shard(&shard)
         {
@@ -482,6 +499,173 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         let page = self.posix_list_opened_dir_no_links_page(&opened, after, max_entries)?;
         Ok((opened, page))
+    }
+
+    fn owner_directory_page(
+        &mut self,
+        opened: &DfsStat,
+        after: Option<&DfsDirectoryPageCursor>,
+        max_entries: usize,
+        project_hardlinks: bool,
+    ) -> Result<DfsDirEntryPage> {
+        let path = opened.path.as_str();
+        if opened.kind != DfsObjectKind::Directory {
+            return Err(DfsPosixError::NotDirectory {
+                path: path.to_string(),
+            });
+        }
+        if max_entries == 0 {
+            return Ok(DfsDirEntryPage {
+                entries: Vec::new(),
+                next_cursor: None,
+            });
+        }
+        let fs = sifs_file_system_id();
+        let configs = self.metadata_shard_authorities(&fs)?;
+        let directory_owner =
+            crate::select_metadata_shard_config_for_path_strict_default_sifs_split(
+                &fs, &configs, path,
+            )
+            .map_err(crate::DfsError::from)?
+            .ok_or_else(|| DfsPosixError::InvalidPath {
+                path: path.to_string(),
+            })?;
+        // A direct child inherits the directory's prefix owner, unless that
+        // child is itself an assignment boundary. Hash assignments can select
+        // any direct child, so their full current set remains relevant.
+        let shards = configs
+            .iter()
+            .filter(|shard| {
+                shard.shard_id == directory_owner.shard_id
+                    || match &shard.assignment {
+                        crate::DfsMetadataShardAssignment::PathPrefix { prefix } => {
+                            normalize_posix_path(prefix).is_ok_and(|prefix| {
+                                crate::posix_path::parent_posix_path(&prefix).as_deref()
+                                    == Some(path)
+                            })
+                        }
+                        crate::DfsMetadataShardAssignment::NameHashRange { .. } => true,
+                        crate::DfsMetadataShardAssignment::Root => matches!(
+                            &directory_owner.assignment,
+                            crate::DfsMetadataShardAssignment::NameHashRange { .. }
+                        ),
+                    }
+            })
+            .map(|shard| {
+                (
+                    crate::DfsMetadataShardId::new(shard.shard_id.clone()),
+                    shard.clone(),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        if after.is_some_and(|cursor| {
+            cursor
+                .shard_id
+                .as_ref()
+                .is_none_or(|id| !shards.contains_key(id))
+                || normalize_posix_path(&cursor.path).map_or(true, |child| {
+                    crate::posix_path::parent_posix_path(&child).as_deref() != Some(path)
+                })
+        }) {
+            return Err(DfsPosixError::InvalidPath {
+                path: path.to_string(),
+            });
+        }
+        let pairs = crate::metadata_shard_pages::collect_resumed_sharded_page_entries(
+            &shards,
+            after,
+            after.and_then(|cursor| cursor.shard_id.as_ref()),
+            max_entries,
+            crate::metadata_keys::local_directory_page_cursor,
+            |_, shard, local_after, limit| {
+                let result = self
+                    .query_metadata_authority_impl(
+                        shard,
+                        crate::DfsMetadataSelection::DirectoryPage {
+                            path: path.to_string(),
+                            after: local_after.cloned(),
+                            limit,
+                        },
+                    )
+                    .map_err(|error| crate::MetadataBackendError::Serde(error.to_string()))?;
+                let crate::DfsMetadataQueryResult::DirectoryPage {
+                    entries,
+                    after: next,
+                } = result
+                else {
+                    return Err(crate::MetadataBackendError::Serde(
+                        "directory authority returned another query kind".into(),
+                    ));
+                };
+                let mut previous = local_after.cloned();
+                for (object, cursor) in &entries {
+                    let child = normalize_posix_path(&object.path)
+                        .map_err(|error| crate::MetadataBackendError::Serde(error.to_string()))?;
+                    if object.file_system_id != fs
+                        || cursor.object_id != object.object_id
+                        || cursor.path != object.path
+                        || cursor.shard_id.is_some()
+                        || crate::posix_path::parent_posix_path(&child).as_deref() != Some(path)
+                        || previous.as_ref().is_some_and(|old| {
+                            super::metadata::compare_directory_page_cursors(old, cursor)
+                                != std::cmp::Ordering::Less
+                        })
+                    {
+                        return Err(crate::MetadataBackendError::Serde(
+                            "directory owner page changes exact scope or cursor order".into(),
+                        ));
+                    }
+                    previous = Some(cursor.clone());
+                }
+                if entries.len() > limit
+                    || next
+                        .as_ref()
+                        .is_some_and(|next| entries.last().is_none_or(|(_, cursor)| cursor != next))
+                {
+                    return Err(crate::MetadataBackendError::Serde(
+                        "directory owner page changes its exact continuation".into(),
+                    ));
+                }
+                Ok((entries, next))
+            },
+            |shard_id, _, (object, cursor)| {
+                let selected =
+                    crate::select_metadata_shard_config_for_path_strict_default_sifs_split(
+                        &fs,
+                        &configs,
+                        &object.path,
+                    )
+                    .map_err(|error| crate::MetadataBackendError::Serde(error.to_string()))?;
+                if object.kind == DfsObjectKind::Tombstone
+                    || selected
+                        .as_ref()
+                        .is_none_or(|owner| owner.shard_id != shard_id.0)
+                {
+                    return Ok(None);
+                }
+                Ok(Some((
+                    object,
+                    crate::metadata_keys::directory_page_cursor_with_shard(cursor, shard_id),
+                )))
+            },
+        )?;
+        let (objects, next_cursor) = crate::metadata_pages::finish_cursor_page(pairs, max_entries);
+        let mut entries = Vec::with_capacity(objects.len());
+        for object in objects {
+            let target = if project_hardlinks {
+                super::metadata::resolve_hardlink_target_with(&object, |id| {
+                    self.current_object_from_authority(&fs, id)
+                        .map_err(Into::into)
+                })?
+            } else {
+                object.clone()
+            };
+            entries.push(Self::directory_entry_projection(&object, &target)?);
+        }
+        Ok(DfsDirEntryPage {
+            entries,
+            next_cursor,
+        })
     }
 
     fn local_metadata_replica_can_list_resolved_dir(&mut self, path: &str) -> Result<bool> {
@@ -524,6 +708,32 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(entries)
     }
 
+    fn directory_entry_projection(
+        object: &DfsObjectMetadata,
+        target: &DfsObjectMetadata,
+    ) -> Result<DfsDirEntry> {
+        let path = normalize_posix_path(&object.path)?;
+        Ok(DfsDirEntry {
+            name: path
+                .rsplit('/')
+                .next()
+                .filter(|name| !name.is_empty())
+                .unwrap_or("/")
+                .to_string(),
+            path: path,
+            kind: target.kind.clone(),
+            object_id: target.object_id.clone(),
+            version: target.version.clone(),
+            // Directory pages stay metadata-only: do not turn a list into one manifest or
+            // version lookup per child. Current metadata supplies the visible size;
+            // an absent metadata size remains unknown.
+            size_bytes: target.content_size_bytes,
+            modified_at_unix_nanos: target.modified_at_unix_nanos,
+            policy: target.policy.clone(),
+            current_locations: target.current_locations.clone(),
+        })
+    }
+
     fn posix_list_resolved_dir_page(
         &self,
         path: &str,
@@ -548,30 +758,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let mut entries = Vec::new();
         let page = self.child_objects_for_sifs_dir_page(path, after, max_entries)?;
         for object in page.objects {
-            let object_path = normalize_posix_path(&object.path)?;
             if object.kind == DfsObjectKind::Tombstone {
                 continue;
             }
             let target = self.resolve_hardlink_target(&object)?;
-            entries.push(DfsDirEntry {
-                name: object_path
-                    .rsplit('/')
-                    .next()
-                    .filter(|name| !name.is_empty())
-                    .unwrap_or("/")
-                    .to_string(),
-                path: object_path,
-                kind: target.kind.clone(),
-                object_id: target.object_id.clone(),
-                version: target.version.clone(),
-                // Directory pages stay metadata-only: do not turn a list into one manifest or
-                // version lookup per child. Current writers place the visible size directly on
-                // the object metadata; older objects simply report an unknown size here.
-                size_bytes: target.content_size_bytes,
-                modified_at_unix_nanos: target.modified_at_unix_nanos,
-                policy: target.policy.clone(),
-                current_locations: target.current_locations.clone(),
-            });
+            entries.push(Self::directory_entry_projection(&object, &target)?);
         }
         Ok(DfsDirEntryPage {
             entries,
@@ -594,26 +785,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let page = self.child_objects_for_sifs_dir_page(&path, after, max_entries)?;
         let mut entries = Vec::with_capacity(page.objects.len());
         for object in page.objects {
-            let object_path = normalize_posix_path(&object.path)?;
             if object.kind == DfsObjectKind::Tombstone {
                 continue;
             }
-            entries.push(DfsDirEntry {
-                name: object_path
-                    .rsplit('/')
-                    .next()
-                    .filter(|name| !name.is_empty())
-                    .unwrap_or("/")
-                    .to_string(),
-                path: object_path,
-                kind: object.kind.clone(),
-                object_id: object.object_id.clone(),
-                version: object.version.clone(),
-                size_bytes: object.content_size_bytes,
-                modified_at_unix_nanos: object.modified_at_unix_nanos,
-                policy: object.policy.clone(),
-                current_locations: object.current_locations.clone(),
-            });
+            entries.push(Self::directory_entry_projection(&object, &object)?);
         }
         Ok(DfsDirEntryPage {
             entries,

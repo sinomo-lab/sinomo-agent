@@ -20,25 +20,11 @@ pub const MODULE_HOT_UNLOAD_ADMIN_CAPABILITY: &str = "module.hot-unload.admin";
 /// Advertised only by main daemons that understand snapshot-bound placement
 /// reconciliation jobs and their v1 control-plane namespace.
 pub const DFS_PLACEMENT_RECONCILIATION_V1_CAPABILITY: &str = "dfs.placement.reconciliation.v1";
-/// Advertised by main daemons that can replay packed-v1 namespace prepare
-/// journal bodies. A shard may select that persisted format only when every
-/// assigned metadata member advertises this capability.
-pub const DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY: &str =
-    "dfs.metadata.namespace-prepare.packed.v1";
-/// Advertised by main daemons that can replay packed-v2 namespace prepare
-/// journal bodies as well as every earlier namespace-prepare format. Selection
-/// remains capability-fenced per metadata shard so an older assigned member
-/// can never receive a format it cannot decode.
-pub const DFS_METADATA_PACKED_NAMESPACE_PREPARE_V2_CAPABILITY: &str =
-    "dfs.metadata.namespace-prepare.packed.v2";
-/// Packed-v3 supports the complete file-history contract: captures, pins,
-/// retained repair owners, and durability plans across metadata generations.
-/// Earlier development builds advertised partial history capabilities instead;
-/// they must not satisfy admission for this consolidated format.
-pub const DFS_METADATA_PACKED_NAMESPACE_PREPARE_V3_CAPABILITY: &str =
-    "dfs.metadata.namespace-prepare.packed.v3";
-pub const DFS_METADATA_PACKED_NAMESPACE_PREPARE_V6_CAPABILITY: &str =
-    "dfs.metadata.namespace-prepare.packed.v6";
+/// Supports complete prepared shard operations and digest-only commits.
+/// Every assigned metadata member must support this protocol. Incompatible
+/// nodes must upgrade before participating in a shard.
+pub const DFS_METADATA_PREPARED_OPERATION_V7_CAPABILITY: &str =
+    "dfs.metadata.prepared-operation.v7";
 pub const DAEMON_MAIN_CLUSTER_ROLE: &str = "daemon-main";
 pub const DAEMON_SHADOW_CLUSTER_ROLE: &str = "daemon-shadow";
 
@@ -57,14 +43,8 @@ pub fn main_daemon_capabilities(role: &ClusterMemberRole) -> Vec<CapabilityName>
         CapabilityName::new(MODULE_NATIVE_RUST_ADMIN_CAPABILITY).expect("static capability"),
         CapabilityName::new(MODULE_HOT_UNLOAD_ADMIN_CAPABILITY).expect("static capability"),
         CapabilityName::new(DFS_PLACEMENT_RECONCILIATION_V1_CAPABILITY).expect("static capability"),
-        CapabilityName::new(DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY)
-            .expect("static capability"),
-        CapabilityName::new(DFS_METADATA_PACKED_NAMESPACE_PREPARE_V2_CAPABILITY)
-            .expect("static capability"),
-        CapabilityName::new(DFS_METADATA_PACKED_NAMESPACE_PREPARE_V3_CAPABILITY)
-            .expect("static capability"),
-        CapabilityName::new(DFS_METADATA_PACKED_NAMESPACE_PREPARE_V6_CAPABILITY)
-            .expect("valid generic-retention codec capability"),
+        CapabilityName::new(DFS_METADATA_PREPARED_OPERATION_V7_CAPABILITY)
+            .expect("valid prepared-operation protocol capability"),
     ];
     if matches!(role, ClusterMemberRole::Voter) {
         capabilities.push(CapabilityName::new("cluster.kv.vote").expect("static capability"));

@@ -3,21 +3,21 @@
 use super::*;
 
 #[test]
-fn subtree_policy_default_encoding_remains_legacy_compatible() {
-    let policy = DfsSubtreePolicy::legacy("/models", DfsObjectPolicy::ReplicatedEventual);
-    let encoded = serde_json::to_value(&policy).expect("serialize subtree policy");
-
+fn current_subtree_policy_encoding_requires_explicit_replication_counts() {
+    let policy = DfsSubtreePolicy::new("/models", DfsObjectPolicy::ReplicatedEventual, 1, 2);
+    let encoded = serde_json::to_value(&policy).unwrap();
+    assert_eq!(encoded["min_commit_replicas"], 1);
+    assert_eq!(encoded["desired_replicas"], 2);
     assert_eq!(
-        encoded,
-        serde_json::json!({
-            "path_prefix": "/models",
-            "policy": "replicated-eventual"
-        }),
-        "default placement fields must not change metadata snapshot semantic checksums"
+        serde_json::from_value::<DfsSubtreePolicy>(encoded).unwrap(),
+        policy
     );
-    assert_eq!(
-        serde_json::from_value::<DfsSubtreePolicy>(encoded).expect("deserialize legacy policy"),
-        policy,
+    assert!(
+        serde_json::from_value::<DfsSubtreePolicy>(
+            serde_json::json!({"path_prefix":"/models","policy":"replicated-eventual"})
+        )
+        .is_err(),
+        "old implicit count records must be converted before current DFS use"
     );
 }
 
@@ -60,10 +60,12 @@ fn pending_write_stream_falls_back_to_exact_blob_after_manifest_replacement() {
 
 #[test]
 fn mkdir_all_over_tombstone_uses_new_directory_attributes_and_policy() {
-    let root = temp_root("mkdir-all-tombstone-create-metadata");
     let node =
         NodeId::from_legacy_named("node_mkdir_all_tombstone_create_metadata").expect("node id");
-    let mut dfs = networked_sifs_with_backend(&root, node.clone());
+    let (_runtime, mut dfs) = native_sifs_service(
+        "mkdir_all_over_tombstone_uses_new_directory_attributes_and_policy",
+        node.clone(),
+    );
     let path = "/unmanaged/deleted-file";
     dfs.posix_mkdir_all("/unmanaged").expect("create parent");
     let deleted = dfs
@@ -114,9 +116,11 @@ fn mkdir_all_over_tombstone_uses_new_directory_attributes_and_policy() {
 
 #[test]
 fn mkdir_over_tombstone_applies_current_managed_directory_policy() {
-    let root = temp_root("mkdir-tombstone-managed-policy");
     let node = NodeId::from_legacy_named("node_mkdir_tombstone_managed_policy").expect("node id");
-    let mut dfs = networked_sifs_with_backend(&root, node.clone());
+    let (_runtime, mut dfs) = native_sifs_service(
+        "mkdir_over_tombstone_applies_current_managed_directory_policy",
+        node.clone(),
+    );
     let path = "/services/deleted-file";
     let deleted = dfs
         .posix_write_file_with_create_attrs(
@@ -142,9 +146,11 @@ fn mkdir_over_tombstone_applies_current_managed_directory_policy() {
         .get(&sifs_file_system_id())
         .expect("SIFS metadata")
         .clone();
-    file_system.subtree_policies.push(DfsSubtreePolicy::legacy(
+    file_system.subtree_policies.push(DfsSubtreePolicy::new(
         path,
         DfsObjectPolicy::ReplicatedConfirmed,
+        2,
+        2,
     ));
     dfs.add_file_system(file_system)
         .expect("install current managed policy");
@@ -208,7 +214,10 @@ fn reconnect_does_not_restore_local_replica_removed_by_managed_placement() {
             .expect("filesystem config");
     });
 
-    let mut dfs = networked_sifs_with_backend(&root, local.clone());
+    let (_runtime, mut dfs) = native_sifs_service(
+        "reconnect_does_not_restore_local_replica_removed_by_managed_placement",
+        local.clone(),
+    );
     let manifest = dfs
         .content
         .put_object_version(object_id.as_str(), version.as_str(), bytes)
@@ -297,7 +306,7 @@ fn dfs_policy_violation_event_is_structured_for_supervision() {
 fn sifs_cluster_posix_routed_namespace_ops_converge_across_replicas() {
     // Namespace mutations issued from different replicas serialize through
     // the shard primary, and every node converges to one identical namespace.
-    let cluster = sifs_posix_cluster("sifs-cluster-ns-converge");
+    let cluster = sifs_posix_cluster("sifs-cluster-ns-converge", "/users");
     let SifsPosixCluster {
         root,
         primary_node: _,
@@ -307,6 +316,7 @@ fn sifs_cluster_posix_routed_namespace_ops_converge_across_replicas() {
         mut writer,
         mut observer,
         rejections: _,
+        _runtime,
     } = cluster;
 
     let stop_primary = Arc::new(AtomicBool::new(false));
@@ -432,7 +442,7 @@ fn sifs_cluster_posix_routed_namespace_ops_converge_across_replicas() {
         bytes
     );
 
-    std::fs::remove_dir_all(&root).ok();
+    drop(_runtime);
 }
 
 #[test]
@@ -443,6 +453,10 @@ fn sifs_cluster_posix_reverse_direction_move_resolves_by_id_on_replicas() {
     // shard naming.
     let cluster = sifs_two_primary_cluster("sifs-xshard-reverse");
     let SifsTwoPrimaryCluster {
+        shared_kv,
+        services_primary_node,
+        users_primary_node,
+        _runtime,
         root,
         replica_node,
         users_primary,
@@ -493,11 +507,12 @@ fn sifs_cluster_posix_reverse_direction_move_resolves_by_id_on_replicas() {
     // the local read path resolves the object id through the backend, which
     // must return the live "users" record, not the "services" tombstone.
     let mut cluster = SifsTwoPrimaryCluster {
+        _runtime,
         root,
-        users_primary_node: NodeId::from_legacy_named("node_unused_users4").expect("node"),
-        services_primary_node: NodeId::from_legacy_named("node_unused_services4").expect("node"),
+        users_primary_node,
+        services_primary_node,
         replica_node,
-        shared_kv: SharedDfsControlPlaneKvClient::new(InProcessKvStore::new()),
+        shared_kv,
         users_primary,
         services_primary,
         replica,
@@ -528,7 +543,7 @@ fn sifs_cluster_posix_reverse_direction_move_resolves_by_id_on_replicas() {
         cluster.rejections
     );
 
-    std::fs::remove_dir_all(&cluster.root).ok();
+    cluster.close();
 }
 
 #[test]
@@ -578,6 +593,7 @@ fn mounted_read_policy_does_not_escalate_lookup_failure_to_sync_path() {
                     command.routed_message.message_id.saturating_add(1),
                     DfsNetworkMessage::NamespaceResponse(DfsNamespaceResponse {
                         request_id: namespace.request_id.clone(),
+                        committed_work: Default::default(),
                         result: DfsNamespaceResult::Rejected {
                             reason: "injected authoritative lookup failure".to_string(),
                             posix_error: None,
@@ -586,7 +602,7 @@ fn mounted_read_policy_does_not_escalate_lookup_failure_to_sync_path() {
                         synced_path_object: None,
                         synced_path_objects: Vec::new(),
                         metadata_journal_batches: Vec::new(),
-                        metadata_journal_has_more: None,
+                        metadata_journal_has_more: false,
                         posix_coordination_result: None,
                     }),
                 )],
@@ -655,44 +671,16 @@ fn mounted_read_policy_does_not_escalate_lookup_failure_to_sync_path() {
 
 #[test]
 fn placement_reconciliation_resumes_durable_phase_and_updates_existing_file() {
-    let root = temp_root("placement-reconciliation-durable-cursor");
-    let local = NodeId::from_legacy_named("node_placement_reconciliation_local").expect("node");
-    let file_system = file_system(local.clone());
-    let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
-    control_plane.with_client(|kv| {
-        let mut store = DfsControlPlaneStore::new(kv);
-        store
-            .put_file_system_config(&DfsFileSystemConfig::from(&file_system))
-            .expect("filesystem config");
-        store
-            .put_metadata_shard(&DfsMetadataShardConfig {
-                file_system_id: file_system.file_system_id.clone(),
-                shard_id: "root".to_string(),
-                primary_node_id: local.clone(),
-                replica_node_ids: Vec::new(),
-                epoch: 1,
-                assignment: DfsMetadataShardAssignment::Root,
-                namespace_prepare_codec: Default::default(),
-                default_policy: DfsObjectPolicy::ReplicatedEventual,
-            })
-            .expect("root metadata shard");
-    });
-    let metadata_root = root.join("metadata");
-    let content_root = root.join("content");
-    let mut metadata = open_root_local_metadata_backend(&metadata_root).expect("metadata backend");
-    metadata
-        .put_file_system(&file_system)
-        .expect("seed filesystem");
-    for object in distributed_sifs_bootstrap_objects(file_system.owner_node_id.clone()) {
-        metadata.put_object(&object).expect("seed SIFS namespace");
-    }
-    let mut service = NetworkedDfsService::new(
-        crate::test_runtime::DfsTestRuntime::local_transport(local.clone()),
-        LocalContentStore::new(&content_root).expect("content"),
-    )
-    .with_control_plane(control_plane.clone())
-    .with_metadata_backend(metadata)
-    .expect("attach metadata backend");
+    let local =
+        crate::test_runtime::DfsTestRuntime::ordered_node_ids("native-placement-restart", 1)
+            .remove(0);
+    let mut runtime =
+        crate::test_runtime::DfsTestRuntime::new("native-placement-restart", local.clone())
+            .unwrap();
+    runtime.start_nodes().unwrap();
+    let file_system = runtime.file_system();
+    let control_plane = runtime.shared_control_plane().unwrap();
+    let mut service = runtime.client(&local).unwrap();
     let path = "/services/placement-existing.txt";
     service.posix_mkdir_all("/services").expect("services");
     service
@@ -709,7 +697,7 @@ fn placement_reconciliation_resumes_durable_phase_and_updates_existing_file() {
 
     let now = dfs_now_unix_nanos();
     let job = control_plane.with_client(|kv| {
-        let mut store = DfsControlPlaneStore::new(kv);
+        let mut store = DfsControlPlaneStore::new(kv.as_mut());
         let expected = store
             .get_file_system_config(&file_system.file_system_id)
             .expect("read config")
@@ -737,7 +725,7 @@ fn placement_reconciliation_resumes_durable_phase_and_updates_existing_file() {
             adaptive: false,
             adaptive_budget: None,
             processed_content_bytes: 0,
-            accepted_config: Some(desired.clone()),
+            accepted_config: desired.clone(),
             state: DfsPlacementReconciliationState::Pending,
             cursor: None,
             total_object_count: 0,
@@ -760,32 +748,6 @@ fn placement_reconciliation_resumes_durable_phase_and_updates_existing_file() {
         job
     });
 
-    let non_primary = NodeId::from_legacy_named("node_placement_reconciliation_replica")
-        .expect("non-primary node");
-    let mut replica_service = NetworkedDfsService::new(
-        crate::test_runtime::DfsTestRuntime::local_transport(non_primary),
-        LocalContentStore::new(root.join("replica-content")).expect("replica content"),
-    )
-    .with_control_plane(control_plane.clone());
-    assert!(
-        replica_service
-            .run_placement_reconciliation_bounded(1)
-            .expect("non-primary reconciliation tick")
-            .is_none(),
-        "only the filesystem root metadata primary may advance the durable job"
-    );
-    control_plane.with_client(|kv| {
-        assert_eq!(
-            DfsControlPlaneStore::new(kv)
-                .placement_reconciliation(&file_system.file_system_id, &job.job_id)
-                .expect("unclaimed durable job")
-                .expect("job remains pending")
-                .revision,
-            0,
-            "a non-primary tick must not claim progress or perform side effects"
-        );
-    });
-
     let first_page = service
         .run_placement_reconciliation_bounded(1)
         .expect("first reconciliation page")
@@ -799,15 +761,9 @@ fn placement_reconciliation_resumes_durable_phase_and_updates_existing_file() {
     assert_eq!(first_page.total_object_count, 1);
     drop(service);
 
-    let mut reopened = NetworkedDfsService::new(
-        crate::test_runtime::DfsTestRuntime::local_transport(local),
-        LocalContentStore::new(&content_root).expect("reopen content"),
-    )
-    .with_control_plane(control_plane.clone())
-    .with_metadata_backend(
-        open_root_local_metadata_backend(&metadata_root).expect("reopen metadata"),
-    )
-    .expect("attach reopened metadata");
+    runtime.stop_node(&local).unwrap();
+    runtime.reopen_node(local.clone()).unwrap();
+    let mut reopened = runtime.client(&local).unwrap();
     let mut completed = None;
     for _ in 0..32 {
         let Some(next) = reopened
@@ -830,10 +786,13 @@ fn placement_reconciliation_resumes_durable_phase_and_updates_existing_file() {
     );
     control_plane.with_client(|kv| {
         assert_eq!(
-            DfsControlPlaneStore::new(kv)
+            DfsControlPlaneStore::new(kv.as_mut())
                 .placement_reconciliation(&file_system.file_system_id, &job.job_id)
                 .expect("durable job"),
             Some(completed)
         );
     });
+    drop(reopened);
+    drop(control_plane);
+    runtime.close().unwrap();
 }

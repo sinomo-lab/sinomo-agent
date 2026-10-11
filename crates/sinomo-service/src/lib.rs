@@ -40,8 +40,8 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 use sinomo_kv::{
-    ClusterKvTxnCommitResult, ClusterKvTxnCompactCommitResult, KvAuthoritativeRead, KvEntry,
-    KvError, KvLocalRead, KvTxnRequest,
+    ClusterKvRequestOutcomeRead, ClusterKvTxnCommitResult, ClusterKvTxnCompactCommitResult,
+    KvAuthoritativeRead, KvEntry, KvError, KvLocalRead, KvRequestId, KvTxnRequest,
 };
 use sinomo_local::SinomoDataDir;
 use sinomo_network::{
@@ -175,6 +175,21 @@ pub trait ClusterAccess: Send + Sync {
             )))
         })
     }
+    /// Read retained request history through the SAME normal current-term
+    /// authoritative boundary. This never executes the supplied request ID.
+    /// Received request DATA cannot become an effect/receipt on an unsupported host.
+    fn kv_request_outcome_authoritative_async<'a>(
+        &'a self,
+        _request_id: KvRequestId,
+    ) -> Pin<Box<dyn Future<Output = Result<ClusterKvRequestOutcomeRead, ServiceError>> + Send + 'a>>
+    {
+        Box::pin(async {
+            Err(ServiceError::Kv(KvError::AuthorityUnavailable {
+                detail: "host has no native authoritative request-outcome reader".into(),
+            }))
+        })
+    }
+
     /// Commit a stable-ID cluster-KV request through the host-owned async
     /// runtime. The ID must be preserved through forwarding and retries.
     fn kv_commit_async<'a>(

@@ -60,7 +60,7 @@ pub(crate) fn mount_dfs_runtime_tasks(
                 let reactor = reactor
                     .as_mut()
                     .ok_or_else(|| "DFS startup reactor is unavailable".to_string())?;
-                reactor
+                match reactor
                     .reconcile_startup_until_idle_async(
                         &paths,
                         &DfsRuntimeOptions,
@@ -69,7 +69,20 @@ pub(crate) fn mount_dfs_runtime_tasks(
                         &runtime,
                     )
                     .await
-                    .map_err(|error| error.to_string())?;
+                {
+                    Ok(()) => {}
+                    Err(DfsRuntimeError::StoragePreparationPending { root, processed_records }) => {
+                        // This edge prepares orchestration, not physical storage.
+                        // Keep the SAME unfinished reactor generation for its
+                        // normal source-change/backoff path after host preparation.
+                        // Cold opens still require the actual provider's Ready;
+                        // no lifecycle generation has been completed here.
+                        tracing::debug!(target: "sinomo.dfs.reconciliation",
+                            root = %root.display(), processed_records,
+                            "DFS eager startup storage preparation deferred to its retained reactor");
+                    }
+                    Err(error) => return Err(error.to_string()),
+                }
             }
             schedule_daemon_dfs_startup_repair_reconciliation(&paths)
                 .map_err(|error| error.to_string())?;
@@ -171,10 +184,13 @@ async fn run_component_host_events(
                 };
                 match event.envelope.kind.as_str() {
                     sinomo_module::COMPONENT_HOST_CLUSTER_CONTROL_CHANGED_EVENT_KIND => {
+                        if let Ok(data_dir)=paths.data_dir() {
+                            if let Ok(actor)=crate::source_adoption::actor_for_root(&data_dir.root()) {actor.wake_reconciliation();}
+                        }
                         if let Err(error) = request_daemon_dfs_maintenance_reconciliation(&paths) {
                             tracing::warn!(%error, "DFS could not observe host cluster-control change");
                         }
-                        notify_daemon_dfs_maintenance_work();
+                        notify_daemon_dfs_maintenance_work_for_paths(&paths);
                         let _ = schedule_daemon_dfs_metadata_publish_on_runtime(
                             &paths,
                             &runtime,
@@ -182,7 +198,10 @@ async fn run_component_host_events(
                         );
                     }
                     sinomo_module::COMPONENT_HOST_CONNECTIVITY_CHANGED_EVENT_KIND => {
-                        notify_daemon_dfs_maintenance_work();
+                        if let Ok(data_dir)=paths.data_dir() {
+                            if let Ok(actor)=crate::source_adoption::actor_for_root(&data_dir.root()) {actor.wake_reconciliation();}
+                        }
+                        notify_daemon_dfs_maintenance_work_for_paths(&paths);
                         let _ = notify_daemon_dfs_metadata_publish_route_generation_on_runtime(
                             &paths,
                             &runtime,
@@ -380,7 +399,7 @@ async fn run_component_route_generation_watch(
             }
             generation = subscription.changed() => {
                 if daemon_dfs_repair_queue_work_is_known(&paths) {
-                    notify_daemon_dfs_maintenance_work();
+                    notify_daemon_dfs_maintenance_work_for_paths(&paths);
                 }
                 match notify_daemon_dfs_metadata_publish_route_generation_on_runtime(&paths, &runtime) {
                     Ok(0) => {}
@@ -395,7 +414,6 @@ async fn run_component_route_generation_watch(
 fn pending_work_requires_local_recovery(work: &DaemonDfsPendingMaintenanceWork) -> bool {
     work.pending_write_count > 0
         || work.pending_namespace_job_count > 0
-        || work.actionable_conflict_count > 0
         || work.pending_local_membership_handoff_count > 0
         || work.completed_local_primary_handoff_rebind_count > 0
         || work.mounted_mutation_recoverable_exact_count > 0
@@ -462,7 +480,14 @@ async fn run_component_maintenance(
     let mut triggered = false;
     let mut immediate = false;
     let mut resources = node_resources.take_latest();
-    let notify = daemon_dfs_maintenance_notify();
+    let notify =
+        match daemon_dfs_maintenance_notify(&paths.data_dir().expect("validated data root")) {
+            Ok(notify) => notify,
+            Err(error) => {
+                tracing::warn!(%error, "DFS maintenance has no registered runtime host");
+                return;
+            }
+        };
 
     loop {
         if *shutdown.borrow() {

@@ -7,27 +7,19 @@ pub(super) fn active_store(
 ) -> (sinomo_testdir::TestDir, DfsDataOwnerLock, LocalContentStore) {
     let root = sinomo_testdir::TestDir::new(name);
     let data = SinomoDataDir::new(root.path());
-    let mut owner = DfsDataOwnerLock::acquire(&DfsRuntimePaths::new(&data)).unwrap();
-    owner.activate_content_bindings_before_routes().unwrap();
+    let owner = DfsDataOwnerLock::acquire(&DfsRuntimePaths::new(&data)).unwrap();
     let content = LocalContentStore::new(data.dfs_dir().join("content")).unwrap();
     (root, owner, content)
 }
 
 #[test]
-fn inline_binding_recovers_exact_manifest_payload_and_reservation_without_legacy_indexes() {
+fn inline_binding_recovers_exact_manifest_payload_and_reservation_without_files_indexes() {
     let (_root, _owner, store) = active_store("dfs-inline-exact-reopen");
     let manifest = store
         .put_object_version("object", "v1", b"complete durable binding")
         .unwrap();
     assert!(!store.manifest_path("object", "v1").exists());
     assert!(!store.blob_path(&manifest.content_hash).unwrap().exists());
-    assert!(
-        store
-            .read_packed_blob_index_unlocked()
-            .unwrap()
-            .entries
-            .is_empty()
-    );
     let root = store.root.clone();
     drop(store); // lost reply/weak resident expiry; fresh owner must resync.
     let reopened = LocalContentStore::new(root).unwrap();
@@ -45,72 +37,6 @@ fn inline_binding_recovers_exact_manifest_payload_and_reservation_without_legacy
     assert!(reopened.scrub().unwrap().is_healthy());
     reopened
         .put_object_version("object", "v2", b"after recovery")
-        .unwrap();
-}
-
-#[test]
-fn cold_activation_rejects_live_legacy_reader_and_retries_on_existing_root() {
-    let root = sinomo_testdir::TestDir::new("dfs-inline-cold-drain");
-    let data = SinomoDataDir::new(root.path());
-    let content_root = data.dfs_dir().join("content");
-    let legacy = LocalContentStore::new(&content_root).unwrap();
-    let old = legacy
-        .put_object_version("old", "v1", b"legacy bytes")
-        .unwrap();
-    let mut reader = legacy.open_blob_stream(&old.content_hash).unwrap();
-    drop(legacy);
-    let mut owner = DfsDataOwnerLock::acquire(&DfsRuntimePaths::new(&data)).unwrap();
-    let error = owner
-        .activate_content_bindings_before_routes()
-        .expect_err("a retained legacy lease must block activation");
-    let expected = ContentStoreError::InlineActivationBusy {
-        root: fs::canonicalize(&content_root).expect("created canonical content root"),
-        live_leases: 1,
-    };
-    assert!(
-        matches!(&error, crate::runtime_host::DfsRuntimeError::Parse { detail }
-            if detail == &expected.to_string()),
-        "unexpected activation refusal: {error:?}"
-    );
-    assert!(!content_root.join("inline-bindings/current.sobj").exists());
-    let mut bytes = Vec::new();
-    reader.read_to_end(&mut bytes).unwrap();
-    assert_eq!(bytes, b"legacy bytes");
-    drop(reader);
-    owner.activate_content_bindings_before_routes().unwrap();
-    assert!(content_root.join("inline-bindings/current.sobj").is_file());
-    let store = LocalContentStore::new(&content_root).unwrap();
-    assert_eq!(
-        store.read_object_version("old", "v1").unwrap().1,
-        b"legacy bytes"
-    );
-    store
-        .put_object_version("new", "v1", b"inline bytes")
-        .unwrap();
-    assert_eq!(store.stats().unwrap().manifest_count, 2);
-    assert!(store.scrub().unwrap().is_healthy());
-}
-
-#[test]
-fn partial_activation_catalog_parent_failure_is_retryable_before_routes() {
-    let root = sinomo_testdir::TestDir::new("dfs-inline-partial-activation");
-    let data = SinomoDataDir::new(root.path());
-    let content_root = data.dfs_dir().join("content");
-    drop(LocalContentStore::new(&content_root).unwrap());
-    let canonical = fs::canonicalize(&content_root).unwrap();
-    let mut owner = DfsDataOwnerLock::acquire(&DfsRuntimePaths::new(&data)).unwrap();
-    INLINE_FAULT
-        .with(|fault| *fault.borrow_mut() = Some((canonical, InlineFault::CatalogParentSync)));
-    assert!(owner.activate_content_bindings_before_routes().is_err());
-    let inspected = LocalContentStore::open_for_inspection(&content_root);
-    assert!(inspected.inline_sentinel_unlocked().unwrap().is_none());
-    drop(inspected);
-    drop(owner);
-    let mut owner = DfsDataOwnerLock::acquire(&DfsRuntimePaths::new(&data)).unwrap();
-    owner.activate_content_bindings_before_routes().unwrap();
-    let store = LocalContentStore::new(content_root).unwrap();
-    store
-        .put_object_version("after-retry", "v1", b"bytes")
         .unwrap();
 }
 
@@ -137,7 +63,7 @@ fn inline_generic_retry_renews_grace_and_clears_absence_even_after_clock_rollbac
             InlineOperation::Reserve(ContentStoreReservationRecord {
                 identity: identity.clone(),
                 reserved_at_unix_nanos: future,
-                causal_stamp: Some(reservation.sentinel.stamp()),
+                causal_stamp: reservation.sentinel.stamp(),
             }),
             &[],
         )
@@ -159,14 +85,18 @@ fn inline_generic_retry_renews_grace_and_clears_absence_even_after_clock_rollbac
     };
     assert!(record.reserved_at_unix_nanos >= future);
     store
-        .ensure_content_reservations_batch(std::slice::from_ref(&identity))
+        .ensure_content_reservation(
+            &identity.object_id,
+            &identity.version,
+            &identity.content_hash,
+        )
         .unwrap();
-    let Some(InlineReservationState::Live(batch_renewed)) =
+    let Some(InlineReservationState::Live(renewed_again)) =
         store.inline_reservation_state(&identity).unwrap()
     else {
-        panic!("missing batch renewal");
+        panic!("missing normal renewal");
     };
-    assert!(batch_renewed.reserved_at_unix_nanos >= record.reserved_at_unix_nanos);
+    assert!(renewed_again.reserved_at_unix_nanos >= record.reserved_at_unix_nanos);
 }
 
 #[test]
@@ -283,14 +213,16 @@ fn visible_rotated_catalog_cannot_ack_before_recertification_even_after_owner_ex
 }
 
 #[test]
-fn inline_delete_shadows_legacy_copies_and_blob_only_republish_has_no_manifest() {
+fn inline_delete_shadows_files_copies_and_blob_only_republish_has_no_manifest() {
     let (_root, _owner, store) = active_store("dfs-inline-shadowed-delete");
     let manifest = store
         .put_object_version("object", "v1", b"payload")
         .unwrap();
     let legacy_manifest = store.manifest_path("object", "v1");
     write_file_atomic(&legacy_manifest, &encode_manifest(&manifest).unwrap()).unwrap();
-    fs::write(store.blob_path(&manifest.content_hash).unwrap(), b"payload").unwrap();
+    let loose_copy = store.blob_path(&manifest.content_hash).unwrap();
+    fs::create_dir_all(loose_copy.parent().unwrap()).unwrap();
+    fs::write(loose_copy, b"payload").unwrap();
     {
         let _owner = store.content_mutation_guard().unwrap();
         store
@@ -344,44 +276,6 @@ fn inline_delete_shadows_legacy_copies_and_blob_only_republish_has_no_manifest()
 
 #[cfg(unix)]
 #[test]
-fn precreation_alias_inspection_lease_cannot_evade_activation_drain() {
-    let root = sinomo_testdir::TestDir::new("dfs-inline-alias-drain");
-    let real = root.join("real");
-    fs::create_dir(&real).unwrap();
-    let alias = root.join("alias");
-    std::os::unix::fs::symlink(&real, &alias).unwrap();
-    let inspected = LocalContentStore::open_for_inspection(alias.join("dfs/content"));
-    assert!(!real.join("dfs/content").exists());
-    let data = SinomoDataDir::new(&real);
-    let content_root = real.join("dfs/content");
-    let mut owner = DfsDataOwnerLock::acquire(&DfsRuntimePaths::new(&data)).unwrap();
-    let error = owner
-        .activate_content_bindings_before_routes()
-        .expect_err("a retained legacy lease must block activation");
-    let expected = ContentStoreError::InlineActivationBusy {
-        root: fs::canonicalize(&content_root).expect("created canonical content root"),
-        live_leases: 1,
-    };
-    assert!(
-        matches!(&error, crate::runtime_host::DfsRuntimeError::Parse { detail }
-            if detail == &expected.to_string()),
-        "unexpected activation refusal: {error:?}"
-    );
-    assert!(!content_root.join("inline-bindings/current.sobj").exists());
-    drop(inspected);
-    owner.activate_content_bindings_before_routes().unwrap();
-    assert!(content_root.join("inline-bindings/current.sobj").is_file());
-    let store = LocalContentStore::new(alias.join("dfs/../dfs/content")).unwrap();
-    store
-        .put_object_version("object", "v1", b"alias safe")
-        .unwrap();
-    assert_eq!(
-        store.read_object_version("object", "v1").unwrap().1,
-        b"alias safe"
-    );
-}
-
-#[test]
 fn successful_scrub_preserves_exact_resident_durability_capability() {
     let (_root, _owner, store) = active_store("dfs-inline-scrub-keeps-certificate");
     store.put_object_version("object", "v1", b"first").unwrap();
@@ -406,9 +300,9 @@ fn successful_scrub_preserves_exact_resident_durability_capability() {
 
 #[cfg(unix)]
 #[test]
-fn small_verified_quarantine_adopts_one_public_binding_and_large_bytes_keep_legacy_layout() {
+fn small_verified_quarantine_adopts_one_public_binding_and_large_bytes_keep_files_layout() {
     let (_root, _owner, store) = active_store("dfs-inline-stream-and-large");
-    let bytes = vec![17u8; PACKED_BLOB_SMALL_LIMIT_BYTES as usize];
+    let bytes = vec![17u8; INLINE_BLOB_SMALL_LIMIT_BYTES as usize];
     let hash = content_hash(&bytes);
     let mut ingest = store
         .begin_quarantined_blob_ingest(bytes.len() as u64, Some(&hash))
@@ -426,10 +320,13 @@ fn small_verified_quarantine_adopts_one_public_binding_and_large_bytes_keep_lega
         store.read_object_version("streamed", "v1").unwrap().1,
         bytes
     );
-    let large = vec![23u8; PACKED_BLOB_SMALL_LIMIT_BYTES as usize + 1];
+    let large = vec![23u8; INLINE_BLOB_SMALL_LIMIT_BYTES as usize + 1];
     store.put_object_version("large", "v1", &large).unwrap();
-    assert!(store.manifest_path("large", "v1").is_file());
-    assert!(store.inline_version_state("large", "v1").unwrap().is_none());
+    assert!(!store.manifest_path("large", "v1").exists());
+    assert!(matches!(
+        store.inline_version_state("large", "v1").unwrap(),
+        Some(InlineVersionState::Live(_))
+    ));
     assert_eq!(store.read_object_version("large", "v1").unwrap().1, large);
     assert!(store.scrub().unwrap().is_healthy());
 }
@@ -483,7 +380,7 @@ fn mixed_extent_manifest_protects_inline_base_hash_after_original_version_retire
 #[test]
 fn expected_hash_inline_bytes_bypass_quarantine_and_reopen_exact_binding() {
     let (_root, _owner, store) = active_store("dfs-inline-expected-hash-no-quarantine");
-    let bytes = vec![31; PACKED_BLOB_SMALL_LIMIT_BYTES as usize];
+    let bytes = vec![31; INLINE_BLOB_SMALL_LIMIT_BYTES as usize];
     let hash = content_hash(&bytes);
     // The old expected-hash path cannot even create its private temporary file.
     // Successful publication therefore cannot have issued a quarantine sync.
@@ -517,7 +414,7 @@ fn expected_hash_inline_bytes_bypass_quarantine_and_reopen_exact_binding() {
     };
     assert_eq!(
         reservation.causal_stamp,
-        Some(store.inline_sentinel_unlocked().unwrap().unwrap().stamp())
+        store.inline_sentinel_unlocked().unwrap().unwrap().stamp()
     );
     let empty = store
         .put_object_version_with_expected_hash("empty", "v1", intrinsic_empty_content_hash(), &[])
@@ -703,11 +600,11 @@ fn expected_hash_inline_lost_completion_requires_same_or_fresh_owner_certificati
 }
 
 #[test]
-fn expected_hash_large_legacy_and_public_quarantine_keep_file_ingest() {
+fn expected_hash_large_files_and_public_quarantine_keep_file_ingest() {
     let (_root, _owner, store) = active_store("dfs-inline-expected-hash-file-fallback");
     let blocker = store.root.join("blob-tmp");
     fs::write(&blocker, b"file ingest blocked").unwrap();
-    let large = vec![41; PACKED_BLOB_SMALL_LIMIT_BYTES as usize + 1];
+    let large = vec![41; INLINE_BLOB_SMALL_LIMIT_BYTES as usize + 1];
     let large_hash = content_hash(&large);
     assert!(
         store
@@ -723,8 +620,11 @@ fn expected_hash_large_legacy_and_public_quarantine_keep_file_ingest() {
         .put_object_version_with_expected_hash("large", "v1", &large_hash, &large)
         .unwrap();
     assert_eq!(store.read_object_version("large", "v1").unwrap().1, large);
-    assert!(store.inline_version_state("large", "v1").unwrap().is_none());
-    assert!(store.manifest_path("large", "v1").is_file());
+    assert!(matches!(
+        store.inline_version_state("large", "v1").unwrap(),
+        Some(InlineVersionState::Live(_))
+    ));
+    assert!(!store.manifest_path("large", "v1").exists());
     assert_eq!(manifest.content_hash, large_hash);
     let mut quarantine = store
         .begin_quarantined_blob_ingest(1, Some(&content_hash(b"q")))
@@ -736,18 +636,4 @@ fn expected_hash_large_legacy_and_public_quarantine_keep_file_ingest() {
         &store.read_manifest("anonymous", "v1").unwrap_err()
     ));
     drop(quarantine);
-    let legacy_root = sinomo_testdir::TestDir::new("dfs-expected-hash-legacy-fallback");
-    let legacy = LocalContentStore::new(legacy_root.path()).unwrap();
-    fs::write(legacy.root.join("blob-tmp"), b"file ingest blocked").unwrap();
-    assert!(
-        legacy
-            .put_object_version_with_expected_hash("object", "v1", &content_hash(b"x"), b"x")
-            .is_err()
-    );
-    fs::remove_file(legacy.root.join("blob-tmp")).unwrap();
-    legacy
-        .put_object_version_with_expected_hash("object", "v1", &content_hash(b"x"), b"x")
-        .unwrap();
-    assert_eq!(legacy.read_object_version("object", "v1").unwrap().1, b"x");
-    assert!(legacy.inline_binding_view().unwrap().is_none());
 }

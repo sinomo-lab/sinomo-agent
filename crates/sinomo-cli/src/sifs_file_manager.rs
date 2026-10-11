@@ -10,7 +10,6 @@ use sinomo_runtime::dfs::DfsPosixCreateAttrs;
 use sinomo_runtime::dfs::{
     AsyncDfsPeerTransport, DaemonDfsInspectionRequest, DaemonDfsInspectionResponse,
     DfsControlPlaneKvClient, DfsControlPlaneStore, DfsError, DfsFileSystemConfig,
-    DfsMetadataJournalReplicationOptions, DfsMetadataJournalReplicationReport,
     DfsMetadataShardConfig, DfsNamespaceOperation, DfsNodeAdvertisement, DfsNodeTransport,
     DfsObjectKind, DfsObjectRpcSendOptions, DfsOperatorObjectView, DfsOperatorStatus,
     DfsPeerTransport, DfsPeerTransportError, DfsPeerTransportFuture, DfsPinAddRequest, DfsPinMode,
@@ -23,12 +22,10 @@ use sinomo_runtime::dfs::{
     DfsResolvedPlacementPolicy, DfsStableNamespaceOperationReconciliation, DfsStat,
     DfsWriteOptions, LocalContentStore, NetworkedDfsService, content_services_prefix,
     default_dfs_metadata_root, default_dfs_metadata_shards_root, default_dfs_pin_root,
-    discovered_cluster_dfs_peer_node_ids, fallback_dfs_node_id, metadata_shards_prefix,
+    discovered_cluster_dfs_peer_node_ids, metadata_shards_prefix,
     open_cluster_aware_dfs_metadata_backend_for_inspection,
     open_cluster_aware_dfs_metadata_backend_for_inspection_with_topology,
-    open_local_sharded_metadata_backend_for_replica_repair, open_root_local_metadata_backend,
     preview_placement_with_unavailable_nodes,
-    publish_cluster_dfs_metadata_journal_with_peer_transports_async,
     select_metadata_shard_config_for_path_strict_default_sifs_split, sifs_file_system_id,
     with_cached_cluster_aware_dfs_metadata_inspection,
 };
@@ -49,7 +46,6 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const SIFS_PEER_TARGET_REFRESH_TTL: Duration = Duration::from_secs(1);
-const SIFS_FOREGROUND_METADATA_PUBLISH_MAX_BATCHES_PER_TARGET: usize = 1;
 const SIFS_MAINTENANCE_REFRESH_TIMEOUT: Duration = Duration::from_millis(750);
 const SIFS_PLACEMENT_IMPACT_PAGE_SIZE: usize = 256;
 const SIFS_AUTHORITATIVE_SCOPE_CACHE_MAX_ENTRIES: usize =
@@ -293,7 +289,7 @@ pub(crate) struct SifsFileManagerObservationSnapshot {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SifsFileManagerObservationMetrics {
     pub(crate) object_count: usize,
-    pub(crate) open_conflict_count: usize,
+
     pub(crate) repair_job_count: usize,
     pub(crate) repair_attempt_count: usize,
     pub(crate) pending_write_count: usize,
@@ -327,7 +323,7 @@ impl SifsFileManagerObservation {
                 .map_err(|error| format!("cannot read local cluster state: {error}"))?
                 .local_node_id
         } else {
-            fallback_dfs_node_id()
+            return Err("SIFS requires an initialized node".into());
         };
         Ok(Self {
             data_dir: data_dir.clone(),
@@ -426,7 +422,7 @@ impl SifsFileManagerObservation {
             .count();
         let metrics = SifsFileManagerObservationMetrics {
             object_count: operator_status.object_count,
-            open_conflict_count: operator_status.open_conflict_count,
+
             repair_job_count: operator_status.pending_repair_count,
             repair_attempt_count: operator_status.repair_attempt_count,
             pending_write_count: operator_status.pending_write_count,
@@ -866,7 +862,7 @@ impl SifsFileManagerBackend {
             // reply; a client must not reopen local stores to repeat it.
             return Ok(());
         }
-        if let Err(error) = self.prepare_metadata_after_mutation(operation_deadline) {
+        if let Err(error) = self.finish_pending_mutation_dispatch(operation_deadline) {
             // The namespace/content mutation has already crossed its durable
             // commit edge. Detached sends and metadata publication are
             // replay-safe maintenance owned by the daemon; reporting their
@@ -877,54 +873,20 @@ impl SifsFileManagerBackend {
             );
             return Ok(());
         }
-        handoff_or_publish_sifs_metadata(
-            operation_deadline,
-            |timeout| request_sifs_daemon_maintenance_refresh(&self.data_dir, timeout),
-            || {
-                publish_sifs_metadata_journal_from_data_dir(
-                    &self.data_dir,
-                    &self.rpc_runtime,
-                    operation_deadline,
-                )
-                .map(|_| ())
-                .map_err(|error| error.to_string())
-            },
-        )
+        Ok(())
     }
 
-    /// Best-effort post-commit maintenance for a conditional editor save.
-    /// Unlike the legacy mutation helper, this preserves a warning for the UI
-    /// instead of printing and discarding publication failures.
+    /// Preserve caller dispatch errors as warnings after a conditional commit.
+    /// The real Main already retained and scheduled its committed metadata work.
     fn publish_metadata_after_conditional_mutation_warning(&self) -> Option<String> {
-        if let Err(error) = self.prepare_metadata_after_mutation(None) {
-            return Some(format!(
-                "follow-up DFS maintenance preparation failed: {error}"
-            ));
-        }
-        if request_sifs_daemon_maintenance_refresh(&self.data_dir, SIFS_MAINTENANCE_REFRESH_TIMEOUT)
-        {
-            return None;
-        }
-        publish_sifs_metadata_journal_from_data_dir(&self.data_dir, &self.rpc_runtime, None)
+        self.finish_pending_mutation_dispatch(None)
             .err()
-            .map(|error| format!("SIFS metadata publication failed: {error}"))
+            .map(|error| format!("follow-up DFS dispatch preparation failed: {error}"))
     }
 
-    pub(crate) fn publish_metadata_after_mutation_report(
-        &self,
-    ) -> Result<DfsMetadataJournalReplicationReport, String> {
-        self.prepare_metadata_after_mutation(None)?;
-        let report =
-            publish_sifs_metadata_journal_from_data_dir(&self.data_dir, &self.rpc_runtime, None)
-                .map_err(|error| error.to_string())?;
-        let _ = request_sifs_daemon_maintenance_refresh(
-            &self.data_dir,
-            SIFS_MAINTENANCE_REFRESH_TIMEOUT,
-        );
-        Ok(report)
-    }
-
-    fn prepare_metadata_after_mutation(
+    /// Finish already-owned outgoing calls. This never republishes caller data;
+    /// Main owns every committed-effect publication before its reply returns.
+    pub(crate) fn finish_pending_mutation_dispatch(
         &self,
         operation_deadline: Option<Instant>,
     ) -> Result<(), String> {
@@ -1306,33 +1268,17 @@ impl SifsFileManagerBackend {
             .unix_timestamp_nanos()
             .try_into()
             .unwrap_or(1_000_000_000);
-        let job = DfsPlacementReconciliationJob {
-            schema_version: sinomo_runtime::dfs::DFS_PLACEMENT_RECONCILIATION_SCHEMA_VERSION,
-            job_id: sinomo_runtime::core::Id::generate().to_string(),
-            file_system_id: desired.file_system_id.clone(),
+        let job = sinomo_runtime::dfs::build_placement_reconciliation_job(
+            sinomo_runtime::core::Id::generate().to_string(),
+            &desired,
             path,
             scope,
             unavailable_node_ids,
             candidate_snapshot,
-            placement_snapshot: None,
-            adaptive: false,
-            adaptive_budget: None,
-            processed_content_bytes: 0,
-            accepted_config: Some(desired.clone()),
-            state: DfsPlacementReconciliationState::Pending,
-            cursor: None,
-            total_object_count: 0,
-            scanned_object_count: 0,
-            matched_object_count: 0,
-            updated_object_count: 0,
-            scheduled_repair_count: 0,
-            completed_repair_count: 0,
-            pending_repair_count: 0,
-            revision: 0,
-            created_at_unix_nanos: now,
-            updated_at_unix_nanos: now,
-            last_error: None,
-        };
+            None,
+            now,
+        )
+        .map_err(|error| format!("cannot build SIFS placement reconciliation: {error}"))?;
         if !store
             .compare_and_put_placement_update(&expected, &desired, &job)
             .map_err(|error| format!("cannot save SIFS placement policy: {error}"))?
@@ -2716,14 +2662,7 @@ impl SifsOneShotBulkWriteRequester {
             .map_err(|error| format!("cannot discover DFS service peers: {error}"))?;
         let local_node_id = state.local_node_id;
 
-        let peer_transport = sinomo_runtime::dfs::DaemonDfsPeerTransport::connect(data_dir.clone())
-            .map_err(|error| {
-                format!(
-                    "one-shot SIFS bulk write requires the resident daemon DFS transport: {error}"
-                )
-            })?;
-        let (sync_peer_transport, async_peer_transport) =
-            shared_sifs_peer_transports(peer_transport);
+        let transport = sifs_main_caller_transport(data_dir, local_node_id.clone(), peer_node_ids)?;
         let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))
             .map_err(|error| format!("cannot open DFS content store: {error}"))?;
 
@@ -2754,17 +2693,8 @@ impl SifsOneShotBulkWriteRequester {
             .validate_cached_catalog()
             .map_err(|error| format!("cannot validate one-shot DFS shard catalog: {error}"))?;
 
-        let mut service = NetworkedDfsService::new(
-            DfsNodeTransport::with_peer_transports_for_nodes(
-                local_node_id.clone(),
-                peer_node_ids,
-                sinomo_runtime::network::DEFAULT_NETWORK_TIMEOUT,
-                sync_peer_transport,
-                async_peer_transport,
-            ),
-            content,
-        )
-        .with_control_plane(control_plane.clone());
+        let mut service =
+            NetworkedDfsService::new(transport, content).with_control_plane(control_plane.clone());
         service
             .bootstrap_distributed_sifs()
             .map_err(|error| format!("cannot bootstrap one-shot SIFS bulk write: {error}"))?;
@@ -3122,7 +3052,7 @@ fn resident_sifs_list(
 
 fn open_sifs_service_read_only_until(
     data_dir: &SinomoDataDir,
-    rpc_runtime: &SifsRpcRuntime,
+    _rpc_runtime: &SifsRpcRuntime,
     operation_deadline: Option<Instant>,
 ) -> Result<NetworkedDfsService<DfsNodeTransport>, String> {
     sifs_operation_remaining(operation_deadline, "reading local cluster state")?;
@@ -3141,29 +3071,13 @@ fn open_sifs_service_read_only_until(
             discovered_cluster_dfs_peer_node_ids(&cluster_paths, state)
                 .map_err(|error| format!("cannot discover DFS service peers: {error}"))?,
         ),
-        None => (fallback_dfs_node_id(), Vec::new()),
+        None => return Err("SIFS requires an initialized node".into()),
     };
     sifs_operation_remaining(operation_deadline, "opening the DFS content store")?;
     let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))
         .map_err(|error| format!("cannot open DFS content store: {error}"))?;
-    let (sync_peer_transport, async_peer_transport) =
-        match sinomo_runtime::dfs::DaemonDfsPeerTransport::connect(data_dir.clone()) {
-            Ok(peer_transport) => shared_sifs_peer_transports(peer_transport),
-            Err(_) => shared_sifs_peer_transports(SifsDfsPeerTransport::new(
-                rpc_runtime.clone(),
-                data_dir.clone(),
-            )),
-        };
-    let mut service = NetworkedDfsService::new(
-        DfsNodeTransport::with_peer_transports_for_nodes(
-            local_node_id.clone(),
-            peer_node_ids,
-            sinomo_runtime::network::DEFAULT_NETWORK_TIMEOUT,
-            sync_peer_transport,
-            async_peer_transport,
-        ),
-        content,
-    );
+    let transport = sifs_main_caller_transport(data_dir, local_node_id.clone(), peer_node_ids)?;
+    let mut service = NetworkedDfsService::new(transport, content);
     let mut control_plane = cluster_state
         .as_ref()
         .map(|_| SifsControlPlaneKvClient::new(data_dir, &cluster_paths));
@@ -3249,7 +3163,7 @@ fn open_sifs_service_with_authoritative_catalog_until(
 
 fn open_sifs_service_with_catalog_until(
     data_dir: &SinomoDataDir,
-    rpc_runtime: &SifsRpcRuntime,
+    _rpc_runtime: &SifsRpcRuntime,
     hydrate_metadata: bool,
     operation_deadline: Option<Instant>,
     authoritative_catalog: Option<(SifsControlPlaneKvClient, Vec<DfsMetadataShardConfig>)>,
@@ -3273,31 +3187,14 @@ fn open_sifs_service_with_catalog_until(
             .map_err(|error| format!("cannot discover DFS service peers: {error}"))?;
         (state.local_node_id, peer_node_ids)
     } else {
-        (fallback_dfs_node_id(), Vec::new())
+        return Err("SIFS requires an initialized node".into());
     };
     let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))
         .map_err(|error| format!("cannot open DFS content store: {error}"))?;
     sifs_operation_remaining(operation_deadline, "opening the DFS content store")?;
-    // Both daemon-backed and direct routing use the same canonical call/result
-    // contract, preserving typed response values and explicit attachments.
-    let (sync_peer_transport, async_peer_transport) =
-        match sinomo_runtime::dfs::DaemonDfsPeerTransport::connect(data_dir.clone()) {
-            Ok(peer_transport) => shared_sifs_peer_transports(peer_transport),
-            Err(_) => shared_sifs_peer_transports(SifsDfsPeerTransport::new(
-                rpc_runtime.clone(),
-                data_dir.clone(),
-            )),
-        };
-    let mut service = NetworkedDfsService::new(
-        DfsNodeTransport::with_peer_transports_for_nodes(
-            local_node_id.clone(),
-            peer_node_ids,
-            sinomo_runtime::network::DEFAULT_NETWORK_TIMEOUT,
-            sync_peer_transport,
-            async_peer_transport,
-        ),
-        content,
-    );
+    // The caller uses Main's normal typed call/result and attachment contract.
+    let transport = sifs_main_caller_transport(data_dir, local_node_id.clone(), peer_node_ids)?;
+    let mut service = NetworkedDfsService::new(transport, content);
     let metadata_shards = if let Some((client, shards)) = authoritative_catalog {
         service = service.with_control_plane(client);
         shards
@@ -3322,8 +3219,11 @@ fn open_sifs_service_with_catalog_until(
                 .map_err(|error| format!("cannot open sharded SIFS metadata: {error}"))?
         }
     } else {
-        let metadata = open_root_local_metadata_backend(default_dfs_metadata_root(data_dir))
-            .map_err(|error| format!("cannot open local SIFS metadata: {error}"))?;
+        let metadata = sinomo_runtime::dfs::LocalSobjMetadataBackend::open_for_inspection(
+            sinomo_runtime::dfs::DfsMetadataShardId::new("root"),
+            default_dfs_metadata_root(data_dir),
+        )
+        .map_err(|error| format!("cannot inspect local SIFS metadata: {error}"))?;
         if hydrate_metadata {
             service
                 .with_metadata_backend(metadata)
@@ -3335,11 +3235,29 @@ fn open_sifs_service_with_catalog_until(
         }
     };
     sifs_operation_remaining(operation_deadline, "opening DFS metadata shards")?;
-    // Cold client hydration is observational. Authority rebind/recovery and
-    // fixed-namespace maintenance are deferred until a writable backend's
-    // first mutation; the daemon-owned service remains the recurring
-    // maintenance owner.
+    // Caller hydration stays observational. Main owns bootstrap, authority
+    // rebind, recovery, journal ingest and all semantic publication.
     Ok(service)
+}
+
+/// Cold CLI callers own routing and result queues; resident Main owns effects.
+fn sifs_main_caller_transport(
+    data_dir: &SinomoDataDir,
+    local_node_id: NodeId,
+    peer_node_ids: Vec<NodeId>,
+) -> Result<DfsNodeTransport, String> {
+    let peer = sinomo_runtime::dfs::DaemonDfsPeerTransport::connect(data_dir.clone()).map_err(
+        |error| format!("SIFS caller requires the resident Main DFS transport: {error}"),
+    )?;
+    let (sync_peer, async_peer) = shared_sifs_peer_transports(peer);
+    Ok(DfsNodeTransport::with_peer_transports_for_nodes(
+        local_node_id,
+        peer_node_ids,
+        sinomo_runtime::network::DEFAULT_NETWORK_TIMEOUT,
+        sync_peer,
+        async_peer,
+    )
+    .with_registered_main_namespace_dispatch())
 }
 
 fn shared_sifs_peer_transports<T>(
@@ -3976,37 +3894,14 @@ impl SifsControlPlaneKvClient {
             },
         )
         .map_err(|source| self.kv_error(source))?;
-        let response = match self.call_local_daemon_kv_call_raw(
-            call,
-            route,
-            sinomo_runtime::kv::CLUSTER_KV_AUTHORITATIVE_ENTRIES_MAX_PAYLOAD_BYTES
-                .saturating_add(1024 * 1024),
-        ) {
-            Ok(response) => response,
-            Err(error) if error.is_unknown_route(route) => {
-                let payload = sinomo_runtime::kv::cluster_kv_authoritative_snapshot_rpc_payload()?;
-                let response = self
-                    .call_local_daemon_kv_rpc_raw(
-                        payload,
-                        (sinomo_runtime::kv::MAX_CLUSTER_KV_RAFT_SNAPSHOT_BYTES as usize)
-                            .saturating_add(1024 * 1024),
-                    )
-                    .map_err(|source| self.kv_error(source))?;
-                let snapshot =
-                    sinomo_runtime::kv::decode_cluster_kv_authoritative_snapshot_rpc_body(
-                        &response.body,
-                    )?;
-                self.ensure_authoritative_revision(
-                    snapshot.authority.revision,
-                    Some(minimum_revision),
-                    "mixed-version exact-key snapshot",
-                )?;
-                return sinomo_runtime::kv::project_cluster_kv_authoritative_entries(
-                    &snapshot, keys,
-                );
-            }
-            Err(error) => return Err(self.kv_error(error)),
-        };
+        let response = self
+            .call_local_daemon_kv_call_raw(
+                call,
+                route,
+                sinomo_runtime::kv::CLUSTER_KV_AUTHORITATIVE_ENTRIES_MAX_PAYLOAD_BYTES
+                    .saturating_add(1024 * 1024),
+            )
+            .map_err(|error| self.kv_error(error))?;
         let read = sinomo_runtime::kv::decode_cluster_kv_authoritative_entries_rpc_body(
             &response.body,
             keys,
@@ -4589,6 +4484,20 @@ impl DfsControlPlaneKvClient for SifsControlPlaneKvClient {
     }
 
     fn txn(&mut self, txn: KvTxn) -> Result<KvTxnResponse, KvError> {
+        self.txn_with_native_authority(txn)
+            .map(|(response, _)| response)
+    }
+
+    fn txn_with_native_authority(
+        &mut self,
+        txn: KvTxn,
+    ) -> Result<
+        (
+            KvTxnResponse,
+            Option<sinomo_runtime::dfs::DfsNativeTxnCommit>,
+        ),
+        KvError,
+    > {
         let request = KvTxnRequest::generated(txn);
         let submitted_digest = sinomo_runtime::kv::kv_command_digest(
             &sinomo_runtime::kv::KvCommand::Txn(request.txn.clone()),
@@ -4605,19 +4514,19 @@ impl DfsControlPlaneKvClient for SifsControlPlaneKvClient {
                 ),
             });
         }
-        if result
-            .submitted_command_digest
-            .is_some_and(|digest| digest != submitted_digest)
-        {
+        if result.submitted_command_digest != Some(submitted_digest) {
             return Err(KvError::Serialization {
-                detail: "SIFS cluster KV transaction response does not match the submitted command"
-                    .to_string(),
+                detail: "SIFS cluster KV transaction response does not bind the submitted command"
+                    .into(),
             });
         }
-        let response = result.txn_response.ok_or_else(|| KvError::Serialization {
-            detail: "cluster KV returned a barrier result for a SIFS control-plane transaction"
-                .to_string(),
-        })?;
+        let response = result
+            .txn_response
+            .clone()
+            .ok_or_else(|| KvError::Serialization {
+                detail: "cluster KV returned a barrier result for a SIFS control-plane transaction"
+                    .to_string(),
+            })?;
         if result.authority.revision < response.revision {
             return Err(KvError::AuthorityUnavailable {
                 detail: format!(
@@ -4662,7 +4571,20 @@ impl DfsControlPlaneKvClient for SifsControlPlaneKvClient {
         for prefix in refreshed_prefixes {
             self.revalidate_mutated_prefix(prefix, response.revision)?;
         }
-        Ok(response)
+        Ok((
+            response,
+            Some(sinomo_runtime::dfs::DfsNativeTxnCommit {
+                request,
+                result: sinomo_runtime::kv::ClusterKvTxnCompactCommitResult {
+                    request_id: result.request_id,
+                    submitted_command_digest: result.submitted_command_digest,
+                    command_digest: result.command_digest,
+                    txn_response: result.txn_response,
+                    authority: result.authority,
+                    replayed_committed_request: result.replayed_committed_request,
+                },
+            }),
+        ))
     }
 }
 
@@ -4792,6 +4714,21 @@ impl DfsControlPlaneKvClient for SifsOneShotBulkWriteControlPlaneKvClient {
         self.validate_cached_catalog()?;
         Ok(response)
     }
+    fn txn_with_native_authority(
+        &mut self,
+        txn: KvTxn,
+    ) -> Result<
+        (
+            KvTxnResponse,
+            Option<sinomo_runtime::dfs::DfsNativeTxnCommit>,
+        ),
+        KvError,
+    > {
+        self.validate_cached_catalog()?;
+        let response = self.inner.txn_with_native_authority(txn)?;
+        self.validate_cached_catalog()?;
+        Ok(response)
+    }
 }
 
 fn read_sifs_metadata_shard_configs(
@@ -4912,7 +4849,7 @@ fn open_sifs_sharded_metadata_backend(
     if shards.is_empty() {
         return Ok(None);
     }
-    open_local_sharded_metadata_backend_for_replica_repair(
+    sinomo_runtime::dfs::LocalShardedMetadataBackend::open_for_inspection_at_node(
         default_dfs_metadata_shards_root(data_dir),
         shards,
         local_node_id,
@@ -5229,336 +5166,6 @@ fn sifs_replica_candidate_rank(
     (3, u64::MAX, node_id.to_string())
 }
 
-#[derive(Clone, Debug)]
-struct SifsDfsPeerTransport {
-    rpc_runtime: SifsRpcRuntime,
-    data_dir: SinomoDataDir,
-    operation_deadline: Option<Instant>,
-}
-
-impl SifsDfsPeerTransport {
-    fn new(rpc_runtime: SifsRpcRuntime, data_dir: SinomoDataDir) -> Self {
-        Self {
-            rpc_runtime,
-            data_dir,
-            operation_deadline: None,
-        }
-    }
-
-    fn with_operation_deadline(mut self, operation_deadline: Option<Instant>) -> Self {
-        self.operation_deadline = operation_deadline;
-        self
-    }
-}
-
-impl DfsPeerTransport for SifsDfsPeerTransport {
-    fn call_object_rpc(
-        &self,
-        target_node_id: &NodeId,
-        call: network::ObjectRpcCall,
-        options: DfsObjectRpcSendOptions,
-    ) -> Result<network::ObjectRpcResult, DfsPeerTransportError> {
-        let operation_deadline =
-            sifs_rpc_effective_operation_deadline(&options, self.operation_deadline);
-        let options = sifs_rpc_options_with_operation_deadline(options, operation_deadline)?;
-        sifs_send_dfs_object_rpc(
-            &self.rpc_runtime,
-            &self.data_dir,
-            target_node_id,
-            call,
-            options,
-            operation_deadline,
-        )
-    }
-}
-
-impl AsyncDfsPeerTransport for SifsDfsPeerTransport {
-    fn call_object_rpc_async<'a>(
-        &'a self,
-        target_node_id: &'a NodeId,
-        call: network::ObjectRpcCall,
-        options: DfsObjectRpcSendOptions,
-    ) -> DfsPeerTransportFuture<'a, Result<network::ObjectRpcResult, DfsPeerTransportError>> {
-        let operation_deadline =
-            sifs_rpc_effective_operation_deadline(&options, self.operation_deadline);
-        let options = match sifs_rpc_options_with_operation_deadline(options, operation_deadline) {
-            Ok(options) => options,
-            Err(error) => return Box::pin(async move { Err(error) }),
-        };
-        let handle = self.rpc_runtime.runtime.handle().clone();
-        let target_node_id = target_node_id.clone();
-        let data_dir = self.data_dir.clone();
-        Box::pin(async move {
-            let daemon_target_node_id = target_node_id.clone();
-            let daemon_runtime = handle.clone();
-            let daemon_probe = tokio::task::spawn_blocking(move || {
-                sifs_send_dfs_object_rpc_via_daemon(
-                    &data_dir,
-                    &daemon_target_node_id,
-                    call,
-                    options,
-                    operation_deadline,
-                    &daemon_runtime,
-                )
-            });
-            // Discovery and the forwarded RPC are each bounded internally.
-            // Do not add a competing outer deadline: the daemon-control client
-            // intentionally waits one default network phase beyond the inner
-            // route budget so it can return the terminal delivery state.
-            let daemon_result = daemon_probe
-                .await
-                .map_err(|error| DfsPeerTransportError::new(error.to_string()))?;
-            let call = match daemon_result {
-                SifsDaemonRpcAttempt::Complete(result) => return result,
-                SifsDaemonRpcAttempt::Unavailable(call) => call,
-            };
-
-            let options = sifs_rpc_options_with_operation_deadline(options, operation_deadline)?;
-            sinomo_runtime::daemon::send_object_rpc_call_to_target_async_with_options(
-                &target_node_id,
-                call,
-                options.cluster_rpc_options(),
-                &handle,
-                options.observe_connectivity,
-            )
-            .await
-            .map_err(|error| DfsPeerTransportError::new(error.to_string()))
-        })
-    }
-}
-
-fn sifs_rpc_effective_operation_deadline(
-    options: &DfsObjectRpcSendOptions,
-    operation_deadline: Option<Instant>,
-) -> Option<Instant> {
-    let now = Instant::now();
-    let relative_deadline = options
-        .overall_timeout
-        .map(|timeout| now.checked_add(timeout).unwrap_or(now));
-    match (operation_deadline, relative_deadline) {
-        (Some(operation), Some(relative)) => Some(operation.min(relative)),
-        (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
-        (None, None) => None,
-    }
-}
-
-fn sifs_rpc_remaining_operation_budget(
-    deadline: Instant,
-    operation: &str,
-) -> Result<Duration, DfsPeerTransportError> {
-    deadline
-        .checked_duration_since(Instant::now())
-        .filter(|remaining| !remaining.is_zero())
-        .ok_or_else(|| {
-            DfsPeerTransportError::new(format!(
-                "SIFS operation deadline expired during {operation}"
-            ))
-        })
-}
-
-fn sifs_rpc_options_with_operation_deadline(
-    mut options: DfsObjectRpcSendOptions,
-    operation_deadline: Option<Instant>,
-) -> Result<DfsObjectRpcSendOptions, DfsPeerTransportError> {
-    let Some(deadline) = operation_deadline else {
-        return Ok(options);
-    };
-    let remaining = sifs_rpc_remaining_operation_budget(deadline, "SIFS peer RPC dispatch")?;
-    options.overall_timeout = Some(
-        options
-            .overall_timeout
-            .map(|timeout| timeout.min(remaining))
-            .unwrap_or(remaining),
-    );
-    Ok(options)
-}
-
-fn sifs_send_dfs_object_rpc(
-    rpc_runtime: &SifsRpcRuntime,
-    data_dir: &SinomoDataDir,
-    target_node_id: &NodeId,
-    call: network::ObjectRpcCall,
-    options: DfsObjectRpcSendOptions,
-    operation_deadline: Option<Instant>,
-) -> Result<network::ObjectRpcResult, DfsPeerTransportError> {
-    let options = sifs_rpc_options_with_operation_deadline(options, operation_deadline)?;
-    let call = match sifs_send_dfs_object_rpc_via_daemon(
-        data_dir,
-        target_node_id,
-        call,
-        options,
-        operation_deadline,
-        rpc_runtime.runtime.handle(),
-    ) {
-        SifsDaemonRpcAttempt::Complete(result) => return result,
-        SifsDaemonRpcAttempt::Unavailable(call) => call,
-    };
-    let options = sifs_rpc_options_with_operation_deadline(options, operation_deadline)?;
-
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        if matches!(
-            handle.runtime_flavor(),
-            tokio::runtime::RuntimeFlavor::MultiThread
-        ) {
-            return tokio::task::block_in_place(|| {
-                handle
-                    .block_on(
-                        sinomo_runtime::daemon::send_object_rpc_call_to_target_async_with_options(
-                            target_node_id,
-                            call,
-                            options.cluster_rpc_options(),
-                            &handle,
-                            options.observe_connectivity,
-                        ),
-                    )
-                    .map_err(|error| DfsPeerTransportError::new(error.to_string()))
-            });
-        }
-        return Err(DfsPeerTransportError::new(
-            "SIFS DFS object RPC sync sender cannot run inside a current-thread Tokio runtime",
-        ));
-    }
-    rpc_runtime
-        .runtime
-        .block_on(
-            sinomo_runtime::daemon::send_object_rpc_call_to_target_async_with_options(
-                target_node_id,
-                call,
-                options.cluster_rpc_options(),
-                rpc_runtime.runtime.handle(),
-                options.observe_connectivity,
-            ),
-        )
-        .map_err(|error| DfsPeerTransportError::new(error.to_string()))
-}
-
-/// Forward a peer RPC through the daemon that owns `data_dir`, when it is
-/// running. Scoped to the backend's own data directory on purpose — probing
-/// the env/home default daemon routed backends opened on foreign directories
-/// (tests, tooling) through the developer's live daemon and its real cluster.
-enum SifsDaemonRpcAttempt {
-    Unavailable(network::ObjectRpcCall),
-    Complete(Result<network::ObjectRpcResult, DfsPeerTransportError>),
-}
-
-fn sifs_send_dfs_object_rpc_via_daemon(
-    data_dir: &SinomoDataDir,
-    target_node_id: &NodeId,
-    call: network::ObjectRpcCall,
-    options: DfsObjectRpcSendOptions,
-    operation_deadline: Option<Instant>,
-    runtime: &tokio::runtime::Handle,
-) -> SifsDaemonRpcAttempt {
-    let paths = sinomo_runtime::daemon::DaemonPaths::new(data_dir);
-    let client = if let Some(deadline) = operation_deadline {
-        let remaining =
-            match sifs_rpc_remaining_operation_budget(deadline, "local daemon discovery") {
-                Ok(remaining) => remaining,
-                Err(error) => return SifsDaemonRpcAttempt::Complete(Err(error)),
-            };
-        sinomo_runtime::daemon::DaemonApiClient::connect_for_paths_with_timeout(
-            &paths,
-            remaining.min(sinomo_runtime::daemon::DAEMON_API_PROBE_TIMEOUT),
-        )
-    } else {
-        sinomo_runtime::daemon::DaemonApiClient::connect_for_paths(&paths)
-    };
-    let Ok(client) = client else {
-        return SifsDaemonRpcAttempt::Unavailable(call);
-    };
-    let options = match sifs_rpc_options_with_operation_deadline(options, operation_deadline) {
-        Ok(options) => options,
-        Err(error) => return SifsDaemonRpcAttempt::Complete(Err(error)),
-    };
-    if let Some(deadline) = operation_deadline
-        && let Err(error) = sifs_rpc_remaining_operation_budget(deadline, "daemon-forwarded RPC")
-    {
-        return SifsDaemonRpcAttempt::Complete(Err(error));
-    }
-    // Keep the inner routed RPC clamped to the DFS operation deadline through
-    // `options`, but do not clamp the loopback control stream to that same
-    // instant. `DaemonApiClient` deliberately gives canonical forwarding one
-    // default network phase of grace so the daemon can return the terminal
-    // response (including a precise possibly-applied error) after the inner
-    // route budget expires.
-    let send = async {
-        client
-            .object_rpc_call_to_target_with_deadline_and_affinity_async(
-                target_node_id,
-                call,
-                options.connect_timeout,
-                options.overall_timeout,
-                options.observe_connectivity,
-                sinomo_runtime::api::DaemonObjectRpcDestinationProcessAffinity::MainDaemon,
-            )
-            .await
-            .map_err(|error| {
-                DfsPeerTransportError::with_delivery_state(
-                    error.to_string(),
-                    error.delivery_state(),
-                )
-            })
-    };
-    let result = if let Ok(current) = tokio::runtime::Handle::try_current() {
-        if matches!(
-            current.runtime_flavor(),
-            tokio::runtime::RuntimeFlavor::MultiThread
-        ) {
-            tokio::task::block_in_place(|| runtime.block_on(send))
-        } else {
-            Err(DfsPeerTransportError::new(
-                "SIFS daemon RPC cannot block a current-thread Tokio runtime; use the async transport",
-            ))
-        }
-    } else {
-        runtime.block_on(send)
-    };
-    SifsDaemonRpcAttempt::Complete(result)
-}
-
-fn publish_sifs_metadata_journal_from_data_dir(
-    data_dir: &SinomoDataDir,
-    rpc_runtime: &SifsRpcRuntime,
-    operation_deadline: Option<Instant>,
-) -> Result<DfsMetadataJournalReplicationReport, sinomo_runtime::dfs::DfsError> {
-    let cluster_paths = ClusterPaths::new(data_dir);
-    let peer_transport = Arc::new(
-        SifsDfsPeerTransport::new(rpc_runtime.clone(), data_dir.clone())
-            .with_operation_deadline(operation_deadline),
-    );
-    let sync_peer_transport: Arc<dyn DfsPeerTransport> = peer_transport.clone();
-    let async_peer_transport: Arc<dyn AsyncDfsPeerTransport> = peer_transport;
-    let options = sifs_foreground_metadata_publish_options_with_deadline(operation_deadline)
-        .map_err(|message| sinomo_runtime::dfs::DfsError::Network { message })?;
-    let publish = publish_cluster_dfs_metadata_journal_with_peer_transports_async(
-        data_dir,
-        &cluster_paths,
-        sync_peer_transport,
-        async_peer_transport,
-        options,
-    );
-    block_on_sifs_rpc_runtime(rpc_runtime, publish)
-}
-
-fn block_on_sifs_rpc_runtime<F, T>(rpc_runtime: &SifsRpcRuntime, future: F) -> Result<T, DfsError>
-where
-    F: Future<Output = Result<T, DfsError>>,
-{
-    if let Ok(current) = tokio::runtime::Handle::try_current() {
-        if matches!(
-            current.runtime_flavor(),
-            tokio::runtime::RuntimeFlavor::MultiThread
-        ) {
-            return tokio::task::block_in_place(|| rpc_runtime.runtime.block_on(future));
-        }
-        return Err(DfsError::Network {
-            message: "SIFS metadata publication cannot block a current-thread Tokio runtime; use the async transport"
-                .to_string(),
-        });
-    }
-    rpc_runtime.runtime.block_on(future)
-}
-
 fn block_on_sifs_network_rpc<F, T>(
     rpc_runtime: &SifsRpcRuntime,
     future: F,
@@ -5604,65 +5211,6 @@ where
         .into());
     }
     rpc_runtime.runtime.block_on(future)
-}
-
-fn sifs_foreground_metadata_publish_options() -> DfsMetadataJournalReplicationOptions {
-    DfsMetadataJournalReplicationOptions {
-        max_batches_per_target: SIFS_FOREGROUND_METADATA_PUBLISH_MAX_BATCHES_PER_TARGET,
-        ..DfsMetadataJournalReplicationOptions::default()
-    }
-}
-
-fn sifs_foreground_metadata_publish_options_with_deadline(
-    operation_deadline: Option<Instant>,
-) -> Result<DfsMetadataJournalReplicationOptions, String> {
-    let mut options = sifs_foreground_metadata_publish_options();
-    if let Some(remaining) = sifs_operation_remaining(operation_deadline, "metadata publication")? {
-        options.attempt_timeout = options.attempt_timeout.min(remaining);
-        options.target_timeout = options.target_timeout.min(remaining);
-    }
-    Ok(options)
-}
-
-fn handoff_or_publish_sifs_metadata<R, P>(
-    operation_deadline: Option<Instant>,
-    request_refresh: R,
-    publish: P,
-) -> Result<(), String>
-where
-    R: FnOnce(Duration) -> bool,
-    P: FnOnce() -> Result<(), String>,
-{
-    let refresh_timeout = match sifs_operation_remaining(
-        operation_deadline,
-        "daemon metadata publication handoff",
-    ) {
-        Ok(remaining) => remaining
-            .map(|remaining| remaining.min(SIFS_MAINTENANCE_REFRESH_TIMEOUT))
-            .unwrap_or(SIFS_MAINTENANCE_REFRESH_TIMEOUT),
-        Err(error) => {
-            eprintln!(
-                "warning: skipping SIFS metadata publication after a committed mutation because its operation budget expired: {error}"
-            );
-            return Ok(());
-        }
-    };
-    if request_refresh(refresh_timeout) {
-        return Ok(());
-    }
-
-    if let Err(error) = sifs_operation_remaining(operation_deadline, "metadata publication") {
-        eprintln!(
-            "warning: skipping foreground SIFS metadata publication after a committed mutation because its operation budget expired: {error}"
-        );
-        return Ok(());
-    }
-    if let Err(error) = publish() {
-        eprintln!(
-            "warning: foreground SIFS metadata publication failed after a committed mutation; durable metadata maintenance will retry: {error}"
-        );
-    }
-    Ok(())
 }
 
 fn request_sifs_daemon_maintenance_refresh(data_dir: &SinomoDataDir, timeout: Duration) -> bool {
@@ -5954,7 +5502,7 @@ mod tests {
                     .map_err(Into::into)
                 }
                 DAEMON_DFS_BROWSER_READ_FILE_ROUTE
-                | sinomo_runtime::api::DAEMON_DFS_BROWSER_READ_FILE_BYTES_ROUTE => {
+                | sinomo_runtime::api::DAEMON_DFS_BROWSER_READ_FILE_ROUTE => {
                     let read: DaemonDfsBrowserReadFileRequest = request.decode_body().unwrap();
                     assert_eq!(read.path, "/services/owned.txt");
                     network::ObjectRpcResponse::encode_body(
@@ -6395,7 +5943,7 @@ mod tests {
             [
                 DAEMON_DFS_BROWSER_STATUS_ROUTE,
                 DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE,
-                sinomo_runtime::api::DAEMON_DFS_BROWSER_READ_FILE_BYTES_ROUTE,
+                sinomo_runtime::api::DAEMON_DFS_BROWSER_READ_FILE_ROUTE,
                 sinomo_runtime::api::DAEMON_DFS_BROWSER_READ_OBJECT_VERSION_ROUTE,
                 DAEMON_DFS_BROWSER_CREATE_DIR_ALL_ROUTE,
                 DAEMON_DFS_BROWSER_RENAME_ROUTE,
@@ -7245,7 +6793,6 @@ mod tests {
             replica_node_ids: vec![replica.clone()],
             epoch: 1,
             assignment: sinomo_runtime::dfs::DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
             default_policy: sinomo_runtime::core::DfsObjectPolicy::ReplicatedEventual,
         };
 
@@ -7666,7 +7213,6 @@ mod tests {
             .expect("observation")
             .operational_snapshot()
             .expect("activated markers are not durable invariant failures");
-        assert_eq!(snapshot.metrics.open_conflict_count, 0);
         assert_eq!(snapshot.metrics.cross_shard_namespace_lock_count, 0);
         assert_eq!(snapshot.metrics.pending_metadata_replication_count, 0);
 
@@ -8215,66 +7761,32 @@ mod tests {
     }
 
     #[test]
-    fn sifs_exact_set_uses_one_snapshot_only_for_a_definite_legacy_route() {
-        let root = temp_sifs_data_dir("control-plane-legacy-exact-set");
-        let data_dir = SinomoDataDir::new(&root);
-        seed_observation_cluster(&data_dir);
-        let cluster_paths = ClusterPaths::new(&data_dir);
-        let state = cluster::read_cluster_state_without_kv(&cluster_paths)
-            .expect("cluster state without KV");
-        let keys = vec![
-            "/dfs/test/legacy-a".to_string(),
-            "/dfs/test/legacy-b".to_string(),
-        ];
-
-        let transport = Arc::new(RecordingSifsKvDaemonTransport::new(
-            state.local_node_id.clone(),
-        ));
-        transport.return_unknown_exact_set_route_once();
-        let mut client = SifsControlPlaneKvClient::new(&data_dir, &cluster_paths)
-            .with_peer_transport(transport.clone());
-        client
-            .refresh_latest()
-            .expect("start legacy authority generation");
-        let values = client
-            .get_consistent(&keys)
-            .expect("legacy daemon snapshot projection fallback");
-        assert_eq!(values.len(), keys.len());
-        for (key, value) in keys.iter().zip(&values) {
+    fn sifs_exact_set_rejects_incompatible_routes_and_transport_failure() {
+        for unknown_route in [false, true] {
+            let root = temp_sifs_data_dir("control-plane-current-exact-set");
+            let data_dir = SinomoDataDir::new(&root);
+            seed_observation_cluster(&data_dir);
+            let cluster_paths = ClusterPaths::new(&data_dir);
+            let state = cluster::read_cluster_state_without_kv(&cluster_paths).unwrap();
+            let transport = Arc::new(RecordingSifsKvDaemonTransport::new(state.local_node_id));
+            if unknown_route {
+                transport.return_unknown_exact_set_route_once();
+            } else {
+                transport.fail_exact_set_route_once();
+            }
+            let mut client = SifsControlPlaneKvClient::new(&data_dir, &cluster_paths)
+                .with_peer_transport(transport.clone());
+            client.refresh_latest().unwrap();
+            assert!(
+                client
+                    .get_consistent(&["/dfs/test/current".into()])
+                    .is_err()
+            );
             assert_eq!(
-                value.as_ref().map(|entry| entry.key.as_str()),
-                Some(key.as_str())
+                transport.routes(),
+                vec![sinomo_runtime::kv::CLUSTER_KV_AUTHORITATIVE_ENTRIES_ROUTE.to_string()]
             );
         }
-        assert_eq!(
-            transport.routes(),
-            vec![
-                sinomo_runtime::kv::CLUSTER_KV_AUTHORITATIVE_ENTRIES_ROUTE.to_string(),
-                sinomo_runtime::kv::CLUSTER_KV_AUTHORITATIVE_SNAPSHOT_ROUTE.to_string(),
-            ],
-            "mixed-version fallback must project the complete key set from one authoritative snapshot"
-        );
-
-        let transport = Arc::new(RecordingSifsKvDaemonTransport::new(state.local_node_id));
-        transport.fail_exact_set_route_once();
-        let mut client = SifsControlPlaneKvClient::new(&data_dir, &cluster_paths)
-            .with_peer_transport(transport.clone());
-        client
-            .refresh_latest()
-            .expect("start strict authority generation");
-        let error = client
-            .get_consistent(&keys)
-            .expect_err("an ambiguous transport failure must not use compatibility fallback");
-        assert!(
-            error
-                .to_string()
-                .contains("exact-key-set transport failure")
-        );
-        assert_eq!(
-            transport.routes(),
-            vec![sinomo_runtime::kv::CLUSTER_KV_AUTHORITATIVE_ENTRIES_ROUTE.to_string()],
-            "only a definite UnknownRoute may use the snapshot compatibility path"
-        );
     }
 
     #[test]
@@ -8780,110 +8292,6 @@ mod tests {
                 .expect("async response attachment"),
             attachment
         );
-    }
-
-    #[test]
-    fn persistent_peer_transport_does_not_retain_backend_open_deadline() {
-        let root = temp_sifs_data_dir("persistent-peer-deadline");
-        let data_dir = SinomoDataDir::new(&root);
-        let runtime = SifsRpcRuntime::new().expect("runtime");
-        let expired_open_deadline = Instant::now() - Duration::from_millis(1);
-        let bootstrap = SifsDfsPeerTransport::new(runtime.clone(), data_dir.clone())
-            .with_operation_deadline(Some(expired_open_deadline));
-        let persistent = SifsDfsPeerTransport::new(runtime, data_dir);
-
-        assert_eq!(
-            bootstrap.operation_deadline,
-            Some(expired_open_deadline),
-            "the temporary bootstrap transport must retain the open deadline"
-        );
-        assert_eq!(
-            persistent.operation_deadline, None,
-            "the service transport must start with no backend-open deadline"
-        );
-
-        let started_at = Instant::now();
-        let later_deadline = sifs_rpc_effective_operation_deadline(
-            &DfsObjectRpcSendOptions::default().with_overall_timeout(Duration::from_millis(100)),
-            persistent.operation_deadline,
-        )
-        .expect("later per-RPC deadline");
-        assert!(
-            later_deadline > started_at,
-            "a later RPC was clamped by the expired backend-open deadline"
-        );
-    }
-
-    #[test]
-    fn metadata_peer_rpc_options_are_clamped_to_remaining_operation_budget() {
-        let deadline = Instant::now() + Duration::from_millis(100);
-        let options = sifs_rpc_options_with_operation_deadline(
-            DfsObjectRpcSendOptions::default().with_overall_timeout(Duration::from_secs(5)),
-            Some(deadline),
-        )
-        .expect("bounded metadata RPC options");
-        let overall_timeout = options.overall_timeout.expect("overall timeout");
-        assert!(overall_timeout > Duration::ZERO);
-        assert!(
-            overall_timeout <= Duration::from_millis(100),
-            "metadata RPC must receive only the operation's remaining budget: {overall_timeout:?}"
-        );
-    }
-
-    #[test]
-    fn peer_rpc_budget_is_recomputed_after_daemon_discovery_time() {
-        let deadline = Instant::now() + Duration::from_millis(200);
-        let initial = sifs_rpc_options_with_operation_deadline(
-            DfsObjectRpcSendOptions::default().with_overall_timeout(Duration::from_secs(5)),
-            Some(deadline),
-        )
-        .expect("initial bounded options")
-        .overall_timeout
-        .expect("initial overall timeout");
-        std::thread::sleep(Duration::from_millis(30));
-        let before_dispatch = Instant::now();
-        let after_discovery = sifs_rpc_options_with_operation_deadline(
-            DfsObjectRpcSendOptions::default().with_overall_timeout(initial),
-            Some(deadline),
-        )
-        .expect("dispatch-time bounded options")
-        .overall_timeout
-        .expect("dispatch-time overall timeout");
-
-        assert!(
-            after_discovery < initial,
-            "daemon discovery time restarted the route budget: initial={initial:?}, after={after_discovery:?}"
-        );
-        assert!(
-            after_discovery <= deadline.saturating_duration_since(before_dispatch),
-            "dispatch timeout exceeds the remaining absolute operation budget"
-        );
-    }
-
-    #[test]
-    fn relative_rpc_timeout_becomes_an_absolute_dispatch_deadline() {
-        let started_at = Instant::now();
-        let options =
-            DfsObjectRpcSendOptions::default().with_overall_timeout(Duration::from_millis(100));
-        let deadline =
-            sifs_rpc_effective_operation_deadline(&options, None).expect("relative RPC deadline");
-
-        assert!(deadline > started_at);
-        assert!(
-            deadline.saturating_duration_since(started_at) <= Duration::from_millis(110),
-            "relative route timeout was not converted at transport entry"
-        );
-    }
-
-    #[test]
-    fn metadata_peer_rpc_options_reject_an_expired_operation_budget() {
-        let error = sifs_rpc_options_with_operation_deadline(
-            DfsObjectRpcSendOptions::default(),
-            Some(Instant::now() - Duration::from_millis(1)),
-        )
-        .expect_err("expired metadata RPC must fail before transport dispatch");
-
-        assert!(error.to_string().contains("operation deadline expired"));
     }
 
     #[test]
@@ -9428,7 +8836,6 @@ mod tests {
             NodeId::from_legacy_named("placement-activity-local-owner").expect("activity owner");
         let file_system_id = sifs_file_system_id();
         let base = DfsFileSystemConfig {
-            metadata_format: sinomo_runtime::dfs::DfsRevisionMetadataFormat::Legacy,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: file_system_id.clone(),
@@ -9463,7 +8870,7 @@ mod tests {
             adaptive: false,
             adaptive_budget: None,
             processed_content_bytes: 0,
-            accepted_config: None,
+            accepted_config: desired.clone(),
             state: DfsPlacementReconciliationState::Pending,
             cursor: None,
             total_object_count: 0,
@@ -9688,154 +9095,6 @@ mod tests {
     }
 
     #[test]
-    fn sifs_foreground_metadata_publish_uses_network_timeout_defaults() {
-        let options = sifs_foreground_metadata_publish_options();
-
-        assert_eq!(options.max_batches_per_target, 1);
-        assert_eq!(options.attempt_timeout, network::DEFAULT_NETWORK_TIMEOUT);
-        assert_eq!(options.target_timeout, network::DEFAULT_NETWORK_TIMEOUT);
-    }
-
-    #[test]
-    fn sifs_rpc_runtime_blocks_foreground_publish_from_plain_thread() {
-        let rpc_runtime = SifsRpcRuntime::new().expect("SIFS RPC runtime");
-
-        let value = block_on_sifs_rpc_runtime(&rpc_runtime, async {
-            tokio::task::yield_now().await;
-            Ok::<_, DfsError>(41)
-        })
-        .expect("foreground publish future");
-
-        assert_eq!(value, 41);
-    }
-
-    #[test]
-    fn sifs_rpc_runtime_blocks_foreground_publish_from_multithread_runtime() {
-        let rpc_runtime = SifsRpcRuntime::new().expect("SIFS RPC runtime");
-        let caller_runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .expect("caller runtime");
-
-        let value = caller_runtime
-            .block_on(async {
-                block_on_sifs_rpc_runtime(&rpc_runtime, async {
-                    tokio::task::yield_now().await;
-                    Ok::<_, DfsError>(42)
-                })
-            })
-            .expect("foreground publish future");
-
-        assert_eq!(value, 42);
-    }
-
-    #[test]
-    fn sifs_rpc_runtime_rejects_blocking_current_thread_runtime() {
-        let rpc_runtime = SifsRpcRuntime::new().expect("SIFS RPC runtime");
-        let caller_runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("caller runtime");
-
-        let error = caller_runtime
-            .block_on(async {
-                block_on_sifs_rpc_runtime(&rpc_runtime, async { Ok::<_, DfsError>(()) })
-            })
-            .expect_err("current-thread runtime must not be blocked");
-
-        assert!(
-            error
-                .to_string()
-                .contains("cannot block a current-thread Tokio runtime")
-        );
-    }
-
-    #[test]
-    fn acknowledged_daemon_metadata_handoff_skips_foreground_publish() {
-        let refresh_requests = std::cell::Cell::new(0);
-        let foreground_publishes = std::cell::Cell::new(0);
-
-        handoff_or_publish_sifs_metadata(
-            None,
-            |timeout| {
-                refresh_requests.set(refresh_requests.get() + 1);
-                assert_eq!(timeout, SIFS_MAINTENANCE_REFRESH_TIMEOUT);
-                true
-            },
-            || {
-                foreground_publishes.set(foreground_publishes.get() + 1);
-                Ok(())
-            },
-        )
-        .expect("acknowledged daemon handoff");
-
-        assert_eq!(refresh_requests.get(), 1);
-        assert_eq!(foreground_publishes.get(), 0);
-    }
-
-    #[test]
-    fn failed_daemon_metadata_handoff_falls_back_to_foreground_publish() {
-        let refresh_requests = std::cell::Cell::new(0);
-        let foreground_publishes = std::cell::Cell::new(0);
-
-        handoff_or_publish_sifs_metadata(
-            None,
-            |_| {
-                refresh_requests.set(refresh_requests.get() + 1);
-                false
-            },
-            || {
-                foreground_publishes.set(foreground_publishes.get() + 1);
-                Ok(())
-            },
-        )
-        .expect("foreground metadata publication fallback");
-
-        assert_eq!(refresh_requests.get(), 1);
-        assert_eq!(foreground_publishes.get(), 1);
-    }
-
-    #[test]
-    fn failed_foreground_metadata_fallback_does_not_misreport_committed_mutation() {
-        let foreground_publishes = std::cell::Cell::new(0);
-
-        handoff_or_publish_sifs_metadata(
-            None,
-            |_| false,
-            || {
-                foreground_publishes.set(foreground_publishes.get() + 1);
-                Err("simulated WAN publication failure".to_string())
-            },
-        )
-        .expect("metadata publication failure must not fail a committed mutation");
-
-        assert_eq!(foreground_publishes.get(), 1);
-    }
-
-    #[test]
-    fn expired_publication_budget_does_not_misreport_committed_mutation() {
-        let refresh_requests = std::cell::Cell::new(0);
-        let foreground_publishes = std::cell::Cell::new(0);
-
-        handoff_or_publish_sifs_metadata(
-            Some(Instant::now() - Duration::from_millis(1)),
-            |_| {
-                refresh_requests.set(refresh_requests.get() + 1);
-                true
-            },
-            || {
-                foreground_publishes.set(foreground_publishes.get() + 1);
-                Ok(())
-            },
-        )
-        .expect("expired publication budget must not fail a committed mutation");
-
-        assert_eq!(refresh_requests.get(), 0);
-        assert_eq!(foreground_publishes.get(), 0);
-    }
-
-    #[test]
     fn ordinary_sifs_write_cannot_succeed_before_its_receipt_threshold() {
         for overwrite in [false, true] {
             let root = temp_sifs_data_dir("write-missing-required-replica");
@@ -10019,109 +9278,19 @@ mod tests {
     }
 
     fn seed_observation_cluster(data_dir: &SinomoDataDir) -> Vec<DfsMetadataShardConfig> {
-        let cluster_paths = ClusterPaths::new(data_dir);
-        cluster_paths.ensure().expect("cluster paths");
-        let cluster_id = sinomo_runtime::node::ClusterId::from_legacy_named(
-            "cluster_sifs_observation_journal_heads",
-        )
-        .expect("cluster id");
-        let local_node_id =
-            NodeId::from_legacy_named("node_sifs_observation_local").expect("node id");
-        let mut state = sinomo_runtime::core::ClusterBootstrapState::initialized_locally(
-            cluster_id,
-            "SIFS observation journal heads",
-            local_node_id.clone(),
-            "local",
-            "local-public-key",
-            time::OffsetDateTime::now_utc(),
-        );
-        state.members[0].capabilities =
-            sinomo_runtime::node::main_daemon_capabilities(&state.members[0].role);
-        state.members[0].allowed_capabilities = state.members[0].capabilities.clone();
-        cluster::write_cluster_state(&cluster_paths, &state).expect("cluster state");
-        cluster::locked_set_cluster_raft_leader(&cluster_paths, &local_node_id, state.term)
-            .expect("seed initial local Raft leadership");
-
-        let file_system_id = sifs_file_system_id();
-        let shards = vec![
-            DfsMetadataShardConfig {
-                file_system_id: file_system_id.clone(),
-                shard_id: "root".to_string(),
-                primary_node_id: local_node_id.clone(),
-                replica_node_ids: Vec::new(),
-                epoch: 1,
-                assignment: sinomo_runtime::dfs::DfsMetadataShardAssignment::Root,
-                namespace_prepare_codec: Default::default(),
-                default_policy: sinomo_runtime::core::DfsObjectPolicy::ReplicatedEventual,
-            },
-            DfsMetadataShardConfig {
-                file_system_id: file_system_id.clone(),
-                shard_id: "services".to_string(),
-                primary_node_id: local_node_id.clone(),
-                replica_node_ids: Vec::new(),
-                epoch: 1,
-                assignment: sinomo_runtime::dfs::DfsMetadataShardAssignment::PathPrefix {
-                    prefix: "/services".to_string(),
-                },
-                namespace_prepare_codec: Default::default(),
-                default_policy: sinomo_runtime::core::DfsObjectPolicy::ReplicatedEventual,
-            },
-            DfsMetadataShardConfig {
-                file_system_id,
-                shard_id: "users".to_string(),
-                primary_node_id: local_node_id.clone(),
-                replica_node_ids: Vec::new(),
-                epoch: 1,
-                assignment: sinomo_runtime::dfs::DfsMetadataShardAssignment::PathPrefix {
-                    prefix: "/users".to_string(),
-                },
-                namespace_prepare_codec: Default::default(),
-                default_policy: sinomo_runtime::core::DfsObjectPolicy::ReplicatedEventual,
-            },
-        ];
-        cluster::bootstrap_single_voter_cluster_state_to_local_kv(&cluster_paths, &state)
-            .expect("bootstrap canonical cluster KV authority");
-        let shard_ops = shards
-            .iter()
-            .map(|shard| {
-                KvOp::put_serde(
-                    sinomo_runtime::dfs::metadata_shard_key(&shard.file_system_id, &shard.shard_id),
-                    shard,
-                    None,
-                )
-                .expect("metadata shard op")
-            })
-            .collect();
-        let canonical_snapshot = cluster::append_cluster_raft_command(
-            &cluster_paths,
-            &local_node_id,
-            sinomo_runtime::kv::KvCommand::Txn(KvTxn {
-                compares: Vec::new(),
-                success: shard_ops,
-                failure: Vec::new(),
-            }),
-        )
-        .expect("commit metadata shards to canonical cluster KV authority");
-        // Keep the daemon-style materialized projection too: observation-only
-        // readers consume this file, while strict topology reads use the
-        // canonical resident Raft node seeded above.
-        sinomo_runtime::kv::write_cluster_kv_snapshot(
-            &cluster_paths.kv_paths(),
-            &canonical_snapshot,
-        )
-        .expect("write KV snapshot");
-
-        let file_system = sinomo_runtime::dfs::DfsFileSystem::sifs(local_node_id);
-        for shard in &shards {
-            let mut metadata = sinomo_runtime::dfs::open_local_metadata_shard_backend(
-                data_dir,
-                sinomo_runtime::dfs::DfsMetadataShardId::new(&shard.shard_id),
+        let name = format!("cli-observation-{}", sinomo_runtime::core::Id::generate());
+        let (runtime, _) =
+            sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node_in_data_dir(
+                &name,
+                data_dir.clone(),
             )
-            .expect("metadata shard backend");
-            metadata
-                .put_file_system(&file_system)
-                .expect("seed metadata journal");
-        }
+            .expect("normal current DFS owner and guarded genesis");
+        let shards = runtime
+            .metadata_shards()
+            .expect("actual committed native assignments");
+        runtime
+            .close()
+            .expect("actual current fixture closes and retains its durable volume");
         shards
     }
 

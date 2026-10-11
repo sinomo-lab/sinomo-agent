@@ -105,8 +105,8 @@ impl DfsPlacementPolicy {
             path_prefix: path,
             policy: self.consistency,
             scope,
-            min_commit_replicas: Some(self.min_commit_replicas),
-            desired_replicas: Some(self.desired_replicas),
+            min_commit_replicas: self.min_commit_replicas,
+            desired_replicas: self.desired_replicas,
             required_node_ids: self.required_node_ids,
             forbidden_node_ids: self.forbidden_node_ids,
             min_distinct_zones: self.min_distinct_zones,
@@ -466,10 +466,9 @@ impl DfsPlacementReconciliationState {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct DfsPlacementReconciliationJob {
-    /// Version of the durable job contract. Version 1 jobs live in a sibling
-    /// KV namespace that legacy daemons do not scan or CAS.
-    #[serde(default)]
+    /// Exact version of the current durable reconciliation contract.
     pub schema_version: u32,
     pub job_id: String,
     pub file_system_id: DfsFileSystemId,
@@ -483,13 +482,9 @@ pub struct DfsPlacementReconciliationJob {
     /// Exact content-node advertisements used by the accepted preview. Replica
     /// selection must remain stable even when another node observes a newer or
     /// temporarily different cluster view while this job is running.
-    ///
-    /// An empty snapshot identifies a legacy/read-only job and is never
-    /// accepted by the v1 writer or runner.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub candidate_snapshot: Vec<DfsNodeAdvertisement>,
     /// Primary-owned health/network evidence used for adaptive jobs. Manual
-    /// policy jobs without this field retain their exact legacy planner.
+    /// policy jobs use their immutable accepted candidate snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placement_snapshot: Option<crate::dfs::DfsPlacementSnapshot>,
     #[serde(default)]
@@ -498,11 +493,8 @@ pub struct DfsPlacementReconciliationJob {
     pub adaptive_budget: Option<DfsAdaptivePlacementBudget>,
     #[serde(default)]
     pub processed_content_bytes: u64,
-    /// Exact filesystem config accepted atomically with this job. Legacy jobs
-    /// deserialize with no snapshot but remain read-only; v1 writers persist
-    /// it so stale jobs can be superseded safely.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub accepted_config: Option<DfsFileSystemConfig>,
+    /// Exact scoped filesystem policy accepted atomically with this job.
+    pub accepted_config: DfsFileSystemConfig,
     pub state: DfsPlacementReconciliationState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<DfsObjectPageCursor>,
@@ -523,7 +515,6 @@ pub struct DfsPlacementReconciliationJob {
 impl DfsPlacementReconciliationJob {
     pub fn supports_snapshot_reconciliation(&self) -> bool {
         self.schema_version == DFS_PLACEMENT_RECONCILIATION_SCHEMA_VERSION
-            && self.accepted_config.is_some()
             && !self.candidate_snapshot.is_empty()
     }
 
@@ -680,14 +671,10 @@ pub struct DfsPlacementReconciliationActivityPage {
     pub activities: Vec<DfsPlacementReconciliationActivitySummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<DfsPlacementReconciliationActivityCursor>,
-    /// Some durable jobs may predate the compact activity projection or may
-    /// have been written by an older daemon. Active jobs are still unioned
-    /// from the bounded execution queue, but terminal history can have gaps.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    /// Whether the bounded activity projection omits durable jobs.
     pub partial: bool,
     /// Older terminal activity has fallen outside the retained recent index.
     /// `next_cursor` pages only through the records that remain available.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub history_truncated: bool,
 }
 

@@ -106,7 +106,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             NetworkedDfsReadOutcome::Found { .. }
             | NetworkedDfsReadOutcome::NotConfirmed { .. }
             | NetworkedDfsReadOutcome::PendingReplication { .. }
-            | NetworkedDfsReadOutcome::Conflicted { .. }
             | NetworkedDfsReadOutcome::NotFound => None,
         })
     }
@@ -564,19 +563,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         object: &DfsObjectMetadata,
         allow_stale: bool,
     ) -> Result<NetworkedDfsReadOutcome, DfsError> {
-        let open_conflicts = self.open_conflicts_for_object(&object.object_id)?;
-        if !open_conflicts.is_empty() {
-            return Ok(NetworkedDfsReadOutcome::Conflicted {
-                object_id: object.object_id.clone(),
-                visible_version: object.version.clone(),
-                visible_content_hash: object.content_hash.clone(),
-                conflicts: open_conflicts
-                    .into_iter()
-                    .map(DfsConflictReadView::from)
-                    .collect(),
-            });
-        }
-
         if let Ok((manifest, bytes)) = self
             .content
             .read_object_version(object.object_id.as_str(), object.version.as_str())
@@ -653,10 +639,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 return Ok(NetworkedDfsReadOutcome::Found {
                     data: DfsReadData {
                         object_id: object.object_id.clone(),
-                        version: DfsVersion::deserialize_migrating_legacy(manifest.version.clone())
-                            .map_err(|error| DfsError::ContentStore {
+                        version: DfsVersion::new(manifest.version.clone()).map_err(|error| {
+                            DfsError::ContentStore {
                                 message: error.to_string(),
-                            })?,
+                            }
+                        })?,
                         content_hash: Some(manifest.content_hash.clone()),
                         bytes,
                     },
@@ -692,16 +679,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &self,
         object: &DfsObjectMetadata,
     ) -> Result<NetworkedDfsReadStreamOutcome, DfsError> {
-        let open_conflicts = self.open_conflicts_for_object(&object.object_id)?;
-        if !open_conflicts.is_empty() {
-            return Ok(NetworkedDfsReadStreamOutcome::Conflicted {
-                conflicts: open_conflicts
-                    .into_iter()
-                    .map(DfsConflictReadView::from)
-                    .collect(),
-            });
-        }
-
         if let Ok((manifest, reader)) = self
             .content
             .open_object_version_stream(object.object_id.as_str(), object.version.as_str())
@@ -769,16 +746,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         offset: u64,
         max_bytes: usize,
     ) -> Result<NetworkedDfsRangeReadStreamOutcome, DfsError> {
-        let open_conflicts = self.open_conflicts_for_object(&object.object_id)?;
-        if !open_conflicts.is_empty() {
-            return Ok(NetworkedDfsRangeReadStreamOutcome::Conflicted {
-                conflicts: open_conflicts
-                    .into_iter()
-                    .map(DfsConflictReadView::from)
-                    .collect(),
-            });
-        }
-
         if let Ok((manifest, reader)) = self.content.open_object_version_range_stream_shared(
             object.object_id.as_str(),
             object.version.as_str(),
@@ -892,19 +859,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         max_bytes: usize,
         allow_stale: bool,
     ) -> Result<NetworkedDfsRangeReadOutcome, DfsError> {
-        let open_conflicts = self.open_conflicts_for_object(&object.object_id)?;
-        if !open_conflicts.is_empty() {
-            return Ok(NetworkedDfsRangeReadOutcome::Conflicted {
-                object_id: object.object_id.clone(),
-                visible_version: object.version.clone(),
-                visible_content_hash: object.content_hash.clone(),
-                conflicts: open_conflicts
-                    .into_iter()
-                    .map(DfsConflictReadView::from)
-                    .collect(),
-            });
-        }
-
         self.read_object_metadata_local_range_contents(object, offset, max_bytes, allow_stale)
     }
 
@@ -1012,10 +966,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 return Ok(NetworkedDfsRangeReadOutcome::Found {
                     data: DfsReadRangeData {
                         object_id: object.object_id.clone(),
-                        version: DfsVersion::deserialize_migrating_legacy(manifest.version.clone())
-                            .map_err(|error| DfsError::ContentStore {
+                        version: DfsVersion::new(manifest.version.clone()).map_err(|error| {
+                            DfsError::ContentStore {
                                 message: error.to_string(),
-                            })?,
+                            }
+                        })?,
                         content_hash: Some(manifest.content_hash.clone()),
                         offset: offset.min(manifest.size_bytes),
                         total_size_bytes: manifest.size_bytes,

@@ -2,8 +2,8 @@
 
 mod accounting;
 mod fs_ops;
+mod initialization;
 mod inline_bindings;
-mod packed;
 mod readers;
 
 pub use accounting::{
@@ -14,19 +14,16 @@ use blake3::hazmat::{
     ChainingValue, HasherExt, Mode, left_subtree_len, merge_subtrees_non_root, merge_subtrees_root,
 };
 use fs_ops::{
-    content_durable_file_error, create_dir_all, duration_nanos_saturating, file_age_nanos,
-    file_len_if_exists, projected_file_growth, read_dir, read_file, recursive_file_count_and_bytes,
+    content_durable_file_error, create_dir_all, duration_nanos_saturating, file_len_if_exists,
+    projected_file_growth, read_dir, read_file, recursive_file_count_and_bytes,
     remove_file_if_exists, remove_file_if_exists_and_sync_parent, sync_dir,
     system_time_nanos_since_epoch_saturating, temporary_path_for, write_file_atomic,
     write_file_create_new_atomic, write_files_create_new_relaxed, write_reader_to_file,
 };
 use fs2::FileExt;
+#[cfg(feature = "storage-conversion")]
+pub use inline_bindings::{ContentStoreStagingRow, ContentStoreStagingWriter};
 use inline_bindings::{InlineReservationState, InlineStoreLease, InlineVersionState};
-#[cfg(test)]
-use packed::PACKED_BLOB_LOCK_FILE;
-use packed::{
-    PACKED_BLOB_DIR, PACKED_BLOB_SEGMENT_DIR, PACKED_BLOB_SMALL_LIMIT_BYTES, PackedBlobIndexCache,
-};
 pub use readers::{BlobRangeReader, BlobReader, ObjectVersionReader};
 use serde::{Deserialize, Serialize};
 use sinomo_core::object::{LengthMode, serde_ext as sinomo_object_serde};
@@ -57,14 +54,10 @@ const CONTENT_HASH_TREE_LEAF_BYTES: u64 = 1024 * 1024;
 const STREAM_MANIFEST_CACHE_MAX_ENTRIES: usize = 1024;
 const ORPHAN_OBSERVATION_FORMAT_VERSION: u32 = 2;
 const ORPHAN_OBSERVATION_DIR: &str = "orphan-observations";
-const CONTENT_RESERVATION_FORMAT_VERSION: u32 = 2;
 const CONTENT_RESERVATION_DIR: &str = "content-reservations";
-const CONTENT_RESERVATION_BATCH_FORMAT_VERSION: u32 = 2;
-const CONTENT_RESERVATION_BATCH_SUBDIR: &str = "batches";
-const CONTENT_RESERVATION_BATCH_MAX_IDENTITIES: usize = 256;
 const CONTENT_RESERVATION_LOCK_FILE: &str = "write.lock";
-const CONTENT_RESERVATION_BATCH_SENTINEL_FORMAT_VERSION: u32 = 2;
-const CONTENT_BINDING_LAYOUT: &str = "legacy-files-v1";
+const CONTENT_RESERVATION_BATCH_SENTINEL_FORMAT_VERSION: u32 = 3;
+const CONTENT_BINDING_LAYOUT: &str = "inline-bindings-v2";
 const CONTENT_RESERVATION_BATCH_SENTINEL_MARKER: &str = "sinomo-dfs-content-reservation-batches-v1";
 const CONTENT_RESERVATION_BATCH_SENTINEL_SHARD: &str = "00";
 const CONTENT_RESERVATION_BATCH_SENTINEL_FILE: &str = "batch-format-v1.sobj";
@@ -74,7 +67,7 @@ const CONTENT_RESERVATION_RECONCILIATION_CURSOR_FILE: &str =
 const MANIFEST_ABSENCE_OBSERVATION_FORMAT_VERSION: u32 = 1;
 const MANIFEST_ABSENCE_OBSERVATION_DIR: &str = "manifest-absence-observations";
 const VERSION_GC_DELETE_BATCH_SIZE: usize = 1024;
-const ORPHAN_GC_PACKED_TOMBSTONE_BATCH_SIZE: usize = 1024;
+const INLINE_BLOB_SMALL_LIMIT_BYTES: u64 = 16 * 1024;
 
 fn intrinsic_empty_content_hash() -> &'static str {
     static HASH: OnceLock<String> = OnceLock::new();
@@ -99,14 +92,17 @@ pub enum ContentStoreError {
     BlobHashMismatch { expected: String, actual: String },
     #[error("loose content-addressed blob not found: {hash}")]
     MissingLooseBlob { hash: String },
-    #[error("content-addressed blob is packed, not loose: {hash}")]
-    PackedBlob { hash: String },
+    #[error(
+        "content storage preparation at {root:?} remains pending after {processed_records} records"
+    )]
+    StoragePreparationPending {
+        root: PathBuf,
+        processed_records: usize,
+    },
+    #[error("unsupported content storage format at {root:?}; external conversion is required")]
+    UnsupportedStorageFormat { root: PathBuf },
     #[error("invalid content layout: {message}")]
     InvalidContentLayout { message: String },
-    #[error(
-        "inline content activation requires drained legacy handles at {root}: {live_leases} leases remain"
-    )]
-    InlineActivationBusy { root: PathBuf, live_leases: usize },
     #[error(
         "object version manifest already exists with different content: object={object_id}, version={version}, existing={existing_hash}, new={new_hash}"
     )]
@@ -150,6 +146,35 @@ pub struct ContentStoreQuarantinedBlob {
     synced_file: durable_file::SyncedPrivateStagedFile,
     pub content_hash: String,
     pub size_bytes: u64,
+}
+
+impl ContentStoreQuarantinedBlob {
+    pub(crate) fn open_patch_reader(&self) -> Result<fs::File> {
+        // Unix validates the opaque synchronized capability even when the
+        // bounded read intentionally selects no payload bytes. The transport
+        // also verifies the complete declared digest/length at Main ingress.
+        durable_file::read_synced_private_staged_file_bounded(&self.synced_file, 0)
+            .map_err(content_durable_file_error)?;
+        let file =
+            fs::File::open(self.synced_file.path()).map_err(|source| ContentStoreError::Io {
+                path: self.synced_file.path().to_owned(),
+                source,
+            })?;
+        if file
+            .metadata()
+            .map_err(|source| ContentStoreError::Io {
+                path: self.synced_file.path().to_owned(),
+                source,
+            })?
+            .len()
+            != self.size_bytes
+        {
+            return Err(ContentStoreError::InvalidContentLayout {
+                message: "quarantined patch length changed before transport".into(),
+            });
+        }
+        Ok(file)
+    }
 }
 
 impl Drop for ContentStoreQuarantinedBlob {
@@ -378,13 +403,6 @@ pub enum ContentStoreScrubIssue {
         path: PathBuf,
         size_bytes: u64,
     },
-    OrphanPackedBlob {
-        content_hash: String,
-        segment_id: String,
-        offset: u64,
-        path: PathBuf,
-        size_bytes: u64,
-    },
     OrphanInlineBlob {
         content_hash: String,
         path: PathBuf,
@@ -559,22 +577,6 @@ pub struct ContentStoreGcReport {
     pub retained_limit_orphan_observation_bytes: u64,
     /// Physical packed-segment reclamation derived from the durable index after
     /// logical orphan tombstones have been applied.
-    #[serde(default)]
-    pub scanned_packed_segment_count: u64,
-    #[serde(default)]
-    pub eligible_packed_segment_count: u64,
-    #[serde(default)]
-    pub eligible_packed_reclaimable_bytes: u64,
-    #[serde(default)]
-    pub compacted_packed_segment_count: u64,
-    #[serde(default)]
-    pub reclaimed_packed_segment_bytes: u64,
-    #[serde(default)]
-    pub checkpointed_packed_index_lane_count: u64,
-    #[serde(default)]
-    pub truncated_packed_index_log_bytes: u64,
-    #[serde(default)]
-    pub retained_limit_packed_segment_count: u64,
     /// Bounded inline generation work (copy, verification or retired files).
     #[serde(default)]
     pub pending_inline_compaction_count: u64,
@@ -585,8 +587,6 @@ pub struct ContentStoreGcReport {
     #[serde(default)]
     pub reclaimed_inline_generation_bytes: u64,
     /// Lane-grouped packed-index tombstone appends made durable by this pass.
-    #[serde(default)]
-    pub packed_tombstone_batch_count: u64,
     /// Directory fsyncs used to make relaxed orphan-marker changes durable.
     #[serde(default)]
     pub orphan_observation_directory_sync_count: u64,
@@ -869,9 +869,8 @@ pub struct ContentStoreReservationIdentity {
 pub struct ContentStoreReservationRecord {
     pub identity: ContentStoreReservationIdentity,
     pub reserved_at_unix_nanos: u64,
-    /// Missing or conflicting legacy provenance cannot authorize absence release.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub causal_stamp: Option<ContentStoreCausalStamp>,
+    /// Required provenance minted by the actual current content owner.
+    pub causal_stamp: ContentStoreCausalStamp,
 }
 
 /// Local durable ordering; wall clocks never establish a reservation/root-cut order.
@@ -1000,24 +999,12 @@ enum ContentStoreReservationResolution {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
-struct ContentStoreReservation {
-    format_version: u32,
-    identity: ContentStoreReservationIdentity,
-    reserved_at_unix_nanos: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    causal_stamp: Option<ContentStoreCausalStamp>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 struct ContentStoreReservationBatchSentinel {
     format_version: u32,
     marker: String,
-    #[serde(default)]
     store_incarnation: String,
-    #[serde(default)]
     catalog_scan_epoch: u64,
-    // Required compatibility gate: a future binding layout must not be ignored.
-    #[serde(default)]
+    // Required current schema gate: a future binding layout must not be ignored.
     content_binding_layout: String,
 }
 
@@ -1040,35 +1027,6 @@ impl ContentStoreReservationBatchSentinel {
     }
 }
 
-/// One bounded reservation publication.
-///
-/// `original_identity_digests` is immutable. Reconciliation may remove
-/// entries from `reservations`, but every retained identity must remain a
-/// member of the original digest set and `batch_id` must continue to verify
-/// against that complete set.
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
-struct ContentStoreReservationBatch {
-    format_version: u32,
-    batch_id: String,
-    original_identity_digests: Vec<String>,
-    reservations: Vec<ContentStoreReservationRecord>,
-}
-
-#[derive(Debug)]
-struct LoadedContentStoreReservationBatch {
-    path: PathBuf,
-    batch: ContentStoreReservationBatch,
-}
-
-#[derive(Debug, Default)]
-struct ContentStoreReservationInventory {
-    reservations: Vec<ContentStoreReservationRecord>,
-    batches: Vec<LoadedContentStoreReservationBatch>,
-    /// Every physical legacy copy plus the current inline root, before merging
-    /// or shadowing. Commit completion cannot hide an unknown/older duplicate.
-    all_copies: Vec<ContentStoreReservationRecord>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 struct ContentStoreReservationReconciliationCursor {
     format_version: u32,
@@ -1083,12 +1041,11 @@ pub struct LocalContentStore {
     content_reservation_writer_initialized: bool,
     quota: Option<ContentStoreQuota>,
     quota_stats_initialized: Arc<AtomicBool>,
-    packed_index_cache: Arc<Mutex<PackedBlobIndexCache>>,
     stream_manifest_cache: Arc<Mutex<StreamManifestCache>>,
     #[cfg(test)]
     blob_stream_open_count: Arc<AtomicU64>,
     #[cfg(test)]
-    stream_manifest_file_read_count: Arc<AtomicU64>,
+    stream_manifest_validation_count: Arc<AtomicU64>,
 }
 
 #[derive(Debug)]
@@ -1149,9 +1106,7 @@ struct OrphanObservation {
     format_version: u32,
     content_hash: String,
     first_observed_at_unix_nanos: u64,
-    #[serde(default)]
     catalog_generation: String,
-    #[serde(default)]
     catalog_observed_at_unix_nanos: u64,
 }
 
@@ -1179,10 +1134,6 @@ enum OrphanBlobGcCandidate {
         path: PathBuf,
         size_bytes: u64,
     },
-    Packed {
-        content_hash: String,
-        size_bytes: u64,
-    },
     Inline {
         content_hash: String,
         size_bytes: u64,
@@ -1192,17 +1143,13 @@ enum OrphanBlobGcCandidate {
 impl OrphanBlobGcCandidate {
     fn size_bytes(&self) -> u64 {
         match self {
-            Self::Loose { size_bytes, .. }
-            | Self::Packed { size_bytes, .. }
-            | Self::Inline { size_bytes, .. } => *size_bytes,
+            Self::Loose { size_bytes, .. } | Self::Inline { size_bytes, .. } => *size_bytes,
         }
     }
 
     fn content_hash(&self) -> &str {
         match self {
-            Self::Loose { content_hash, .. }
-            | Self::Packed { content_hash, .. }
-            | Self::Inline { content_hash, .. } => content_hash,
+            Self::Loose { content_hash, .. } | Self::Inline { content_hash, .. } => content_hash,
         }
     }
 }
@@ -1219,26 +1166,10 @@ struct VersionManifestEntry {
     object_id: String,
     version: String,
     content_hash: String,
-    storage: VersionManifestStorage,
     modified_nanos: u64,
     manifest_bytes: u64,
     logical_bytes: u64,
     extent_count: u64,
-}
-
-#[derive(Debug, Clone)]
-enum VersionManifestStorage {
-    Legacy { path: PathBuf },
-    Inline,
-}
-
-impl VersionManifestStorage {
-    fn legacy_path(&self) -> Option<&Path> {
-        match self {
-            Self::Legacy { path, .. } => Some(path),
-            Self::Inline => None,
-        }
-    }
 }
 
 #[derive(Debug, Default)]
@@ -1247,12 +1178,6 @@ struct VersionManifestDeletionBatchResult {
     deleted_logical_bytes: u64,
     deleted_manifest_bytes: u64,
     stats_delta: ContentStoreStatsDelta,
-}
-
-#[derive(Debug)]
-struct PendingPackedOrphanDeletion {
-    content_hash: String,
-    size_bytes: u64,
 }
 
 #[derive(Debug)]
@@ -1271,14 +1196,6 @@ enum RelaxedDirectoryRemoval {
     Missing,
 }
 
-struct PreparedSmallObjectVersion<'a> {
-    bytes: &'a [u8],
-    blob_path: PathBuf,
-    manifest: ContentManifest,
-    manifest_bytes: Option<Vec<u8>>,
-    manifest_path: PathBuf,
-}
-
 struct StreamedObjectVersionFile {
     path: PathBuf,
     hash: String,
@@ -1289,18 +1206,73 @@ struct StreamedObjectVersionFile {
 impl LocalContentStore {
     pub fn new(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
-        let blobs_dir = root.join("blobs");
-        create_dir_all(blobs_dir.clone())?;
-        for shard in 0_u8..=u8::MAX {
-            create_dir_all(blobs_dir.join(format!("{shard:02x}")))?;
+        crate::storage_preparation::prepare_storage_root_before_open(
+            &root,
+            &crate::DfsStoragePreparationScope::Content,
+        )
+        .map_err(|error| match error {
+            crate::MetadataBackendError::StoragePreparationPending {
+                root,
+                processed_records,
+            } => ContentStoreError::StoragePreparationPending {
+                root,
+                processed_records,
+            },
+            crate::MetadataBackendError::Io { path, source } => {
+                ContentStoreError::Io { path, source }
+            }
+            error => ContentStoreError::InvalidContentLayout {
+                message: error.to_string(),
+            },
+        })?;
+        Self::initialize_current(root)
+    }
+
+    // The explicit staging capability creates CURRENT output, not a cold-open
+    // source. Keep one initializer and every current marker/intent/owner check.
+    fn initialize_current(root: PathBuf) -> Result<Self> {
+        let marker = root.join("content-reservations/00/batch-format-v1.sobj");
+        let has_current_marker = fs::read(&marker)
+            .ok()
+            .and_then(|bytes| decode_content_reservation_batch_sentinel(&bytes).ok())
+            .is_some_and(|sentinel| validate_content_reservation_batch_sentinel(&sentinel).is_ok());
+        if root.exists()
+            && !has_current_marker
+            && !initialization::pending(&root)?
+            && fs::read_dir(&root)
+                .map_err(|source| ContentStoreError::Io {
+                    path: root.clone(),
+                    source,
+                })?
+                .next()
+                .is_some()
+        {
+            return Err(ContentStoreError::UnsupportedStorageFormat { root });
         }
-        create_dir_all(root.join(PACKED_BLOB_DIR).join(PACKED_BLOB_SEGMENT_DIR))?;
-        create_dir_all(root.join("objects"))?;
-        create_dir_all(root.join("staging"))?;
+        create_dir_all(root.clone())?;
+        if !has_current_marker {
+            initialization::begin(&root)?;
+        }
         let mut store = Self::open_for_inspection(root);
+        // Current initialization resumes under the same actual content owner.
+        // Existing current stores must retain their owner file.
+        let _owner =
+            inline_bindings::ContentMutationGuard::acquire(&store.root, !has_current_marker)?;
+        create_dir_all(store.root.join("blobs"))?;
+        create_dir_all(store.root.join("objects"))?;
+        create_dir_all(store.root.join("staging"))?;
         store.initialize_content_reservation_writer_state()?;
-        inline_bindings::initialize_legacy_reclamation_lock(&store.root)?;
+        store.initialize_inline_bindings()?;
+        inline_bindings::initialize_file_reclamation_lock(&store.root)?;
+        initialization::complete(&store.root)?;
         Ok(store)
+    }
+
+    /// Current initialization recognition for a converter's preparation boundary.
+    /// This grants neither ownership nor permission to mutate the root.
+    #[cfg(feature = "storage-conversion")]
+    pub fn has_current_initialization(root: &Path) -> Result<bool> {
+        initialization::pending(root)
     }
 
     /// Opens a read-only view without initializing the content-store layout.
@@ -1320,12 +1292,11 @@ impl LocalContentStore {
             // not trusted for quota admission until this process has rebuilt
             // it from the durable store while quota mode is active.
             quota_stats_initialized: Arc::new(AtomicBool::new(false)),
-            packed_index_cache: Arc::new(Mutex::new(PackedBlobIndexCache::default())),
             stream_manifest_cache: Arc::new(Mutex::new(StreamManifestCache::default())),
             #[cfg(test)]
             blob_stream_open_count: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
-            stream_manifest_file_read_count: Arc::new(AtomicU64::new(0)),
+            stream_manifest_validation_count: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -1378,7 +1349,8 @@ impl LocalContentStore {
 
         let sentinel_path = self.content_reservation_batch_sentinel_path();
         let shard_existed = sentinel_path.parent().is_some_and(Path::is_dir);
-        let sentinel = ContentStoreReservationBatchSentinel::new();
+        let sentinel = initialization::marker(&self.root)?
+            .unwrap_or_else(ContentStoreReservationBatchSentinel::new);
         let bytes = encode_content_reservation_batch_sentinel(&sentinel)?;
         match write_file_create_new_atomic(&sentinel_path, &bytes) {
             Ok(()) => {
@@ -1394,14 +1366,11 @@ impl LocalContentStore {
             {
                 let existing =
                     decode_content_reservation_batch_sentinel(&read_file(&sentinel_path)?)?;
-                if existing.format_version == 1
-                    && existing.marker == CONTENT_RESERVATION_BATCH_SENTINEL_MARKER
-                {
-                    // Old operations already past this lock have unstamped roots;
-                    // those remain negative-ineligible until a current renewal.
-                    write_file_atomic(&sentinel_path, &bytes)?;
-                } else {
-                    validate_content_reservation_batch_sentinel(&existing)?;
+                validate_content_reservation_batch_sentinel(&existing)?;
+                if initialization::pending(&self.root)? && existing != sentinel {
+                    return Err(ContentStoreError::InvalidContentLayout {
+                        message: "current content marker differs from initialization intent".into(),
+                    });
                 }
             }
             Err(error) => return Err(error),
@@ -1539,25 +1508,29 @@ impl LocalContentStore {
         self.persist_content_reservation(&identity)
     }
 
-    fn ensure_content_reservations_batch(
+    /// Restores an existing retention root without shortening its recorded grace.
+    /// The current store mints fresh causal provenance under its write owner.
+    pub fn ensure_content_reservation_not_before(
         &self,
-        identities: &[ContentStoreReservationIdentity],
+        identity: &ContentStoreReservationIdentity,
+        minimum_reserved_at_unix_nanos: u64,
     ) -> Result<()> {
         let _owner = self.content_mutation_guard()?;
-        if identities.is_empty() {
-            return Ok(());
-        }
-        let mut identities = identities.to_vec();
-        identities.sort();
-        identities.dedup();
-        for identity in &identities {
-            hash_hex(&identity.content_hash)?;
-            self.remove_manifest_absence_observation(identity)?;
-        }
-        let guard = self.lock_content_reservations_for_write()?;
-        for identities in identities.chunks(CONTENT_RESERVATION_BATCH_MAX_IDENTITIES) {
-            self.persist_content_reservation_batch_unlocked(identities, &guard.sentinel.stamp())?;
-        }
+        hash_hex(&identity.content_hash)?;
+        self.remove_manifest_absence_observation(identity)?;
+        let reservation = self.lock_content_reservations_for_write()?;
+        let previous = match self.inline_reservation_state(identity)? {
+            Some(InlineReservationState::Live(record)) => record.reserved_at_unix_nanos,
+            _ => 0,
+        };
+        let record = ContentStoreReservationRecord {
+            identity: identity.clone(),
+            reserved_at_unix_nanos: refreshed_reservation_timestamp(Some(
+                previous.max(minimum_reserved_at_unix_nanos),
+            )),
+            causal_stamp: reservation.sentinel.stamp(),
+        };
+        self.inline_reserve_owned_identity_unlocked(&record, &reservation.sentinel)?;
         Ok(())
     }
 
@@ -1605,16 +1578,12 @@ impl LocalContentStore {
         let _lock = self.lock_content_reservations_for_write()?;
         let inventory = self.read_content_reservation_inventory_unlocked()?;
         if inventory
-            .reservations
             .binary_search_by(|reservation| reservation.identity.cmp(&identity))
             .is_err()
         {
             return Ok(false);
         }
-        self.apply_content_reservation_resolutions_unlocked(
-            &inventory,
-            &BTreeSet::from([identity]),
-        )?;
+        self.inline_release_reservations_unlocked(&BTreeSet::from([identity]))?;
         Ok(true)
     }
 
@@ -1623,13 +1592,12 @@ impl LocalContentStore {
         let _lock = self.lock_content_reservations_for_write()?;
         let inventory = self.read_content_reservation_inventory_unlocked()?;
         let resolved_identities = inventory
-            .reservations
             .iter()
             .map(|reservation| reservation.identity.clone())
             .collect::<BTreeSet<_>>();
         let released = resolved_identities.len() as u64;
         if released != 0 {
-            self.apply_content_reservation_resolutions_unlocked(&inventory, &resolved_identities)?;
+            self.inline_release_reservations_unlocked(&resolved_identities)?;
         }
         Ok(released)
     }
@@ -1702,7 +1670,7 @@ impl LocalContentStore {
             None => None,
         };
         let inventory = self.read_content_reservation_inventory_unlocked()?;
-        let reservations = &inventory.reservations;
+        let reservations = &inventory;
         let reservation_count = reservations.len() as u64;
         let start_after = durable_after.as_ref().or(options.after.as_ref());
         let start_index = start_after
@@ -1728,14 +1696,12 @@ impl LocalContentStore {
             let resolution = match version_covered {
                 true => Some(ContentStoreReservationResolution::CatalogCovered),
                 false
-                    if !causal_cut
-                        .zip(reservation.causal_stamp.as_ref())
-                        .is_some_and(|(cut, stamp)| {
-                            stamp.store_incarnation == cut.stamp.store_incarnation
-                                && stamp.catalog_scan_epoch < cut.stamp.catalog_scan_epoch
-                        })
-                        || options.catalog_generated_at_unix_nanos
-                            <= reservation.reserved_at_unix_nanos =>
+                    if !causal_cut.is_some_and(|cut| {
+                        reservation.causal_stamp.store_incarnation == cut.stamp.store_incarnation
+                            && reservation.causal_stamp.catalog_scan_epoch
+                                < cut.stamp.catalog_scan_epoch
+                    }) || options.catalog_generated_at_unix_nanos
+                        <= reservation.reserved_at_unix_nanos =>
                 {
                     report.retained_catalog_too_old_count =
                         report.retained_catalog_too_old_count.saturating_add(1);
@@ -1771,7 +1737,7 @@ impl LocalContentStore {
 
         // Resolution files are durable before publishing the continuation
         // cursor. A crash can therefore only repeat work, never skip roots.
-        self.apply_content_reservation_resolutions_unlocked(&inventory, &resolved_identities)?;
+        self.inline_release_reservations_unlocked(&resolved_identities)?;
         if report.has_more {
             if let Some(next_cursor) = report.next_cursor.as_ref() {
                 self.persist_content_reservation_reconciliation_cursor(
@@ -1875,6 +1841,30 @@ impl LocalContentStore {
         })
     }
 
+    pub(crate) fn capture_quarantined_patch_reader(
+        &self,
+        reader: &mut dyn Read,
+    ) -> Result<ContentStoreQuarantinedBlob> {
+        let mut ingest = self.begin_quarantined_blob_ingest(u64::MAX, None)?;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = reader
+                .read(&mut buffer)
+                .map_err(|source| ContentStoreError::Io {
+                    path: ingest.temporary_path.clone(),
+                    source,
+                })?;
+            if read == 0 {
+                break;
+            }
+            ingest.write_chunk(&buffer[..read])?;
+        }
+        // The caller had no advance length declaration. This is the exact
+        // byte count observed at EOF by the SAME quarantined ingest engine.
+        ingest.expected_size_bytes = ingest.received_size_bytes;
+        ingest.finish_quarantined()
+    }
+
     /// Atomically binds a finalized quarantine blob to one object version.
     ///
     /// All admission, authority, base-version, and route-rebase checks must
@@ -1895,11 +1885,11 @@ impl LocalContentStore {
                 ),
             });
         }
-        if blob.size_bytes <= PACKED_BLOB_SMALL_LIMIT_BYTES
+        if blob.size_bytes <= INLINE_BLOB_SMALL_LIMIT_BYTES
             && self.inline_sentinel_unlocked()?.is_some()
             && let Some(bytes) = durable_file::read_synced_private_staged_file_bounded(
                 &blob.synced_file,
-                PACKED_BLOB_SMALL_LIMIT_BYTES as usize,
+                INLINE_BLOB_SMALL_LIMIT_BYTES as usize,
             )
             .map_err(content_durable_file_error)?
         {
@@ -1941,7 +1931,7 @@ impl LocalContentStore {
         expected_hash: &str,
         bytes: &[u8],
     ) -> Result<ContentManifest> {
-        if bytes.len() as u64 <= PACKED_BLOB_SMALL_LIMIT_BYTES
+        if bytes.len() as u64 <= INLINE_BLOB_SMALL_LIMIT_BYTES
             && self.inline_sentinel_unlocked()?.is_some()
         {
             // These caller-owned bytes are already complete. Verify before any
@@ -1975,7 +1965,7 @@ impl LocalContentStore {
         }
         if versions
             .iter()
-            .any(|(_, _, bytes)| bytes.len() as u64 > PACKED_BLOB_SMALL_LIMIT_BYTES)
+            .any(|(_, _, bytes)| bytes.len() as u64 > INLINE_BLOB_SMALL_LIMIT_BYTES)
         {
             return versions
                 .into_iter()
@@ -1994,137 +1984,12 @@ impl LocalContentStore {
     where
         I: IntoIterator<Item = (&'a str, &'a str, &'a [u8])>,
     {
-        let versions = versions.into_iter().collect::<Vec<_>>();
-        if versions.is_empty() {
-            return Ok(Vec::new());
-        }
-        if versions
-            .iter()
-            .any(|(_, _, bytes)| bytes.len() as u64 > PACKED_BLOB_SMALL_LIMIT_BYTES)
-        {
-            return versions
-                .into_iter()
-                .map(|(object_id, version, bytes)| {
-                    self.write_object_version_blob_only(object_id, version, bytes)
-                })
-                .collect();
-        }
-
-        let _owner = self.content_mutation_guard()?;
-        if self.inline_sentinel_unlocked()?.is_some() {
-            return versions
-                .into_iter()
-                .map(|(object, version, bytes)| {
-                    self.write_object_version_blob_only(object, version, bytes)
-                })
-                .collect();
-        }
-        let hashes = versions
-            .iter()
-            .map(|(_, _, bytes)| content_hash(bytes))
-            .collect::<Vec<_>>();
-        let empty_hash = intrinsic_empty_content_hash();
-        let mut existing_manifests = Vec::with_capacity(versions.len());
-        let mut reservation_identities = Vec::with_capacity(versions.len());
-        for ((object_id, version, _), hash) in versions.iter().zip(&hashes) {
-            let manifest_path = self.manifest_path(object_id, version);
-            let existing = if manifest_path.is_file() {
-                let existing =
-                    decode_manifest_for_path(&read_file(&manifest_path)?, &manifest_path)?;
-                if existing.content_hash != *hash {
-                    return Err(ContentStoreError::VersionHashConflict {
-                        object_id: (*object_id).to_owned(),
-                        version: (*version).to_owned(),
-                        existing_hash: existing.content_hash,
-                        new_hash: hash.clone(),
-                    });
-                }
-                Some(existing)
-            } else {
-                None
-            };
-            if hash != empty_hash {
-                reservation_identities.push(
-                    existing
-                        .as_ref()
-                        .map(|manifest| ContentStoreReservationIdentity {
-                            object_id: manifest.object_id.clone(),
-                            version: manifest.version.clone(),
-                            content_hash: manifest.content_hash.clone(),
-                        })
-                        .unwrap_or_else(|| ContentStoreReservationIdentity {
-                            object_id: (*object_id).to_owned(),
-                            version: (*version).to_owned(),
-                            content_hash: hash.clone(),
-                        }),
-                );
-            }
-            existing_manifests.push(existing);
-        }
-        self.ensure_content_reservations_batch(&reservation_identities)?;
-
-        let mut manifests = Vec::with_capacity(versions.len());
-        let mut blob_writes = Vec::new();
-        let mut quota_delta = ContentStoreQuotaDelta::default();
-        {
-            let _locks = self.lock_packed_blob_lanes_for_hashes(
-                hashes
-                    .iter()
-                    .map(String::as_str)
-                    .filter(|hash| *hash != empty_hash),
-            )?;
-            for (((object_id, version, bytes), hash), existing) in
-                versions.iter().zip(&hashes).zip(existing_manifests)
-            {
-                if hash == empty_hash {
-                    manifests.push(existing.unwrap_or_else(|| ContentManifest {
-                        object_id: (*object_id).to_owned(),
-                        version: (*version).to_owned(),
-                        content_hash: hash.clone(),
-                        size_bytes: 0,
-                        extents: Vec::new(),
-                    }));
-                    continue;
-                }
-                if let Some(existing) = existing {
-                    self.clear_orphan_observations_before_manifest_publish(std::iter::once(
-                        &existing,
-                    ))?;
-                    self.ensure_content_manifest_index_best_effort(&existing);
-                    manifests.push(existing);
-                    continue;
-                }
-
-                let blob_path = self.blob_path(hash)?;
-                let manifest = ContentManifest {
-                    object_id: (*object_id).to_owned(),
-                    version: (*version).to_owned(),
-                    content_hash: hash.clone(),
-                    size_bytes: bytes.len() as u64,
-                    extents: Vec::new(),
-                };
-                let loose_readable = blob_path.is_file()
-                    && file_content_hash(&blob_path)
-                        .is_ok_and(|actual| actual == manifest.content_hash);
-                let packed_readable =
-                    match self.packed_blob_location_for_update_unlocked(&manifest.content_hash)? {
-                        Some(location) => self.packed_blob_location_readable(&location)?,
-                        None => false,
-                    };
-                if !loose_readable && !packed_readable {
-                    quota_delta.blob_bytes =
-                        quota_delta.blob_bytes.saturating_add(bytes.len() as u64);
-                    blob_writes.push((manifest.content_hash.clone(), *bytes));
-                }
-                manifests.push(manifest);
-            }
-            self.ensure_quota_delta(quota_delta)?;
-            let blob_delta = self.write_packed_blobs_unlocked(&blob_writes)?;
-            if !blob_delta.is_zero() {
-                self.apply_stats_delta(blob_delta)?;
-            }
-        }
-        Ok(manifests)
+        versions
+            .into_iter()
+            .map(|(object, version, bytes)| {
+                self.write_object_version_blob_only(object, version, bytes)
+            })
+            .collect()
     }
 
     #[tracing::instrument(
@@ -2164,7 +2029,7 @@ impl LocalContentStore {
                 ),
             });
         }
-        self.write_manifest_create_new_or_existing(ContentManifest {
+        self.publish_existing_manifest(ContentManifest {
             object_id: object_id.to_owned(),
             version: version.to_owned(),
             content_hash: content_hash.to_owned(),
@@ -2191,7 +2056,7 @@ impl LocalContentStore {
         capture_limit_bytes: usize,
     ) -> Result<(ContentManifest, Option<Vec<u8>>)> {
         let internal_capture_limit =
-            capture_limit_bytes.max(PACKED_BLOB_SMALL_LIMIT_BYTES as usize);
+            capture_limit_bytes.max(INLINE_BLOB_SMALL_LIMIT_BYTES as usize);
 
         // Keep small reader-backed writes in memory. The old path created,
         // wrote, fsynced, and removed a temporary file before writing the same
@@ -2220,7 +2085,7 @@ impl LocalContentStore {
         let reader = std::io::Cursor::new(buffered).chain(reader);
         let mut streamed =
             self.write_streamed_object_version_file(reader, internal_capture_limit)?;
-        if streamed.size_bytes <= PACKED_BLOB_SMALL_LIMIT_BYTES {
+        if streamed.size_bytes <= INLINE_BLOB_SMALL_LIMIT_BYTES {
             let bytes = streamed
                 .captured_bytes
                 .take()
@@ -2334,13 +2199,10 @@ impl LocalContentStore {
                 .len();
             return Ok(BlobReader::new(file, size_bytes).retain_store(self.inline_store.clone()));
         }
-        let Some((_, reader)) = self.open_packed_blob_reader(hash, 0, usize::MAX)? else {
-            return Err(ContentStoreError::Io {
-                path,
-                source: io::Error::new(io::ErrorKind::NotFound, "blob not found"),
-            });
-        };
-        Ok(reader.retain_store(self.inline_store.clone()))
+        Err(ContentStoreError::Io {
+            path,
+            source: io::Error::new(io::ErrorKind::NotFound, "blob not found"),
+        })
     }
 
     /// Opens a bounded range of a content-addressed blob for streaming.
@@ -2378,16 +2240,6 @@ impl LocalContentStore {
             });
         }
         let path = self.blob_path(hash)?;
-        if !path.is_file() {
-            let Some((_, reader)) = self.open_packed_blob_range_reader(hash, offset, max_bytes)?
-            else {
-                return Err(ContentStoreError::Io {
-                    path,
-                    source: io::Error::new(io::ErrorKind::NotFound, "blob not found"),
-                });
-            };
-            return Ok(reader.retain_store(self.inline_store.clone()));
-        }
         let mut file = fs::File::open(&path).map_err(|source| ContentStoreError::Io {
             path: path.clone(),
             source,
@@ -2648,32 +2500,13 @@ impl LocalContentStore {
 
     pub fn read_manifest(&self, object_id: &str, version: &str) -> Result<ContentManifest> {
         let _owner = self.content_mutation_guard()?;
-        let path = self.manifest_path(object_id, version);
-        let expected_legacy_hash = match self.inline_version_state(object_id, version)? {
-            Some(InlineVersionState::Live(entry)) => return Ok(entry.manifest),
-            Some(InlineVersionState::Deleted { .. }) => {
-                return Err(ContentStoreError::Io {
-                    path,
-                    source: io::Error::new(
-                        io::ErrorKind::NotFound,
-                        "content version was durably collected",
-                    ),
-                });
-            }
-            Some(InlineVersionState::Legacy { content_hash }) => Some(content_hash),
-            None => None,
-        };
-        let bytes = read_file(&path)?;
-        let manifest = decode_manifest_for_path(&bytes, &path)?;
-        if expected_legacy_hash
-            .as_ref()
-            .is_some_and(|hash| *hash != manifest.content_hash)
-        {
-            return Err(ContentStoreError::InvalidContentLayout {
-                message: "legacy manifest disagrees with its adopted binding identity".into(),
-            });
+        match self.inline_version_state(object_id, version)? {
+            Some(InlineVersionState::Live(entry)) => Ok(entry.manifest),
+            Some(InlineVersionState::Deleted { .. }) | None => Err(ContentStoreError::Io {
+                path: self.manifest_path(object_id, version),
+                source: io::Error::new(io::ErrorKind::NotFound, "content version is not live"),
+            }),
         }
-        Ok(manifest)
     }
 
     fn read_stream_manifest(
@@ -2682,48 +2515,20 @@ impl LocalContentStore {
         version: &str,
     ) -> Result<Arc<ValidatedContentManifest>> {
         let _owner = self.content_mutation_guard()?;
+        let manifest = self.read_manifest(object_id, version)?;
         let path = self.manifest_path(object_id, version);
-        match self.inline_version_state(object_id, version)? {
-            Some(InlineVersionState::Live(entry)) => {
-                return self.cache_stream_manifest(entry.manifest);
-            }
-            Some(InlineVersionState::Deleted { .. }) => {
-                self.evict_stream_manifest(&path);
-                return Err(ContentStoreError::Io {
-                    path,
-                    source: io::Error::new(
-                        io::ErrorKind::NotFound,
-                        "content version was durably collected",
-                    ),
-                });
-            }
-            Some(InlineVersionState::Legacy { .. }) => {
-                return self.cache_stream_manifest(self.read_manifest(object_id, version)?);
-            }
-            None => {}
+        if let Some(cached) = self
+            .stream_manifest_cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&path)
+        {
+            return Ok(cached);
         }
-        let cached = {
-            let mut cache = self
-                .stream_manifest_cache
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            cache.get(&path)
-        };
-        if let Some(manifest) = cached {
-            // Object-version manifests are immutable. The existence probe keeps
-            // version collection visible while avoiding another file read,
-            // decode, extent sort, and full layout validation on cache hits.
-            if path.is_file() {
-                return Ok(manifest);
-            }
-            self.evict_stream_manifest(&path);
-        }
-
         #[cfg(test)]
-        self.stream_manifest_file_read_count
+        self.stream_manifest_validation_count
             .fetch_add(1, Ordering::Relaxed);
-        let manifest = decode_manifest(&read_file(&path)?)?;
-        self.cache_stream_manifest_at(path, manifest)
+        self.cache_stream_manifest(manifest)
     }
 
     fn cache_stream_manifest(
@@ -2758,25 +2563,8 @@ impl LocalContentStore {
 
     pub fn manifests_for_object(&self, object_id: &str) -> Result<Vec<ContentManifest>> {
         let _owner = self.content_mutation_guard()?;
-        let inline = self.inline_binding_view()?;
-        let object_root = self.root.join("objects").join(object_id);
-        let mut manifests: Vec<ContentManifest> = Vec::new();
-        if object_root.exists() {
-            for entry in read_dir(&object_root)? {
-                let version = entry.file_name().to_string_lossy().into_owned();
-                if inline
-                    .as_ref()
-                    .is_some_and(|view| view.owns_version(object_id, &version))
-                {
-                    continue;
-                }
-                let path = entry.path().join("manifest.sobj");
-                if path.is_file() {
-                    manifests.push(self.read_manifest(object_id, &version)?);
-                }
-            }
-        }
-        if let Some(view) = inline {
+        let mut manifests = Vec::new();
+        if let Some(view) = self.inline_binding_view()? {
             for ((object, _), state) in view.versions {
                 if object == object_id
                     && let InlineVersionState::Live(entry) = state
@@ -2795,49 +2583,16 @@ impl LocalContentStore {
         content_hash: &str,
         size_bytes: u64,
     ) -> Result<Option<ContentManifest>> {
-        let index_path = self.content_manifest_index_path(object_id, content_hash)?;
-        if index_path.is_file() {
-            match decode_manifest(&read_file(&index_path)?) {
-                Ok(manifest)
-                    if manifest.object_id == object_id
-                        && manifest.content_hash == content_hash
-                        && manifest.size_bytes == size_bytes =>
-                {
-                    match self.read_manifest(object_id, &manifest.version) {
-                        Ok(current)
-                            if current.content_hash == content_hash
-                                && current.size_bytes == size_bytes =>
-                        {
-                            return Ok(Some(current));
-                        }
-                        Ok(_) => {}
-                        Err(error) if content_error_is_not_found(&error) => {}
-                        Err(error) => return Err(error),
-                    }
-                }
-                Ok(_) | Err(_) => {
-                    // The index is derived cache state. Discard a corrupt or
-                    // mismatched link and rebuild it from source manifests.
-                    let _ = remove_file_if_exists(&index_path);
-                }
-            }
-        }
-
-        let manifest = self
-            .manifests_for_object(object_id)?
-            .into_iter()
-            .rev()
-            .find(|manifest| {
-                manifest.content_hash == content_hash && manifest.size_bytes == size_bytes
-            });
-        if let Some(manifest) = manifest.as_ref() {
-            self.ensure_content_manifest_index_best_effort(manifest);
-        }
-        Ok(manifest)
+        self.inline_manifest_for_content(object_id, content_hash, size_bytes)
     }
 
     pub fn scrub(&self) -> Result<ContentStoreScrubReport> {
         self.scrub_with_stats_snapshot(true)
+    }
+
+    /// Verifies current catalog and content without publishing derived statistics.
+    pub fn inspect_integrity(&self) -> Result<ContentStoreScrubReport> {
+        self.scrub_with_stats_snapshot(false)
     }
 
     fn scrub_with_stats_snapshot(
@@ -2869,14 +2624,6 @@ impl LocalContentStore {
         };
         let mut referenced_blobs = BTreeSet::new();
         let mut checked_blobs = BTreeMap::new();
-        self.scrub_manifest_tree(
-            &self.root.join("objects"),
-            &mut report,
-            &mut referenced_blobs,
-            &mut checked_blobs,
-            version_entries.as_deref_mut(),
-            inline.as_ref(),
-        )?;
         if let Some(view) = inline.as_ref() {
             for ((object, version), state) in &view.versions {
                 let InlineVersionState::Live(entry) = state else {
@@ -2906,7 +2653,6 @@ impl LocalContentStore {
                             object_id: object.clone(),
                             version: version.clone(),
                             content_hash: manifest.content_hash.clone(),
-                            storage: VersionManifestStorage::Inline,
                             modified_nanos: entry.published_at_unix_nanos,
                             manifest_bytes: encoded_bytes,
                             logical_bytes: manifest.size_bytes,
@@ -2945,7 +2691,6 @@ impl LocalContentStore {
             &shadowed_hashes,
             &mut report,
         )?;
-        self.collect_orphan_packed_blob_issues(&referenced_blobs, &shadowed_hashes, &mut report)?;
         report.referenced_blob_count = referenced_blobs.len() as u64;
         report.referenced_blob_bytes = referenced_blobs
             .iter()
@@ -2989,7 +2734,6 @@ impl LocalContentStore {
                 !matches!(
                     issue,
                     ContentStoreScrubIssue::OrphanBlob { .. }
-                        | ContentStoreScrubIssue::OrphanPackedBlob { .. }
                         | ContentStoreScrubIssue::OrphanInlineBlob { .. }
                 )
             })
@@ -3024,14 +2768,6 @@ impl LocalContentStore {
                     path: path.clone(),
                     size_bytes: *size_bytes,
                 }),
-                ContentStoreScrubIssue::OrphanPackedBlob {
-                    content_hash,
-                    size_bytes,
-                    ..
-                } => Some(OrphanBlobGcCandidate::Packed {
-                    content_hash: content_hash.clone(),
-                    size_bytes: *size_bytes,
-                }),
                 ContentStoreScrubIssue::OrphanInlineBlob {
                     content_hash,
                     size_bytes,
@@ -3050,17 +2786,14 @@ impl LocalContentStore {
             .collect::<BTreeSet<_>>();
         let max_durable_work = options.max_deletions.unwrap_or(u64::MAX);
         let mut durable_work_count = 0_u64;
-        let mut pending_packed_deletions =
-            Vec::with_capacity(ORPHAN_GC_PACKED_TOMBSTONE_BATCH_SIZE);
         let mut stats_delta = ContentStoreStatsDelta::default();
         let mut dirty_orphan_observation_directories = BTreeSet::<PathBuf>::new();
         let mut orphan_observation_root_created = false;
         let mut dirty_loose_blob_directories = BTreeSet::<PathBuf>::new();
-        let mut dirty_packed_index_lanes = BTreeSet::<u8>::new();
-        let legacy_reclamation = if options.dry_run {
+        let file_reclamation = if options.dry_run {
             None
         } else {
-            self.try_lock_legacy_reclamation()?
+            self.try_lock_file_reclamation()?
         };
         for stale in self.orphan_observation_gc_candidates(&observed_orphan_hashes)? {
             report.stale_orphan_observation_count =
@@ -3068,9 +2801,7 @@ impl LocalContentStore {
             report.stale_orphan_observation_bytes = report
                 .stale_orphan_observation_bytes
                 .saturating_add(stale.size_bytes);
-            if durable_work_count.saturating_add(pending_packed_deletions.len() as u64)
-                >= max_durable_work
-            {
+            if durable_work_count >= max_durable_work {
                 report.max_deletions_reached = true;
                 report.retained_limit_orphan_observation_count = report
                     .retained_limit_orphan_observation_count
@@ -3123,9 +2854,7 @@ impl LocalContentStore {
                 report.newly_observed_orphan_bytes = report
                     .newly_observed_orphan_bytes
                     .saturating_add(size_bytes);
-                if durable_work_count.saturating_add(pending_packed_deletions.len() as u64)
-                    >= max_durable_work
-                {
+                if durable_work_count >= max_durable_work {
                     report.max_deletions_reached = true;
                     report.retained_limit_orphan_observation_count = report
                         .retained_limit_orphan_observation_count
@@ -3199,9 +2928,7 @@ impl LocalContentStore {
 
             report.eligible_orphan_count = report.eligible_orphan_count.saturating_add(1);
             report.eligible_orphan_bytes = report.eligible_orphan_bytes.saturating_add(size_bytes);
-            if durable_work_count.saturating_add(pending_packed_deletions.len() as u64)
-                >= max_durable_work
-            {
+            if durable_work_count >= max_durable_work {
                 report.max_deletions_reached = true;
                 report.retained_limit_orphan_count =
                     report.retained_limit_orphan_count.saturating_add(1);
@@ -3215,10 +2942,10 @@ impl LocalContentStore {
                 continue;
             }
             if !matches!(&orphan, OrphanBlobGcCandidate::Inline { .. })
-                && legacy_reclamation.is_none()
+                && file_reclamation.is_none()
             {
-                // A lazy reader owns immutable legacy locators. Retain both
-                // their index reachability and physical files until it drains.
+                // A current lazy reader owns immutable loose-blob locators.
+                // Retain their physical files until that reader drains.
                 continue;
             }
             match orphan {
@@ -3242,23 +2969,6 @@ impl LocalContentStore {
                         }
                     }
                 }
-                OrphanBlobGcCandidate::Packed { content_hash, .. } => {
-                    pending_packed_deletions.push(PendingPackedOrphanDeletion {
-                        content_hash,
-                        size_bytes,
-                    });
-                    if pending_packed_deletions.len() >= ORPHAN_GC_PACKED_TOMBSTONE_BATCH_SIZE {
-                        durable_work_count = durable_work_count.saturating_add(
-                            self.flush_pending_packed_orphan_deletions(
-                                &mut pending_packed_deletions,
-                                &mut dirty_orphan_observation_directories,
-                                &mut dirty_packed_index_lanes,
-                                &mut stats_delta,
-                                &mut report,
-                            )?,
-                        );
-                    }
-                }
                 OrphanBlobGcCandidate::Inline { content_hash, .. } => {
                     if self.inline_remove_blob_unlocked(&content_hash)? {
                         report.deleted_orphan_count = report.deleted_orphan_count.saturating_add(1);
@@ -3279,14 +2989,6 @@ impl LocalContentStore {
                 }
             }
         }
-        durable_work_count =
-            durable_work_count.saturating_add(self.flush_pending_packed_orphan_deletions(
-                &mut pending_packed_deletions,
-                &mut dirty_orphan_observation_directories,
-                &mut dirty_packed_index_lanes,
-                &mut stats_delta,
-                &mut report,
-            )?);
         for directory in dirty_loose_blob_directories {
             sync_dir(&directory)?;
             report.loose_blob_directory_sync_count =
@@ -3296,41 +2998,18 @@ impl LocalContentStore {
             &dirty_orphan_observation_directories,
             orphan_observation_root_created,
         )?;
-        let (checkpointed_lane_count, truncated_log_bytes) =
-            self.checkpoint_packed_blob_index_lanes_after_gc(&dirty_packed_index_lanes)?;
-        report.checkpointed_packed_index_lane_count = checkpointed_lane_count;
-        report.truncated_packed_index_log_bytes = truncated_log_bytes;
         if !stats_delta.is_zero() && self.tracks_stats_deltas() {
             self.apply_stats_delta(stats_delta)?;
             report.stats_delta_persist_count = 1;
         }
-        drop(legacy_reclamation);
-        // Repack at most one bounded segment after logical orphan work. If the
-        // process crashes after an index tombstone, the next projection derives
-        // the same physical garbage from the durable index and schedules retry.
+        drop(file_reclamation);
         let max_compactions =
             u64::from(durable_work_count < max_durable_work && !report.max_deletions_reached);
-        let packed = self.collect_packed_blob_segment_garbage(options.dry_run, max_compactions)?;
-        report.scanned_packed_segment_count = packed.scanned_segment_count;
-        report.eligible_packed_segment_count = packed.eligible_segment_count;
-        report.eligible_packed_reclaimable_bytes = packed.eligible_reclaimable_bytes;
-        report.compacted_packed_segment_count = packed.compacted_segment_count;
-        report.reclaimed_packed_segment_bytes = packed.reclaimed_segment_bytes;
-        report.checkpointed_packed_index_lane_count = report
-            .checkpointed_packed_index_lane_count
-            .saturating_add(packed.checkpointed_index_lane_count);
-        report.truncated_packed_index_log_bytes = report
-            .truncated_packed_index_log_bytes
-            .saturating_add(packed.truncated_index_log_bytes);
-        report.retained_limit_packed_segment_count = packed.retained_limit_segment_count;
         let inline = self.advance_inline_compaction(options.dry_run, max_compactions != 0)?;
         report.pending_inline_compaction_count = inline.pending;
         report.copied_inline_compaction_records = inline.copied_records;
         report.advanced_inline_compaction_steps = inline.advanced_steps;
         report.reclaimed_inline_generation_bytes = inline.reclaimed_bytes;
-        if packed.retained_limit_segment_count > 0 {
-            report.max_deletions_reached = true;
-        }
         Ok(report)
     }
 
@@ -3436,7 +3115,6 @@ impl LocalContentStore {
                 !matches!(
                     issue,
                     ContentStoreScrubIssue::OrphanBlob { .. }
-                        | ContentStoreScrubIssue::OrphanPackedBlob { .. }
                         | ContentStoreScrubIssue::OrphanInlineBlob { .. }
                 )
             })
@@ -3498,7 +3176,6 @@ impl LocalContentStore {
                     .modified_nanos
                     .cmp(&left.modified_nanos)
                     .then_with(|| right.version.cmp(&left.version))
-                    .then_with(|| right.storage.legacy_path().cmp(&left.storage.legacy_path()))
             });
             for (index, entry) in entries.iter().enumerate() {
                 if protected_versions_by_object
@@ -3526,10 +3203,7 @@ impl LocalContentStore {
                     continue;
                 }
 
-                let age_nanos = match entry.storage.legacy_path() {
-                    Some(path) => file_age_nanos(path, now)?,
-                    None => observed_at_unix_nanos.saturating_sub(entry.modified_nanos),
-                };
+                let age_nanos = observed_at_unix_nanos.saturating_sub(entry.modified_nanos);
                 if age_nanos < options.min_version_age_nanos {
                     report.retained_young_version_count =
                         report.retained_young_version_count.saturating_add(1);
@@ -3717,19 +3391,7 @@ impl LocalContentStore {
         if path.is_file() {
             return Ok(file_content_hash(&path).is_ok_and(|actual| actual == hash));
         }
-        let Some((location, mut reader)) = self.open_packed_blob_reader(hash, 0, usize::MAX)?
-        else {
-            return Ok(false);
-        };
-        let mut bytes =
-            Vec::with_capacity(usize::try_from(reader.size_bytes()).unwrap_or(usize::MAX));
-        reader
-            .read_to_end(&mut bytes)
-            .map_err(|source| ContentStoreError::Io {
-                path: self.packed_blob_location_path(&location),
-                source,
-            })?;
-        Ok(content_hash(&bytes) == hash)
+        Ok(false)
     }
 
     /// Returns whether local storage has an addressable candidate for `hash`.
@@ -3756,7 +3418,7 @@ impl LocalContentStore {
             Err(source) if source.kind() == io::ErrorKind::NotFound => {}
             Err(source) => return Err(ContentStoreError::Io { path, source }),
         }
-        Ok(self.packed_blob_readable_size(hash)?.is_some())
+        Ok(false)
     }
 
     /// Read-only form of [`Self::blob_storage_candidate_exists`] that does not
@@ -3827,8 +3489,8 @@ impl LocalContentStore {
 
     /// Test-only fault injection: remove a loose content-addressed blob.
     ///
-    /// Packed blobs share segment files, so this deliberately refuses packed
-    /// content. Cluster tests use payloads above the packed threshold when they
+    /// Inline blobs share segment files, so this only removes file payloads.
+    /// Cluster tests use payloads above the inline threshold when they
     /// need to simulate one replica losing local disk content.
     pub fn debug_remove_loose_blob(&self, hash: &str) -> Result<()> {
         hash_hex(hash)?;
@@ -3839,11 +3501,6 @@ impl LocalContentStore {
                 self.apply_stats_delta(ContentStoreStatsDelta::blob_file_change(before_len, None))?;
             }
             return Ok(());
-        }
-        if self.packed_blob_readable_size(hash)?.is_some() {
-            return Err(ContentStoreError::PackedBlob {
-                hash: hash.to_owned(),
-            });
         }
         Err(ContentStoreError::MissingLooseBlob {
             hash: hash.to_owned(),
@@ -4231,23 +3888,17 @@ impl LocalContentStore {
         )
     }
 
-    fn put_object_version_patch_from_blob_with_trusted_content_hash(
+    fn patch_target_extents(
         &self,
         object_id: &str,
         base_version: &str,
         target_version: &str,
+        base_manifest: &ContentManifest,
         offset: u64,
-        patch_hash: Option<String>,
+        patch_hash: &Option<String>,
         patch_size: u64,
-        trusted_content_hash: Option<&str>,
-        base_identity: Option<&ContentVersionIdentity>,
-    ) -> Result<ContentPatchManifest> {
-        let _owner = self.content_mutation_guard()?;
-        if let Some(trusted_content_hash) = trusted_content_hash {
-            hash_hex(trusted_content_hash)?;
-        }
-        let base_manifest = self.patch_base_manifest(object_id, base_version, base_identity)?;
-        let base_extents = self.logical_extents_for_manifest(&base_manifest)?;
+    ) -> Result<(u64, Vec<ContentExtent>)> {
+        let base_extents = self.logical_extents_for_manifest(base_manifest)?;
         self.ensure_extents_readable(&base_extents)?;
         if offset > base_manifest.size_bytes {
             return Err(ContentStoreError::InvalidContentLayout {
@@ -4315,6 +3966,110 @@ impl LocalContentStore {
         });
         let target_extents = coalesce_extents(target_extents)?;
         validate_extents_cover_size(&target_extents, target_size, object_id, target_version)?;
+        Ok((target_size, target_extents))
+    }
+
+    pub(crate) fn replay_object_version_patch_manifest(
+        &self,
+        object_id: &str,
+        base_version: &str,
+        target_version: &str,
+        offset: u64,
+        patch_hash: &str,
+        patch_size: u64,
+        base_identity: &ContentVersionIdentity,
+    ) -> Result<Option<ContentManifest>> {
+        let _owner = self.content_mutation_guard()?;
+        let target = match self.read_manifest(object_id, target_version) {
+            Ok(target) => target,
+            Err(error) if content_error_is_not_found(&error) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let base = self.patch_base_manifest(object_id, base_version, Some(base_identity))?;
+        let (size, extents) = self.patch_target_extents(
+            object_id,
+            base_version,
+            target_version,
+            &base,
+            offset,
+            &Some(patch_hash.to_owned()),
+            patch_size,
+        )?;
+        if target.size_bytes != size || target.extents != extents {
+            return Err(ContentStoreError::InvalidContentLayout {
+                message: "routed patch differs from the immutable target extent layout".into(),
+            });
+        }
+        Ok(Some(target))
+    }
+
+    pub(crate) fn bind_quarantined_patch(
+        &self,
+        object_id: &str,
+        base_version: &str,
+        target_version: &str,
+        offset: u64,
+        blob: ContentStoreQuarantinedBlob,
+        base_identity: &ContentVersionIdentity,
+    ) -> Result<ContentPatchManifest> {
+        let _owner = self.content_mutation_guard()?;
+        if blob.store_root != self.root {
+            return Err(ContentStoreError::InvalidContentLayout {
+                message: "quarantined patch belongs to another content root".into(),
+            });
+        }
+        self.validate_object_version_patch_source(
+            object_id,
+            base_version,
+            offset,
+            blob.size_bytes,
+            Some(base_identity),
+        )?;
+        self.ensure_content_reservation(object_id, target_version, &blob.content_hash)?;
+        let path = self.blob_path(&blob.content_hash)?;
+        if !self.has_blob(&blob.content_hash)? {
+            self.ensure_quota_delta(ContentStoreQuotaDelta {
+                blob_bytes: projected_file_growth(&path, blob.size_bytes)?,
+                ..ContentStoreQuotaDelta::default()
+            })?;
+            self.publish_prehashed_temporary_blob(&blob.synced_file, &path)?;
+        }
+        self.put_object_version_patch_from_blob(
+            object_id,
+            base_version,
+            target_version,
+            offset,
+            Some(blob.content_hash.clone()),
+            blob.size_bytes,
+            Some(base_identity),
+        )
+    }
+
+    fn put_object_version_patch_from_blob_with_trusted_content_hash(
+        &self,
+        object_id: &str,
+        base_version: &str,
+        target_version: &str,
+        offset: u64,
+        patch_hash: Option<String>,
+        patch_size: u64,
+        trusted_content_hash: Option<&str>,
+        base_identity: Option<&ContentVersionIdentity>,
+    ) -> Result<ContentPatchManifest> {
+        let _owner = self.content_mutation_guard()?;
+        if let Some(trusted_content_hash) = trusted_content_hash {
+            hash_hex(trusted_content_hash)?;
+        }
+        let base_manifest = self.patch_base_manifest(object_id, base_version, base_identity)?;
+        let (target_size, target_extents) = self.patch_target_extents(
+            object_id,
+            base_version,
+            target_version,
+            &base_manifest,
+            offset,
+            &patch_hash,
+            patch_size,
+        )?;
         for content_hash in target_extents
             .iter()
             .map(|extent| extent.content_hash.as_str())
@@ -4349,7 +4104,7 @@ impl LocalContentStore {
             size_bytes: target_size,
             extents: target_extents,
         };
-        let manifest = self.write_manifest_create_new_or_existing(manifest)?;
+        let manifest = self.publish_existing_manifest(manifest)?;
         if let Some(hash_tree) = hash_tree {
             self.write_hash_tree_create_new_or_existing(ContentHashTree {
                 content_hash: manifest.content_hash.clone(),
@@ -4373,106 +4128,24 @@ impl LocalContentStore {
         if let Some(manifest) = self.try_write_inline_binding(object_id, version, bytes)? {
             return Ok(manifest);
         }
-        let hash = content_hash(bytes);
-        self.inline_check_manifest_conflict(&ContentManifest {
-            object_id: object_id.to_owned(),
-            version: version.to_owned(),
-            content_hash: hash.clone(),
-            size_bytes: bytes.len() as u64,
-            extents: Vec::new(),
-        })?;
-        let manifest_path = self.manifest_path(object_id, version);
-        if manifest_path.is_file() {
-            let existing = decode_manifest_for_path(&read_file(&manifest_path)?, &manifest_path)?;
-            if existing.content_hash != hash {
-                return Err(ContentStoreError::VersionHashConflict {
-                    object_id: object_id.to_owned(),
-                    version: version.to_owned(),
-                    existing_hash: existing.content_hash,
-                    new_hash: hash,
-                });
-            }
-            if existing.content_hash != intrinsic_empty_content_hash() {
-                self.ensure_content_reservation(
-                    &existing.object_id,
-                    &existing.version,
-                    &existing.content_hash,
-                )?;
-            }
-            let blob_path = self.blob_path(&hash)?;
-            if !self.has_blob(&hash)? {
-                self.ensure_quota_delta(ContentStoreQuotaDelta {
-                    blob_bytes: projected_file_growth(&blob_path, bytes.len() as u64)?,
-                    ..ContentStoreQuotaDelta::default()
-                })?;
-                self.write_tracked_blob_bytes(&hash, &blob_path, bytes)?;
-            }
-            self.clear_orphan_observations_before_manifest_publish(std::iter::once(&existing))?;
-            self.inline_legacy_manifest_published(&existing)?;
-            self.ensure_content_manifest_index_best_effort(&existing);
-            return Ok(existing);
-        }
-
-        let blob_path = self.blob_path(&hash)?;
-        let blob_needs_write = !self.has_blob(&hash)?;
         let manifest = ContentManifest {
-            object_id: object_id.to_owned(),
-            version: version.to_owned(),
-            content_hash: hash,
+            object_id: object_id.into(),
+            version: version.into(),
+            content_hash: content_hash(bytes),
             size_bytes: bytes.len() as u64,
             extents: Vec::new(),
         };
-        if manifest.content_hash != intrinsic_empty_content_hash() {
-            self.ensure_content_reservation(
-                &manifest.object_id,
-                &manifest.version,
-                &manifest.content_hash,
-            )?;
+        self.inline_check_manifest_conflict(&manifest)?;
+        self.ensure_content_reservation(object_id, version, &manifest.content_hash)?;
+        let path = self.blob_path(&manifest.content_hash)?;
+        if !self.has_blob(&manifest.content_hash)? {
+            self.ensure_quota_delta(ContentStoreQuotaDelta {
+                blob_bytes: projected_file_growth(&path, manifest.size_bytes)?,
+                ..ContentStoreQuotaDelta::default()
+            })?;
+            self.write_tracked_blob_bytes(&manifest.content_hash, &path, bytes)?;
         }
-        let manifest_bytes = encode_manifest(&manifest)?;
-        self.ensure_quota_delta(ContentStoreQuotaDelta {
-            blob_bytes: if blob_needs_write {
-                projected_file_growth(&blob_path, bytes.len() as u64)?
-            } else {
-                0
-            },
-            logical_object_bytes: manifest.size_bytes,
-            manifest_bytes: manifest_bytes.len() as u64,
-            ..ContentStoreQuotaDelta::default()
-        })?;
-        if blob_needs_write {
-            self.write_tracked_blob_bytes(&manifest.content_hash, &blob_path, bytes)?;
-        }
-
-        self.clear_orphan_observations_before_manifest_publish(std::iter::once(&manifest))?;
-        if let Err(error) = write_file_create_new_atomic(&manifest_path, &manifest_bytes) {
-            if let ContentStoreError::Io { source, .. } = &error
-                && source.kind() == io::ErrorKind::AlreadyExists
-            {
-                let existing =
-                    decode_manifest_for_path(&read_file(&manifest_path)?, &manifest_path)?;
-                if existing.content_hash != manifest.content_hash {
-                    return Err(ContentStoreError::VersionHashConflict {
-                        object_id: object_id.to_owned(),
-                        version: version.to_owned(),
-                        existing_hash: existing.content_hash,
-                        new_hash: manifest.content_hash,
-                    });
-                }
-                self.clear_orphan_observations_before_manifest_publish(std::iter::once(&existing))?;
-                self.inline_legacy_manifest_published(&existing)?;
-                self.ensure_content_manifest_index_best_effort(&existing);
-                return Ok(existing);
-            }
-            return Err(error);
-        }
-        self.apply_stats_delta(ContentStoreStatsDelta::manifest_created(
-            &manifest,
-            manifest_bytes.len() as u64,
-        ))?;
-        self.inline_legacy_manifest_published(&manifest)?;
-        self.ensure_content_manifest_index_best_effort(&manifest);
-        Ok(manifest)
+        self.publish_existing_manifest(manifest)
     }
 
     fn publish_prehashed_object_version_file(
@@ -4483,105 +4156,27 @@ impl LocalContentStore {
         size_bytes: u64,
         synced_file: &durable_file::SyncedPrivateStagedFile,
     ) -> Result<ContentManifest> {
-        let temporary_path = synced_file.path();
         let _owner = self.content_mutation_guard()?;
-        self.inline_check_manifest_conflict(&ContentManifest {
-            object_id: object_id.to_owned(),
-            version: version.to_owned(),
-            content_hash: hash.clone(),
-            size_bytes,
-            extents: Vec::new(),
-        })?;
-        let manifest_path = self.manifest_path(object_id, version);
-        if manifest_path.is_file() {
-            let existing = decode_manifest_for_path(&read_file(&manifest_path)?, &manifest_path)?;
-            if existing.content_hash != hash {
-                return Err(ContentStoreError::VersionHashConflict {
-                    object_id: object_id.to_owned(),
-                    version: version.to_owned(),
-                    existing_hash: existing.content_hash,
-                    new_hash: hash,
-                });
-            }
-            if existing.size_bytes != size_bytes {
-                return Err(ContentStoreError::InvalidContentLayout {
-                    message: format!(
-                        "object {object_id} version {version} manifest size {} does not match ingested size {size_bytes}",
-                        existing.size_bytes
-                    ),
-                });
-            }
-            if !self.has_blob(&existing.content_hash)? {
-                let blob_path = self.blob_path(&existing.content_hash)?;
-                self.ensure_quota_delta(ContentStoreQuotaDelta {
-                    blob_bytes: projected_file_growth(&blob_path, size_bytes)?,
-                    ..ContentStoreQuotaDelta::default()
-                })?;
-                self.publish_prehashed_temporary_blob(synced_file, &blob_path)?;
-            } else {
-                remove_file_if_exists(temporary_path)?;
-            }
-            self.clear_orphan_observations_before_manifest_publish(std::iter::once(&existing))?;
-            self.inline_legacy_manifest_published(&existing)?;
-            self.ensure_content_manifest_index_best_effort(&existing);
-            return Ok(existing);
-        }
-
-        let blob_path = self.blob_path(&hash)?;
-        let blob_needs_write = !self.has_blob(&hash)?;
         let manifest = ContentManifest {
-            object_id: object_id.to_owned(),
-            version: version.to_owned(),
+            object_id: object_id.into(),
+            version: version.into(),
             content_hash: hash,
             size_bytes,
             extents: Vec::new(),
         };
-        let manifest_bytes = encode_manifest(&manifest)?;
-        self.ensure_quota_delta(ContentStoreQuotaDelta {
-            blob_bytes: if blob_needs_write {
-                projected_file_growth(&blob_path, size_bytes)?
-            } else {
-                0
-            },
-            logical_object_bytes: manifest.size_bytes,
-            manifest_bytes: manifest_bytes.len() as u64,
-            ..ContentStoreQuotaDelta::default()
-        })?;
-        if blob_needs_write {
-            self.publish_prehashed_temporary_blob(synced_file, &blob_path)?;
+        self.inline_check_manifest_conflict(&manifest)?;
+        self.ensure_content_reservation(object_id, version, &manifest.content_hash)?;
+        let path = self.blob_path(&manifest.content_hash)?;
+        if !self.has_blob(&manifest.content_hash)? {
+            self.ensure_quota_delta(ContentStoreQuotaDelta {
+                blob_bytes: projected_file_growth(&path, size_bytes)?,
+                ..ContentStoreQuotaDelta::default()
+            })?;
+            self.publish_prehashed_temporary_blob(synced_file, &path)?;
         } else {
-            remove_file_if_exists(temporary_path)?;
+            remove_file_if_exists(synced_file.path())?;
         }
-
-        self.clear_orphan_observations_before_manifest_publish(std::iter::once(&manifest))?;
-        if let Err(error) = write_file_create_new_atomic(&manifest_path, &manifest_bytes) {
-            if let ContentStoreError::Io { source, .. } = &error
-                && source.kind() == io::ErrorKind::AlreadyExists
-            {
-                let existing =
-                    decode_manifest_for_path(&read_file(&manifest_path)?, &manifest_path)?;
-                if existing.content_hash != manifest.content_hash {
-                    return Err(ContentStoreError::VersionHashConflict {
-                        object_id: object_id.to_owned(),
-                        version: version.to_owned(),
-                        existing_hash: existing.content_hash,
-                        new_hash: manifest.content_hash,
-                    });
-                }
-                self.clear_orphan_observations_before_manifest_publish(std::iter::once(&existing))?;
-                self.inline_legacy_manifest_published(&existing)?;
-                self.ensure_content_manifest_index_best_effort(&existing);
-                return Ok(existing);
-            }
-            return Err(error);
-        }
-        self.apply_stats_delta(ContentStoreStatsDelta::manifest_created(
-            &manifest,
-            manifest_bytes.len() as u64,
-        ))?;
-        self.inline_legacy_manifest_published(&manifest)?;
-        self.ensure_content_manifest_index_best_effort(&manifest);
-        Ok(manifest)
+        self.publish_existing_manifest(manifest)
     }
 
     fn publish_prehashed_temporary_blob(
@@ -4591,9 +4186,7 @@ impl LocalContentStore {
     ) -> Result<()> {
         let _owner = self.content_mutation_guard()?;
         let temporary_path = synced_file.path();
-        if let Some(parent) = blob_path.parent() {
-            create_dir_all(parent.to_owned())?;
-        }
+        ensure_loose_blob_parent(blob_path)?;
         let before_len = file_len_if_exists(blob_path)?;
         match durable_file::install_synced_private_staged_file(synced_file, blob_path)
             .map_err(content_durable_file_error)
@@ -4613,7 +4206,7 @@ impl LocalContentStore {
             let hash = format!("{HASH_PREFIX}{hex}");
             if self.inline_blob_deleted(&hash)? {
                 let bytes =
-                    durable_file::read_object_file_bytes(blob_path, PACKED_BLOB_SMALL_LIMIT_BYTES)
+                    durable_file::read_object_file_bytes(blob_path, INLINE_BLOB_SMALL_LIMIT_BYTES)
                         .map_err(content_durable_file_error)?;
                 self.try_restore_inline_blob(&hash, &bytes)?;
             }
@@ -4646,7 +4239,16 @@ impl LocalContentStore {
             self.inline_version_state(object_id, version)?
         {
             self.ensure_content_reservation(object_id, version, &proposed.content_hash)?;
-            if !self.has_blob(&proposed.content_hash)? {
+            let content_valid = if entry.manifest.extents.is_empty() {
+                self.has_blob(&proposed.content_hash)?
+            } else {
+                // This current binding owns an extent layout, not a blob at
+                // its whole-file hash. Validate the exact logical stream and
+                // retain the original manifest without duplicating its bytes.
+                let extents = self.logical_extents_for_manifest(&entry.manifest)?;
+                self.hash_extents(&extents)? == proposed.content_hash
+            };
+            if !content_valid {
                 return Err(ContentStoreError::InvalidContentLayout {
                     message: "authoritative inline binding payload is corrupt".into(),
                 });
@@ -4658,45 +4260,6 @@ impl LocalContentStore {
         }
         let trace_started = Instant::now();
         let manifest_check_started = Instant::now();
-        let manifest_path = self.manifest_path(object_id, version);
-        if manifest_path.is_file()
-            && !matches!(
-                self.inline_version_state(object_id, version)?,
-                Some(InlineVersionState::Deleted { .. })
-            )
-        {
-            let hash_started = Instant::now();
-            let hash = content_hash(bytes);
-            let hash_ms = hash_started.elapsed().as_millis();
-            let existing = decode_manifest_for_path(&read_file(&manifest_path)?, &manifest_path)?;
-            if existing.content_hash != hash {
-                return Err(ContentStoreError::VersionHashConflict {
-                    object_id: object_id.to_owned(),
-                    version: version.to_owned(),
-                    existing_hash: existing.content_hash,
-                    new_hash: hash,
-                });
-            }
-            if existing.content_hash != intrinsic_empty_content_hash() {
-                self.ensure_content_reservation(
-                    &existing.object_id,
-                    &existing.version,
-                    &existing.content_hash,
-                )?;
-            }
-            content_store_perf_trace(format_args!(
-                "blob-only-write object={} version={} bytes={} existing_manifest=true hash_ms={} manifest_check_ms={} total_ms={}",
-                object_id,
-                version,
-                bytes.len(),
-                hash_ms,
-                manifest_check_started.elapsed().as_millis(),
-                trace_started.elapsed().as_millis()
-            ));
-            self.clear_orphan_observations_before_manifest_publish(std::iter::once(&existing))?;
-            self.ensure_content_manifest_index_best_effort(&existing);
-            return Ok(existing);
-        }
         let manifest_check_ms = manifest_check_started.elapsed().as_millis();
 
         if self.uses_streamed_blob_only_path(bytes.len()) {
@@ -4822,9 +4385,7 @@ impl LocalContentStore {
             )?;
 
             let create_dir_started = Instant::now();
-            if let Some(parent) = blob_path.parent() {
-                create_dir_all(parent.to_owned())?;
-            }
+            ensure_loose_blob_parent(&blob_path)?;
             let create_dir_ms = create_dir_started.elapsed().as_millis();
 
             let publish_started = Instant::now();
@@ -4893,132 +4454,10 @@ impl LocalContentStore {
         &self,
         versions: &[(&'a str, &'a str, &'a [u8])],
     ) -> Result<Vec<ContentManifest>> {
-        let _owner = self.content_mutation_guard()?;
-        if self.inline_sentinel_unlocked()?.is_some() {
-            return versions
-                .iter()
-                .map(|(object, version, bytes)| self.write_object_version(object, version, bytes))
-                .collect();
-        }
-        let mut prepared = Vec::with_capacity(versions.len());
-        let mut quota_delta = ContentStoreQuotaDelta::default();
-        for (object_id, version, bytes) in versions {
-            let hash = content_hash(bytes);
-            let manifest_path = self.manifest_path(object_id, version);
-            if manifest_path.is_file() {
-                let existing =
-                    decode_manifest_for_path(&read_file(&manifest_path)?, &manifest_path)?;
-                if existing.content_hash != hash {
-                    return Err(ContentStoreError::VersionHashConflict {
-                        object_id: (*object_id).to_owned(),
-                        version: (*version).to_owned(),
-                        existing_hash: existing.content_hash,
-                        new_hash: hash,
-                    });
-                }
-                prepared.push(PreparedSmallObjectVersion {
-                    bytes,
-                    blob_path: self.blob_path(&existing.content_hash)?,
-                    manifest: existing,
-                    manifest_bytes: None,
-                    manifest_path,
-                });
-                continue;
-            }
-            let blob_path = self.blob_path(&hash)?;
-            let manifest = ContentManifest {
-                object_id: (*object_id).to_owned(),
-                version: (*version).to_owned(),
-                content_hash: hash,
-                size_bytes: bytes.len() as u64,
-                extents: Vec::new(),
-            };
-            let manifest_bytes = encode_manifest(&manifest)?;
-            quota_delta.logical_object_bytes = quota_delta
-                .logical_object_bytes
-                .saturating_add(manifest.size_bytes);
-            quota_delta.manifest_bytes = quota_delta
-                .manifest_bytes
-                .saturating_add(manifest_bytes.len() as u64);
-            prepared.push(PreparedSmallObjectVersion {
-                bytes,
-                blob_path,
-                manifest,
-                manifest_bytes: Some(manifest_bytes),
-                manifest_path,
-            });
-        }
-        let reservation_identities = prepared
+        versions
             .iter()
-            .map(|prepared| ContentStoreReservationIdentity {
-                object_id: prepared.manifest.object_id.clone(),
-                version: prepared.manifest.version.clone(),
-                content_hash: prepared.manifest.content_hash.clone(),
-            })
-            .collect::<Vec<_>>();
-        self.ensure_content_reservations_batch(&reservation_identities)?;
-
-        let mut blob_writes = Vec::new();
-        let mut invalid_loose_blobs = Vec::new();
-        {
-            let _locks = self.lock_packed_blob_lanes_for_hashes(
-                prepared
-                    .iter()
-                    .map(|prepared| prepared.manifest.content_hash.as_str()),
-            )?;
-            for prepared in &prepared {
-                let hash = prepared.manifest.content_hash.as_str();
-                if prepared.blob_path.is_file() {
-                    if file_content_hash(&prepared.blob_path).is_ok_and(|actual| actual == hash) {
-                        continue;
-                    }
-                    invalid_loose_blobs.push(prepared.blob_path.clone());
-                }
-                if let Some(location) = self.packed_blob_location_for_update_unlocked(hash)?
-                    && self.packed_blob_location_readable(&location)?
-                {
-                    continue;
-                }
-                quota_delta.blob_bytes = quota_delta
-                    .blob_bytes
-                    .saturating_add(prepared.bytes.len() as u64);
-                blob_writes.push((prepared.manifest.content_hash.clone(), prepared.bytes));
-            }
-            self.ensure_quota_delta(quota_delta)?;
-            let blob_delta = self.write_packed_blobs_unlocked(&blob_writes)?;
-            if !blob_delta.is_zero() {
-                self.apply_stats_delta(blob_delta)?;
-            }
-        }
-
-        for path in invalid_loose_blobs {
-            remove_file_if_exists(&path)?;
-        }
-
-        let mut manifest_delta = ContentStoreStatsDelta::default();
-        self.clear_orphan_observations_before_manifest_publish(
-            prepared.iter().map(|prepared| &prepared.manifest),
-        )?;
-        write_files_create_new_relaxed(prepared.iter().filter_map(|prepared| {
-            prepared
-                .manifest_bytes
-                .as_ref()
-                .map(|manifest_bytes| (prepared.manifest_path.clone(), manifest_bytes.as_slice()))
-        }))?;
-        for prepared in &prepared {
-            if let Some(manifest_bytes) = prepared.manifest_bytes.as_ref() {
-                manifest_delta.add(ContentStoreStatsDelta::manifest_created(
-                    &prepared.manifest,
-                    manifest_bytes.len() as u64,
-                ));
-            }
-            self.ensure_content_manifest_index_best_effort(&prepared.manifest);
-        }
-        self.apply_stats_delta(manifest_delta)?;
-        Ok(prepared
-            .into_iter()
-            .map(|prepared| prepared.manifest)
-            .collect())
+            .map(|(object, version, bytes)| self.write_object_version(object, version, bytes))
+            .collect()
     }
 
     fn write_object_version_from_file(
@@ -5121,231 +4560,29 @@ impl LocalContentStore {
         size_bytes: u64,
     ) -> Result<ContentManifest> {
         let _owner = self.content_mutation_guard()?;
-        self.inline_check_manifest_conflict(&ContentManifest {
-            object_id: object_id.to_owned(),
-            version: version.to_owned(),
-            content_hash: hash.clone(),
-            size_bytes,
-            extents: Vec::new(),
-        })?;
-        let manifest_path = self.manifest_path(object_id, version);
-        if manifest_path.is_file() {
-            let existing = decode_manifest_for_path(&read_file(&manifest_path)?, &manifest_path)?;
-            if existing.content_hash != hash {
-                return Err(ContentStoreError::VersionHashConflict {
-                    object_id: object_id.to_owned(),
-                    version: version.to_owned(),
-                    existing_hash: existing.content_hash,
-                    new_hash: hash,
-                });
-            }
-            self.ensure_content_reservation(
-                &existing.object_id,
-                &existing.version,
-                &existing.content_hash,
-            )?;
-            let blob_path = self.blob_path(&hash)?;
-            if !self.has_blob(&hash)? {
-                self.ensure_quota_delta(ContentStoreQuotaDelta {
-                    blob_bytes: projected_file_growth(&blob_path, size_bytes)?,
-                    ..ContentStoreQuotaDelta::default()
-                })?;
-                self.publish_tracked_file_as_blob(&hash, source_path, &blob_path, &hash)?;
-            }
-            self.clear_orphan_observations_before_manifest_publish(std::iter::once(&existing))?;
-            self.inline_legacy_manifest_published(&existing)?;
-            self.ensure_content_manifest_index_best_effort(&existing);
-            return Ok(existing);
-        }
-
-        let blob_path = self.blob_path(&hash)?;
-        let blob_needs_publish = !self.has_blob(&hash)?;
         let manifest = ContentManifest {
-            object_id: object_id.to_owned(),
-            version: version.to_owned(),
+            object_id: object_id.into(),
+            version: version.into(),
             content_hash: hash,
             size_bytes,
             extents: Vec::new(),
         };
-        self.ensure_content_reservation(
-            &manifest.object_id,
-            &manifest.version,
-            &manifest.content_hash,
-        )?;
-        let manifest_bytes = encode_manifest(&manifest)?;
-        self.ensure_quota_delta(ContentStoreQuotaDelta {
-            blob_bytes: if blob_needs_publish {
-                projected_file_growth(&blob_path, size_bytes)?
-            } else {
-                0
-            },
-            logical_object_bytes: manifest.size_bytes,
-            manifest_bytes: manifest_bytes.len() as u64,
-            ..ContentStoreQuotaDelta::default()
-        })?;
-        // The quota check needs to know whether this publish grows durable blob
-        // storage, so we preflight the content-addressed blob before linking it.
-        if blob_needs_publish {
+        self.inline_check_manifest_conflict(&manifest)?;
+        self.ensure_content_reservation(object_id, version, &manifest.content_hash)?;
+        let path = self.blob_path(&manifest.content_hash)?;
+        if !self.has_blob(&manifest.content_hash)? {
+            self.ensure_quota_delta(ContentStoreQuotaDelta {
+                blob_bytes: projected_file_growth(&path, size_bytes)?,
+                ..ContentStoreQuotaDelta::default()
+            })?;
             self.publish_tracked_file_as_blob(
                 &manifest.content_hash,
                 source_path,
-                &blob_path,
+                &path,
                 &manifest.content_hash,
             )?;
         }
-        self.clear_orphan_observations_before_manifest_publish(std::iter::once(&manifest))?;
-        if let Err(error) = write_file_create_new_atomic(&manifest_path, &manifest_bytes) {
-            if let ContentStoreError::Io { source, .. } = &error
-                && source.kind() == io::ErrorKind::AlreadyExists
-            {
-                let existing =
-                    decode_manifest_for_path(&read_file(&manifest_path)?, &manifest_path)?;
-                if existing.content_hash != manifest.content_hash {
-                    return Err(ContentStoreError::VersionHashConflict {
-                        object_id: object_id.to_owned(),
-                        version: version.to_owned(),
-                        existing_hash: existing.content_hash,
-                        new_hash: manifest.content_hash,
-                    });
-                }
-                self.clear_orphan_observations_before_manifest_publish(std::iter::once(&existing))?;
-                self.inline_legacy_manifest_published(&existing)?;
-                self.ensure_content_manifest_index_best_effort(&existing);
-                return Ok(existing);
-            }
-            return Err(error);
-        }
-        self.apply_stats_delta(ContentStoreStatsDelta::manifest_created(
-            &manifest,
-            manifest_bytes.len() as u64,
-        ))?;
-        self.inline_legacy_manifest_published(&manifest)?;
-        self.ensure_content_manifest_index_best_effort(&manifest);
-        Ok(manifest)
-    }
-
-    fn scrub_manifest_tree(
-        &self,
-        path: &Path,
-        report: &mut ContentStoreScrubReport,
-        referenced_blobs: &mut BTreeSet<String>,
-        checked_blobs: &mut BTreeMap<String, ScrubbedBlob>,
-        mut version_entries: Option<&mut BTreeMap<String, Vec<VersionManifestEntry>>>,
-        inline: Option<&inline_bindings::InlineBindingView>,
-    ) -> Result<()> {
-        if !path.exists() {
-            return Ok(());
-        }
-        for entry in read_dir(path)? {
-            let entry_path = entry.path();
-            if entry_path.is_dir() {
-                self.scrub_manifest_tree(
-                    &entry_path,
-                    report,
-                    referenced_blobs,
-                    checked_blobs,
-                    version_entries.as_deref_mut(),
-                    inline,
-                )?;
-                continue;
-            }
-            if entry_path.file_name().and_then(|name| name.to_str()) != Some("manifest.sobj") {
-                continue;
-            }
-            if let Some(version_dir) = entry_path.parent()
-                && let Some(object_dir) = version_dir.parent()
-                && let (Some(object), Some(version)) = (
-                    object_dir.file_name().and_then(|name| name.to_str()),
-                    version_dir.file_name().and_then(|name| name.to_str()),
-                )
-                && inline.is_some_and(|view| view.owns_version(object, version))
-            {
-                continue;
-            }
-            let version_entry = self.scrub_manifest(
-                &entry_path,
-                report,
-                referenced_blobs,
-                checked_blobs,
-                version_entries.is_some(),
-                inline,
-            )?;
-            if let Some(version_entry) = version_entry
-                && let Some(version_entries) = version_entries.as_deref_mut()
-            {
-                version_entries
-                    .entry(version_entry.object_id.clone())
-                    .or_default()
-                    .push(version_entry);
-            }
-        }
-        Ok(())
-    }
-
-    fn scrub_manifest(
-        &self,
-        path: &Path,
-        report: &mut ContentStoreScrubReport,
-        referenced_blobs: &mut BTreeSet<String>,
-        checked_blobs: &mut BTreeMap<String, ScrubbedBlob>,
-        collect_version_entry: bool,
-        inline: Option<&inline_bindings::InlineBindingView>,
-    ) -> Result<Option<VersionManifestEntry>> {
-        let manifest_bytes = match read_file(path) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                report.issues.push(ContentStoreScrubIssue::InvalidManifest {
-                    path: path.to_owned(),
-                    message: error.to_string(),
-                });
-                return Ok(None);
-            }
-        };
-        report.stats.manifest_count = report.stats.manifest_count.saturating_add(1);
-        report.stats.manifest_bytes = report
-            .stats
-            .manifest_bytes
-            .saturating_add(manifest_bytes.len() as u64);
-        let manifest = match decode_manifest_for_path(&manifest_bytes, path).and_then(|manifest| {
-            if let Some(view) = inline {
-                view.validate_legacy_manifest(&manifest)?;
-            }
-            Ok(manifest)
-        }) {
-            Ok(manifest) => manifest,
-            Err(error) => {
-                report.issues.push(ContentStoreScrubIssue::InvalidManifest {
-                    path: path.to_owned(),
-                    message: error.to_string(),
-                });
-                return Ok(None);
-            }
-        };
-        let version_entry = if collect_version_entry {
-            let modified = path
-                .metadata()
-                .and_then(|metadata| metadata.modified())
-                .map_err(|source| ContentStoreError::Io {
-                    path: path.to_owned(),
-                    source,
-                })?;
-            Some(VersionManifestEntry {
-                object_id: manifest.object_id.clone(),
-                version: manifest.version.clone(),
-                content_hash: manifest.content_hash.clone(),
-                storage: VersionManifestStorage::Legacy {
-                    path: path.to_owned(),
-                },
-                modified_nanos: system_time_nanos_since_epoch_saturating(modified),
-                manifest_bytes: manifest_bytes.len() as u64,
-                logical_bytes: manifest.size_bytes,
-                extent_count: manifest.extents.len() as u64,
-            })
-        } else {
-            None
-        };
-        self.scrub_manifest_references(path, &manifest, report, referenced_blobs, checked_blobs)?;
-        Ok(version_entry)
+        self.publish_existing_manifest(manifest)
     }
 
     fn scrub_manifest_references(
@@ -5432,12 +4669,6 @@ impl LocalContentStore {
         let mut diagnostic_path = self.blob_path(content_hash)?;
         if let Some(entry) = self.inline_blob_entry(content_hash)? {
             diagnostic_path = entry.path().to_owned();
-        } else if !diagnostic_path.is_file()
-            && content_hash != intrinsic_empty_content_hash()
-            && let Some((location, _lock)) =
-                self.packed_blob_location_and_read_lock(content_hash)?
-        {
-            diagnostic_path = self.packed_blob_location_path(&location);
         }
         if !checked_blobs.contains_key(content_hash) {
             let mut reader = match self.open_blob_stream(content_hash) {
@@ -5577,33 +4808,6 @@ impl LocalContentStore {
                 path: entry_path,
                 size_bytes,
             });
-        }
-        Ok(())
-    }
-
-    fn collect_orphan_packed_blob_issues(
-        &self,
-        referenced_blobs: &BTreeSet<String>,
-        shadowed_hashes: &BTreeSet<String>,
-        report: &mut ContentStoreScrubReport,
-    ) -> Result<()> {
-        let index = self.read_packed_blob_index_unlocked()?;
-        for (content_hash, location) in index.entries {
-            if referenced_blobs.contains(&content_hash) || shadowed_hashes.contains(&content_hash) {
-                continue;
-            }
-            let path = self.packed_blob_location_path(&location);
-            report.orphan_blob_count = report.orphan_blob_count.saturating_add(1);
-            report.orphan_blob_bytes = report.orphan_blob_bytes.saturating_add(location.size_bytes);
-            report
-                .issues
-                .push(ContentStoreScrubIssue::OrphanPackedBlob {
-                    content_hash,
-                    segment_id: location.segment_id,
-                    offset: location.offset,
-                    path,
-                    size_bytes: location.size_bytes,
-                });
         }
         Ok(())
     }
@@ -5757,7 +4961,7 @@ impl LocalContentStore {
         if let Some(size_bytes) = file_len_if_exists(&path)? {
             return Ok(Some(size_bytes));
         }
-        self.packed_blob_readable_size(hash)
+        Ok(None)
     }
 
     fn read_hash_tree_optional(
@@ -6088,126 +5292,48 @@ impl LocalContentStore {
         Ok(format!("{HASH_PREFIX}{}", hasher.finalize().to_hex()))
     }
 
-    fn write_manifest_create_new_or_existing(
-        &self,
-        manifest: ContentManifest,
-    ) -> Result<ContentManifest> {
+    pub fn publish_existing_manifest(&self, manifest: ContentManifest) -> Result<ContentManifest> {
         let _owner = self.content_mutation_guard()?;
         self.inline_check_manifest_conflict(&manifest)?;
         if let Some(InlineVersionState::Live(entry)) =
             self.inline_version_state(&manifest.object_id, &manifest.version)?
         {
-            self.ensure_content_reservation(
-                &manifest.object_id,
-                &manifest.version,
-                &manifest.content_hash,
-            )?;
+            if manifest.content_hash != intrinsic_empty_content_hash() {
+                self.ensure_content_reservation(
+                    &manifest.object_id,
+                    &manifest.version,
+                    &manifest.content_hash,
+                )?;
+            }
             self.clear_orphan_observations_before_manifest_publish(std::iter::once(
                 &entry.manifest,
             ))?;
             return Ok(entry.manifest);
         }
-        let manifest_path = self.manifest_path(&manifest.object_id, &manifest.version);
-        if manifest_path.is_file() {
-            let existing = decode_manifest_for_path(&read_file(&manifest_path)?, &manifest_path)?;
-            if existing.content_hash != manifest.content_hash
-                || existing.size_bytes != manifest.size_bytes
-            {
-                return Err(ContentStoreError::VersionHashConflict {
-                    object_id: manifest.object_id,
-                    version: manifest.version,
-                    existing_hash: existing.content_hash,
-                    new_hash: manifest.content_hash,
-                });
-            }
-            self.ensure_content_reservation(
-                &existing.object_id,
-                &existing.version,
-                &existing.content_hash,
-            )?;
-            self.clear_orphan_observations_before_manifest_publish(std::iter::once(&existing))?;
-            self.inline_legacy_manifest_published(&existing)?;
-            self.ensure_content_manifest_index_best_effort(&existing);
-            return Ok(existing);
+        if !self.manifest_content_available(&manifest)? {
+            return Err(ContentStoreError::InvalidContentLayout {
+                message: "manifest content is not durable and readable".into(),
+            });
         }
-        self.ensure_content_reservation(
-            &manifest.object_id,
-            &manifest.version,
-            &manifest.content_hash,
-        )?;
-        let manifest_bytes = encode_manifest(&manifest)?;
+        if manifest.content_hash != intrinsic_empty_content_hash() {
+            self.ensure_content_reservation(
+                &manifest.object_id,
+                &manifest.version,
+                &manifest.content_hash,
+            )?;
+        }
         self.ensure_quota_delta(ContentStoreQuotaDelta {
             logical_object_bytes: manifest.size_bytes,
-            manifest_bytes: manifest_bytes.len() as u64,
+            manifest_bytes: encode_manifest(&manifest)?.len() as u64,
             ..ContentStoreQuotaDelta::default()
         })?;
         self.clear_orphan_observations_before_manifest_publish(std::iter::once(&manifest))?;
-        if let Err(error) = write_file_create_new_atomic(&manifest_path, &manifest_bytes) {
-            if let ContentStoreError::Io { source, .. } = &error
-                && source.kind() == io::ErrorKind::AlreadyExists
-            {
-                let existing =
-                    decode_manifest_for_path(&read_file(&manifest_path)?, &manifest_path)?;
-                if existing.content_hash != manifest.content_hash
-                    || existing.size_bytes != manifest.size_bytes
-                {
-                    return Err(ContentStoreError::VersionHashConflict {
-                        object_id: manifest.object_id,
-                        version: manifest.version,
-                        existing_hash: existing.content_hash,
-                        new_hash: manifest.content_hash,
-                    });
-                }
-                self.clear_orphan_observations_before_manifest_publish(std::iter::once(&existing))?;
-                self.inline_legacy_manifest_published(&existing)?;
-                self.ensure_content_manifest_index_best_effort(&existing);
-                return Ok(existing);
-            }
-            return Err(error);
+        self.inline_manifest_published(&manifest)?;
+        self.quota_stats_initialized.store(false, Ordering::Release);
+        if self.quota.is_some() {
+            self.replace_stats_snapshot(&self.scan_stats()?)?;
         }
-        self.apply_stats_delta(ContentStoreStatsDelta::manifest_created(
-            &manifest,
-            manifest_bytes.len() as u64,
-        ))?;
-        self.inline_legacy_manifest_published(&manifest)?;
-        self.ensure_content_manifest_index_best_effort(&manifest);
         Ok(manifest)
-    }
-
-    fn ensure_content_manifest_index_best_effort(&self, manifest: &ContentManifest) {
-        let result = (|| {
-            let index_path =
-                self.content_manifest_index_path(&manifest.object_id, &manifest.content_hash)?;
-            if index_path.is_file() {
-                return Ok(());
-            }
-            let manifest_path = self.manifest_path(&manifest.object_id, &manifest.version);
-            match fs::hard_link(&manifest_path, &index_path) {
-                Ok(()) => Ok(()),
-                Err(source) if source.kind() == io::ErrorKind::AlreadyExists => Ok(()),
-                Err(_) => {
-                    let bytes = read_file(&manifest_path)?;
-                    match write_file_create_new_atomic(&index_path, &bytes) {
-                        Ok(()) => Ok(()),
-                        Err(ContentStoreError::Io { source, .. })
-                            if source.kind() == io::ErrorKind::AlreadyExists =>
-                        {
-                            Ok(())
-                        }
-                        Err(error) => Err(error),
-                    }
-                }
-            }
-        })();
-        if let Err(error) = result {
-            // The index is a rebuildable accelerator. The manifest remains
-            // authoritative and the first identity lookup will fall back to
-            // one version-directory scan if this best-effort link fails.
-            content_store_perf_trace(format_args!(
-                "content manifest index link skipped object={} version={} error={error}",
-                manifest.object_id, manifest.version
-            ));
-        }
     }
 
     fn flush_version_manifest_deletion_batch(
@@ -6254,11 +5380,6 @@ impl LocalContentStore {
             self.remove_manifest_absence_observation(&content_reservation_identity_for_entry(
                 entry,
             ))?;
-            if let Some(parent) =
-                self.remove_content_manifest_index_for_version_if_current_without_sync(entry)?
-            {
-                dirty_directories.insert(parent);
-            }
             // The log tombstone is the authority edge for mixed stores. It
             // precedes physical cleanup so a lost unlink cannot resurrect the
             // old manifest or its content-index hardlink after reopening.
@@ -6331,75 +5452,6 @@ impl LocalContentStore {
         Ok(result)
     }
 
-    fn remove_content_manifest_index_for_version_if_current_without_sync(
-        &self,
-        entry: &VersionManifestEntry,
-    ) -> Result<Option<PathBuf>> {
-        let index_path = self.content_manifest_index_path(&entry.object_id, &entry.content_hash)?;
-        if !index_path.is_file() {
-            return Ok(None);
-        }
-        let Ok(indexed_manifest) = decode_manifest(&read_file(&index_path)?) else {
-            // A derived index that does not decode cannot be proven to point
-            // at the version being collected. Leave it for scrub/lookup repair.
-            return Ok(None);
-        };
-        if indexed_manifest.object_id == entry.object_id
-            && indexed_manifest.version == entry.version
-            && indexed_manifest.content_hash == entry.content_hash
-            && remove_file_if_exists_without_sync(&index_path)?
-        {
-            return Ok(index_path.parent().map(Path::to_owned));
-        }
-        Ok(None)
-    }
-
-    fn flush_pending_packed_orphan_deletions(
-        &self,
-        pending: &mut Vec<PendingPackedOrphanDeletion>,
-        dirty_orphan_observation_directories: &mut BTreeSet<PathBuf>,
-        dirty_packed_index_lanes: &mut BTreeSet<u8>,
-        stats_delta: &mut ContentStoreStatsDelta,
-        report: &mut ContentStoreGcReport,
-    ) -> Result<u64> {
-        if pending.is_empty() {
-            return Ok(0);
-        }
-        let hashes = pending
-            .iter()
-            .map(|deletion| deletion.content_hash.clone())
-            .collect::<Vec<_>>();
-        let removal = self.remove_packed_blob_index_entries_deferred_checkpoint(&hashes)?;
-        if !removal.removed_hashes.is_empty() {
-            report.packed_tombstone_batch_count =
-                report.packed_tombstone_batch_count.saturating_add(1);
-        }
-        dirty_packed_index_lanes.extend(removal.modified_lanes);
-
-        let mut removed_count = 0_u64;
-        for deletion in pending.drain(..) {
-            if !removal.removed_hashes.contains(&deletion.content_hash) {
-                continue;
-            }
-            removed_count = removed_count.saturating_add(1);
-            report.deleted_orphan_count = report.deleted_orphan_count.saturating_add(1);
-            report.deleted_orphan_bytes = report
-                .deleted_orphan_bytes
-                .saturating_add(deletion.size_bytes);
-            stats_delta.add(ContentStoreStatsDelta {
-                blob_count: -1,
-                blob_bytes: -i128::from(deletion.size_bytes),
-                ..ContentStoreStatsDelta::default()
-            });
-            if let Some(parent) =
-                self.remove_orphan_observation_without_sync(&deletion.content_hash)?
-            {
-                dirty_orphan_observation_directories.insert(parent);
-            }
-        }
-        Ok(removed_count)
-    }
-
     fn persist_content_reservation(
         &self,
         identity: &ContentStoreReservationIdentity,
@@ -6414,156 +5466,6 @@ impl LocalContentStore {
         identity: &ContentStoreReservationIdentity,
         stamp: &ContentStoreCausalStamp,
     ) -> Result<()> {
-        let path = self.content_reservation_path(identity);
-        let existing = match read_file(&path) {
-            Ok(bytes) => {
-                let reservation = decode_content_reservation(&bytes)?;
-                validate_content_reservation(&reservation, identity)?;
-                Some(reservation)
-            }
-            Err(ContentStoreError::Io { source, .. })
-                if source.kind() == io::ErrorKind::NotFound =>
-            {
-                None
-            }
-            Err(error) => return Err(error),
-        };
-        let reservation_root = self.root.join(CONTENT_RESERVATION_DIR);
-        let root_existed = reservation_root.is_dir();
-        let shard_existed = path.parent().is_some_and(Path::is_dir);
-        let reservation = ContentStoreReservation {
-            format_version: CONTENT_RESERVATION_FORMAT_VERSION,
-            identity: identity.clone(),
-            causal_stamp: Some(stamp.clone()),
-            reserved_at_unix_nanos: refreshed_reservation_timestamp(
-                existing
-                    .as_ref()
-                    .map(|reservation| reservation.reserved_at_unix_nanos),
-            ),
-        };
-        if let Some(mut prior) = match self.inline_reservation_state(identity)? {
-            Some(InlineReservationState::Live(prior)) => Some(prior),
-            Some(InlineReservationState::Released) => Some(ContentStoreReservationRecord {
-                identity: identity.clone(),
-                reserved_at_unix_nanos: 0,
-                causal_stamp: None,
-            }),
-            None => None,
-        } {
-            prior.reserved_at_unix_nanos = refreshed_reservation_timestamp(Some(
-                prior
-                    .reserved_at_unix_nanos
-                    .max(reservation.reserved_at_unix_nanos),
-            ));
-            prior.causal_stamp = Some(stamp.clone());
-            let sentinel = decode_content_reservation_batch_sentinel(&read_file(
-                &self.content_reservation_batch_sentinel_path(),
-            )?)?;
-            if sentinel.stamp() != *stamp {
-                return Err(ContentStoreError::InvalidContentLayout {
-                    message: "reservation epoch changed under its write owner".into(),
-                });
-            }
-            if self.inline_reserve_owned_identity_unlocked(&prior, &sentinel)? {
-                return Ok(());
-            }
-        }
-        if existing.is_some() {
-            return write_file_atomic(&path, &encode_content_reservation(&reservation)?);
-        }
-        let bytes = encode_content_reservation(&reservation)?;
-        match write_file_create_new_atomic(&path, &bytes) {
-            Ok(()) => {}
-            Err(ContentStoreError::Io { source, .. })
-                if source.kind() == io::ErrorKind::AlreadyExists =>
-            {
-                let existing = decode_content_reservation(&read_file(&path)?)?;
-                validate_content_reservation(&existing, identity)?;
-            }
-            Err(error) => return Err(error),
-        }
-        self.sync_new_sharded_record_parents(
-            &reservation_root,
-            path.parent(),
-            root_existed,
-            shard_existed,
-        )
-    }
-
-    fn persist_content_reservation_batch_unlocked(
-        &self,
-        identities: &[ContentStoreReservationIdentity],
-        stamp: &ContentStoreCausalStamp,
-    ) -> Result<()> {
-        if identities.is_empty() || identities.len() > CONTENT_RESERVATION_BATCH_MAX_IDENTITIES {
-            return Err(ContentStoreError::InvalidContentLayout {
-                message: format!(
-                    "content reservation batch size must be between 1 and {}: actual={}",
-                    CONTENT_RESERVATION_BATCH_MAX_IDENTITIES,
-                    identities.len()
-                ),
-            });
-        }
-        if !identities.windows(2).all(|pair| pair[0] < pair[1]) {
-            return Err(ContentStoreError::InvalidContentLayout {
-                message: "content reservation batch identities must be sorted and unique"
-                    .to_owned(),
-            });
-        }
-        let original_identity_digests = identities
-            .iter()
-            .map(content_identity_digest)
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        if original_identity_digests.len() != identities.len() {
-            return Err(ContentStoreError::InvalidContentLayout {
-                message: "content reservation identity digest collision".to_owned(),
-            });
-        }
-        let batch_id = content_reservation_batch_id(&original_identity_digests);
-        let path = self.content_reservation_batch_path(&batch_id);
-        let existing = match read_file(&path) {
-            Ok(bytes) => {
-                let batch = decode_content_reservation_batch(&bytes)?;
-                validate_content_reservation_batch(&batch, Some(&batch_id))?;
-                if batch.original_identity_digests != original_identity_digests {
-                    return Err(ContentStoreError::InvalidContentLayout {
-                        message: format!(
-                            "content reservation batch immutable membership mismatch: batch={batch_id}"
-                        ),
-                    });
-                }
-                Some(batch)
-            }
-            Err(ContentStoreError::Io { source, .. })
-                if source.kind() == io::ErrorKind::NotFound =>
-            {
-                None
-            }
-            Err(error) => return Err(error),
-        };
-        let refreshed_at = refreshed_reservation_timestamp(existing.as_ref().and_then(|batch| {
-            batch
-                .reservations
-                .iter()
-                .map(|reservation| reservation.reserved_at_unix_nanos)
-                .max()
-        }));
-        let batch = ContentStoreReservationBatch {
-            format_version: CONTENT_RESERVATION_BATCH_FORMAT_VERSION,
-            batch_id,
-            original_identity_digests,
-            reservations: identities
-                .iter()
-                .map(|identity| ContentStoreReservationRecord {
-                    identity: identity.clone(),
-                    reserved_at_unix_nanos: refreshed_at,
-                    causal_stamp: Some(stamp.clone()),
-                })
-                .collect(),
-        };
-        validate_content_reservation_batch(&batch, Some(&batch.batch_id))?;
         let sentinel = decode_content_reservation_batch_sentinel(&read_file(
             &self.content_reservation_batch_sentinel_path(),
         )?)?;
@@ -6572,270 +5474,38 @@ impl LocalContentStore {
                 message: "reservation epoch changed under its write owner".into(),
             });
         }
-        for record in &batch.reservations {
-            self.inline_reserve_owned_identity_unlocked(record, &sentinel)?;
-        }
-        let bytes = encode_content_reservation_batch(&batch)?;
-        if existing.is_some() {
-            return write_file_atomic(&path, &bytes);
-        }
-
-        let batch_root = self.content_reservation_batch_root();
-        let batch_root_existed = batch_root.is_dir();
-        let shard_existed = path.parent().is_some_and(Path::is_dir);
-        match write_file_create_new_atomic(&path, &bytes) {
-            Ok(()) => {}
-            Err(ContentStoreError::Io { source, .. })
-                if source.kind() == io::ErrorKind::AlreadyExists =>
-            {
-                let existing = decode_content_reservation_batch(&read_file(&path)?)?;
-                validate_content_reservation_batch(&existing, Some(&batch.batch_id))?;
-                if existing.original_identity_digests != batch.original_identity_digests {
-                    return Err(ContentStoreError::InvalidContentLayout {
-                        message: format!(
-                            "content reservation batch immutable membership mismatch after create race: batch={}",
-                            batch.batch_id
-                        ),
-                    });
-                }
-                write_file_atomic(&path, &bytes)?;
-                return Ok(());
-            }
-            Err(error) => return Err(error),
-        }
-        if !shard_existed {
-            sync_dir(&batch_root)?;
-        }
-        if !batch_root_existed {
-            sync_dir(&self.root.join(CONTENT_RESERVATION_DIR))?;
-        }
+        let previous = match self.inline_reservation_state(identity)? {
+            Some(InlineReservationState::Live(record)) => Some(record.reserved_at_unix_nanos),
+            _ => None,
+        };
+        let record = ContentStoreReservationRecord {
+            identity: identity.clone(),
+            reserved_at_unix_nanos: refreshed_reservation_timestamp(previous),
+            causal_stamp: stamp.clone(),
+        };
+        self.inline_reserve_owned_identity_unlocked(&record, &sentinel)?;
         Ok(())
     }
 
     fn read_content_reservations(&self) -> Result<Vec<ContentStoreReservationRecord>> {
         let _owner = self.content_mutation_guard()?;
         let _lock = self.lock_content_reservations_for_read_if_present()?;
-        Ok(self
-            .read_content_reservation_inventory_unlocked()?
-            .reservations)
+        self.read_content_reservation_inventory_unlocked()
     }
 
     fn read_content_reservation_inventory_unlocked(
         &self,
-    ) -> Result<ContentStoreReservationInventory> {
-        let mut inventory = self.read_legacy_content_reservation_inventory_unlocked()?;
-        let Some(view) = self.inline_binding_view()? else {
-            return Ok(inventory);
-        };
-        let mut logical = inventory
-            .reservations
+    ) -> Result<Vec<ContentStoreReservationRecord>> {
+        let reservations = self
+            .inline_binding_view()?
             .into_iter()
-            .map(|record| (record.identity.clone(), record))
-            .collect::<BTreeMap<_, _>>();
-        for (identity, state) in view.reservations {
-            match state {
-                InlineReservationState::Live(record) => {
-                    inventory.all_copies.push(record.clone());
-                    logical.insert(identity, record);
-                }
-                InlineReservationState::Released => {
-                    logical.remove(&identity);
-                }
-            }
-        }
-        inventory.reservations = logical.into_values().collect();
-        Ok(inventory)
-    }
-
-    fn read_legacy_content_reservation_inventory_unlocked(
-        &self,
-    ) -> Result<ContentStoreReservationInventory> {
-        let root = self.root.join(CONTENT_RESERVATION_DIR);
-        if !root.exists() {
-            return Ok(ContentStoreReservationInventory::default());
-        }
-        let mut reservations = Vec::new();
-        let sentinel_path = self.content_reservation_batch_sentinel_path();
-        let batch_root = self.content_reservation_batch_root();
-        let mut sentinel_present = false;
-        let mut shard_entries = read_dir(&root)?;
-        shard_entries.sort_by_key(|entry| entry.path());
-        for shard_entry in shard_entries {
-            let shard_path = shard_entry.path();
-            if !shard_path.is_dir() || shard_path == batch_root {
-                continue;
-            }
-            let mut entries = read_dir(&shard_path)?;
-            entries.sort_by_key(|entry| entry.path());
-            for entry in entries {
-                let path = entry.path();
-                if !path.is_file()
-                    || path.extension().and_then(|extension| extension.to_str()) != Some("sobj")
-                {
-                    continue;
-                }
-                if path == sentinel_path {
-                    let sentinel = decode_content_reservation_batch_sentinel(&read_file(&path)?)?;
-                    if sentinel.format_version != 1
-                        || sentinel.marker != CONTENT_RESERVATION_BATCH_SENTINEL_MARKER
-                    {
-                        validate_content_reservation_batch_sentinel(&sentinel)?;
-                    }
-                    sentinel_present = true;
-                    continue;
-                }
-                let reservation = decode_content_reservation(&read_file(&path)?)?;
-                validate_content_reservation(&reservation, &reservation.identity)?;
-                let expected_path = self.content_reservation_path(&reservation.identity);
-                if path != expected_path {
-                    return Err(ContentStoreError::InvalidContentLayout {
-                        message: format!(
-                            "content reservation path mismatch: expected={}, actual={}",
-                            expected_path.display(),
-                            path.display()
-                        ),
-                    });
-                }
-                reservations.push(ContentStoreReservationRecord {
-                    identity: reservation.identity,
-                    reserved_at_unix_nanos: reservation.reserved_at_unix_nanos,
-                    causal_stamp: reservation.causal_stamp,
-                });
-            }
-        }
-
-        let mut batches = Vec::new();
-        let mut batch_file_seen = false;
-        if batch_root.exists() {
-            let mut shard_entries = read_dir(&batch_root)?;
-            shard_entries.sort_by_key(|entry| entry.path());
-            for shard_entry in shard_entries {
-                let shard_path = shard_entry.path();
-                if !shard_path.is_dir() {
-                    continue;
-                }
-                let mut entries = read_dir(&shard_path)?;
-                entries.sort_by_key(|entry| entry.path());
-                for entry in entries {
-                    let path = entry.path();
-                    if !path.is_file()
-                        || path.extension().and_then(|extension| extension.to_str()) != Some("sobj")
-                    {
-                        continue;
-                    }
-                    batch_file_seen = true;
-                    let batch = decode_content_reservation_batch(&read_file(&path)?)?;
-                    validate_content_reservation_batch(&batch, None)?;
-                    let expected_path = self.content_reservation_batch_path(&batch.batch_id);
-                    if path != expected_path {
-                        return Err(ContentStoreError::InvalidContentLayout {
-                            message: format!(
-                                "content reservation batch path mismatch: expected={}, actual={}",
-                                expected_path.display(),
-                                path.display()
-                            ),
-                        });
-                    }
-                    reservations.extend(batch.reservations.iter().cloned());
-                    batches.push(LoadedContentStoreReservationBatch { path, batch });
-                }
-            }
-        }
-        if batch_file_seen && !sentinel_present {
-            return Err(ContentStoreError::InvalidContentLayout {
-                message: "content reservation batches exist without the downgrade-safety sentinel"
-                    .to_owned(),
-            });
-        }
-
-        let all_copies = reservations.clone();
-        let mut flattened: BTreeMap<
-            ContentStoreReservationIdentity,
-            ContentStoreReservationRecord,
-        > = BTreeMap::new();
-        for reservation in reservations {
-            flattened
-                .entry(reservation.identity.clone())
-                .and_modify(|existing| {
-                    // Wall-time and causal provenance are independent. A rollback
-                    // must not select an older epoch merely because its time is larger.
-                    existing.reserved_at_unix_nanos = existing
-                        .reserved_at_unix_nanos
-                        .max(reservation.reserved_at_unix_nanos);
-                    existing.causal_stamp =
-                        match (&existing.causal_stamp, &reservation.causal_stamp) {
-                            (Some(left), Some(right))
-                                if left.store_incarnation == right.store_incarnation =>
-                            {
-                                Some(ContentStoreCausalStamp {
-                                    store_incarnation: left.store_incarnation.clone(),
-                                    catalog_scan_epoch: left
-                                        .catalog_scan_epoch
-                                        .max(right.catalog_scan_epoch),
-                                })
-                            }
-                            _ => None,
-                        };
-                })
-                .or_insert(reservation);
-        }
-        Ok(ContentStoreReservationInventory {
-            reservations: flattened.into_values().collect(),
-            batches,
-            all_copies,
-        })
-    }
-
-    fn apply_content_reservation_resolutions_unlocked(
-        &self,
-        inventory: &ContentStoreReservationInventory,
-        resolved_identities: &BTreeSet<ContentStoreReservationIdentity>,
-    ) -> Result<()> {
-        if resolved_identities.is_empty() {
-            return Ok(());
-        }
-        // The durable control record suppresses legacy-copy resurrection after
-        // a crash between logical release and physical file/batch cleanup.
-        self.inline_release_reservations_unlocked(resolved_identities)?;
-        for identity in resolved_identities {
-            let path = self.content_reservation_path(identity);
-            let bytes = match read_file(&path) {
-                Ok(bytes) => bytes,
-                Err(ContentStoreError::Io { source, .. })
-                    if source.kind() == io::ErrorKind::NotFound =>
-                {
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
-            let reservation = decode_content_reservation(&bytes)?;
-            validate_content_reservation(&reservation, identity)?;
-            remove_file_if_exists_and_sync_parent(&path)?;
-        }
-
-        for loaded in &inventory.batches {
-            let retained = loaded
-                .batch
-                .reservations
-                .iter()
-                .filter(|reservation| !resolved_identities.contains(&reservation.identity))
-                .cloned()
-                .collect::<Vec<_>>();
-            if retained.len() == loaded.batch.reservations.len() {
-                continue;
-            }
-            if retained.is_empty() {
-                remove_file_if_exists_and_sync_parent(&loaded.path)?;
-                continue;
-            }
-            let batch = ContentStoreReservationBatch {
-                reservations: retained,
-                ..loaded.batch.clone()
-            };
-            validate_content_reservation_batch(&batch, Some(&batch.batch_id))?;
-            write_file_atomic(&loaded.path, &encode_content_reservation_batch(&batch)?)?;
-        }
-        Ok(())
+            .flat_map(|view| view.reservations.into_values())
+            .filter_map(|state| match state {
+                InlineReservationState::Live(record) => Some(record),
+                InlineReservationState::Released => None,
+            })
+            .collect::<Vec<_>>();
+        Ok(reservations)
     }
 
     fn read_content_reservation_reconciliation_cursor(
@@ -7264,14 +5934,6 @@ impl LocalContentStore {
             .join(format!("{hex}.sobj")))
     }
 
-    fn content_reservation_path(&self, identity: &ContentStoreReservationIdentity) -> PathBuf {
-        let digest = content_identity_digest(identity);
-        self.root
-            .join(CONTENT_RESERVATION_DIR)
-            .join(&digest[..2])
-            .join(format!("{digest}.sobj"))
-    }
-
     fn content_reservation_lock_path(&self) -> PathBuf {
         self.root
             .join(CONTENT_RESERVATION_DIR)
@@ -7283,18 +5945,6 @@ impl LocalContentStore {
             .join(CONTENT_RESERVATION_DIR)
             .join(CONTENT_RESERVATION_BATCH_SENTINEL_SHARD)
             .join(CONTENT_RESERVATION_BATCH_SENTINEL_FILE)
-    }
-
-    fn content_reservation_batch_root(&self) -> PathBuf {
-        self.root
-            .join(CONTENT_RESERVATION_DIR)
-            .join(CONTENT_RESERVATION_BATCH_SUBDIR)
-    }
-
-    fn content_reservation_batch_path(&self, batch_id: &str) -> PathBuf {
-        self.content_reservation_batch_root()
-            .join(&batch_id[..2])
-            .join(format!("{batch_id}.sobj"))
     }
 
     fn content_reservation_reconciliation_cursor_path(&self) -> PathBuf {
@@ -7324,15 +5974,6 @@ impl LocalContentStore {
             .join(object_id)
             .join(version)
             .join("manifest.sobj")
-    }
-
-    fn content_manifest_index_path(&self, object_id: &str, content_hash: &str) -> Result<PathBuf> {
-        let hex = hash_hex(content_hash)?;
-        Ok(self
-            .root
-            .join("objects")
-            .join(object_id)
-            .join(format!(".content-{hex}.sobj")))
     }
 
     fn hash_tree_path(&self, object_id: &str, version: &str) -> PathBuf {
@@ -7380,43 +6021,6 @@ fn encode_manifest(manifest: &ContentManifest) -> Result<Vec<u8>> {
         .map_err(|source| ContentStoreError::Serde(source.to_string()))
 }
 
-fn decode_manifest_for_path(bytes: &[u8], path: &Path) -> Result<ContentManifest> {
-    let manifest = decode_manifest(bytes)?;
-    let version = path
-        .parent()
-        .and_then(Path::file_name)
-        .and_then(|name| name.to_str());
-    let object = path
-        .parent()
-        .and_then(Path::parent)
-        .and_then(Path::file_name)
-        .and_then(|name| name.to_str());
-    if version != Some(manifest.version.as_str()) || object != Some(manifest.object_id.as_str()) {
-        return Err(ContentStoreError::InvalidContentLayout {
-            message: format!(
-                "manifest identity does not match its exact version path: {}",
-                path.display()
-            ),
-        });
-    }
-    Ok(manifest)
-}
-
-fn decode_manifest(bytes: &[u8]) -> Result<ContentManifest> {
-    sinomo_object_serde::from_bytes(bytes)
-        .map_err(|source| ContentStoreError::Serde(source.to_string()))
-}
-
-fn encode_content_reservation(reservation: &ContentStoreReservation) -> Result<Vec<u8>> {
-    sinomo_object_serde::to_bytes(reservation, 1, LengthMode::U32)
-        .map_err(|source| ContentStoreError::Serde(source.to_string()))
-}
-
-fn decode_content_reservation(bytes: &[u8]) -> Result<ContentStoreReservation> {
-    sinomo_object_serde::from_bytes(bytes)
-        .map_err(|source| ContentStoreError::Serde(source.to_string()))
-}
-
 fn encode_content_reservation_batch_sentinel(
     sentinel: &ContentStoreReservationBatchSentinel,
 ) -> Result<Vec<u8>> {
@@ -7427,16 +6031,6 @@ fn encode_content_reservation_batch_sentinel(
 fn decode_content_reservation_batch_sentinel(
     bytes: &[u8],
 ) -> Result<ContentStoreReservationBatchSentinel> {
-    sinomo_object_serde::from_bytes(bytes)
-        .map_err(|source| ContentStoreError::Serde(source.to_string()))
-}
-
-fn encode_content_reservation_batch(batch: &ContentStoreReservationBatch) -> Result<Vec<u8>> {
-    sinomo_object_serde::to_bytes(batch, 1, LengthMode::U32)
-        .map_err(|source| ContentStoreError::Serde(source.to_string()))
-}
-
-fn decode_content_reservation_batch(bytes: &[u8]) -> Result<ContentStoreReservationBatch> {
     sinomo_object_serde::from_bytes(bytes)
         .map_err(|source| ContentStoreError::Serde(source.to_string()))
 }
@@ -7485,62 +6079,12 @@ fn validate_content_causal_stamp(stamp: &ContentStoreCausalStamp) -> Result<()> 
     Ok(())
 }
 
-fn validate_content_reservation_stamp(
-    format_version: u32,
-    stamp: Option<&ContentStoreCausalStamp>,
-) -> Result<()> {
-    match (format_version, stamp) {
-        (1, None) => Ok(()),
-        (CONTENT_RESERVATION_FORMAT_VERSION, Some(stamp)) => validate_content_causal_stamp(stamp),
-        _ => Err(ContentStoreError::InvalidContentLayout {
-            message: "content reservation has incompatible causal provenance".to_owned(),
-        }),
-    }
-}
-
-fn validate_content_reservation(
-    reservation: &ContentStoreReservation,
-    expected: &ContentStoreReservationIdentity,
-) -> Result<()> {
-    if !matches!(
-        reservation.format_version,
-        1 | CONTENT_RESERVATION_FORMAT_VERSION
-    ) {
-        return Err(ContentStoreError::InvalidContentLayout {
-            message: format!(
-                "unsupported content reservation format version {}",
-                reservation.format_version
-            ),
-        });
-    }
-    validate_content_reservation_stamp(
-        reservation.format_version,
-        reservation.causal_stamp.as_ref(),
-    )?;
-    if reservation.reserved_at_unix_nanos == 0 {
-        return Err(ContentStoreError::InvalidContentLayout {
-            message: "content reservation has an invalid zero reservation timestamp".to_owned(),
-        });
-    }
-    hash_hex(&reservation.identity.content_hash)?;
-    if &reservation.identity != expected {
-        return Err(ContentStoreError::InvalidContentLayout {
-            message: format!(
-                "content reservation identity mismatch: expected={expected:?}, actual={:?}",
-                reservation.identity
-            ),
-        });
-    }
-    Ok(())
-}
-
 fn validate_content_reservation_batch_sentinel(
     sentinel: &ContentStoreReservationBatchSentinel,
 ) -> Result<()> {
     if sentinel.format_version != CONTENT_RESERVATION_BATCH_SENTINEL_FORMAT_VERSION
         || sentinel.marker != CONTENT_RESERVATION_BATCH_SENTINEL_MARKER
-        || (sentinel.content_binding_layout != CONTENT_BINDING_LAYOUT
-            && sentinel.content_binding_layout != inline_bindings::INLINE_BINDING_LAYOUT)
+        || sentinel.content_binding_layout != CONTENT_BINDING_LAYOUT
         || sentinel
             .store_incarnation
             .parse::<sinomo_core::Id>()
@@ -7556,110 +6100,6 @@ fn validate_content_reservation_batch_sentinel(
     Ok(())
 }
 
-fn validate_content_reservation_batch(
-    batch: &ContentStoreReservationBatch,
-    expected_batch_id: Option<&str>,
-) -> Result<()> {
-    if !matches!(
-        batch.format_version,
-        1 | CONTENT_RESERVATION_BATCH_FORMAT_VERSION
-    ) {
-        return Err(ContentStoreError::InvalidContentLayout {
-            message: format!(
-                "unsupported content reservation batch format version {}",
-                batch.format_version
-            ),
-        });
-    }
-    if !valid_content_identity_digest(&batch.batch_id) {
-        return Err(ContentStoreError::InvalidContentLayout {
-            message: format!(
-                "content reservation batch has an invalid batch id: {}",
-                batch.batch_id
-            ),
-        });
-    }
-    if let Some(expected_batch_id) = expected_batch_id
-        && batch.batch_id != expected_batch_id
-    {
-        return Err(ContentStoreError::InvalidContentLayout {
-            message: format!(
-                "content reservation batch id mismatch: expected={expected_batch_id}, actual={}",
-                batch.batch_id
-            ),
-        });
-    }
-    if batch.original_identity_digests.is_empty()
-        || batch.original_identity_digests.len() > CONTENT_RESERVATION_BATCH_MAX_IDENTITIES
-        || !batch
-            .original_identity_digests
-            .iter()
-            .all(|digest| valid_content_identity_digest(digest))
-        || !batch
-            .original_identity_digests
-            .windows(2)
-            .all(|pair| pair[0] < pair[1])
-    {
-        return Err(ContentStoreError::InvalidContentLayout {
-            message: "content reservation batch has invalid immutable identity digests".to_owned(),
-        });
-    }
-    let computed_batch_id = content_reservation_batch_id(&batch.original_identity_digests);
-    if batch.batch_id != computed_batch_id {
-        return Err(ContentStoreError::InvalidContentLayout {
-            message: format!(
-                "content reservation batch id does not match immutable membership: expected={computed_batch_id}, actual={}",
-                batch.batch_id
-            ),
-        });
-    }
-    if batch.reservations.is_empty()
-        || batch.reservations.len() > batch.original_identity_digests.len()
-        || !batch
-            .reservations
-            .windows(2)
-            .all(|pair| pair[0].identity < pair[1].identity)
-    {
-        return Err(ContentStoreError::InvalidContentLayout {
-            message: "content reservation batch has invalid retained reservations".to_owned(),
-        });
-    }
-    for reservation in &batch.reservations {
-        validate_content_reservation_stamp(
-            batch.format_version,
-            reservation.causal_stamp.as_ref(),
-        )?;
-        if reservation.reserved_at_unix_nanos == 0 {
-            return Err(ContentStoreError::InvalidContentLayout {
-                message: "content reservation batch has an invalid zero reservation timestamp"
-                    .to_owned(),
-            });
-        }
-        hash_hex(&reservation.identity.content_hash)?;
-        let digest = content_identity_digest(&reservation.identity);
-        if batch
-            .original_identity_digests
-            .binary_search(&digest)
-            .is_err()
-        {
-            return Err(ContentStoreError::InvalidContentLayout {
-                message: format!(
-                    "retained content reservation is not a member of batch {}: identity={:?}",
-                    batch.batch_id, reservation.identity
-                ),
-            });
-        }
-    }
-    Ok(())
-}
-
-fn valid_content_identity_digest(digest: &str) -> bool {
-    digest.len() == BLAKE3_HEX_LEN
-        && digest
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-}
-
 fn content_identity_digest(identity: &ContentStoreReservationIdentity) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"sinomo-content-identity-v1");
@@ -7670,16 +6110,6 @@ fn content_identity_digest(identity: &ContentStoreReservationIdentity) -> String
     ] {
         hasher.update(&(field.len() as u64).to_le_bytes());
         hasher.update(field);
-    }
-    hasher.finalize().to_hex().to_string()
-}
-
-fn content_reservation_batch_id(original_identity_digests: &[String]) -> String {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"sinomo-content-reservation-batch-v1");
-    hasher.update(&(original_identity_digests.len() as u64).to_le_bytes());
-    for digest in original_identity_digests {
-        hasher.update(digest.as_bytes());
     }
     hasher.finalize().to_hex().to_string()
 }
@@ -8177,10 +6607,21 @@ fn capture_limit_includes_size(limit_bytes: usize, size_bytes: u64) -> bool {
     limit_bytes > 0 && size_bytes <= u64::try_from(limit_bytes).unwrap_or(u64::MAX)
 }
 
-fn publish_file_as_blob(source_path: &Path, blob_path: &Path, expected_hash: &str) -> Result<()> {
+/// Materialize only the selected loose bucket under the existing content owner.
+/// Synchronize its name before file publication, including a retry after an
+/// earlier directory synchronization failed.
+fn ensure_loose_blob_parent(blob_path: &Path) -> Result<()> {
     if let Some(parent) = blob_path.parent() {
         create_dir_all(parent.to_owned())?;
+        if let Some(blobs_root) = parent.parent() {
+            sync_dir(blobs_root)?;
+        }
     }
+    Ok(())
+}
+
+fn publish_file_as_blob(source_path: &Path, blob_path: &Path, expected_hash: &str) -> Result<()> {
+    ensure_loose_blob_parent(blob_path)?;
     if blob_path.exists() {
         if file_content_hash(blob_path).is_ok_and(|actual| actual == expected_hash) {
             return Ok(());
@@ -8269,38 +6710,14 @@ fn write_content_addressed_blob_bytes_prehashed(
     Ok(())
 }
 
-fn write_content_addressed_blob_bytes_prehashed_existing_parent(
-    hash: &str,
-    blob_path: &Path,
-    bytes: &[u8],
-) -> Result<()> {
-    if let Some(parent) = write_content_addressed_blob_bytes_prehashed_defer_dir_sync_inner(
-        hash, blob_path, bytes, false,
-    )? {
-        sync_dir(&parent)?;
-    }
-    Ok(())
-}
-
 fn write_content_addressed_blob_bytes_prehashed_defer_dir_sync(
     hash: &str,
     blob_path: &Path,
     bytes: &[u8],
 ) -> Result<Option<PathBuf>> {
-    write_content_addressed_blob_bytes_prehashed_defer_dir_sync_inner(hash, blob_path, bytes, true)
-}
-
-fn write_content_addressed_blob_bytes_prehashed_defer_dir_sync_inner(
-    hash: &str,
-    blob_path: &Path,
-    bytes: &[u8],
-    ensure_parent: bool,
-) -> Result<Option<PathBuf>> {
     let trace_started = Instant::now();
     let create_dir_started = Instant::now();
-    if ensure_parent && let Some(parent) = blob_path.parent() {
-        create_dir_all(parent.to_owned())?;
-    }
+    ensure_loose_blob_parent(blob_path)?;
     let create_dir_ms = create_dir_started.elapsed().as_millis();
     let existing_check_started = Instant::now();
     if blob_path.is_file() {
@@ -8752,11 +7169,11 @@ mod tests {
         assert!(!store.has_blob(&hash).unwrap());
         assert!(store.read_manifest("changed-object", "v1").is_err());
         assert!(!path.exists());
-        // Reservation precedes publication and remains conservative when the
-        // following blob publication fails; normal reconciliation owns it.
+        // The bounded inline producer validates the synced private capability
+        // before reserving a version. Rejected mutation owns no reservation.
         assert_eq!(
             store.content_reservation_roots().unwrap().reservation_count,
-            1
+            0
         );
         cleanup(&root);
     }
@@ -8803,15 +7220,11 @@ mod tests {
     }
 
     #[test]
-    fn batch_sentinel_rejects_legacy_decoder_and_blocks_destructive_gc_when_malformed() {
+    fn current_sentinel_blocks_destructive_gc_when_malformed() {
         let root = temp_root("content_reservation_batch_sentinel");
         let store = LocalContentStore::new(&root).expect("create store");
         let sentinel_path = store.content_reservation_batch_sentinel_path();
         let sentinel_bytes = read_file(&sentinel_path).expect("read sentinel");
-        assert!(
-            decode_content_reservation(&sentinel_bytes).is_err(),
-            "the legacy single-reservation decoder must fail closed on the sentinel"
-        );
 
         let manifests = store
             .put_object_versions([
@@ -8883,7 +7296,7 @@ mod tests {
                     .with_catalog_observation("sentinel-orphan-catalog-2", u64::MAX),
             )
             .expect_err("orphan GC must fail before deleting with a malformed sentinel");
-        assert!(store.manifest_path("sentinel-object", "v1").is_file());
+        assert!(store.root.join("inline-bindings/current.sobj").is_file());
         store
             .has_blob(&blob_only.content_hash)
             .expect_err("blob reads must fail closed while the mandatory layout gate is malformed");
@@ -8912,113 +7325,57 @@ mod tests {
     }
 
     #[test]
-    fn inspection_open_is_non_creating_and_reads_sentinel_less_legacy_records() {
-        let root = temp_root("content_reservation_inspection");
-        let missing = root.join("missing-content-root");
-        let missing_inspection = LocalContentStore::open_for_inspection(&missing);
+    fn inspection_open_is_non_creating_and_rejects_unconverted_records() {
+        let root = temp_root("content-reservation-inspection");
+        let missing = root.join("missing");
+        let inspected = LocalContentStore::open_for_inspection(&missing);
         assert_eq!(
-            missing_inspection
+            inspected
                 .content_reservation_roots()
-                .expect("inspect missing root")
+                .unwrap()
                 .reservation_count,
             0
         );
+        assert!(!missing.exists());
+        let old = root.join("old");
+        fs::create_dir_all(old.join("objects/object/v1")).unwrap();
+        fs::write(old.join("objects/object/v1/manifest.sobj"), b"obsolete").unwrap();
+        assert!(LocalContentStore::new(&old).is_err());
         assert!(
-            !missing.exists(),
-            "inspection of a missing content root must not create it"
+            LocalContentStore::open_for_inspection(&old)
+                .read_manifest("object", "v1")
+                .is_err()
         );
-
-        let legacy_root = root.join("legacy-content-root");
-        fs::create_dir_all(&legacy_root).expect("create legacy fixture root");
-        let legacy = LocalContentStore::open_for_inspection(&legacy_root);
-        let identity = ContentStoreReservationIdentity {
-            object_id: "legacy-object".to_owned(),
-            version: "v1".to_owned(),
-            content_hash: content_hash(b"legacy content"),
-        };
-        let reservation = ContentStoreReservation {
-            format_version: 1,
-            identity: identity.clone(),
-            reserved_at_unix_nanos: 1,
-            causal_stamp: None,
-        };
-        write_file_create_new_atomic(
-            &legacy.content_reservation_path(&identity),
-            &encode_content_reservation(&reservation).expect("encode legacy reservation"),
-        )
-        .expect("write legacy reservation fixture");
-
-        let roots = legacy
-            .content_reservation_roots()
-            .expect("read sentinel-less legacy reservation");
-        assert_eq!(roots.reservation_count, 1);
-        assert_eq!(
-            roots.reservations[0],
-            ContentStoreReservationRecord {
-                identity,
-                reserved_at_unix_nanos: 1,
-                causal_stamp: None,
-            }
-        );
-        assert!(!legacy.content_reservation_lock_path().exists());
-        assert!(!legacy.content_reservation_batch_sentinel_path().exists());
-        cleanup(&root);
+        assert!(!old.join("inline-bindings").exists());
     }
 
     #[test]
-    fn causal_catalog_cut_survives_restart_and_clock_rollback_with_duplicate_records() {
-        let root = temp_root("causal_cut_duplicate_clock_rollback");
+    fn causal_catalog_cut_survives_restart_and_monotonic_renewal() {
+        let root = temp_root("causal-cut-restart");
         let store = LocalContentStore::new(&root).unwrap();
-        let identity = ContentStoreReservationIdentity {
-            object_id: "causal-duplicate".into(),
-            version: "v1".into(),
-            content_hash: content_hash(b"bytes"),
-        };
+        let hash = content_hash(b"bytes");
         store
-            .ensure_content_reservation(
-                &identity.object_id,
-                &identity.version,
-                &identity.content_hash,
-            )
+            .ensure_content_reservation("object", "v1", &hash)
             .unwrap();
-        let single_path = store.content_reservation_path(&identity);
-        let mut single = decode_content_reservation(&read_file(&single_path).unwrap()).unwrap();
-        single.reserved_at_unix_nanos = 100;
-        write_file_atomic(&single_path, &encode_content_reservation(&single).unwrap()).unwrap();
+        let first = store.content_reservation_roots().unwrap().reservations[0].clone();
         let cut = store.begin_content_root_catalog_scan_at(200).unwrap();
-        // A second process renews via a batch after the cut, while its wall clock
-        // has rolled back. Both physical representations remain on disk.
         let other = LocalContentStore::new(&root).unwrap();
         other
-            .ensure_content_reservations_batch(std::slice::from_ref(&identity))
+            .ensure_content_reservation("object", "v1", &hash)
             .unwrap();
-        let inventory = other.read_content_reservation_inventory_unlocked().unwrap();
-        let loaded = &inventory.batches[0];
-        let mut batch = loaded.batch.clone();
-        batch.reservations[0].reserved_at_unix_nanos = 50;
-        write_file_atomic(
-            &loaded.path,
-            &encode_content_reservation_batch(&batch).unwrap(),
-        )
-        .unwrap();
         drop(other);
         drop(store);
         let reopened = LocalContentStore::new(&root).unwrap();
-        let roots = reopened.content_reservation_roots().unwrap();
-        assert_eq!(roots.reservations[0].reserved_at_unix_nanos, 100);
-        assert_eq!(
-            roots.reservations[0].causal_stamp.as_ref(),
-            Some(&cut.stamp)
-        );
-        let options =
-            ContentStoreReservationReconciliationOptions::bounded(300, Duration::ZERO, 10)
-                .with_catalog_generation("delayed-cut")
-                .with_catalog_scan_cut(Some(cut));
+        let record = reopened.content_reservation_roots().unwrap().reservations[0].clone();
+        assert!(record.reserved_at_unix_nanos >= first.reserved_at_unix_nanos);
+        assert_eq!(record.causal_stamp, cut.stamp);
         let report = reopened
             .reconcile_content_reservations_with_catalog(
                 &BTreeSet::new(),
                 &BTreeSet::new(),
-                options,
+                ContentStoreReservationReconciliationOptions::bounded(u64::MAX, Duration::ZERO, 10)
+                    .with_catalog_generation("delayed-cut")
+                    .with_catalog_scan_cut(Some(cut)),
             )
             .unwrap();
         assert_eq!(report.released_rejected_count, 0);
@@ -9029,19 +7386,19 @@ mod tests {
                 .reservation_count,
             1
         );
-        let later_cut = reopened.begin_content_root_catalog_scan_at(400).unwrap();
+        let later = reopened
+            .begin_content_root_catalog_scan_at(u64::MAX)
+            .unwrap();
         let report = reopened
             .reconcile_content_reservations_with_catalog(
                 &BTreeSet::new(),
                 &BTreeSet::new(),
-                ContentStoreReservationReconciliationOptions::bounded(400, Duration::ZERO, 10)
+                ContentStoreReservationReconciliationOptions::bounded(u64::MAX, Duration::ZERO, 10)
                     .with_catalog_generation("later-cut")
-                    .with_catalog_scan_cut(Some(later_cut)),
+                    .with_catalog_scan_cut(Some(later)),
             )
             .unwrap();
         assert_eq!(report.released_rejected_count, 1);
-        assert!(!single_path.exists());
-        assert!(!loaded.path.exists());
         assert_eq!(
             reopened
                 .content_reservation_roots()
@@ -9049,80 +7406,43 @@ mod tests {
                 .reservation_count,
             0
         );
-        cleanup(&root);
+        assert_eq!(refreshed_reservation_timestamp(Some(u64::MAX)), u64::MAX);
     }
 
     #[test]
-    fn causal_catalog_cut_legacy_and_foreign_duplicates_require_positive_coverage() {
-        for legacy in [true, false] {
-            let root = temp_root(if legacy {
-                "causal_legacy_copy"
-            } else {
-                "causal_foreign_copy"
-            });
-            let store = LocalContentStore::new(&root).unwrap();
-            let identity = ContentStoreReservationIdentity {
-                object_id: "mixed-copy".into(),
-                version: "v1".into(),
-                content_hash: content_hash(b"mixed"),
-            };
+    fn causal_catalog_rejects_missing_and_foreign_reservation_provenance() {
+        let root = temp_root("causal-invalid-provenance");
+        let store = LocalContentStore::new(&root).unwrap();
+        let hash = content_hash(b"bytes");
+        store
+            .ensure_content_reservation("object", "v1", &hash)
+            .unwrap();
+        let original = store.content_reservation_roots().unwrap();
+        let mut missing = serde_json::to_value(&original.reservations[0]).unwrap();
+        missing.as_object_mut().unwrap().remove("causal_stamp");
+        assert!(
+            serde_json::from_value::<ContentStoreReservationRecord>(missing).is_err(),
+            "old missing-stamp data must go through migration"
+        );
+        let mut record = original.reservations[0].clone();
+        record.causal_stamp = ContentStoreCausalStamp {
+            store_incarnation: sinomo_core::Id::generate().to_string(),
+            catalog_scan_epoch: 0,
+        };
+        let _owner = store.content_mutation_guard().unwrap();
+        let reservation = store.lock_content_reservations_for_write().unwrap();
+        assert!(
             store
-                .ensure_content_reservation(
-                    &identity.object_id,
-                    &identity.version,
-                    &identity.content_hash,
-                )
-                .unwrap();
-            store
-                .ensure_content_reservations_batch(std::slice::from_ref(&identity))
-                .unwrap();
-            let path = store.content_reservation_path(&identity);
-            let mut single = decode_content_reservation(&read_file(&path).unwrap()).unwrap();
-            if legacy {
-                single.format_version = 1;
-                single.causal_stamp = None;
-            } else {
-                single.causal_stamp.as_mut().unwrap().store_incarnation =
-                    sinomo_core::Id::generate().to_string();
-            }
-            single.reserved_at_unix_nanos = 1;
-            write_file_atomic(&path, &encode_content_reservation(&single).unwrap()).unwrap();
-            let cut = store.begin_content_root_catalog_scan_at(u64::MAX).unwrap();
-            assert!(
-                store.content_reservation_roots().unwrap().reservations[0]
-                    .causal_stamp
-                    .is_none()
-            );
-            let options =
-                ContentStoreReservationReconciliationOptions::bounded(u64::MAX, Duration::ZERO, 10)
-                    .with_catalog_generation("mixed-cut")
-                    .with_catalog_scan_cut(Some(cut));
-            let report = store
-                .reconcile_content_reservations_with_catalog(
-                    &BTreeSet::new(),
-                    &BTreeSet::new(),
-                    options.clone(),
-                )
-                .unwrap();
-            assert_eq!(report.released_rejected_count, 0);
-            let report = store
-                .reconcile_content_reservations_with_catalog(
-                    &BTreeSet::from([(identity.object_id, identity.version)]),
-                    &BTreeSet::new(),
-                    options,
-                )
-                .unwrap();
-            assert_eq!(report.released_catalog_covered_count, 1);
-            assert_eq!(
-                store.content_reservation_roots().unwrap().reservation_count,
-                0
-            );
-            cleanup(&root);
-        }
+                .inline_reserve_owned_identity_unlocked(&record, &reservation.sentinel)
+                .is_err()
+        );
+        drop(reservation);
+        drop(_owner);
+        assert_eq!(store.content_reservation_roots().unwrap(), original);
     }
 
     #[test]
-    fn causal_catalog_cut_is_store_scoped_and_legacy_catalogs_only_release_coverage() {
+    fn causal_catalog_cut_is_store_scoped_and_unsealed_catalogs_only_release_coverage() {
         let root = temp_root("causal_cut_store_scope");
         let store = LocalContentStore::new(root.join("one")).unwrap();
         let other = LocalContentStore::new(root.join("two")).unwrap();
@@ -9135,7 +7455,7 @@ mod tests {
         ] {
             let options =
                 ContentStoreReservationReconciliationOptions::bounded(u64::MAX, Duration::ZERO, 10)
-                    .with_catalog_generation("foreign-or-legacy")
+                    .with_catalog_generation("foreign-or-unsealed")
                     .with_catalog_scan_cut(cut);
             let report = store
                 .reconcile_content_reservations_with_catalog(
@@ -9151,7 +7471,7 @@ mod tests {
                 &BTreeSet::from([("object".into(), "v1".into())]),
                 &BTreeSet::new(),
                 ContentStoreReservationReconciliationOptions::bounded(0, Duration::ZERO, 10)
-                    .with_catalog_generation("legacy-covered"),
+                    .with_catalog_generation("unsealed-covered"),
             )
             .unwrap();
         assert_eq!(report.released_catalog_covered_count, 1);
@@ -9159,39 +7479,33 @@ mod tests {
     }
 
     #[test]
-    fn causal_catalog_sentinel_upgrade_revalidates_initialized_handles_and_epoch_overflow() {
-        let root = temp_root("causal_sentinel_upgrade");
+    fn causal_catalog_revalidates_layout_and_rejects_epoch_overflow() {
+        let root = temp_root("causal-sentinel-gate");
         let store = LocalContentStore::new(&root).unwrap();
         let path = store.content_reservation_batch_sentinel_path();
-        let mut sentinel =
+        let original =
             decode_content_reservation_batch_sentinel(&read_file(&path).unwrap()).unwrap();
+        let mut sentinel = original.clone();
         sentinel.format_version = 1;
-        sentinel.store_incarnation.clear();
-        sentinel.catalog_scan_epoch = 0;
-        sentinel.content_binding_layout.clear();
         write_file_atomic(
             &path,
             &encode_content_reservation_batch_sentinel(&sentinel).unwrap(),
         )
         .unwrap();
-        // Even an initialized handle rereads the sentinel after acquiring flock.
         assert!(
             store
                 .ensure_content_reservation("object", "v1", &content_hash(b"root"))
                 .is_err()
         );
-        let upgraded = LocalContentStore::new(&root).unwrap();
-        let mut sentinel =
-            decode_content_reservation_batch_sentinel(&read_file(&path).unwrap()).unwrap();
-        assert_eq!(sentinel.format_version, 2);
-        assert_eq!(sentinel.content_binding_layout, CONTENT_BINDING_LAYOUT);
+        assert!(LocalContentStore::new(&root).is_err());
+        sentinel = original;
         sentinel.catalog_scan_epoch = u64::MAX;
         write_file_atomic(
             &path,
             &encode_content_reservation_batch_sentinel(&sentinel).unwrap(),
         )
         .unwrap();
-        assert!(upgraded.begin_content_root_catalog_scan_at(1).is_err());
+        assert!(store.begin_content_root_catalog_scan_at(1).is_err());
         assert_eq!(
             decode_content_reservation_batch_sentinel(&read_file(&path).unwrap()).unwrap(),
             sentinel
@@ -9203,84 +7517,61 @@ mod tests {
         )
         .unwrap();
         assert!(
-            upgraded
+            store
                 .ensure_content_reservation("object", "v1", &content_hash(b"root"))
                 .is_err()
         );
         assert!(LocalContentStore::new(&root).is_err());
-        cleanup(&root);
     }
 
     #[test]
-    fn batch_reconciliation_preserves_immutable_membership_then_deletes() {
-        let root = temp_root("content_reservation_batch_membership");
-        let store = LocalContentStore::new(&root).expect("create store");
+    fn bounded_reconciliation_preserves_unprocessed_roots_then_releases() {
+        let root = temp_root("bounded-reservation-membership");
+        let store = LocalContentStore::new(&root).unwrap();
         store
             .put_object_version_blobs_only([
-                ("a-covered", "v1", b"covered-a".as_slice()),
-                ("b-covered", "v1", b"covered-b".as_slice()),
-                ("c-rejected", "v1", b"rejected-c".as_slice()),
+                ("a-covered", "v1", b"a".as_slice()),
+                ("b-covered", "v1", b"b".as_slice()),
+                ("c-rejected", "v1", b"c".as_slice()),
             ])
-            .expect("publish reservation batch");
-        let roots = store.content_reservation_roots().expect("read roots");
-        let original_identity_digests = roots
-            .reservations
-            .iter()
-            .map(|reservation| content_identity_digest(&reservation.identity))
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let batch_id = content_reservation_batch_id(&original_identity_digests);
-        let batch_path = store.content_reservation_batch_path(&batch_id);
-        let catalog_time = roots
-            .reservations
-            .iter()
-            .map(|reservation| reservation.reserved_at_unix_nanos)
-            .max()
-            .expect("reservation time");
+            .unwrap();
         let covered = BTreeSet::from([
-            ("a-covered".to_owned(), "v1".to_owned()),
-            ("b-covered".to_owned(), "v1".to_owned()),
+            ("a-covered".into(), "v1".into()),
+            ("b-covered".into(), "v1".into()),
         ]);
-
+        let cut = store.begin_content_root_catalog_scan().unwrap();
         let partial = store
             .reconcile_content_reservations_with_catalog(
                 &covered,
                 &BTreeSet::new(),
                 ContentStoreReservationReconciliationOptions::bounded(
-                    catalog_time,
+                    u64::MAX,
                     Duration::from_secs(60),
                     2,
                 )
-                .with_catalog_generation("membership-catalog")
-                .with_catalog_scan_cut(Some(store.begin_content_root_catalog_scan().unwrap())),
+                .with_catalog_generation("membership")
+                .with_catalog_scan_cut(Some(cut)),
             )
-            .expect("partially reconcile batch");
+            .unwrap();
         assert_eq!(partial.released_catalog_covered_count, 2);
-        let rewritten = decode_content_reservation_batch(
-            &read_file(&batch_path).expect("read rewritten batch"),
-        )
-        .expect("decode rewritten batch");
-        assert_eq!(
-            rewritten.original_identity_digests,
-            original_identity_digests
-        );
-        assert_eq!(rewritten.reservations.len(), 1);
-        validate_content_reservation_batch(&rewritten, Some(&batch_id))
-            .expect("validate retained membership");
-
+        let roots = store.content_reservation_roots().unwrap();
+        assert_eq!(roots.reservation_count, 1);
+        assert_eq!(roots.reservations[0].identity.object_id, "c-rejected");
+        let cut = store.begin_content_root_catalog_scan().unwrap();
         let full = store
             .reconcile_content_reservations_with_catalog(
                 &covered,
                 &BTreeSet::new(),
                 ContentStoreReservationReconciliationOptions::bounded(u64::MAX, Duration::ZERO, 2)
-                    .with_catalog_generation("membership-catalog")
-                    .with_catalog_scan_cut(Some(store.begin_content_root_catalog_scan().unwrap())),
+                    .with_catalog_generation("membership")
+                    .with_catalog_scan_cut(Some(cut)),
             )
-            .expect("release remaining reservation");
+            .unwrap();
         assert_eq!(full.released_rejected_count, 1);
-        assert!(!batch_path.exists());
-        cleanup(&root);
+        assert_eq!(
+            store.content_reservation_roots().unwrap().reservation_count,
+            0
+        );
     }
 
     #[test]
@@ -9319,11 +7610,6 @@ mod tests {
                 .iter()
                 .all(|reservation| reservation.reserved_at_unix_nanos >= stale_catalog_time)
         );
-        assert!(refreshed.reservations.iter().all(|reservation| {
-            !store
-                .content_reservation_path(&reservation.identity)
-                .exists()
-        }));
 
         let stale = store
             .reconcile_content_reservations_with_catalog(
@@ -10166,7 +8452,7 @@ mod tests {
     fn manifest_storage_candidate_probe_does_not_hash_payload_bytes() {
         let root = temp_root("manifest_storage_candidate_non_hashing");
         let store = LocalContentStore::new(&root).expect("create store");
-        let bytes = vec![0x2a; PACKED_BLOB_SMALL_LIMIT_BYTES as usize + 1];
+        let bytes = vec![0x2a; INLINE_BLOB_SMALL_LIMIT_BYTES as usize + 1];
         let manifest = store
             .put_object_version("object-candidate", "v1", &bytes)
             .expect("put object version");
@@ -10371,11 +8657,11 @@ mod tests {
         );
         assert!(
             store
-                .read_packed_blob_index_unlocked()
-                .expect("read packed index")
-                .entries
-                .is_empty(),
-            "canonical empty content must not occupy packed blob storage"
+                .inline_binding_view()
+                .unwrap()
+                .unwrap()
+                .blobs
+                .is_empty()
         );
         let roots = store
             .content_reservation_roots()
@@ -10388,8 +8674,8 @@ mod tests {
     }
 
     #[test]
-    fn put_object_version_blobs_only_deduplicates_same_batch_packed_hash() {
-        let root = temp_root("put_object_version_blobs_only_deduplicates_same_batch_packed_hash");
+    fn put_object_version_blobs_only_deduplicates_same_batch_inline_hash() {
+        let root = temp_root("put_object_version_blobs_only_deduplicates_same_batch_inline_hash");
         let store = LocalContentStore::new(&root).expect("create store");
 
         let bytes = b"same packed blob bytes";
@@ -10408,13 +8694,9 @@ mod tests {
                 .expect("read packed duplicate blob"),
             bytes
         );
-        let index = store
-            .read_packed_blob_index_unlocked()
-            .expect("read packed index");
-        assert_eq!(index.entries.len(), 1);
-        let stats = store.stats().expect("stats");
-        assert_eq!(stats.blob_count, 1);
-        assert_eq!(stats.blob_bytes, bytes.len() as u64);
+        let view = store.inline_binding_view().unwrap().unwrap();
+        assert_eq!(view.blobs.len(), 1);
+        assert_eq!(store.stats().unwrap().blob_count, 1);
 
         cleanup(&root);
     }
@@ -10464,7 +8746,18 @@ mod tests {
     fn put_object_version_blob_only_large_blob_skips_manifest() {
         let root = temp_root("put_object_version_blob_only_large_blob_skips_manifest");
         let store = LocalContentStore::new(&root).expect("create store");
-        let bytes = vec![0x73; PACKED_BLOB_SMALL_LIMIT_BYTES as usize + 4096];
+        let bytes = vec![0x73; INLINE_BLOB_SMALL_LIMIT_BYTES as usize + 4096];
+        let expected_hash = content_hash(&bytes);
+        let bucket = store
+            .blob_path(&expected_hash)
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_owned();
+        assert!(
+            !bucket.exists(),
+            "new content root has not published this hash bucket"
+        );
 
         let manifest = store
             .put_object_version_blob_only("object-blob-only-durable-large", "v1", &bytes)
@@ -10483,6 +8776,11 @@ mod tests {
             "durable blob-only large writes should not create per-object manifests"
         );
 
+        assert!(bucket.is_dir());
+        drop(store);
+        let reopened = LocalContentStore::new(&root).expect("reopen actual current content root");
+        assert_eq!(reopened.read_blob(&expected_hash).unwrap(), bytes);
+        drop(reopened);
         cleanup(&root);
     }
 
@@ -10597,8 +8895,10 @@ mod tests {
     fn open_blob_reader_streams_without_rehashing_bytes() {
         let root = temp_root("open_blob_reader_validates_hash_and_streams_bytes");
         let store = LocalContentStore::new(&root).expect("create store");
+        let original = vec![b'a'; INLINE_BLOB_SMALL_LIMIT_BYTES as usize + 1];
+        let corrupt = vec![b'b'; original.len()];
         let manifest = store
-            .put_object_version("object-reader", "v1", b"streamed reader bytes")
+            .put_object_version("object-reader", "v1", &original)
             .expect("put object version");
 
         let mut reader = store
@@ -10607,16 +8907,17 @@ mod tests {
         assert_eq!(reader.size_bytes(), manifest.size_bytes);
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes).expect("read blob reader");
-        assert_eq!(bytes, b"streamed reader bytes");
+        assert_eq!(bytes, original);
 
         let blob_path = store.blob_path(&manifest.content_hash).expect("blob path");
-        write_file_atomic(&blob_path, b"corrupt reader bytes").expect("corrupt blob");
+        assert!(blob_path.is_file(), "normal producer selected a loose blob");
+        write_file_atomic(&blob_path, &corrupt).expect("corrupt blob");
         let mut reader = store
             .open_blob_reader(&manifest.content_hash)
             .expect("read without rehashing");
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes).expect("read bytes");
-        assert_eq!(bytes, b"corrupt reader bytes");
+        assert_eq!(bytes, corrupt);
         assert!(
             store
                 .scrub()
@@ -10656,11 +8957,11 @@ mod tests {
     }
 
     #[test]
-    fn read_missing_blob_does_not_create_packed_blob_lock() {
-        let root = temp_root("read_missing_blob_does_not_create_packed_blob_lock");
+    fn read_missing_blob_does_not_create_storage() {
+        let root = temp_root("read-missing-blob");
         let store = LocalContentStore::new(&root).expect("create store");
         let missing_hash = content_hash(b"missing read-only packed blob lookup");
-        let lock_path = root.join(PACKED_BLOB_DIR).join(PACKED_BLOB_LOCK_FILE);
+        let lock_path = root.join("blob-packs/pack.lock");
 
         assert!(!store.has_blob(&missing_hash).expect("missing blob check"));
         assert!(
@@ -10726,8 +9027,8 @@ mod tests {
             .expect("put extent-backed version");
         assert!(patched.extents.len() >= 3);
 
-        let manifest_reads_before = store
-            .stream_manifest_file_read_count
+        let manifest_validations_before = store
+            .stream_manifest_validation_count
             .load(Ordering::Relaxed);
         let opens_before = store.blob_stream_open_count.load(Ordering::Relaxed);
         let (stream_manifest, mut reader) = store
@@ -10751,9 +9052,9 @@ mod tests {
         );
         assert_eq!(
             store
-                .stream_manifest_file_read_count
+                .stream_manifest_validation_count
                 .load(Ordering::Relaxed),
-            manifest_reads_before + 1
+            manifest_validations_before + 1
         );
 
         let (_, mut repeated) = store
@@ -10766,218 +9067,10 @@ mod tests {
         assert_eq!(repeated_bytes, b"5WXYZa");
         assert_eq!(
             store
-                .stream_manifest_file_read_count
+                .stream_manifest_validation_count
                 .load(Ordering::Relaxed),
-            manifest_reads_before + 1,
+            manifest_validations_before + 1,
             "repeated ranges should reuse the immutable validated manifest"
-        );
-
-        cleanup(&root);
-    }
-
-    #[test]
-    fn small_object_versions_are_stored_in_packed_segments() {
-        let root = temp_root("small_object_versions_are_stored_in_packed_segments");
-        let store = LocalContentStore::new(&root).expect("create store");
-        let first_bytes = b"tiny packed object alpha";
-        let second_bytes = b"tiny packed object bravo";
-
-        let first = store
-            .put_object_version("object-packed-a", "v1", first_bytes)
-            .expect("put first packed object");
-        let second = store
-            .put_object_version("object-packed-b", "v1", second_bytes)
-            .expect("put second packed object");
-
-        assert!(
-            !store
-                .blob_path(&first.content_hash)
-                .expect("first loose blob path")
-                .exists(),
-            "small content should avoid one loose blob file per object"
-        );
-        assert!(
-            !store
-                .blob_path(&second.content_hash)
-                .expect("second loose blob path")
-                .exists(),
-            "small content should avoid one loose blob file per object"
-        );
-        let first_location = store
-            .packed_blob_location(&first.content_hash)
-            .expect("first packed lookup")
-            .expect("first packed location");
-        let second_location = store
-            .packed_blob_location(&second.content_hash)
-            .expect("second packed lookup")
-            .expect("second packed location");
-        let segment_paths = [
-            store.packed_blob_location_path(&first_location),
-            store.packed_blob_location_path(&second_location),
-        ]
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-        assert!(segment_paths.iter().all(|path| path.is_file()));
-        assert!(
-            (1..=2).contains(&segment_paths.len()),
-            "two small blobs occupy at most one segment in each hash lane"
-        );
-
-        assert_eq!(
-            store
-                .read_blob(&first.content_hash)
-                .expect("read first blob"),
-            first_bytes
-        );
-        assert_eq!(
-            store
-                .read_object_version("object-packed-b", "v1")
-                .expect("read second object")
-                .1,
-            second_bytes
-        );
-        let mut stream = store
-            .open_blob_stream(&first.content_hash)
-            .expect("open packed stream");
-        let mut streamed = Vec::new();
-        stream.read_to_end(&mut streamed).expect("read stream");
-        assert_eq!(streamed, first_bytes);
-        assert_eq!(
-            store
-                .read_blob_range(&second.content_hash, 5, 6)
-                .expect("read packed range"),
-            &second_bytes[5..11]
-        );
-
-        let stats = store.stats().expect("packed stats");
-        assert_eq!(stats.blob_count, 2);
-        assert_eq!(
-            stats.blob_bytes,
-            first_bytes.len() as u64 + second_bytes.len() as u64
-        );
-        assert_eq!(stats.manifest_count, 2);
-        let scrub = store.scrub().expect("packed scrub");
-        assert!(scrub.is_healthy(), "packed scrub issues: {scrub:?}");
-        assert_eq!(scrub.referenced_blob_count, 2);
-        assert_eq!(scrub.orphan_blob_count, 0);
-        assert_eq!(store.stats().expect("stats after scrub"), scrub.stats);
-
-        cleanup(&root);
-    }
-
-    #[test]
-    fn small_object_packed_index_uses_append_log_instead_of_per_write_snapshot() {
-        let root =
-            temp_root("small_object_packed_index_uses_append_log_instead_of_per_write_snapshot");
-        let store = LocalContentStore::new(&root).expect("create store");
-        let first_bytes = b"tiny packed index log alpha";
-        let second_bytes = b"tiny packed index log bravo";
-
-        let first = store
-            .put_object_version("object-packed-index-log-a", "v1", first_bytes)
-            .expect("put first packed object");
-        let second = store
-            .put_object_version("object-packed-index-log-b", "v1", second_bytes)
-            .expect("put second packed object");
-
-        assert!(
-            store
-                .packed_blob_index_log_path_for_hash(&first.content_hash)
-                .expect("first packed lane log path")
-                .is_file()
-                && store
-                    .packed_blob_index_log_path_for_hash(&second.content_hash)
-                    .expect("second packed lane log path")
-                    .is_file(),
-            "small packed writes should append compact index records"
-        );
-        assert!(
-            !store
-                .packed_blob_index_path_for_hash(&first.content_hash)
-                .expect("first packed lane index path")
-                .exists()
-                && !store
-                    .packed_blob_index_path_for_hash(&second.content_hash)
-                    .expect("second packed lane index path")
-                    .exists(),
-            "small packed writes should not rewrite the full index snapshot on every object"
-        );
-
-        let reopened = LocalContentStore::new(&root).expect("reopen store");
-        assert_eq!(
-            reopened
-                .read_blob(&first.content_hash)
-                .expect("read first packed blob after replay"),
-            first_bytes
-        );
-        assert_eq!(
-            reopened
-                .read_blob(&second.content_hash)
-                .expect("read second packed blob after replay"),
-            second_bytes
-        );
-        let index = reopened
-            .read_packed_blob_index_unlocked()
-            .expect("replayed packed index");
-        assert_eq!(index.entries.len(), 2);
-
-        cleanup(&root);
-    }
-
-    #[test]
-    fn packed_blob_index_cache_advances_after_local_write() {
-        let root = temp_root("packed_blob_index_cache_advances_after_local_write");
-        let store = LocalContentStore::new(&root).expect("create store");
-
-        let first = store
-            .put_object_version("object-packed-cache-a", "v1", b"packed cache alpha")
-            .expect("put first packed object");
-        assert!(
-            store
-                .packed_blob_location(&first.content_hash)
-                .expect("populate packed cache")
-                .is_some()
-        );
-
-        let second = store
-            .put_object_version("object-packed-cache-b", "v1", b"packed cache bravo")
-            .expect("put second packed object");
-        assert!(
-            store
-                .packed_blob_location(&second.content_hash)
-                .expect("read advanced packed cache")
-                .is_some(),
-            "same-process packed writes must advance the authoritative cache"
-        );
-
-        cleanup(&root);
-    }
-
-    #[test]
-    fn packed_blob_index_cache_observes_external_writer() {
-        let root = temp_root("packed_blob_index_cache_observes_external_writer");
-        let reader = LocalContentStore::new(&root).expect("reader store");
-        let writer = LocalContentStore::new(&root).expect("writer store");
-
-        let first = writer
-            .put_object_version("object-packed-external-a", "v1", b"packed external alpha")
-            .expect("put first packed object");
-        assert_eq!(
-            reader
-                .read_blob(&first.content_hash)
-                .expect("read first packed blob"),
-            b"packed external alpha"
-        );
-
-        let second = writer
-            .put_object_version("object-packed-external-b", "v1", b"packed external bravo")
-            .expect("put second packed object");
-        assert_eq!(
-            reader
-                .read_blob(&second.content_hash)
-                .expect("reader must observe externally updated packed index"),
-            b"packed external bravo",
-            "packed index cache must not hide blobs written by another process"
         );
 
         cleanup(&root);
@@ -11187,13 +9280,6 @@ mod tests {
             .expect("read patched identity range")
             .expect("indexed patched identity");
         assert_eq!(identity_range, range);
-        assert!(
-            store
-                .content_manifest_index_path("object-patch", &patched.content_hash)
-                .expect("content manifest index path")
-                .is_file(),
-            "extent manifests must have a durable O(1) content-identity index"
-        );
 
         drop(store);
         let reopened = LocalContentStore::new(&root).expect("reopen content store");
@@ -11216,8 +9302,8 @@ mod tests {
     fn scrub_reports_missing_corrupt_and_orphan_blobs() {
         let root = temp_root("scrub_reports_content_anomalies");
         let store = LocalContentStore::new(&root).expect("create store");
-        let missing_bytes = vec![b'm'; PACKED_BLOB_SMALL_LIMIT_BYTES as usize + 1];
-        let corrupt_bytes = vec![b'c'; PACKED_BLOB_SMALL_LIMIT_BYTES as usize + 2];
+        let missing_bytes = vec![b'm'; INLINE_BLOB_SMALL_LIMIT_BYTES as usize + 1];
+        let corrupt_bytes = vec![b'c'; INLINE_BLOB_SMALL_LIMIT_BYTES as usize + 2];
         let missing = store
             .put_object_version("object-missing", "v1", &missing_bytes)
             .expect("put missing object");
@@ -11384,43 +9470,7 @@ mod tests {
     }
 
     #[test]
-    fn gc_options_default_missing_protected_roots_for_backward_compatibility() {
-        let gc_options: ContentStoreGcOptions = serde_json::from_value(serde_json::json!({
-            "dry_run": false,
-            "min_orphan_age_nanos": 17
-        }))
-        .expect("deserialize legacy content gc options");
-        assert!(gc_options.protected_content_hashes.is_empty());
-
-        let version_options: ContentStoreVersionGcOptions =
-            serde_json::from_value(serde_json::json!({
-                "dry_run": true,
-                "min_version_age_nanos": 23,
-                "keep_latest_versions_per_object": 2
-            }))
-            .expect("deserialize legacy version gc options");
-        assert!(version_options.protected_versions.is_empty());
-
-        let serialized_gc =
-            serde_json::to_value(ContentStoreGcOptions::dry_run(Duration::from_nanos(17)))
-                .expect("serialize default content gc options");
-        assert!(serialized_gc.get("protected_content_hashes").is_none());
-        assert!(serialized_gc.get("catalog_generation").is_none());
-        assert!(
-            serialized_gc
-                .get("catalog_observed_at_unix_nanos")
-                .is_none()
-        );
-        let serialized_versions = serde_json::to_value(ContentStoreVersionGcOptions::dry_run(
-            Duration::from_nanos(23),
-            2,
-        ))
-        .expect("serialize default version gc options");
-        assert!(serialized_versions.get("protected_versions").is_none());
-    }
-
-    #[test]
-    fn high_count_gc_batches_directory_syncs_and_packed_tombstones() {
+    fn high_count_gc_batches_directory_syncs_and_inline_tombstones() {
         const VERSION_COUNT: usize = VERSION_GC_DELETE_BATCH_SIZE + 2;
         const HASH_SHARD: &str = "2a";
         let root = temp_root("high_count_gc_batches_durability");
@@ -11462,10 +9512,30 @@ mod tests {
         assert_eq!(version_gc.deleted_version_count, (VERSION_COUNT - 1) as u64);
         assert_eq!(version_gc.durable_delete_batch_count, 2);
         assert_eq!(
-            version_gc.durable_directory_sync_count, 1,
-            "one final object-directory barrier must cover every bounded unlink group"
+            version_gc.durable_directory_sync_count, 0,
+            "inline tombstones create no loose manifest-directory unlink work"
         );
         assert_eq!(version_gc.stats_delta_persist_count, 1);
+        let retired_bindings = store
+            .inline_binding_view()
+            .expect("actual inline tombstones")
+            .unwrap();
+        for version in &versions[..VERSION_COUNT - 1] {
+            assert!(
+                matches!(
+                    retired_bindings
+                        .versions
+                        .get(&("batched-gc-object".to_string(), version.clone())),
+                    Some(InlineVersionState::Deleted { .. })
+                ),
+                "every collected version has its durable tombstone"
+            );
+            assert!(content_error_is_not_found(
+                &store
+                    .read_manifest("batched-gc-object", version)
+                    .unwrap_err()
+            ));
+        }
 
         let observed = store
             .collect_garbage(delete_eligible_orphan_gc_options(Duration::ZERO))
@@ -11483,7 +9553,7 @@ mod tests {
             .collect_garbage(delete_eligible_orphan_gc_options(Duration::ZERO))
             .expect("batch packed orphan collection");
         assert_eq!(collected.deleted_orphan_count, (VERSION_COUNT - 1) as u64);
-        assert_eq!(collected.packed_tombstone_batch_count, 2);
+
         assert_eq!(
             collected.orphan_observation_directory_sync_count, 1,
             "removing the now-empty marker shard only dirties its parent"
@@ -11495,6 +9565,19 @@ mod tests {
 
         drop(store);
         let reopened = LocalContentStore::new(&root).expect("reopen batched GC store");
+        for version in &versions[..VERSION_COUNT - 1] {
+            assert!(matches!(
+                reopened
+                    .inline_version_state("batched-gc-object", version)
+                    .expect("reopen exact tombstone"),
+                Some(InlineVersionState::Deleted { .. })
+            ));
+            assert!(content_error_is_not_found(
+                &reopened
+                    .read_manifest("batched-gc-object", version)
+                    .unwrap_err()
+            ));
+        }
         assert_eq!(
             reopened
                 .manifests_for_object("batched-gc-object")
@@ -11591,7 +9674,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_garbage_retains_protected_loose_and_packed_orphans() {
+    fn collect_garbage_retains_protected_loose_and_inline_orphans() {
         let root = temp_root("collect_garbage_retains_protected_orphans");
         let store = LocalContentStore::new(&root).expect("create store");
         let protected_packed = store
@@ -11599,7 +9682,7 @@ mod tests {
             .expect("put protected packed version");
         assert!(
             store
-                .packed_blob_location(&protected_packed.content_hash)
+                .inline_blob_entry(&protected_packed.content_hash)
                 .expect("protected packed lookup")
                 .is_some(),
             "fixture must exercise packed-orphan protection"
@@ -11824,7 +9907,7 @@ mod tests {
     }
 
     #[test]
-    fn orphan_observation_survives_restart_before_packed_blob_collection() {
+    fn orphan_observation_survives_restart_before_inline_blob_collection() {
         let root = temp_root("orphan_observation_survives_restart");
         let store = LocalContentStore::new(&root).expect("create store");
         let old = store
@@ -11835,7 +9918,7 @@ mod tests {
             .expect("put new packed version");
         assert!(
             store
-                .packed_blob_location(&old.content_hash)
+                .inline_blob_entry(&old.content_hash)
                 .expect("old packed lookup")
                 .is_some(),
             "fixture must exercise packed-orphan observations"
@@ -11871,14 +9954,6 @@ mod tests {
         assert_eq!(second_pass.newly_observed_orphan_count, 0);
         assert_eq!(second_pass.eligible_orphan_count, 1);
         assert_eq!(second_pass.deleted_orphan_count, 1);
-        assert_eq!(second_pass.eligible_packed_segment_count, 1);
-        assert_eq!(second_pass.compacted_packed_segment_count, 1);
-        assert_eq!(second_pass.reclaimed_packed_segment_bytes, old.size_bytes);
-        assert_eq!(
-            second_pass.checkpointed_packed_index_lane_count, 2,
-            "the tombstone batch and the subsequent physical repack each checkpoint the lane"
-        );
-        assert!(second_pass.truncated_packed_index_log_bytes > 0);
         assert!(
             !reopened
                 .has_blob(&old.content_hash)
@@ -11934,56 +10009,6 @@ mod tests {
         assert_eq!(later_generation.eligible_orphan_count, 1);
         assert_eq!(later_generation.deleted_orphan_count, 1);
         assert!(!reopened.has_blob(&hash).expect("orphan collected"));
-
-        cleanup(&root);
-    }
-
-    #[test]
-    fn legacy_orphan_observation_resets_to_a_catalog_bound_first_observation() {
-        let root = temp_root("legacy_orphan_observation_catalog_reset");
-        let store = LocalContentStore::new(&root).expect("create store");
-        let bytes = b"legacy observed orphan";
-        let hash = content_hash(bytes);
-        write_file_atomic(&store.blob_path(&hash).expect("orphan path"), bytes)
-            .expect("write orphan");
-        let marker_path = store
-            .orphan_observation_path(&hash)
-            .expect("observation path");
-        let legacy = OrphanObservation {
-            format_version: 1,
-            content_hash: hash.clone(),
-            first_observed_at_unix_nanos: 1,
-            catalog_generation: String::new(),
-            catalog_observed_at_unix_nanos: 0,
-        };
-        write_file_atomic(
-            &marker_path,
-            &encode_orphan_observation(&legacy).expect("encode legacy observation"),
-        )
-        .expect("write legacy observation");
-
-        let reset = store
-            .collect_garbage(
-                ContentStoreGcOptions::delete_eligible(Duration::ZERO)
-                    .with_catalog_observation("catalog-generation-reset", u64::MAX - 1),
-            )
-            .expect("reset legacy observation");
-        assert_eq!(reset.newly_observed_orphan_count, 1);
-        assert_eq!(reset.persisted_orphan_observation_count, 1);
-        assert_eq!(reset.deleted_orphan_count, 0);
-        let rebound =
-            decode_orphan_observation(&read_file(&marker_path).expect("read rebound observation"))
-                .expect("decode rebound observation");
-        assert_eq!(rebound.format_version, ORPHAN_OBSERVATION_FORMAT_VERSION);
-        assert_eq!(rebound.catalog_generation, "catalog-generation-reset");
-
-        let collected = store
-            .collect_garbage(
-                ContentStoreGcOptions::delete_eligible(Duration::ZERO)
-                    .with_catalog_observation("catalog-generation-later", u64::MAX),
-            )
-            .expect("collect after later observation");
-        assert_eq!(collected.deleted_orphan_count, 1);
 
         cleanup(&root);
     }
@@ -12075,10 +10100,12 @@ mod tests {
         store
             .collect_versions(forged_version_options)
             .expect_err("serialized catalog fields must not authorize manifest deletion");
-        assert!(
+        assert_eq!(
             store
-                .manifest_path("serialized-version-object", "v1")
-                .is_file()
+                .read_manifest("serialized-version-object", "v1")
+                .expect("unqualified collector leaves the actual binding live")
+                .content_hash,
+            content_hash(b"old version"),
         );
         assert!(
             !store.stats_snapshot_path().exists(),
@@ -12133,7 +10160,7 @@ mod tests {
     fn orphan_observation_is_pruned_after_content_becomes_referenced() {
         let root = temp_root("orphan_observation_pruned_when_referenced");
         let store = LocalContentStore::new(&root).expect("create store");
-        let bytes = vec![b'r'; PACKED_BLOB_SMALL_LIMIT_BYTES as usize + 1];
+        let bytes = vec![b'r'; INLINE_BLOB_SMALL_LIMIT_BYTES as usize + 1];
         let hash = content_hash(&bytes);
         write_file_atomic(&store.blob_path(&hash).expect("orphan blob path"), &bytes)
             .expect("write loose orphan");
@@ -12175,7 +10202,7 @@ mod tests {
     fn rereferenced_content_gets_fresh_grace_after_last_manifest_is_removed() {
         let root = temp_root("rereferenced_content_gets_fresh_grace");
         let store = LocalContentStore::new(&root).expect("create store");
-        let bytes = vec![b'g'; PACKED_BLOB_SMALL_LIMIT_BYTES as usize + 1];
+        let bytes = vec![b'g'; INLINE_BLOB_SMALL_LIMIT_BYTES as usize + 1];
         let hash = content_hash(&bytes);
         write_file_atomic(&store.blob_path(&hash).expect("orphan blob path"), &bytes)
             .expect("write loose orphan");
@@ -12333,8 +10360,10 @@ mod tests {
     fn collect_garbage_dry_run_and_blocks_on_non_orphan_scrub_issues() {
         let root = temp_root("collect_garbage_dry_run_blocks_on_corrupt");
         let store = LocalContentStore::new(&root).expect("create store");
+        let live_bytes = vec![b'a'; INLINE_BLOB_SMALL_LIMIT_BYTES as usize + 1];
+        let corrupt = vec![b'b'; live_bytes.len()];
         let live = store
-            .put_object_version("object-live", "v1", b"live referenced blob")
+            .put_object_version("object-live", "v1", &live_bytes)
             .expect("put live object");
         let orphan_bytes = b"dry run orphan blob";
         let orphan_hash = content_hash(orphan_bytes);
@@ -12371,11 +10400,9 @@ mod tests {
         );
         assert!(store.has_blob(&orphan_hash).expect("dry-run retained"));
 
-        write_file_atomic(
-            &store.blob_path(&live.content_hash).expect("live blob path"),
-            b"corrupt live bytes",
-        )
-        .expect("corrupt referenced blob");
+        let live_path = store.blob_path(&live.content_hash).expect("live blob path");
+        assert!(live_path.is_file(), "normal producer selected a loose blob");
+        write_file_atomic(&live_path, &corrupt).expect("corrupt referenced blob");
         let blocked = store
             .collect_garbage(delete_eligible_orphan_gc_options(Duration::from_nanos(0)))
             .expect("blocked gc");
@@ -12482,13 +10509,14 @@ mod tests {
         release_all_content_reservations(&store);
 
         let min_age = Duration::from_secs(60 * 60);
-        let young_modified = store
-            .manifest_path("object-deadline", "version_2")
-            .metadata()
-            .and_then(|metadata| metadata.modified())
-            .expect("young manifest modified time");
-        let expected_deadline = system_time_nanos_since_epoch_saturating(young_modified)
-            .saturating_add(duration_nanos_saturating(min_age));
+        let young_published = match store
+            .inline_version_state("object-deadline", "version_2")
+            .expect("actual binding age")
+        {
+            Some(InlineVersionState::Live(entry)) => entry.published_at_unix_nanos,
+            _ => panic!("young version must remain live"),
+        };
+        let expected_deadline = young_published.saturating_add(duration_nanos_saturating(min_age));
         let report = store
             .collect_versions(
                 ContentStoreVersionGcOptions::dry_run(min_age, 1)
@@ -12689,78 +10717,22 @@ mod tests {
     }
 
     #[test]
-    fn collect_versions_removes_deleted_manifest_index_and_rebuilds_from_survivor() {
-        let root = temp_root("collect_versions_rebuilds_content_index");
-        let store = LocalContentStore::new(&root).expect("create store");
-        let version_1 = store
-            .put_object_version("object-shared-content", "version_1", b"shared bytes")
-            .expect("put version 1");
-        let version_2 = store
-            .put_object_version("object-shared-content", "version_2", b"shared bytes")
-            .expect("put version 2");
-        assert_eq!(version_1.content_hash, version_2.content_hash);
-
-        let index_path = store
-            .content_manifest_index_path("object-shared-content", &version_1.content_hash)
-            .expect("content index path");
-        let indexed = decode_manifest(&read_file(&index_path).expect("read initial index"))
-            .expect("decode initial index");
-        assert_eq!(indexed.version, version_1.version);
-        release_all_content_reservations(&store);
-        observe_collectible_versions(&store, 1);
-
-        let report = store
-            .collect_versions(
-                ContentStoreVersionGcOptions::delete_eligible(Duration::from_nanos(0), 1)
-                    .with_catalog_observation("test-catalog-generation-2", u64::MAX),
-            )
-            .expect("collect old version");
-        assert_eq!(report.deleted_version_count, 1);
-        assert!(
-            !store
-                .manifest_path("object-shared-content", &version_1.version)
-                .is_file()
-        );
-        assert!(
-            !index_path.is_file(),
-            "the index hardlink must not retain a collected manifest"
-        );
-
-        let (_, bytes) = store
-            .read_object_content_range(
-                "object-shared-content",
-                &version_2.content_hash,
-                version_2.size_bytes,
-                0,
-                usize::MAX,
-            )
-            .expect("read surviving content identity")
-            .expect("surviving content identity");
-        assert_eq!(bytes, b"shared bytes");
-        let rebuilt = decode_manifest(&read_file(&index_path).expect("read rebuilt index"))
-            .expect("decode rebuilt index");
-        assert_eq!(rebuilt.version, version_2.version);
-
-        cleanup(&root);
-    }
-
-    #[test]
     fn collect_versions_blocks_on_non_orphan_scrub_issues() {
         let root = temp_root("collect_versions_blocks_on_corrupt");
         let store = LocalContentStore::new(&root).expect("create store");
+        let original = vec![b'a'; INLINE_BLOB_SMALL_LIMIT_BYTES as usize + 1];
+        let corrupt = vec![b'b'; original.len()];
         let version_1 = store
-            .put_object_version("object-history", "version_1", b"history bytes v1")
+            .put_object_version("object-history", "version_1", &original)
             .expect("put version 1");
         store
             .put_object_version("object-history", "version_2", b"history bytes v2")
             .expect("put version 2");
-        write_file_atomic(
-            &store
-                .blob_path(&version_1.content_hash)
-                .expect("version 1 blob path"),
-            b"corrupt old version bytes",
-        )
-        .expect("corrupt referenced old version");
+        let old_path = store
+            .blob_path(&version_1.content_hash)
+            .expect("version 1 blob path");
+        assert!(old_path.is_file(), "normal producer selected a loose blob");
+        write_file_atomic(&old_path, &corrupt).expect("corrupt referenced old version");
 
         let blocked = store
             .collect_versions(
@@ -13170,15 +11142,18 @@ mod tests {
     fn read_blob_defers_content_address_verification_to_scrub() {
         let root = temp_root("read_blob_rejects_content_address_mismatch");
         let store = LocalContentStore::new(&root).expect("create store");
+        let original = vec![b'a'; INLINE_BLOB_SMALL_LIMIT_BYTES as usize + 1];
+        let corrupt = vec![b'b'; original.len()];
         let manifest = store
-            .put_object_version("object-a", "v1", b"correct bytes")
+            .put_object_version("object-a", "v1", &original)
             .expect("put object version");
         let blob_path = store.blob_path(&manifest.content_hash).expect("blob path");
-        write_file_atomic(&blob_path, b"corrupt bytes").expect("corrupt blob");
+        assert!(blob_path.is_file(), "normal producer selected a loose blob");
+        write_file_atomic(&blob_path, &corrupt).expect("corrupt blob");
 
         assert_eq!(
             store.read_blob(&manifest.content_hash).expect("read bytes"),
-            b"corrupt bytes"
+            corrupt
         );
         assert!(
             store

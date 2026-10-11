@@ -41,7 +41,10 @@ fn content_hash_range_fallback_validates_returned_window_not_full_blob_size() {
 fn content_root_catalog_refresh_failure_durably_invalidates_previous_catalog() {
     let root = temp_root("content-root-catalog-refresh-failure");
     let node_id = NodeId::from_legacy_named("node_catalog_refresh_failure").expect("node");
-    let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+    let (_runtime, mut dfs) = native_sifs_service(
+        "content_root_catalog_refresh_failure_durably_invalidates_previous_catalog",
+        node_id.clone(),
+    );
     let shard = DfsMetadataShardConfig {
         file_system_id: sifs_file_system_id(),
         shard_id: "root".to_string(),
@@ -49,11 +52,10 @@ fn content_root_catalog_refresh_failure_durably_invalidates_previous_catalog() {
         replica_node_ids: Vec::new(),
         epoch: 1,
         assignment: DfsMetadataShardAssignment::Root,
-        namespace_prepare_codec: Default::default(),
+
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     let file_system = DfsFileSystemConfig {
-        metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
         retention_policies: Default::default(),
         module_metadata: Default::default(),
         file_system_id: shard.file_system_id.clone(),
@@ -147,99 +149,59 @@ fn content_root_catalog_refresh_failure_durably_invalidates_previous_catalog() {
 }
 
 #[test]
-fn content_root_catalog_continuations_do_not_repeat_control_plane_refresh() {
-    let root = temp_root("content-root-catalog-control-plane-once");
-    let primary = NodeId::from_legacy_named("node_catalog_primary").expect("primary");
-    let file_system = file_system(primary.clone());
-    let file_system_config = DfsFileSystemConfig::from(&file_system);
-    let shard = DfsMetadataShardConfig {
-        file_system_id: file_system.file_system_id.clone(),
-        shard_id: "root".to_string(),
-        primary_node_id: primary.clone(),
-        replica_node_ids: Vec::new(),
-        epoch: 1,
-        assignment: DfsMetadataShardAssignment::Root,
-        namespace_prepare_codec: Default::default(),
-        default_policy: DfsObjectPolicy::ReplicatedEventual,
-    };
-    let current_kv = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
-    current_kv.with_client(|kv| {
-        let mut control = DfsControlPlaneStore::new(kv);
-        control
-            .put_file_system_config(&file_system_config)
-            .expect("filesystem config");
-        control.put_metadata_shard(&shard).expect("metadata shard");
-    });
-
-    let mut metadata =
-        open_root_local_metadata_backend(root.join("metadata")).expect("metadata backend");
-    metadata
-        .put_file_system(&file_system)
-        .expect("metadata filesystem");
-    let mut object = file_metadata(primary.clone());
-    object.file_system_id = file_system.file_system_id.clone();
-    metadata.put_object(&object).expect("metadata object");
-    for index in 0..1_100_u64 {
-        metadata
-            .put_version(&DfsObjectVersionRecord {
-                metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
-                content_durability: None,
-                retention: Default::default(),
-                module_metadata: Default::default(),
-                file_system_id: file_system.file_system_id.clone(),
-                object_id: object.object_id.clone(),
-                version: DfsVersion::from_legacy_named(format!(
-                    "version_catalog_control_plane_{index:04}"
-                ))
-                .expect("catalog version"),
-                content_hash: Some(format!("blake3:{index:064x}")),
-                size_bytes: Some(index),
-                locations: vec![primary.clone()],
-                created_by_event_id: None,
-                created_at: OffsetDateTime::UNIX_EPOCH
-                    + time::Duration::seconds(index.try_into().expect("timestamp")),
-                visible: true,
-            })
-            .expect("metadata version");
+fn native_content_root_catalog_pages_share_one_recorded_cut() {
+    let node =
+        crate::test_runtime::DfsTestRuntime::ordered_node_ids("native-catalog-pages", 1).remove(0);
+    let (runtime, mut writer) = native_sifs_service("native-catalog-pages", node.clone());
+    for index in 0..300_u64 {
+        writer
+            .posix_write_file(
+                &format!("/catalog-{index:04}.bin"),
+                &index.to_le_bytes(),
+                DfsWriteOptions::replicated_eventual(vec![node.clone()]),
+            )
+            .unwrap();
     }
-
-    let refreshes = Arc::new(AtomicUsize::new(0));
-    let control_plane = RefreshingDfsControlPlaneKvClient::new(
-        InProcessKvStore::new(),
-        current_kv,
-        Arc::clone(&refreshes),
-    );
-    let network = InProcessNetwork::new();
-    let content_root = root.join("content");
-    let content = LocalContentStore::new(&content_root).expect("content");
-    let mut service = NetworkedDfsService::new(network.add_node(primary), content)
-        .with_control_plane(control_plane)
-        .with_metadata_backend(metadata)
-        .expect("metadata service");
-    refreshes.store(0, Ordering::SeqCst);
-
-    let catalog = service
-        .refresh_content_root_catalog(
-            std::slice::from_ref(&file_system_config),
-            std::slice::from_ref(&shard),
-            &[],
-            &content_root,
-            &[],
-            16,
+    let shard = runtime.root_shard().unwrap();
+    let backend = writer.metadata_backend_mut().unwrap();
+    let request = DfsContentRootCatalogPageRequest {
+        identity: DfsContentRootCatalogShardIdentity::from_config(&shard),
+        expected_topology_digest: dfs_content_root_catalog_topology_digest_with_file_systems(
+            &[DfsFileSystemConfig::from(&runtime.file_system())],
+            &[shard],
         )
-        .expect("multi-page catalog refresh");
-    assert!(catalog.is_complete());
-    assert!(
-        catalog.fragments()[0].entries.len() > DFS_CONTENT_ROOT_CATALOG_PAGE_ENTRY_LIMIT,
-        "fixture must require a continuation page"
-    );
-    assert_eq!(
-        refreshes.load(Ordering::SeqCst),
-        3,
-        "refresh should read topology before and after the drain and prove authority once, not once per page"
-    );
-
-    std::fs::remove_dir_all(root).ok();
+        .unwrap(),
+        minimum_journal_sequence: 0,
+        minimum_state_fingerprint: None,
+        after: None,
+        max_entries: 16,
+    };
+    let mut cursor = None;
+    let mut entries = Vec::new();
+    let mut pages = 0;
+    let mut cut = None;
+    loop {
+        let mut next = request.clone();
+        next.after = cursor;
+        let page = backend.content_root_catalog_page(&next).unwrap();
+        pages += 1;
+        let identity = (page.coverage.clone(), page.generated_at_unix_nanos);
+        if let Some(cut) = &cut {
+            assert_eq!(&identity, cut);
+        } else {
+            cut = Some(identity);
+        }
+        assert!(page.entries.len() <= 16);
+        entries.extend(page.entries);
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    assert!(pages > 1);
+    assert!(entries.len() > 300);
+    drop(writer);
+    runtime.close().unwrap();
 }
 
 #[test]
@@ -278,291 +240,279 @@ fn dfs_smoke_content_nodes_prefer_fresh_remote_advertisements() {
 }
 
 #[test]
-fn local_content_anti_entropy_accepts_hash_addressed_blob_without_version_manifest() {
-    let root = temp_root("local-content-anti-entropy-hash-addressed");
-    let node_id = NodeId::from_legacy_named("node_anti_entropy_hash").expect("node");
-    let file_system_id = DfsFileSystemId::from_legacy_named("fs_anti_entropy_hash").expect("fs");
-    let network = InProcessNetwork::new();
-    let content = LocalContentStore::new(root.join("content")).expect("content");
-    let metadata =
-        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("metadata"))
-            .expect("metadata");
-    let mut dfs = NetworkedDfsService::new(network.add_node(node_id.clone()), content)
-        .with_metadata_backend(metadata)
-        .expect("metadata backend");
-    let file_system = DfsFileSystem {
-        metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
-        retention_policies: Default::default(),
-        module_metadata: Default::default(),
-        file_system_id: file_system_id.clone(),
-        display_name: "anti entropy hash".to_string(),
-        owner_node_id: node_id.clone(),
-        subtree_policies: Vec::new(),
-    };
-    dfs.metadata_backend
-        .as_mut()
-        .expect("metadata backend")
-        .put_file_system(&file_system)
-        .expect("filesystem");
-
-    let bytes = b"hash-addressed bytes without matching manifest";
-    let seed_manifest = dfs
-        .content
-        .put_object_version("obj_seed_for_hash_addressed_blob", "version_seed", bytes)
-        .expect("seed blob");
-    let mut object = file_metadata(node_id.clone());
-    object.file_system_id = file_system_id.clone();
-    object.object_id =
-        DfsObjectId::from_legacy_named("obj_anti_entropy_hash_blob").expect("object");
-    object.version = DfsVersion::from_legacy_named("version_hash_addressed").expect("ver");
-    object.path = "/anti/hash-addressed.bin".to_string();
-    object.current_locations = vec![node_id.clone()];
-    object.content_hash = Some(seed_manifest.content_hash.clone());
-    object.content_size_bytes = Some(seed_manifest.size_bytes);
-    dfs.metadata_backend
-        .as_mut()
-        .expect("metadata backend")
-        .put_object(&object)
-        .expect("hash-addressed object metadata");
-
-    let report = dfs
-        .run_local_content_anti_entropy(DfsAntiEntropyOptions {
-            file_system_id: file_system_id.clone(),
-            after: None,
-            max_objects: 8,
-            max_issues: 8,
-            repair_metadata: true,
-        })
-        .expect("anti entropy");
-
-    assert_eq!(report.scanned_object_count, 1);
-    assert_eq!(report.checked_local_location_count, 1);
-    assert_eq!(report.stale_local_location_count, 0);
-    assert_eq!(report.repaired_location_count, 0);
-    assert_eq!(report.issue_count, 0);
-    let retained = dfs
-        .metadata_backend()
-        .expect("metadata backend")
-        .get_object(&object.object_id)
-        .expect("object")
-        .expect("retained object");
-    assert!(retained.current_locations.contains(&node_id));
-
-    std::fs::remove_dir_all(root).ok();
-}
-
-#[test]
-fn add_object_metadata_batch_trusts_supplied_content_size() {
-    let root = temp_root("add-object-metadata-batch-trusts-size");
+fn add_object_metadata_batch_rejects_unrecorded_content_generation() {
     let owner = NodeId::from_legacy_named("node_batch_size_owner").expect("node");
-    let network = InProcessNetwork::new();
-    let content = LocalContentStore::new(root.join("content")).expect("content");
-    let manifest = content
-        .put_object_version(
-            "obj_batch_trusted_size",
-            "version_batch_trusted_size",
-            b"local",
-        )
-        .expect("local content manifest");
-    let metadata =
-        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("metadata"))
-            .expect("metadata");
-    let mut dfs = NetworkedDfsService::new(network.add_node(owner.clone()), content)
-        .with_metadata_backend(metadata)
-        .expect("metadata backend");
-
+    let (runtime, mut dfs) =
+        native_sifs_service("native-metadata-batch-trusted-size", owner.clone());
+    let object_id = DfsObjectId::generate();
+    let version = DfsVersion::generate();
+    let manifest = dfs
+        .content()
+        .put_object_version(object_id.as_str(), version.as_str(), b"local")
+        .expect("actual current local content manifest");
     let mut object = file_metadata(owner);
-    object.object_id = DfsObjectId::from_legacy_named("obj_batch_trusted_size").expect("object");
+    object.object_id = object_id;
     object.path = "/services/batch-visible/trusted-size.txt".to_string();
     object.content_hash = Some(manifest.content_hash);
     object.content_size_bytes = Some(128);
-    object.version = DfsVersion::from_legacy_named("version_batch_trusted_size").expect("version");
-
-    dfs.add_object_metadata_batch([object.clone()])
-        .expect("metadata batch");
-
-    let version = dfs
-        .metadata_backend()
-        .expect("metadata backend")
-        .get_version(&object.object_id, &object.version)
-        .expect("version lookup")
-        .expect("version");
-    assert_eq!(
-        version.size_bytes, object.content_size_bytes,
-        "metadata-only batch imports should not stat local content first"
+    object.version = version;
+    let error = dfs
+        .add_object_metadata_batch([object.clone()])
+        .expect_err("local bytes alone cannot authorize an unrecorded visible generation");
+    assert!(
+        error
+            .to_string()
+            .contains("no sealed or recorded same-object head")
     );
-
-    std::fs::remove_dir_all(root).ok();
+    let backend = dfs.metadata_backend().expect("actual metadata backend");
+    assert!(backend.get_object(&object.object_id).unwrap().is_none());
+    assert!(
+        backend
+            .get_version(&object.object_id, &object.version)
+            .unwrap()
+            .is_none()
+    );
+    drop(dfs);
+    runtime.close().unwrap();
 }
 
 #[test]
 fn complete_remote_range_content_mismatch_prunes_stale_location() {
-    let root = temp_root("remote-range-read-mismatch-prunes-location");
-    let reader = NodeId::from_legacy_named("node_range_mismatch_reader").expect("node");
-    let source = NodeId::from_legacy_named("node_range_mismatch_source").expect("node");
-    let object_id = DfsObjectId::from_legacy_named("obj_range_mismatch").expect("object");
-    let version = DfsVersion::from_legacy_named("version_range_mismatch").expect("version");
-    let expected_bytes = b"expected remote range bytes".to_vec();
-    let expected_hash = content_hash(&expected_bytes);
-    let mut corrupt_bytes = expected_bytes.clone();
-    corrupt_bytes[0] ^= 0xff;
-    let request_id = "dfs_net_req_range_mismatch".to_string();
-    let mut dfs = networked_sifs_with_backend(&root, reader);
-    let mut object = file_metadata(source.clone());
-    object.object_id = object_id.clone();
-    object.version = version.clone();
-    object.policy = DfsObjectPolicy::ReplicatedEventual;
-    object.current_locations = vec![source.clone()];
-    object.content_hash = Some(expected_hash.clone());
-    object.content_size_bytes = Some(expected_bytes.len() as u64);
-    dfs.add_object_metadata(object).expect("object metadata");
-    dfs.reads.pending_reads.insert(
-        request_id.clone(),
-        PendingNetworkedRead {
-            object_id: object_id.clone(),
-            version: version.clone(),
-            content_hash: Some(expected_hash.clone()),
-            content_size_bytes: Some(expected_bytes.len() as u64),
-            range_offset: Some(0),
-            range_max_bytes: Some(expected_bytes.len()),
-            target_node_id: source.clone(),
-            next_retry_at: Instant::now() + DFS_REMOTE_READ_RETRY_DELAY,
-            cache_response: false,
-        },
+    let (runtime, source, _, reader_node, stat, bytes) = native_read_fixture(
+        "native-range-no-storage-rehash",
+        1,
+        true,
+        b"actual complete ranged read payload".to_vec(),
     );
-
-    let event = dfs
-        .handle_networked_read_response(
-            source.clone(),
-            DfsReadResponse {
-                request_id: request_id.clone(),
-                object_id: object_id.clone(),
-                result: DfsReadResult::RangeFound(DfsReadRangeData {
-                    object_id: object_id.clone(),
-                    version,
-                    content_hash: Some(expected_hash),
-                    offset: 0,
-                    total_size_bytes: expected_bytes.len() as u64,
-                    bytes: corrupt_bytes,
-                }),
-            },
-        )
-        .expect("matching identity and length are accepted without rehashing");
-
-    assert!(matches!(
-        event,
-        NetworkedDfsServiceEvent::RemoteReadCompleted {
-            result: DfsReadResult::RangeFound(_),
-            ..
-        }
-    ));
-    assert!(!dfs.reads.pending_reads.contains_key(&request_id));
+    let mut reader = runtime.client(&reader_node).unwrap();
+    assert_eq!(
+        reader
+            .request_remote_object_range_read(&stat.object_id, 0, bytes.len())
+            .unwrap(),
+        vec![source.clone()]
+    );
+    let request = reader.reads.pending_reads.keys().next().unwrap().clone();
+    let original = reader
+        .transport
+        .drain_incoming_messages()
+        .unwrap()
+        .into_iter()
+        .find(|routed| {
+            matches!(&routed.message,
+        DfsNetworkMessage::ReadResponse(response) if response.request_id == request)
+        })
+        .unwrap();
+    assert_eq!(original.source_node_id, source);
+    assert_eq!(original.target_node_id, reader_node);
+    let DfsNetworkMessage::ReadResponse(mut response) = original.message else {
+        unreachable!()
+    };
+    assert_eq!(response.object_id, stat.object_id);
+    let DfsReadResult::RangeFound(data) = &mut response.result else {
+        panic!("actual native RangeFound required")
+    };
+    assert_eq!(data.object_id, stat.object_id);
+    assert_eq!(data.version, stat.version);
+    assert_eq!(data.content_hash, stat.content_hash);
+    assert_eq!(data.offset, 0);
+    assert_eq!(data.total_size_bytes, bytes.len() as u64);
+    assert_eq!(data.bytes, bytes);
+    data.bytes[0] ^= 0xff;
+    let event = reader
+        .handle_networked_read_response(source.clone(), response)
+        .unwrap();
     assert!(
-        dfs.current_read_object_metadata(&object_id)
-            .expect("current metadata")
+        matches!(
+            event,
+            NetworkedDfsServiceEvent::RemoteReadCompleted {
+                result: DfsReadResult::RangeFound(_),
+                ..
+            }
+        ),
+        "normal matching identity/length acceptance does not rehash stored range bytes"
+    );
+    assert!(!reader.reads.pending_reads.contains_key(&request));
+    assert!(
+        reader
+            .current_read_object_metadata(&stat.object_id)
+            .unwrap()
             .current_locations
             .contains(&source)
     );
-
-    std::fs::remove_dir_all(root).ok();
+    assert_eq!(
+        reader
+            .metadata_backend()
+            .unwrap()
+            .get_object(&stat.object_id)
+            .unwrap()
+            .unwrap()
+            .content_hash,
+        stat.content_hash
+    );
+    drop(reader);
+    runtime.close().unwrap();
 }
 
 #[test]
 fn fetch_response_reuses_existing_local_blob_without_rehashing_payload() {
-    let root = temp_root("fetch-response-reuses-existing-local-blob");
-    let owner = NodeId::from_legacy_named("node_fetch_reuse_owner").expect("node");
-    let source = NodeId::from_legacy_named("node_fetch_reuse_source").expect("node");
-    let target = NodeId::from_legacy_named("node_fetch_reuse_target").expect("node");
-    let object_id = DfsObjectId::from_legacy_named("obj_fetch_reuse").expect("object");
-    let version = DfsVersion::from_legacy_named("version_2").expect("version");
-    let intent_id = "dfs_intent_fetch_reuse".to_string();
-    let request_id = "dfs_net_req_fetch_reuse".to_string();
-    let bytes = b"already fetched bytes";
-    let mut stale_payload = bytes.to_vec();
-    stale_payload[0] ^= 0xff;
-    stale_payload.extend_from_slice(b" with a different duplicate payload length");
-    let mut dfs = NetworkedDfsService::new(
-        InProcessNetwork::new().add_node(owner.clone()),
-        LocalContentStore::new(root.join("content")).expect("content"),
-    );
-    let manifest = dfs
-        .content
-        .put_object_version(object_id.as_str(), version.as_str(), bytes)
-        .expect("seed existing local blob");
-    dfs.writes.pending_writes.insert(
-        intent_id.clone(),
-        PendingNetworkedWrite {
-            object_id: object_id.clone(),
-            version: version.clone(),
-            content_hash: manifest.content_hash.clone(),
-            size_bytes: bytes.len() as u64,
-            foreground_replica_repair: true,
-            patch: None,
-            stage_retries: BTreeMap::from([(
-                target.clone(),
-                RepairRetryState {
-                    attempts: 2,
-                    next_retry_tick: 100,
-                    inflight: true,
-                },
-            )]),
-            repair_retries: BTreeMap::new(),
-            stage_inflight_request_ids: BTreeMap::new(),
-            repair_inflight_request_ids: BTreeMap::new(),
-            fetch_inflight_from: BTreeSet::from([source.clone()]),
-            fetch_inflight_request_ids: BTreeMap::from([(source.clone(), request_id.clone())]),
-            fetch_inflight_started_ticks: BTreeMap::from([(source.clone(), 0)]),
-            fetch_failed_from: BTreeSet::new(),
-        },
-    );
-
-    let event = dfs
-        .handle_fetch_blob_response(
-            source.clone(),
-            DfsFetchBlobResponse {
-                request_id,
-                intent_id: intent_id.clone(),
-                object_id: object_id.clone(),
-                version: version.clone(),
-                source_node_id: source.clone(),
-                result: DfsFetchBlobResult::Found {
-                    content_hash: manifest.content_hash.clone(),
-                    bytes: stale_payload,
-                },
-            },
+    let name = "native-existing-blob-duplicate-fetch";
+    let (runtime, initial, config) =
+        crate::test_support::current_native_metadata_service(name, 3, "/services").unwrap();
+    let owner = config.primary_node_id;
+    drop(initial);
+    let nodes = crate::test_runtime::DfsTestRuntime::ordered_node_ids(name, 3);
+    let peers = nodes
+        .iter()
+        .filter(|node| **node != owner)
+        .cloned()
+        .collect::<Vec<_>>();
+    let source = peers[0].clone();
+    let target = peers[1].clone();
+    let path = "/services/native-duplicate-fetch.bin";
+    let mut base_policy =
+        DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 1).unwrap();
+    base_policy.required_node_ids = vec![owner.clone()];
+    runtime
+        .apply_placement_policy(&owner, path, DfsPlacementScope::Subtree, base_policy)
+        .unwrap();
+    let mut first = runtime.client(&owner).unwrap();
+    let base = first
+        .posix_write_file(
+            path,
+            b"actual original fetch head",
+            DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
         )
-        .expect("existing local blob should satisfy fetch");
-
-    assert!(matches!(
-        event,
-        NetworkedDfsServiceEvent::BlobFetched {
-            source_node_id,
-            ..
-        } if source_node_id == source
-    ));
-    let pending = dfs
-        .writes
-        .pending_writes
-        .get(&intent_id)
-        .expect("pending write");
-    assert!(!pending.fetch_inflight_from.contains(&source));
-    assert!(!pending.fetch_inflight_request_ids.contains_key(&source));
-    assert!(pending.fetch_failed_from.is_empty());
+        .unwrap();
+    drop(first);
+    let mut current_policy =
+        DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 2, 3).unwrap();
+    current_policy.required_node_ids = nodes.clone();
+    runtime
+        .apply_placement_policy(&owner, path, DfsPlacementScope::Subtree, current_policy)
+        .unwrap();
+    deny_native_read_repair(&runtime, &owner, &target);
+    let mut first = runtime.client(&owner).unwrap();
+    let bytes = vec![0x76; 2 * 1024 * 1024 + 4096];
+    let version = crate::namespace::next_version(&base.version);
+    let request = DfsWriteRequest {
+        file_system_id: base.file_system_id,
+        object_id: base.object_id.clone(),
+        target_version: version.clone(),
+        requesting_node_id: owner.clone(),
+    };
+    let mut policy = DfsReplicationPolicy::new(2, 3).unwrap();
+    policy.required_node_ids = nodes.clone();
+    let outcome = first
+        .write_distributed_reader_with_candidates(
+            request.clone(),
+            std::io::Cursor::new(&bytes),
+            nodes,
+            policy,
+            DfsDistributedWriteOptions::default(),
+        )
+        .unwrap();
+    first.settle_ready_write_outcome(outcome, true).unwrap();
+    let intent = first
+        .coordinator()
+        .repair_jobs()
+        .iter()
+        .find(|job| {
+            job.object_id == request.object_id
+                && job.version == version
+                && job.missing_replica_node_id == target
+        })
+        .unwrap()
+        .intent_id
+        .clone();
+    first
+        .content()
+        .debug_remove_loose_blob(&content_hash(&bytes))
+        .unwrap();
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    runtime.install_fault(crate::test_support::DfsTestFaultRule {
+        source: Some(owner.clone()),
+        target: Some(source.clone()),
+        route: Some(crate::DFS_DATA_FETCH_BLOB_ROUTE.into()),
+        call_id: None,
+        origin: Some(crate::test_support::DfsTestRpcOrigin::RegisteredHost),
+        remaining_hits: 1,
+        action: crate::test_runtime::FaultAction::AlterFetchReplyAfterDispatch {
+            change: crate::test_runtime::FetchReplyFault::CorruptPayloadAndLength,
+            captured: Arc::clone(&captured),
+        },
+    });
+    for _ in 0..32 {
+        first.retry_pending_repairs_bounded(1).unwrap();
+        if !captured.lock().unwrap().is_empty() {
+            break;
+        }
+    }
+    assert_eq!(captured.lock().unwrap().len(), 1);
+    assert!(
+        first
+            .writes
+            .pending_writes
+            .get(&intent)
+            .unwrap()
+            .fetch_inflight_from
+            .contains(&source)
+    );
+    // A second genuinely hydrated service independently finishes an ordinary
+    // native Fetch into this same content store before the queued duplicate.
+    runtime.clear_faults();
+    deny_native_read_repair(&runtime, &owner, &target);
+    let mut second = runtime.client(&owner).unwrap();
+    second.hydrate_from_metadata_backend().unwrap();
+    for _ in 0..32 {
+        second.retry_pending_repairs_bounded(1).unwrap();
+        second.process_incoming().unwrap();
+        if second
+            .content()
+            .read_object_version(request.object_id.as_str(), version.as_str())
+            .is_ok()
+        {
+            break;
+        }
+    }
     assert_eq!(
-        pending
-            .stage_retries
-            .get(&target)
-            .expect("stage retry")
-            .next_retry_tick,
+        second
+            .content()
+            .read_object_version(request.object_id.as_str(), version.as_str())
+            .unwrap()
+            .1,
+        bytes
+    );
+    let events = first.process_incoming().unwrap();
+    assert!(
+        events.iter().any(
+            |event| matches!(event, NetworkedDfsServiceEvent::BlobFetched {
+        object_id, source_node_id, ..
+    } if object_id == &request.object_id && source_node_id == &source)
+        ),
+        "actual duplicate payload corruption and length change are ignored only after a genuine prior verified binding"
+    );
+    let pending = first.writes.pending_writes.get(&intent).unwrap();
+    assert!(!pending.fetch_inflight_from.contains(&source));
+    assert_eq!(pending.size_bytes, bytes.len() as u64);
+    assert_eq!(
+        pending.stage_retries.get(&target).unwrap().next_retry_tick,
         0
     );
     assert_eq!(
-        dfs.content
-            .read_blob(&manifest.content_hash)
-            .expect("existing blob"),
-        bytes
+        pending.repair_retries.get(&target).unwrap().next_retry_tick,
+        0
     );
-    std::fs::remove_dir_all(root).ok();
+    let stored = first
+        .content()
+        .read_object_version(request.object_id.as_str(), version.as_str())
+        .unwrap();
+    assert_eq!(stored.0.content_hash, content_hash(&bytes));
+    assert_eq!(stored.0.size_bytes, bytes.len() as u64);
+    assert_eq!(stored.1, bytes);
+    drop(second);
+    drop(first);
+    runtime.clear_faults();
+    runtime.close().unwrap();
 }
 
 #[test]
@@ -577,7 +527,10 @@ fn rejected_streamed_stage_does_not_reserve_version_for_later_valid_content() {
         DfsVersion::from_legacy_named("version_streamed_stage_1").expect("base version");
     let version_2 =
         DfsVersion::from_legacy_named("version_streamed_stage_2").expect("target version");
-    let mut dfs = networked_sifs_with_backend(&root, replica.clone());
+    let (_runtime, mut dfs) = native_sifs_service(
+        "rejected_streamed_stage_does_not_reserve_version_for_later_valid_content",
+        replica.clone(),
+    );
     let mut metadata = file_metadata(owner.clone());
     metadata.object_id = object_id.clone();
     metadata.version = version_1.clone();
@@ -738,7 +691,10 @@ fn reconcile_local_manifests_requires_current_blob_bytes() {
     let object_id = DfsObjectId::from_legacy_named("obj_reconcile_missing_blob").expect("object");
     let version = DfsVersion::from_legacy_named("version_2").expect("version");
     let bytes = vec![b'r'; 17 * 1024];
-    let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+    let (_runtime, mut dfs) = native_sifs_service(
+        "reconcile_local_manifests_requires_current_blob_bytes",
+        node_id.clone(),
+    );
     let manifest = dfs
         .content
         .put_object_version(object_id.as_str(), version.as_str(), &bytes)
@@ -747,8 +703,16 @@ fn reconcile_local_manifests_requires_current_blob_bytes() {
         .content_hash
         .strip_prefix("blake3:")
         .expect("blake3 hash");
-    std::fs::remove_file(root.join("content").join("blobs").join(&hex[..2]).join(hex))
-        .expect("remove blob");
+    std::fs::remove_file(
+        _runtime
+            .data_dir(&node_id)
+            .dfs_dir()
+            .join("content")
+            .join("blobs")
+            .join(&hex[..2])
+            .join(hex),
+    )
+    .expect("remove blob");
     let mut metadata = file_metadata(node_id);
     metadata.object_id = object_id.clone();
     metadata.policy = DfsObjectPolicy::ReplicatedEventual;
@@ -763,7 +727,6 @@ fn reconcile_local_manifests_requires_current_blob_bytes() {
         .expect("reconcile");
 
     assert_eq!(reconciliation.refreshed_receipts, 0);
-    assert!(reconciliation.conflicts.is_empty());
     assert!(reconciliation.missing_current);
     assert!(
         dfs.metadata_backend()

@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use super::{POSIX_LINK_COUNT_PAGE_SIZE, POSIX_LIST_DIR_COLLECT_PAGE_SIZE, now_unix_nanos};
 use crate::metadata_pages::try_walk_metadata_pages;
 use crate::namespace::{metadata_path, next_version};
-use crate::posix_model::{DfsPosixError, DfsStat, Result, read_conflict_error};
+use crate::posix_model::{DfsPosixError, DfsStat, Result};
 use crate::posix_object::{object_mode_or_default, object_timestamp_or_default};
 use crate::posix_path::{
     append_posix_components, join_posix_path, normalize_posix_path,
@@ -125,7 +125,29 @@ fn sifs_dir_direct_child_path(
     Some(object_path)
 }
 
-fn compare_directory_page_cursors(
+/// Keep one hop limit and missing-target contract for local and owner reads.
+pub(super) fn resolve_hardlink_target_with(
+    object: &DfsObjectMetadata,
+    mut fetch: impl FnMut(&DfsObjectId) -> Result<Option<DfsObjectMetadata>>,
+) -> Result<DfsObjectMetadata> {
+    let mut current = object.clone();
+    for _ in 0..16 {
+        if current.kind != DfsObjectKind::Hardlink {
+            return Ok(current);
+        }
+        let Some(target_id) = current.link_target_object_id.clone() else {
+            return Err(DfsPosixError::NotFound { path: current.path });
+        };
+        current = fetch(&target_id)?.ok_or_else(|| DfsPosixError::NotFound {
+            path: current.path.clone(),
+        })?;
+    }
+    Err(DfsPosixError::InvalidPath {
+        path: object.path.clone(),
+    })
+}
+
+pub(super) fn compare_directory_page_cursors(
     left: &DfsDirectoryPageCursor,
     right: &DfsDirectoryPageCursor,
 ) -> Ordering {
@@ -149,6 +171,86 @@ fn sort_directory_page_entries(entries: &mut [(DfsDirectoryPageCursor, DfsObject
     entries.sort_by(|(left_cursor, _), (right_cursor, _)| {
         compare_directory_page_cursors(left_cursor, right_cursor)
     });
+}
+
+pub(super) fn symlink_target_from_distributed_read_outcome(
+    path: &str,
+    outcome: NetworkedDfsReadOutcome,
+) -> Result<String> {
+    match outcome {
+        NetworkedDfsReadOutcome::Found {
+            data: DfsReadData { bytes, .. },
+            ..
+        } => String::from_utf8(bytes).map_err(|_| DfsPosixError::InvalidPath {
+            path: path.to_string(),
+        }),
+        NetworkedDfsReadOutcome::PendingReplication {
+            object_id,
+            version,
+            current_locations,
+            ..
+        } => {
+            let detail = format!(
+                "replication pending for object {object_id} version {version} at {current_locations:?}"
+            );
+            tracing::debug!(
+                target: "sinomo.dfs.posix",
+                symlink_path = %path,
+                object_id = %object_id,
+                version = %version,
+                current_locations = ?current_locations,
+                stage = "fetch-link-body",
+                outcome = "pending-replication",
+                "distributed symlink follow is waiting for link content"
+            );
+            Err(DfsPosixError::SymlinkContentPending {
+                path: path.to_string(),
+                stage: "fetch-link-body".to_string(),
+                detail,
+            })
+        }
+        NetworkedDfsReadOutcome::NotConfirmed {
+            object_id,
+            version,
+            confirmed_locations,
+            required_locations,
+        } => {
+            let detail = format!(
+                "object {object_id} version {version} is confirmed at {confirmed_locations:?}, required {required_locations:?}"
+            );
+            tracing::debug!(
+                target: "sinomo.dfs.posix",
+                symlink_path = %path,
+                object_id = %object_id,
+                version = %version,
+                confirmed_locations = ?confirmed_locations,
+                required_locations = ?required_locations,
+                stage = "fetch-link-body",
+                outcome = "not-confirmed",
+                "distributed symlink follow is waiting for confirmed link content"
+            );
+            Err(DfsPosixError::SymlinkContentPending {
+                path: path.to_string(),
+                stage: "fetch-link-body".to_string(),
+                detail,
+            })
+        }
+        NetworkedDfsReadOutcome::NotFound => {
+            tracing::warn!(
+                target: "sinomo.dfs.posix",
+                symlink_path = %path,
+                stage = "fetch-link-body",
+                outcome = "content-not-found",
+                "authoritative symlink metadata has no readable link content"
+            );
+            Err(DfsPosixError::SymlinkContentPending {
+                path: path.to_string(),
+                stage: "fetch-link-body".to_string(),
+                detail: "authoritative symlink metadata has no readable content location"
+                    .to_string(),
+            })
+        }
+    }
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
@@ -591,9 +693,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             | NetworkedDfsReadOutcome::NotFound => Err(DfsPosixError::NotFound {
                 path: path.to_string(),
             }),
-            NetworkedDfsReadOutcome::Conflicted { conflicts, .. } => {
-                Err(read_conflict_error(path.to_string(), conflicts))
-            }
         }
     }
 
@@ -608,91 +707,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             });
         }
         let outcome = self.read_object_metadata_or_fetch_remote_without_cache(object)?;
-        self.symlink_target_from_distributed_read_outcome(path, outcome)
-    }
-
-    pub(super) fn symlink_target_from_distributed_read_outcome(
-        &self,
-        path: &str,
-        outcome: NetworkedDfsReadOutcome,
-    ) -> Result<String> {
-        match outcome {
-            NetworkedDfsReadOutcome::Found {
-                data: DfsReadData { bytes, .. },
-                ..
-            } => String::from_utf8(bytes).map_err(|_| DfsPosixError::InvalidPath {
-                path: path.to_string(),
-            }),
-            NetworkedDfsReadOutcome::PendingReplication {
-                object_id,
-                version,
-                current_locations,
-                ..
-            } => {
-                let detail = format!(
-                    "replication pending for object {object_id} version {version} at {current_locations:?}"
-                );
-                tracing::debug!(
-                    target: "sinomo.dfs.posix",
-                    symlink_path = %path,
-                    object_id = %object_id,
-                    version = %version,
-                    current_locations = ?current_locations,
-                    stage = "fetch-link-body",
-                    outcome = "pending-replication",
-                    "distributed symlink follow is waiting for link content"
-                );
-                Err(DfsPosixError::SymlinkContentPending {
-                    path: path.to_string(),
-                    stage: "fetch-link-body".to_string(),
-                    detail,
-                })
-            }
-            NetworkedDfsReadOutcome::NotConfirmed {
-                object_id,
-                version,
-                confirmed_locations,
-                required_locations,
-            } => {
-                let detail = format!(
-                    "object {object_id} version {version} is confirmed at {confirmed_locations:?}, required {required_locations:?}"
-                );
-                tracing::debug!(
-                    target: "sinomo.dfs.posix",
-                    symlink_path = %path,
-                    object_id = %object_id,
-                    version = %version,
-                    confirmed_locations = ?confirmed_locations,
-                    required_locations = ?required_locations,
-                    stage = "fetch-link-body",
-                    outcome = "not-confirmed",
-                    "distributed symlink follow is waiting for confirmed link content"
-                );
-                Err(DfsPosixError::SymlinkContentPending {
-                    path: path.to_string(),
-                    stage: "fetch-link-body".to_string(),
-                    detail,
-                })
-            }
-            NetworkedDfsReadOutcome::NotFound => {
-                tracing::warn!(
-                    target: "sinomo.dfs.posix",
-                    symlink_path = %path,
-                    stage = "fetch-link-body",
-                    outcome = "content-not-found",
-                    "authoritative symlink metadata has no readable link content"
-                );
-                Err(DfsPosixError::SymlinkContentPending {
-                    path: path.to_string(),
-                    stage: "fetch-link-body".to_string(),
-                    detail: "authoritative symlink metadata has no readable content location"
-                        .to_string(),
-                })
-            }
-            NetworkedDfsReadOutcome::Conflicted { conflicts, .. } => {
-                Err(read_conflict_error(path.to_string(), conflicts))
-            }
-        }
+        symlink_target_from_distributed_read_outcome(path, outcome)
     }
 
     pub(super) fn lookup_metadata_path(
@@ -982,10 +997,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             after.is_some_and(|cursor| cursor.dentry.is_none() && cursor.shard_id.is_none());
         let needs_overlay_merge =
             self.has_transient_child_overlay_for_sifs_dir(&file_system_id, path);
-        // Preserve legacy path-only cursors emitted by older processes during
-        // a rolling upgrade. New backed walks never emit this mode, including
-        // when they merge transient namespace entries.
-        if self.metadata_backend.is_none() || path_cursor_active {
+        if path_cursor_active && self.metadata_backend.is_some() {
+            return Err(DfsPosixError::InvalidPath {
+                path: path.to_owned(),
+            });
+        }
+        if self.metadata_backend.is_none() {
             let mut objects = self.child_objects_for_sifs_dir(path)?;
             objects.sort_by(|left, right| {
                 left.path
@@ -1319,23 +1336,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &self,
         object: &DfsObjectMetadata,
     ) -> Result<DfsObjectMetadata> {
-        let mut current = object.clone();
-        for _ in 0..16 {
-            if current.kind != DfsObjectKind::Hardlink {
-                return Ok(current);
-            }
-            let Some(target_id) = current.link_target_object_id.clone() else {
-                return Err(DfsPosixError::NotFound { path: current.path });
-            };
-            current = self
-                .object_by_id(&target_id)?
-                .ok_or_else(|| DfsPosixError::NotFound {
-                    path: current.path.clone(),
-                })?;
-        }
-        Err(DfsPosixError::InvalidPath {
-            path: object.path.clone(),
-        })
+        resolve_hardlink_target_with(object, |target_id| self.object_by_id(target_id))
     }
 
     /// Stat for a path that a routed unlink/rmdir just tombstoned; the
@@ -1651,32 +1652,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 #[cfg(test)]
 mod symlink_follow_tests {
     use super::*;
-    use crate::{DfsVersion, LocalContentStore};
-    use sinomo_core::network::InProcessNetwork;
+    use crate::DfsVersion;
     use sinomo_core::node::NodeId;
 
     #[test]
     fn transient_symlink_read_outcomes_remain_retryable_and_diagnostic() {
-        let root = sinomo_testdir::TestDir::new("dfs-symlink-transient-read-outcomes");
         let node = NodeId::from_legacy_named("node_symlink_outcome_reader").expect("node");
-        let service = NetworkedDfsService::new(
-            InProcessNetwork::new().add_node(node.clone()),
-            LocalContentStore::new(root.join("content")).expect("content store"),
-        );
         let object_id = DfsObjectId::from_legacy_named("obj_symlink_outcome").expect("object id");
         let version = DfsVersion::from_legacy_named("version_symlink_outcome").expect("version");
 
-        let pending = service
-            .symlink_target_from_distributed_read_outcome(
-                "/services/link",
-                NetworkedDfsReadOutcome::PendingReplication {
-                    object_id: object_id.clone(),
-                    version: version.clone(),
-                    content_hash: Some("blake3:pending".to_string()),
-                    current_locations: vec![node.clone()],
-                },
-            )
-            .expect_err("pending replication cannot resolve a symlink yet");
+        let pending = symlink_target_from_distributed_read_outcome(
+            "/services/link",
+            NetworkedDfsReadOutcome::PendingReplication {
+                object_id: object_id.clone(),
+                version: version.clone(),
+                content_hash: Some("blake3:pending".to_string()),
+                current_locations: vec![node.clone()],
+            },
+        )
+        .expect_err("pending replication cannot resolve a symlink yet");
         assert!(
             matches!(
                 &pending,
@@ -1691,17 +1685,16 @@ mod symlink_follow_tests {
             "unexpected pending replication mapping: {pending:?}"
         );
 
-        let not_confirmed = service
-            .symlink_target_from_distributed_read_outcome(
-                "/services/link",
-                NetworkedDfsReadOutcome::NotConfirmed {
-                    object_id,
-                    version,
-                    confirmed_locations: vec![node.clone()],
-                    required_locations: vec![node],
-                },
-            )
-            .expect_err("unconfirmed content cannot resolve a symlink yet");
+        let not_confirmed = symlink_target_from_distributed_read_outcome(
+            "/services/link",
+            NetworkedDfsReadOutcome::NotConfirmed {
+                object_id,
+                version,
+                confirmed_locations: vec![node.clone()],
+                required_locations: vec![node],
+            },
+        )
+        .expect_err("unconfirmed content cannot resolve a symlink yet");
         assert!(
             matches!(
                 &not_confirmed,

@@ -2877,7 +2877,7 @@ impl TuiState {
 
     fn apply_tool_progress_event(&mut self, event: AgentToolProgressEvent) {
         match event {
-            AgentToolProgressEvent::ProcessStarted { process } => {
+            AgentToolProgressEvent::ProcessStarted { process, .. } => {
                 self.runtime_activity.active = true;
                 self.runtime_activity.active_command = Some(process.command.clone());
                 self.stream_message = None;
@@ -2887,13 +2887,13 @@ impl TuiState {
                     format!("command started: {}", process.command),
                 );
             }
-            AgentToolProgressEvent::ProcessOutput { process } => {
+            AgentToolProgressEvent::ProcessOutput { process, .. } => {
                 self.runtime_activity.active = true;
                 self.status = "running command".to_string();
                 self.append_runtime_process_output("stdout", &process.stdout);
                 self.append_runtime_process_output("stderr", &process.stderr);
             }
-            AgentToolProgressEvent::ProcessCompleted { process } => {
+            AgentToolProgressEvent::ProcessCompleted { process, .. } => {
                 self.runtime_activity.active = false;
                 self.runtime_activity.active_command = None;
                 self.stream_message = None;
@@ -2917,6 +2917,18 @@ impl TuiState {
             AgentToolProgressEvent::Artifacts { .. } => {}
             AgentToolProgressEvent::Message { summary, .. } => {
                 self.push_message(TuiMessageKind::System, summary);
+            }
+            AgentToolProgressEvent::DetachedStarted { tool, task_id, .. } => {
+                self.push_message(
+                    TuiMessageKind::System,
+                    format!("{tool} continues in the background ({task_id})"),
+                );
+            }
+            AgentToolProgressEvent::DetachedCompleted { update } => {
+                self.push_message(
+                    TuiMessageKind::System,
+                    format!("background task {} finished", update.task_id),
+                );
             }
         }
     }
@@ -5496,6 +5508,7 @@ mod tui_tests {
             sequence: 1,
             op_id: sinomo_agent::TaskId::generate(),
             event: AgentToolProgressEvent::ProcessStarted {
+                call: None,
                 process: process_snapshot(
                     sinomo_agent::AgentProcessLifecycleStatus::Running,
                     "",
@@ -5507,6 +5520,7 @@ mod tui_tests {
             sequence: 1,
             op_id: sinomo_agent::TaskId::generate(),
             event: AgentToolProgressEvent::ProcessOutput {
+                call: None,
                 process: process_snapshot(
                     sinomo_agent::AgentProcessLifecycleStatus::Running,
                     "hello\n",
@@ -5528,6 +5542,7 @@ mod tui_tests {
             sequence: 1,
             op_id: sinomo_agent::TaskId::generate(),
             event: AgentToolProgressEvent::ProcessCompleted {
+                call: None,
                 process: process_snapshot(
                     sinomo_agent::AgentProcessLifecycleStatus::Completed,
                     "",
@@ -7902,6 +7917,25 @@ impl<S: EventStore, H: InteractionEventHandler> InteractionRuntime<S, H> {
             .handle_event_streaming(&mut self.store, &self.session, &event, emit)
     }
 
+    /// Continue the session with a completed detached tool call, under
+    /// surface-owned system context and without a new user message.
+    pub fn ingest_async_update_streaming(
+        &mut self,
+        system_context: &str,
+        update: &sinomo_agent::AsyncTaskUpdate,
+        emit: &mut dyn FnMut(InteractionOutput),
+    ) -> Result<Vec<InteractionOutput>, CliError> {
+        let mut event = user_interaction_input_event(&self.session, "");
+        event.payload["transient_system_context"] = serde_json::json!(system_context);
+        event.payload["async_update"] =
+            serde_json::to_value(update).map_err(|source| CliError::Parse {
+                detail: format!("serialize async update failed: {source}"),
+            })?;
+        self.store.append(event.clone())?;
+        self.handler
+            .handle_event_streaming(&mut self.store, &self.session, &event, emit)
+    }
+
     pub fn append_session_context(&mut self, event: EventEnvelope) -> Result<(), CliError> {
         self.store.append(event)?;
         Ok(())
@@ -8487,7 +8521,13 @@ where
                     session.agent_definition_key = Some(self.agent_definition.key().to_string());
                 }
                 let runtime = self.build_runtime(model, session);
-                if let Err(error) = self.register_runtime_control(&runtime) {
+                // The session's detached calls outlive the runtime being
+                // replaced: queue the completions it had not continued with.
+                let attached = runtime
+                    .restore_detached_calls()
+                    .map_err(CliError::from)
+                    .and_then(|()| self.register_runtime_control(&runtime));
+                if let Err(error) = attached {
                     if let Some(transition) = recall_transition {
                         self.tool_registry
                             .replace_registered_tools_from(&transition.previous);
@@ -8673,6 +8713,26 @@ where
                 ),
             }
         }
+    }
+
+    /// Completions of the session's detached tool calls waiting to be
+    /// continued with, oldest first.
+    pub(crate) fn take_async_updates(&self) -> Vec<sinomo_agent::AsyncTaskUpdate> {
+        self.ready_runtime()
+            .map(AgentSessionRuntime::take_async_updates)
+            .unwrap_or_default()
+    }
+
+    /// A running turn, detached tool calls, or completions waiting to be
+    /// continued with. An unreadable runtime counts as busy.
+    pub(crate) fn has_running_work(&self) -> bool {
+        self.ready_runtime()
+            .is_some_and(|runtime| runtime.has_running_work().unwrap_or(true))
+    }
+
+    pub(crate) fn has_async_updates(&self) -> bool {
+        self.ready_runtime()
+            .is_some_and(AgentSessionRuntime::has_async_updates)
     }
 
     pub(crate) fn agent_session_snapshot(&self) -> Result<Option<AgentSession>, CliError> {
@@ -10188,6 +10248,14 @@ where
             }
             None => Vec::new(),
         };
+        let async_update = event
+            .payload
+            .get("async_update")
+            .map(|value| serde_json::from_value::<sinomo_agent::AsyncTaskUpdate>(value.clone()))
+            .transpose()
+            .map_err(|source| CliError::Parse {
+                detail: format!("parse async update failed: {source}"),
+            })?;
         let mut transient_system_context = event
             .payload
             .get("transient_system_context")
@@ -10260,7 +10328,7 @@ where
             session: session.clone(),
             latest_event: message.clone(),
             transient_system_context,
-            async_update: None,
+            async_update,
             context_attachments,
             tool_specs: Vec::new(),
         };

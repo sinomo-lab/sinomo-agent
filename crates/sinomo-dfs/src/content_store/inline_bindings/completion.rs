@@ -1,9 +1,9 @@
 //! Reuse a durable binding only at canonical current-write completion.
 //!
 //! Generic staging remains a renewal. This seam additionally requires the
-//! response handler's current-publication proof and every physical reservation
-//! copy to belong to the current catalog cut. An old scan must not consume a
-//! reservation merely because a merged inventory hid its older provenance.
+//! response handler's current-publication proof and the live reservation's
+//! exact current catalog cut. An old scan must not consume a reservation whose
+//! causal stamp has advanced.
 
 use super::*;
 use crate::service_routed_write::CanonicalCurrentWriteCompletion;
@@ -23,7 +23,7 @@ impl LocalContentStore {
         let _owner = self.content_mutation_guard()?;
         if self.inline_sentinel_unlocked()?.is_none()
             || !manifest.extents.is_empty()
-            || manifest.size_bytes > PACKED_BLOB_SMALL_LIMIT_BYTES
+            || manifest.size_bytes > INLINE_BLOB_SMALL_LIMIT_BYTES
             || manifest.content_hash == intrinsic_empty_content_hash()
         {
             return Ok(None);
@@ -54,7 +54,7 @@ impl LocalContentStore {
                 .live_manifest(&manifest.object_id, &manifest.version)
                 != Some(manifest)
                 || !matches!(state.view.reservations.get(&identity),
-                    Some(InlineReservationState::Live(record)) if record.causal_stamp.as_ref() == Some(&stamp))
+                    Some(InlineReservationState::Live(record)) if record.causal_stamp == stamp)
                 || state.view.deleted_blobs.contains(&manifest.content_hash)
             {
                 return Ok(None);
@@ -67,17 +67,9 @@ impl LocalContentStore {
             }
             blob.clone()
         };
-        // Keep the owner and reservation fence, but release the resident mutex
-        // before the exact identity lookup acquires that mutex again. This
-        // retains every legacy copy without cloning unrelated inline roots.
-        let copies = self.reservation_copies_for_identity_unlocked(&identity)?;
-        if copies.is_empty()
-            || copies
-                .iter()
-                .any(|record| record.causal_stamp.as_ref() != Some(&stamp))
-        {
-            return Ok(None);
-        }
+        // Keep both owner and reservation fence through completion. The live
+        // reservation was checked against this exact stamp under the resident
+        // mutex above; these locks prevent a renewal or release in between.
         // The certified frame owns this exact payload. Check the bounded bytes
         // as well: a missing or damaged source must not turn completion into a
         // successful local publication. The mutation owner pins the generation.
@@ -239,65 +231,56 @@ mod tests {
     }
 
     #[test]
-    fn canonical_completion_never_hides_unknown_foreign_or_older_duplicate() {
-        for duplicate_kind in ["unknown", "foreign", "older", "exact"] {
-            let (_root, _owner, store) =
-                active_store(&format!("dfs-inline-completion-duplicate-{duplicate_kind}"));
-            store.begin_content_root_catalog_scan().unwrap();
-            let manifest = store
-                .put_object_version("object", "v1", b"same tuple")
-                .unwrap();
-            let mut stamp = store.inline_sentinel_unlocked().unwrap().unwrap().stamp();
-            match duplicate_kind {
-                "foreign" => stamp.store_incarnation = sinomo_core::Id::generate().to_string(),
-                "older" => stamp.catalog_scan_epoch -= 1,
-                _ => {}
-            }
-            let copy = ContentStoreReservation {
-                format_version: if duplicate_kind == "unknown" {
-                    1
-                } else {
-                    CONTENT_RESERVATION_FORMAT_VERSION
-                },
-                identity: identity(&manifest),
-                reserved_at_unix_nanos: u64::MAX - 1,
-                causal_stamp: (duplicate_kind != "unknown").then_some(stamp),
-            };
-            write_file_atomic(
-                &store.content_reservation_path(&copy.identity),
-                &encode_content_reservation(&copy).unwrap(),
-            )
+    fn canonical_completion_rejects_invalid_provenance_and_requires_current_cut() {
+        let (_root, _owner, store) = active_store("dfs-inline-completion-provenance");
+        store.begin_content_root_catalog_scan().unwrap();
+        let manifest = store
+            .put_object_version("object", "v1", b"same tuple")
             .unwrap();
+        let original = store.content_reservation_roots().unwrap().reservations[0].clone();
+        for stamp in [ContentStoreCausalStamp {
+            store_incarnation: sinomo_core::Id::generate().to_string(),
+            catalog_scan_epoch: 0,
+        }] {
             let before = sequence(&store);
-            let completed = store
-                .try_complete_current_inline_manifest(&manifest)
-                .unwrap();
-            assert_eq!(
-                completed.is_some(),
-                duplicate_kind == "exact",
-                "{duplicate_kind}"
-            );
-            assert_eq!(sequence(&store), before);
-            if duplicate_kind != "exact" {
-                store
-                    .put_blob_only_manifest(
-                        "object",
-                        "v1",
-                        &manifest.content_hash,
-                        manifest.size_bytes,
-                    )
-                    .unwrap();
-                assert!(sequence(&store) > before);
+            {
+                let _owner = store.content_mutation_guard().unwrap();
+                let reservation = store.lock_content_reservations_for_write().unwrap();
+                let mut invalid = original.clone();
+                invalid.causal_stamp = stamp;
                 assert!(
                     store
-                        .content_reservation_roots()
-                        .unwrap()
-                        .reservations
-                        .iter()
-                        .any(|record| record.identity == copy.identity)
+                        .inline_reserve_owned_identity_unlocked(&invalid, &reservation.sentinel)
+                        .is_err()
                 );
             }
+            assert_eq!(sequence(&store), before);
+            assert_eq!(
+                store
+                    .try_complete_current_inline_manifest(&manifest)
+                    .unwrap(),
+                Some(manifest.clone())
+            );
         }
+        store.begin_content_root_catalog_scan().unwrap();
+        let before = sequence(&store);
+        assert_eq!(
+            store
+                .try_complete_current_inline_manifest(&manifest)
+                .unwrap(),
+            None
+        );
+        assert_eq!(sequence(&store), before);
+        store
+            .put_blob_only_manifest("object", "v1", &manifest.content_hash, manifest.size_bytes)
+            .unwrap();
+        assert!(sequence(&store) > before);
+        assert_eq!(
+            store
+                .try_complete_current_inline_manifest(&manifest)
+                .unwrap(),
+            Some(manifest)
+        );
     }
 
     #[test]
@@ -345,11 +328,15 @@ mod tests {
     }
 
     #[test]
-    fn canonical_completion_legacy_binding_takes_generic_renewal() {
+    fn canonical_completion_external_binding_takes_generic_renewal() {
         let root = sinomo_testdir::TestDir::new("dfs-inline-completion-legacy");
         let store = LocalContentStore::new(root.path()).unwrap();
         let manifest = store
-            .put_object_version("object", "v1", b"legacy bytes")
+            .put_object_version(
+                "object",
+                "v1",
+                &vec![b'x'; INLINE_BLOB_SMALL_LIMIT_BYTES as usize + 1],
+            )
             .unwrap();
         assert_eq!(
             store
@@ -362,7 +349,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             store.read_object_version("object", "v1").unwrap().1,
-            b"legacy bytes"
+            vec![b'x'; INLINE_BLOB_SMALL_LIMIT_BYTES as usize + 1]
         );
     }
 }

@@ -112,10 +112,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 path: format!("{path}: directory sync kind used for a file"),
             });
         }
-        let path = self.resolve_existing_posix_path_distributed(path, true)?;
-        let object = self
-            .lookup_sifs_path(&path)?
-            .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
+        let (path, object) = self.lookup_sifs_path_distributed_synced(path, true)?;
+        let object = object.ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
         let object = self.resolve_hardlink_target(&object)?;
         if object.kind == DfsObjectKind::Directory {
             return Err(DfsPosixError::IsDirectory { path });
@@ -445,10 +443,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         path: &str,
     ) -> Result<DfsPosixDirectorySyncTarget> {
         let _namespace_plan = self.namespace_execution.begin_planning();
-        let path = self.resolve_existing_posix_path_distributed(path, true)?;
-        let object = self
-            .lookup_sifs_path(&path)?
-            .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
+        let (path, object) = self.lookup_sifs_path_distributed_synced(path, true)?;
+        let object = object.ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
         if object.kind != DfsObjectKind::Directory {
             return Err(DfsPosixError::NotDirectory { path });
         }
@@ -715,33 +711,20 @@ mod tests {
     };
 
     struct PosixSyncFixture {
-        _root: sinomo_testdir::TestDir,
+        _runtime: crate::test_runtime::DfsTestRuntime,
         owner: NodeId,
         service: NetworkedDfsService<crate::DfsNodeTransport>,
     }
 
     fn sync_fixture(name: &str) -> PosixSyncFixture {
-        let root = sinomo_testdir::TestDir::new(&format!("sinomo-dfs-posix-sync-{name}"));
-        let owner =
-            NodeId::from_legacy_named(format!("node_posix_sync_{name}")).expect("test node id");
-        let backend = LocalSobjMetadataBackend::new(
-            DfsMetadataShardId::new("root"),
-            root.path().join("metadata"),
-        )
-        .expect("metadata backend");
-        let mut service = NetworkedDfsService::new(
-            crate::test_runtime::DfsTestRuntime::local_transport(owner.clone()),
-            LocalContentStore::new(root.path().join("content")).expect("content store"),
-        )
-        .with_metadata_backend(backend)
-        .expect("metadata-backed service");
-        service
-            .bootstrap_distributed_sifs()
-            .expect("bootstrap distributed sifs");
+        let owner = crate::test_runtime::DfsTestRuntime::ordered_node_ids(name, 1).remove(0);
+        let mut runtime = crate::test_runtime::DfsTestRuntime::new(name, owner.clone()).unwrap();
+        runtime.start_nodes().unwrap();
+        let service = runtime.client(&owner).unwrap();
         PosixSyncFixture {
-            _root: root,
             owner,
             service,
+            _runtime: runtime,
         }
     }
 
@@ -778,167 +761,6 @@ mod tests {
             .posix_sync_file_local(&target, Duration::ZERO)
             .expect("the captured historical version remains independently certifiable");
         assert_eq!(certificate.target, target);
-    }
-
-    #[test]
-    fn file_sync_uses_the_desired_replica_threshold_and_rejects_wrong_hash_targets() {
-        let mut fixture = sync_fixture("receipt_threshold");
-        let offline =
-            NodeId::from_legacy_named("node_posix_sync_offline_replica").expect("offline node id");
-        fixture
-            .service
-            .posix_write_file(
-                "/services/eventual-sync.txt",
-                b"one of two desired replicas is enough to commit",
-                DfsWriteOptions {
-                    policy: DfsReplicationPolicy::new(1, 2).expect("eventual policy"),
-                    replica_candidates: vec![fixture.owner.clone(), offline.clone()],
-                    wait_for_commit: true,
-                    foreground_replica_repair: false,
-                },
-            )
-            .expect("eventual write");
-        let target = fixture
-            .service
-            .posix_capture_file_sync_target("/services/eventual-sync.txt", DfsPosixSyncKind::File)
-            .expect("capture file target");
-        let pending = fixture
-            .service
-            .posix_validate_file_sync_target_local(&target)
-            .expect_err("fsync must wait for the desired replica count");
-        assert!(matches!(
-            pending,
-            DfsPosixError::PendingWrite {
-                durable_receipts: 1,
-                required_receipts: 2,
-                ..
-            }
-        ));
-
-        let outsider = NodeId::from_legacy_named("node_posix_sync_unnamed_receipt")
-            .expect("unnamed receipt node id");
-        let (named_receipt, outsider_receipt) = {
-            let backend = fixture
-                .service
-                .metadata_backend
-                .as_ref()
-                .expect("metadata backend");
-            let receipt = backend
-                .receipts_for_version(&target.object_id, &target.version)
-                .expect("receipts")
-                .into_iter()
-                .next()
-                .expect("local exact receipt");
-            (
-                crate::DfsReplicaReceiptRecord {
-                    replica_node_id: offline.clone(),
-                    ..receipt.clone()
-                },
-                crate::DfsReplicaReceiptRecord {
-                    replica_node_id: outsider,
-                    ..receipt
-                },
-            )
-        };
-        let backend = fixture
-            .service
-            .metadata_backend
-            .as_mut()
-            .expect("metadata backend");
-        backend
-            .put_receipt(&outsider_receipt)
-            .expect("record exact receipt for unnamed node");
-        let unnamed_pending = fixture
-            .service
-            .posix_validate_file_sync_target_local(&target)
-            .expect_err("an unnamed node cannot substitute for a desired node");
-        assert!(matches!(
-            unnamed_pending,
-            DfsPosixError::PendingWrite {
-                durable_receipts: 1,
-                required_receipts: 2,
-                ..
-            }
-        ));
-        fixture
-            .service
-            .metadata_backend
-            .as_mut()
-            .expect("metadata backend")
-            .put_receipt(&named_receipt)
-            .expect("record exact receipt for named desired node");
-        let evidence = fixture
-            .service
-            .posix_validate_file_sync_target_local(&target)
-            .expect("every named desired node has an exact receipt");
-        let mut expected_receipt_nodes = vec![fixture.owner.clone(), offline];
-        expected_receipt_nodes.sort();
-        assert_eq!(evidence.required_receipts, 2);
-        assert_eq!(evidence.receipt_node_ids, expected_receipt_nodes);
-
-        let mut wrong_hash = target;
-        wrong_hash.content_hash = "blake3:not-the-committed-content".to_string();
-        assert!(matches!(
-            fixture
-                .service
-                .posix_validate_file_sync_target_local(&wrong_hash),
-            Err(DfsPosixError::Conflict { .. })
-        ));
-    }
-
-    #[test]
-    fn file_sync_rejects_a_desired_node_set_with_the_wrong_cardinality() {
-        let mut fixture = sync_fixture("desired_cardinality");
-        let offline = NodeId::from_legacy_named("node_posix_sync_cardinality_offline")
-            .expect("offline node id");
-        fixture
-            .service
-            .posix_write_file(
-                "/services/cardinality-sync.txt",
-                b"committed with a well-formed two-node placement",
-                DfsWriteOptions {
-                    policy: DfsReplicationPolicy::new(1, 2).expect("eventual policy"),
-                    replica_candidates: vec![fixture.owner.clone(), offline],
-                    wait_for_commit: true,
-                    foreground_replica_repair: false,
-                },
-            )
-            .expect("eventual write");
-        let target = fixture
-            .service
-            .posix_capture_file_sync_target(
-                "/services/cardinality-sync.txt",
-                DfsPosixSyncKind::FileData,
-            )
-            .expect("capture target");
-        let extra =
-            NodeId::from_legacy_named("node_posix_sync_cardinality_extra").expect("extra node id");
-        let backend = fixture
-            .service
-            .metadata_backend
-            .as_mut()
-            .expect("metadata backend");
-        let mut intent = backend
-            .intents_for_object(&target.object_id)
-            .expect("intents")
-            .into_iter()
-            .find(|intent| intent.target_version == target.version)
-            .expect("matching intent");
-        intent.desired_replica_node_ids.push(extra);
-        backend
-            .put_intent(&intent)
-            .expect("persist malformed desired-node set");
-
-        let error = fixture
-            .service
-            .posix_validate_file_sync_target_local(&target)
-            .expect_err("fsync must reject a desired-node cardinality mismatch");
-        assert!(matches!(
-            error,
-            DfsPosixError::Conflict { reason, .. }
-                if reason.contains("names 3 unique desired nodes")
-                    && reason.contains("requires exactly 2")
-        ));
     }
 
     #[test]

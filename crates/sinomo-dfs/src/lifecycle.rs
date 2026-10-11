@@ -271,21 +271,15 @@ pub struct DfsRevisionMetadataContribution {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
 #[serde(tag = "operation", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum DfsContentReferenceOperation {
-    #[serde(rename = "capture", alias = "capture-current")]
     CaptureCurrent {
-        #[serde(rename = "pin_id", alias = "reference_id")]
         reference_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         metadata: Option<DfsModuleMetadataValue>,
     },
-    #[serde(rename = "pin", alias = "retain")]
     Retain {
-        #[serde(rename = "pin_id", alias = "reference_id")]
         reference_id: String,
     },
-    #[serde(rename = "unpin", alias = "release")]
     Release {
-        #[serde(rename = "pin_id", alias = "reference_id")]
         reference_id: String,
     },
 }
@@ -300,9 +294,9 @@ impl DfsContentReferenceOperation {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct DfsContentReferenceRequest {
-    pub wire_format: DfsContentReferenceFormat,
     pub namespace: String,
     pub path: String,
     pub identity: DfsRevisionReference,
@@ -326,20 +320,7 @@ impl DfsContentReferenceRequest {
                 "content reference requires a bounded locator and reference identity".into(),
             ));
         }
-        if self.wire_format == DfsContentReferenceFormat::Legacy
-            && (self.namespace != legacy_reference_namespace()
-                || matches!(
-                    &self.operation,
-                    DfsContentReferenceOperation::CaptureCurrent {
-                        metadata: Some(_),
-                        ..
-                    }
-                ))
-        {
-            return Err(invalid(
-                "legacy content reference contains unencoded namespace or metadata".into(),
-            ));
-        }
+
         if let DfsContentReferenceOperation::CaptureCurrent {
             metadata: Some(metadata),
             ..
@@ -355,88 +336,12 @@ impl DfsContentReferenceRequest {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DfsContentReferenceFormat {
-    Legacy,
-    NamespacedV6,
-}
-
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DfsContentReferenceWire {
-    #[serde(
-        default,
-        deserialize_with = "sinomo_api::dfs::metadata_records::deserialize_present_value"
-    )]
-    namespace: Option<String>,
-    path: String,
-    identity: DfsRevisionReference,
-    operation: DfsContentReferenceOperation,
-    operation_id: String,
-}
-
-impl<'de> serde::Deserialize<'de> for DfsContentReferenceRequest {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let wire = <DfsContentReferenceWire as serde::Deserialize>::deserialize(deserializer)?;
-        let wire_format = if wire.namespace.is_some() {
-            DfsContentReferenceFormat::NamespacedV6
-        } else {
-            DfsContentReferenceFormat::Legacy
-        };
-        Ok(Self {
-            wire_format,
-            namespace: wire.namespace.unwrap_or_else(legacy_reference_namespace),
-            path: wire.path,
-            identity: wire.identity,
-            operation: wire.operation,
-            operation_id: wire.operation_id,
-        })
-    }
-}
-
-impl serde::Serialize for DfsContentReferenceRequest {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeStruct;
-        let legacy = self.wire_format == DfsContentReferenceFormat::Legacy;
-        let mut state = serializer
-            .serialize_struct("DfsContentReferenceRequest", if legacy { 4 } else { 5 })?;
-        // Legacy operation digests depend on the original field order too.
-        state.serialize_field("path", &self.path)?;
-        state.serialize_field("identity", &self.identity)?;
-        let operation = match &self.operation {
-            DfsContentReferenceOperation::CaptureCurrent { reference_id, .. } if legacy => {
-                DfsContentReferenceOperation::CaptureCurrent {
-                    reference_id: reference_id.clone(),
-                    metadata: None,
-                }
-            }
-            operation => operation.clone(),
-        };
-        state.serialize_field("operation", &operation)?;
-        state.serialize_field("operation_id", &self.operation_id)?;
-        if !legacy {
-            state.serialize_field("namespace", &self.namespace)?;
-        }
-        state.end()
-    }
-}
-
-// Compatibility for admitted jobs and reference rows authored before v6.
-// New module calls always supply their declared namespace explicitly.
-pub(crate) fn legacy_reference_namespace() -> String {
-    "module.dfs.history".into()
-}
-
 pub fn content_reference_storage_id(namespace: &str, reference_id: &str) -> String {
     format!("ref/{namespace}/{reference_id}")
 }
 
 pub fn content_reference_record_id(record: &DfsContentReferenceRecord) -> String {
-    if record.namespace.is_some() {
-        record.pin_id.clone()
-    } else {
-        content_reference_storage_id(&legacy_reference_namespace(), &record.pin_id)
-    }
+    record.pin_id.clone()
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
@@ -489,14 +394,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             "metadata-contribution:{namespace}:{}",
             contribution.operation_id
         );
-        if let Some(transaction) = backend.get_namespace_transaction(&transaction_id)? {
-            if transaction.contribution_digest.as_deref() == Some(contribution_digest.as_str()) {
-                return Ok(());
-            }
-            return Err(invalid(
-                "contribution operation identity was reused with different input",
-            ));
-        }
         if let Some(receipt) = backend.get_namespace_transaction_receipt(&transaction_id)? {
             if receipt.contribution_digest.as_deref() == Some(contribution_digest.as_str()) {
                 return Ok(());
@@ -609,7 +506,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 version: version.version.clone(),
                 expected: Some(Box::new(version.clone())),
             });
-            version.metadata_format = DfsRevisionMetadataFormat::NamespacedV6;
             match update.metadata {
                 Some(metadata) => {
                     version.module_metadata.insert(namespace.clone(), metadata);

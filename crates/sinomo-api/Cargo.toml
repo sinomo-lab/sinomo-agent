@@ -16,6 +16,7 @@ blake3.workspace = true
 sinomo-module-api.workspace = true
 fs2.workspace = true
 serde = { workspace = true, features = ["rc"] }
+serde_bytes.workspace = true
 serde_json.workspace = true
 sinomo-core = { path = "../sinomo-core" }
 sinomo-config = { path = "../sinomo-config" }

@@ -1076,6 +1076,7 @@ fn prior_tool_call_projection_bounds_large_input() {
 
     let transcript_item = project_agent_item_to_transcript_item(AgentItem::ToolCall {
         item_id: TaskId::generate(),
+        tool_call_id: TaskId::generate(),
         step_index: 4,
         call_index: 0,
         call: call.clone(),
@@ -2121,6 +2122,7 @@ fn turn_context_bounds_large_async_update_for_model() {
     input.async_update = Some(AsyncTaskUpdate {
         kind: "coding.validation".to_string(),
         task_id: TaskId::generate(),
+        tool_call_id: None,
         status: crate::AsyncTaskStatus::Progress,
         summary,
         needs_user_attention: true,

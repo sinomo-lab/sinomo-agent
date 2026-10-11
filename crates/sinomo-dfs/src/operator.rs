@@ -2,9 +2,9 @@
 
 use crate::metadata_pages::{collect_metadata_pages, walk_metadata_pages};
 use crate::{
-    DfsConflictPageCursor, DfsConflictRecord, DfsConflictStatus, DfsFileSystem, DfsMetadataBackend,
-    DfsMetadataSummary, DfsObjectMetadata, DfsObjectVersionRecord, DfsReplicaReceiptRecord,
-    DfsWriteIntentRecord, DfsWriteIntentStatus, MetadataBackendError,
+    DfsFileSystem, DfsMetadataBackend, DfsMetadataSummary, DfsObjectMetadata,
+    DfsObjectVersionRecord, DfsReplicaReceiptRecord, DfsWriteIntentRecord, DfsWriteIntentStatus,
+    MetadataBackendError,
 };
 use crate::{DfsFileSystemId, DfsObjectId, DfsVersion};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -37,18 +37,6 @@ pub use sinomo_api::dfs::operator::DfsOperatorFileSystemView;
 pub use sinomo_api::dfs::operator::DfsOperatorObjectView;
 
 pub use sinomo_api::dfs::operator::DfsOperatorRepairView;
-
-pub use sinomo_api::dfs::operator::DfsOperatorConflictPage;
-
-pub use sinomo_api::dfs::operator::DfsOperatorConflictResolutionReport;
-
-pub use sinomo_api::dfs::operator::DfsOperatorConflictVersionsReport;
-
-pub use sinomo_api::dfs::operator::DfsOperatorConflictVersionView;
-
-pub use sinomo_api::dfs::operator::DfsOperatorConflictVersionRole;
-
-pub use sinomo_api::dfs::operator::DfsOperatorUseConflictVersionReport;
 
 pub use sinomo_api::dfs::operator::DfsOperatorRepairPage;
 
@@ -93,19 +81,8 @@ impl<'a> DfsOperatorInspector<'a> {
         &self,
         summary: DfsMetadataSummary,
     ) -> Result<DfsOperatorStatus, MetadataBackendError> {
-        let (storage_migrations, incomplete_reasons) =
-            match self.backend.metadata_storage_migrations() {
-                Ok(jobs) => (jobs, Vec::new()),
-                Err(error) => (
-                    Vec::new(),
-                    vec![format!(
-                        "storage migration observation unavailable: {error}"
-                    )],
-                ),
-            };
         Ok(DfsOperatorStatus {
-            storage_migrations,
-            incomplete_reasons,
+            incomplete_reasons: Vec::new(),
             bounded_omissions: Vec::new(),
             file_system_count: summary.file_system_count,
             object_count: summary.object_count,
@@ -113,7 +90,7 @@ impl<'a> DfsOperatorInspector<'a> {
             receipt_count: summary.receipt_count,
             intent_count: summary.intent_count,
             pending_write_count: summary.pending_write_count,
-            open_conflict_count: summary.open_conflict_count,
+
             pending_repair_count: summary.pending_repair_count,
             repair_attempt_count: 0,
             pending_namespace_job_count: summary.pending_namespace_job_count,
@@ -121,6 +98,7 @@ impl<'a> DfsOperatorInspector<'a> {
             cross_shard_namespace_lock_count: Some(summary.cross_shard_namespace_lock_count),
             metadata_shards: self.backend.metadata_shard_statuses()?,
             repair_attempts: Vec::new(),
+            storage_migrations: Vec::new(),
         })
     }
 
@@ -138,7 +116,7 @@ impl<'a> DfsOperatorInspector<'a> {
         Ok(Some(DfsOperatorFileSystemView {
             file_system,
             object_count: summary.object_count,
-            open_conflict_count: summary.open_conflict_count,
+
             pending_repair_count: summary.pending_repair_count,
         }))
     }
@@ -151,29 +129,34 @@ impl<'a> DfsOperatorInspector<'a> {
             return Ok(None);
         };
         let versions = versions_for_object_from_backend(self.backend, object_id)?;
+        let intents = intents_for_object_from_backend(self.backend, object_id)?;
+        let receipt_versions = versions
+            .iter()
+            .map(|record| record.version.clone())
+            .chain(intents.iter().map(|record| record.target_version.clone()))
+            .collect::<std::collections::BTreeSet<_>>();
         let mut receipts = Vec::new();
         let mut receipts_by_version = BTreeMap::new();
-        for version in &versions {
+        for version in receipt_versions {
             let version_receipts =
-                receipts_for_version_from_backend(self.backend, object_id, &version.version)?;
-            receipts_by_version.insert(version.version.clone(), version_receipts.clone());
+                receipts_for_version_from_backend(self.backend, object_id, &version)?;
+            receipts_by_version.insert(version, version_receipts.clone());
             receipts.extend(version_receipts);
         }
-        let intents = intents_for_object_from_backend(self.backend, object_id)?;
-        let conflicts = conflicts_for_object_from_backend(self.backend, object_id)?;
+
         let repairs = repairs_from_intents_and_receipts(
             self.backend,
             &object,
             &intents,
             &receipts_by_version,
         )?;
-        let agent_state = agent_state_for(&object, &intents, &conflicts, &repairs);
+        let agent_state = agent_state_for(&object, &intents, &repairs);
         Ok(Some(DfsOperatorObjectView {
             object,
             versions,
             receipts,
             intents,
-            conflicts,
+
             repairs,
             agent_state,
         }))
@@ -188,157 +171,6 @@ impl<'a> DfsOperatorInspector<'a> {
             return Ok(None);
         };
         self.object(&object.object_id)
-    }
-
-    pub fn conflict_versions(
-        &self,
-        object_id: &DfsObjectId,
-        conflict_ids: &[String],
-    ) -> Result<Option<DfsOperatorConflictVersionsReport>, MetadataBackendError> {
-        let Some(object) = self.backend.get_object(object_id)? else {
-            return Ok(None);
-        };
-        let requested_ids: BTreeSet<String> = conflict_ids.iter().cloned().collect();
-        let conflicts: Vec<DfsConflictRecord> =
-            conflicts_for_object_from_backend(self.backend, &object.object_id)?
-                .into_iter()
-                .filter(|conflict| {
-                    requested_ids.is_empty() || requested_ids.contains(&conflict.conflict_id)
-                })
-                .collect();
-        let versions = conflict_version_views(self.backend, &object, &conflicts)?;
-        Ok(Some(DfsOperatorConflictVersionsReport {
-            object,
-            conflicts,
-            versions,
-        }))
-    }
-
-    pub fn conflicts(
-        &self,
-        file_system_id: Option<&DfsFileSystemId>,
-        object_id: Option<&DfsObjectId>,
-    ) -> Result<Vec<DfsConflictRecord>, MetadataBackendError> {
-        let backend = self.backend;
-        let mut conflicts = Vec::new();
-        self.for_filtered_objects(file_system_id, object_id, |object| {
-            conflicts.extend(conflicts_for_object_from_backend(
-                backend,
-                &object.object_id,
-            )?);
-            Ok(())
-        })?;
-        conflicts.sort_by(|left, right| {
-            left.object_id
-                .cmp(&right.object_id)
-                .then_with(|| left.conflict_id.cmp(&right.conflict_id))
-        });
-        Ok(conflicts)
-    }
-
-    pub fn conflicts_page(
-        &self,
-        file_system_id: Option<&DfsFileSystemId>,
-        object_id: Option<&DfsObjectId>,
-        limit: Option<usize>,
-        cursor: Option<&DfsOperatorInspectionCursor>,
-    ) -> Result<DfsOperatorConflictPage, MetadataBackendError> {
-        let limit = normalize_operator_inspection_limit(limit);
-        let mut conflicts = Vec::new();
-        if let Some(object_id) = object_id {
-            if let Some(object) = self.backend.get_object(object_id)? {
-                let resume = cursor
-                    .filter(|cursor| cursor.object_id.as_ref() == Some(object_id))
-                    .and_then(|cursor| cursor.item_key.as_ref());
-                let has_remaining =
-                    self.extend_conflicts_for_object(&object, resume, limit, &mut conflicts)?;
-                let next_cursor = next_operator_inspection_cursor(
-                    self.backend,
-                    &object,
-                    has_remaining,
-                    false,
-                    conflicts.last().map(conflict_inspection_cursor),
-                )?;
-                return Ok(DfsOperatorConflictPage {
-                    conflicts,
-                    next_cursor,
-                });
-            }
-            return Ok(DfsOperatorConflictPage {
-                conflicts,
-                next_cursor: None,
-            });
-        }
-
-        let file_systems = self.inspection_file_systems(file_system_id)?;
-        for (file_system_index, file_system) in file_systems.iter().enumerate() {
-            let page_cursor = match self.resume_cursor_for_file_system(
-                file_system,
-                cursor,
-                &mut conflicts,
-                limit,
-                |inspector, object, item_cursor, item_limit, output| {
-                    inspector.extend_conflicts_for_object(object, item_cursor, item_limit, output)
-                },
-                conflict_inspection_cursor,
-            )? {
-                OperatorResumeState::SkipFileSystem => continue,
-                OperatorResumeState::Filled(next_cursor) => {
-                    return Ok(DfsOperatorConflictPage {
-                        next_cursor,
-                        conflicts,
-                    });
-                }
-                OperatorResumeState::Continue(cursor) => cursor,
-            };
-
-            let mut object_page_cursor = page_cursor.and_then(|cursor| cursor.object_cursor);
-            loop {
-                let page = self.backend.objects_for_file_system_page(
-                    &file_system.file_system_id,
-                    object_page_cursor.as_ref(),
-                    OPERATOR_OBJECT_SCAN_PAGE_SIZE,
-                )?;
-                let page_next_cursor = page.next_cursor.clone();
-                let objects = page.objects;
-                if objects.is_empty() {
-                    break;
-                }
-                let object_count = objects.len();
-                for (object_index, object) in objects.iter().enumerate() {
-                    let item_limit = limit.saturating_sub(conflicts.len());
-                    if item_limit == 0 {
-                        break;
-                    }
-                    let has_remaining =
-                        self.extend_conflicts_for_object(object, None, item_limit, &mut conflicts)?;
-                    if conflicts.len() >= limit {
-                        let has_more_after_object = object_index + 1 < object_count
-                            || page_next_cursor.is_some()
-                            || file_system_index + 1 < file_systems.len();
-                        return Ok(DfsOperatorConflictPage {
-                            next_cursor: next_operator_inspection_cursor(
-                                self.backend,
-                                object,
-                                has_remaining,
-                                has_more_after_object,
-                                conflicts.last().map(conflict_inspection_cursor),
-                            )?,
-                            conflicts,
-                        });
-                    }
-                }
-                let Some(next_cursor) = page_next_cursor else {
-                    break;
-                };
-                object_page_cursor = Some(next_cursor);
-            }
-        }
-
-        Ok(DfsOperatorConflictPage {
-            conflicts,
-            next_cursor: None,
-        })
     }
 
     pub fn repairs(
@@ -508,14 +340,14 @@ impl<'a> DfsOperatorInspector<'a> {
         let mut objects = Vec::new();
         self.for_filtered_objects(Some(file_system_id), None, |object| {
             let intents = intents_for_object_from_backend(backend, &object.object_id)?;
-            let has_open_conflict = object_has_open_conflict(backend, &object.object_id)?;
+
             let repairs = repairs_for_object_from_backend(backend, &object, &intents)?;
             objects.push(DfsAgentObjectSummary {
                 object_id: object.object_id.clone(),
                 path: object.path.clone(),
                 version: object.version.clone(),
                 content_hash: object.content_hash.clone(),
-                state: agent_state_from_flags(&object, &intents, has_open_conflict, &repairs),
+                state: agent_state_for(&object, &intents, &repairs),
             });
             Ok(())
         })?;
@@ -578,99 +410,6 @@ impl<'a> DfsOperatorInspector<'a> {
                 .collect()),
             None => self.backend.list_file_systems(),
         }
-    }
-
-    fn resume_cursor_for_file_system<T, Extend, Key>(
-        &self,
-        file_system: &DfsFileSystem,
-        cursor: Option<&DfsOperatorInspectionCursor>,
-        output: &mut Vec<T>,
-        limit: usize,
-        mut extend: Extend,
-        key_for_item: Key,
-    ) -> Result<OperatorResumeState, MetadataBackendError>
-    where
-        Extend: FnMut(
-            &Self,
-            &DfsObjectMetadata,
-            Option<&DfsOperatorInspectionItemCursor>,
-            usize,
-            &mut Vec<T>,
-        ) -> Result<bool, MetadataBackendError>,
-        Key: Fn(&T) -> DfsOperatorInspectionItemCursor,
-    {
-        let Some(cursor) = cursor else {
-            return Ok(OperatorResumeState::Continue(Some(
-                DfsOperatorInspectionCursor {
-                    file_system_id: file_system.file_system_id.clone(),
-                    object_cursor: None,
-                    object_id: None,
-                    item_key: None,
-                },
-            )));
-        };
-        if file_system.file_system_id < cursor.file_system_id {
-            return Ok(OperatorResumeState::SkipFileSystem);
-        }
-        if file_system.file_system_id > cursor.file_system_id {
-            return Ok(OperatorResumeState::Continue(Some(
-                DfsOperatorInspectionCursor {
-                    file_system_id: file_system.file_system_id.clone(),
-                    object_cursor: None,
-                    object_id: None,
-                    item_key: None,
-                },
-            )));
-        }
-
-        if let Some(object_id) = cursor.object_id.as_ref()
-            && let Some(object) = self.backend.get_object(object_id)?
-        {
-            let item_limit = limit.saturating_sub(output.len());
-            if item_limit > 0 {
-                let has_remaining =
-                    extend(self, &object, cursor.item_key.as_ref(), item_limit, output)?;
-                if output.len() >= limit {
-                    return Ok(OperatorResumeState::Filled(
-                        next_operator_inspection_cursor(
-                            self.backend,
-                            &object,
-                            has_remaining,
-                            cursor.object_cursor.is_some(),
-                            output.last().map(key_for_item),
-                        )?,
-                    ));
-                }
-            }
-        }
-
-        Ok(OperatorResumeState::Continue(Some(
-            DfsOperatorInspectionCursor {
-                file_system_id: file_system.file_system_id.clone(),
-                object_cursor: cursor.object_cursor.clone(),
-                object_id: None,
-                item_key: None,
-            },
-        )))
-    }
-
-    fn extend_conflicts_for_object(
-        &self,
-        object: &DfsObjectMetadata,
-        cursor: Option<&DfsOperatorInspectionItemCursor>,
-        limit: usize,
-        output: &mut Vec<DfsConflictRecord>,
-    ) -> Result<bool, MetadataBackendError> {
-        if limit == 0 {
-            return Ok(true);
-        }
-        let after = conflict_page_cursor_from_operator(cursor);
-        let page =
-            self.backend
-                .conflicts_for_object_page(&object.object_id, after.as_ref(), limit)?;
-        let has_remaining = page.next_cursor.is_some();
-        output.extend(page.conflicts);
-        Ok(has_remaining)
     }
 
     fn extend_repairs_for_object(
@@ -745,193 +484,6 @@ impl<'a> DfsOperatorInspector<'a> {
     }
 }
 
-pub fn resolve_dfs_conflicts(
-    backend: &mut dyn DfsMetadataBackend,
-    file_system_id: Option<&DfsFileSystemId>,
-    object_id: Option<&DfsObjectId>,
-    conflict_ids: &[String],
-) -> Result<DfsOperatorConflictResolutionReport, MetadataBackendError> {
-    let requested_ids: BTreeSet<String> = conflict_ids.iter().cloned().collect();
-    let conflicts = {
-        let inspector = DfsOperatorInspector::new(backend);
-        inspector.conflicts(file_system_id, object_id)?
-    };
-    let mut removed = Vec::new();
-    for conflict in conflicts {
-        if !requested_ids.is_empty() && !requested_ids.contains(&conflict.conflict_id) {
-            continue;
-        }
-        if let Some(removed_conflict) =
-            backend.remove_conflict(&conflict.object_id, &conflict.conflict_id)?
-        {
-            removed.push(removed_conflict);
-        }
-    }
-    removed.sort_by(|left, right| {
-        left.object_id
-            .cmp(&right.object_id)
-            .then_with(|| left.conflict_id.cmp(&right.conflict_id))
-    });
-    let removed_ids: BTreeSet<String> = removed
-        .iter()
-        .map(|conflict| conflict.conflict_id.clone())
-        .collect();
-    let not_found_conflict_ids = requested_ids
-        .into_iter()
-        .filter(|conflict_id| !removed_ids.contains(conflict_id))
-        .collect();
-    Ok(DfsOperatorConflictResolutionReport {
-        removed,
-        not_found_conflict_ids,
-    })
-}
-
-/// Reject the retired metadata-only version selection contract. It cannot
-/// establish content durability, conditional publication, or retry identity.
-/// Call the service's durable file-history restore API instead.
-pub fn use_dfs_conflict_version(
-    _backend: &mut dyn DfsMetadataBackend,
-    _object_id: &DfsObjectId,
-    _version: &DfsVersion,
-    _conflict_ids: &[String],
-) -> Result<DfsOperatorUseConflictVersionReport, MetadataBackendError> {
-    Err(MetadataBackendError::Serde(
-        "metadata-only version selection is retired; use the file-history restore API with retained source, expected destination, and operation ID".into(),
-    ))
-}
-
-#[derive(Debug, Default)]
-struct ConflictVersionViewBuilder {
-    content_hash: Option<String>,
-    version_record: Option<DfsObjectVersionRecord>,
-    current: bool,
-    roles: Vec<DfsOperatorConflictVersionRole>,
-}
-
-fn conflict_version_views(
-    backend: &dyn DfsMetadataBackend,
-    object: &DfsObjectMetadata,
-    conflicts: &[DfsConflictRecord],
-) -> Result<Vec<DfsOperatorConflictVersionView>, MetadataBackendError> {
-    let mut views = BTreeMap::<DfsVersion, ConflictVersionViewBuilder>::new();
-    add_conflict_version_role(
-        &mut views,
-        object.version.clone(),
-        DfsOperatorConflictVersionRole {
-            conflict_id: None,
-            role: "current".to_string(),
-            content_hash: object.content_hash.clone(),
-        },
-    );
-    if let Some(view) = views.get_mut(&object.version) {
-        view.current = true;
-    }
-
-    for conflict in conflicts {
-        if let Some(base_version) = conflict.base_version.clone() {
-            add_conflict_version_role(
-                &mut views,
-                base_version,
-                DfsOperatorConflictVersionRole {
-                    conflict_id: Some(conflict.conflict_id.clone()),
-                    role: "base".to_string(),
-                    content_hash: None,
-                },
-            );
-        }
-        add_conflict_version_role(
-            &mut views,
-            conflict.local_version.clone(),
-            DfsOperatorConflictVersionRole {
-                conflict_id: Some(conflict.conflict_id.clone()),
-                role: "local".to_string(),
-                content_hash: conflict.local_content_hash.clone(),
-            },
-        );
-        add_conflict_version_role(
-            &mut views,
-            conflict.remote_version.clone(),
-            DfsOperatorConflictVersionRole {
-                conflict_id: Some(conflict.conflict_id.clone()),
-                role: "remote".to_string(),
-                content_hash: conflict.remote_content_hash.clone(),
-            },
-        );
-    }
-
-    for (version, view) in &mut views {
-        let version_record = backend.get_version(&object.object_id, version)?;
-        if let Some(version_record) = version_record {
-            if view.content_hash.is_none() {
-                view.content_hash = version_record.content_hash.clone();
-            }
-            view.version_record = Some(version_record);
-        }
-    }
-
-    Ok(views
-        .into_iter()
-        .map(|(version, view)| {
-            let stored = view.version_record.is_some();
-            let visible = view
-                .version_record
-                .as_ref()
-                .map(|record| record.visible)
-                .unwrap_or(false);
-            let size_bytes = view
-                .version_record
-                .as_ref()
-                .and_then(|record| record.size_bytes);
-            let locations = view
-                .version_record
-                .as_ref()
-                .map(|record| normalized_nodes(&record.locations))
-                .unwrap_or_default();
-            DfsOperatorConflictVersionView {
-                version,
-                content_hash: view.content_hash,
-                size_bytes,
-                locations,
-                visible,
-                current: view.current,
-                stored,
-                roles: view.roles,
-            }
-        })
-        .collect())
-}
-
-fn add_conflict_version_role(
-    views: &mut BTreeMap<DfsVersion, ConflictVersionViewBuilder>,
-    version: DfsVersion,
-    role: DfsOperatorConflictVersionRole,
-) {
-    let view = views.entry(version).or_default();
-    if view.content_hash.is_none() {
-        view.content_hash = role.content_hash.clone();
-    }
-    if !view.roles.contains(&role) {
-        view.roles.push(role);
-    }
-}
-
-fn normalized_nodes(nodes: &[NodeId]) -> Vec<NodeId> {
-    let mut nodes = nodes.to_vec();
-    normalize_node_locations(&mut nodes);
-    nodes
-}
-
-fn normalize_node_locations(nodes: &mut Vec<NodeId>) {
-    nodes.sort();
-    nodes.dedup();
-}
-
-enum OperatorResumeState {
-    SkipFileSystem,
-    Continue(Option<DfsOperatorInspectionCursor>),
-    Filled(Option<DfsOperatorInspectionCursor>),
-}
-
 fn normalize_operator_inspection_limit(limit: Option<usize>) -> usize {
     limit
         .unwrap_or(DEFAULT_OPERATOR_INSPECTION_LIMIT)
@@ -958,25 +510,6 @@ fn next_operator_inspection_cursor(
         object_id: has_remaining_in_object.then(|| object.object_id.clone()),
         item_key: has_remaining_in_object.then_some(item_key).flatten(),
     }))
-}
-
-fn conflict_inspection_cursor(conflict: &DfsConflictRecord) -> DfsOperatorInspectionItemCursor {
-    DfsOperatorInspectionItemCursor::Conflict {
-        conflict_id: conflict.conflict_id.clone(),
-    }
-}
-
-fn conflict_page_cursor_from_operator(
-    cursor: Option<&DfsOperatorInspectionItemCursor>,
-) -> Option<DfsConflictPageCursor> {
-    match cursor {
-        Some(DfsOperatorInspectionItemCursor::Conflict { conflict_id }) => {
-            Some(DfsConflictPageCursor {
-                conflict_id: conflict_id.clone(),
-            })
-        }
-        _ => None,
-    }
 }
 
 fn repair_inspection_cursor(repair: &DfsOperatorRepairView) -> DfsOperatorInspectionItemCursor {
@@ -1066,20 +599,6 @@ fn intents_for_object_from_backend(
     })
 }
 
-fn conflicts_for_object_from_backend(
-    backend: &dyn DfsMetadataBackend,
-    object_id: &DfsObjectId,
-) -> Result<Vec<DfsConflictRecord>, MetadataBackendError> {
-    collect_metadata_pages(|cursor| {
-        let page = backend.conflicts_for_object_page(
-            object_id,
-            cursor,
-            OPERATOR_OBJECT_LOCAL_METADATA_PAGE_SIZE,
-        )?;
-        Ok((page.conflicts, page.next_cursor))
-    })
-}
-
 fn repairs_for_object_from_backend(
     backend: &dyn DfsMetadataBackend,
     object: &DfsObjectMetadata,
@@ -1102,30 +621,6 @@ fn repairs_for_object_from_backend(
         }
     }
     repairs_from_intents_and_receipts(backend, object, intents, &receipts_by_version)
-}
-
-fn object_has_open_conflict(
-    backend: &dyn DfsMetadataBackend,
-    object_id: &DfsObjectId,
-) -> Result<bool, MetadataBackendError> {
-    let mut has_open_conflict = false;
-    walk_metadata_pages(|cursor| {
-        let page = backend.conflicts_for_object_page(
-            object_id,
-            cursor,
-            OPERATOR_OBJECT_LOCAL_METADATA_PAGE_SIZE,
-        )?;
-        if page
-            .conflicts
-            .iter()
-            .any(|conflict| conflict.status == DfsConflictStatus::Open)
-        {
-            has_open_conflict = true;
-            return Ok(None);
-        }
-        Ok(page.next_cursor)
-    })?;
-    Ok(has_open_conflict)
 }
 
 fn version_receipt_nodes_by_hash(
@@ -1312,18 +807,6 @@ impl LocalDfsPinStore {
     pub fn put_pin(&self, record: &DfsPinRecord) -> Result<(), DfsPinStoreError> {
         let path = self.pin_path(record);
         write_object_atomic(&path, record)?;
-        let legacy_path = self.legacy_pin_path(record);
-        if legacy_path != path && legacy_path.is_file() {
-            let legacy_record: Result<DfsPinRecord, DfsPinStoreError> = read_object(&legacy_path);
-            if legacy_record.is_ok_and(|legacy_record| {
-                legacy_record.file_system_id == record.file_system_id
-                    && normalize_path(&legacy_record.path) == normalize_path(&record.path)
-                    && legacy_record.pinned_by_node_id == record.pinned_by_node_id
-                    && legacy_record.mode == record.mode
-            }) {
-                let _ = fs::remove_file(&legacy_path);
-            }
-        }
         Ok(())
     }
 
@@ -1381,6 +864,11 @@ impl LocalDfsPinStore {
                 continue;
             }
             let record: DfsPinRecord = read_object(&path)?;
+            if path != self.pin_path(&record) {
+                return Err(DfsPinStoreError::Serde(
+                    "pin storage requires conversion before opening".into(),
+                ));
+            }
             if file_system_id.is_none_or(|expected| &record.file_system_id == expected) {
                 records.push((path, record));
             }
@@ -1419,15 +907,6 @@ impl LocalDfsPinStore {
             key_segment(&record.mode)
         ))
     }
-
-    fn legacy_pin_path(&self, record: &DfsPinRecord) -> PathBuf {
-        self.root.join(format!(
-            "{}-{}-{}.sobj",
-            key_segment(&record.file_system_id),
-            path_hash(&record.path),
-            key_segment(&record.pinned_by_node_id)
-        ))
-    }
 }
 
 #[derive(Debug, Error)]
@@ -1441,34 +920,16 @@ pub enum DfsPinStoreError {
 fn agent_state_for(
     object: &DfsObjectMetadata,
     intents: &[DfsWriteIntentRecord],
-    conflicts: &[DfsConflictRecord],
     repairs: &[DfsOperatorRepairView],
 ) -> DfsAgentObjectState {
-    let has_open_conflict = conflicts
-        .iter()
-        .any(|conflict| conflict.status == DfsConflictStatus::Open);
-    agent_state_from_flags(object, intents, has_open_conflict, repairs)
-}
-
-fn agent_state_from_flags(
-    object: &DfsObjectMetadata,
-    intents: &[DfsWriteIntentRecord],
-    has_open_conflict: bool,
-    repairs: &[DfsOperatorRepairView],
-) -> DfsAgentObjectState {
-    if has_open_conflict {
-        return DfsAgentObjectState::Conflicted;
-    }
     if intents
         .iter()
         .any(|intent| write_intent_is_active(&intent.status))
     {
-        return DfsAgentObjectState::PendingWrite;
-    }
-    if !repairs.is_empty() {
-        return DfsAgentObjectState::PendingRepair;
-    }
-    if object.content_hash.is_some() {
+        DfsAgentObjectState::PendingWrite
+    } else if !repairs.is_empty() {
+        DfsAgentObjectState::PendingRepair
+    } else if object.content_hash.is_some() {
         DfsAgentObjectState::Current
     } else {
         DfsAgentObjectState::MetadataOnly
@@ -1562,7 +1023,6 @@ mod tests {
 
     fn empty_operator_status() -> DfsOperatorStatus {
         DfsOperatorStatus {
-            storage_migrations: Vec::new(),
             incomplete_reasons: Vec::new(),
             bounded_omissions: Vec::new(),
             file_system_count: 0,
@@ -1571,7 +1031,7 @@ mod tests {
             receipt_count: 0,
             intent_count: 0,
             pending_write_count: 0,
-            open_conflict_count: 0,
+
             pending_repair_count: 0,
             repair_attempt_count: 0,
             pending_namespace_job_count: 0,
@@ -1579,23 +1039,19 @@ mod tests {
             cross_shard_namespace_lock_count: Some(0),
             metadata_shards: Vec::new(),
             repair_attempts: Vec::new(),
+            storage_migrations: Vec::new(),
         }
     }
 
     #[test]
-    fn typed_bounded_omissions_preserve_legacy_fail_closed_serde() {
-        let legacy_reason = "4 historical routing topology generation(s) remain active; metadata counters requiring authoritative visibility were omitted";
+    fn typed_bounded_omissions_roundtrip() {
         let mut status = empty_operator_status();
         status.push_bounded_omission(DfsOperatorStatusOmission::historical_routing_topology(4));
 
-        assert_eq!(status.incomplete_reasons, vec![legacy_reason]);
+        assert!(status.incomplete_reasons.is_empty());
         assert!(status.blocking_incomplete_reasons().is_empty());
         assert_eq!(status.bounded_omissions.len(), 1);
-        assert!(
-            status.bounded_omissions[0]
-                .omitted_metrics()
-                .contains(&DfsOperatorStatusMetric::OpenConflictCount)
-        );
+
         assert!(
             status.bounded_omissions[0]
                 .omitted_metrics()
@@ -1608,23 +1064,10 @@ mod tests {
             serde_json::from_value(encoded.clone()).expect("decode current status");
         assert_eq!(decoded, status);
         assert!(decoded.blocking_incomplete_reasons().is_empty());
-
-        let mut legacy_encoded = encoded;
-        legacy_encoded
-            .as_object_mut()
-            .expect("status object")
-            .remove("bounded_omissions");
-        let legacy_decoded: DfsOperatorStatus =
-            serde_json::from_value(legacy_encoded).expect("decode old status payload");
-        assert!(legacy_decoded.bounded_omissions.is_empty());
-        assert_eq!(
-            legacy_decoded.blocking_incomplete_reasons(),
-            vec![legacy_reason]
-        );
     }
 
     #[test]
-    fn historical_routing_zero_lock_proof_is_explicit_and_legacy_safe() {
+    fn historical_routing_zero_lock_proof_is_explicit() {
         let omission =
             DfsOperatorStatusOmission::historical_routing_topology_with_cross_shard_lock_zero_proof(
                 4,
@@ -1639,42 +1082,14 @@ mod tests {
         let mut status = empty_operator_status();
         status.push_bounded_omission(omission.clone());
         assert_eq!(status.cross_shard_namespace_lock_count, Some(0));
-
-        let mut legacy_encoded = serde_json::to_value(omission).expect("encode omission");
-        legacy_encoded
-            .as_object_mut()
-            .expect("omission object")
-            .remove("cross_shard_namespace_locks_zero_proven");
-        let legacy_decoded: DfsOperatorStatusOmission =
-            serde_json::from_value(legacy_encoded).expect("decode legacy omission");
-        assert!(
-            legacy_decoded
-                .omitted_metrics()
-                .contains(&DfsOperatorStatusMetric::CrossShardNamespaceLockCount),
-            "an old omission without the proof flag must remain fail closed"
-        );
-    }
-
-    #[test]
-    fn legacy_status_without_cross_shard_lock_metric_decodes_as_unknown() {
-        let mut encoded = serde_json::to_value(empty_operator_status()).expect("encode status");
-        encoded
-            .as_object_mut()
-            .expect("status object")
-            .remove("cross_shard_namespace_lock_count");
-
-        let decoded: DfsOperatorStatus =
-            serde_json::from_value(encoded).expect("decode legacy status");
-        assert_eq!(decoded.cross_shard_namespace_lock_count, None);
     }
 
     #[test]
     fn unmatched_incomplete_reason_remains_blocking_with_typed_omissions() {
-        let legacy_reason = "repair queue observation unavailable: bounded DFS repair queue status unavailable because the resident queue is not hydrated";
         let mut status = empty_operator_status();
         status
             .push_bounded_omission(DfsOperatorStatusOmission::resident_repair_queue_not_hydrated());
-        assert_eq!(status.incomplete_reasons, vec![legacy_reason]);
+        assert!(status.incomplete_reasons.is_empty());
         status
             .incomplete_reasons
             .push("metadata shard cursor projection is corrupt".to_string());
@@ -1686,877 +1101,577 @@ mod tests {
     }
 
     #[test]
-    fn operator_inspector_reports_status_object_conflicts_and_repairs() {
-        let root = temp_root("operator_inspector_reports_status_object_conflicts_and_repairs");
-        let mut backend =
-            LocalSobjMetadataBackend::new(crate::DfsMetadataShardId::new("shard-root"), &root)
-                .expect("backend");
-        let file_system = DfsFileSystem {
-            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
-            retention_policies: Default::default(),
-            module_metadata: Default::default(),
-            file_system_id: file_system_id(),
-            display_name: "repo".to_string(),
-            owner_node_id: node("node_owner"),
-            subtree_policies: Vec::new(),
-        };
-        let object = DfsObjectMetadata {
-            object_id: object_id(),
-            file_system_id: file_system_id(),
-            path: "artifact.bin".to_string(),
-            kind: DfsObjectKind::Artifact,
-            tombstone_provenance: None,
-            owner_node_id: node("node_owner"),
-            current_locations: vec![node("node_owner")],
-            content_hash: Some("blake3:new".to_string()),
-            content_size_bytes: Some(1024),
-            link_target_object_id: None,
-            mode: 0o644,
-            uid: 0,
-            gid: 0,
-            accessed_at_unix_nanos: 0,
-            modified_at_unix_nanos: 0,
-            created_at_unix_nanos: 0,
-            changed_at_unix_nanos: 0,
-            version: version("version_2"),
-            policy: DfsObjectPolicy::ReplicatedEventual,
-            created_by_event_id: None,
-            last_modified_by_event_id: None,
-        };
-        backend.put_file_system(&file_system).expect("filesystem");
-        backend.put_object(&object).expect("object");
-        backend
-            .put_version(&DfsObjectVersionRecord {
-                metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
-                content_durability: None,
-                retention: Default::default(),
-                module_metadata: Default::default(),
-                file_system_id: file_system_id(),
-                object_id: object_id(),
-                version: version("version_2"),
-                content_hash: Some("blake3:new".to_string()),
-                size_bytes: Some(3),
-                locations: vec![node("node_owner")],
-                created_by_event_id: None,
-                created_at: OffsetDateTime::UNIX_EPOCH,
-                visible: true,
-            })
-            .expect("version");
-        backend
-            .put_receipt(&DfsReplicaReceiptRecord {
-                receipt: DfsWriteReceipt {
-                    file_system_id: file_system_id(),
-                    object_id: object_id(),
-                    committed_version: version("version_2"),
-                    owner_node_id: node("node_owner"),
-                    event_id: EventId::from_legacy_named("evt_commit").expect("event"),
-                },
-                replica_node_id: node("node_owner"),
-                content_hash: Some("blake3:new".to_string()),
-                received_at: OffsetDateTime::UNIX_EPOCH,
-            })
-            .expect("receipt");
-        backend
-            .put_intent(&DfsWriteIntentRecord {
-                publication: Default::default(),
-                intent_id: "dfs_intent_1".to_string(),
-                file_system_id: file_system_id(),
-                object_id: object_id(),
-                base_version: Some(version("version_1")),
-                target_version: version("version_2"),
-                coordinator_node_id: node("node_owner"),
-                operation_id: None,
-                operation_order_token: None,
-                owner_epoch: 1,
-                desired_replica_node_ids: vec![node("node_owner"), node("node_replica")],
-                policy: DfsReplicationPolicy::new(1, 2).expect("policy"),
-                status: DfsWriteIntentStatus::Committed,
-                content_hash: Some("blake3:new".to_string()),
-                object_metadata: None,
-                touch_parent_on_create: false,
-                create_predecessor_object_id: None,
-                created_at: OffsetDateTime::UNIX_EPOCH,
-                updated_at: Some(OffsetDateTime::UNIX_EPOCH),
-            })
-            .expect("intent");
-        backend
-            .put_conflict(&DfsConflictRecord {
-                conflict_id: "conflict_a".to_string(),
-                file_system_id: file_system_id(),
-                object_id: object_id(),
-                path: "artifact.bin".to_string(),
-                base_version: Some(version("version_1")),
-                local_version: version("version_2_local"),
-                remote_version: version("version_2"),
-                detected_by_node_id: node("node_laptop"),
-                reason: "offline edit".to_string(),
-                local_content_hash: Some("blake3:local".to_string()),
-                remote_content_hash: Some("blake3:new".to_string()),
-                created_by_intent_id: None,
-                strategy: Some("branch".to_string()),
-                status: DfsConflictStatus::Open,
-                detected_at: OffsetDateTime::UNIX_EPOCH,
-            })
-            .expect("conflict");
-
-        let inspector = DfsOperatorInspector::new(&backend);
-        let status = inspector.status().expect("status");
-        assert_eq!(status.file_system_count, 1);
-        assert_eq!(status.object_count, 1);
-        assert_eq!(status.open_conflict_count, 1);
-        assert_eq!(status.pending_repair_count, 1);
-
-        let object = inspector
-            .object(&object_id())
-            .expect("object")
-            .expect("object");
-        assert_eq!(object.agent_state, DfsAgentObjectState::Conflicted);
+    fn operator_inspector_reports_status_object_and_repairs() {
+        use crate::test_support::{DfsTestFaultAction, DfsTestFaultRule, DfsTestRuntime};
+        let nodes = DfsTestRuntime::ordered_node_ids("operator-status-real-repair", 3);
+        let mut runtime =
+            DfsTestRuntime::new("operator-status-real-repair", nodes[0].clone()).unwrap();
+        for node in &nodes[1..] {
+            runtime.define_node(node.clone()).unwrap();
+        }
+        runtime.start_nodes().unwrap();
+        let path = "/users/operator-pending-repair.bin";
+        let mut placement =
+            crate::DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 2).unwrap();
+        placement.required_node_ids = vec![nodes[0].clone(), nodes[2].clone()];
+        runtime
+            .apply_placement_policy(
+                &nodes[0],
+                path,
+                crate::DfsPlacementScope::Subtree,
+                placement.clone(),
+            )
+            .unwrap();
+        let mut writer = runtime.client(&nodes[0]).unwrap();
+        let resolved = writer
+            .resolved_placement_policy_for_path(path, DfsObjectPolicy::ReplicatedEventual, 2)
+            .unwrap();
+        assert_eq!(resolved.policy, placement);
+        assert_eq!(resolved.source_path.as_deref(), Some(path));
         assert_eq!(
-            object.repairs[0].missing_replica_node_id,
-            node("node_replica")
+            resolved.source_scope,
+            Some(crate::DfsPlacementScope::Subtree)
         );
-        let path_object = inspector
-            .object_by_path(&file_system_id(), "/artifact.bin")
-            .expect("path object")
-            .expect("path object");
-        assert_eq!(path_object.object.object_id, object_id());
-
-        fs::remove_dir_all(&root).expect("cleanup");
+        assert!(!resolved.inherited);
+        let replication = resolved
+            .policy
+            .replication_policy(Default::default())
+            .unwrap();
+        let baseline = DfsOperatorInspector::new(writer.metadata_backend().unwrap())
+            .status()
+            .unwrap();
+        runtime.install_fault(DfsTestFaultRule {
+            source: None,
+            target: Some(nodes[2].clone()),
+            route: Some(crate::DFS_DATA_STAGE_BLOB_ROUTE.into()),
+            call_id: None,
+            origin: None,
+            remaining_hits: 32,
+            action: DfsTestFaultAction::BudgetExhausted,
+        });
+        let stat = writer
+            .posix_write_file(
+                path,
+                b"real pending repair",
+                crate::DfsWriteOptions {
+                    policy: replication,
+                    replica_candidates: nodes.clone(),
+                    wait_for_commit: true,
+                    foreground_replica_repair: false,
+                },
+            )
+            .unwrap();
+        let backend = writer.metadata_backend().unwrap();
+        let inspector = DfsOperatorInspector::new(backend);
+        let status = inspector.status().unwrap();
+        assert_eq!(status.file_system_count, baseline.file_system_count);
+        assert_eq!(status.object_count, baseline.object_count + 1);
+        assert_eq!(
+            status.pending_repair_count,
+            baseline.pending_repair_count + 1
+        );
+        let object = inspector.object(&stat.object_id).unwrap().unwrap();
+        assert_eq!(object.agent_state, DfsAgentObjectState::PendingRepair);
+        let owner = object
+            .intents
+            .iter()
+            .find(|intent| {
+                intent.publication.is_current()
+                    && intent.file_system_id == stat.file_system_id
+                    && intent.object_id == stat.object_id
+                    && intent.target_version == stat.version
+                    && intent.content_hash == stat.content_hash
+            })
+            .expect("actual current write owner for the inspected target");
+        assert_eq!(owner.status, DfsWriteIntentStatus::Committed);
+        assert_eq!(owner.policy.min_commit_replicas, 1);
+        assert_eq!(owner.policy.desired_replicas, 2);
+        assert_eq!(
+            owner
+                .desired_replica_node_ids
+                .iter()
+                .collect::<BTreeSet<_>>(),
+            [&nodes[0], &nodes[2]].into_iter().collect::<BTreeSet<_>>()
+        );
+        assert!(
+            object
+                .repairs
+                .iter()
+                .any(|repair| repair.missing_replica_node_id == nodes[2])
+        );
+        let by_path = inspector
+            .object_by_path(&stat.file_system_id, path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(by_path.object.object_id, stat.object_id);
+        drop(writer);
+        runtime.close().unwrap();
     }
 
     #[test]
-    fn compact_terminal_intent_history_does_not_reappear_as_repair_work() {
-        let root = temp_root("compact_terminal_intent_history_repairs");
-        let mut backend =
-            LocalSobjMetadataBackend::new(crate::DfsMetadataShardId::new("root"), &root).unwrap();
-        let fs = DfsFileSystem {
-            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
-            file_system_id: file_system_id(),
-            display_name: "history".into(),
-            owner_node_id: node("owner"),
-            subtree_policies: Vec::new(),
-            retention_policies: Default::default(),
-            module_metadata: Default::default(),
-        };
-        let object: DfsObjectMetadata = serde_json::from_value(serde_json::json!({
-            "object_id": object_id(), "file_system_id": file_system_id(),
-            "path": "/history.bin", "kind": "file", "owner_node_id": node("owner"),
-            "current_locations": [node("owner")], "content_hash": "blake3:current",
-            "content_size_bytes": 7, "version": version("current"),
-            "policy": "replicated-eventual"
-        }))
+    fn native_terminal_history_collection_preserves_current_durability_and_operator_state() {
+        let nodes = crate::test_support::DfsTestRuntime::ordered_node_ids(
+            "operator-native-terminal-history",
+            1,
+        );
+        let mut runtime = crate::test_support::DfsTestRuntime::new(
+            "operator-native-terminal-history",
+            nodes[0].clone(),
+        )
         .unwrap();
-        backend.put_file_system(&fs).unwrap();
-        backend.put_object(&object).unwrap();
-        backend
-            .put_version(&DfsObjectVersionRecord {
-                metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
-                content_durability: None,
-                file_system_id: fs.file_system_id.clone(),
-                object_id: object.object_id.clone(),
-                version: object.version.clone(),
-                content_hash: object.content_hash.clone(),
-                size_bytes: object.content_size_bytes,
-                locations: object.current_locations.clone(),
-                created_by_event_id: None,
-                created_at: OffsetDateTime::UNIX_EPOCH,
-                visible: true,
-                retention: Default::default(),
-                module_metadata: Default::default(),
-            })
-            .unwrap();
-        backend
-            .put_receipt(&DfsReplicaReceiptRecord {
-                receipt: DfsWriteReceipt {
-                    file_system_id: fs.file_system_id.clone(),
-                    object_id: object.object_id.clone(),
-                    committed_version: object.version.clone(),
-                    owner_node_id: node("owner"),
-                    event_id: EventId::generate(),
+        runtime.start_nodes().unwrap();
+        let mut writer = runtime.client(&nodes[0]).unwrap();
+        let path = "/users/terminal-current.bin".to_string();
+        let mut file_system = runtime.file_system();
+        file_system
+            .subtree_policies
+            .push(crate::DfsSubtreePolicy::new(
+                &path,
+                DfsObjectPolicy::ReplicatedConfirmed,
+                1,
+                1,
+            ));
+        writer.add_file_system(file_system).unwrap();
+        let bytes = b"current grant survives terminal collection";
+        let stat = writer
+            .posix_write_file_with_operation_id(
+                &path,
+                bytes,
+                crate::DfsWriteOptions {
+                    policy: DfsReplicationPolicy::new(1, 1).unwrap(),
+                    replica_candidates: vec![nodes[0].clone()],
+                    wait_for_commit: true,
+                    foreground_replica_repair: false,
                 },
-                replica_node_id: node("owner"),
-                content_hash: object.content_hash.clone(),
-                received_at: OffsetDateTime::UNIX_EPOCH,
-            })
+                "operator-terminal-current",
+            )
             .unwrap();
-        let mut intent = DfsWriteIntentRecord {
-            publication: crate::DfsWritePublication::Current,
-            intent_id: "compacted-terminal-write".into(),
-            file_system_id: fs.file_system_id.clone(),
-            object_id: object.object_id.clone(),
-            base_version: None,
-            target_version: object.version.clone(),
-            coordinator_node_id: node("owner"),
-            operation_id: None,
-            operation_order_token: None,
-            owner_epoch: 1,
-            desired_replica_node_ids: vec![node("owner"), node("old-replica")],
-            policy: DfsReplicationPolicy::new(1, 2).unwrap(),
-            status: DfsWriteIntentStatus::Committed,
-            content_hash: object.content_hash.clone(),
-            object_metadata: None,
-            touch_parent_on_create: false,
-            create_predecessor_object_id: None,
-            created_at: OffsetDateTime::UNIX_EPOCH,
-            updated_at: Some(OffsetDateTime::UNIX_EPOCH),
-        };
-        // Imported compact history answers exact retries, but is deliberately
-        // absent from the full-intent scan used to recover executable work.
-        let compact =
-            crate::DfsWriteIntentReceipt::from_intent(&intent, OffsetDateTime::UNIX_EPOCH).unwrap();
-        backend
-            .put_intent_receipt_for_object(Some(&object), &compact)
+        let before = writer
+            .metadata_backend()
+            .unwrap()
+            .get_version(&stat.object_id, &stat.version)
+            .unwrap()
+            .unwrap();
+        let grant = before
+            .content_durability
+            .clone()
+            .expect("normal publication carries actual W/N grant");
+        let collection = writer
+            .gc_metadata_history(
+                crate::DfsMetadataHistoryGcOptions::delete_eligible(std::time::Duration::ZERO, 1)
+                    .with_now_unix_nanos(u64::MAX),
+            )
             .unwrap();
         assert!(
-            backend
-                .get_intent(&object.object_id, &intent.intent_id)
-                .unwrap()
-                .is_some()
+            collection.compacted_intent_count > 0,
+            "the regression must actually compact a real terminal intent"
         );
-        assert!(
-            backend
-                .write_intents_page(None, 8)
-                .unwrap()
-                .intents
-                .is_empty()
+        let after = writer
+            .metadata_backend()
+            .unwrap()
+            .get_version(&stat.object_id, &stat.version)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.content_durability,
+            Some(grant),
+            "terminal cleanup cannot reconstruct or weaken the durable plan"
         );
-
-        let inspector = DfsOperatorInspector::new(&backend);
-        let view = inspector.object(&object.object_id).unwrap().unwrap();
-        assert_eq!(view.intents.len(), 1, "retain terminal identity in history");
-        assert!(
-            view.repairs.is_empty(),
-            "compact history is not an outstanding repair"
-        );
-        assert!(
-            inspector
-                .repairs(None, Some(&object.object_id))
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            inspector
-                .repairs_page(None, Some(&object.object_id), Some(1), None)
-                .unwrap()
-                .repairs
-                .is_empty()
-        );
-        assert_eq!(inspector.status().unwrap().pending_repair_count, 0);
+        let view = DfsOperatorInspector::new(writer.metadata_backend().unwrap())
+            .object(&stat.object_id)
+            .unwrap()
+            .unwrap();
+        assert!(view.repairs.is_empty());
         assert_eq!(view.agent_state, DfsAgentObjectState::Current);
-        assert_eq!(
-            inspector
-                .agent_file_system_summary(&fs.file_system_id)
-                .unwrap()
-                .unwrap()
-                .objects[0]
-                .state,
-            DfsAgentObjectState::Current,
-        );
-
-        // A separate full intent for the same visible version still owns its
-        // missing replica even while the compact identity remains queryable.
-        intent.intent_id = "active-replica-repair".into();
-        intent.desired_replica_node_ids = vec![node("owner"), node("new-replica")];
-        backend.put_intent(&intent).unwrap();
-        let inspector = DfsOperatorInspector::new(&backend);
-        let view = inspector.object(&object.object_id).unwrap().unwrap();
-        assert_eq!(view.intents.len(), 2);
-        assert_eq!(view.repairs.len(), 1);
-        assert_eq!(view.repairs[0].intent_id, intent.intent_id);
-        let page = inspector
-            .repairs_page(None, Some(&object.object_id), Some(1), None)
-            .unwrap();
-        assert_eq!(page.repairs, view.repairs);
-        assert!(page.next_cursor.is_none());
-        assert_eq!(
-            inspector.repairs(None, Some(&object.object_id)).unwrap(),
-            view.repairs
-        );
-        assert_eq!(inspector.status().unwrap().pending_repair_count, 1);
-        assert_eq!(view.agent_state, DfsAgentObjectState::PendingRepair);
-        assert_eq!(
-            inspector
-                .agent_file_system_summary(&fs.file_system_id)
-                .unwrap()
-                .unwrap()
-                .objects[0]
-                .state,
-            DfsAgentObjectState::PendingRepair,
-        );
+        assert_eq!(writer.posix_read_file(&path).unwrap(), bytes);
+        drop(writer);
+        runtime.close().unwrap();
     }
 
     #[test]
     fn operator_inspector_counts_staging_intents_as_pending_writes() {
-        let root = temp_root("operator_inspector_counts_staging_intents_as_pending_writes");
-        let mut backend =
-            LocalSobjMetadataBackend::new(crate::DfsMetadataShardId::new("shard-root"), &root)
-                .expect("backend");
-        let file_system = DfsFileSystem {
-            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
-            retention_policies: Default::default(),
-            module_metadata: Default::default(),
-            file_system_id: file_system_id(),
-            display_name: "repo".to_string(),
-            owner_node_id: node("node_owner"),
-            subtree_policies: Vec::new(),
+        use crate::test_support::{DfsTestFaultAction, DfsTestFaultRule, DfsTestRuntime};
+        let nodes = DfsTestRuntime::ordered_node_ids("operator-staging-real-write", 3);
+        let mut runtime =
+            DfsTestRuntime::new("operator-staging-real-write", nodes[0].clone()).unwrap();
+        for node in &nodes[1..] {
+            runtime.define_node(node.clone()).unwrap();
+        }
+        runtime.start_nodes().unwrap();
+        let mut writer = runtime.client(&nodes[0]).unwrap();
+        let path = "/operator-staging.bin";
+        let original = writer
+            .posix_write_file(
+                path,
+                b"old visible bytes",
+                crate::DfsWriteOptions {
+                    policy: DfsReplicationPolicy::new(1, 2).unwrap(),
+                    replica_candidates: nodes.clone(),
+                    wait_for_commit: true,
+                    foreground_replica_repair: true,
+                },
+            )
+            .unwrap();
+        let baseline = DfsOperatorInspector::new(writer.metadata_backend().unwrap())
+            .status()
+            .unwrap();
+        let mut file_system = runtime.file_system();
+        let mut policy =
+            crate::DfsSubtreePolicy::new(path, DfsObjectPolicy::ReplicatedConfirmed, 2, 2);
+        policy.required_node_ids = vec![nodes[0].clone(), nodes[2].clone()];
+        file_system.subtree_policies.push(policy);
+        writer.add_file_system(file_system).unwrap();
+        runtime.install_fault(DfsTestFaultRule {
+            source: None,
+            target: Some(nodes[2].clone()),
+            route: Some(crate::DFS_DATA_STAGE_BLOB_ROUTE.into()),
+            call_id: None,
+            origin: None,
+            remaining_hits: 32,
+            action: DfsTestFaultAction::BudgetExhausted,
+        });
+        let outcome = writer
+            .write_distributed_eventual(
+                sinomo_core::DfsWriteRequest {
+                    file_system_id: original.file_system_id.clone(),
+                    object_id: original.object_id.clone(),
+                    target_version: DfsVersion::generate(),
+                    requesting_node_id: nodes[0].clone(),
+                },
+                b"pending actual W2 bytes".to_vec(),
+                vec![nodes[0].clone(), nodes[2].clone()],
+                DfsReplicationPolicy::new(2, 2).unwrap(),
+            )
+            .unwrap();
+        let crate::NetworkedDfsWriteOutcome::Pending {
+            intent_id,
+            durable_receipts,
+            required_receipts,
+        } = outcome
+        else {
+            panic!("missing actual replica must keep W2 pending");
         };
-        let object = DfsObjectMetadata {
-            object_id: object_id(),
-            file_system_id: file_system_id(),
-            path: "artifact.bin".to_string(),
-            kind: DfsObjectKind::Artifact,
-            tombstone_provenance: None,
-            owner_node_id: node("node_owner"),
-            current_locations: vec![node("node_owner")],
-            content_hash: Some("blake3:old".to_string()),
-            content_size_bytes: Some(512),
-            link_target_object_id: None,
-            mode: 0o644,
-            uid: 0,
-            gid: 0,
-            accessed_at_unix_nanos: 0,
-            modified_at_unix_nanos: 0,
-            created_at_unix_nanos: 0,
-            changed_at_unix_nanos: 0,
-            version: version("version_1"),
-            policy: DfsObjectPolicy::ReplicatedEventual,
-            created_by_event_id: None,
-            last_modified_by_event_id: None,
-        };
-        backend.put_file_system(&file_system).expect("filesystem");
-        backend.put_object(&object).expect("object");
-        backend
-            .put_intent(&DfsWriteIntentRecord {
-                publication: Default::default(),
-                intent_id: "dfs_intent_staging".to_string(),
-                file_system_id: file_system_id(),
-                object_id: object_id(),
-                base_version: Some(version("version_1")),
-                target_version: version("version_2"),
-                coordinator_node_id: node("node_owner"),
-                operation_id: None,
-                operation_order_token: None,
-                owner_epoch: 1,
-                desired_replica_node_ids: vec![node("node_owner"), node("node_replica")],
-                policy: DfsReplicationPolicy::new(2, 2).expect("policy"),
-                status: DfsWriteIntentStatus::Staging,
-                content_hash: Some("blake3:new".to_string()),
-                object_metadata: None,
-                touch_parent_on_create: false,
-                create_predecessor_object_id: None,
-                created_at: OffsetDateTime::UNIX_EPOCH,
-                updated_at: Some(OffsetDateTime::UNIX_EPOCH),
-            })
-            .expect("intent");
-
-        let inspector = DfsOperatorInspector::new(&backend);
-        let status = inspector.status().expect("status");
-        assert_eq!(status.pending_write_count, 1);
+        assert_eq!(durable_receipts, 1);
+        assert_eq!(required_receipts, 2);
+        let backend = writer.metadata_backend().unwrap();
+        let inspector = DfsOperatorInspector::new(backend);
+        assert_eq!(
+            inspector.status().unwrap().pending_write_count,
+            baseline.pending_write_count + 1
+        );
         assert_eq!(
             inspector
-                .object(&object_id())
-                .expect("object")
-                .expect("object")
+                .object(&original.object_id)
+                .unwrap()
+                .unwrap()
                 .agent_state,
             DfsAgentObjectState::PendingWrite
         );
-
-        fs::remove_dir_all(&root).expect("cleanup");
+        assert_eq!(
+            backend
+                .get_object(&original.object_id)
+                .unwrap()
+                .unwrap()
+                .version,
+            original.version,
+            "pending write cannot become visible"
+        );
+        writer.abort_pending_write(&intent_id).unwrap();
+        drop(writer);
+        runtime.close().unwrap();
     }
 
     #[test]
     fn operator_inspector_ignores_superseded_version_repairs() {
-        let root = temp_root("operator_inspector_ignores_superseded_version_repairs");
-        let mut backend =
-            LocalSobjMetadataBackend::new(crate::DfsMetadataShardId::new("shard-root"), &root)
-                .expect("backend");
-        let file_system = DfsFileSystem {
-            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
-            retention_policies: Default::default(),
-            module_metadata: Default::default(),
-            file_system_id: file_system_id(),
-            display_name: "repo".to_string(),
-            owner_node_id: node("node_owner"),
-            subtree_policies: Vec::new(),
-        };
-        let object = DfsObjectMetadata {
-            object_id: object_id(),
-            file_system_id: file_system_id(),
-            path: "artifact.bin".to_string(),
-            kind: DfsObjectKind::Artifact,
-            tombstone_provenance: None,
-            owner_node_id: node("node_owner"),
-            current_locations: vec![node("node_owner"), node("node_replica")],
-            content_hash: Some("blake3:new".to_string()),
-            content_size_bytes: Some(1024),
-            link_target_object_id: None,
-            mode: 0o644,
-            uid: 0,
-            gid: 0,
-            accessed_at_unix_nanos: 0,
-            modified_at_unix_nanos: 0,
-            created_at_unix_nanos: 0,
-            changed_at_unix_nanos: 0,
-            version: version("version_2"),
-            policy: DfsObjectPolicy::ReplicatedEventual,
-            created_by_event_id: None,
-            last_modified_by_event_id: None,
-        };
-        backend.put_file_system(&file_system).expect("filesystem");
-        backend.put_object(&object).expect("object");
-        for (version_id, hash) in [
-            (version("version_1"), "blake3:old"),
-            (version("version_2"), "blake3:new"),
-        ] {
-            backend
-                .put_version(&DfsObjectVersionRecord {
-                    metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
-                    content_durability: None,
-                    retention: Default::default(),
-                    module_metadata: Default::default(),
-                    file_system_id: file_system_id(),
-                    object_id: object_id(),
-                    version: version_id.clone(),
-                    content_hash: Some(hash.to_string()),
-                    size_bytes: Some(3),
-                    locations: vec![node("node_owner"), node("node_replica")],
-                    created_by_event_id: None,
-                    created_at: OffsetDateTime::UNIX_EPOCH,
-                    visible: true,
-                })
-                .expect("version");
-            backend
-                .put_receipt(&DfsReplicaReceiptRecord {
-                    receipt: DfsWriteReceipt {
-                        file_system_id: file_system_id(),
-                        object_id: object_id(),
-                        committed_version: version_id,
-                        owner_node_id: node("node_owner"),
-                        event_id: EventId::from_legacy_named(format!("evt_{hash}")).expect("event"),
-                    },
-                    replica_node_id: node("node_owner"),
-                    content_hash: Some(hash.to_string()),
-                    received_at: OffsetDateTime::UNIX_EPOCH,
-                })
-                .expect("owner receipt");
+        use crate::test_support::{DfsTestFaultAction, DfsTestFaultRule, DfsTestRuntime};
+        let nodes = DfsTestRuntime::ordered_node_ids("operator-superseded-real-repair", 3);
+        let mut runtime =
+            DfsTestRuntime::new("operator-superseded-real-repair", nodes[0].clone()).unwrap();
+        for node in &nodes[1..] {
+            runtime.define_node(node.clone()).unwrap();
         }
-        backend
-            .put_receipt(&DfsReplicaReceiptRecord {
-                receipt: DfsWriteReceipt {
-                    file_system_id: file_system_id(),
-                    object_id: object_id(),
-                    committed_version: version("version_2"),
-                    owner_node_id: node("node_owner"),
-                    event_id: EventId::from_legacy_named("evt_current_replica").expect("event"),
+        runtime.start_nodes().unwrap();
+        let mut writer = runtime.client(&nodes[0]).unwrap();
+        let path = "/operator-superseded.bin";
+        let mut file_system = runtime.file_system();
+        let mut policy =
+            crate::DfsSubtreePolicy::new(path, DfsObjectPolicy::ReplicatedEventual, 1, 2);
+        policy.required_node_ids = vec![nodes[0].clone(), nodes[2].clone()];
+        file_system.subtree_policies.push(policy);
+        writer.add_file_system(file_system).unwrap();
+        let options = crate::DfsWriteOptions {
+            policy: DfsReplicationPolicy::new(1, 2).unwrap(),
+            replica_candidates: nodes.clone(),
+            wait_for_commit: true,
+            foreground_replica_repair: false,
+        };
+        runtime.install_fault(DfsTestFaultRule {
+            source: None,
+            target: Some(nodes[2].clone()),
+            route: Some(crate::DFS_DATA_STAGE_BLOB_ROUTE.into()),
+            call_id: None,
+            origin: None,
+            remaining_hits: 32,
+            action: DfsTestFaultAction::BudgetExhausted,
+        });
+        let old = writer
+            .posix_write_file(path, b"old incomplete placement", options.clone())
+            .unwrap();
+        assert!(
+            !DfsOperatorInspector::new(writer.metadata_backend().unwrap())
+                .object(&old.object_id)
+                .unwrap()
+                .unwrap()
+                .repairs
+                .is_empty(),
+            "the regression begins with real old-version repair work"
+        );
+        runtime.clear_faults();
+        let current = writer
+            .posix_write_file(
+                path,
+                b"current fully placed",
+                crate::DfsWriteOptions {
+                    foreground_replica_repair: true,
+                    ..options
                 },
-                replica_node_id: node("node_replica"),
-                content_hash: Some("blake3:new".to_string()),
-                received_at: OffsetDateTime::UNIX_EPOCH,
-            })
-            .expect("replica receipt");
-        for (intent_id, target_version, hash) in [
-            ("dfs_intent_old", version("version_1"), "blake3:old"),
-            ("dfs_intent_current", version("version_2"), "blake3:new"),
-        ] {
-            backend
-                .put_intent(&DfsWriteIntentRecord {
-                    publication: Default::default(),
-                    intent_id: intent_id.to_string(),
-                    file_system_id: file_system_id(),
-                    object_id: object_id(),
-                    base_version: None,
-                    target_version,
-                    coordinator_node_id: node("node_owner"),
-                    operation_id: None,
-                    operation_order_token: None,
-                    owner_epoch: 1,
-                    desired_replica_node_ids: vec![node("node_owner"), node("node_replica")],
-                    policy: DfsReplicationPolicy::new(1, 2).expect("policy"),
-                    status: DfsWriteIntentStatus::Committed,
-                    content_hash: Some(hash.to_string()),
-                    object_metadata: None,
-                    touch_parent_on_create: false,
-                    create_predecessor_object_id: None,
-                    created_at: OffsetDateTime::UNIX_EPOCH,
-                    updated_at: Some(OffsetDateTime::UNIX_EPOCH),
-                })
-                .expect("intent");
-        }
-
-        let inspector = DfsOperatorInspector::new(&backend);
-        assert_eq!(
-            inspector.status().expect("status").pending_repair_count,
-            0,
-            "a superseded version missing an old receipt must not keep the current object pending repair"
+            )
+            .unwrap();
+        writer
+            .posix_sync_file(path, crate::DfsPosixSyncKind::File)
+            .unwrap();
+        assert_ne!(old.version, current.version);
+        let view = DfsOperatorInspector::new(writer.metadata_backend().unwrap())
+            .object(&current.object_id)
+            .unwrap()
+            .unwrap();
+        assert!(
+            view.repairs.is_empty(),
+            "missing old-version receipt cannot reappear as current repair work"
         );
+        assert_eq!(view.agent_state, DfsAgentObjectState::Current);
         assert_eq!(
-            inspector
-                .object(&object_id())
-                .expect("object")
-                .expect("object")
-                .agent_state,
-            DfsAgentObjectState::Current
+            writer.posix_read_file(path).unwrap(),
+            b"current fully placed"
         );
-
-        fs::remove_dir_all(&root).expect("cleanup");
+        drop(writer);
+        runtime.close().unwrap();
     }
 
     #[test]
-    fn operator_inspection_scans_conflicts_repairs_and_agent_summary_in_pages() {
-        let root = temp_root("operator_inspection_scans_conflicts_repairs_in_pages");
-        let mut backend =
-            LocalSobjMetadataBackend::new(crate::DfsMetadataShardId::new("shard-root"), &root)
-                .expect("backend");
-        backend
-            .put_file_system(&DfsFileSystem {
-                metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
-                retention_policies: Default::default(),
-                module_metadata: Default::default(),
-                file_system_id: file_system_id(),
-                display_name: "repo".to_string(),
-                owner_node_id: node("node_owner"),
-                subtree_policies: Vec::new(),
-            })
-            .expect("filesystem");
-
-        let make_object = |object_id: DfsObjectId, path: String| DfsObjectMetadata {
-            object_id,
-            file_system_id: file_system_id(),
-            path,
-            kind: DfsObjectKind::Artifact,
-            tombstone_provenance: None,
-            owner_node_id: node("node_owner"),
-            current_locations: vec![node("node_owner")],
-            content_hash: Some("blake3:new".to_string()),
-            content_size_bytes: Some(3),
-            link_target_object_id: None,
-            mode: 0o644,
-            uid: 0,
-            gid: 0,
-            accessed_at_unix_nanos: 0,
-            modified_at_unix_nanos: 0,
-            created_at_unix_nanos: 0,
-            changed_at_unix_nanos: 0,
-            version: version("version_2"),
-            policy: DfsObjectPolicy::ReplicatedEventual,
-            created_by_event_id: None,
-            last_modified_by_event_id: None,
-        };
-
+    fn operator_inspection_scans_repairs_and_agent_summary_in_pages() {
+        use crate::test_support::{DfsTestFaultAction, DfsTestFaultRule, DfsTestRuntime};
+        let nodes = DfsTestRuntime::ordered_node_ids("operator-native-large-page", 4);
+        let mut runtime =
+            DfsTestRuntime::new("operator-native-large-page", nodes[0].clone()).unwrap();
+        for node in &nodes[1..] {
+            runtime.define_node(node.clone()).unwrap();
+        }
+        runtime.start_nodes().unwrap();
+        let mut writer = runtime.client(&nodes[0]).unwrap();
+        let path = "/operator-paging-target.bin";
+        let mut file_system = runtime.file_system();
+        let mut policy =
+            crate::DfsSubtreePolicy::new(path, DfsObjectPolicy::ReplicatedEventual, 1, 4);
+        policy.required_node_ids = nodes.clone();
+        file_system.subtree_policies.push(policy);
+        writer.add_file_system(file_system).unwrap();
+        for node in &nodes[1..] {
+            runtime.install_fault(DfsTestFaultRule {
+                source: None,
+                target: Some(node.clone()),
+                route: Some(crate::DFS_DATA_STAGE_BLOB_ROUTE.into()),
+                call_id: None,
+                origin: None,
+                remaining_hits: 32,
+                action: DfsTestFaultAction::BudgetExhausted,
+            });
+        }
+        let baseline = writer
+            .metadata_backend()
+            .unwrap()
+            .metadata_summary()
+            .unwrap()
+            .object_count;
+        let template = writer
+            .metadata_backend()
+            .unwrap()
+            .get_object_by_path(&runtime.file_system().file_system_id, "/")
+            .unwrap()
+            .unwrap();
+        let mut effects = Vec::new();
+        let mut versions = Vec::new();
+        let mut paths = Vec::new();
         for index in 0..OPERATOR_OBJECT_SCAN_PAGE_SIZE {
-            backend
-                .put_object(&make_object(
-                    DfsObjectId::from_legacy_named(format!("obj_operator_page_filler_{index}"))
-                        .expect("filler object"),
-                    format!("a/{index:05}.bin"),
-                ))
-                .expect("filler object");
+            let mut directory = template.clone();
+            directory.path = format!("/operator-fill-{index:05}");
+            directory.object_id = crate::object_id_for_path(&directory.path);
+            directory.version = DfsVersion::generate();
+            versions.push(crate::DfsNamespaceObjectVersionExpectation {
+                object_id: directory.object_id.clone(),
+                expected_version: None,
+            });
+            paths.push(crate::DfsNamespacePathOccupantExpectation {
+                path: directory.path.clone(),
+                expected_object_id: None,
+            });
+            effects.push(crate::DfsPreparedMetadataEffect::PutObject { object: directory });
         }
-
-        let target_object_id =
-            DfsObjectId::from_legacy_named("obj_operator_page_target").expect("target object");
-        backend
-            .put_object(&make_object(
-                target_object_id.clone(),
-                "z/target.bin".to_string(),
-            ))
-            .expect("target object");
-        backend
-            .put_receipt(&DfsReplicaReceiptRecord {
-                receipt: DfsWriteReceipt {
-                    file_system_id: file_system_id(),
-                    object_id: target_object_id.clone(),
-                    committed_version: version("version_2"),
-                    owner_node_id: node("node_owner"),
-                    event_id: EventId::from_legacy_named("evt_page_target").expect("event"),
+        let shard = runtime.root_shard().unwrap();
+        let payload = crate::DfsPreparedOperationPayload::for_metadata_effects(
+            crate::DfsPreparedOperationScope {
+                file_system_id: shard.file_system_id.clone(),
+                shard_id: crate::DfsMetadataShardId::new(shard.shard_id),
+                owner_epoch: shard.epoch,
+                operation_id: "operator-paging-directories".into(),
+            },
+            versions,
+            paths,
+            effects,
+            OffsetDateTime::now_utc(),
+        )
+        .unwrap();
+        crate::test_support::publish_current_payload(&mut writer, payload).unwrap();
+        let stat = writer
+            .posix_write_file(
+                path,
+                b"real paged repair",
+                crate::DfsWriteOptions {
+                    policy: DfsReplicationPolicy::new(1, 4).unwrap(),
+                    replica_candidates: nodes.clone(),
+                    wait_for_commit: true,
+                    foreground_replica_repair: false,
                 },
-                replica_node_id: node("node_owner"),
-                content_hash: Some("blake3:new".to_string()),
-                received_at: OffsetDateTime::UNIX_EPOCH,
-            })
-            .expect("target receipt");
-        backend
-            .put_intent(&DfsWriteIntentRecord {
-                publication: Default::default(),
-                intent_id: "dfs_intent_page_target".to_string(),
-                file_system_id: file_system_id(),
-                object_id: target_object_id.clone(),
-                base_version: Some(version("version_1")),
-                target_version: version("version_2"),
-                coordinator_node_id: node("node_owner"),
-                operation_id: None,
-                operation_order_token: None,
-                owner_epoch: 1,
-                desired_replica_node_ids: vec![
-                    node("node_owner"),
-                    node("node_replica_a"),
-                    node("node_replica_b"),
-                ],
-                policy: DfsReplicationPolicy::new(1, 3).expect("policy"),
-                status: DfsWriteIntentStatus::Committed,
-                content_hash: Some("blake3:new".to_string()),
-                object_metadata: None,
-                touch_parent_on_create: false,
-                create_predecessor_object_id: None,
-                created_at: OffsetDateTime::UNIX_EPOCH,
-                updated_at: Some(OffsetDateTime::UNIX_EPOCH),
-            })
-            .expect("target intent");
-        for conflict_id in ["conflict_page_target_a", "conflict_page_target_b"] {
-            backend
-                .put_conflict(&DfsConflictRecord {
-                    conflict_id: conflict_id.to_string(),
-                    file_system_id: file_system_id(),
-                    object_id: target_object_id.clone(),
-                    path: "z/target.bin".to_string(),
-                    base_version: Some(version("version_1")),
-                    local_version: version("version_2_local"),
-                    remote_version: version("version_2"),
-                    detected_by_node_id: node("node_laptop"),
-                    reason: "offline edit".to_string(),
-                    local_content_hash: Some("blake3:local".to_string()),
-                    remote_content_hash: Some("blake3:new".to_string()),
-                    created_by_intent_id: None,
-                    strategy: None,
-                    status: DfsConflictStatus::Open,
-                    detected_at: OffsetDateTime::UNIX_EPOCH,
-                })
-                .expect("target conflict");
-        }
-
-        let inspector = DfsOperatorInspector::new(&backend);
-        let conflicts = inspector
-            .conflicts(Some(&file_system_id()), None)
-            .expect("conflicts");
-        assert_eq!(conflicts.len(), 2);
-        assert_eq!(&conflicts[0].object_id, &target_object_id);
-        let first_conflict_page = inspector
-            .conflicts_page(Some(&file_system_id()), None, Some(1), None)
-            .expect("first conflict page");
-        assert_eq!(first_conflict_page.conflicts.len(), 1);
-        assert_eq!(
-            first_conflict_page.conflicts[0].conflict_id,
-            "conflict_page_target_a"
-        );
-        assert_eq!(
-            first_conflict_page
-                .next_cursor
-                .as_ref()
-                .and_then(|cursor| cursor.object_id.as_ref()),
-            Some(&target_object_id)
-        );
-        assert_eq!(
-            first_conflict_page
-                .next_cursor
-                .as_ref()
-                .and_then(|cursor| cursor.item_key.as_ref()),
-            Some(&DfsOperatorInspectionItemCursor::Conflict {
-                conflict_id: "conflict_page_target_a".to_string()
-            })
-        );
-        let second_conflict_page = inspector
-            .conflicts_page(
-                Some(&file_system_id()),
-                None,
-                Some(1),
-                first_conflict_page.next_cursor.as_ref(),
             )
-            .expect("second conflict page");
-        assert_eq!(second_conflict_page.conflicts.len(), 1);
-        assert_eq!(
-            second_conflict_page.conflicts[0].conflict_id,
-            "conflict_page_target_b"
-        );
-        assert!(second_conflict_page.next_cursor.is_none());
-
-        let repairs = inspector
-            .repairs(Some(&file_system_id()), None)
-            .expect("repairs");
-        assert_eq!(repairs.len(), 2);
-        assert_eq!(&repairs[0].object_id, &target_object_id);
-        let first_repair_page = inspector
-            .repairs_page(Some(&file_system_id()), None, Some(1), None)
-            .expect("first repair page");
-        assert_eq!(first_repair_page.repairs.len(), 1);
-        let second_repair_page = inspector
+            .unwrap();
+        let backend = writer.metadata_backend().unwrap();
+        let inspector = DfsOperatorInspector::new(backend);
+        let all = inspector
+            .repairs(Some(&stat.file_system_id), Some(&stat.object_id))
+            .unwrap();
+        assert_eq!(all.len(), 3, "three real missing content replicas");
+        let first = inspector
+            .repairs_page(Some(&stat.file_system_id), None, Some(1), None)
+            .unwrap();
+        let second = inspector
             .repairs_page(
-                Some(&file_system_id()),
+                Some(&stat.file_system_id),
                 None,
                 Some(1),
-                first_repair_page.next_cursor.as_ref(),
+                first.next_cursor.as_ref(),
             )
-            .expect("second repair page");
-        assert_eq!(second_repair_page.repairs.len(), 1);
-        let paged_missing_replicas = BTreeSet::from([
-            first_repair_page.repairs[0].missing_replica_node_id.clone(),
-            second_repair_page.repairs[0]
-                .missing_replica_node_id
-                .clone(),
-        ]);
+            .unwrap();
+        let third = inspector
+            .repairs_page(
+                Some(&stat.file_system_id),
+                None,
+                Some(1),
+                second.next_cursor.as_ref(),
+            )
+            .unwrap();
+        let merged = first
+            .repairs
+            .into_iter()
+            .chain(second.repairs)
+            .chain(third.repairs)
+            .collect::<Vec<_>>();
+        assert_eq!(merged, all);
+        assert!(third.next_cursor.is_none());
+        let summary = inspector
+            .agent_file_system_summary(&stat.file_system_id)
+            .unwrap()
+            .unwrap();
         assert_eq!(
-            paged_missing_replicas,
-            BTreeSet::from([node("node_replica_a"), node("node_replica_b")])
+            summary.objects.len(),
+            baseline as usize + OPERATOR_OBJECT_SCAN_PAGE_SIZE + 1
         );
-        assert!(second_repair_page.next_cursor.is_none());
-
-        let agent_summary = inspector
-            .agent_file_system_summary(&file_system_id())
-            .expect("agent summary")
-            .expect("filesystem");
         assert_eq!(
-            agent_summary.objects.len(),
-            OPERATOR_OBJECT_SCAN_PAGE_SIZE + 1
+            summary
+                .objects
+                .iter()
+                .find(|object| object.object_id == stat.object_id)
+                .unwrap()
+                .state,
+            DfsAgentObjectState::PendingRepair
         );
-        let target_summary = agent_summary
-            .objects
-            .iter()
-            .find(|object| object.object_id == target_object_id)
-            .expect("target summary");
-        assert_eq!(target_summary.state, DfsAgentObjectState::Conflicted);
-
-        fs::remove_dir_all(&root).expect("cleanup");
+        drop(writer);
+        runtime.close().unwrap();
     }
 
     #[test]
     fn operator_repair_pages_preserve_order_without_full_object_materialization() {
-        let root = temp_root("operator_repair_pages_preserve_order");
-        let mut backend =
-            LocalSobjMetadataBackend::new(crate::DfsMetadataShardId::new("shard-root"), &root)
-                .expect("backend");
-        let file_system = DfsFileSystem {
-            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
-            retention_policies: Default::default(),
-            module_metadata: Default::default(),
-            file_system_id: file_system_id(),
-            display_name: "repo".to_string(),
-            owner_node_id: node("node_owner"),
-            subtree_policies: Vec::new(),
-        };
-        let object = DfsObjectMetadata {
-            object_id: object_id(),
-            file_system_id: file_system_id(),
-            path: "artifact.bin".to_string(),
-            kind: DfsObjectKind::Artifact,
-            tombstone_provenance: None,
-            owner_node_id: node("node_owner"),
-            current_locations: vec![node("node_owner")],
-            content_hash: Some("blake3:new".to_string()),
-            content_size_bytes: Some(1024),
-            link_target_object_id: None,
-            mode: 0o644,
-            uid: 0,
-            gid: 0,
-            accessed_at_unix_nanos: 0,
-            modified_at_unix_nanos: 0,
-            created_at_unix_nanos: 0,
-            changed_at_unix_nanos: 0,
-            version: version("version_2"),
-            policy: DfsObjectPolicy::ReplicatedEventual,
-            created_by_event_id: None,
-            last_modified_by_event_id: None,
-        };
-        backend.put_file_system(&file_system).expect("filesystem");
-        backend.put_object(&object).expect("object");
-        for (replica_node_id, content_hash) in [
-            (node("node_owner"), Some("blake3:new".to_string())),
-            (
-                node("node_seen_other_hash"),
-                Some("blake3:other".to_string()),
-            ),
-        ] {
-            backend
-                .put_receipt(&DfsReplicaReceiptRecord {
-                    receipt: DfsWriteReceipt {
-                        file_system_id: file_system_id(),
-                        object_id: object_id(),
-                        committed_version: version("version_2"),
-                        owner_node_id: node("node_owner"),
-                        event_id: EventId::generate(),
-                    },
-                    replica_node_id,
-                    content_hash,
-                    received_at: OffsetDateTime::UNIX_EPOCH,
-                })
-                .expect("receipt");
+        use crate::test_support::{DfsTestFaultAction, DfsTestFaultRule, DfsTestRuntime};
+        let nodes = DfsTestRuntime::ordered_node_ids("operator-native-repair-order", 4);
+        let mut runtime =
+            DfsTestRuntime::new("operator-native-repair-order", nodes[0].clone()).unwrap();
+        for node in &nodes[1..] {
+            runtime.define_node(node.clone()).unwrap();
         }
-        for (intent_id, content_hash, desired_replica_node_ids) in [
-            (
-                "dfs_intent_missing_b",
-                Some("blake3:new".to_string()),
-                vec![node("node_owner"), node("node_b")],
-            ),
-            (
-                "dfs_intent_missing_a",
-                Some("blake3:new".to_string()),
-                vec![node("node_owner"), node("node_a")],
-            ),
-            (
-                "dfs_intent_missing_c_hashless",
-                None,
-                vec![
-                    node("node_owner"),
-                    node("node_seen_other_hash"),
-                    node("node_c"),
-                ],
-            ),
-        ] {
-            backend
-                .put_intent(&DfsWriteIntentRecord {
-                    publication: Default::default(),
-                    intent_id: intent_id.to_string(),
-                    file_system_id: file_system_id(),
-                    object_id: object_id(),
-                    base_version: Some(version("version_1")),
-                    target_version: version("version_2"),
-                    coordinator_node_id: node("node_owner"),
-                    operation_id: None,
-                    operation_order_token: None,
-                    owner_epoch: 1,
-                    desired_replica_node_ids,
-                    policy: DfsReplicationPolicy::new(1, 3).expect("policy"),
-                    status: DfsWriteIntentStatus::Committed,
-                    content_hash,
-                    object_metadata: None,
-                    touch_parent_on_create: false,
-                    create_predecessor_object_id: None,
-                    created_at: OffsetDateTime::UNIX_EPOCH,
-                    updated_at: Some(OffsetDateTime::UNIX_EPOCH),
-                })
-                .expect("intent");
+        runtime.start_nodes().unwrap();
+        let mut writer = runtime.client(&nodes[0]).unwrap();
+        let path = "/operator-paging-target.bin";
+        let mut file_system = runtime.file_system();
+        let mut policy =
+            crate::DfsSubtreePolicy::new(path, DfsObjectPolicy::ReplicatedEventual, 1, 4);
+        policy.required_node_ids = nodes.clone();
+        file_system.subtree_policies.push(policy);
+        writer.add_file_system(file_system).unwrap();
+        for node in &nodes[1..] {
+            runtime.install_fault(DfsTestFaultRule {
+                source: None,
+                target: Some(node.clone()),
+                route: Some(crate::DFS_DATA_STAGE_BLOB_ROUTE.into()),
+                call_id: None,
+                origin: None,
+                remaining_hits: 32,
+                action: DfsTestFaultAction::BudgetExhausted,
+            });
         }
-
-        let inspector = DfsOperatorInspector::new(&backend);
-        let first_page = inspector
-            .repairs_page(None, Some(&object_id()), Some(2), None)
-            .expect("first page");
-        assert_eq!(
-            first_page
-                .repairs
-                .iter()
-                .map(|repair| repair.missing_replica_node_id.clone())
-                .collect::<Vec<_>>(),
-            vec![node("node_a"), node("node_b")]
-        );
-        assert!(first_page.next_cursor.is_some());
-        let second_page = inspector
-            .repairs_page(
-                None,
-                Some(&object_id()),
-                Some(2),
-                first_page.next_cursor.as_ref(),
+        let stat = writer
+            .posix_write_file(
+                path,
+                b"real paged repair",
+                crate::DfsWriteOptions {
+                    policy: DfsReplicationPolicy::new(1, 4).unwrap(),
+                    replica_candidates: nodes.clone(),
+                    wait_for_commit: true,
+                    foreground_replica_repair: false,
+                },
             )
-            .expect("second page");
-        assert_eq!(
-            second_page
-                .repairs
-                .iter()
-                .map(|repair| repair.missing_replica_node_id.clone())
-                .collect::<Vec<_>>(),
-            vec![node("node_c")]
-        );
-        assert!(second_page.next_cursor.is_none());
-
-        fs::remove_dir_all(&root).expect("cleanup");
+            .unwrap();
+        let backend = writer.metadata_backend().unwrap();
+        let inspector = DfsOperatorInspector::new(backend);
+        let all = inspector
+            .repairs(Some(&stat.file_system_id), Some(&stat.object_id))
+            .unwrap();
+        assert_eq!(all.len(), 3, "three real missing content replicas");
+        let first = inspector
+            .repairs_page(
+                Some(&stat.file_system_id),
+                Some(&stat.object_id),
+                Some(2),
+                None,
+            )
+            .unwrap();
+        assert_eq!(first.repairs, all[..2]);
+        let second = inspector
+            .repairs_page(
+                Some(&stat.file_system_id),
+                Some(&stat.object_id),
+                Some(2),
+                first.next_cursor.as_ref(),
+            )
+            .unwrap();
+        assert_eq!(second.repairs, all[2..]);
+        assert!(first.next_cursor.is_some());
+        assert!(second.next_cursor.is_none());
+        let observed = all
+            .iter()
+            .map(|repair| repair.missing_replica_node_id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(observed, nodes[1..]);
+        drop(writer);
+        runtime.close().unwrap();
     }
 
     #[test]
@@ -2666,450 +1781,245 @@ mod tests {
     }
 
     #[test]
-    fn local_pin_store_removes_matching_legacy_pin_by_mode() {
-        let root = temp_root("local_pin_store_removes_matching_legacy_pin_by_mode");
-        let store = LocalDfsPinStore::new(&root);
-        let owner = node("node_laptop");
-        let record = DfsPinRecord {
-            file_system_id: file_system_id(),
-            path: "src/lib.rs".to_string(),
-            object_id: Some(object_id()),
-            pinned_by_node_id: owner.clone(),
-            mode: DfsPinMode::Content,
-            created_at: OffsetDateTime::UNIX_EPOCH,
-        };
-        let legacy_path = store.legacy_pin_path(&record);
-        write_object_atomic(&legacy_path, &record).expect("write legacy pin");
-
-        assert_eq!(store.list_pins(None).expect("pins"), vec![record]);
-        assert!(
-            store
-                .remove_pin(
-                    &file_system_id(),
-                    "src/lib.rs",
-                    Some(&owner),
-                    Some(&DfsPinMode::Content),
-                )
-                .expect("remove legacy content pin")
-        );
-        assert!(!legacy_path.exists());
-        assert!(store.list_pins(None).expect("pins").is_empty());
-
-        fs::remove_dir_all(&root).expect("cleanup");
-    }
-
-    #[test]
     fn operator_status_aggregates_counts_across_multiple_objects() {
-        let root = temp_root("operator_status_aggregates_counts_across_multiple_objects");
-        let mut backend =
-            LocalSobjMetadataBackend::new(crate::DfsMetadataShardId::new("shard-root"), &root)
-                .expect("backend");
-        backend
-            .put_file_system(&DfsFileSystem {
-                metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
-                retention_policies: Default::default(),
-                module_metadata: Default::default(),
-                file_system_id: file_system_id(),
-                display_name: "repo".to_string(),
-                owner_node_id: node("node_owner"),
-                subtree_policies: Vec::new(),
-            })
-            .expect("filesystem");
-
-        let object_a = DfsObjectId::from_legacy_named("obj_alpha").expect("object");
-        let object_b = DfsObjectId::from_legacy_named("obj_beta").expect("object");
-        let make_object =
-            |object_id: &DfsObjectId, path: &str, current: DfsVersion| DfsObjectMetadata {
-                object_id: object_id.clone(),
-                file_system_id: file_system_id(),
-                path: path.to_string(),
-                kind: DfsObjectKind::Artifact,
-                tombstone_provenance: None,
-                owner_node_id: node("node_owner"),
-                current_locations: vec![node("node_owner")],
-                content_hash: Some("blake3:new".to_string()),
-                content_size_bytes: Some(3),
-                link_target_object_id: None,
-                mode: 0o644,
-                uid: 0,
-                gid: 0,
-                accessed_at_unix_nanos: 0,
-                modified_at_unix_nanos: 0,
-                created_at_unix_nanos: 0,
-                changed_at_unix_nanos: 0,
-                version: current,
-                policy: DfsObjectPolicy::ReplicatedEventual,
-                created_by_event_id: None,
-                last_modified_by_event_id: None,
-            };
-        backend
-            .put_object(&make_object(&object_a, "alpha.bin", version("version_2")))
-            .expect("object a");
-        backend
-            .put_object(&make_object(&object_b, "beta.bin", version("version_1")))
-            .expect("object b");
-
-        // object_a: two versions, one receipt, a committed intent missing a
-        // replica (one repair), and an open conflict.
-        for version_id in [version("version_1"), version("version_2")] {
-            backend
-                .put_version(&DfsObjectVersionRecord {
-                    metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
-                    content_durability: None,
-                    retention: Default::default(),
-                    module_metadata: Default::default(),
-                    file_system_id: file_system_id(),
-                    object_id: object_a.clone(),
-                    version: version_id.clone(),
-                    content_hash: Some("blake3:new".to_string()),
-                    size_bytes: Some(3),
-                    locations: vec![node("node_owner")],
-                    created_by_event_id: None,
-                    created_at: OffsetDateTime::UNIX_EPOCH,
-                    visible: true,
-                })
-                .expect("version a");
+        use crate::test_support::{DfsTestFaultAction, DfsTestFaultRule, DfsTestRuntime};
+        let nodes = DfsTestRuntime::ordered_node_ids("operator-native-aggregate", 3);
+        let mut runtime =
+            DfsTestRuntime::new("operator-native-aggregate", nodes[0].clone()).unwrap();
+        for node in &nodes[1..] {
+            runtime.define_node(node.clone()).unwrap();
         }
-        backend
-            .put_receipt(&DfsReplicaReceiptRecord {
-                receipt: DfsWriteReceipt {
-                    file_system_id: file_system_id(),
-                    object_id: object_a.clone(),
-                    committed_version: version("version_2"),
-                    owner_node_id: node("node_owner"),
-                    event_id: EventId::from_legacy_named("evt_a").expect("event"),
+        runtime.start_nodes().unwrap();
+        let mut writer = runtime.client(&nodes[0]).unwrap();
+        let fs_id = runtime.file_system().file_system_id;
+        let baseline = writer
+            .metadata_backend()
+            .unwrap()
+            .metadata_summary()
+            .unwrap();
+        let mut file_system = runtime.file_system();
+        for (path, kind, w) in [
+            (
+                "/operator-alpha.bin",
+                DfsObjectPolicy::ReplicatedEventual,
+                1,
+            ),
+            (
+                "/operator-beta.bin",
+                DfsObjectPolicy::ReplicatedConfirmed,
+                2,
+            ),
+        ] {
+            let mut policy = crate::DfsSubtreePolicy::new(path, kind, w, 2);
+            policy.required_node_ids = vec![nodes[0].clone(), nodes[2].clone()];
+            file_system.subtree_policies.push(policy);
+        }
+        writer.add_file_system(file_system).unwrap();
+        let options = crate::DfsWriteOptions {
+            policy: DfsReplicationPolicy::new(2, 2).unwrap(),
+            replica_candidates: nodes.clone(),
+            wait_for_commit: true,
+            foreground_replica_repair: true,
+        };
+        let alpha_old = writer
+            .posix_write_file("/operator-alpha.bin", b"old alpha", options.clone())
+            .unwrap();
+        let beta = writer
+            .posix_write_file("/operator-beta.bin", b"visible beta", options)
+            .unwrap();
+        runtime.install_fault(DfsTestFaultRule {
+            source: None,
+            target: Some(nodes[2].clone()),
+            route: Some(crate::DFS_DATA_STAGE_BLOB_ROUTE.into()),
+            call_id: None,
+            origin: None,
+            remaining_hits: 32,
+            action: DfsTestFaultAction::BudgetExhausted,
+        });
+        let alpha = writer
+            .posix_write_file(
+                "/operator-alpha.bin",
+                b"new alpha",
+                crate::DfsWriteOptions {
+                    policy: DfsReplicationPolicy::new(1, 2).unwrap(),
+                    replica_candidates: nodes.clone(),
+                    wait_for_commit: true,
+                    foreground_replica_repair: false,
                 },
-                replica_node_id: node("node_owner"),
-                content_hash: Some("blake3:new".to_string()),
-                received_at: OffsetDateTime::UNIX_EPOCH,
-            })
-            .expect("receipt a");
-        backend
-            .put_intent(&DfsWriteIntentRecord {
-                publication: Default::default(),
-                intent_id: "dfs_intent_a".to_string(),
-                file_system_id: file_system_id(),
-                object_id: object_a.clone(),
-                base_version: Some(version("version_1")),
-                target_version: version("version_2"),
-                coordinator_node_id: node("node_owner"),
-                operation_id: None,
-                operation_order_token: None,
-                owner_epoch: 1,
-                desired_replica_node_ids: vec![node("node_owner"), node("node_replica")],
-                policy: DfsReplicationPolicy::new(1, 2).expect("policy"),
-                status: DfsWriteIntentStatus::Committed,
-                content_hash: Some("blake3:new".to_string()),
-                object_metadata: None,
-                touch_parent_on_create: false,
-                create_predecessor_object_id: None,
-                created_at: OffsetDateTime::UNIX_EPOCH,
-                updated_at: Some(OffsetDateTime::UNIX_EPOCH),
-            })
-            .expect("intent a");
-        backend
-            .put_conflict(&DfsConflictRecord {
-                conflict_id: "conflict_a".to_string(),
-                file_system_id: file_system_id(),
-                object_id: object_a.clone(),
-                path: "alpha.bin".to_string(),
-                base_version: Some(version("version_1")),
-                local_version: version("version_2_local"),
-                remote_version: version("version_2"),
-                detected_by_node_id: node("node_laptop"),
-                reason: "offline edit".to_string(),
-                local_content_hash: Some("blake3:local".to_string()),
-                remote_content_hash: Some("blake3:new".to_string()),
-                created_by_intent_id: None,
-                strategy: None,
-                status: DfsConflictStatus::Open,
-                detected_at: OffsetDateTime::UNIX_EPOCH,
-            })
-            .expect("conflict a");
-
-        // object_b: one version, one receipt, and a staging intent (pending write,
-        // no repair, no conflict).
-        backend
-            .put_version(&DfsObjectVersionRecord {
-                metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
-                content_durability: None,
-                retention: Default::default(),
-                module_metadata: Default::default(),
-                file_system_id: file_system_id(),
-                object_id: object_b.clone(),
-                version: version("version_1"),
-                content_hash: Some("blake3:new".to_string()),
-                size_bytes: Some(3),
-                locations: vec![node("node_owner")],
-                created_by_event_id: None,
-                created_at: OffsetDateTime::UNIX_EPOCH,
-                visible: true,
-            })
-            .expect("version b");
-        backend
-            .put_receipt(&DfsReplicaReceiptRecord {
-                receipt: DfsWriteReceipt {
-                    file_system_id: file_system_id(),
-                    object_id: object_b.clone(),
-                    committed_version: version("version_1"),
-                    owner_node_id: node("node_owner"),
-                    event_id: EventId::from_legacy_named("evt_b").expect("event"),
+            )
+            .unwrap();
+        assert_eq!(alpha.object_id, alpha_old.object_id);
+        assert_ne!(alpha.version, alpha_old.version);
+        let pending = writer
+            .write_distributed_eventual(
+                sinomo_core::DfsWriteRequest {
+                    file_system_id: fs_id.clone(),
+                    object_id: beta.object_id.clone(),
+                    target_version: DfsVersion::generate(),
+                    requesting_node_id: nodes[0].clone(),
                 },
-                replica_node_id: node("node_owner"),
-                content_hash: Some("blake3:new".to_string()),
-                received_at: OffsetDateTime::UNIX_EPOCH,
-            })
-            .expect("receipt b");
-        backend
-            .put_intent(&DfsWriteIntentRecord {
-                publication: Default::default(),
-                intent_id: "dfs_intent_b".to_string(),
-                file_system_id: file_system_id(),
-                object_id: object_b.clone(),
-                base_version: Some(version("version_1")),
-                target_version: version("version_2"),
-                coordinator_node_id: node("node_owner"),
-                operation_id: None,
-                operation_order_token: None,
-                owner_epoch: 1,
-                desired_replica_node_ids: vec![node("node_owner"), node("node_replica")],
-                policy: DfsReplicationPolicy::new(2, 2).expect("policy"),
-                status: DfsWriteIntentStatus::Staging,
-                content_hash: Some("blake3:newer".to_string()),
-                object_metadata: None,
-                touch_parent_on_create: false,
-                create_predecessor_object_id: None,
-                created_at: OffsetDateTime::UNIX_EPOCH,
-                updated_at: Some(OffsetDateTime::UNIX_EPOCH),
-            })
-            .expect("intent b");
-
-        // Bulk accessors return whole-backend totals in one call each.
-        assert_eq!(backend.all_versions().expect("versions").len(), 3);
-        assert_eq!(backend.all_receipts().expect("receipts").len(), 2);
-        assert_eq!(backend.all_intents().expect("intents").len(), 2);
-        assert_eq!(backend.all_conflicts().expect("conflicts").len(), 1);
-        backend
-            .put_namespace_job(&DfsNamespaceJobRecord {
-                job_id: "namespace-job-running".to_string(),
-                file_system_id: file_system_id(),
-                origin: None,
-                kind: DfsNamespaceJobKind::RenameObjectAcrossShardPrimaries,
-                status: DfsNamespaceJobStatus::Running,
-                root_path: "/alpha".to_string(),
-                target_path: Some("/beta/alpha".to_string()),
-                pending_frames: vec![DfsNamespaceJobFrame::ScanDirectory {
-                    path: "/alpha".to_string(),
-                    cursor: None,
-                }],
-                processed_object_count: 0,
-                created_at: OffsetDateTime::UNIX_EPOCH,
-                updated_at: OffsetDateTime::UNIX_EPOCH,
-                completed_at: None,
-                failure_reason: None,
-            })
-            .expect("running namespace job");
-        backend
-            .put_namespace_job(&DfsNamespaceJobRecord {
-                job_id: "namespace-job-failed".to_string(),
-                file_system_id: file_system_id(),
-                origin: None,
-                kind: DfsNamespaceJobKind::RenameDirectory,
-                status: DfsNamespaceJobStatus::Failed,
-                root_path: "/beta".to_string(),
-                target_path: Some("/gamma".to_string()),
-                pending_frames: Vec::new(),
-                processed_object_count: 0,
-                created_at: OffsetDateTime::UNIX_EPOCH,
-                updated_at: OffsetDateTime::UNIX_EPOCH,
-                completed_at: None,
-                failure_reason: Some("invalid destination".to_string()),
-            })
-            .expect("failed namespace job");
-
-        let summary = backend.metadata_summary().expect("summary");
-        assert_eq!(summary.file_system_count, 1);
-        assert_eq!(summary.object_count, 2);
-        assert_eq!(summary.version_count, 3);
-        assert_eq!(summary.receipt_count, 2);
-        assert_eq!(summary.intent_count, 2);
-        assert_eq!(summary.pending_write_count, 1);
-        assert_eq!(summary.open_conflict_count, 1);
-        assert_eq!(summary.pending_repair_count, 1);
-        assert_eq!(summary.pending_namespace_job_count, 1);
-        assert_eq!(summary.failed_namespace_job_count, 1);
-        assert_eq!(summary.cross_shard_namespace_lock_count, 1);
-        let scoped_summary = backend
-            .metadata_summary_for_file_system(&file_system_id())
-            .expect("scoped summary")
-            .expect("filesystem summary");
-        assert_eq!(scoped_summary.file_system_count, 1);
-        assert_eq!(scoped_summary.object_count, 2);
-        assert_eq!(scoped_summary.version_count, 3);
-        assert_eq!(scoped_summary.open_conflict_count, 1);
-        assert_eq!(scoped_summary.pending_repair_count, 1);
+                b"pending beta".to_vec(),
+                vec![nodes[0].clone(), nodes[2].clone()],
+                DfsReplicationPolicy::new(2, 2).unwrap(),
+            )
+            .unwrap();
+        let crate::NetworkedDfsWriteOutcome::Pending {
+            intent_id,
+            durable_receipts,
+            required_receipts,
+        } = pending
+        else {
+            panic!("a real missing replica must keep beta pending");
+        };
+        assert_eq!((durable_receipts, required_receipts), (1, 2));
+        let now = OffsetDateTime::now_utc();
+        let running = DfsNamespaceJobRecord {
+            job_id: "operator-native-running-job".into(),
+            file_system_id: fs_id.clone(),
+            origin: None,
+            kind: DfsNamespaceJobKind::RenameObjectAcrossShardPrimaries,
+            status: DfsNamespaceJobStatus::Running,
+            root_path: "/operator-alpha.bin".into(),
+            target_path: Some("/users/operator-alpha.bin".into()),
+            pending_frames: vec![DfsNamespaceJobFrame::ScanDirectory {
+                path: "/operator-alpha.bin".into(),
+                cursor: None,
+            }],
+            processed_object_count: 0,
+            created_at: now,
+            updated_at: now,
+            completed_at: None,
+            failure_reason: None,
+        };
+        let failed = DfsNamespaceJobRecord {
+            job_id: "operator-native-failed-job".into(),
+            kind: DfsNamespaceJobKind::RenameDirectory,
+            status: DfsNamespaceJobStatus::Failed,
+            root_path: "/operator-missing-directory".into(),
+            target_path: Some("/operator-invalid-destination".into()),
+            pending_frames: Vec::new(),
+            failure_reason: Some("invalid destination".into()),
+            ..running.clone()
+        };
+        let shard = runtime.root_shard().unwrap();
+        let payload = crate::DfsPreparedOperationPayload::for_metadata_effects(
+            crate::DfsPreparedOperationScope {
+                file_system_id: fs_id.clone(),
+                shard_id: crate::DfsMetadataShardId::new(shard.shard_id),
+                owner_epoch: shard.epoch,
+                operation_id: "operator-native-job-counts".into(),
+            },
+            Vec::new(),
+            Vec::new(),
+            vec![
+                crate::DfsPreparedMetadataEffect::PutNamespaceJob { job: running },
+                crate::DfsPreparedMetadataEffect::PutNamespaceJob { job: failed },
+            ],
+            now,
+        )
+        .unwrap();
+        crate::test_support::publish_current_payload(&mut writer, payload).unwrap();
+        let backend = writer.metadata_backend().unwrap();
+        let summary = backend.metadata_summary().unwrap();
+        assert_eq!(summary.file_system_count, baseline.file_system_count);
+        assert_eq!(summary.object_count, baseline.object_count + 2);
+        assert_eq!(summary.version_count, backend.all_versions().unwrap().len());
+        assert_eq!(summary.receipt_count, backend.all_receipts().unwrap().len());
+        assert_eq!(summary.intent_count, backend.all_intents().unwrap().len());
+        let actual_file_versions = backend
+            .all_versions()
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.object_id == alpha.object_id || row.object_id == beta.object_id)
+            .collect::<Vec<_>>();
+        assert_eq!(actual_file_versions.len(), 3);
+        assert_eq!(
+            summary.pending_write_count,
+            baseline.pending_write_count + 1
+        );
+        assert_eq!(
+            summary.pending_repair_count,
+            baseline.pending_repair_count + 1
+        );
+        assert_eq!(
+            summary.pending_namespace_job_count,
+            baseline.pending_namespace_job_count + 1
+        );
+        assert_eq!(
+            summary.failed_namespace_job_count,
+            baseline.failed_namespace_job_count + 1
+        );
+        assert_eq!(
+            summary.cross_shard_namespace_lock_count,
+            baseline.cross_shard_namespace_lock_count + 1
+        );
+        let scoped = backend
+            .metadata_summary_for_file_system(&fs_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(scoped.object_count, summary.object_count);
+        assert_eq!(scoped.version_count, summary.version_count);
+        assert_eq!(scoped.receipt_count, summary.receipt_count);
+        assert_eq!(scoped.pending_repair_count, summary.pending_repair_count);
         assert!(
             backend
-                .metadata_summary_for_file_system(
-                    &DfsFileSystemId::from_legacy_named("missing_filesystem")
-                        .expect("missing filesystem id")
-                )
-                .expect("missing scoped summary")
+                .metadata_summary_for_file_system(&DfsFileSystemId::generate())
+                .unwrap()
                 .is_none()
         );
-
-        let inspector = DfsOperatorInspector::new(&backend);
-        let status = inspector.status().expect("status");
-        assert_eq!(status.file_system_count, 1);
-        assert_eq!(status.object_count, 2);
-        assert_eq!(status.version_count, 3);
-        assert_eq!(status.receipt_count, 2);
-        assert_eq!(status.intent_count, 2);
-        assert_eq!(status.pending_write_count, 1, "object_b staging intent");
-        assert_eq!(status.open_conflict_count, 1, "object_a open conflict");
+        let inspector = DfsOperatorInspector::new(backend);
+        let status = inspector.status().unwrap();
+        assert_eq!(status.object_count, summary.object_count);
+        assert_eq!(status.version_count, summary.version_count);
+        assert_eq!(status.receipt_count, summary.receipt_count);
+        assert_eq!(status.intent_count, summary.intent_count);
+        assert_eq!(status.pending_write_count, summary.pending_write_count);
+        assert_eq!(status.pending_repair_count, summary.pending_repair_count);
         assert_eq!(
-            status.pending_repair_count, 1,
-            "object_a committed intent is missing node_replica"
+            status.pending_namespace_job_count,
+            summary.pending_namespace_job_count
         );
-        assert_eq!(status.pending_namespace_job_count, 1);
-        assert_eq!(status.failed_namespace_job_count, 1);
-        assert_eq!(status.cross_shard_namespace_lock_count, Some(1));
-        let file_system = inspector
-            .file_system(&file_system_id())
-            .expect("filesystem view")
-            .expect("filesystem");
-        assert_eq!(file_system.object_count, 2);
-        assert_eq!(file_system.open_conflict_count, 1);
-        assert_eq!(file_system.pending_repair_count, 1);
-
-        fs::remove_dir_all(&root).expect("cleanup");
-    }
-
-    #[test]
-    fn operator_conflict_versions_are_diagnostic_and_cannot_rewind_metadata() {
-        let root = temp_root("operator_conflict_versions_can_be_viewed_and_selected");
-        let mut backend =
-            LocalSobjMetadataBackend::new(crate::DfsMetadataShardId::new("shard-root"), &root)
-                .expect("backend");
-        let file_system = DfsFileSystem {
-            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
-            retention_policies: Default::default(),
-            module_metadata: Default::default(),
-            file_system_id: file_system_id(),
-            display_name: "repo".to_string(),
-            owner_node_id: node("node_owner"),
-            subtree_policies: Vec::new(),
-        };
-        let object = DfsObjectMetadata {
-            object_id: object_id(),
-            file_system_id: file_system_id(),
-            path: "artifact.bin".to_string(),
-            kind: DfsObjectKind::Artifact,
-            tombstone_provenance: None,
-            owner_node_id: node("node_owner"),
-            current_locations: vec![node("node_owner")],
-            content_hash: Some("blake3:local".to_string()),
-            content_size_bytes: Some(5),
-            link_target_object_id: None,
-            mode: 0o644,
-            uid: 0,
-            gid: 0,
-            accessed_at_unix_nanos: 0,
-            modified_at_unix_nanos: 0,
-            created_at_unix_nanos: 0,
-            changed_at_unix_nanos: 0,
-            version: version("version_local"),
-            policy: DfsObjectPolicy::ReplicatedEventual,
-            created_by_event_id: None,
-            last_modified_by_event_id: None,
-        };
-        backend.put_file_system(&file_system).expect("filesystem");
-        backend.put_object(&object).expect("object");
-        for (version_id, hash, size, visible) in [
-            (version("version_base"), "blake3:base", 4, false),
-            (version("version_local"), "blake3:local", 5, true),
-            (version("version_remote"), "blake3:remote", 6, false),
-        ] {
-            backend
-                .put_version(&DfsObjectVersionRecord {
-                    metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
-                    content_durability: None,
-                    retention: Default::default(),
-                    module_metadata: Default::default(),
-                    file_system_id: file_system_id(),
-                    object_id: object_id(),
-                    version: version_id,
-                    content_hash: Some(hash.to_string()),
-                    size_bytes: Some(size),
-                    locations: vec![node("node_owner")],
-                    created_by_event_id: None,
-                    created_at: OffsetDateTime::UNIX_EPOCH,
-                    visible,
-                })
-                .expect("version");
-        }
-        backend
-            .put_conflict(&DfsConflictRecord {
-                conflict_id: "conflict_a".to_string(),
-                file_system_id: file_system_id(),
-                object_id: object_id(),
-                path: "artifact.bin".to_string(),
-                base_version: Some(version("version_base")),
-                local_version: version("version_local"),
-                remote_version: version("version_remote"),
-                detected_by_node_id: node("node_owner"),
-                reason: "manual test conflict".to_string(),
-                local_content_hash: Some("blake3:local".to_string()),
-                remote_content_hash: Some("blake3:remote".to_string()),
-                created_by_intent_id: None,
-                strategy: Some("branch".to_string()),
-                status: DfsConflictStatus::Open,
-                detected_at: OffsetDateTime::UNIX_EPOCH,
-            })
-            .expect("conflict");
-
-        let report = DfsOperatorInspector::new(&backend)
-            .conflict_versions(&object_id(), &[])
-            .expect("versions")
-            .expect("report");
-        assert_eq!(report.versions.len(), 3);
-        let remote = report
-            .versions
-            .iter()
-            .find(|candidate| candidate.version == version("version_remote"))
-            .expect("remote version");
-        assert!(remote.stored);
-        assert_eq!(remote.content_hash.as_deref(), Some("blake3:remote"));
-        assert!(remote.roles.iter().any(|role| role.role == "remote"));
-        let current = report
-            .versions
-            .iter()
-            .find(|candidate| candidate.version == version("version_local"))
-            .expect("current version");
-        assert!(current.current);
-        assert!(current.roles.iter().any(|role| role.role == "current"));
-
-        let before = backend.journal_last_sequence();
-        let result = use_dfs_conflict_version(
-            &mut backend,
-            &object_id(),
-            &version("version_remote"),
-            &["conflict_a".to_string()],
+        assert_eq!(
+            status.failed_namespace_job_count,
+            summary.failed_namespace_job_count
         );
-        assert!(
-            result.is_err(),
-            "metadata-only selection must not rewind the current head"
+        assert_eq!(
+            status.cross_shard_namespace_lock_count,
+            Some(summary.cross_shard_namespace_lock_count)
         );
-        assert_eq!(backend.journal_last_sequence(), before);
-        assert_eq!(backend.get_object(&object_id()).unwrap(), Some(object));
-        assert!(
-            backend
-                .get_conflict(&object_id(), "conflict_a")
+        let file_system = inspector.file_system(&fs_id).unwrap().unwrap();
+        assert_eq!(file_system.object_count, scoped.object_count);
+        assert_eq!(
+            file_system.pending_repair_count,
+            scoped.pending_repair_count
+        );
+        assert_eq!(
+            inspector
+                .object(&alpha.object_id)
                 .unwrap()
-                .is_some()
+                .unwrap()
+                .agent_state,
+            DfsAgentObjectState::PendingRepair
         );
-
-        fs::remove_dir_all(&root).expect("cleanup");
+        assert_eq!(
+            inspector
+                .object(&beta.object_id)
+                .unwrap()
+                .unwrap()
+                .agent_state,
+            DfsAgentObjectState::PendingWrite
+        );
+        assert_eq!(
+            backend
+                .get_object(&beta.object_id)
+                .unwrap()
+                .unwrap()
+                .version,
+            beta.version
+        );
+        writer.abort_pending_write(&intent_id).unwrap();
+        drop(writer);
+        runtime.close().unwrap();
     }
 
     fn file_system_id() -> DfsFileSystemId {

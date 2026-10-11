@@ -4,20 +4,91 @@ use super::*;
 
 #[test]
 fn mkdir_all_commits_a_missing_chain_in_one_namespace_transaction() {
-    let root = temp_root("mkdir-all-single-transaction");
     let node = NodeId::from_legacy_named("node_mkdir_all_single_transaction").expect("node id");
-    let mut dfs =
-        open_shared_metadata_posix_service(&root, &root.join("metadata"), node, "content");
+    let mut runtime = crate::test_runtime::DfsTestRuntime::new(
+        "mkdir_all_commits_a_missing_chain_in_one_namespace_transaction",
+        node.clone(),
+    )
+    .unwrap();
+    runtime.start_nodes().unwrap();
+    let mut dfs = runtime.client(&node).unwrap();
     dfs.bootstrap_distributed_sifs().expect("bootstrap SIFS");
 
-    crate::metadata_backend::reset_metadata_journal_write_count();
+    let shard = DfsMetadataShardId::new("services");
+    let physical_root = crate::local_dfs_metadata_shard_path(runtime.data_dir(&node), &shard);
+    let anchor = crate::read_metadata_candidate(&physical_root)
+        .expect("actual installed current source")
+        .prefix_proof;
+    let before = crate::inspect_metadata_prefix_descendant(&physical_root, &shard, &anchor)
+        .expect("actual current source inspection")
+        .expect("complete actual source prefix");
     dfs.posix_mkdir_all("/services/batched/one/two")
         .expect("create directory chain");
+    let after = crate::inspect_metadata_prefix_descendant(&physical_root, &shard, &before)
+        .expect("actual Main publication source inspection")
+        .expect("the exact same source extends its original prefix");
     assert_eq!(
-        crate::metadata_backend::metadata_journal_write_count(),
-        1,
-        "one mkdir-all operation should publish its complete missing chain atomically"
+        after.journal_sequence - before.journal_sequence,
+        2,
+        "one mkdir-all operation must seal its complete chain in one prepare and one digest commit"
     );
+    let chain_before_repeat = {
+        let inspector = runtime
+            .metadata_primary_service("/services/batched/one/two")
+            .expect("normal current Main/Core inspector");
+        let batch = inspector
+            .metadata_backend()
+            .unwrap()
+            .journal_batch_for_shard_since_limited(&shard, before.journal_sequence, 2, usize::MAX)
+            .unwrap()
+            .expect("the actual same-shard durable journal");
+        assert_eq!(batch.entries.len(), 2);
+        let DfsMetadataMutation::PrepareOperationV7 { record, .. } = &batch.entries[0].mutation
+        else {
+            panic!("actual mkdir-all immutable preparation");
+        };
+        let DfsMetadataMutation::CommitPreparedOperationV7 { digest, .. } =
+            &batch.entries[1].mutation
+        else {
+            panic!("actual mkdir-all digest commitment");
+        };
+        assert_eq!(record.digest, *digest);
+        for path in [
+            "/services/batched",
+            "/services/batched/one",
+            "/services/batched/one/two",
+        ] {
+            assert!(
+                record
+                    .payload
+                    .transaction
+                    .objects
+                    .iter()
+                    .any(|object| object.path == path && object.kind == DfsObjectKind::Directory)
+            );
+        }
+        record
+            .payload
+            .transaction
+            .objects
+            .iter()
+            .filter(|object| {
+                matches!(
+                    object.path.as_str(),
+                    "/services/batched" | "/services/batched/one" | "/services/batched/one/two"
+                )
+            })
+            .map(|object| {
+                inspector
+                    .metadata_backend()
+                    .unwrap()
+                    .get_object_on_shard(&shard, &object.object_id)
+                    .unwrap()
+                    .expect("actual committed chain object")
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(chain_before_repeat.len(), 3);
     for path in [
         "/services/batched",
         "/services/batched/one",
@@ -29,301 +100,106 @@ fn mkdir_all_commits_a_missing_chain_in_one_namespace_transaction() {
         );
     }
 
-    crate::metadata_backend::reset_metadata_journal_write_count();
     dfs.posix_mkdir_all("/services/batched/one/two")
         .expect("repeat existing directory chain");
+    let repeat_after = crate::inspect_metadata_prefix_descendant(&physical_root, &shard, &after)
+        .expect("actual repeated Main operation inspection")
+        .expect("the same actual source extends its known prefix");
     assert_eq!(
-        crate::metadata_backend::metadata_journal_write_count(),
-        0,
-        "an already-complete chain must remain a no-op"
+        repeat_after.journal_sequence - after.journal_sequence,
+        2,
+        "a fresh routed retry records only its canonical completed request"
     );
-}
-
-#[test]
-fn maintenance_tick_rebinds_activated_handoff_before_namespace_job_mutation() {
-    let root = temp_root("maintenance-tick-rebinds-activated-handoff-first");
-    let local = NodeId::from_legacy_named("node_maintenance_handoff_rebind").expect("local");
-    let mut dfs = networked_sifs_with_backend(&root, local.clone());
-    let now = OffsetDateTime::now_utc();
-    let invalid_job = DfsNamespaceJobRecord {
-        job_id: "invalid-job-behind-activated-handoff".to_string(),
-        file_system_id: sifs_file_system_id(),
-        origin: None,
-        kind: DfsNamespaceJobKind::ClearDirectoryRecursive,
-        status: DfsNamespaceJobStatus::Running,
-        root_path: "/services/sandbox/instances/handoff-rebind/work".to_string(),
-        target_path: None,
-        pending_frames: vec![DfsNamespaceJobFrame::RenameDirectoryStart {
-            source_object_id: DfsObjectId::generate(),
-        }],
-        processed_object_count: 0,
-        created_at: now,
-        updated_at: now,
-        completed_at: None,
-        failure_reason: None,
-    };
-    dfs.metadata_backend
-        .as_deref_mut()
-        .expect("metadata backend")
-        .put_namespace_job(&invalid_job)
-        .expect("install invalid namespace job");
-
-    // Simulate the activation transaction committing before the retiring
-    // process advances its local marker. The real transaction records the
-    // exact completion proof atomically with the active assignment, so build
-    // that lifecycle instead of publishing an impossible proof-less state.
-    let shard_id = DfsMetadataShardId::new("root");
-    let removed_replica =
-        NodeId::from_legacy_named("node_maintenance_removed_replica").expect("removed replica");
-    let retiring = DfsMetadataShardConfig {
-        file_system_id: sifs_file_system_id(),
-        shard_id: shard_id.0.clone(),
-        primary_node_id: local.clone(),
-        replica_node_ids: vec![removed_replica.clone()],
-        epoch: 1,
-        assignment: DfsMetadataShardAssignment::Root,
-        namespace_prepare_codec: Default::default(),
-        default_policy: DfsObjectPolicy::ReplicatedEventual,
-    };
-    let active = DfsMetadataShardConfig {
-        replica_node_ids: Vec::new(),
-        epoch: 2,
-        ..retiring.clone()
-    };
-    let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
-    control_plane.with_client(|kv| {
-        let mut store = DfsControlPlaneStore::new(kv);
-        store
-            .put_metadata_shard(&retiring)
-            .expect("publish retiring assignment");
-        let handoff = store
-            .begin_metadata_shard_membership_handoff(&retiring, &active)
-            .expect("begin removal handoff")
-            .expect("new pending handoff");
-        let freeze = dfs
-            .metadata_backend
-            .as_deref_mut()
-            .expect("metadata backend")
-            .freeze_metadata_shard_for_membership_handoff(
-                &shard_id,
-                &handoff.handoff_id,
-                retiring.epoch,
-            )
-            .expect("install retiring freeze")
-            .expect("local shard");
-        let fence = DfsMetadataShardMembershipHandoffFence {
-            handoff_id: handoff.handoff_id.clone(),
-            primary_node_id: local.clone(),
-            journal_sequence: freeze.journal_sequence,
-            state_fingerprint: freeze.state_fingerprint.clone(),
-        };
-        let handoff = store
-            .acknowledge_metadata_shard_membership_handoff_fence(&handoff, &fence)
-            .expect("acknowledge retiring fence")
-            .expect("exact pending handoff");
-        assert!(
-            store
-                .complete_metadata_shard_membership_handoff(
-                    &retiring,
-                    &active,
-                    &DfsMetadataShardMembershipHandoffProof {
-                        handoff_id: handoff.handoff_id,
-                        retiring_shard: retiring.clone(),
-                        desired_shard: active.clone(),
-                        journal_sequence: freeze.journal_sequence,
-                        state_fingerprint: freeze.state_fingerprint,
-                        acknowledged_node_ids: vec![local.clone(), removed_replica.clone()],
-                    },
-                )
-                .expect("commit activated assignment")
-        );
-    });
-    let mut dfs = dfs.with_control_plane(control_plane);
-
-    let mut maintenance_host = RecordingMaintenanceHost::default();
-    let mut publisher_host = RecordingMetadataJournalPublisherHost::new(root.join("publisher"));
-    let unused_target =
-        NodeId::from_legacy_named("node_maintenance_unused_replica").expect("unused target");
-    let mut transport = ApplyingMetadataJournalTransport::new(unused_target);
-    let report = run_dfs_maintenance_tick_with_host(
-        &mut dfs,
-        &mut maintenance_host,
-        active.file_system_id.clone(),
-        &local,
-        vec![active.clone()],
-        &mut publisher_host,
-        &mut transport,
-        DfsMaintenanceTickOptions {
-            namespace_job_max_jobs: 4,
-            namespace_job_max_steps_per_job: 4,
-            conflict_max_records: 0,
-            write_intent_max_records: 0,
-            repair_max_jobs: 0,
-            lifecycle: DfsMaintenanceRunOptions {
-                anti_entropy_max_objects: 0,
-                anti_entropy_max_issues: 0,
-                repair_metadata: false,
-                cleanup_stale_staging: false,
-                ..DfsMaintenanceRunOptions::default()
-            },
-            ..DfsMaintenanceTickOptions::default()
-        },
-    )
-    .expect("maintenance must reconcile authority before frozen metadata work");
-
-    assert_eq!(report.namespace_jobs.failed_job_count, 1);
-    let failed = dfs
-        .metadata_backend
-        .as_deref()
-        .expect("metadata backend")
-        .get_namespace_job(&invalid_job.job_id)
-        .expect("read namespace job")
-        .expect("namespace job remains recorded");
-    assert_eq!(failed.status, DfsNamespaceJobStatus::Failed);
-    let marker = dfs
-        .metadata_backend
-        .as_deref()
-        .expect("metadata backend")
-        .metadata_shard_write_freeze(&shard_id)
-        .expect("read durable active marker")
-        .expect("active generation marker remains durable");
-    assert_eq!(marker.retiring_epoch, retiring.epoch);
-    assert_eq!(marker.activated_epoch, Some(active.epoch));
-
-    std::fs::remove_dir_all(root).ok();
-}
-
-#[test]
-fn metadata_journal_missing_namespace_transaction_payload_uses_keyed_replay() {
-    let root = temp_root("metadata-journal-namespace-transaction-keyed-replay");
-    let owner = NodeId::from_legacy_named("node_namespace_tx_owner").expect("owner");
-    let file_system = file_system(owner.clone());
-    let mut backend =
-        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), &root).expect("backend");
-    backend.put_file_system(&file_system).expect("filesystem");
-
-    let mut unrelated = file_metadata(owner.clone());
-    unrelated.object_id =
-        DfsObjectId::from_legacy_named("obj_namespace_tx_unrelated").expect("object");
-    unrelated.path = "/services/namespace-tx/unrelated.txt".to_string();
-    backend.put_object(&unrelated).expect("unrelated object");
-
-    let mut touched = file_metadata(owner.clone());
-    touched.object_id = DfsObjectId::from_legacy_named("obj_namespace_tx_touched").expect("object");
-    touched.path = "/services/namespace-tx/touched.txt".to_string();
-    touched.version =
-        DfsVersion::from_legacy_named("version_namespace_tx_touched").expect("touched version");
-    let transaction = DfsNamespaceTransaction {
-        content_reference_identity: None,
-        extension_expectations: Vec::new(),
-        contribution_digest: None,
-        file_version_pins: None,
-        transaction_id: "namespace_tx_keyed_replay".to_string(),
-        file_system_id: file_system.file_system_id.clone(),
-        objects: vec![touched.clone()],
-        versions: Vec::new(),
-        advisory_lock_states: Vec::new(),
-        created_at: OffsetDateTime::UNIX_EPOCH,
-    };
-    let mut entry = backend
-        .apply_namespace_transaction(&transaction)
-        .expect("transaction");
-    if let DfsMetadataMutation::ApplyNamespaceTransaction { transaction, .. } = &mut entry.mutation
     {
-        *transaction = None;
-    } else {
-        panic!("expected namespace transaction journal entry");
+        let inspector = runtime
+            .metadata_primary_service("/services/batched/one/two")
+            .expect("normal current Main/Core repeat inspector");
+        let backend = inspector.metadata_backend().unwrap();
+        let batch = backend
+            .journal_batch_for_shard_since_limited(&shard, after.journal_sequence, 2, usize::MAX)
+            .unwrap()
+            .expect("actual repeat completion kernel pair");
+        assert_eq!(batch.entries.len(), 2);
+        assert_eq!(batch.entries[0].sequence, after.journal_sequence + 1);
+        assert_eq!(batch.entries[1].sequence, repeat_after.journal_sequence);
+        let DfsMetadataMutation::PrepareOperationV7 { record, .. } = &batch.entries[0].mutation
+        else {
+            panic!("actual completed-request preparation");
+        };
+        let DfsMetadataMutation::CommitPreparedOperationV7 { digest, .. } =
+            &batch.entries[1].mutation
+        else {
+            panic!("actual completed-request digest commitment");
+        };
+        assert_eq!(record.digest, *digest);
+        let payload = &record.payload;
+        assert!(payload.expected_object_versions.is_empty());
+        assert!(payload.expected_path_occupants.is_empty());
+        assert!(payload.transaction.objects.is_empty());
+        assert!(payload.transaction.versions.is_empty());
+        assert!(payload.transaction.advisory_lock_states.is_empty());
+        assert!(payload.transaction.extension_expectations.is_empty());
+        assert!(payload.transaction.file_version_pins.is_none());
+        assert!(payload.transaction.content_reference_identity.is_none());
+        assert!(payload.transaction.contribution_digest.is_none());
+        assert!(payload.content_receipts.is_empty());
+        assert!(payload.required_replica_node_ids.is_empty());
+        assert!(payload.prepared_intent.is_none() && payload.terminal_intent.is_none());
+        assert!(
+            payload.completed_request.is_none() && payload.completed_request_completion.is_none()
+        );
+        let [DfsPreparedMetadataEffect::PutNamespaceRequest { request }] =
+            payload.metadata_effects.as_slice()
+        else {
+            panic!("repeat publishes exactly one completed namespace request row");
+        };
+        assert_eq!(request.file_system_id, payload.file_system_id);
+        assert_eq!(request.requester_node_id, node);
+        assert_eq!(request.authority_shard_id, shard);
+        assert_eq!(request.status, DfsNamespaceRequestStatus::Completed);
+        assert_eq!(request.result, Some(DfsNamespaceResult::Applied));
+        assert!(
+            matches!(&request.operation, DfsNamespaceOperation::MkdirAll { path }
+            if path == "/services/batched/one/two")
+        );
+        for object in &chain_before_repeat {
+            assert_eq!(
+                backend
+                    .get_object_on_shard(&shard, &object.object_id)
+                    .unwrap(),
+                Some(object.clone()),
+                "repeat must preserve the exact existing directory and version"
+            );
+        }
     }
-
-    let network = InProcessNetwork::new();
-    let content = LocalContentStore::new(root.join("content")).expect("content");
-    let mut dfs = NetworkedDfsService::new(network.add_node(owner), content);
-    dfs.metadata.add_file_system(file_system);
-    dfs.set_metadata_backend_unhydrated(backend);
-
-    dfs.apply_metadata_journal_batch_to_service_state(&DfsMetadataJournalBatch {
-        shard_id: entry.shard_id.clone(),
-        next_after_sequence: entry.sequence,
-        entries: vec![entry],
-    })
-    .expect("incremental namespace transaction replay");
-
-    assert!(
-        dfs.metadata.object(&touched.object_id).is_some(),
-        "missing-payload namespace transaction replay should restore touched objects"
-    );
-    assert!(
-        dfs.metadata.object(&unrelated.object_id).is_none(),
-        "missing-payload namespace transaction replay should not scan and import the whole file system"
-    );
-
-    std::fs::remove_dir_all(root).ok();
-}
-
-#[test]
-fn metadata_journal_missing_namespace_transaction_record_fails_without_full_scan() {
-    let root = temp_root("metadata-journal-namespace-transaction-missing-record");
-    let owner = NodeId::from_legacy_named("node_namespace_tx_missing_owner").expect("owner");
-    let file_system = file_system(owner.clone());
-    let mut backend =
-        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), &root).expect("backend");
-    backend.put_file_system(&file_system).expect("filesystem");
-
-    let mut unrelated = file_metadata(owner.clone());
-    unrelated.object_id =
-        DfsObjectId::from_legacy_named("obj_namespace_tx_missing_unrelated").expect("object");
-    unrelated.path = "/services/namespace-tx-missing/unrelated.txt".to_string();
-    backend.put_object(&unrelated).expect("unrelated object");
-
-    let entry = DfsMetadataJournalEntry {
-        shard_id: DfsMetadataShardId::new("root"),
-        sequence: 99,
-        created_at: OffsetDateTime::UNIX_EPOCH,
-        mutation: DfsMetadataMutation::ApplyNamespaceTransaction {
-            file_system_id: file_system.file_system_id.clone(),
-            transaction_id: "namespace_tx_missing_record".to_string(),
-            object_count: 1,
-            operation_id: None,
-            transaction: None,
-        },
-    };
-
-    let network = InProcessNetwork::new();
-    let content = LocalContentStore::new(root.join("content")).expect("content");
-    let mut dfs = NetworkedDfsService::new(network.add_node(owner), content);
-    dfs.metadata.add_file_system(file_system);
-    dfs.set_metadata_backend_unhydrated(backend);
-
-    let error = dfs
-        .apply_metadata_journal_batch_to_service_state(&DfsMetadataJournalBatch {
-            shard_id: entry.shard_id.clone(),
-            next_after_sequence: entry.sequence,
-            entries: vec![entry],
-        })
-        .expect_err("missing namespace transaction record should fail replay");
-    assert!(
-        error
-            .to_string()
-            .contains("cannot apply namespace transaction namespace_tx_missing_record without its transaction payload")
-    );
-    assert!(
-        dfs.metadata.object(&unrelated.object_id).is_none(),
-        "unrecoverable sparse namespace transaction replay must not import the whole file system"
-    );
-
-    std::fs::remove_dir_all(root).ok();
+    drop(dfs);
+    runtime.close().unwrap();
 }
 
 #[test]
 fn reader_backed_stable_create_replays_after_reopen_and_rejects_a_new_digest() {
-    let root = temp_root("reader-stable-create-reopen");
     let node_id = NodeId::from_legacy_named("node_reader_stable_create").expect("node");
     let path = "/documents/reader-create.txt";
     let operation_id = format!("cf_{}", sinomo_core::Id::generate());
     let options = DfsWriteOptions::replicated_eventual(vec![node_id.clone()]);
 
+    let mut runtime = crate::test_runtime::DfsTestRuntime::new(
+        "reader_backed_stable_create_replays_after_reopen_and_rejects_a_new_digest",
+        node_id.clone(),
+    )
+    .unwrap();
+    let trace_before = crate::test_support::NativeShardTraceArtifactSession::from_environment(
+        "native-reader-digest-before-reopen",
+        [(
+            node_id.clone(),
+            runtime.data_dir(&node_id).root().to_owned(),
+        )],
+        DfsMetadataShardId::new("root"),
+    )
+    .expect("actual first owner capture before mount");
+    runtime.start_nodes().unwrap();
     let created = {
-        let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+        let mut dfs = runtime.client(&node_id).unwrap();
         dfs.posix_mkdir_all("/documents").expect("mkdir");
         dfs.posix_create_file_from_reader_with_operation_id(
             path,
@@ -334,7 +210,26 @@ fn reader_backed_stable_create_replays_after_reopen_and_rejects_a_new_digest() {
         .expect("stable reader create")
     };
 
-    let mut restarted = networked_sifs_with_backend(&root, node_id.clone());
+    if let Some(trace) = &trace_before {
+        trace.close().unwrap();
+    }
+    runtime.stop_node(&node_id).unwrap();
+    if let Some(trace) = trace_before {
+        trace.export().unwrap();
+    }
+    // The prior request is consumed before this new actual mount is admitted.
+    // No capture identity is relabeled across the real owner reincarnation.
+    let trace_after = crate::test_support::NativeShardTraceArtifactSession::from_environment(
+        "native-reader-digest-after-reopen",
+        [(
+            node_id.clone(),
+            runtime.data_dir(&node_id).root().to_owned(),
+        )],
+        DfsMetadataShardId::new("root"),
+    )
+    .expect("actual reopened owner capture before its new mount");
+    runtime.reopen_node(node_id.clone()).unwrap();
+    let mut restarted = runtime.client(&node_id).unwrap();
     assert_eq!(
         created.version,
         crate::intent::stable_write_target_version(&node_id, &created.object_id, &operation_id,),
@@ -399,221 +294,29 @@ fn reader_backed_stable_create_replays_after_reopen_and_rejects_a_new_digest() {
         b"captured once"
     );
 
-    std::fs::remove_dir_all(root).ok();
-}
-
-#[test]
-fn stable_create_reconciliation_routes_from_a_restarted_non_replica_after_authority_moves() {
-    let root = temp_root("stable-create-reconcile-authority-move");
-    let old_primary_node =
-        NodeId::from_legacy_named("node_stable_reconcile_old_primary").expect("old primary");
-    let new_primary_node =
-        NodeId::from_legacy_named("node_stable_reconcile_new_primary").expect("new primary");
-    let requester_node =
-        NodeId::from_legacy_named("node_stable_reconcile_requester").expect("requester");
-    let network = InProcessNetwork::new();
-    let shared_kv = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
-    let shard = |primary: &NodeId, replicas: Vec<NodeId>, epoch| DfsMetadataShardConfig {
-        file_system_id: sifs_file_system_id(),
-        shard_id: "root".to_string(),
-        primary_node_id: primary.clone(),
-        replica_node_ids: replicas,
-        epoch,
-        assignment: DfsMetadataShardAssignment::Root,
-        namespace_prepare_codec: Default::default(),
-        default_policy: DfsObjectPolicy::ReplicatedEventual,
-    };
-    shared_kv.with_client(|kv| {
-        let mut control = DfsControlPlaneStore::new(kv);
-        control
-            .put_file_system_config(&DfsFileSystemConfig::from(&distributed_sifs(
-                old_primary_node.clone(),
-            )))
-            .expect("filesystem config");
-        control
-            .put_metadata_shard(&shard(&old_primary_node, vec![new_primary_node.clone()], 1))
-            .expect("initial shard");
-    });
-    let mut old_primary = sifs_posix_cluster_node(
-        &network,
-        &shared_kv,
-        &root,
-        "old-primary",
-        old_primary_node.clone(),
-    );
-    let mut new_primary = sifs_posix_cluster_node(
-        &network,
-        &shared_kv,
-        &root,
-        "new-primary",
-        new_primary_node.clone(),
-    );
-    let mut requester = sifs_posix_cluster_node(
-        &network,
-        &shared_kv,
-        &root,
-        "requester",
-        requester_node.clone(),
-    );
-
-    // Bootstrap is a replicated namespace mutation, so keep the future
-    // authority online while the original primary publishes the root shard.
-    new_primary = std::thread::scope(|scope| {
-        let stop = Arc::new(AtomicBool::new(false));
-        let pump_stop = Arc::clone(&stop);
-        let pump = scope.spawn(move || pump_sifs_service_until_stop(new_primary, pump_stop));
-        old_primary
-            .bootstrap_distributed_sifs()
-            .expect("initial primary bootstrap");
-        stop.store(true, Ordering::SeqCst);
-        pump.join().expect("bootstrap replica pump")
-    });
-
-    let path = "/users/stable-reconcile-after-move.txt";
-    let bytes = b"durable stable reconciliation".to_vec();
-    let expected_hash = content_hash(&bytes);
-    let operation_id = format!("cf_{}", sinomo_core::Id::generate());
-    let options = DfsWriteOptions::replicated_eventual(vec![requester_node.clone()]);
-    let (old_after_create, new_after_create, created) = std::thread::scope(|scope| {
-        let stop = Arc::new(AtomicBool::new(false));
-        let old_stop = Arc::clone(&stop);
-        let new_stop = Arc::clone(&stop);
-        let old_pump = scope.spawn(move || pump_sifs_service_until_stop(old_primary, old_stop));
-        let new_pump = scope.spawn(move || pump_sifs_service_until_stop(new_primary, new_stop));
-        let parent = requester.posix_mkdir_all("/users");
-        let created = parent.and_then(|_| {
-            requester.posix_create_file_from_reader_with_operation_id(
-                path,
-                std::io::Cursor::new(bytes),
-                options,
-                &operation_id,
-            )
-        });
-        stop.store(true, Ordering::SeqCst);
-        (
-            old_pump.join().expect("old primary pump"),
-            new_pump.join().expect("new primary pump"),
-            created,
-        )
-    });
-    let created = created.expect("routed stable create");
-    old_primary = old_after_create;
-    new_primary = new_after_create;
-
-    let stable_intent_id =
-        crate::intent::stable_write_intent_id(&requester_node, &created.object_id, &operation_id);
-    let replication_deadline = Instant::now() + SIFS_CLUSTER_PUMP_DEADLINE;
-    loop {
-        old_primary
-            .replicate_configured_metadata_shards(&sifs_file_system_id())
-            .expect("publish terminal stable receipt");
-        new_primary
-            .process_incoming()
-            .expect("future authority receives terminal receipt");
-        old_primary
-            .process_incoming()
-            .expect("original authority receives replica acknowledgement");
-        let replicated_status = new_primary
-            .metadata_backend()
-            .expect("replica metadata")
-            .get_intent(&created.object_id, &stable_intent_id)
-            .expect("replicated intent lookup")
-            .map(|record| record.status);
-        if matches!(replicated_status, Some(DfsWriteIntentStatus::Committed)) {
-            break;
-        }
-        assert!(
-            Instant::now() < replication_deadline,
-            "future authority did not receive the terminal stable receipt: {replicated_status:?}",
-        );
-        std::thread::sleep(SIFS_CLUSTER_PUMP_IDLE_SLEEP);
+    drop(restarted);
+    if let Some(trace) = &trace_after {
+        trace.close().unwrap();
     }
-    assert!(
-        new_primary
-            .metadata_backend()
-            .expect("replica metadata")
-            .get_intent(&created.object_id, &stable_intent_id)
-            .expect("replicated intent lookup")
-            .is_some(),
-        "the future authority must durably replicate the exact operation receipt",
-    );
-
-    // Promote the replica, then restart both it and the non-replica caller.
-    // The caller deliberately reopens with an empty metadata root, proving the
-    // answer is routed to the new authority instead of inferred locally.
-    shared_kv.with_client(|kv| {
-        DfsControlPlaneStore::new(kv)
-            .put_metadata_shard(&shard(&new_primary_node, vec![old_primary_node.clone()], 2))
-            .expect("promote replicated authority");
-    });
-    drop(old_primary);
-    drop(new_primary);
-    drop(requester);
-    let restarted_primary = sifs_posix_cluster_node(
-        &network,
-        &shared_kv,
-        &root,
-        "new-primary",
-        new_primary_node.clone(),
-    );
-    let mut restarted_requester = sifs_posix_cluster_node(
-        &network,
-        &shared_kv,
-        &root,
-        "requester-without-local-history",
-        requester_node,
-    );
-    assert!(
-        restarted_requester
-            .metadata_backend()
-            .expect("requester metadata")
-            .get_intent(&created.object_id, &stable_intent_id)
-            .expect("local receipt lookup")
-            .is_none(),
-        "the restarted non-replica fixture must not have local receipt evidence",
-    );
-
-    let (reconciliation, restarted_primary) = std::thread::scope(|scope| {
-        let stop = Arc::new(AtomicBool::new(false));
-        let pump_stop = Arc::clone(&stop);
-        let pump = scope.spawn(move || pump_sifs_service_until_stop(restarted_primary, pump_stop));
-        let reconciliation = restarted_requester.reconcile_stable_create_file_operation(
-            path,
-            &operation_id,
-            &expected_hash,
-            created.size_bytes.expect("created size"),
-        );
-        stop.store(true, Ordering::SeqCst);
-        (
-            reconciliation,
-            pump.join().expect("promoted authority pump"),
-        )
-    });
-    let reconciliation = reconciliation.expect("routed reconciliation");
-    let DfsStableWriteOperationReconciliation::Applied { receipt } = reconciliation else {
-        panic!("remote durable receipt must prove Applied: {reconciliation:?}");
-    };
-    assert_eq!(receipt.operation_id, operation_id);
-    assert_eq!(receipt.object_id, created.object_id);
-    assert_eq!(
-        receipt.content_hash.as_deref(),
-        Some(expected_hash.as_str())
-    );
-    assert_eq!(receipt.content_size_bytes, created.size_bytes);
-
-    drop(restarted_primary);
-    std::fs::remove_dir_all(root).ok();
+    runtime.close().unwrap();
+    if let Some(trace) = trace_after {
+        trace.export().unwrap();
+    }
 }
 
 #[test]
 fn reader_backed_stable_cas_replays_but_rejects_a_recreated_path() {
-    let root = temp_root("reader-stable-cas-recreated");
     let node_id = NodeId::from_legacy_named("node_reader_stable_cas").expect("node");
     let path = "/documents/reader-cas.txt";
     let operation_id = format!("cf_{}", sinomo_core::Id::generate());
     let options = DfsWriteOptions::replicated_eventual(vec![node_id.clone()]);
+    let (mut runtime, setup) = native_sifs_service(
+        "reader_backed_stable_cas_replays_but_rejects_a_recreated_path",
+        node_id.clone(),
+    );
+    drop(setup);
     let (opened, saved) = {
-        let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+        let mut dfs = runtime.client(&node_id).unwrap();
         dfs.posix_mkdir_all("/documents").expect("mkdir");
         let opened = dfs
             .posix_write_file(path, b"opened", options.clone())
@@ -631,7 +334,9 @@ fn reader_backed_stable_cas_replays_but_rejects_a_recreated_path() {
         (opened, saved)
     };
 
-    let mut restarted = networked_sifs_with_backend(&root, node_id.clone());
+    runtime.stop_node(&node_id).unwrap();
+    runtime.reopen_node(node_id.clone()).unwrap();
+    let mut restarted = runtime.client(&node_id).unwrap();
     let replayed = restarted
         .posix_replace_file_if_version_from_reader_with_operation_id(
             path,
@@ -667,60 +372,8 @@ fn reader_backed_stable_cas_replays_but_rejects_a_recreated_path() {
         b"replacement identity"
     );
 
-    std::fs::remove_dir_all(root).ok();
-}
-
-#[test]
-fn sifs_namespace_job_maintenance_marks_invalid_job_failed() {
-    let root = temp_root("sifs-namespace-job-maintenance-failed");
-    let node_id = NodeId::from_legacy_named("node_sifs_namespace_job_maintenance").expect("node");
-    let mut dfs = networked_sifs_with_backend(&root, node_id);
-    let now = time::OffsetDateTime::now_utc();
-    let job = DfsNamespaceJobRecord {
-        job_id: "invalid-clear-job".to_string(),
-        file_system_id: sifs_file_system_id(),
-        origin: None,
-        kind: DfsNamespaceJobKind::ClearDirectoryRecursive,
-        status: DfsNamespaceJobStatus::Running,
-        root_path: "/services/sandbox/instances/invalid-clear/work".to_string(),
-        target_path: None,
-        pending_frames: vec![DfsNamespaceJobFrame::RenameDirectoryStart {
-            source_object_id: DfsObjectId::generate(),
-        }],
-        processed_object_count: 0,
-        created_at: now,
-        updated_at: now,
-        completed_at: None,
-        failure_reason: None,
-    };
-    dfs.metadata_backend
-        .as_mut()
-        .expect("backend")
-        .put_namespace_job(&job)
-        .expect("put invalid job");
-
-    let report = dfs
-        .posix_resume_namespace_jobs_bounded(4, 4)
-        .expect("namespace job maintenance");
-
-    assert_eq!(report.scanned_job_count, 1);
-    assert_eq!(report.resumed_job_count, 1);
-    assert_eq!(report.failed_job_count, 1);
-    assert_eq!(report.failures.len(), 1);
-    assert_eq!(report.failures[0].job_id, job.job_id);
-    let failed = dfs
-        .metadata_backend
-        .as_ref()
-        .expect("backend")
-        .get_namespace_job(&job.job_id)
-        .expect("get failed job")
-        .expect("failed job");
-    assert_eq!(failed.status, DfsNamespaceJobStatus::Failed);
-    assert!(failed.failure_reason.as_deref().is_some_and(|reason| {
-        reason.contains("invalid DFS path") || reason.contains("invalid-clear-job")
-    }));
-
-    std::fs::remove_dir_all(root).ok();
+    drop(restarted);
+    runtime.close().unwrap();
 }
 
 #[test]
@@ -730,7 +383,10 @@ fn sifs_posix_recreate_directory_uses_a_new_namespace_transaction_generation() {
     let parent_path = "/services/sandbox/instances/sandbox_recreate_dir_transaction/work";
     let dir_path = "/services/sandbox/instances/sandbox_recreate_dir_transaction/work/recreated";
 
-    let mut dfs = networked_sifs_with_backend(&root, node_id);
+    let (_runtime, mut dfs) = native_sifs_service(
+        "sifs_posix_recreate_directory_uses_a_new_namespace_transaction_generation",
+        node_id,
+    );
     dfs.posix_mkdir_all(parent_path).expect("mkdir parent");
     let original = dfs.posix_mkdir(dir_path).expect("initial mkdir");
     dfs.posix_rmdir(dir_path).expect("rmdir");
@@ -744,122 +400,57 @@ fn sifs_posix_recreate_directory_uses_a_new_namespace_transaction_generation() {
 }
 
 #[test]
-fn durable_pending_namespace_request_recovers_automatically_after_restart() {
-    let cluster = sifs_two_primary_cluster("sifs-namespace-pending-restart");
-    let SifsTwoPrimaryCluster {
-        root,
-        users_primary_node,
-        services_primary_node,
-        replica_node,
-        shared_kv,
-        mut services_primary,
-        replica,
-        ..
-    } = cluster;
-    let source = "/services/pending-source.txt";
-    let destination = "/services/pending-destination.txt";
-    let primary_node = services_primary.node_id().clone();
-    services_primary
+fn native_namespace_request_replay_survives_actual_primary_restart() {
+    let nodes =
+        crate::test_runtime::DfsTestRuntime::ordered_node_ids("native-namespace-replay-restart", 3);
+    let mut runtime = crate::test_runtime::DfsTestRuntime::new(
+        "native-namespace-replay-restart",
+        nodes[0].clone(),
+    )
+    .unwrap();
+    for node in &nodes[1..] {
+        runtime.define_node(node.clone()).unwrap();
+    }
+    runtime.start_nodes().unwrap();
+    let primary = runtime
+        .metadata_shards()
+        .unwrap()
+        .into_iter()
+        .find(|shard| shard.shard_id == "services")
+        .unwrap()
+        .primary_node_id;
+    let requester = nodes.iter().find(|node| **node != primary).unwrap().clone();
+    let mut writer = runtime.client(&requester).unwrap();
+    let from = "/services/native-replay-source";
+    let to = "/services/native-replay-target";
+    let source = writer
         .posix_write_file(
-            source,
-            b"pending request payload",
-            DfsWriteOptions::replicated_eventual(vec![primary_node]),
+            from,
+            b"native request bytes",
+            DfsWriteOptions::replicated_eventual(nodes.clone()),
         )
-        .expect("seed pending source");
-
-    let command = DfsNamespaceCommand {
-        request_id: "dfs_net_req_pending_restart".to_string(),
-        file_system_id: sifs_file_system_id(),
-        requesting_node_id: replica_node.clone(),
-        include_metadata_journal_batches: true,
-        metadata_journal_after_sequences: Vec::new(),
-        authority_shards: Vec::new(),
-        operation: DfsNamespaceOperation::Rename {
-            from: source.to_string(),
-            to: destination.to_string(),
-        },
-    };
-    let encoded = serde_json::to_vec(&(
-        &command.file_system_id,
-        &command.requesting_node_id,
-        &command.operation,
-    ))
-    .expect("encode command digest");
-    let now = OffsetDateTime::now_utc();
-    let pending = DfsNamespaceRequestRecord {
-        file_system_id: command.file_system_id.clone(),
-        requester_node_id: replica_node.clone(),
-        request_id: command.request_id.clone(),
-        operation_id: "req-pending-restart".to_string(),
-        authority_shard_id: DfsMetadataShardId::new("services"),
-        operation: command.operation.clone(),
-        command_digest: format!("blake3:{}", blake3::hash(&encoded).to_hex()),
-        status: DfsNamespaceRequestStatus::Pending,
-        result: None,
-        posix_coordination_result: None,
-        recovery_attempts: 0,
-        last_recovery_error: None,
-        created_at: now,
-        updated_at: now,
-    };
-    services_primary
-        .metadata_backend
-        .as_mut()
-        .expect("metadata backend")
-        .put_namespace_request_on_shard(&DfsMetadataShardId::new("services"), &pending)
-        .expect("persist pending request");
-
-    let restarted_transport = services_primary.transport.clone();
-    drop(services_primary);
-    let restarted_shards = sifs_two_primary_shard_configs(
-        &users_primary_node,
-        &services_primary_node,
-        2,
-        vec![services_primary_node.clone(), replica_node.clone()],
-        vec![users_primary_node.clone(), replica_node.clone()],
+        .unwrap();
+    let operation = sinomo_core::Id::generate().to_string();
+    let moved = writer
+        .posix_rename_with_operation_id(from, to, &operation)
+        .unwrap();
+    assert_eq!(moved.object_id, source.object_id);
+    drop(writer);
+    runtime.stop_node(&primary).unwrap();
+    runtime.reopen_node(primary).unwrap();
+    let mut reader = runtime.client(&requester).unwrap();
+    let replay = reader
+        .posix_rename_with_operation_id(from, to, &operation)
+        .unwrap();
+    assert_eq!(replay, moved);
+    assert_eq!(
+        reader.posix_read_file_distributed(to).unwrap(),
+        b"native request bytes"
     );
-    let mut services_primary = NetworkedDfsService::new(
-        restarted_transport,
-        LocalContentStore::new(root.join("services-primary").join("content"))
-            .expect("restarted services content"),
-    )
-    .with_control_plane(shared_kv)
-    .with_metadata_backend(
-        open_local_sharded_metadata_backend(
-            root.join("services-primary").join("metadata"),
-            restarted_shards,
-        )
-        .expect("reopen services metadata"),
-    )
-    .expect("attach restarted services metadata");
-
     assert!(matches!(
-        services_primary.posix_stat(source),
+        reader.posix_stat_distributed(from),
         Err(DfsPosixError::NotFound { .. })
     ));
-    assert!(services_primary.posix_stat(destination).is_ok());
-    let recovered = services_primary
-        .metadata_backend
-        .as_ref()
-        .expect("metadata backend")
-        .get_namespace_request(&replica_node, &command.request_id)
-        .expect("recovered request")
-        .expect("durable request");
-    assert_eq!(recovered.status, DfsNamespaceRequestStatus::Completed);
-    assert_eq!(recovered.result, Some(DfsNamespaceResult::Applied));
-
-    let event = services_primary
-        .handle_namespace_request(replica_node, command)
-        .expect("replay automatically recovered request");
-    assert!(matches!(
-        event,
-        NetworkedDfsServiceEvent::RemoteNamespaceServed {
-            result: DfsNamespaceResult::Applied,
-            mutates_metadata: false,
-            ..
-        }
-    ));
-
-    drop(replica);
-    std::fs::remove_dir_all(root).ok();
+    drop(reader);
+    runtime.close().unwrap();
 }

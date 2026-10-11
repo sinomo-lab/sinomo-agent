@@ -68,6 +68,21 @@ pub(crate) fn notify_daemon_dfs_storage_environment_dirty(data_dir: &SinomoDataD
     signal.notify.notify_one();
 }
 
+/// Retained observation only. In particular, do not call the environment
+/// helper which would create a monitor/cache or sample missing host state.
+#[cfg(feature = "storage-conversion")]
+pub(super) fn retained_storage_import_placement_snapshot(
+    data_dir: &SinomoDataDir,
+) -> Option<Arc<sinomo_dfs::DfsPlacementSnapshot>> {
+    DAEMON_DFS_PLACEMENT_ENVIRONMENTS
+        .get()?
+        .lock()
+        .ok()?
+        .get(&data_dir.root())?
+        .cache
+        .snapshot()
+}
+
 fn placement_environments() -> &'static Mutex<BTreeMap<PathBuf, DaemonDfsPlacementEnvironment>> {
     DAEMON_DFS_PLACEMENT_ENVIRONMENTS.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
@@ -86,7 +101,7 @@ fn with_placement_environment<R>(
         .or_insert_with(|| DaemonDfsPlacementEnvironment {
             monitor: sinomo_dfs::DfsDeviceHealthMonitor::new(
                 node_id.clone(),
-                vec![sinomo_dfs::DfsContentLocationConfig::legacy(
+                vec![sinomo_dfs::DfsContentLocationConfig::default_for_root(
                     data_dir.dfs_dir().join("content"),
                 )],
             ),
@@ -341,6 +356,23 @@ fn prepare_daemon_dfs_storage_environment_refresh(
         return Ok(None);
     }
     let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)?;
+    if sample_storage {
+        let content_root = data_dir.dfs_dir().join("content");
+        let content_exists = content_root
+            .try_exists()
+            .map_err(|source| DaemonError::Io {
+                path: content_root.display().to_string(),
+                detail: source.to_string(),
+            })?;
+        if !content_exists {
+            // A clustered peer can become prepared before its first content
+            // ingress. Initialize through its actual owner and converter before
+            // sampling; Pending retains the ordinary refresh retry without
+            // installing a missing-layout health baseline.
+            let _actual_owner = require_daemon_dfs_data_owner_lock(paths)?;
+            LocalContentStore::new(&content_root)?;
+        }
+    }
     if with_placement_environment(&data_dir, &state.local_node_id, |environment| {
         environment.remote_projection_pending
     }) {

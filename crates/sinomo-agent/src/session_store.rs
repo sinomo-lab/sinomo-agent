@@ -8,7 +8,7 @@ use crate::agent::{
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sinomo_lm::{RealtimeAudioSampleFormat, RealtimeVideoFrameFormat};
-use sinomo_runtime::events::SessionId;
+use sinomo_runtime::events::{EventId, SessionId};
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::vfs::{
     ConfinedLocalVfsBackend, VfsAppendOptions, VfsDirectoryCursor, VfsError, VfsHandle,
@@ -280,11 +280,22 @@ pub trait AgentSessionStore: Send + Sync {
 
     fn save_session(&self, session: &AgentSession) -> Result<(), AgentSessionStoreError>;
 
+    /// Journal items to the session's activity log. The store assigns each
+    /// record the session's next activity sequence number.
     fn append_items(
         &self,
         session_id: &SessionId,
+        origin: &AgentItemOrigin,
         items: &[AgentItem],
     ) -> Result<(), AgentSessionStoreError>;
+
+    /// The session's activity log in sequence order.
+    fn load_item_records(
+        &self,
+        _session_id: &SessionId,
+    ) -> Result<Vec<AgentSessionItemRecord>, AgentSessionStoreError> {
+        Ok(Vec::new())
+    }
 
     fn append_projection(
         &self,
@@ -308,6 +319,63 @@ pub trait AgentSessionStore: Send + Sync {
     ) -> Result<Vec<AgentEvent>, AgentSessionStoreError> {
         Ok(Vec::new())
     }
+
+    /// The session's detached calls whose completion it has not continued
+    /// with yet, in start order.
+    fn load_detached_calls(
+        &self,
+        _session_id: &SessionId,
+    ) -> Result<Vec<AgentDetachedCall>, AgentSessionStoreError> {
+        Ok(Vec::new())
+    }
+}
+
+/// A detached tool call the session has not continued with yet.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentDetachedCall {
+    pub task_id: TaskId,
+    pub tool_call_id: TaskId,
+    pub tool: String,
+    /// The outcome, once the call finished; `None` while it runs (or if the
+    /// process running it stopped).
+    pub completion: Option<crate::AsyncTaskUpdate>,
+}
+
+/// Fold a session's records into its undelivered detached calls.
+pub fn fold_detached_calls<'a>(
+    records: impl IntoIterator<Item = &'a AgentSessionStoreRecordKind>,
+) -> Vec<AgentDetachedCall> {
+    let mut calls: Vec<AgentDetachedCall> = Vec::new();
+    for record in records {
+        match record {
+            AgentSessionStoreRecordKind::DetachedCallStarted {
+                task_id,
+                tool_call_id,
+                tool,
+            } => {
+                if !calls.iter().any(|call| &call.task_id == task_id) {
+                    calls.push(AgentDetachedCall {
+                        task_id: task_id.clone(),
+                        tool_call_id: tool_call_id.clone(),
+                        tool: tool.clone(),
+                        completion: None,
+                    });
+                }
+            }
+            AgentSessionStoreRecordKind::DetachedCallCompleted { update } => {
+                if let Some(call) = calls.iter_mut().find(|call| call.task_id == update.task_id)
+                    && call.completion.is_none()
+                {
+                    call.completion = Some(update.clone());
+                }
+            }
+            AgentSessionStoreRecordKind::DetachedCallDelivered { task_id } => {
+                calls.retain(|call| &call.task_id != task_id);
+            }
+            _ => {}
+        }
+    }
+    calls
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -345,28 +413,80 @@ impl AgentSessionStoreRecord {
     }
 }
 
+/// Why items entered a session's activity log.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub struct AgentItemOrigin {
+    /// Operation that produced the items; absent for items recorded outside
+    /// an operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub op_id: Option<TaskId>,
+    /// Events that caused the operation, such as the delivered message.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub caused_by: Vec<EventId>,
+}
+
+impl AgentItemOrigin {
+    pub fn for_op(op_id: TaskId, caused_by: impl IntoIterator<Item = EventId>) -> Self {
+        Self {
+            op_id: Some(op_id),
+            caused_by: caused_by.into_iter().collect(),
+        }
+    }
+}
+
+/// One entry of a session's append-only activity log.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct AgentSessionItemRecord {
     pub record_id: TaskId,
     pub session_id: SessionId,
+    /// Per-session position, strictly increasing in append order. Readers page
+    /// and resume by it.
+    #[serde(default)]
+    pub seq: u64,
     #[serde(with = "crate::time_serde::rfc3339")]
     pub recorded_at: time::OffsetDateTime,
     pub item_id: TaskId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub op_id: Option<TaskId>,
+    /// The tool call the item belongs to, for calls, results, and async
+    /// updates of work a call started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<TaskId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub caused_by: Vec<EventId>,
     pub item: AgentItem,
 }
 
 impl AgentSessionItemRecord {
-    pub fn new(session_id: SessionId, item: AgentItem) -> Self {
-        let item_id = agent_item_id(&item);
+    pub fn new(session_id: SessionId, seq: u64, origin: &AgentItemOrigin, item: AgentItem) -> Self {
         Self {
             record_id: TaskId::generate(),
             session_id,
+            seq,
             recorded_at: time::OffsetDateTime::now_utc(),
-            item_id,
+            item_id: agent_item_id(&item),
+            op_id: origin.op_id.clone(),
+            tool_call_id: agent_item_tool_call_id(&item),
+            caused_by: origin.caused_by.clone(),
             item,
         }
     }
 }
+
+/// The tool call an item belongs to, if any.
+pub fn agent_item_tool_call_id(item: &AgentItem) -> Option<TaskId> {
+    match item {
+        AgentItem::ToolCall { tool_call_id, .. } => Some(tool_call_id.clone()),
+        AgentItem::ToolResult { call_id, .. } => Some(call_id.clone()),
+        AgentItem::AsyncTaskUpdate { update, .. } => update.tool_call_id.clone(),
+        _ => None,
+    }
+}
+
+/// Next activity sequence per items log, shared by every store instance in
+/// the process. A session has one host process, so this is the only writer.
+static NEXT_ITEM_SEQ: std::sync::LazyLock<Mutex<std::collections::BTreeMap<PathBuf, u64>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::BTreeMap::new()));
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct AgentSessionProjectionRecord {
@@ -660,6 +780,21 @@ pub enum AgentSessionStoreRecordKind {
     ControlSnapshotSaved {
         snapshot: AgentSessionControlSnapshot,
     },
+    /// An `async` tool call started running detached.
+    DetachedCallStarted {
+        task_id: TaskId,
+        tool_call_id: TaskId,
+        tool: String,
+    },
+    /// A detached call finished, or was found interrupted; the session has
+    /// not continued with `update` yet.
+    DetachedCallCompleted {
+        update: crate::AsyncTaskUpdate,
+    },
+    /// The session continued with the detached call's completion.
+    DetachedCallDelivered {
+        task_id: TaskId,
+    },
     AudioSegmentAppended {
         segment_id: TaskId,
         direction: AgentAudioDirection,
@@ -736,6 +871,7 @@ impl AgentSessionStore for NoopAgentSessionStore {
     fn append_items(
         &self,
         _session_id: &SessionId,
+        _origin: &AgentItemOrigin,
         _items: &[AgentItem],
     ) -> Result<(), AgentSessionStoreError> {
         Ok(())
@@ -1506,18 +1642,42 @@ impl AgentSessionStore for FileAgentSessionStore {
     fn append_items(
         &self,
         session_id: &SessionId,
+        origin: &AgentItemOrigin,
         items: &[AgentItem],
     ) -> Result<(), AgentSessionStoreError> {
         if items.is_empty() {
             return Ok(());
         }
         let path = self.paths.session_items_path_for_session(session_id);
+        let mut next_seq = NEXT_ITEM_SEQ
+            .lock()
+            .map_err(|_| AgentSessionStoreError::Io {
+                path: path.display().to_string(),
+                detail: "activity sequence lock poisoned".to_string(),
+            })?;
+        let mut seq = match next_seq.get(&path) {
+            Some(seq) => *seq,
+            None => self
+                .read_jsonl_records::<AgentSessionItemRecord>(&path)?
+                .iter()
+                .map(|record| record.seq + 1)
+                .max()
+                .unwrap_or(1),
+        };
         for item in items {
-            self.append_jsonl_record(
+            let appended = self.append_jsonl_record(
                 &path,
-                &AgentSessionItemRecord::new(session_id.clone(), item.clone()),
-            )?;
+                &AgentSessionItemRecord::new(session_id.clone(), seq, origin, item.clone()),
+            );
+            if let Err(error) = appended {
+                // The failed record may or may not be on disk; reread next time.
+                next_seq.remove(&path);
+                return Err(error);
+            }
+            seq += 1;
         }
+        next_seq.insert(path, seq);
+        drop(next_seq);
         self.append_record(&AgentSessionStoreRecord::new(
             session_id.clone(),
             AgentSessionStoreRecordKind::ItemsAppended {
@@ -1525,6 +1685,17 @@ impl AgentSessionStore for FileAgentSessionStore {
                 item_ids: items.iter().map(agent_item_id).collect(),
             },
         ))
+    }
+
+    fn load_item_records(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<AgentSessionItemRecord>, AgentSessionStoreError> {
+        let path = self.paths.session_items_path_for_session(session_id);
+        let mut records = self.read_jsonl_records::<AgentSessionItemRecord>(&path)?;
+        records.retain(|record| &record.session_id == session_id);
+        records.sort_by_key(|record| record.seq);
+        Ok(records)
     }
 
     fn append_projection(
@@ -1572,6 +1743,20 @@ impl AgentSessionStore for FileAgentSessionStore {
             }
         }
         Ok(latest)
+    }
+
+    fn load_detached_calls(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<AgentDetachedCall>, AgentSessionStoreError> {
+        let path = self.paths.session_events_path_for_session(session_id);
+        let records = self.read_jsonl_records::<AgentSessionStoreRecord>(&path)?;
+        Ok(fold_detached_calls(
+            records
+                .iter()
+                .filter(|record| &record.session_id == session_id)
+                .map(|record| &record.record),
+        ))
     }
 
     fn load_control_events(

@@ -171,13 +171,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     required_receipts,
                 })
             }
-            NetworkedDfsWriteOutcome::Conflict { conflict } => {
-                self.remove_transient_object_metadata(&object.object_id);
-                Err(DfsPosixError::Conflict {
-                    path: link_path,
-                    reason: conflict.reason,
-                })
-            }
         }
     }
 
@@ -298,9 +291,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             kind: DfsObjectKind::Hardlink,
             tombstone_provenance: None,
             owner_node_id: self.node_id.clone(),
-            current_locations: target.current_locations.clone(),
-            content_hash: target.content_hash.clone(),
-            content_size_bytes: target.content_size_bytes,
+            // The directory entry refers to the canonical object's generation;
+            // it does not own a second generation or a copied durability grant.
+            current_locations: Vec::new(),
+            content_hash: None,
+            content_size_bytes: None,
             link_target_object_id: Some(target.object_id.clone()),
             mode: target.mode,
             uid: target.uid,

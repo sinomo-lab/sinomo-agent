@@ -9,6 +9,7 @@ verify_steps="${QUINT_VERIFY_MAX_STEPS:-5}"
 run_steps="${QUINT_RUN_MAX_STEPS:-20}"
 run_samples="${QUINT_RUN_MAX_SAMPLES:-50}"
 run_seed="${QUINT_RUN_SEED:-0x51a0f04d20260710}"
+run_backend="${QUINT_RUN_BACKEND:-rust}"
 case_filter="${QUINT_CASE_FILTER:-}"
 case_timeout_seconds="${QUINT_CASE_TIMEOUT_SECONDS:-300}"
 expected_quint_version="${QUINT_EXPECTED_VERSION:-0.32.0}"
@@ -46,6 +47,7 @@ register_case membership specs/quint/checks/membership/membership_safety.qnt mem
 register_case membership-kv specs/quint/checks/membership/membership_kv_safety.qnt membership_kv_safety "${QUINT_MEMBERSHIP_KV_VERIFY_MAX_STEPS:-4}" tlc step stepCore deep
 register_case membership-raft-config specs/quint/checks/membership/raft_config_transition_safety.qnt raft_config_transition_safety "${QUINT_MEMBERSHIP_RAFT_CONFIG_VERIFY_MAX_STEPS:-4}" apalache step step fast "witnessOneToTwoLearnerPromotionCommitted witnessOneToTwoNonVotingPromotionCommitted witnessThreeToTwoShrinkCommitted witnessTwoToOneShrinkRejected witnessDirectVoterAdditionRejected witnessTwoVoterAdditionsRejected witnessHealthObservationWithoutConfigMutation witnessPartialAcknowledgementDoesNotCommit"
 register_case dfs-metadata specs/quint/checks/dfs/metadata_safety.qnt dfs_metadata_safety "$verify_steps"
+register_case dfs-whole-shard specs/quint/checks/dfs/whole_shard_safety.qnt dfs_whole_shard_safety "${QUINT_DFS_WHOLE_SHARD_VERIFY_MAX_STEPS:-8}" apalache step step deep "witnessMinorityRejected witnessChangedRetryRejected witnessPartialActivationRejected witnessWrongDigestRejected witnessDivergentPrefixRejected"
 register_case dfs-content-binding-publication specs/quint/checks/dfs/content_binding_publication_safety.qnt dfs_content_binding_publication_safety "${QUINT_DFS_CONTENT_BINDING_PUBLICATION_VERIFY_MAX_STEPS:-8}" apalache coverageStep step fast "witnessOneSyncExactPublication witnessLostReplyCrashReconstructsBinding witnessIndexLossRebuildsManifestAndRoot witnessSyncFailureCacheDoesNotAuthorizeReceipt witnessRetrySynchronizesUncertainRecord witnessTornTailReopenPreservesAcknowledgedPrefix witnessCompleteMalformedRecordFailsClosed witnessConflictingTupleRejected witnessQuotaRejectsSecondLiveTuple witnessPostCutRenewalBlocksNegativeRelease witnessForeignCutBlocksNegativeRelease witnessOlderReservationCanRelease witnessPositiveReleaseKeepsCanonicalManifest"
 register_case dfs-content-binding-lifecycle specs/quint/checks/dfs/content_binding_lifecycle_safety.qnt dfs_content_binding_lifecycle_safety "${QUINT_DFS_CONTENT_BINDING_LIFECYCLE_VERIFY_MAX_STEPS:-10}" apalache coverageStep step fast "witnessActivationWaitsForOldOperation witnessActivationCarriesDrainedLegacyBaseline witnessStaleHandleCannotWriteNewLayout witnessCompactionKeepsBindingAndReader witnessCompactionReclaimsAfterReaderRelease witnessCrashBeforeDirectorySyncCanSelectOldGeneration"
 register_case dfs-requester-prestage-binding specs/quint/checks/dfs/requester_prestage_binding_safety.qnt dfs_requester_prestage_binding_safety "${QUINT_DFS_REQUESTER_PRESTAGE_BINDING_VERIFY_MAX_STEPS:-8}" apalache step step fast "witnessUnchangedCreateUsesRequesterWithoutStage witnessVersionRebaseSuppressesLegacyCredit witnessObjectRebaseSuppressesLegacyCredit witnessExcludedRequesterNeedsSelectedReplica witnessRebasedTupleBoundBeforeCommit witnessLostReplyCrashRetainsCanonicalBinding witnessRestartNeedsNoPostReplyBinding witnessCancelledCallerCannotUndoDurableBinding witnessWAloneCannotPublish witnessRemovedParentCannotPublish witnessExclusiveRaceCannotPublish witnessChangedRetryDoesNotChangeBinding"
@@ -117,16 +119,19 @@ register_case dfs-anti-entropy specs/quint/checks/dfs/anti_entropy_safety.qnt df
 
 usage() {
   cat <<'EOF'
-Usage: scripts/formal/check-quint.sh [all|fast|typecheck|run|smoke|verify-fast|verify-full|coverage]
+Usage: scripts/formal/check-quint.sh [all|fast|typecheck|run|smoke|verify-fast|verify-full|coverage|whole-shard]
 
 Environment:
   QUINT_CASE_FILTER=id[,id...]    Restrict focused run/verify cases.
   QUINT_RUN_SEED=seed             Reproduce all randomized runs (fixed by default).
+  QUINT_RUN_BACKEND=name         Simulation backend (default: rust).
   QUINT_REQUIRE_WITNESSES=1       Fail when a registered witness is not reached.
   QUINT_COVERAGE_MAX_SAMPLES=n    Samples for focused witness coverage (default: 5000).
   QUINT_CASE_TIMEOUT_SECONDS=n    Bound each Quint command (default: 300).
   QUINT_EXPECTED_VERSION=x.y.z    Required Quint CLI version (default: 0.32.0).
   QUINT_APALACHE_VERSION=x.y.z    Pinned Apalache version (default: 0.56.1).
+  QUINT_WHOLE_SHARD_MAX_SAMPLES=n Samples for whole-shard mode (default: 1000).
+  QUINT_WHOLE_SHARD_MAX_STEPS=n   Steps for whole-shard mode (default: 40).
 EOF
 }
 
@@ -216,6 +221,7 @@ run_check() {
   local -a args=(
     quint run "$file"
     "--main=$main"
+    "--backend=$run_backend"
     --invariant=safety
     "--step=$step"
     "--max-steps=$run_steps"
@@ -268,6 +274,7 @@ run_scenario() {
   local -a args=(
     quint run "$file"
     "--main=$main"
+    "--backend=$run_backend"
     --invariant=safety
     "--max-steps=$steps"
     "--max-samples=$samples"
@@ -316,7 +323,22 @@ run_canonical_write_scenarios() {
     "witnessQuorumPermitPublishesWithoutFullShardAcks witnessStaleEpochOrPermitCannotPublish"
 }
 
+run_whole_shard_scenarios() {
+  case_selected dfs-whole-shard || return 0
+  local name
+  for name in healthy fallback membership promotion cached_permit_handoff wrong_digest_prefix permit_watermark_handoff one_voter storage_import; do
+    run_scenario \
+      "dfs-whole-shard-$name" \
+      "specs/quint/scenarios/dfs/whole_shard_$name.qnt" \
+      "dfs_whole_shard_${name}_scenario" \
+      24 \
+      1 \
+      terminalWitness
+  done
+}
+
 run_smoke_scenarios() {
+  run_whole_shard_scenarios
   run_canonical_write_scenarios
   run_scenario \
     dfs-pending-read-identity \
@@ -715,6 +737,21 @@ case "$mode" in
     if case_selected dfs-canonical-write-eligibility; then
       run_canonical_write_scenarios
     fi
+    run_whole_shard_scenarios
+    ;;
+  whole-shard)
+    if [[ -n "$case_filter" && "$case_filter" != dfs-whole-shard ]]; then
+      echo "error: whole-shard mode requires QUINT_CASE_FILTER=dfs-whole-shard or no filter" >&2
+      exit 2
+    fi
+    case_filter=dfs-whole-shard
+    run_backend="${QUINT_WHOLE_SHARD_RUN_BACKEND:-typescript}"
+    require_witnesses=1
+    run_samples="${QUINT_WHOLE_SHARD_MAX_SAMPLES:-1000}"
+    run_steps="${QUINT_WHOLE_SHARD_MAX_STEPS:-40}"
+    run_focused_checks
+    run_whole_shard_scenarios
+    python3 scripts/formal/check-shard-model-negative-controls.py
     ;;
   -h|--help|help)
     usage
