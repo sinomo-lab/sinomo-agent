@@ -83,6 +83,9 @@ const APP_CHAT_RUNTIME_DRAIN_INTERVAL: Duration = Duration::from_millis(25);
 const APP_CHAT_ATTACHMENT_TEXT_EXCERPT_BYTES: usize = 24 * 1024;
 pub const SIFS_AGENT_CHANNELS_ROOT: &str = "/services/sinomo-agent/channels";
 const SIFS_PATH_ACCESS_CAPABILITY: &str = sinomo_runtime::dfs::SIFS_PATH_ACCESS_CAPABILITY;
+/// Starts the error for a cluster whose service catalog lists no SIFS
+/// path-access provider yet, as while a daemon is still publishing services.
+pub(crate) const NO_SIFS_PROVIDER_ERROR: &str = "no cluster service instance provides";
 const SIFS_AGENT_CHANNEL_LOG_CHUNK_SIZE: u64 = 128;
 const SIFS_AGENT_CHANNEL_METADATA_SCHEMA_VERSION: u32 = 1;
 const SIFS_AGENT_CHANNEL_HISTORY_METADATA_SCHEMA_VERSION: u32 = 1;
@@ -957,7 +960,7 @@ impl AgentChatSifsStorage {
                 discovery.provider_capabilities.join(", ")
             };
             return Err(format!(
-                "no cluster service instance provides {SIFS_PATH_ACCESS_CAPABILITY} \
+                "{NO_SIFS_PROVIDER_ERROR} {SIFS_PATH_ACCESS_CAPABILITY} \
                  (catalog revision {}, {} entries, {} decoded instances; services: [{}]; \
                  provider capabilities: [{}])",
                 read.revision.0,
