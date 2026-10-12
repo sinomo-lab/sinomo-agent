@@ -1845,7 +1845,7 @@ impl DfsMetadataAuthorityState {
                 (Err(_), None) => {}
             }
         }
-        if observed.entries.len() > sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES
+        if observed.entries.len() > sinomo_core::kv::CLUSTER_KV_COMPLETE_RANGE_PREFIX_MAX_ENTRIES
             || observed
                 .entries
                 .iter()
@@ -1853,7 +1853,7 @@ impl DfsMetadataAuthorityState {
                     let bytes = bytes
                         .checked_add(entry.key.len())?
                         .checked_add(entry.value.len())?;
-                    (bytes <= sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_PAYLOAD_BYTES)
+                    (bytes <= sinomo_core::kv::CLUSTER_KV_COMPLETE_RANGE_PREFIX_MAX_PAYLOAD_BYTES)
                         .then_some(bytes)
                 })
                 .is_none()

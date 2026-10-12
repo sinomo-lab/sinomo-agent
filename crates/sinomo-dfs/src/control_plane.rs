@@ -1114,10 +1114,10 @@ impl DfsAuthoritativePrefixProjection {
         entries: Vec<KvEntry>,
         revision: KvRevision,
     ) -> Result<Self, KvError> {
-        if entries.len() > sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES {
+        if entries.len() > sinomo_core::kv::CLUSTER_KV_COMPLETE_RANGE_PREFIX_MAX_ENTRIES {
             return Err(KvError::RangeLimit {
                 prefix: prefix.to_string(),
-                max_entries: sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES,
+                max_entries: sinomo_core::kv::CLUSTER_KV_COMPLETE_RANGE_PREFIX_MAX_ENTRIES,
             });
         }
         let mut payload_bytes = 0_usize;
@@ -1126,11 +1126,11 @@ impl DfsAuthoritativePrefixProjection {
             payload_bytes = payload_bytes
                 .saturating_add(entry.key.len())
                 .saturating_add(entry.value.len());
-            if payload_bytes > sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_PAYLOAD_BYTES {
+            if payload_bytes > sinomo_core::kv::CLUSTER_KV_COMPLETE_RANGE_PREFIX_MAX_PAYLOAD_BYTES {
                 return Err(KvError::RangePayloadLimit {
                     prefix: prefix.to_string(),
                     observed_bytes: payload_bytes,
-                    max_bytes: sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_PAYLOAD_BYTES,
+                    max_bytes: sinomo_core::kv::CLUSTER_KV_COMPLETE_RANGE_PREFIX_MAX_PAYLOAD_BYTES,
                 });
             }
             if !entry.key.starts_with(prefix) {

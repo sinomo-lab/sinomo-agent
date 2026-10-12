@@ -476,7 +476,7 @@ impl NativeImportAuthority {
         let read = block_native(
             &self.runtime,
             self.cluster()?
-                .kv_range_prefix_authoritative_async(PREFIX.into()),
+                .kv_range_prefix_complete_authoritative_async(PREFIX.into()),
         )?;
         current_authority(&read.authority)?;
         let mut required = Vec::new();
@@ -565,7 +565,7 @@ impl NativeImportAuthority {
         let native = block_native(
             &self.runtime,
             self.cluster()?
-                .kv_range_prefix_authoritative_async("/".into()),
+                .kv_range_prefix_complete_authoritative_async("/".into()),
         )?;
         current_authority(&native.authority)?;
         // Fresh roots and already-current control data need no policy defaults

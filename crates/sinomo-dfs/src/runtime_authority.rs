@@ -73,9 +73,9 @@ pub(crate) fn dfs_metadata_prefix_probe_is_verification_only(
 pub(crate) const DFS_AUTHORITY_PROJECTION_MAX_SCOPES: usize =
     sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES;
 pub(crate) const DFS_AUTHORITY_PROJECTION_MAX_ENTRIES: usize =
-    sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES;
+    sinomo_core::kv::CLUSTER_KV_COMPLETE_RANGE_PREFIX_MAX_ENTRIES;
 pub(crate) const DFS_AUTHORITY_PROJECTION_MAX_BYTES: usize =
-    sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_PAYLOAD_BYTES;
+    sinomo_core::kv::CLUSTER_KV_COMPLETE_RANGE_PREFIX_MAX_PAYLOAD_BYTES;
 
 /// A compact collection of exact and prefix scopes backed by authoritative KV
 /// reads. This is DFS cache policy: hosts provide linearized reads, while DFS

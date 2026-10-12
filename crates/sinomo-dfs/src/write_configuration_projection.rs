@@ -7,7 +7,8 @@
 
 use crate::DfsAuthoritativePrefixProjection;
 use sinomo_core::kv::{
-    CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES, CLUSTER_KV_RANGE_PREFIX_MAX_PAYLOAD_BYTES,
+    CLUSTER_KV_COMPLETE_RANGE_PREFIX_MAX_ENTRIES,
+    CLUSTER_KV_COMPLETE_RANGE_PREFIX_MAX_PAYLOAD_BYTES, CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES,
     ClusterKvCommittedDelta, ClusterKvRaftConfigRecord, KvAuthoritativeRead, KvAuthorityBasis,
     KvAuthorityProof, KvEntry, KvError, KvEventKind, KvLocalRead, KvRevision,
     MAX_CLUSTER_KV_WATCH_EVENTS, cluster_kv_raft_config_key, cluster_kv_raft_quorum_size,
@@ -485,9 +486,9 @@ fn check_bounds<'a>(
             }
         }
     }
-    if entries > CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES
+    if entries > CLUSTER_KV_COMPLETE_RANGE_PREFIX_MAX_ENTRIES
         || events > MAX_CLUSTER_KV_WATCH_EVENTS
-        || bytes > CLUSTER_KV_RANGE_PREFIX_MAX_PAYLOAD_BYTES
+        || bytes > CLUSTER_KV_COMPLETE_RANGE_PREFIX_MAX_PAYLOAD_BYTES
     {
         return Err(KvError::ResourceExhausted {
             operation: "DFS write configuration retained view and bootstrap journal".to_string(),
@@ -941,7 +942,7 @@ mod tests {
         let mut state = DfsWriteConfigurationState::new();
         let token = state.begin_refresh();
         let mut native = reads([10; 3]);
-        native[0].value = (0..CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES)
+        native[0].value = (0..CLUSTER_KV_COMPLETE_RANGE_PREFIX_MAX_ENTRIES)
             .map(|index| entry(&format!("/dfs/filesystems/{index:08}"), b"bounded", 5))
             .collect();
         assert!(

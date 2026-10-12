@@ -1292,13 +1292,20 @@ impl DfsControlPlaneKvClient for NativeImportKv<'_> {
     ) -> std::result::Result<Vec<Option<KvEntry>>, KvError> {
         self.get_consistent(keys)
     }
+    /// sinomo:kv-configuration: Bootstrap inventory and post-validation borrow
+    /// one complete native configuration cut; narrower source scopes retain
+    /// the ordinary native prefix bounds.
     fn range_prefix(&self, prefix: &str) -> std::result::Result<Vec<KvEntry>, KvError> {
         let cluster = self.owner.cluster().map_err(|e| KvError::Serialization {
             detail: e.to_string(),
         })?;
         let read = block_native(
             &self.owner.runtime,
-            cluster.kv_range_prefix_authoritative_async(prefix.into()),
+            if matches!(prefix, "/" | "/dfs/filesystems/") {
+                cluster.kv_range_prefix_complete_authoritative_async(prefix.into())
+            } else {
+                cluster.kv_range_prefix_authoritative_async(prefix.into())
+            },
         )
         .map_err(|e| KvError::Serialization {
             detail: e.to_string(),
@@ -1853,6 +1860,122 @@ pub fn standalone_storage_preparation_provider(
 #[cfg(test)]
 mod provider_lifecycle_tests {
     use super::*;
+
+    #[test]
+    fn native_large_complete_filesystem_prefix_reopens_before_normal_dfs_write() {
+        use sinomo_dfs::test_support::DfsTestRuntime;
+        const VALUE_BYTES: usize = 3 * 1024 * 1024;
+        const PREFIX: &str = "/dfs/filesystems/";
+        let name = "native-large-complete-prefix-bootstrap";
+        let node = DfsTestRuntime::ordered_node_ids(name, 1).remove(0);
+        let mut native = DfsTestRuntime::new(name, node.clone()).unwrap();
+        native
+            .configure_component_factories(vec![
+                Arc::new(
+                    sinomo_dfs::component_factory_with_storage_preparation(Arc::new(
+                        storage_preparation_provider,
+                    ))
+                    .unwrap(),
+                ),
+                Arc::new(staged_import_component_factory().unwrap()),
+            ])
+            .unwrap();
+        native.start_nodes().unwrap();
+        let context = native.component_context(&node).unwrap();
+        let cluster = context.cluster_access().unwrap();
+        let runtime = native.runtime_handle();
+        let fs = sinomo_dfs::sifs_file_system_id();
+        let keys = (0..3)
+            .map(|index| format!("{PREFIX}{fs}/extensions/native-bootstrap/{index}"))
+            .collect::<Vec<_>>();
+        // Opaque extension DATA is neither a config nor an intent/receipt/grant.
+        // The provider preserves unknown keys while decoding only owned schemas.
+        for (index, key) in keys.iter().enumerate() {
+            let request = KvTxnRequest::generated(KvTxn {
+                compares: vec![KvCompare::Missing { key: key.clone() }],
+                success: vec![KvOp::Put {
+                    key: key.clone(),
+                    value: vec![index as u8; VALUE_BYTES],
+                    lease_id: None,
+                }],
+                failure: Vec::new(),
+            });
+            let submitted =
+                sinomo_core::kv::kv_command_digest(&KvCommand::Txn(request.txn.clone())).unwrap();
+            let id = request.request_id.clone();
+            let commit = runtime
+                .block_on(cluster.kv_commit_compact_async(request))
+                .unwrap();
+            assert_eq!(commit.request_id, id);
+            assert_eq!(commit.submitted_command_digest, Some(submitted));
+            assert!(commit.txn_response.unwrap().succeeded);
+        }
+        let ordinary = runtime
+            .block_on(cluster.kv_range_prefix_authoritative_async(PREFIX.into()))
+            .unwrap_err();
+        assert!(ordinary.to_string().contains("payload bytes"), "{ordinary}");
+        assert!(
+            ordinary
+                .to_string()
+                .contains(&sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_PAYLOAD_BYTES.to_string()),
+            "{ordinary}"
+        );
+        let before = runtime
+            .block_on(cluster.kv_range_prefix_complete_authoritative_async(PREFIX.into()))
+            .unwrap();
+        sinomo_core::kv::validate_cluster_kv_authoritative_complete_range_prefix_read(
+            PREFIX, &before,
+        )
+        .unwrap();
+        let payload = before
+            .value
+            .iter()
+            .map(|entry| entry.key.len() + entry.value.len())
+            .sum::<usize>();
+        assert!(payload > sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_PAYLOAD_BYTES);
+        assert!(payload < sinomo_core::kv::CLUSTER_KV_COMPLETE_RANGE_PREFIX_MAX_PAYLOAD_BYTES);
+        for (index, key) in keys.iter().enumerate() {
+            let entry = before.value.iter().find(|entry| &entry.key == key).unwrap();
+            assert_eq!(entry.value, vec![index as u8; VALUE_BYTES]);
+        }
+        drop(cluster);
+        drop(context);
+        native.stop_node(&node).unwrap();
+        native.reopen_node(node.clone()).unwrap();
+        let context = native.component_context(&node).unwrap();
+        let cluster = context.cluster_access().unwrap();
+        let after = runtime
+            .block_on(cluster.kv_range_prefix_complete_authoritative_async(PREFIX.into()))
+            .unwrap();
+        sinomo_core::kv::validate_cluster_kv_authoritative_complete_range_prefix_read(
+            PREFIX, &after,
+        )
+        .unwrap();
+        assert!(after.authority.revision >= before.authority.revision);
+        for key in &keys {
+            assert_eq!(
+                after.value.iter().find(|entry| &entry.key == key).unwrap(),
+                before.value.iter().find(|entry| &entry.key == key).unwrap()
+            );
+        }
+        let mut client = native.client(&node).unwrap();
+        let path = "/services/after-large-complete-prefix-bootstrap";
+        client
+            .posix_write_file(
+                path,
+                b"real native complete prefix is ready",
+                sinomo_dfs::DfsWriteOptions::replicated_eventual(vec![node.clone()]),
+            )
+            .unwrap();
+        assert_eq!(
+            client.posix_read_file_distributed(path).unwrap(),
+            b"real native complete prefix is ready"
+        );
+        drop(client);
+        drop(cluster);
+        drop(context);
+        native.close().unwrap();
+    }
 
     #[cfg(unix)]
     #[test]

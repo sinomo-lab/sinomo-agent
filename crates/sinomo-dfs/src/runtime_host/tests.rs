@@ -12530,7 +12530,7 @@ fn daemon_dfs_metadata_authority_delta_rejects_revision_gaps() {
 #[test]
 fn daemon_dfs_metadata_authority_delta_invalidates_prefix_overflow() {
     let generation = Arc::new(DaemonDfsMetadataAuthorityGeneration::new());
-    let entries = (0..sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES)
+    let entries = (0..sinomo_core::kv::CLUSTER_KV_COMPLETE_RANGE_PREFIX_MAX_ENTRIES)
         .map(|index| {
             (
                 format!("{DAEMON_DFS_METADATA_AUTHORITY_PREFIX}overflow/records/{index:04}"),
