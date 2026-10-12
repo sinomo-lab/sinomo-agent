@@ -1012,6 +1012,31 @@ impl sinomo_core::service::ClusterAccess for TestDfsClusterAccess {
         })
     }
 
+    fn kv_range_prefix_complete_authoritative_async<'a>(
+        &'a self,
+        prefix: String,
+    ) -> sinomo_core::cluster::ClusterMembershipServiceFuture<
+        'a,
+        sinomo_core::kv::KvAuthoritativeRead<Vec<KvEntry>>,
+    > {
+        Box::pin(async move {
+            let options =
+                sinomo_core::cluster::ClusterControlPlaneTimeouts::default_daemon_transport()
+                    .kv_txn_quorum_options(true);
+            let paths = self.cluster_paths();
+            let mut state = self.state()?;
+            let runtime = tokio::runtime::Handle::current();
+            let mut host = TestDfsClusterQuorumHost {
+                peers: self.peers.clone(),
+            };
+            sinomo_core::cluster::read_cluster_kv_authoritative_complete_range_prefix_async_with_host(
+                &runtime, &paths, &mut state, prefix, options, &mut host,
+            )
+            .await
+            .map_err(sinomo_core::service::ServiceError::Network)
+        })
+    }
+
     fn kv_request_outcome_authoritative_async<'a>(
         &'a self,
         request_id: sinomo_core::kv::KvRequestId,
@@ -2015,7 +2040,7 @@ impl sinomo_dfs::DfsMetadataAuthorityHost for DaemonDfsMetadataAuthorityHost {
         record_daemon_dfs_test_authoritative_prefix_call(&self.cluster_paths);
         Box::pin(async move {
             self.cluster
-                .kv_range_prefix_authoritative_async(prefix.to_string())
+                .kv_range_prefix_complete_authoritative_async(prefix.to_string())
                 .await
                 .map_err(|error| sinomo_dfs::DfsError::Network {
                     message: error.to_string(),
@@ -2053,7 +2078,7 @@ impl sinomo_dfs::DfsMetadataAuthorityHost for DaemonDfsMetadataAuthorityHost {
         record_daemon_dfs_test_authoritative_prefix_call(&self.cluster_paths);
         Box::pin(async move {
             self.cluster
-                .kv_range_prefix_authoritative_async(
+                .kv_range_prefix_complete_authoritative_async(
                     DAEMON_DFS_METADATA_AUTHORITY_PREFIX.to_string(),
                 )
                 .await

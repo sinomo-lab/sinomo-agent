@@ -47,7 +47,7 @@ impl NativeImportAuthority {
         let observed = block_native(
             &self.runtime,
             self.cluster()?
-                .kv_range_prefix_authoritative_async("/dfs/filesystems/".into()),
+                .kv_range_prefix_complete_authoritative_async("/dfs/filesystems/".into()),
         )?;
         current_authority(&observed.authority)?;
         let mut remaining = max_records;
