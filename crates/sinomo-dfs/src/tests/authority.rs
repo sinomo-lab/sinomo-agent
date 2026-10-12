@@ -1539,9 +1539,11 @@ fn sifs_cluster_authority_local_follower_bootstrap_stays_on_incremental_stream()
                 DfsWriteOptions::replicated_eventual(vec![primary_node.clone()]),
             )
             .unwrap();
-        primary
-            .replicate_configured_metadata_shards(&stat.file_system_id)
+        let publication = runtime
+            .maintenance_tick(&primary_node, sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
             .unwrap();
+        assert!(publication.outcome.is_ok(), "{:?}", publication.outcome);
+        assert_eq!(publication.omitted_kv_event_count, 0);
         assert_eq!(follower.posix_stat(&file).unwrap().version, stat.version);
         assert_eq!(follower.posix_read_file_distributed(&file).unwrap(), bytes);
     }

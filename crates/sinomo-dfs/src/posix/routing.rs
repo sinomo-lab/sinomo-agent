@@ -1358,11 +1358,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// catch-up retry as `stat_routed_namespace_result`.
     pub(super) fn stat_replayed_tombstone_synced(&mut self, path: &str) -> Result<DfsStat> {
         if self.transport.delegates_local_namespace_authority() {
+            let shards = self.refresh_sifs_metadata_shards()?.ok_or_else(|| {
+                DfsPosixError::Dfs(DfsError::Metadata {
+                    message: "Main caller lookup has no current metadata shard authority".into(),
+                })
+            })?;
+            // The authority tombstones the canonical entry after following parent
+            // links. Resolve that result through one current routing cut, while
+            // preserving the final entry itself instead of following it.
+            let resolved =
+                self.resolve_posix_path_distributed_from_snapshot(path, false, &shards)?;
             let object = self
-                .lookup_sifs_path_direct_distributed_synced(path)?
-                .ok_or_else(|| DfsPosixError::NotFound {
-                    path: path.to_string(),
-                })?;
+                .lookup_sifs_path_direct_distributed_synced_from_snapshot(&resolved, Some(&shards))?
+                .ok_or_else(|| DfsPosixError::NotFound { path: resolved })?;
             return self.stat_object(&object);
         }
         for _ in 0..POSIX_ROUTED_SYNC_RETRY_ROUNDS {

@@ -10986,7 +10986,10 @@ mod tests {
             let observed_command = Arc::clone(&self.observed_create_command);
             let hook: Arc<crate::runtime_host::DaemonDfsPreDispatchTestHook> =
                 Arc::new(move |point, command, _| {
-                    if point != crate::runtime_host::DaemonDfsPreDispatchTestPoint::BeforeExecute {
+                    if !matches!(
+                        point,
+                        crate::runtime_host::DaemonDfsPreDispatchTestPoint::BeforeExecute { .. }
+                    ) {
                         return Ok(());
                     }
                     let Some(command) = command else {

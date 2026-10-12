@@ -90,14 +90,23 @@ fn run_private_requester_custody(terminal_before_drain: bool) {
     runtime.clear_faults();
     gate.add_permits(64);
     let deadline = std::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    let primary_deadline = primary_view.transport.operation_deadline();
+    let requester_deadline = private.transport.operation_deadline();
+    primary_view.set_transport_operation_deadline(Some(
+        primary_deadline.map_or(deadline, |previous| previous.min(deadline)),
+    ));
+    private.set_transport_operation_deadline(Some(
+        requester_deadline.map_or(deadline, |previous| previous.min(deadline)),
+    ));
     loop {
         let actual = primary_view
-            .metadata_backend()
-            .unwrap()
-            .get_object(&original.object_id)
-            .unwrap()
-            .unwrap();
+            .posix_stat_distributed("/private-custody")
+            .expect("actual Main publication observation");
         if actual.version == target {
+            assert_eq!(actual.file_system_id, original.file_system_id);
+            assert_eq!(actual.object_id, original.object_id);
+            assert_eq!(actual.content_hash, Some(crate::content_hash(PAYLOAD)));
+            assert_eq!(actual.size_bytes, Some(PAYLOAD.len() as u64));
             break;
         }
         assert!(
@@ -106,6 +115,7 @@ fn run_private_requester_custody(terminal_before_drain: bool) {
         );
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
+    primary_view.set_transport_operation_deadline(primary_deadline);
     loop {
         private
             .process_incoming_without_deferred_parent_touches()
@@ -120,6 +130,7 @@ fn run_private_requester_custody(terminal_before_drain: bool) {
         );
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
+    private.set_transport_operation_deadline(requester_deadline);
     let dispatches = runtime
         .rpc_observations()
         .iter()
@@ -136,7 +147,9 @@ fn run_private_requester_custody(terminal_before_drain: bool) {
         "completion never replays the original mutation"
     );
     assert_eq!(
-        private.posix_read_file("/private-custody").unwrap(),
+        private
+            .posix_read_file_distributed("/private-custody")
+            .unwrap(),
         PAYLOAD
     );
     runtime.assert_fault_budgets().unwrap();

@@ -1315,3 +1315,122 @@ impl LocalContentStore {
         }
     }
 }
+
+// Shared negative utility: mutate the header of one actual current live
+// manifest record under the same normal content writer; no legacy files.
+#[cfg(test)]
+impl LocalContentStore {
+    pub(crate) fn corrupt_current_manifest_for_test(
+        &self,
+        manifest: &ContentManifest,
+    ) -> Result<()> {
+        let _owner = self.content_mutation_guard()?;
+        let view = self
+            .inline_binding_view_verified()?
+            .ok_or_else(|| inline_error("current binding view is absent"))?;
+        if view.live_manifest(&manifest.object_id, &manifest.version) != Some(manifest) {
+            return Err(inline_error("negative fault lacks the exact live manifest"));
+        }
+        let sentinel = self
+            .inline_sentinel_unlocked()?
+            .ok_or_else(|| inline_error("current content writer identity is absent"))?;
+        let root = &self.inline_store.owner.root;
+        let catalog = read_catalog(root, &sentinel.store_incarnation)?;
+        let catalog_file = catalog_path(root);
+        let catalog_before = fs::read(&catalog_file).map_err(|source| ContentStoreError::Io {
+            path: catalog_file.clone(),
+            source,
+        })?;
+        let mut selected = None;
+        let mut next_sequence = 1;
+        for segment in &catalog.segments {
+            let path = segment_path(root, catalog.generation, segment.id);
+            let mut file = fs::File::open(&path).map_err(|source| ContentStoreError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            loop {
+                match read_frame(&mut file, &path, frame_limits()).map_err(inline_error)? {
+                    FrameRead::Complete(frame) => {
+                        let record: InlineRecord = sinomo_object_serde::from_bytes(frame.header())
+                            .map_err(|error| ContentStoreError::Serde(error.to_string()))?;
+                        if record.format_version != INLINE_FORMAT_VERSION
+                            || record.store_incarnation != catalog.store_incarnation
+                            || record.generation != catalog.generation
+                            || record.sequence != next_sequence
+                            || record.sequence > view.sequence
+                        {
+                            return Err(inline_error("negative fault names another current cut"));
+                        }
+                        next_sequence = record
+                            .sequence
+                            .checked_add(1)
+                            .ok_or_else(|| inline_error("current record sequence overflow"))?;
+                        let actual = match &record.operation {
+                            InlineOperation::Bind { manifest, .. }
+                            | InlineOperation::Link { manifest, .. }
+                            | InlineOperation::RestoreVersion { manifest, .. }
+                            | InlineOperation::ExternalBinding { manifest, .. } => Some(manifest),
+                            _ => None,
+                        };
+                        if actual == Some(manifest) {
+                            let header_start = frame
+                                .payload_offset()
+                                .checked_sub(frame.header().len() as u64)
+                                .ok_or_else(|| inline_error("manifest header offset underflow"))?;
+                            selected = Some((path.clone(), header_start, frame.header()[0]));
+                        }
+                    }
+                    FrameRead::CleanEof { .. } => break,
+                    _ => {
+                        return Err(inline_error(
+                            "negative fault requires complete current frames",
+                        ));
+                    }
+                }
+            }
+        }
+        let (path, offset, original) = selected
+            .ok_or_else(|| inline_error("exact live manifest has no current native frame"))?;
+        let mut expected = fs::read(&path).map_err(|source| ContentStoreError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        let index = usize::try_from(offset)
+            .map_err(|_| inline_error("manifest header offset exceeds address space"))?;
+        if expected.get(index).copied() != Some(original) {
+            return Err(inline_error(
+                "actual manifest header changed before negative fault",
+            ));
+        }
+        expected[index] ^= 0x40;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .map_err(|source| ContentStoreError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        file.seek(SeekFrom::Start(offset))
+            .and_then(|_| file.write_all(&[expected[index]]))
+            .and_then(|_| file.sync_data())
+            .map_err(|source| ContentStoreError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        let actual = fs::read(&path).map_err(|source| ContentStoreError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        let catalog_after = fs::read(&catalog_file).map_err(|source| ContentStoreError::Io {
+            path: catalog_file,
+            source,
+        })?;
+        if actual != expected || catalog_after != catalog_before {
+            return Err(inline_error(
+                "negative fault changed another current byte or catalog",
+            ));
+        }
+        Ok(())
+    }
+}

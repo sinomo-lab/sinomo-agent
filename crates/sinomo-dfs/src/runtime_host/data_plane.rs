@@ -126,6 +126,8 @@ where
             &peer_snapshot,
             runtime,
             peer_deadline,
+            #[cfg(test)]
+            None,
         )
         .await?;
     let file_system_id = expected_context.shard.file_system_id.clone();
@@ -590,6 +592,8 @@ pub(super) async fn handle_daemon_dfs_inspection_async(
         &preflight_peer_snapshot,
         runtime,
         peer_deadline,
+        #[cfg(test)]
+        None,
     )
     .await?;
     let scheduler = daemon_dfs_mutation_scheduler(&data_dir)?;
@@ -771,6 +775,8 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
             &cluster_paths,
             &peer_snapshot,
             &self.runtime,
+            #[cfg(test)]
+            None,
         )
         .map_err(|source| DfsDataPlaneHostError::new(source.to_string()))?;
         Ok(Some(Arc::new(content_store)))
@@ -836,6 +842,8 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
                 &peer_snapshot,
                 &runtime,
                 peer_deadline,
+                #[cfg(test)]
+                None,
             )
             .await
             .map_err(|source| DfsDataPlaneHostError::new(source.to_string()))?;

@@ -5395,15 +5395,29 @@ fn daemon_dfs_content_gc_projection_requires_complete_catalog_coverage() {
     default_dfs_content_root_catalog_store(&content_root)
         .install_test_catalog_at(complete_catalog, generated_at_unix_nanos)
         .expect("restore complete catalog");
-    std::fs::write(
-        content_root
-            .join("objects")
-            .join("pending-content-object")
-            .join("pending-content-version-2")
-            .join("manifest.sobj"),
-        b"torn manifest",
+    let manifest = content
+        .read_manifest("pending-content-object", "pending-content-version-2")
+        .expect("actual current live manifest");
+    assert_eq!(manifest.object_id, "pending-content-object");
+    assert_eq!(manifest.version, "pending-content-version-2");
+    assert_eq!(
+        manifest.content_hash,
+        crate::content_hash(b"latest manifest")
+    );
+    assert_eq!(manifest.size_bytes, b"latest manifest".len() as u64);
+    let catalog_before = serde_json::to_value(
+        default_dfs_content_root_catalog_store(&content_root)
+            .load()
+            .expect("actual complete catalog before corruption"),
     )
-    .expect("corrupt fixture manifest");
+    .unwrap();
+    content
+        .corrupt_current_manifest_for_test(&manifest)
+        .expect("corrupt only the actual current manifest record");
+    assert!(matches!(
+        content.read_manifest(&manifest.object_id, &manifest.version),
+        Err(crate::ContentStoreError::InvalidContentLayout { .. })
+    ));
     let scrub_blocked = daemon_dfs_content_gc_projection(
         &data_dir,
         &cluster_paths,
@@ -5412,10 +5426,16 @@ fn daemon_dfs_content_gc_projection_requires_complete_catalog_coverage() {
         lifecycle,
         daemon_dfs_now_unix_nanos(),
     )
-    .expect("scrub-blocked projection");
-    assert!(
-        scrub_blocked.scrub_blocked_issue_count > 0,
-        "local scrub failures must remain visible when catalog coverage is complete"
+    .expect_err("invalid current manifest blocks a complete-catalog GC projection");
+    assert!(matches!(scrub_blocked, DaemonError::Parse { .. }));
+    assert_eq!(
+        serde_json::to_value(
+            default_dfs_content_root_catalog_store(&content_root)
+                .load()
+                .expect("complete catalog remains unchanged after refused GC"),
+        )
+        .unwrap(),
+        catalog_before,
     );
 
     let incomplete_catalog = sinomo_dfs::DfsContentRootCatalog::from_fragments(
@@ -6495,9 +6515,11 @@ fn daemon_dfs_reactive_probe_never_opens_the_metadata_or_content_inventory() {
     let new_target = NodeId::from_legacy_named("node_reactive_new_target").expect("new target");
     let now = daemon_dfs_now_unix_nanos();
     let preserved_retry = DfsRepairAttemptRecord {
-        transfer_delivery_state: None,
+        transfer_delivery_state: Some(
+            sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent,
+        ),
         completed_transfer_request_id: None,
-        transfer_kind: None,
+        transfer_kind: Some(sinomo_api::dfs::maintenance::DfsRepairTransferKind::Repair),
         intent_id: "intent-reactive-retry".to_string(),
         object_id: DfsObjectId::from_legacy_named("object_reactive_retry").expect("retry object"),
         version: DfsVersion::from_legacy_named("version_reactive_retry").expect("retry version"),
@@ -6518,9 +6540,11 @@ fn daemon_dfs_reactive_probe_never_opens_the_metadata_or_content_inventory() {
     )
     .expect("initial repair queue");
     let new_repair = DfsRepairAttemptRecord {
-        transfer_delivery_state: None,
+        transfer_delivery_state: Some(
+            sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent,
+        ),
         completed_transfer_request_id: None,
-        transfer_kind: None,
+        transfer_kind: Some(sinomo_api::dfs::maintenance::DfsRepairTransferKind::Repair),
         intent_id: "intent-reactive-new".to_string(),
         object_id: DfsObjectId::from_legacy_named("object_reactive_new").expect("new object"),
         version: DfsVersion::from_legacy_named("version_reactive_new").expect("new version"),
@@ -6559,6 +6583,31 @@ fn daemon_dfs_reactive_probe_never_opens_the_metadata_or_content_inventory() {
     assert!(
         daemon_dfs_repair_queue_work_is_known(&paths),
         "the bounded queue sample must retain blocker-clear wake eligibility"
+    );
+    // These are negative scheduling DATA, with the same past/future deadlines.
+    // They cannot establish transport custody, an ACK, or a writable owner.
+    let mut unidentified = snapshot.records.clone();
+    for record in &mut unidentified {
+        record.transfer_kind = None;
+        record.transfer_delivery_state = None;
+    }
+    let untouched = unidentified.clone();
+    let unavailable = crate::dfs_pending_reactive_maintenance_work_from_authority_entries(
+        &data_dir,
+        &node_id,
+        &[],
+        &unidentified,
+        now,
+    )
+    .expect("same production classifier retains unavailable repair DATA");
+    assert_eq!(unavailable.pending_repair_count, unidentified.len());
+    assert_eq!(unavailable.repair_attempt_count, unidentified.len());
+    assert_eq!(unavailable.due_repair_attempt_count, 0);
+    assert_eq!(unavailable.next_repair_retry_unix_nanos, None);
+    assert!(!unavailable.should_trigger_background_maintenance());
+    assert_eq!(
+        unidentified, untouched,
+        "classification never changes queue deadlines or custody"
     );
 }
 
@@ -8292,17 +8341,26 @@ fn late_native_hidden_suffix(
     shard: &DfsMetadataShardConfig,
     count: usize,
 ) -> u64 {
+    let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
+    let current = service
+        .metadata_backend()
+        .unwrap()
+        .get_file_system_on_shard(&shard_id, &shard.file_system_id)
+        .expect("actual owning filesystem row read")
+        .expect("normal native filesystem row exists");
     for index in 0..count {
+        let mut next = current.clone();
+        next.display_name.push_str(&format!("-hidden-{index}"));
         let payload = crate::DfsPreparedOperationPayload::for_metadata_effects(
             crate::DfsPreparedOperationScope {
                 file_system_id: shard.file_system_id.clone(),
-                shard_id: DfsMetadataShardId::new(shard.shard_id.clone()),
+                shard_id: shard_id.clone(),
                 owner_epoch: shard.epoch,
                 operation_id: format!("late-native-hidden-{}-{index}", sinomo_core::Id::generate()),
             },
             Vec::new(),
             Vec::new(),
-            Vec::new(),
+            vec![crate::DfsPreparedMetadataEffect::PutFileSystem { file_system: next }],
             OffsetDateTime::now_utc(),
         )
         .expect("complete current hidden body");
@@ -10414,6 +10472,8 @@ fn daemon_dfs_resident_mutation_lanes_are_scoped_by_exact_shard() {
             &peer_snapshot,
             &root_key,
             &runtime,
+            #[cfg(test)]
+            None,
         )
         .unwrap()
     );
@@ -10728,6 +10788,8 @@ fn daemon_dfs_stamped_lookup_is_cold_global_warm_exact_and_read_only() {
             &peer_snapshot,
             current_namespace,
             runtime.handle(),
+            #[cfg(test)]
+            None,
         )
         .expect("validate warm current stamp"),
         "the global cold read should leave the exact resident shard warm"
@@ -10751,6 +10813,8 @@ fn daemon_dfs_stamped_lookup_is_cold_global_warm_exact_and_read_only() {
             &peer_snapshot,
             stale_namespace,
             runtime.handle(),
+            #[cfg(test)]
+            None,
         )
         .expect("reject stale same-id stamp"),
         "a warm shard id must not admit an obsolete full authority stamp"
@@ -11965,7 +12029,11 @@ fn daemon_dfs_metadata_authority_refresh_handoff_does_not_refetch() {
     let waiter_authority = Arc::clone(&authority);
     let waiter = runtime.spawn(async move {
         waiter_authority
-            .ensure_complete_prefix_for_generation_async(expected_generation)
+            .ensure_complete_prefix_for_generation_async(
+                expected_generation,
+                #[cfg(test)]
+                None,
+            )
             .await
     });
     runtime.block_on(reached_before_claim.notified());

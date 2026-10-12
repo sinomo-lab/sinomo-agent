@@ -870,9 +870,9 @@ pub use service_state::{
     DFS_ROUTED_NAMESPACE_OP_TIMEOUT, DFS_ROUTED_RESPONSE_JOURNAL_BATCH_LIMIT, DfsCancellationFlag,
     DfsCommittedWork, DfsCommittedWorkTracker, DfsConfirmedTimeoutAction,
     DfsConfirmedTimeoutOutcome, DfsMessageCommittedWork, DfsMessageProcessReport,
-    DfsMessageProcessResult, DfsMetadataReplicationOutcome, DfsReconnectReconciliation,
-    NetworkedDfsRangeReadOutcome, NetworkedDfsReadFreshness, NetworkedDfsReadOutcome,
-    NetworkedDfsService, NetworkedDfsServiceEvent, NetworkedDfsWriteOutcome,
+    DfsMessageProcessResult, DfsReconnectReconciliation, NetworkedDfsRangeReadOutcome,
+    NetworkedDfsReadFreshness, NetworkedDfsReadOutcome, NetworkedDfsService,
+    NetworkedDfsServiceEvent, NetworkedDfsWriteOutcome,
 };
 pub use service_trace::{DfsPhaseTimer, current_dfs_traceparent, with_dfs_traceparent};
 pub(crate) use service_trace::{

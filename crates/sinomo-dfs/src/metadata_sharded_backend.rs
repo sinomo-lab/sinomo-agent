@@ -603,6 +603,19 @@ impl ResidentLocalMetadataShardSlot {
                 self.config.shard_id
             ))
         })?;
+        tracing::trace!(
+            target: "sinomo.dfs.perf",
+            data_root = %self.root.display(),
+            fs = %self.config.file_system_id,
+            shard = %self.config.shard_id,
+            slot_state = match &*state {
+                ResidentLocalMetadataShardState::Unopened => "unopened",
+                ResidentLocalMetadataShardState::Opening => "opening",
+                ResidentLocalMetadataShardState::Available(_) => "available",
+                ResidentLocalMetadataShardState::CheckedOut => "checked-out",
+            },
+            "resident metadata checkout state"
+        );
         match &*state {
             ResidentLocalMetadataShardState::Unopened => {
                 *state = ResidentLocalMetadataShardState::Opening;
@@ -1572,7 +1585,23 @@ impl ResidentLocalShardedMetadataBackend {
     pub fn checkout_global(&self) -> Result<ResidentLocalShardedMetadataBackendLease> {
         let mut leases = Vec::with_capacity(self.inner.shards.len());
         for (shard_id, slot) in &self.inner.shards {
+            tracing::trace!(
+                target: "sinomo.dfs.perf",
+                data_root = %slot.root.display(),
+                fs = %slot.config.file_system_id,
+                shard = %shard_id.0,
+                checkpoint = "before-checkout",
+                "resident global metadata checkout"
+            );
             let backend = slot.checkout()?;
+            tracing::trace!(
+                target: "sinomo.dfs.perf",
+                data_root = %slot.root.display(),
+                fs = %slot.config.file_system_id,
+                shard = %shard_id.0,
+                checkpoint = "after-checkout",
+                "resident global metadata checkout"
+            );
             leases.push((
                 shard_id.clone(),
                 ResidentLocalMetadataShardLease {

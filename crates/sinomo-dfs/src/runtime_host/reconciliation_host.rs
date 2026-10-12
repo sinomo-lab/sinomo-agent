@@ -692,6 +692,8 @@ async fn ensure_default_distributed_dfs_outcome_async_on_runtime(
             &peer_snapshot,
             &runtime,
             peer_deadline,
+            #[cfg(test)]
+            None,
         )
         .await?;
         Some((peer_snapshot, preflight))
@@ -894,14 +896,34 @@ async fn ensure_default_distributed_dfs_outcome_async_on_runtime(
                     // are drained. Reuse the existing certified successor
                     // rule when authority advanced while admission waited.
                     // An unavailable successor still fails before execution.
-                    daemon_dfs_resident_metadata_backend_after_preflight(
+                    match try_daemon_dfs_resident_metadata_backend_after_preflight(
                         &task_data_dir,
                         &task_cluster_paths,
                         peer_snapshot,
                         selected_preflight.as_ref().expect("captured preflight"),
                         &task_runtime,
-                    )
-                    .map_err(DaemonError::from)
+                    ) {
+                        Ok(backend) => Ok(backend),
+                        Err(DaemonDfsAuthorityPreExecutionError::AuthorityPreflightStale(stale))
+                            if stale.current_generation != stale.expected_generation =>
+                        {
+                            tracing::trace!(target: "sinomo.dfs.reconciliation",
+                                phase = "lifecycle-authority-advanced-before-execution",
+                                expected_generation = stale.expected_generation,
+                                current_generation = stale.current_generation,
+                                current_ready = stale.current_ready);
+                            // No lifecycle effect ran. The same retained reactor
+                            // reselects its current role and configuration before
+                            // trying this unfinished generation again.
+                            return Ok(DaemonDefaultDfsLifecycleOutcome::DeferredBeforeAdmission);
+                        }
+                        Err(DaemonDfsAuthorityPreExecutionError::AuthorityPreflightStale(stale)) => {
+                            Err(DaemonError::from(stale.into_dfs_error()))
+                        }
+                        Err(DaemonDfsAuthorityPreExecutionError::Failed(error)) => {
+                            Err(DaemonError::from(error))
+                        }
+                    }
                 }
                 None => Ok(None),
             };

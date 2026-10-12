@@ -232,6 +232,18 @@ impl DfsSourceAdoptionActor {
         if pending.plan == *plan {
             return Ok(Some(prepared));
         }
+        // A later phase can already see the destination and omit the removed
+        // source entry. Carry only this actor's original expectation, proved by
+        // its actual source capture. This retry still passes every identity check
+        // and the native terminal-outcome proof below; it cannot reenter the
+        // original exact-plan fast path or authorize an unknown bound target.
+        let mut retry_plan = plan.clone();
+        if retry_plan.expected_source.is_none()
+            && pending.plan.expected_source.as_ref() == Some(&prepared.family.source_object)
+        {
+            retry_plan.expected_source = pending.plan.expected_source.clone();
+        }
+        let plan = &retry_plan;
         // A later current job phase may retry an already committed adoption.
         // Historical work is data only; verify the exact native terminal body
         // before returning it without reacquiring an original job writer.
@@ -245,6 +257,40 @@ impl DfsSourceAdoptionActor {
             || pending.plan.expected_source != plan.expected_source
             || pending.plan.transfer_id != plan.transfer_id
         {
+            // Bounded DATA from the same compared plans; this grants no custody.
+            let identity = |object: &crate::DfsObjectMetadata| {
+                (
+                    object.file_system_id.clone(),
+                    object.object_id.clone(),
+                    object.version.clone(),
+                    object.owner_node_id.clone(),
+                    object.path.chars().take(256).collect::<String>(),
+                    object
+                        .content_hash
+                        .as_ref()
+                        .map(|hash| hash.chars().take(96).collect::<String>()),
+                    object.content_size_bytes,
+                )
+            };
+            tracing::warn!(target: "sinomo.dfs.source_adoption",
+                job_id_equal = pending.plan.job.job_id == plan.job.job_id,
+                filesystem_equal = pending.plan.job.file_system_id == plan.job.file_system_id,
+                source_config_equal = pending.plan.source_config == plan.source_config,
+                target_config_equal = pending.plan.target_config == plan.target_config,
+                job_config_equal = pending.plan.job_config == plan.job_config,
+                destination_equal = pending.plan.destination == plan.destination,
+                source_path_equal = pending.plan.source_path == plan.source_path,
+                expected_source_equal = pending.plan.expected_source == plan.expected_source,
+                transfer_id_equal = pending.plan.transfer_id == plan.transfer_id,
+                old_expected_matches_captured = pending.plan.expected_source.as_ref()
+                    .is_some_and(|expected| expected == &prepared.family.source_object),
+                destination_locations_equal = pending.plan.destination.current_locations == plan.destination.current_locations,
+                old_destination = ?identity(&pending.plan.destination),
+                current_destination = ?identity(&plan.destination),
+                old_expected_source = ?pending.plan.expected_source.as_ref().map(&identity),
+                current_expected_source = ?plan.expected_source.as_ref().map(&identity),
+                "source preparation rejected changed stable identity"
+            );
             return Err(error(
                 "source preparation retry changed its stable adoption identity",
             ));
@@ -353,7 +399,21 @@ impl DfsSourceAdoptionActor {
             {
                 commit.validate(&digest)?
             }
-            _ => {
+            ref outcome => {
+                tracing::warn!(
+                    session_id = %offer.session_id,
+                    job_id = %offer.job_id,
+                    source_node_id = %offer.source_node_id,
+                    target_node_id = %offer.target_config.primary_node_id,
+                    offer_equal = (reply.offer == *offer),
+                    target_scope_equal = (reply.target_scope == completed.scope),
+                    payload_digest_equal = (reply.payload_digest == completed.hash),
+                    expected_target_scope = ?completed.scope,
+                    actual_target_scope = ?reply.target_scope,
+                    expected_digest = ?completed.digest,
+                    actual_outcome = ?outcome,
+                    "DFS source completion rejected the actual native terminal target proof"
+                );
                 return Err(error(
                     "source completion has no exact current native terminal target proof",
                 ));

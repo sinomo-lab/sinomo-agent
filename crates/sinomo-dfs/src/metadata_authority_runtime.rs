@@ -908,9 +908,14 @@ impl DfsMetadataAuthorityRuntime {
         self: &Arc<Self>,
         host: &Arc<dyn DfsMetadataAuthorityHost>,
         mode: &'static str,
+        #[cfg(test)] native_read_observer: Option<&(dyn Fn(&'static str) + Send + Sync)>,
     ) -> Option<KvRevision> {
         let discontinuity_generation = self.discontinuity_generation.load(Ordering::Acquire);
         if !self.write_configuration_requested.load(Ordering::Acquire) {
+            #[cfg(test)]
+            if let Some(observer) = native_read_observer {
+                observer(DFS_METADATA_AUTHORITY_PREFIX);
+            }
             return self.apply_read_result(
                 host.read_authoritative_prefix().await,
                 mode,
@@ -934,6 +939,10 @@ impl DfsMetadataAuthorityRuntime {
         crate::test_runtime::pause_native_configuration_rebuild(self.as_ref()).await;
         let mut authority_changed = false;
         let result = async {
+            #[cfg(test)]
+            if let Some(observer) = native_read_observer {
+                observer(DFS_WRITE_CONFIGURATION_PREFIXES[0]);
+            }
             let filesystem = host
                 .read_authoritative_configuration_prefix(DFS_WRITE_CONFIGURATION_PREFIXES[0])
                 .await?;
@@ -1031,9 +1040,17 @@ impl DfsMetadataAuthorityRuntime {
                     .store(false, Ordering::Release);
                 return Ok(revision);
             }
+            #[cfg(test)]
+            if let Some(observer) = native_read_observer {
+                observer(DFS_WRITE_CONFIGURATION_PREFIXES[1]);
+            }
             let content = host
                 .read_authoritative_configuration_prefix(DFS_WRITE_CONFIGURATION_PREFIXES[1])
                 .await?;
+            #[cfg(test)]
+            if let Some(observer) = native_read_observer {
+                observer(DFS_WRITE_CONFIGURATION_PREFIXES[2]);
+            }
             let providers = host
                 .read_authoritative_configuration_prefix(DFS_WRITE_CONFIGURATION_PREFIXES[2])
                 .await?;
@@ -1097,6 +1114,7 @@ impl DfsMetadataAuthorityRuntime {
     pub async fn ensure_complete_prefix_for_generation_async(
         self: &Arc<Self>,
         expected_generation: u64,
+        #[cfg(test)] native_read_observer: Option<&(dyn Fn(&'static str) + Send + Sync)>,
     ) -> Option<KvRevision> {
         let mut completion = self.refresh_completion.subscribe();
         let retained = self
@@ -1128,7 +1146,12 @@ impl DfsMetadataAuthorityRuntime {
             }
             self.record_refresh();
             let proof_revision = self
-                .refresh_authoritative_projection(&host, "async cold")
+                .refresh_authoritative_projection(
+                    &host,
+                    "async cold",
+                    #[cfg(test)]
+                    native_read_observer,
+                )
                 .await;
             let refresh_required =
                 proof_revision.is_some_and(|revision| self.state.refresh_required_after(revision));
@@ -1181,7 +1204,12 @@ impl DfsMetadataAuthorityRuntime {
         let task_host = Arc::clone(&host);
         host.spawn(Box::pin(async move {
             let proof_revision = runtime
-                .refresh_authoritative_projection(&task_host, "bounded")
+                .refresh_authoritative_projection(
+                    &task_host,
+                    "bounded",
+                    #[cfg(test)]
+                    None,
+                )
                 .await;
             let refresh_required = proof_revision
                 .is_some_and(|revision| runtime.state.refresh_required_after(revision));

@@ -204,7 +204,11 @@ impl DaemonDfsControlPlaneKvClient {
                 // can change topology or be superseded by a newer revision;
                 // replan against the resulting generation, never the old one.
                 authority
-                    .ensure_complete_prefix_for_generation_async(generation)
+                    .ensure_complete_prefix_for_generation_async(
+                        generation,
+                        #[cfg(test)]
+                        None,
+                    )
                     .await;
                 if let Some(synchronized) = self.try_synchronize_retained_metadata_authority()? {
                     return Ok(synchronized);

@@ -145,9 +145,12 @@ fn prepared_v7_namespace_commit_and_exact_retry_use_one_digest_marker() {
         .unwrap();
     let physical_root =
         crate::local_dfs_metadata_shard_path(runtime.data_dir(&config.primary_node_id), &shard);
-    let anchor = crate::read_metadata_candidate(&physical_root)
+    let anchor = service
+        .metadata_backend()
         .unwrap()
-        .prefix_proof;
+        .metadata_prefix_proof(&shard)
+        .unwrap()
+        .expect("actual current owned backend prefix");
     let committed_prefix =
         crate::inspect_metadata_prefix_descendant(&physical_root, &shard, &anchor)
             .unwrap()

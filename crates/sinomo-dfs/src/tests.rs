@@ -1053,8 +1053,8 @@ fn sifs_cluster_primary_posix_write(cluster: &mut SifsPosixCluster, path: &str, 
     );
 }
 
-/// Publishes the primary's metadata journal to the configured replicas and
-/// pumps the cluster until `done` observes the replicated state.
+/// Runs the existing Main publisher and observes actual replicated state
+/// until `done` completes within the original bounded window.
 fn sifs_cluster_publish_metadata_until(
     cluster: &mut SifsPosixCluster,
     what: &str,
@@ -1066,9 +1066,16 @@ fn sifs_cluster_publish_metadata_until(
             return;
         }
         let outcomes = cluster
-            .primary
-            .replicate_configured_metadata_shards(&sifs_file_system_id())
-            .expect("primary metadata journal publish");
+            ._runtime
+            .maintenance_tick(
+                &cluster.primary_node,
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT),
+            )
+            .expect("ordinary Main metadata publication");
+        assert!(outcomes.outcome.is_ok(), "{:?}", outcomes.outcome);
+        assert_eq!(outcomes.omitted_kv_event_count, 0);
         sifs_posix_cluster_pump_round(cluster);
         if Instant::now() >= deadline {
             panic!(
@@ -1348,14 +1355,19 @@ fn sifs_two_primary_publish_until(
         if done(cluster) {
             return;
         }
-        cluster
-            .users_primary
-            .replicate_configured_metadata_shards(&sifs_file_system_id())
-            .expect("users primary publish");
-        cluster
-            .services_primary
-            .replicate_configured_metadata_shards(&sifs_file_system_id())
-            .expect("services primary publish");
+        for primary in [&cluster.users_primary_node, &cluster.services_primary_node] {
+            let outcome = cluster
+                ._runtime
+                .maintenance_tick(
+                    primary,
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT),
+                )
+                .expect("ordinary Main metadata publication");
+            assert!(outcome.outcome.is_ok(), "{:?}", outcome.outcome);
+            assert_eq!(outcome.omitted_kv_event_count, 0);
+        }
         sifs_two_primary_pump_round(cluster);
         if Instant::now() >= deadline {
             panic!(
@@ -1402,38 +1414,30 @@ fn sifs_two_primary_cluster(name: &str) -> SifsTwoPrimaryCluster {
     let shared_kv = runtime
         .shared_control_plane()
         .expect("actual native control plane");
-    for (shard_name, target_primary) in [
-        ("root", &users_primary_node),
-        ("users", &users_primary_node),
-        ("services", &services_primary_node),
-    ] {
-        let configs = shared_kv
-            .with_client(|kv| {
-                DfsControlPlaneStore::new(kv.as_mut()).list_metadata_shards(&sifs_file_system_id())
-            })
-            .expect("native shard projection");
-        let actual = configs
-            .iter()
-            .find(|cfg| cfg.shard_id == shard_name)
-            .expect("actual current shard")
-            .clone();
-        if &actual.primary_node_id == target_primary {
-            continue;
-        }
-        let replicas = crate::control_plane::topology_preserving_metadata_shard_replicas(
-            &actual,
-            target_primary,
-        )
-        .expect("same actual member ring");
-        runtime
-            .reassign_metadata_shard(
-                &sifs_file_system_id(),
-                shard_name,
-                target_primary.clone(),
-                replicas,
-            )
-            .expect("real freeze/receiver/activation");
-    }
+    // Keep the normal configured placement. The default manager may complete
+    // a newer root handoff while a forced fixture reassignment is waiting.
+    let nodes = [users_primary_node, services_primary_node, replica_node];
+    let configs = runtime
+        .metadata_shards()
+        .expect("actual current shard configuration");
+    let users_primary_node = configs
+        .iter()
+        .find(|config| config.shard_id == "users")
+        .expect("normal users shard")
+        .primary_node_id
+        .clone();
+    let services_primary_node = configs
+        .iter()
+        .find(|config| config.shard_id == "services")
+        .expect("normal services shard")
+        .primary_node_id
+        .clone();
+    assert_ne!(users_primary_node, services_primary_node);
+    assert!(nodes.contains(&users_primary_node) && nodes.contains(&services_primary_node));
+    let replica_node = nodes
+        .into_iter()
+        .find(|node| *node != users_primary_node && *node != services_primary_node)
+        .expect("remaining real replica node");
     let mut users_primary = runtime.client(&users_primary_node).expect("users client");
     let mut services_primary = runtime
         .client(&services_primary_node)

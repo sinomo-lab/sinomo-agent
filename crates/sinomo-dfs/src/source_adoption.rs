@@ -456,9 +456,11 @@ impl DfsSourceAdoptionActor {
             // while its current authoritative projection is still completing.
             let generation = actor.authority.generation();
             let _ = actor.runtime.block_on(
-                actor
-                    .authority
-                    .ensure_complete_prefix_for_generation_async(generation),
+                actor.authority.ensure_complete_prefix_for_generation_async(
+                    generation,
+                    #[cfg(test)]
+                    None,
+                ),
             );
             let current_generation = actor.authority.generation();
             let current_revision = actor
@@ -1231,7 +1233,20 @@ impl DfsSourceAdoptionActor {
                     root.clone(),
                     crate::metadata_cursor::journal_write_lock_path(&root),
                 )? {
-                    None => DfsSourceAdoptionOutcome::Unavailable,
+                    None => {
+                        tracing::warn!(
+                            target: "sinomo.dfs.source-adoption",
+                            reason = "inspection-writer-unavailable",
+                            node = %self.node,
+                            file_system = %scope.file_system_id,
+                            shard = %scope.shard_id.0.chars().take(96).collect::<String>(),
+                            owner_epoch = scope.owner_epoch,
+                            operation = %scope.operation_id.chars().take(192).collect::<String>(),
+                            expected_prepare_sequence = ?expected.map(|digest| digest.prepare_sequence),
+                            "native target outcome remains unavailable"
+                        );
+                        DfsSourceAdoptionOutcome::Unavailable
+                    }
                     Some(_actual_writer_cut) => inspect()?,
                 }
             };

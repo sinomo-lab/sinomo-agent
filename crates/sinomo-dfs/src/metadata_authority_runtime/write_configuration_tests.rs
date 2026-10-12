@@ -851,7 +851,11 @@ async fn write_configuration_same_generation_waiters_join_latched_refresh_succes
     let changed = host.set_configuration(11);
     runtime.observe_delta(&configuration_delta(11, Some(changed)));
     assert_eq!(runtime.generation(), generation);
-    let mut metadata = Box::pin(runtime.ensure_complete_prefix_for_generation_async(generation));
+    let mut metadata = Box::pin(runtime.ensure_complete_prefix_for_generation_async(
+        generation,
+        #[cfg(test)]
+        None,
+    ));
     let mut configuration = Box::pin(runtime.ensure_write_configuration_ready_async());
     require_pending(metadata.as_mut()).await;
     require_pending(configuration.as_mut()).await;
@@ -875,7 +879,11 @@ async fn write_configuration_same_generation_waiters_join_latched_refresh_succes
         .unwrap();
     assert_eq!(
         runtime
-            .ensure_complete_prefix_for_generation_async(generation)
+            .ensure_complete_prefix_for_generation_async(
+                generation,
+                #[cfg(test)]
+                None,
+            )
             .await,
         Some(KvRevision(11))
     );
@@ -897,7 +905,11 @@ async fn write_configuration_terminal_native_failure_does_not_retry_shared_owner
     let generation = runtime.generation();
     assert_eq!(
         runtime
-            .ensure_complete_prefix_for_generation_async(generation)
+            .ensure_complete_prefix_for_generation_async(
+                generation,
+                #[cfg(test)]
+                None,
+            )
             .await,
         None
     );
@@ -1155,6 +1167,8 @@ async fn write_configuration_background_warm_budget_is_not_restarted_by_owner_ha
         crate::runtime_host::warm_daemon_dfs_metadata_authority_before_deadline(
             Arc::clone(&runtime),
             deadline,
+            #[cfg(test)]
+            None,
         ),
     );
     require_pending(warm.as_mut()).await;
@@ -1181,6 +1195,8 @@ async fn write_configuration_background_warm_budget_is_not_restarted_by_owner_ha
     crate::runtime_host::warm_daemon_dfs_metadata_authority_before_deadline(
         Arc::clone(&runtime),
         tokio::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+        #[cfg(test)]
+        None,
     )
     .await
     .unwrap();
@@ -1201,6 +1217,8 @@ async fn write_configuration_background_warm_timeout_releases_its_owned_bootstra
         crate::runtime_host::warm_daemon_dfs_metadata_authority_before_deadline(
             Arc::clone(&runtime),
             deadline,
+            #[cfg(test)]
+            None,
         ),
     );
     require_pending(warm.as_mut()).await;

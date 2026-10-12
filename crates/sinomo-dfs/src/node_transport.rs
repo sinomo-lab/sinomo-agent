@@ -1166,7 +1166,10 @@ impl DfsNodeDetachedSendWorker {
         let background = self.drain_background_replica_calls();
         let ordinary = self
             .transport
-            .flush_detached_peer_sends_excluding_targets(&self.deferred_target_node_ids)
+            .flush_detached_peer_sends_excluding_targets(
+                &self.deferred_target_node_ids,
+                self.background_response_handler.as_deref(),
+            )
             .map_err(DfsError::from_network);
         background.and(ordinary)
     }
@@ -1192,7 +1195,10 @@ impl DfsNodeDetachedSendWorker {
             && self.prepared_replica_calls_ready().is_ok_and(|ready| ready);
         let ordinary = self
             .transport
-            .flush_detached_peer_sends_exclusive_excluding_targets(&self.deferred_target_node_ids)
+            .flush_detached_peer_sends_exclusive_excluding_targets(
+                &self.deferred_target_node_ids,
+                self.background_response_handler.as_deref(),
+            )
             .map_err(DfsError::from_network);
         (background.and(ordinary), background_retry)
     }
@@ -1405,7 +1411,12 @@ impl DfsNodeDetachedSendWorker {
     #[cfg(test)]
     fn drain_at(&mut self, now: Instant) -> Result<(), DfsError> {
         self.transport
-            .flush_detached_peer_sends_with_now_mode(&|| now, false, &self.deferred_target_node_ids)
+            .flush_detached_peer_sends_with_now_mode(
+                &|| now,
+                false,
+                &self.deferred_target_node_ids,
+                self.background_response_handler.as_deref(),
+            )
             .map_err(DfsError::from_network)
     }
 
@@ -2841,21 +2852,33 @@ impl DfsNodeTransport {
     }
 
     fn flush_detached_peer_sends(&mut self) -> Result<(), NetworkError> {
-        self.flush_detached_peer_sends_excluding_targets(&BTreeSet::new())
+        self.flush_detached_peer_sends_excluding_targets(&BTreeSet::new(), None)
     }
 
     fn flush_detached_peer_sends_excluding_targets(
         &mut self,
         deferred_target_node_ids: &BTreeSet<NodeId>,
+        response_handler: Option<&(dyn Fn(DfsRoutedMessage) -> Result<(), DfsError> + Send + Sync)>,
     ) -> Result<(), NetworkError> {
-        self.flush_detached_peer_sends_with_now_mode(&Instant::now, false, deferred_target_node_ids)
+        self.flush_detached_peer_sends_with_now_mode(
+            &Instant::now,
+            false,
+            deferred_target_node_ids,
+            response_handler,
+        )
     }
 
     fn flush_detached_peer_sends_exclusive_excluding_targets(
         &mut self,
         deferred_target_node_ids: &BTreeSet<NodeId>,
+        response_handler: Option<&(dyn Fn(DfsRoutedMessage) -> Result<(), DfsError> + Send + Sync)>,
     ) -> Result<(), NetworkError> {
-        self.flush_detached_peer_sends_with_now_mode(&Instant::now, true, deferred_target_node_ids)
+        self.flush_detached_peer_sends_with_now_mode(
+            &Instant::now,
+            true,
+            deferred_target_node_ids,
+            response_handler,
+        )
     }
 
     #[cfg(test)]
@@ -2863,7 +2886,7 @@ impl DfsNodeTransport {
     where
         F: Fn() -> Instant + ?Sized,
     {
-        self.flush_detached_peer_sends_with_now_mode(now, false, &BTreeSet::new())
+        self.flush_detached_peer_sends_with_now_mode(now, false, &BTreeSet::new(), None)
     }
 
     fn flush_detached_peer_sends_with_now_mode<F>(
@@ -2871,6 +2894,7 @@ impl DfsNodeTransport {
         now: &F,
         wait_for_drain_gate: bool,
         deferred_target_node_ids: &BTreeSet<NodeId>,
+        response_handler: Option<&(dyn Fn(DfsRoutedMessage) -> Result<(), DfsError> + Send + Sync)>,
     ) -> Result<(), NetworkError>
     where
         F: Fn() -> Instant + ?Sized,
@@ -3024,9 +3048,18 @@ impl DfsNodeTransport {
                 } else {
                     self.operation_deadline
                 };
+                let fetch = matches!(
+                    &send.routed_message.message,
+                    DfsNetworkMessage::FetchBlob(_)
+                )
+                .then(|| send.routed_message.clone());
                 let result = Self::send_detached_peer_message(send, current_operation_deadline)
                     .and_then(|returned_messages| {
-                        self.route_detached_peer_responses(returned_messages)
+                        self.route_detached_peer_responses(
+                            returned_messages,
+                            fetch.as_ref(),
+                            response_handler,
+                        )
                     });
                 if let Err(error) = result {
                     if let Some(attempted_replay) = attempted_replay {
@@ -3187,8 +3220,39 @@ impl DfsNodeTransport {
     fn route_detached_peer_responses(
         &mut self,
         returned_messages: Vec<DfsRoutedMessage>,
+        fetch: Option<&DfsRoutedMessage>,
+        response_handler: Option<&(dyn Fn(DfsRoutedMessage) -> Result<(), DfsError> + Send + Sync)>,
     ) -> Result<(), NetworkError> {
         for returned_message in returned_messages {
+            if let (Some(original), Some(handler)) = (fetch, response_handler) {
+                let DfsNetworkMessage::FetchBlob(command) = &original.message else {
+                    unreachable!("captured detached fetch command");
+                };
+                let matching = matches!(&returned_message.message,
+                DfsNetworkMessage::FetchBlobResponse(response)
+                    if original.source_node_id == self.local_node_id
+                        && returned_message.source_node_id == original.target_node_id
+                        && returned_message.target_node_id == original.source_node_id
+                        && response.source_node_id == original.target_node_id
+                        && response.request_id == command.request_id
+                        && response.intent_id == command.intent_id
+                        && response.object_id == command.object_id
+                        && response.version == command.version
+                        && match &response.result {
+                            crate::DfsFetchBlobResult::Found { content_hash, .. } => content_hash == &command.content_hash,
+                            _ => true,
+                        });
+                if !matching {
+                    return Err(NetworkError::Serialization {
+                        detail: "detached DFS fetch returned an unmatched response identity".into(),
+                    });
+                }
+                handler(returned_message).map_err(|error| NetworkError::Io {
+                    operation: "deliver detached DFS fetch response to Main".into(),
+                    detail: error.to_string(),
+                })?;
+                continue;
+            }
             let target_node_id = returned_message.target_node_id.clone();
             self.send_routed_message_to_peer(&target_node_id, returned_message, false)?;
         }

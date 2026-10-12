@@ -318,6 +318,9 @@ fn namespace_operation_uses_durable_request_admission(operation: &DfsNamespaceOp
                 | DfsNamespaceOperation::LookupPath { .. }
                 | DfsNamespaceOperation::LookupPaths { .. }
                 | DfsNamespaceOperation::SyncPath { .. }
+                // Progress is already owned by the exact durable job. A new
+                // Pending row would reacquire its retained physical writer.
+                | DfsNamespaceOperation::ResumeNamespaceJobBounded { .. }
         )
 }
 
@@ -384,6 +387,7 @@ pub(crate) fn namespace_operation_response_retry_safe(operation: &DfsNamespaceOp
                 | DfsNamespaceOperation::FinalizeObjectFamilyAdoption { .. }
                 | DfsNamespaceOperation::VerifyObjectFamilyAdoption { .. }
                 | DfsNamespaceOperation::ReconcilePlacement { .. }
+                | DfsNamespaceOperation::ResumeNamespaceJobBounded { .. }
                 | DfsNamespaceOperation::AdoptObjectAtPath {
                     pin_transfer_id: Some(_),
                     ..
@@ -1762,6 +1766,23 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             });
         }
 
+        // A new creation cannot resume the move that owns this path.
+        // Reject through the existing guard before writing bookkeeping
+        // under the move's retained writer; exact request replay stays above.
+        if let DfsNamespaceOperation::Mkdir { path }
+        | DfsNamespaceOperation::MkdirWithAttrs { path, .. }
+        | DfsNamespaceOperation::MkdirAtNoLinks { path, .. }
+        | DfsNamespaceOperation::BeginContentCopy { path, .. } = &command.operation
+            && let Err(error) =
+                self.ensure_path_not_in_cross_shard_flight(&command.file_system_id, path)
+        {
+            let error = posix_model::DfsPosixError::from(error);
+            return Ok(DurableNamespaceRequestAdmission::Reject {
+                reason: error.to_string(),
+                posix_error: posix_model::namespace_posix_error_for(&error),
+            });
+        }
+
         let now = time::OffsetDateTime::now_utc();
         let record = DfsNamespaceRequestRecord {
             file_system_id: command.file_system_id.clone(),
@@ -1916,6 +1937,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 DfsNamespaceOperation::CommitLocalEventualBatch { .. }
             )
             || !namespace_transaction_proves_operation_completed(&active.operation, transaction)
+            || (matches!(
+                active.operation,
+                DfsNamespaceOperation::ContentReference { .. }
+            ) && transaction.created_at != active.created_at)
         {
             return None;
         }
@@ -1924,7 +1949,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         completed.result = Some(DfsNamespaceResult::Applied);
         completed.posix_coordination_result = None;
         completed.last_recovery_error = None;
-        completed.updated_at = time::OffsetDateTime::now_utc();
+        // Reference effects already carry their original durable admission
+        // time in the canonical transaction. A foreground planner and normal
+        // Main recovery must not restamp the SAME completed request body.
+        completed.updated_at = if matches!(
+            active.operation,
+            DfsNamespaceOperation::ContentReference { .. }
+        ) {
+            transaction.created_at
+        } else {
+            time::OffsetDateTime::now_utc()
+        };
         Some(completed)
     }
 
@@ -2280,7 +2315,27 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             // affected-shard comparison below without first clearing a
             // durable handoff fence or running rebind hydration/recovery.
             for expected in &command.authority_shards {
+                tracing::trace!(
+                    target: "sinomo.dfs.perf",
+                    node = %self.node_id,
+                    request = %request_id,
+                    operation = %trace_operation,
+                    stamped_fs = %expected.file_system_id,
+                    stamped_shard = %expected.shard_id,
+                    phase = "before-rebind",
+                    "namespace request prologue"
+                );
                 self.rebind_completed_local_metadata_shard_membership_handoff_if_frozen(expected)?;
+                tracing::trace!(
+                    target: "sinomo.dfs.perf",
+                    node = %self.node_id,
+                    request = %request_id,
+                    operation = %trace_operation,
+                    stamped_fs = %expected.file_system_id,
+                    stamped_shard = %expected.shard_id,
+                    phase = "after-rebind",
+                    "namespace request prologue"
+                );
             }
         }
         // The authority the requester should retry against when this node is
@@ -2335,6 +2390,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
         } else {
             let affected_started = Instant::now();
+            tracing::trace!(
+                target: "sinomo.dfs.perf",
+                node = %self.node_id,
+                request = %request_id,
+                operation = %trace_operation,
+                phase = "before-affected-shards",
+                "namespace request prologue"
+            );
             let affected = self
                 .metadata_shard_config_snapshot(&command.file_system_id)
                 .and_then(|snapshot| {
@@ -2346,6 +2409,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     )?;
                     Ok((snapshot, affected))
                 });
+            tracing::trace!(
+                target: "sinomo.dfs.perf",
+                node = %self.node_id,
+                request = %request_id,
+                operation = %trace_operation,
+                phase = "after-affected-shards",
+                "namespace request prologue"
+            );
             match affected {
                 Err(error) => {
                     trace_affected_ms = affected_started.elapsed().as_millis();
@@ -2413,7 +2484,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         // Finish generic pending receipts left by older
                         // placement callers, without creating new ones on the
                         // normal desired-state reconciliation path.
-                        let durable_admission =
+                        let mut durable_admission =
                             if (namespace_operation_uses_durable_request_admission(
                                 &command.operation,
                             ) || (recovering
@@ -2429,17 +2500,114 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                     .expect("non-empty affected shard ids")
                                     .clone();
                                 let admission_started = Instant::now();
+                                tracing::trace!(
+                                    target: "sinomo.dfs.perf",
+                                    node = %self.node_id,
+                                    request = %request_id,
+                                    operation = %trace_operation,
+                                    phase = "before-durable-admission",
+                                    "namespace request prologue"
+                                );
                                 let admission = self.admit_durable_namespace_request(
                                     &requester_node_id,
                                     &mut command,
                                     shard_id,
                                     recovering,
                                 )?;
+                                tracing::trace!(
+                                    target: "sinomo.dfs.perf",
+                                    node = %self.node_id,
+                                    request = %request_id,
+                                    operation = %trace_operation,
+                                    phase = "after-durable-admission",
+                                    "namespace request prologue"
+                                );
                                 trace_admission_ms = admission_started.elapsed().as_millis();
                                 Some(admission)
                             } else {
                                 None
                             };
+                        let mut _content_copy_begin_owner = None;
+                        if matches!(
+                            &durable_admission,
+                            Some(DurableNamespaceRequestAdmission::Execute { .. })
+                        ) && let (DfsNamespaceOperation::BeginContentCopy { path, .. }, [shard]) =
+                            (&command.operation, shards.as_slice())
+                            && shard.primary_node_id == self.node_id
+                        {
+                            // Preserve canonical Replay/Reject before any new
+                            // writer wait. An executing caller can queue while
+                            // the normal recovery owner completes this SAME Begin.
+                            let rejoin_started = Instant::now();
+                            let Some(DurableNamespaceRequestAdmission::Execute {
+                                shard_id,
+                                record,
+                                ..
+                            }) = durable_admission.as_ref()
+                            else {
+                                unreachable!("executing Begin admission checked above");
+                            };
+                            if shard_id.0 != shard.shard_id
+                                || record.authority_shard_id != *shard_id
+                                || record.file_system_id != command.file_system_id
+                            {
+                                return Err(DfsError::Metadata {
+                                    message:
+                                        "content copy admission changed its recorded shard scope"
+                                            .into(),
+                                });
+                            }
+                            let scope = DfsPreparedOperationScope {
+                                file_system_id: record.file_system_id.clone(),
+                                shard_id: shard_id.clone(),
+                                owner_epoch: shard.epoch,
+                                operation_id: record.operation_id.clone(),
+                            };
+                            let mut path_guard = self.ensure_path_not_in_cross_shard_flight(
+                                &command.file_system_id,
+                                path,
+                            );
+                            if path_guard.is_ok() {
+                                _content_copy_begin_owner =
+                                    self.acquire_prepared_execution(&scope)?;
+                                // Admission may have waited behind another real
+                                // move. Its retained writer still requires the
+                                // same normal Busy check before physical refresh.
+                                path_guard = self.ensure_path_not_in_cross_shard_flight(
+                                    &command.file_system_id,
+                                    path,
+                                );
+                            }
+                            durable_admission = Some(match path_guard {
+                                Err(error) => {
+                                    let error = posix_model::DfsPosixError::from(error);
+                                    DurableNamespaceRequestAdmission::Reject {
+                                        reason: error.to_string(),
+                                        posix_error: posix_model::namespace_posix_error_for(&error),
+                                    }
+                                }
+                                Ok(()) => {
+                                    self.metadata_backend
+                                        .as_mut()
+                                        .ok_or_else(|| DfsError::Metadata {
+                                            message:
+                                                "content copy admission requires durable metadata"
+                                                    .into(),
+                                        })?
+                                        .refresh_metadata_shard_attestation_view(&scope.shard_id)?;
+                                    // Reuse the exact original admission parser;
+                                    // completed recovery returns its immutable
+                                    // Begin response rather than a newer job DTO.
+                                    self.admit_durable_namespace_request(
+                                        &requester_node_id,
+                                        &mut command,
+                                        scope.shard_id,
+                                        recovering,
+                                    )?
+                                }
+                            });
+                            trace_admission_ms += rejoin_started.elapsed().as_millis();
+                        }
                         match durable_admission {
                             Some(DurableNamespaceRequestAdmission::Replay {
                                 result,
@@ -3139,6 +3307,26 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     }),
                 };
                 if let Err(error) = apply_result {
+                    tracing::warn!(
+                        node_id = %self.node_id,
+                        request_id = %response.request_id,
+                        primary_node_id = %primary_node_id,
+                        backend_owner = match self.metadata_backend.as_ref() {
+                            Some(crate::service_state::DfsMetadataBackendOwner::Owned(_)) => "owned",
+                            Some(crate::service_state::DfsMetadataBackendOwner::ResidentShard(_)) => "resident-shard",
+                            Some(crate::service_state::DfsMetadataBackendOwner::ResidentSharded(_)) => "resident-sharded",
+                            None => "absent",
+                        },
+                        resident_exact_shard_id = ?self.metadata_backend.as_ref()
+                            .and_then(|backend| backend.resident_exact_shard_id()),
+                        delegates_local_namespace_authority = self.transport.delegates_local_namespace_authority(),
+                        batch_file_system_id = ?batch_file_system_id,
+                        batch_shard_id = %batch.shard_id.0,
+                        dispatch_authority_shard = ?dispatch_authority_shard,
+                        matched_authority_shard = ?expected_authority,
+                        error = %error,
+                        "routed namespace response journal replay rejected"
+                    );
                     let reason = format!("routed namespace journal replay failed: {error}");
                     if let Some(pending) = self
                         .pending_routed_namespace_ops
@@ -3748,8 +3936,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     }
                     primary = next_primary;
                 }
-                DfsNamespaceResult::Rejected { reason, .. } => {
-                    return Err(DfsError::Distributed { message: reason });
+                DfsNamespaceResult::Rejected {
+                    reason,
+                    posix_error,
+                    ..
+                } => {
+                    return Err(dfs_error_from_posix_namespace_sync(
+                        posix_model::posix_error_for_namespace_rejection(reason, posix_error),
+                    ));
                 }
             }
         }
@@ -3812,8 +4006,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     }
                     primary = next_primary;
                 }
-                DfsNamespaceResult::Rejected { reason, .. } => {
-                    return Err(DfsError::Distributed { message: reason });
+                DfsNamespaceResult::Rejected {
+                    reason,
+                    posix_error,
+                    ..
+                } => {
+                    return Err(dfs_error_from_posix_namespace_sync(
+                        posix_model::posix_error_for_namespace_rejection(reason, posix_error),
+                    ));
                 }
             }
         }

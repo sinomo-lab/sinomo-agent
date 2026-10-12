@@ -2634,18 +2634,27 @@ fn sifs_cluster_posix_directory_rename_across_shard_primaries_recovers_with_subt
             .posix_rename_with_operation_id(from, to, &operation)
             .is_err()
     );
-    assert!(matches!(
+    let blocked_write =
         cluster
             .users_primary
-            .posix_write_file(&format!("{from}/child"), b"blocked", options),
-        Err(DfsPosixError::Dfs(DfsError::Busy { .. }))
-    ));
-    assert!(matches!(
-        cluster
-            .users_primary
-            .posix_mkdir(&format!("{from}/new-dir")),
-        Err(DfsPosixError::Dfs(DfsError::Busy { .. }))
-    ));
+            .posix_write_file(&format!("{from}/child"), b"blocked", options);
+    assert!(
+        matches!(
+            &blocked_write,
+            Err(DfsPosixError::Dfs(DfsError::Busy { .. }))
+        ),
+        "the same subtree write remains Busy: {blocked_write:?}"
+    );
+    let blocked_mkdir = cluster
+        .users_primary
+        .posix_mkdir(&format!("{from}/new-dir"));
+    assert!(
+        matches!(
+            &blocked_mkdir,
+            Err(DfsPosixError::Dfs(DfsError::Busy { .. }))
+        ),
+        "the same subtree mkdir remains Busy: {blocked_mkdir:?}"
+    );
     cluster._runtime.clear_faults();
     cluster
         .users_primary
@@ -2654,12 +2663,12 @@ fn sifs_cluster_posix_directory_rename_across_shard_primaries_recovers_with_subt
     assert_eq!(
         cluster
             .replica
-            .posix_read_file(&format!("{to}/child"))
+            .posix_read_file_distributed(&format!("{to}/child"))
             .unwrap(),
         b"frozen child"
     );
     assert!(matches!(
-        cluster.replica.posix_stat(from),
+        cluster.replica.posix_stat_distributed(from),
         Err(DfsPosixError::NotFound { .. })
     ));
     cluster
@@ -3104,14 +3113,18 @@ fn native_cross_shard_move_recovers_from_real_carrier_failure(
         .find(|job| job.root_path == from && job.target_path.as_deref() == Some(to))
         .expect("actual durable coordinator after transport failure");
     assert_eq!(parked.status, DfsNamespaceJobStatus::Running);
-    assert!(matches!(
-        cluster.users_primary.posix_write_file(
-            from,
-            b"must not race parked job",
-            DfsWriteOptions::replicated_eventual(vec![cluster.users_primary_node.clone()])
+    let blocked_write = cluster.users_primary.posix_write_file(
+        from,
+        b"must not race parked job",
+        DfsWriteOptions::replicated_eventual(vec![cluster.users_primary_node.clone()]),
+    );
+    assert!(
+        matches!(
+            &blocked_write,
+            Err(DfsPosixError::Dfs(DfsError::Busy { .. }))
         ),
-        Err(DfsPosixError::Dfs(DfsError::Busy { .. }))
-    ));
+        "the same write against the actual parked job remains Busy: {blocked_write:?}"
+    );
     cluster._runtime.clear_faults();
     if restart_source {
         let node = cluster.users_primary_node.clone();
@@ -3147,11 +3160,11 @@ fn native_cross_shard_move_recovers_from_real_carrier_failure(
         original.object_id
     );
     assert_eq!(
-        cluster.replica.posix_read_file(to).unwrap(),
+        cluster.replica.posix_read_file_distributed(to).unwrap(),
         b"real carrier fault data"
     );
     assert!(matches!(
-        cluster.replica.posix_stat(from),
+        cluster.replica.posix_stat_distributed(from),
         Err(DfsPosixError::NotFound { .. })
     ));
     let terminal = cluster

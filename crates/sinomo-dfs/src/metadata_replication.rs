@@ -8245,6 +8245,248 @@ mod cursor_update_tests {
     }
 
     #[test]
+    fn native_real_receiver_ack_cannot_advance_a_failed_cursor_checkpoint() {
+        let (runtime, delegated, config) = crate::test_support::current_native_metadata_service(
+            "native-real-ack-cursor-checkpoint",
+            3,
+            "/services",
+        )
+        .unwrap();
+        drop(delegated);
+        let mut service = runtime.metadata_primary_service("/services").unwrap();
+        let primary = config.primary_node_id.clone();
+        let target = config.replica_node_ids[0].clone();
+        let shard = DfsMetadataShardId::new(config.shard_id.clone());
+        let data = runtime.data_dir(&primary).clone();
+        let root = crate::local_state::local_dfs_metadata_shard_path(&data, &shard);
+        let path = crate::metadata_cursor::metadata_replication_cursor_path(&root, &target, &shard);
+        let backup = path.with_extension("actual-cursor-checkpoint-negative-backup");
+        let before = service
+            .metadata_backend()
+            .unwrap()
+            .metadata_replication_cursor(&target, &shard)
+            .unwrap();
+        let original_bytes = match std::fs::read(&path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => panic!("actual cursor before negative fault: {error}"),
+        };
+        let mut fs = service
+            .metadata_backend()
+            .unwrap()
+            .get_file_system_on_shard(&shard, &config.file_system_id)
+            .unwrap()
+            .unwrap();
+        fs.display_name.push_str("-hidden-cursor-checkpoint");
+        let payload = crate::DfsPreparedOperationPayload::for_metadata_effects(
+            crate::DfsPreparedOperationScope {
+                file_system_id: config.file_system_id.clone(),
+                shard_id: shard.clone(),
+                owner_epoch: config.epoch,
+                operation_id: format!("cursor-checkpoint:{}", sinomo_core::Id::generate()),
+            },
+            Vec::new(),
+            Vec::new(),
+            vec![crate::DfsPreparedMetadataEffect::PutFileSystem { file_system: fs }],
+            time::OffsetDateTime::now_utc(),
+        )
+        .unwrap();
+        let digest = service
+            .metadata_backend_mut()
+            .unwrap()
+            .prepare_operation(payload, None)
+            .unwrap();
+        assert!(digest.prepare_sequence > before);
+        let (peer, _) = runtime.peer_transports(&primary).unwrap();
+        let actual =
+            dfs_metadata_journal_batch_sender_from_peer_transport(&data, Arc::clone(&peer));
+        let actual_snapshot = dfs_metadata_snapshot_install_sender_from_peer_transport(peer);
+        let acknowledged = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let replies = Arc::clone(&acknowledged);
+        let faulted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fault = Arc::clone(&faulted);
+        let selected = target.clone();
+        let selected_shard = shard.clone();
+        let fault_root = root.clone();
+        let fault_path = path.clone();
+        let fault_backup = backup.clone();
+        let had_cursor = original_bytes.is_some();
+        let fault_original_bytes = original_bytes.clone();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let snapshot: DfsMetadataSnapshotInstallSender = Arc::new(move |node, command, budget| {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .filter(|remaining| !remaining.is_zero())
+                .ok_or_else(|| {
+                    DfsMetadataPeerTransportError::new(
+                        "original cursor test snapshot deadline elapsed",
+                    )
+                })?;
+            actual_snapshot(node, command, budget.min(remaining))
+        });
+        let sender: DfsMetadataJournalBatchSender = Arc::new(move |node, command, budget| {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .filter(|remaining| !remaining.is_zero())
+                .ok_or_else(|| {
+                    DfsMetadataPeerTransportError::new(
+                        "original cursor test publication deadline elapsed",
+                    )
+                })?;
+            let response = actual(node, command, budget.min(remaining))?;
+            if node == &selected && command.batch.shard_id == selected_shard {
+                validate_dfs_metadata_journal_replication_response(
+                    command,
+                    &selected_shard,
+                    &response,
+                )
+                .expect("genuine current receiver acknowledgement must match the whole request");
+                assert!(command.durable_replication.is_some());
+                assert!(matches!(
+                    response.result,
+                    DfsMetadataJournalBatchResult::Applied
+                ));
+                assert!(command.batch.next_after_sequence > before);
+                replies
+                    .lock()
+                    .unwrap()
+                    .push((command.clone(), response.clone()));
+                if !fault.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    let _writer = crate::metadata_lock::metadata_write_lock(
+                        fault_root.clone(),
+                        crate::metadata_cursor::journal_write_lock_path(&fault_root),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        crate::metadata_cursor::metadata_replication_cursor(
+                            &fault_root,
+                            &selected,
+                            &selected_shard,
+                        )
+                        .unwrap(),
+                        before,
+                    );
+                    if let Some(bytes) = &fault_original_bytes {
+                        assert!(
+                            std::fs::symlink_metadata(&fault_path)
+                                .unwrap()
+                                .file_type()
+                                .is_file()
+                        );
+                        assert_eq!(&std::fs::read(&fault_path).unwrap(), bytes);
+                        std::fs::rename(&fault_path, &fault_backup).unwrap();
+                    } else {
+                        assert!(!fault_path.try_exists().unwrap());
+                    }
+                    std::fs::create_dir_all(&fault_path).unwrap();
+                }
+            }
+            Ok(response)
+        });
+        let failed = publish_cluster_dfs_metadata_journal(
+            &data,
+            &ClusterPaths::new(&data),
+            Arc::clone(&sender),
+            Arc::clone(&snapshot),
+            DfsMetadataJournalReplicationOptions {
+                attempt_timeout: Duration::from_secs(5),
+                target_timeout: Duration::from_secs(5),
+                ..Default::default()
+            },
+        )
+        .expect_err("a real ACK cannot hide failed local cursor durability");
+        assert!(faulted.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!acknowledged.lock().unwrap().is_empty());
+        assert!(
+            service
+                .metadata_backend()
+                .unwrap()
+                .metadata_replication_cursor(&target, &shard)
+                .is_err()
+        );
+        let cold =
+            crate::LocalSobjMetadataBackend::open_for_inspection(shard.clone(), &root).unwrap();
+        assert!(cold.metadata_replication_cursor(&target, &shard).is_err());
+        drop(cold);
+        {
+            let _writer = crate::metadata_lock::metadata_write_lock(
+                root.clone(),
+                crate::metadata_cursor::journal_write_lock_path(&root),
+            )
+            .unwrap();
+            std::fs::remove_dir(&path).unwrap();
+            if had_cursor {
+                assert_eq!(
+                    std::fs::read(&backup).unwrap(),
+                    original_bytes.clone().unwrap()
+                );
+                std::fs::rename(&backup, &path).unwrap();
+            }
+        }
+        assert_eq!(
+            service
+                .metadata_backend()
+                .unwrap()
+                .metadata_replication_cursor(&target, &shard)
+                .unwrap(),
+            before
+        );
+        let cold =
+            crate::LocalSobjMetadataBackend::open_for_inspection(shard.clone(), &root).unwrap();
+        assert_eq!(
+            cold.metadata_replication_cursor(&target, &shard).unwrap(),
+            before
+        );
+        drop(cold);
+        let retry = publish_cluster_dfs_metadata_journal(
+            &data,
+            &ClusterPaths::new(&data),
+            sender,
+            snapshot,
+            DfsMetadataJournalReplicationOptions {
+                attempt_timeout: Duration::from_secs(5),
+                target_timeout: Duration::from_secs(5),
+                ..Default::default()
+            },
+        )
+        .expect("normal replay and genuine acknowledgement persist the cursor after repair");
+        let replies = acknowledged.lock().unwrap();
+        assert!(
+            replies.len() >= 2,
+            "the retry must obtain another actual receiver acknowledgement: {retry:?}"
+        );
+        assert_eq!(replies[0].0.batch, replies[1].0.batch);
+        let head = replies[1].0.batch.next_after_sequence;
+        assert_eq!(
+            service
+                .metadata_backend()
+                .unwrap()
+                .metadata_replication_cursor(&target, &shard)
+                .unwrap(),
+            head
+        );
+        let cold =
+            crate::LocalSobjMetadataBackend::open_for_inspection(shard.clone(), &root).unwrap();
+        assert_eq!(
+            cold.metadata_replication_cursor(&target, &shard).unwrap(),
+            head
+        );
+        drop((cold, replies, service));
+        assert!(
+            Instant::now() < deadline,
+            "publication and replay use the same original five-second window"
+        );
+        assert_eq!(runtime.observation_dropped_count(), 0);
+        runtime
+            .close()
+            .expect("same normal owned source and receivers drain");
+        assert!(
+            failed.to_string().contains(&path.display().to_string()),
+            "the actual cursor path must explain the persistence failure: {failed}"
+        );
+    }
+
+    #[test]
     fn native_cursor_ahead_of_durable_head_is_reported_without_publication() {
         let nodes =
             crate::test_runtime::DfsTestRuntime::ordered_node_ids("native-invalid-cursor", 3);

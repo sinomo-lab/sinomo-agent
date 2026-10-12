@@ -481,14 +481,16 @@ pub fn dfs_pending_reactive_maintenance_work_from_authority_entries(
     let due_repair_attempt_count = repair_attempt_records
         .iter()
         .filter(|record| {
-            record.next_retry_unix_nanos != u64::MAX
+            !crate::service_repair::repair_record_has_unidentified_producer(record)
+                && record.next_retry_unix_nanos != u64::MAX
                 && record.next_retry_unix_nanos <= now_unix_nanos
         })
         .count();
     let next_repair_retry_unix_nanos = repair_attempt_records
         .iter()
         .filter(|record| {
-            record.next_retry_unix_nanos != u64::MAX
+            !crate::service_repair::repair_record_has_unidentified_producer(record)
+                && record.next_retry_unix_nanos != u64::MAX
                 && record.next_retry_unix_nanos > now_unix_nanos
         })
         .map(|record| record.next_retry_unix_nanos)
@@ -2314,7 +2316,8 @@ fn dfs_repair_maintenance_budget_exhausted(
         && eligible_repair_count_before >= repair_max_jobs
         && scheduled_repair_count > 0
         && durable_repair_queue_after.iter().any(|record| {
-            record.next_retry_unix_nanos != u64::MAX
+            !crate::service_repair::repair_record_has_unidentified_producer(record)
+                && record.next_retry_unix_nanos != u64::MAX
                 && record.next_retry_unix_nanos <= now_unix_nanos
         })
 }
@@ -3123,13 +3126,40 @@ where
         }
         let deferred_repair_error = progress.error;
         let scheduled_repairs = progress.scheduled;
+        let preserved_parked = page
+            .records
+            .iter()
+            .filter(|record| {
+                progress.parked.contains(&(
+                    record.intent_id.clone(),
+                    record.missing_replica_node_id.clone(),
+                )) || crate::service_repair::repair_record_has_unidentified_producer(record)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let preserved_keys = preserved_parked
+            .iter()
+            .map(|record| {
+                (
+                    record.intent_id.clone(),
+                    record.missing_replica_node_id.clone(),
+                )
+            })
+            .collect::<BTreeSet<_>>();
         let mut durable_after =
             service.repair_queue_records_for_targets(true, Some(&scoped_targets));
         durable_after.extend(parked.iter().cloned());
+        durable_after.retain(|record| {
+            !preserved_keys.contains(&(
+                record.intent_id.clone(),
+                record.missing_replica_node_id.clone(),
+            ))
+        });
         mark_connectivity_blocked_dfs_repair_attempt_records(
             &mut durable_after,
             execution_exclusions,
         );
+        durable_after.extend(preserved_parked.iter().cloned());
         let mut repair_page_checkpoint = maintenance_host.checkpoint_repair_maintenance_page(
             &page,
             &progress.examined,
@@ -3149,16 +3179,36 @@ where
         }
         tokio::task::yield_now().await;
         let mut followup_keys = scoped_targets.clone();
-        followup_keys.extend(page.enrollment_records.iter().map(|record| {
-            (
-                record.intent_id.clone(),
-                record.missing_replica_node_id.clone(),
-            )
-        }));
+        followup_keys.retain(|key| !preserved_keys.contains(key));
+        followup_keys.extend(
+            page.enrollment_records
+                .iter()
+                .filter(|record| {
+                    !preserved_keys.contains(&(
+                        record.intent_id.clone(),
+                        record.missing_replica_node_id.clone(),
+                    ))
+                })
+                .map(|record| {
+                    (
+                        record.intent_id.clone(),
+                        record.missing_replica_node_id.clone(),
+                    )
+                }),
+        );
         let followup_before = service.repair_queue_records_for_targets(true, Some(&followup_keys));
         let followup_events = service.process_incoming_async_until_quiescent().await?;
         service.observe_repair_maintenance_events(&followup_events);
-        let followup_captures = service.take_message_committed_repair_queue_records();
+        let followup_captures = service
+            .take_message_committed_repair_queue_records()
+            .into_iter()
+            .filter(|record| {
+                !preserved_keys.contains(&(
+                    record.intent_id.clone(),
+                    record.missing_replica_node_id.clone(),
+                ))
+            })
+            .collect::<Vec<_>>();
         service.coordinator.ensure_message_repair_job_capture();
         if !followup_events.is_empty() || !followup_captures.is_empty() {
             followup_keys.extend(followup_captures.iter().map(|record| {
@@ -3209,9 +3259,20 @@ where
         let mut repair_attempts_after =
             service.repair_queue_records_for_targets(false, Some(&scoped_targets));
         repair_attempts_after.extend(parked.into_iter().filter(|record| record.attempts > 0));
+        repair_attempts_after.retain(|record| {
+            !preserved_keys.contains(&(
+                record.intent_id.clone(),
+                record.missing_replica_node_id.clone(),
+            ))
+        });
         mark_connectivity_blocked_dfs_repair_attempt_records(
             &mut repair_attempts_after,
             execution_exclusions,
+        );
+        repair_attempts_after.extend(
+            preserved_parked
+                .into_iter()
+                .filter(|record| record.attempts > 0),
         );
         (
             scheduled_repairs,

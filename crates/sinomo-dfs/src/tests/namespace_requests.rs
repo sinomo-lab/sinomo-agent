@@ -16,9 +16,17 @@ fn mkdir_all_commits_a_missing_chain_in_one_namespace_transaction() {
 
     let shard = DfsMetadataShardId::new("services");
     let physical_root = crate::local_dfs_metadata_shard_path(runtime.data_dir(&node), &shard);
-    let anchor = crate::read_metadata_candidate(&physical_root)
-        .expect("actual installed current source")
-        .prefix_proof;
+    let anchor = {
+        let inspector = runtime
+            .metadata_primary_service("/services")
+            .expect("normal current Main/Core prefix inspector");
+        inspector
+            .metadata_backend()
+            .unwrap()
+            .metadata_prefix_proof(&shard)
+            .expect("actual installed current prefix")
+            .expect("actual services shard prefix")
+    };
     let before = crate::inspect_metadata_prefix_descendant(&physical_root, &shard, &anchor)
         .expect("actual current source inspection")
         .expect("complete actual source prefix");

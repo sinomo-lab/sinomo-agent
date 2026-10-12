@@ -243,9 +243,10 @@ fn verify_daemon_rpc_body_binding(
     Err(DaemonError::AuthDenied)
 }
 
-pub fn create_cluster_invite_challenge_proof(
+pub async fn create_cluster_invite_challenge_proof(
     paths: &DaemonPaths,
     request: &ClusterInviteChallengeRequest,
+    cluster: &dyn sinomo_core::service::ClusterAccess,
 ) -> Result<ClusterInviteChallengeProof, DaemonError> {
     let data_dir = paths.root.parent().ok_or_else(|| DaemonError::Io {
         path: paths.root.display().to_string(),
@@ -253,13 +254,21 @@ pub fn create_cluster_invite_challenge_proof(
     })?;
     let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
     let identity_paths = NodeIdentityPaths::new(data_dir);
-    let identity = load_existing_node_identity(&identity_paths.main)?;
+    let identity_path = identity_paths.main;
+    let task_path = identity_path.clone();
+    let identity = tokio::task::spawn_blocking(move || load_existing_node_identity(&identity_path))
+        .await
+        .map_err(|source| DaemonError::Io {
+            path: task_path.display().to_string(),
+            detail: format!("join challenge identity task failed: {source}"),
+        })??;
     sinomo_core::cluster::create_cluster_invite_challenge_proof(
         &cluster_paths,
         &identity,
         request,
-        OffsetDateTime::now_utc(),
+        cluster,
     )
+    .await
     .map_err(Into::into)
 }
 

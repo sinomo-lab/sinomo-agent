@@ -310,6 +310,14 @@ impl LocalSobjMetadataBackend {
     ) -> Result<crate::source_adoption::DfsSourceAdoptionOutcome> {
         use crate::source_adoption::DfsSourceAdoptionOutcome as Outcome;
         let Some(prefix) = self.prefix_proof.as_ref() else {
+            tracing::warn!(
+                target: "sinomo.dfs.source-adoption",
+                operation = %scope.operation_id.chars().take(192).collect::<String>(),
+                reason = "missing-certified-prefix",
+                materialized_sequence = self.materialized_through_sequence,
+                next_sequence = self.next_sequence,
+                "native target outcome remains unavailable"
+            );
             return Ok(Outcome::Unavailable);
         };
         if scope.shard_id != self.shard_id
@@ -317,6 +325,16 @@ impl LocalSobjMetadataBackend {
             || !prefix.is_well_formed()
             || prefix.journal_sequence != self.materialized_through_sequence
         {
+            tracing::warn!(
+                target: "sinomo.dfs.source-adoption",
+                operation = %scope.operation_id.chars().take(192).collect::<String>(),
+                reason = "uncertified-inspection-cut",
+                shard_equal = (scope.shard_id == self.shard_id),
+                prefix_version = prefix.version,
+                prefix_sequence = prefix.journal_sequence,
+                materialized_sequence = self.materialized_through_sequence,
+                "native target outcome remains unavailable"
+            );
             return Ok(Outcome::Unavailable);
         }
         let record = self.tables.prepared_operations_v7.get(&scope.operation_id);
@@ -365,6 +383,15 @@ impl LocalSobjMetadataBackend {
                 if status != Some(crate::DfsPreparedOperationStatus::Committed)
                     || commit.sequence > prefix.journal_sequence
                 {
+                    tracing::warn!(
+                        target: "sinomo.dfs.source-adoption",
+                        operation = %scope.operation_id.chars().take(192).collect::<String>(),
+                        reason = "commit-outside-certified-cut",
+                        status = ?status,
+                        commit_sequence = commit.sequence,
+                        prefix_sequence = prefix.journal_sequence,
+                        "native target outcome remains unavailable"
+                    );
                     return Ok(Outcome::Unavailable);
                 }
                 return Ok(Outcome::Committed {
@@ -380,12 +407,37 @@ impl LocalSobjMetadataBackend {
         {
             // A missing/evicted operation below a certified head is unknown,
             // never evidence that its effect did not happen.
+            tracing::warn!(
+                target: "sinomo.dfs.source-adoption",
+                operation = %scope.operation_id.chars().take(192).collect::<String>(),
+                reason = "missing-operation-below-certified-head",
+                expected_prepare_sequence = ?expected_digest.map(|digest| digest.prepare_sequence),
+                materialized_sequence = self.materialized_through_sequence,
+                "native target outcome remains unavailable"
+            );
             return Ok(Outcome::Unavailable);
         }
         if self.next_sequence.saturating_sub(1) != self.materialized_through_sequence {
+            tracing::warn!(
+                target: "sinomo.dfs.source-adoption",
+                operation = %scope.operation_id.chars().take(192).collect::<String>(),
+                reason = "unmaterialized-journal-tail",
+                next_sequence = self.next_sequence,
+                materialized_sequence = self.materialized_through_sequence,
+                "native target outcome remains unavailable"
+            );
             return Ok(Outcome::Unavailable);
         }
         if status == Some(crate::DfsPreparedOperationStatus::Committed) {
+            tracing::warn!(
+                target: "sinomo.dfs.source-adoption",
+                operation = %scope.operation_id.chars().take(192).collect::<String>(),
+                reason = "committed-status-without-commit-reference",
+                status = ?status,
+                prepare_sequence = ?digest.map(|digest| digest.prepare_sequence),
+                prefix_sequence = prefix.journal_sequence,
+                "native target outcome remains unavailable"
+            );
             return Ok(Outcome::Unavailable);
         }
         Ok(Outcome::Inactive {

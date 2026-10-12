@@ -216,10 +216,15 @@ fn sifs_cluster_posix_replica_catches_up_after_journal_publish() {
     assert_eq!(read, bytes.to_vec());
 
     // Publication is idempotent: republishing must not error or regress state.
-    cluster
-        .primary
-        .replicate_configured_metadata_shards(&sifs_file_system_id())
-        .expect("idempotent metadata journal publish");
+    let publication = cluster
+        ._runtime
+        .maintenance_tick(
+            &cluster.primary_node,
+            sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+        )
+        .expect("ordinary idempotent Main metadata publication");
+    assert!(publication.outcome.is_ok(), "{:?}", publication.outcome);
+    assert_eq!(publication.omitted_kv_event_count, 0);
     sifs_posix_cluster_pump_round(&mut cluster);
     let stat = cluster
         .observer
@@ -231,9 +236,8 @@ fn sifs_cluster_posix_replica_catches_up_after_journal_publish() {
         "republishing the journal must not regress replicated metadata"
     );
 
-    // The writer (also a configured replica) already replayed these journal
-    // entries from the routed-write response; the publish stream must remain
-    // consistent for it as well.
+    // The writer is also a configured replica. Normal Main replication must
+    // preserve its current namespace and readable body as well.
     assert_eq!(
         cluster.writer.posix_read_file(path).expect("writer read"),
         bytes.to_vec()

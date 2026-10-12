@@ -3982,6 +3982,38 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         requester: Option<&NodeId>,
         restore_input: Option<crate::service_file_restore::VerifiedContentInput>,
     ) -> Result<DfsStat> {
+        self.with_metadata_lookup_cache_mut(|service| {
+            service.posix_write_file_from_reader_with_current_lookup_cache(
+                path,
+                reader,
+                options,
+                check_parent,
+                touch_parent_on_create,
+                create_attrs,
+                exclusive_create,
+                expected_existing,
+                operation_id,
+                requester,
+                restore_input,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn posix_write_file_from_reader_with_current_lookup_cache(
+        &mut self,
+        path: &str,
+        reader: &mut dyn Read,
+        options: DfsWriteOptions,
+        check_parent: bool,
+        touch_parent_on_create: bool,
+        create_attrs: Option<DfsPosixCreateAttrs>,
+        exclusive_create: bool,
+        expected_existing: Option<(&DfsObjectId, &DfsVersion)>,
+        operation_id: Option<String>,
+        requester: Option<&NodeId>,
+        restore_input: Option<crate::service_file_restore::VerifiedContentInput>,
+    ) -> Result<DfsStat> {
         let mut timing = crate::service_trace::DfsPhaseTimer::new(
             operation_id.as_deref().unwrap_or("reader-write"),
         );

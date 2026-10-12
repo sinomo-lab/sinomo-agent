@@ -136,15 +136,13 @@ fn inline_torn_tail_recovery_never_accepts_complete_corruption_or_cached_rejecte
         .unwrap()
         .write_all(&[1, 2, 3])
         .unwrap();
-    store.put_object_version("object", "v2", b"second").unwrap();
+    let second = store.put_object_version("object", "v2", b"second").unwrap();
     assert_eq!(
         store.read_object_version("object", "v1").unwrap().1,
         b"first"
     );
-    let mut bytes = fs::read(&path).unwrap();
-    let end = bytes.len() - 1;
-    bytes[end] ^= 0x40;
-    fs::write(&path, &bytes).unwrap();
+    assert_eq!(store.read_manifest("object", "v2").unwrap(), second);
+    store.corrupt_current_manifest_for_test(&second).unwrap();
     assert!(store.inline_binding_view_verified().is_err());
     assert!(store.read_manifest("object", "v1").is_err());
     assert!(store.content_reservation_roots().is_err());

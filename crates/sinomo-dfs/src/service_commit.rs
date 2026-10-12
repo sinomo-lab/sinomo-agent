@@ -19,6 +19,12 @@ use crate::posix_path::parent_posix_path;
 use crate::transfer::PendingNetworkedWrite;
 use crate::*;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RepairProducerCustodyReadiness {
+    Ready,
+    Parked,
+}
+
 #[cfg(test)]
 type CreatePrepareTestHook = Box<dyn FnOnce(&DfsPreparedOperationPayload)>;
 
@@ -692,7 +698,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub(crate) fn restore_pending_write_for_repair_job(
         &mut self,
         job: &DistributedRepairJob,
-    ) -> Result<(), DfsError> {
+    ) -> Result<RepairProducerCustodyReadiness, DfsError> {
         // Reconstruct the metadata owner without replacing existing producer
         // state. Physical custody below is DATA, not new repair authority.
         if self.writes.pending_writes.contains_key(&job.intent_id) {
@@ -704,19 +710,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
         }
         let Some(store) = self.owned_repair_queue_store()? else {
-            return Ok(());
+            return Ok(RepairProducerCustodyReadiness::Ready);
         };
         let Some(intent) = self.coordinator.intent(&job.intent_id) else {
-            return Ok(());
+            return Ok(RepairProducerCustodyReadiness::Ready);
         };
         let Some(pending) = self.writes.pending_writes.get(&job.intent_id) else {
-            return Ok(());
+            return Ok(RepairProducerCustodyReadiness::Ready);
         };
         // Restore the same owner's targets before either the first request or
         // a same-intent fanout companion chooses a request ID. No full queue scan.
         let mut records =
             store.records_for_targets(&job.intent_id, &intent.desired_replica_nodes)?;
         use sinomo_api::dfs::maintenance::DfsRepairTransferKind;
+        let mut parked = false;
         for record in &mut records {
             if record.intent_id != job.intent_id
                 || record.object_id != pending.object_id
@@ -727,6 +734,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     message: "foreground repair custody differs from its immutable owner".into(),
                 });
             }
+            parked |= record.missing_replica_node_id == job.missing_replica_node_id
+                && crate::service_repair::repair_record_has_unidentified_producer(record);
             for (kind, request, state) in [
                 (
                     DfsRepairTransferKind::Stage,
@@ -751,9 +760,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                     != Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent)
                                     && state.completed_transfer_request_id.is_none())))
                 }) {
-                    return Err(DfsError::Metadata {
-                        message: "foreground repair retains unidentified producer custody".into(),
-                    });
+                    // Unidentified custody belongs to this exact target. It
+                    // cannot grant a request or stall another target's owner.
+                    parked |= record.missing_replica_node_id == job.missing_replica_node_id;
                 }
                 if let Some(request) = request {
                     if record.transfer_kind != Some(kind)
@@ -807,10 +816,26 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     );
                     record.in_flight |= prior.in_flight;
                 }
+                // A receipt-loss pass may have re-armed only this schedule.
+                // Retain it only while every physical carrier field is exact.
+                if record.next_retry_unix_nanos == u64::MAX
+                    && prior.next_retry_unix_nanos != u64::MAX
+                {
+                    let mut scheduled = record.clone();
+                    scheduled.next_retry_unix_nanos = prior.next_retry_unix_nanos;
+                    if &scheduled == prior {
+                        record.next_retry_unix_nanos = prior.next_retry_unix_nanos;
+                    }
+                }
             }
         }
+        if parked {
+            return Ok(RepairProducerCustodyReadiness::Parked);
+        }
+        // Other targets retain their actual producer maps, including UNKNOWN.
+        records.retain(|record| record.missing_replica_node_id == job.missing_replica_node_id);
         self.restore_repair_attempt_records_merging(&records);
-        Ok(())
+        Ok(RepairProducerCustodyReadiness::Ready)
     }
 
     pub(crate) fn commit_local_metadata(
@@ -1411,9 +1436,33 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .transpose()?
             .flatten()
         {
-            // Staging already captured this operation's exact nonterminal
-            // record. Seal its original times rather than reconstructing a
-            // different preparation identity when W becomes satisfied.
+            // Reuse the original staged body; a repair can update the current
+            // base's replica locations before this write crosses W. The current
+            // base still supplies visible publication and its version/path CAS.
+            let captured_object =
+                existing
+                    .object_metadata
+                    .as_ref()
+                    .ok_or_else(|| DfsError::Metadata {
+                        message: "staged write lost its captured object metadata".into(),
+                    })?;
+            let mut comparable_base = base_object.clone();
+            comparable_base
+                .current_locations
+                .clone_from(&captured_object.current_locations);
+            if &comparable_base != captured_object
+                || captured_object.file_system_id != intent.file_system_id
+                || captured_object.object_id != intent.object_id
+                || intent
+                    .base_version
+                    .as_ref()
+                    .is_some_and(|base| base != &captured_object.version)
+            {
+                return Err(DfsError::Metadata {
+                    message: "staged write changed its captured base identity".into(),
+                });
+            }
+            pending_intent_record.object_metadata = existing.object_metadata.clone();
             pending_intent_record.created_at = existing.created_at;
             pending_intent_record.updated_at = existing.updated_at;
             let mut expected = existing;

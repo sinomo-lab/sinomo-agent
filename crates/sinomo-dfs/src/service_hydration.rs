@@ -417,25 +417,86 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         let mut observation =
             crate::background_observation::DfsBackgroundObservation::new("hydration", "rebuild");
-        self.metadata_backend
-            .as_deref_mut()
-            .expect("metadata backend checked above")
-            .begin_consistent_read_snapshot()?;
-        let result = self
-            .hydrate_from_consistent_metadata_snapshot_with_promotion_recovery_until_cancelled(
-                reconstruct_commit_promotions,
-                should_cancel,
-            );
-        self.metadata_backend
-            .as_deref_mut()
-            .expect("metadata backend remains installed during hydration")
-            .end_consistent_read_snapshot();
+        let result = (|| {
+            self.metadata_backend
+                .as_deref_mut()
+                .expect("metadata backend checked above")
+                .begin_consistent_read_snapshot()?;
+            // Preserve the original coherent catalog/reset setup, then end
+            // that read scope before recovery can publish or observe a commit.
+            let setup = (|| -> Result<bool, DfsError> {
+                let file_systems = self
+                    .metadata_backend
+                    .as_ref()
+                    .expect("metadata backend checked above")
+                    .list_file_systems()?;
+                if should_cancel() {
+                    return Ok(false);
+                }
+
+                self.reset_reconstructable_metadata_projection();
+                self.restore_durable_intent_counter_floor()?;
+                if !self.rebuild_cross_shard_namespace_locks_until_cancelled(should_cancel)? {
+                    return Ok(false);
+                }
+                if !self
+                    .project_hydration_file_systems_until_cancelled(&file_systems, should_cancel)
+                {
+                    return Ok(false);
+                }
+
+                Ok(true)
+            })();
+            self.metadata_backend
+                .as_deref_mut()
+                .expect("metadata backend remains installed during hydration")
+                .end_consistent_read_snapshot();
+            if !setup? || !self.recover_durable_namespace_prepares_until_cancelled(should_cancel)? {
+                return Ok(false);
+            }
+            self.metadata_backend
+                .as_deref_mut()
+                .expect("metadata backend checked above")
+                .begin_consistent_read_snapshot()?;
+            let result = self
+                .hydrate_from_consistent_metadata_snapshot_with_promotion_recovery_until_cancelled(
+                    reconstruct_commit_promotions,
+                    should_cancel,
+                );
+            self.metadata_backend
+                .as_deref_mut()
+                .expect("metadata backend remains installed during hydration")
+                .end_consistent_read_snapshot();
+            result
+        })();
         observation.finish(match &result {
             Ok(true) => "complete",
             Ok(false) => "cancelled",
             Err(_) => "error",
         });
         result
+    }
+
+    fn project_hydration_file_systems_until_cancelled(
+        &mut self,
+        file_systems: &[DfsFileSystem],
+        should_cancel: &(dyn Fn() -> bool + Sync),
+    ) -> bool {
+        for file_system in file_systems {
+            if should_cancel() {
+                return false;
+            }
+            self.metadata.add_file_system(file_system.clone());
+        }
+        if !self
+            .metadata
+            .filesystems
+            .contains_key(&sifs_file_system_id())
+        {
+            self.metadata
+                .add_file_system(DfsFileSystem::sifs(self.node_id.clone()));
+        }
+        true
     }
 
     fn hydrate_from_consistent_metadata_snapshot_with_promotion_recovery_until_cancelled(
@@ -452,33 +513,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(false);
         }
 
-        self.reset_reconstructable_metadata_projection();
-        self.restore_durable_intent_counter_floor()?;
-        if !self.rebuild_cross_shard_namespace_locks_until_cancelled(should_cancel)? {
+        if !self.project_hydration_file_systems_until_cancelled(&file_systems, should_cancel) {
             return Ok(false);
-        }
-        for file_system in &file_systems {
-            if should_cancel() {
-                return Ok(false);
-            }
-            self.metadata.add_file_system(file_system.clone());
-        }
-        if !self
-            .metadata
-            .filesystems
-            .contains_key(&sifs_file_system_id())
-        {
-            self.metadata
-                .add_file_system(DfsFileSystem::sifs(self.node_id.clone()));
         }
 
-        // Hidden namespace prepares are not part of the visible object scan.
-        // A certified current primary may safely rebind and finish standalone
-        // prepares now; write-coupled create prepares remain gated on their
-        // durable write receipts below.
-        if !self.recover_durable_namespace_prepares_until_cancelled(should_cancel)? {
-            return Ok(false);
-        }
         for file_system in &file_systems {
             if !try_walk_metadata_pages_until_cancelled(should_cancel, |cursor| {
                 let page = self
@@ -986,6 +1024,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let Some(backend) = self.metadata_backend.as_ref() else {
             return Ok(());
         };
+        tracing::trace!(
+            target: "sinomo.dfs.perf",
+            node = %self.node_id,
+            phase = "before-filesystems",
+            "resident metadata lazy hydration"
+        );
         for file_system in backend.list_file_systems()? {
             self.metadata.add_file_system(file_system);
         }
@@ -1001,12 +1045,36 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // the durable floor without materializing the intent bodies so a
         // rebuilt request shell cannot reuse an identifier after restart or
         // explicit disaster recovery.
+        tracing::trace!(
+            target: "sinomo.dfs.perf",
+            node = %self.node_id,
+            phase = "filesystems-loaded",
+            "resident metadata lazy hydration"
+        );
         self.restore_durable_intent_counter_floor()?;
+        tracing::trace!(
+            target: "sinomo.dfs.perf",
+            node = %self.node_id,
+            phase = "intent-floor-loaded",
+            "resident metadata lazy hydration"
+        );
         // Lazy services still process mutations. Restore the durable guards for
         // running cross-shard namespace jobs without paying for a full object,
         // version, intent, and receipt scan.
         self.rebuild_cross_shard_namespace_locks()?;
+        tracing::trace!(
+            target: "sinomo.dfs.perf",
+            node = %self.node_id,
+            phase = "namespace-locks-loaded",
+            "resident metadata lazy hydration"
+        );
         self.seed_local_metadata_journal_cursors_from_backend()?;
+        tracing::trace!(
+            target: "sinomo.dfs.perf",
+            node = %self.node_id,
+            phase = "journal-cursors-loaded",
+            "resident metadata lazy hydration"
+        );
         Ok(())
     }
 

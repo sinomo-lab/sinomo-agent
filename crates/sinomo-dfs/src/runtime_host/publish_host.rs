@@ -419,9 +419,14 @@ pub(super) async fn daemon_dfs_metadata_publish_discovery_lanes_async(
         Some(runtime),
     )
     .map_err(|error| format!("DFS metadata lanes lack authority projection: {error}"))?;
-    let preflight = warm_daemon_dfs_metadata_authority_before_deadline(authority, deadline)
-        .await
-        .map_err(|error| format!("DFS metadata lanes lack authority projection: {error}"))?;
+    let preflight = warm_daemon_dfs_metadata_authority_before_deadline(
+        authority,
+        deadline,
+        #[cfg(test)]
+        None,
+    )
+    .await
+    .map_err(|error| format!("DFS metadata lanes lack authority projection: {error}"))?;
     let authoritative = preflight
         .authority
         .retained_complete_prefix_for_generation(preflight.generation)
@@ -582,6 +587,7 @@ pub(super) async fn prepare_daemon_dfs_metadata_publish_with_replanning(
     runtime: tokio::runtime::Handle,
     data_owner_lock: Arc<DaemonDataOwnerLock>,
     replication_options: sinomo_dfs::DfsMetadataJournalReplicationOptions,
+    #[cfg(test)] invocation_hook: Option<Arc<super::message_host::DaemonDfsPreDispatchTestHook>>,
 ) -> Result<Option<sinomo_dfs::DfsPreparedClusterMetadataJournalPublish>, String> {
     // Native reads, exact-lane waits and every owner handoff share the
     // caller's original projection budget; a replan cannot restart it.
@@ -591,11 +597,26 @@ pub(super) async fn prepare_daemon_dfs_metadata_publish_with_replanning(
         .ok_or_else(|| {
             "DFS metadata publish planning has no registered runtime task owner".to_string()
         })?;
+    #[cfg(test)]
+    let observed_admission = Arc::new(std::sync::Mutex::new(
+        None::<std::sync::Weak<DaemonDfsMutationAdmission>>,
+    ));
     for replan in 0..=2 {
         if tokio::time::Instant::now() >= deadline {
             return Err("DFS metadata publish planning projection deadline elapsed".to_string());
         }
-        let (peer_snapshot, preflight) = tokio::time::timeout_at(
+        #[cfg(test)]
+        if let Some(hook) = invocation_hook.as_ref() {
+            hook(
+                super::message_host::DaemonDfsPreDispatchTestPoint::PublishPlanningAttemptStarted {
+                    replan,
+                },
+                None,
+                None,
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        let resident = tokio::time::timeout_at(
             deadline,
             ensure_daemon_dfs_metadata_publish_resident_generation_before_deadline(
                 Arc::clone(&mutation_scheduler),
@@ -605,17 +626,44 @@ pub(super) async fn prepare_daemon_dfs_metadata_publish_with_replanning(
                 runtime.clone(),
                 Arc::clone(&data_owner_lock),
                 deadline,
+                #[cfg(test)]
+                invocation_hook.as_ref(),
             ),
         )
-        .await
-        .map_err(|_| "DFS metadata publish resident projection deadline elapsed".to_string())??;
+        .await;
+        #[cfg(test)]
+        if let Some(hook) = invocation_hook.as_ref() {
+            use super::message_host::DaemonDfsPublishPlanningAttemptOutcome as Outcome;
+            let outcome = match &resident {
+                Err(_) => Some(Outcome::Deadline),
+                Ok(Err(_)) => Some(Outcome::Failed),
+                Ok(Ok(_)) => None,
+            };
+            if let Some(outcome) = outcome {
+                hook(super::message_host::DaemonDfsPreDispatchTestPoint::PublishPlanningAttemptFinished { replan, outcome },
+                    None, None).map_err(|error| error.to_string())?;
+            }
+        }
+        let (peer_snapshot, preflight) = resident.map_err(|_| {
+            "DFS metadata publish resident projection deadline elapsed".to_string()
+        })??;
         let planning_data_dir = data_dir.clone();
         let planning_cluster_paths = cluster_paths.clone();
         let planning_runtime = runtime.clone();
         let planning_data_owner_lock = Arc::clone(&data_owner_lock);
+        #[cfg(test)]
+        let planning_invocation_hook = invocation_hook.clone();
+        #[cfg(test)]
+        let planning_observed_admission = Arc::clone(&observed_admission);
         let file_system_id = lane.file_system_id.clone();
         let shard_id = lane.shard_id.clone();
         if tokio::time::Instant::now() >= deadline {
+            #[cfg(test)]
+            if let Some(hook) = invocation_hook.as_ref() {
+                hook(super::message_host::DaemonDfsPreDispatchTestPoint::PublishPlanningAttemptFinished {
+                    replan, outcome: super::message_host::DaemonDfsPublishPlanningAttemptOutcome::Deadline,
+                }, None, None).map_err(|error| error.to_string())?;
+            }
             return Err("DFS metadata publish planning projection deadline elapsed".to_string());
         }
         let attempt = tokio::time::timeout_at(
@@ -624,7 +672,12 @@ pub(super) async fn prepare_daemon_dfs_metadata_publish_with_replanning(
             Arc::clone(&mutation_scheduler),
             lane.clone(),
             task_owner.as_ref(),
-            move |_| {
+            move |_admission| {
+                #[cfg(test)]
+                {
+                    *planning_observed_admission.lock().expect("actual planner admission observer") =
+                        Some(Arc::downgrade(_admission));
+                }
                 if tokio::time::Instant::now() >= deadline {
                     return Err("DFS metadata publish planning projection deadline elapsed".to_string());
                 }
@@ -658,9 +711,11 @@ pub(super) async fn prepare_daemon_dfs_metadata_publish_with_replanning(
                     file_system_id, shard_id.0,
                 ))?;
                 #[cfg(test)]
-                if let Some(hook) = super::message_host::daemon_dfs_pre_dispatch_test_hook(&planning_data_dir) {
+                if let Some(hook) = planning_invocation_hook.as_ref() {
                     hook(
-                        super::message_host::DaemonDfsPreDispatchTestPoint::PublishPlanningAuthorityCaptured,
+                        super::message_host::DaemonDfsPreDispatchTestPoint::PublishPlanningAuthorityCaptured {
+                            admission_held: Arc::downgrade(_admission).upgrade().is_some(),
+                        },
                         None,
                         Some(&preflight),
                     ).map_err(|error| error.to_string())?;
@@ -725,8 +780,38 @@ pub(super) async fn prepare_daemon_dfs_metadata_publish_with_replanning(
             },
             ),
         )
-        .await
-        .map_err(|_| "DFS metadata publish planning projection deadline elapsed".to_string())??;
+        .await;
+        #[cfg(test)]
+        if let Some(hook) = invocation_hook.as_ref() {
+            let released = observed_admission
+                .lock()
+                .expect("actual planner admission observer")
+                .as_ref()
+                .is_some_and(|admission| admission.upgrade().is_none());
+            hook(
+                super::message_host::DaemonDfsPreDispatchTestPoint::ReplicaAdmissionReleased {
+                    released,
+                },
+                None,
+                None,
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        #[cfg(test)]
+        if let Some(hook) = invocation_hook.as_ref() {
+            use super::message_host::DaemonDfsPublishPlanningAttemptOutcome as Outcome;
+            let outcome = match &attempt {
+                Err(_) => Outcome::Deadline,
+                Ok(Err(_)) => Outcome::Failed,
+                Ok(Ok(Ok(_))) => Outcome::Complete,
+                Ok(Ok(Err(_))) => Outcome::AuthorityStale,
+            };
+            hook(super::message_host::DaemonDfsPreDispatchTestPoint::PublishPlanningAttemptFinished { replan, outcome },
+                None, None).map_err(|error| error.to_string())?;
+        }
+        let attempt = attempt.map_err(|_| {
+            "DFS metadata publish planning projection deadline elapsed".to_string()
+        })??;
         if tokio::time::Instant::now() >= deadline {
             return Err("DFS metadata publish planning projection deadline elapsed".to_string());
         }
@@ -742,6 +827,16 @@ pub(super) async fn prepare_daemon_dfs_metadata_publish_with_replanning(
                     stale,
                 )
                 .map_err(|error| error.to_string())?;
+                #[cfg(test)]
+                if let Some(hook) = invocation_hook.as_ref() {
+                    hook(
+                        super::message_host::DaemonDfsPreDispatchTestPoint::BeforeAuthorityRefresh {
+                            owner: "publish-planning", replan: replan + 1,
+                        },
+                        None,
+                        None,
+                    ).map_err(|error| error.to_string())?;
+                }
             }
             Err(stale) => return Err(stale.into_dfs_error().to_string()),
         }
@@ -765,6 +860,8 @@ pub(super) async fn ensure_daemon_dfs_metadata_publish_resident_generation(
         runtime,
         data_owner_lock,
         tokio::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+        #[cfg(test)]
+        None,
     )
     .await
     .map(|(peer, _)| peer)
@@ -778,6 +875,7 @@ async fn ensure_daemon_dfs_metadata_publish_resident_generation_before_deadline(
     runtime: tokio::runtime::Handle,
     data_owner_lock: Arc<DaemonDataOwnerLock>,
     deadline: tokio::time::Instant,
+    #[cfg(test)] invocation_hook: Option<&Arc<super::message_host::DaemonDfsPreDispatchTestHook>>,
 ) -> Result<
     (
         DaemonDfsMessagePeerSnapshot,
@@ -798,18 +896,35 @@ async fn ensure_daemon_dfs_metadata_publish_resident_generation_before_deadline(
             Some(&runtime),
         )
         .map_err(|error| error.to_string())?;
-        let metadata_authority_preflight =
-            warm_daemon_dfs_metadata_authority_before_deadline(authority, deadline)
-                .await
-                .map_err(|error| {
-                    format!("DFS metadata publish authority preflight failed: {error}")
-                })?;
+        #[cfg(test)]
+        let observe_read = |prefix| {
+            if let Some(hook) = invocation_hook {
+                hook(
+                    super::message_host::DaemonDfsPreDispatchTestPoint::AuthorityNativePrefixRead {
+                        prefix,
+                    },
+                    None,
+                    None,
+                )
+                .expect("actual planner native read observer");
+            }
+        };
+        let metadata_authority_preflight = warm_daemon_dfs_metadata_authority_before_deadline(
+            authority,
+            deadline,
+            #[cfg(test)]
+            invocation_hook.map(|_| &observe_read as &(dyn Fn(&'static str) + Send + Sync)),
+        )
+        .await
+        .map_err(|error| format!("DFS metadata publish authority preflight failed: {error}"))?;
         if daemon_dfs_message_cache_exact_admission_is_current(
             &data_dir,
             &cluster_paths,
             &peer_snapshot,
             &lane,
             &runtime,
+            #[cfg(test)]
+            None,
         )
         .map_err(|error| error.to_string())?
         {
@@ -1067,6 +1182,8 @@ pub(super) fn schedule_daemon_dfs_metadata_publish_lane_on_runtime(
                     runtime.clone(),
                     Arc::clone(&data_owner_lock),
                     replication_options,
+                    #[cfg(test)]
+                    None,
                 )
                 .await?;
                 let Some(plan) = plan else {

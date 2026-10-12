@@ -422,12 +422,12 @@ async fn run_daemon_dfs_maintenance_tick_kind_inner(
             "dfs maintenance allocator trim"
         );
         // The preemption helper has already completed or dropped the entire
-        // maintenance future before global admission is released. On success it may
-        // have restored a reset backend-bearing request lane; on preemption/error
-        // the owned lane was destroyed. Local mutation therefore remains
-        // single-generation even when a repair or metadata RPC is cancelled to
-        // admit foreground work. Those sends are replay-safe; return Deferred
-        // below so durable work is retried promptly.
+        // maintenance future before global admission is released. Its return
+        // owner restores the SAME live service through the checked cache boundary
+        // on preemption/error; only quiescent state may have been reset on success.
+        // The cancelled work and publication context are gone before handback,
+        // while actual fetch/repair custody remains single-generation. Return
+        // Deferred below so durable work is retried promptly.
         if let Some(scope) = publication_scope.take() {
             scope.finish()?;
         }
@@ -557,6 +557,66 @@ pub(super) enum DaemonDfsMaintenancePreExecution {
     AuthorityPreflightStale(DaemonDfsAuthorityPreflightStale),
 }
 
+// The cancellable future borrows this actual lane. Dropping that future must
+// return live request custody before its outer global admission is released.
+struct DaemonDfsMaintenanceServiceReturn<'a> {
+    data_dir: &'a SinomoDataDir,
+    cluster_paths: &'a ClusterPaths,
+    runtime: &'a tokio::runtime::Handle,
+    retained: Option<DaemonDfsMaintenanceServiceLane>,
+}
+
+impl DaemonDfsMaintenanceServiceReturn<'_> {
+    fn restore(&mut self) -> Result<bool, sinomo_dfs::DfsError> {
+        let Some(mut retained) = self.retained.take() else {
+            return Ok(false);
+        };
+        // Cancellation bypasses the ordinary post-await cleanup. End only the
+        // temporary dispatch mode; the outer worker still owns the same actual
+        // checkpointed calls and starts after admission release.
+        retained.lane.service.set_background_replica_dispatch(false);
+        // This consumes the lane only at the existing checked handback. A
+        // changed owner, storage generation or freeze still refuses reuse.
+        restore_daemon_dfs_message_mutation_service_after_maintenance(
+            self.data_dir,
+            self.cluster_paths,
+            self.runtime,
+            retained,
+        )
+    }
+
+    fn reset_to_lazy(&mut self) -> Result<(), sinomo_dfs::DfsError> {
+        let mut retained = self.retained.take().expect("owned maintenance lane");
+        // The caller's complete live-operation predicate has already proven
+        // that no request custody is consumed by this existing lazy rebuild.
+        retained.lane.service = retained.lane.service.into_lazy_metadata_backend_service()?;
+        self.retained = Some(retained);
+        Ok(())
+    }
+}
+
+impl Drop for DaemonDfsMaintenanceServiceReturn<'_> {
+    fn drop(&mut self) {
+        if self.retained.is_none() {
+            return;
+        }
+        match self.restore() {
+            Ok(true) => tracing::debug!(
+                data_root = %self.data_dir.root().display(),
+                "returned the same daemon DFS service after cancelled or failed maintenance"
+            ),
+            Ok(false) => tracing::info!(
+                data_root = %self.data_dir.root().display(),
+                "maintenance service handback refused its changed owner or storage"
+            ),
+            Err(error) => tracing::warn!(
+                data_root = %self.data_dir.root().display(),
+                "maintenance service handback failed its existing validation: {error}"
+            ),
+        }
+    }
+}
+
 pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
     data_dir: SinomoDataDir,
     cluster_paths: ClusterPaths,
@@ -618,18 +678,23 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
         }
         Err(DaemonDfsAuthorityPreExecutionError::Failed(error)) => return Err(error.into()),
     };
-    let DaemonDfsMaintenanceServiceLane {
-        signature,
-        metadata_authority_generation,
-        peer_node_ids,
-        lane,
-        detached_send_runtime,
-    } = retained_lane;
-    let DaemonDfsMessageServiceLane {
-        service: mut maintenance_service,
-        resident_metadata_scope,
-        ..
-    } = lane;
+    // Declare the real return owner before the publication-context guard:
+    // cancellation drops borrowed work and that context before cache handback.
+    let mut service_return = DaemonDfsMaintenanceServiceReturn {
+        data_dir: &data_dir,
+        cluster_paths: &cluster_paths,
+        runtime,
+        retained: Some(retained_lane),
+    };
+    let retained = service_return
+        .retained
+        .as_mut()
+        .expect("owned maintenance lane");
+    let signature = retained.signature.clone();
+    let metadata_authority_generation = Arc::clone(&retained.metadata_authority_generation);
+    let peer_node_ids = retained.peer_node_ids.clone();
+    let detached_send_runtime = Arc::clone(&retained.detached_send_runtime);
+    let mut maintenance_service = &mut retained.lane.service;
     let publication_scope =
         publication_owners.map(|owners| maintenance_service.publication_execution.install(owners));
     let placement_advertisements = maintenance_service
@@ -879,63 +944,25 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
             maintenance_service.detach_message_deferred_work(),
         ));
     }
-    // A completed maintenance pass retains only live request state. When no
-    // in-flight repair, replication, or namespace transition owns the hydrated
-    // mirror, collapse routine and disaster-recovery passes back to the same
-    // lazy shell over the resident backend. Durable tables and the repair queue
-    // reconstruct the released projection on demand.
+    // Rebuild only a genuinely quiescent service. Explicit recovery is not a
+    // process restart and cannot discard live fetch/repair or namespace custody.
     drop(publication_scope);
     let preserve_remote_continuation = remote_namespace_phase.is_some();
-    let reusable_service = if preserve_remote_continuation {
-        // Keep the SAME requester, prepared-source and body state. Only its
-        // resident backend lease ends at the existing checked restoration below.
-        Some(maintenance_service)
-    } else if matches!(&maintenance_result, Ok(Some(_))) {
-        match maintenance_service.authoritative_write_frozen_shard_count() {
-            Ok(0) => {
-                let reset_to_lazy = matches!(
-                    maintenance_kind,
-                    DaemonDfsMaintenanceKind::AuthoritativeReconciliation { .. }
-                        | DaemonDfsMaintenanceKind::MountedMutationRecovery
-                ) || maintenance_service
-                    .can_release_hydrated_metadata_projection();
-                if reset_to_lazy {
-                    match maintenance_service.into_lazy_metadata_backend_service() {
-                        Ok(service) => Some(service),
-                        Err(error) => {
-                            tracing::warn!(
-                                data_root = %data_dir.root().display(),
-                                "dropping daemon DFS disaster-recovery service after lazy reset failed: {error}"
-                            );
-                            None
-                        }
-                    }
-                } else {
-                    Some(maintenance_service)
-                }
-            }
-            Ok(frozen_shard_count) => {
-                tracing::info!(
-                    data_root = %data_dir.root().display(),
-                    frozen_shard_count,
-                    "dropping daemon DFS maintenance service while an authoritative shard is frozen"
-                );
-                drop(maintenance_service);
-                None
-            }
-            Err(error) => {
-                tracing::warn!(
-                    data_root = %data_dir.root().display(),
-                    "dropping daemon DFS maintenance service after frozen-shard validation failed: {error}"
-                );
-                drop(maintenance_service);
-                None
-            }
+    let reset_to_lazy = !preserve_remote_continuation
+        && matches!(&maintenance_result, Ok(Some(_)))
+        && matches!(
+            maintenance_service.authoritative_write_frozen_shard_count(),
+            Ok(0)
+        )
+        && maintenance_service.can_release_hydrated_metadata_projection();
+    if reset_to_lazy {
+        if let Err(error) = service_return.reset_to_lazy() {
+            tracing::warn!(
+                data_root = %data_dir.root().display(),
+                "dropping quiescent daemon DFS service after lazy reset failed: {error}"
+            );
         }
-    } else {
-        drop(maintenance_service);
-        None
-    };
+    }
     if matches!(
         maintenance_kind,
         DaemonDfsMaintenanceKind::AuthoritativeReconciliation {
@@ -970,48 +997,29 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
             promotion_recovery_started.elapsed().as_millis()
         ));
     }
-    if let Some(service) = reusable_service {
-        let retained = DaemonDfsMaintenanceServiceLane {
-            signature,
-            metadata_authority_generation,
-            peer_node_ids: peer_node_ids.clone(),
-            lane: DaemonDfsMessageServiceLane {
-                service,
-                peer_node_ids,
-                resident_metadata_scope,
-            },
-            detached_send_runtime,
-        };
-        let restored = restore_daemon_dfs_message_mutation_service_after_maintenance(
-            &data_dir,
-            &cluster_paths,
-            runtime,
-            retained,
-        );
-        if preserve_remote_continuation {
-            // No remote dispatch after a failed/foreign restoration. The
-            // existing actor remains the physical source/job custody owner.
-            if !restored? {
-                return Err(DaemonError::from(crate::DfsError::Metadata {
-                    message: "owned namespace recovery could not restore its current service"
-                        .into(),
-                }));
-            }
-        } else {
-            match restored {
-                Ok(true) => tracing::debug!(
-                    data_root = %data_dir.root().display(),
-                    "restored daemon DFS mutation service after maintenance"
-                ),
-                Ok(false) => tracing::info!(
-                    data_root = %data_dir.root().display(),
-                    "dropped daemon DFS mutation service after maintenance identity changed"
-                ),
-                Err(error) => tracing::warn!(
-                    data_root = %data_dir.root().display(),
-                    "dropping daemon DFS mutation service after maintenance validation failed: {error}"
-                ),
-            }
+    let restored = service_return.restore();
+    if preserve_remote_continuation {
+        // No remote dispatch after a failed/foreign restoration. The existing
+        // actor remains the physical source/job custody owner.
+        if !restored? {
+            return Err(DaemonError::from(crate::DfsError::Metadata {
+                message: "owned namespace recovery could not restore its current service".into(),
+            }));
+        }
+    } else {
+        match restored {
+            Ok(true) => tracing::debug!(
+                data_root = %data_dir.root().display(),
+                "restored daemon DFS mutation service after maintenance"
+            ),
+            Ok(false) => tracing::info!(
+                data_root = %data_dir.root().display(),
+                "dropped daemon DFS mutation service after maintenance identity changed"
+            ),
+            Err(error) => tracing::warn!(
+                data_root = %data_dir.root().display(),
+                "dropping daemon DFS mutation service after maintenance validation failed: {error}"
+            ),
         }
     }
     if let Some((request, phase)) = remote_namespace_phase {

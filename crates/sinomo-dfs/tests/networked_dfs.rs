@@ -9,6 +9,336 @@ use std::io::{Read, Result as IoResult};
 const TEST_LARGE_DFS_BYTES: usize = 1024 * 1024;
 
 #[test]
+fn native_staged_overwrite_keeps_captured_metadata_after_real_prior_version_repair() {
+    use sinomo_dfs::test_support::{
+        DfsTestFaultAction, DfsTestFaultRule, DfsTestRpcOrigin, DfsTestRpcPhase, DfsTestRuntime,
+    };
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    let (runtime, nodes) = DfsTestRuntime::start_cluster("native-captured-overwrite-v1-repair", 3)
+        .expect("same normal three-node startup");
+    let shard = runtime
+        .metadata_shards()
+        .unwrap()
+        .into_iter()
+        .find(|shard| shard.shard_id == "services")
+        .unwrap();
+    let owner = shard.primary_node_id.clone();
+    let mut others = nodes.iter().filter(|node| **node != owner);
+    let replica = others.next().unwrap().clone();
+    let requester = others.next().unwrap().clone();
+    let path = "/services/captured-overwrite-v1-repair.txt";
+    let first_bytes = b"original committed version";
+    let next_bytes = b"actual pending overwrite";
+    let mut placement =
+        sinomo_dfs::DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 2).unwrap();
+    placement.required_node_ids = vec![owner.clone()];
+    placement.forbidden_node_ids = vec![requester.clone()];
+    runtime
+        .apply_placement_policy(
+            &owner,
+            path,
+            sinomo_dfs::DfsPlacementScope::Subtree,
+            placement,
+        )
+        .unwrap();
+    let repair_gate = Arc::new(tokio::sync::Semaphore::new(0));
+    runtime.install_fault(DfsTestFaultRule {
+        source: Some(owner.clone()),
+        target: Some(replica.clone()),
+        route: Some(sinomo_dfs::DFS_DATA_REPAIR_REPLICA_ROUTE.into()),
+        call_id: None,
+        origin: Some(DfsTestRpcOrigin::RegisteredHost),
+        remaining_hits: 32,
+        action: DfsTestFaultAction::PauseBeforeDispatch(Arc::clone(&repair_gate)),
+    });
+    let mut first_writer = runtime.client(&owner).unwrap();
+    let (_, _, first_policy) = first_writer
+        .managed_replication_policy_for_path(path, DfsObjectPolicy::ReplicatedEventual, nodes.len())
+        .unwrap();
+    assert_eq!(first_policy.min_commit_replicas, 1);
+    assert_eq!(first_policy.desired_replicas, 2);
+    assert_eq!(first_policy.required_node_ids, vec![owner.clone()]);
+    assert_eq!(first_policy.forbidden_node_ids, vec![requester.clone()]);
+    let first = first_writer
+        .posix_write_file(
+            path,
+            first_bytes,
+            sinomo_dfs::DfsWriteOptions {
+                replica_candidates: nodes.clone(),
+                policy: first_policy,
+                wait_for_commit: true,
+                foreground_replica_repair: false,
+            },
+        )
+        .unwrap();
+    assert_eq!(first.current_locations, vec![owner.clone()]);
+    let mut writer = runtime.client(&requester).unwrap();
+    let (_, _, next_policy) = writer
+        .managed_replication_policy_for_path(path, DfsObjectPolicy::ReplicatedEventual, nodes.len())
+        .unwrap();
+    assert_eq!(next_policy.min_commit_replicas, 1);
+    assert_eq!(next_policy.desired_replicas, 2);
+    assert_eq!(next_policy.required_node_ids, vec![owner.clone()]);
+    assert_eq!(next_policy.forbidden_node_ids, vec![requester.clone()]);
+    let fetch_gate = Arc::new(tokio::sync::Semaphore::new(0));
+    runtime.install_fault(DfsTestFaultRule {
+        source: Some(owner.clone()),
+        target: Some(requester.clone()),
+        route: Some(sinomo_dfs::DFS_DATA_FETCH_BLOB_ROUTE.into()),
+        call_id: None,
+        origin: Some(DfsTestRpcOrigin::RegisteredHost),
+        remaining_hits: 32,
+        action: DfsTestFaultAction::PauseBeforeDispatch(Arc::clone(&fetch_gate)),
+    });
+    let operation = sinomo_core::Id::generate().to_string();
+    let write_operation = operation.clone();
+    let write_object = first.object_id.clone();
+    let write_base_version = first.version.clone();
+    let baseline = runtime.rpc_observations().len();
+    // Both calls use the original native runtime. The scoped caller only lets
+    // this test control the already-existing negative transport gates while
+    // the ordinary waiting POSIX operation executes on its actual Main path.
+    let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    first_writer.set_transport_operation_deadline(Some(deadline));
+    writer.set_transport_operation_deadline(Some(deadline));
+    // A W1 return does not imply that its asynchronous repair reached its
+    // negative gate. Observe the real V1 send before starting the V2 caller,
+    // so the same worker owns that paused original work first.
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "V1 dispatch uses the same original window"
+        );
+        if runtime.rpc_observations().iter().any(|event| {
+            event.source == owner
+                && event.target == replica
+                && event.route == sinomo_dfs::DFS_DATA_REPAIR_REPLICA_ROUTE
+                && event.origin == DfsTestRpcOrigin::RegisteredHost
+                && event.phase == DfsTestRpcPhase::BeforeDispatch
+                && event.dfs_object_id.as_ref() == Some(&first.object_id)
+                && event.dfs_version.as_ref() == Some(&first.version)
+        }) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let (mut writer, written, captured) = std::thread::scope(|scope| {
+        let waiting = scope.spawn(move || {
+            // The normal versioned-store CAS API captures a local manifest
+            // after validating this actual original object/version on its owner.
+            // Its outside-plan requester then uses the real deferred Fetch path.
+            let result = writer.posix_write_internal_file_from_reader(
+                path,
+                std::io::Cursor::new(next_bytes),
+                sinomo_dfs::DfsWriteOptions {
+                    replica_candidates: nodes,
+                    policy: next_policy,
+                    wait_for_commit: true,
+                    foreground_replica_repair: false,
+                },
+                Some((&write_object, &write_base_version)),
+                &write_operation,
+            );
+            (writer, result)
+        });
+        let captured = loop {
+            assert!(
+                Instant::now() < deadline,
+                "V2 capture retains the original completion window"
+            );
+            let physical = runtime.metadata_primary_service(path).unwrap();
+            let history = physical
+                .metadata_backend()
+                .unwrap()
+                .object_write_intent_history(&first.object_id)
+                .unwrap();
+            if let Some(record) = history
+                .intents
+                .into_iter()
+                .find(|record| record.operation_id.as_deref() == Some(operation.as_str()))
+            {
+                assert_eq!(record.file_system_id, first.file_system_id);
+                assert_eq!(record.object_id, first.object_id);
+                assert_eq!(record.base_version, Some(first.version.clone()));
+                assert_ne!(record.target_version, first.version);
+                assert_eq!(record.coordinator_node_id, requester);
+                assert_eq!(record.owner_epoch, shard.epoch);
+                assert_eq!(record.policy.min_commit_replicas, 1);
+                assert_eq!(record.policy.desired_replicas, 2);
+                assert_eq!(record.desired_replica_node_ids.len(), 2);
+                assert!(record.desired_replica_node_ids.contains(&owner));
+                assert!(record.desired_replica_node_ids.contains(&replica));
+                assert!(!record.desired_replica_node_ids.contains(&requester));
+                assert_eq!(
+                    record.status,
+                    sinomo_dfs::DfsWriteIntentStatus::ReceiptsPending
+                );
+                assert_eq!(
+                    record.object_metadata.as_ref().unwrap().current_locations,
+                    vec![owner.clone()]
+                );
+                break record;
+            }
+            drop(physical);
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        assert!(
+            runtime
+                .rpc_observations()
+                .iter()
+                .any(|event| event.source == owner
+                    && event.target == replica
+                    && event.route == sinomo_dfs::DFS_DATA_REPAIR_REPLICA_ROUTE
+                    && event.phase == DfsTestRpcPhase::BeforeDispatch
+                    && event.dfs_object_id.as_ref() == Some(&first.object_id)
+                    && event.dfs_version.as_ref() == Some(&first.version)),
+            "the real V1 repair is already held before the V2 body"
+        );
+        // Release real V1 receiver work. Its native receipt/object update must
+        // occur before the original queued V2 Fetch body is allowed to stage.
+        repair_gate.add_permits(64);
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "V1 repair and V2 body share the original window"
+            );
+            let actual = first_writer.posix_stat_distributed(path).unwrap();
+            assert_eq!(actual.version, first.version);
+            let fetch_held = runtime.rpc_observations()[baseline..].iter().any(|event| {
+                event.source == owner
+                    && event.target == requester
+                    && event.route == sinomo_dfs::DFS_DATA_FETCH_BLOB_ROUTE
+                    && event.origin == DfsTestRpcOrigin::RegisteredHost
+                    && event.phase == DfsTestRpcPhase::BeforeDispatch
+            });
+            if actual.current_locations.contains(&replica) && fetch_held {
+                let physical = runtime.metadata_primary_service(path).unwrap();
+                let backend = physical.metadata_backend().unwrap();
+                let receipts = backend
+                    .receipts_for_version(&first.object_id, &first.version)
+                    .unwrap();
+                assert!(
+                    receipts
+                        .iter()
+                        .any(|receipt| receipt.replica_node_id == replica
+                            && receipt.receipt.file_system_id == first.file_system_id
+                            && receipt.receipt.object_id == first.object_id
+                            && receipt.receipt.committed_version == first.version
+                            && receipt.content_hash == first.content_hash)
+                );
+                assert_eq!(
+                    backend
+                        .get_intent(&captured.object_id, &captured.intent_id)
+                        .unwrap()
+                        .unwrap(),
+                    captured
+                );
+
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(Instant::now() < deadline);
+        fetch_gate.add_permits(64);
+        let (writer, result) = waiting.join().expect("original normal caller completed");
+        let written =
+            result.expect("V2 stages the same captured intent after real V1 location progress");
+        assert_eq!(written.file_system_id, captured.file_system_id);
+        assert_eq!(written.object_id, captured.object_id);
+        assert_eq!(written.version, captured.target_version);
+        assert_eq!(written.content_hash, captured.content_hash);
+        assert_eq!(written.size_bytes, Some(next_bytes.len() as u64));
+        assert!(Instant::now() < deadline);
+        (writer, written, captured)
+    });
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "actual V2 N receipts retain the same completion window"
+        );
+        let actual = first_writer.posix_stat_distributed(path).unwrap();
+        assert_eq!(actual.version, written.version);
+        if actual.current_locations.contains(&owner) && actual.current_locations.contains(&replica)
+        {
+            let physical = runtime.metadata_primary_service(path).unwrap();
+            let backend = physical.metadata_backend().unwrap();
+            let receipts = backend
+                .receipts_for_version(&written.object_id, &written.version)
+                .unwrap();
+            for node in [&owner, &replica] {
+                assert!(
+                    receipts
+                        .iter()
+                        .any(|receipt| &receipt.replica_node_id == node
+                            && receipt.receipt.file_system_id == written.file_system_id
+                            && receipt.receipt.object_id == written.object_id
+                            && receipt.receipt.committed_version == written.version
+                            && receipt.content_hash == written.content_hash)
+                );
+            }
+            let history = backend
+                .object_write_intent_history(&written.object_id)
+                .unwrap();
+            let mut original = history
+                .intents
+                .iter()
+                .filter(|record| record.operation_id.as_deref() == Some(operation.as_str()));
+            let terminal = original
+                .next()
+                .expect("the original intent has a durable terminal record");
+            assert!(
+                original.next().is_none(),
+                "one original mutation owns the terminal body"
+            );
+            assert_eq!(terminal.status, sinomo_dfs::DfsWriteIntentStatus::Committed);
+            // Comparison only: these are the three legitimate completion fields;
+            // every original publication/request/owner/policy/base field must
+            // equal the actual durable nonterminal record captured above.
+            let mut expected_terminal = captured.clone();
+            expected_terminal.status = sinomo_dfs::DfsWriteIntentStatus::Committed;
+            expected_terminal.updated_at = terminal.updated_at;
+            expected_terminal.object_metadata = terminal.object_metadata.clone();
+            assert_eq!(terminal, &expected_terminal);
+            let metadata = terminal.object_metadata.as_ref().unwrap();
+            assert_eq!(metadata.file_system_id, written.file_system_id);
+            assert_eq!(metadata.object_id, written.object_id);
+            assert_eq!(metadata.version, written.version);
+            assert_eq!(metadata.content_hash, written.content_hash);
+            assert_eq!(metadata.path, path);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        runtime.rpc_observations()[baseline..]
+            .iter()
+            .filter(|event| event.source == requester
+                && event.target == owner
+                && event.route == sinomo_dfs::DFS_DATA_DISTRIBUTED_WRITE_ROUTE
+                && event.phase == DfsTestRpcPhase::BeforeDispatch)
+            .count(),
+        1,
+        "the original waiting requester never replays the mutation"
+    );
+    assert_eq!(
+        writer.posix_read_file_distributed(path).unwrap(),
+        next_bytes
+    );
+    runtime.clear_faults();
+    runtime.assert_fault_budgets().unwrap();
+    assert_eq!(runtime.observation_dropped_count(), 0);
+    drop((writer, first_writer));
+    runtime
+        .close()
+        .expect("normal owned callers and receivers close");
+    assert!(
+        Instant::now() < deadline,
+        "the same original window includes close"
+    );
+}
+
+#[test]
 fn native_file_sync_repairs_full_committed_w1_n3_owner_after_healing_receivers() {
     use sinomo_dfs::test_support::{
         DfsTestFaultAction, DfsTestFaultRule, DfsTestRpcOrigin, DfsTestRpcPhase, DfsTestRuntime,
@@ -2715,10 +3045,14 @@ fn native_unknown_adoption_retains_source_owner_until_exact_reopen_reconciliatio
     assert_eq!(actual.object_id, committed.object_id);
     assert_eq!(actual.version, committed.version);
     assert_eq!(resumed.posix_read_file_distributed(to).unwrap(), bytes);
-    assert!(matches!(
-        resumed.posix_stat_distributed(from),
-        Err(sinomo_dfs::DfsPosixError::NotFound { .. })
-    ));
+    let source_outcome = resumed.posix_stat_distributed(from);
+    assert!(
+        matches!(
+            &source_outcome,
+            Err(sinomo_dfs::DfsPosixError::NotFound { .. })
+        ),
+        "source path after exact reopen reconciliation: {source_outcome:?}"
+    );
     drop(resumed);
     assert_eq!(runtime.observation_dropped_count(), 0);
     runtime.close().unwrap();

@@ -2627,7 +2627,7 @@ fn sifs_cluster_posix_blocking_write_and_read_with_live_peers() {
     let bytes = b"blocking write through live peers".to_vec();
     let SifsPosixCluster {
         root,
-        primary_node: _,
+        primary_node,
         writer_node,
         observer_node: _,
         primary,
@@ -2674,9 +2674,16 @@ fn sifs_cluster_posix_blocking_write_and_read_with_live_peers() {
     let mut primary = primary_thread.join().expect("primary thread");
     let deadline = Instant::now() + SIFS_CLUSTER_PUMP_DEADLINE;
     loop {
-        primary
-            .replicate_configured_metadata_shards(&sifs_file_system_id())
-            .expect("primary journal publish");
+        let publication = _runtime
+            .maintenance_tick(
+                &primary_node,
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT),
+            )
+            .expect("ordinary Main publication");
+        assert!(publication.outcome.is_ok(), "{:?}", publication.outcome);
+        assert_eq!(publication.omitted_kv_event_count, 0);
         primary.process_incoming().expect("primary pump");
         writer.process_incoming().expect("writer pump");
         observer.process_incoming().expect("observer pump");

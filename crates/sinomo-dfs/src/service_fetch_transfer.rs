@@ -339,13 +339,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 reason,
             });
         };
+        // Expiry releases scheduling activity, but retains the original named
+        // request. Its exact authenticated reply still belongs to this owner.
+        let expected_request_id = pending
+            .fetch_inflight_request_ids
+            .get(&frame_source_node_id);
         let restored_fetch_response = pending.fetch_inflight_from.is_empty()
             && pending.fetch_inflight_request_ids.is_empty()
             && self.restored_fetch_response_source_is_authorized_without_inflight(
                 &response,
                 &frame_source_node_id,
             )?;
-        if !pending.fetch_inflight_from.contains(&frame_source_node_id) && !restored_fetch_response
+        if !pending.fetch_inflight_from.contains(&frame_source_node_id)
+            && expected_request_id.is_none()
+            && !restored_fetch_response
         {
             return Ok(NetworkedDfsServiceEvent::BlobFetchRejected {
                 intent_id: response.intent_id,
@@ -354,10 +361,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 reason: "unexpected DFS fetch response source".to_string(),
             });
         }
-        if let Some(expected_request_id) = pending
-            .fetch_inflight_request_ids
-            .get(&frame_source_node_id)
-        {
+        if let Some(expected_request_id) = expected_request_id {
             if expected_request_id != &response.request_id {
                 return Ok(NetworkedDfsServiceEvent::BlobFetchRejected {
                     intent_id: response.intent_id,

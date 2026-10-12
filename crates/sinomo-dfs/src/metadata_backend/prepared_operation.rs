@@ -124,10 +124,70 @@ impl LocalSobjMetadataBackend {
             .get(&payload.operation_id)
         {
             existing.validate()?;
-            if (existing.digest.payload_digest != payload.canonical_digest()?
+            let incoming_digest = payload.canonical_digest()?;
+            if (existing.digest.payload_digest != incoming_digest
                 || existing.payload.as_ref() != &payload)
                 && !committed_capture_request_race_matches(existing, &payload)
             {
+                let stored = existing.payload.as_ref();
+                let completed_request_stable_equal = match (
+                    stored.completed_request.as_ref(),
+                    payload.completed_request.as_ref(),
+                ) {
+                    (Some(old), Some(new)) => {
+                        old.file_system_id == new.file_system_id
+                            && old.requester_node_id == new.requester_node_id
+                            && old.request_id == new.request_id
+                            && old.operation_id == new.operation_id
+                            && old.authority_shard_id == new.authority_shard_id
+                            && old.operation == new.operation
+                            && old.command_digest == new.command_digest
+                            && old.status == new.status
+                            && old.result == new.result
+                            && old.posix_coordination_result == new.posix_coordination_result
+                            && old.recovery_attempts == new.recovery_attempts
+                            && old.last_recovery_error == new.last_recovery_error
+                            && old.created_at == new.created_at
+                    }
+                    (None, None) => true,
+                    _ => false,
+                };
+                tracing::warn!(
+                    target: "sinomo.dfs.metadata",
+                    operation_id = %payload.operation_id,
+                    file_system_id = %payload.file_system_id,
+                    shard_id = %payload.shard_id.0,
+                    stored_status = ?existing.status,
+                    stored_prepare_sequence = existing.digest.prepare_sequence,
+                    stored_commit_sequence = ?existing.committed_entry.as_ref().map(|entry| entry.sequence),
+                    stored_digest = %existing.digest.payload_digest,
+                    incoming_digest = %incoming_digest,
+                    protocol_equal = stored.protocol_version == payload.protocol_version,
+                    filesystem_equal = stored.file_system_id == payload.file_system_id,
+                    shard_equal = stored.shard_id == payload.shard_id,
+                    epoch_equal = stored.owner_epoch == payload.owner_epoch,
+                    operation_equal = stored.operation_id == payload.operation_id,
+                    journal_id_equal = stored.journal_operation_id == payload.journal_operation_id,
+                    journal_sequence_equal = stored.expected_journal_sequence == payload.expected_journal_sequence,
+                    object_expectations_equal = stored.expected_object_versions == payload.expected_object_versions,
+                    path_expectations_equal = stored.expected_path_occupants == payload.expected_path_occupants,
+                    transaction_equal = stored.transaction == payload.transaction,
+                    transaction_versions_equal = stored.transaction.versions == payload.transaction.versions,
+                    transaction_extension_expectations_equal = stored.transaction.extension_expectations == payload.transaction.extension_expectations,
+                    transaction_pins_equal = stored.transaction.file_version_pins == payload.transaction.file_version_pins,
+                    transaction_created_at_equal = stored.transaction.created_at == payload.transaction.created_at,
+                    metadata_effects_equal = stored.metadata_effects == payload.metadata_effects,
+                    content_receipts_equal = stored.content_receipts == payload.content_receipts,
+                    required_replicas_equal = stored.required_replica_node_ids == payload.required_replica_node_ids,
+                    prepared_intent_equal = stored.prepared_intent == payload.prepared_intent,
+                    terminal_intent_equal = stored.terminal_intent == payload.terminal_intent,
+                    completed_request_equal = stored.completed_request == payload.completed_request,
+                    completed_request_stable_equal,
+                    completed_request_updated_at_equal = stored.completed_request.as_ref().map(|request| request.updated_at)
+                        == payload.completed_request.as_ref().map(|request| request.updated_at),
+                    completed_request_completion_equal = stored.completed_request_completion == payload.completed_request_completion,
+                    "prepared operation immutable body mismatch"
+                );
                 return Err(MetadataBackendError::Serde(
                     "prepared operation id reuses a different immutable body".into(),
                 ));

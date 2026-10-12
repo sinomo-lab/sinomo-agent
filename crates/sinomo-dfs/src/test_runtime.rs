@@ -1514,7 +1514,10 @@ impl DfsTestRuntime {
                       _preflight: Option<
                     &crate::runtime_host::DaemonDfsMetadataAuthorityPreflight,
                 >| {
-                    if point != crate::runtime_host::DaemonDfsPreDispatchTestPoint::BeforeExecute {
+                    if !matches!(
+                        point,
+                        crate::runtime_host::DaemonDfsPreDispatchTestPoint::BeforeExecute { .. }
+                    ) {
                         return Ok(());
                     }
                     let Some(command) = command else {
@@ -2377,17 +2380,61 @@ impl DfsTestRuntime {
             }).await.map_err(|_| "normal component service catalog did not publish the actual mounted DFS providers before the existing network deadline".to_string())?
         }))?;
         timing.mark("native-catalog-wait-completed");
-        // The normal mounted catalog publishes before host preparation. Join
-        // its real provider cut before unblocking the ordinary DFS reconciler.
+        // All actual providers and their mounted endpoints are present. Prepare
+        // the independent native owners concurrently on the SAME runtime, as
+        // separate product nodes do. An endpoint accepts requests only after
+        // its own genuine component preparation succeeds.
+        timing.mark("native-host-prepare-started");
+        let mut preparations = Vec::new();
         for id in &ids {
             crate::dfs_perf_trace(format_args!(
                 "native-startup-node owner={} node={} phase=host-ready",
                 self.primary, id
             ));
-            timing.mark("native-host-prepare-started");
-            self.ready_node(id)?;
-            timing.mark("native-host-prepare-completed");
+            let reconciler = self.nodes.get_mut(id).unwrap().reconciler.take().unwrap();
+            let endpoint = Arc::clone(&self.fabric.nodes.lock().unwrap()[id]);
+            let runtime = executor().handle().clone();
+            let preparation = executor().spawn_blocking(move || {
+                reconciler.notify_host_start();
+                let result = reconciler
+                    .prepare_host_on_runtime(Some(&runtime))
+                    .map_err(|error| error.to_string());
+                if result.is_ok() {
+                    reconciler.notify_host_ready();
+                    endpoint.accepting.store(true, Ordering::Release);
+                }
+                (reconciler, result)
+            });
+            preparations.push((id.clone(), preparation));
         }
+        let mut completed = Vec::new();
+        run_unit(Box::pin(async {
+            for (id, preparation) in preparations {
+                completed.push((id, preparation.await));
+            }
+            Ok(())
+        }))?;
+        // Join every started owner before returning an error and restore every
+        // returned real scope so normal shutdown retains ownership of its tasks.
+        let mut failure = None;
+        for (id, result) in completed {
+            match result {
+                Ok((reconciler, result)) => {
+                    self.nodes.get_mut(&id).unwrap().reconciler = Some(reconciler);
+                    if let Err(error) = result {
+                        failure.get_or_insert(error);
+                    }
+                }
+                Err(error) => {
+                    failure
+                        .get_or_insert_with(|| format!("native host preparation failed: {error}"));
+                }
+            }
+        }
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        timing.mark("native-host-prepare-completed");
         timing.mark("native-startup-completion-wait-started");
         let completion = self.wait_startup_completion();
         timing.mark("native-startup-completion-wait-returned");

@@ -783,33 +783,6 @@ pub struct DfsReconnectReconciliation {
 
 /// Result of trying to transfer local-owned object authority to a new owner.
 
-/// Per-target result from sending metadata journal updates to configured shard
-/// replicas.
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub enum DfsMetadataReplicationOutcome {
-    Sent {
-        target_node_id: NodeId,
-        shard_id: DfsMetadataShardId,
-        entries: usize,
-        next_after_sequence: u64,
-    },
-    InFlight {
-        target_node_id: NodeId,
-        shard_id: DfsMetadataShardId,
-        next_after_sequence: u64,
-    },
-    NoChanges {
-        target_node_id: NodeId,
-        shard_id: DfsMetadataShardId,
-        after_sequence: u64,
-    },
-    Unroutable {
-        target_node_id: NodeId,
-        shard_id: DfsMetadataShardId,
-        after_sequence: u64,
-    },
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum PendingMetadataReplicationResponseKind {
     JournalBatch,

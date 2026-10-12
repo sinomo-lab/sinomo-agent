@@ -309,7 +309,7 @@ fn sifs_cluster_posix_routed_namespace_ops_converge_across_replicas() {
     let cluster = sifs_posix_cluster("sifs-cluster-ns-converge", "/users");
     let SifsPosixCluster {
         root,
-        primary_node: _,
+        primary_node,
         writer_node,
         observer_node: _,
         primary,
@@ -373,9 +373,16 @@ fn sifs_cluster_posix_routed_namespace_ops_converge_across_replicas() {
     let mut rejections = Vec::new();
     let deadline = Instant::now() + SIFS_CLUSTER_PUMP_DEADLINE;
     loop {
-        primary
-            .replicate_configured_metadata_shards(&sifs_file_system_id())
-            .expect("publish after replica namespace ops");
+        let publication = _runtime
+            .maintenance_tick(
+                &primary_node,
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT),
+            )
+            .expect("ordinary Main publication after replica namespace ops");
+        assert!(publication.outcome.is_ok(), "{:?}", publication.outcome);
+        assert_eq!(publication.omitted_kv_event_count, 0);
         pump_dfs_services_collect_rejections(
             &mut [
                 ("primary", &mut primary),

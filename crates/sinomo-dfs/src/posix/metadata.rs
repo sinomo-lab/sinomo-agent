@@ -21,8 +21,8 @@ use crate::posix_path::{
 };
 use crate::{
     DfsDirectoryPage, DfsDirectoryPageCursor, DfsFileSystemId, DfsMessageTransport,
-    DfsNamespaceOperation, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsReadData,
-    NetworkedDfsReadOutcome, NetworkedDfsService, sifs_file_system_id,
+    DfsMetadataShardConfig, DfsNamespaceOperation, DfsObjectId, DfsObjectKind, DfsObjectMetadata,
+    DfsReadData, NetworkedDfsReadOutcome, NetworkedDfsService, sifs_file_system_id,
 };
 
 #[cfg(test)]
@@ -414,7 +414,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         follow_final: bool,
     ) -> Result<String> {
         Ok(self
-            .resolve_posix_path_distributed_walk(path, follow_final, false)?
+            .resolve_posix_path_distributed_walk(path, follow_final, false, None)?
             .path)
     }
 
@@ -425,7 +425,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         path: &str,
     ) -> Result<(String, Option<DfsObjectMetadata>)> {
-        let mut resolved = self.resolve_posix_path_distributed_walk(path, true, false)?;
+        let mut resolved = self.resolve_posix_path_distributed_walk(path, true, false, None)?;
         // The component walker has no component to observe for the filesystem
         // root, so retain that one exact lookup here.
         if resolved.path == "/" {
@@ -444,7 +444,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         path: &str,
     ) -> Result<ResolvedPosixPath> {
-        self.resolve_posix_path_distributed_walk(path, true, true)
+        self.resolve_posix_path_distributed_walk(path, true, true, None)
+    }
+
+    pub(super) fn resolve_posix_path_distributed_from_snapshot(
+        &mut self,
+        path: &str,
+        follow_final: bool,
+        shard_snapshot: &[DfsMetadataShardConfig],
+    ) -> Result<String> {
+        Ok(self
+            .resolve_posix_path_distributed_walk(path, follow_final, false, Some(shard_snapshot))?
+            .path)
     }
 
     fn resolve_posix_path_distributed_walk(
@@ -452,12 +463,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         path: &str,
         follow_final: bool,
         capture_components: bool,
+        shard_snapshot: Option<&[DfsMetadataShardConfig]>,
     ) -> Result<ResolvedPosixPath> {
         let file_system_id = sifs_file_system_id();
         let mut current = normalize_posix_walk_path(path)?;
         let mut followed_symlink = None::<String>;
-        let resolve_authoritatively = posix_path_has_dot_components(path);
-        let mut target_shard_snapshot = if resolve_authoritatively {
+        let resolve_authoritatively = self.transport.delegates_local_namespace_authority()
+            || posix_path_has_dot_components(path);
+        let mut target_shard_snapshot = if let Some(shards) = shard_snapshot {
+            Some(shards.to_vec())
+        } else if resolve_authoritatively {
             self.refresh_sifs_metadata_shards()?
         } else {
             None
@@ -485,12 +500,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     resolved = candidate;
                     continue;
                 }
-                // Ordinary component walks remain local: callers commonly
-                // resolve a not-yet-created final path before routing its
-                // mutation, and an authority lookup here would add a second
-                // namespace request that their primary pump cannot service.
-                // Once a symlink redirects the walk, however, the target may
-                // live on a different shard that this node does not mirror.
+                // Main callers resolve through the actual metadata owner.
+                // Keep one routing cut throughout this component/symlink walk;
+                // selected objects remain in the existing request-scoped cache.
+                // Core/local callers retain their ordinary local component path.
                 let object = if let Some(link_path) = followed_symlink.as_deref() {
                     match self.lookup_sifs_path_direct_distributed_synced_from_snapshot(
                         &candidate,
@@ -601,7 +614,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 if object.kind == DfsObjectKind::Symlink {
                     let target = self.symlink_target_for_object_distributed(&candidate, &object)?;
                     followed_symlink = Some(candidate.clone());
-                    target_shard_snapshot = self.refresh_sifs_metadata_shards()?;
+                    if target_shard_snapshot.is_none() {
+                        target_shard_snapshot = self.refresh_sifs_metadata_shards()?;
+                    }
                     current = resolve_posix_symlink_target(&candidate, &target)?;
                     for rest in &components[index + 1..] {
                         current = join_posix_path(&current, rest);

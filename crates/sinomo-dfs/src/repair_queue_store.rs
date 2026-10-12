@@ -956,9 +956,9 @@ impl LocalDfsRepairQueueStore {
             before.insert(key, record);
         }
         let mut operations = BTreeMap::new();
-        // Intent retirement covers all of its indexed target keys, including
-        // siblings outside this candidate window. Bind every removal to the
-        // exact object/version/hash which the service authoritatively retired.
+        // Intent retirement examines its indexed targets, including siblings
+        // outside this candidate window. Retain unresolved transfer custody;
+        // every removal still binds the exact retired object/version/hash.
         for record in retired.values() {
             let lower = DfsRepairQueueKey {
                 intent_id: record.intent_id.clone(),
@@ -971,6 +971,9 @@ impl LocalDfsRepairQueueStore {
                 .take_while(|(key, _)| key.intent_id == record.intent_id)
             {
                 validate_stable_repair_intent_identity(record, existing)?;
+                if crate::service_repair::repair_transfer_custody_unresolved(existing) {
+                    continue;
+                }
                 operations.insert(
                     key.clone(),
                     DfsRepairQueueOperation::Remove { key: key.clone() },
@@ -978,6 +981,14 @@ impl LocalDfsRepairQueueStore {
             }
         }
         for (key, old) in &before {
+            if is_retired(old)?
+                && state
+                    .records
+                    .get(key)
+                    .is_some_and(crate::service_repair::repair_transfer_custody_unresolved)
+            {
+                continue;
+            }
             match desired.get(key) {
                 Some(record) => {
                     validate_stable_repair_identity(old, record)?;
@@ -1864,6 +1875,10 @@ mod tests {
         let records = (0..8)
             .map(|index| {
                 let mut record = record(&format!("b{index}"), "node-target", 3);
+                record.transfer_kind =
+                    Some(sinomo_api::dfs::maintenance::DfsRepairTransferKind::Repair);
+                record.transfer_delivery_state =
+                    Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent);
                 record.last_error = Some("x".repeat(600_000));
                 record
             })
@@ -1888,7 +1903,10 @@ mod tests {
             "normal page checkpoint retains threshold-based log compaction"
         );
         assert_eq!(store.view().unwrap().records, records[1..]);
-        let early = record("a0", "node-earlier", 0);
+        let mut early = record("a0", "node-earlier", 0);
+        early.transfer_kind = Some(sinomo_api::dfs::maintenance::DfsRepairTransferKind::Repair);
+        early.transfer_delivery_state =
+            Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent);
         store.append_enqueues([early.clone()]).unwrap();
         let (next, next_token) = store.maintenance_page(1, &[], None).unwrap();
         assert_eq!(
@@ -2589,6 +2607,149 @@ mod tests {
                 assert_eq!(actual.records, vec![current]);
                 assert_eq!(actual.head_sequence, head, "rejected Set appends no frame");
             }
+        }
+        // Pure queue DATA below proves indexed retirement and CAS behavior,
+        // never a transport ACK, content receipt, or publication authority.
+        for custody in ["unnamed", "named", "null-kind", "stage"] {
+            let path = root.join(format!("retirement-{custody}.sobj"));
+            let store = LocalDfsRepairQueueStore::new(&path);
+            let mut settled = record("retirement", "settled-target-DATA", 2);
+            settled.transfer_kind = Some(DfsRepairTransferKind::Repair);
+            settled.transfer_delivery_state = Some(NetworkDeliveryState::DefinitelyNotSent);
+            let mut unresolved = settled.clone();
+            unresolved.missing_replica_node_id =
+                NodeId::from_legacy_named("unresolved-target-DATA").unwrap();
+            unresolved.transfer_delivery_state = None;
+            if custody == "named" {
+                unresolved.transfer_request_id = Some("retirement-DATA-request".into());
+                unresolved.transfer_delivery_state = Some(NetworkDeliveryState::PossiblyApplied);
+                unresolved.in_flight = true;
+            } else if custody == "null-kind" {
+                unresolved.transfer_kind = None;
+                unresolved.transfer_delivery_state = Some(NetworkDeliveryState::DefinitelyNotSent);
+            } else if custody == "stage" {
+                unresolved.transfer_kind = Some(DfsRepairTransferKind::Stage);
+                unresolved.transfer_request_id = Some("stage-DATA-request".into());
+                unresolved.transfer_delivery_state = Some(NetworkDeliveryState::PossiblyApplied);
+                unresolved.in_flight = true;
+            }
+            store
+                .append_enqueues([settled.clone(), unresolved.clone()])
+                .unwrap();
+            let log = repair_queue_active_log_path(&path);
+            let original_bytes = fs::read(&log).unwrap();
+            // The unknown sibling is outside this observed transfer window.
+            // Whole-intent retirement must still protect its actual custody.
+            let (rows, observed) = store
+                .observe_transfer_targets(
+                    &settled.intent_id,
+                    std::slice::from_ref(&settled.missing_replica_node_id),
+                )
+                .unwrap();
+            assert_eq!(rows, vec![settled.clone()]);
+            assert!(matches!(
+                store
+                    .reconcile_maintenance_page(
+                        &observed,
+                        1,
+                        &rows,
+                        &[],
+                        std::slice::from_ref(&settled),
+                        &[],
+                    )
+                    .unwrap(),
+                DfsRepairQueuePageReconcileOutcome::Applied {
+                    removed_target_count: 1,
+                    operation_count: 1,
+                    ..
+                }
+            ));
+            assert!(fs::read(&log).unwrap().starts_with(&original_bytes));
+            let cold = reopen(&path);
+            assert_eq!(cold.view().unwrap().records, vec![unresolved.clone()]);
+            // An examined unknown row also survives the before/desired loop.
+            // Stale captures cannot recreate either retired or absent siblings.
+            let (rows, observed) = cold
+                .observe_transfer_targets(
+                    &unresolved.intent_id,
+                    std::slice::from_ref(&unresolved.missing_replica_node_id),
+                )
+                .unwrap();
+            let mut absent = unresolved.clone();
+            absent.missing_replica_node_id =
+                NodeId::from_legacy_named("absent-retired-target-DATA").unwrap();
+            let exact = cold.view().unwrap();
+            let bytes = fs::read(&log).unwrap();
+            assert!(matches!(
+                cold.reconcile_maintenance_page(
+                    &observed,
+                    1,
+                    &rows,
+                    &[],
+                    std::slice::from_ref(&settled),
+                    &[settled.clone(), absent],
+                )
+                .unwrap(),
+                DfsRepairQueuePageReconcileOutcome::Applied {
+                    removed_target_count: 0,
+                    operation_count: 0,
+                    ..
+                }
+            ));
+            assert_eq!(cold.view().unwrap(), exact);
+            assert_eq!(fs::read(&log).unwrap(), bytes);
+            let (rows, observed) = cold
+                .observe_transfer_targets(
+                    &unresolved.intent_id,
+                    std::slice::from_ref(&unresolved.missing_replica_node_id),
+                )
+                .unwrap();
+            let mut newer = unresolved.clone();
+            newer.last_error = Some("newer actual queue DATA".into());
+            LocalDfsRepairQueueStore::new(&path)
+                .append_operations(vec![DfsRepairQueueOperation::Set {
+                    record: newer.clone(),
+                }])
+                .unwrap();
+            let exact = cold.view().unwrap();
+            let bytes = fs::read(&log).unwrap();
+            assert!(matches!(
+                cold.reconcile_maintenance_page(
+                    &observed,
+                    1,
+                    &rows,
+                    &[],
+                    std::slice::from_ref(&settled),
+                    &[],
+                )
+                .unwrap(),
+                DfsRepairQueuePageReconcileOutcome::GenerationChanged { .. }
+            ));
+            assert_eq!(cold.view().unwrap(), exact);
+            assert_eq!(fs::read(&log).unwrap(), bytes);
+            let (rows, observed) = cold
+                .observe_transfer_targets(
+                    &newer.intent_id,
+                    std::slice::from_ref(&newer.missing_replica_node_id),
+                )
+                .unwrap();
+            let mut foreign_retirement = settled.clone();
+            foreign_retirement.version =
+                DfsVersion::from_legacy_named("foreign-retirement-version-DATA").unwrap();
+            assert!(
+                cold.reconcile_maintenance_page(
+                    &observed,
+                    1,
+                    &rows,
+                    &[],
+                    &[foreign_retirement],
+                    &[],
+                )
+                .is_err()
+            );
+            assert_eq!(cold.view().unwrap(), exact);
+            assert_eq!(fs::read(&log).unwrap(), bytes);
+            assert_eq!(reopen(&path).view().unwrap().records, vec![newer]);
         }
     }
 

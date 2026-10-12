@@ -256,18 +256,28 @@ fn native_history_retained_content_survives_actual_metadata_authority_handoff() 
         .chain(retiring.replica_node_ids.iter().cloned())
         .collect::<BTreeSet<_>>();
     assert!(members.contains(&promoted));
-    let transferred = runtime
-        .reassign_metadata_shard(
-            &shard.file_system_id,
-            &shard.shard_id,
-            promoted.clone(),
-            members
-                .iter()
-                .filter(|node| **node != promoted)
-                .cloned()
-                .collect(),
-        )
-        .unwrap();
+    let transfer_deadline = Instant::now() + Duration::from_secs(5);
+    let transfer_result = runtime.reassign_metadata_shard(
+        &shard.file_system_id,
+        &shard.shard_id,
+        promoted.clone(),
+        members
+            .iter()
+            .filter(|node| **node != promoted)
+            .cloned()
+            .collect(),
+    );
+    assert!(!overflow.load(Ordering::Acquire));
+    let requested = requested_handoffs
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|handoff| handoff.clone().unwrap())
+        .find(|handoff| {
+            handoff.retiring_shard == *retiring && handoff.desired_shard.primary_node_id == promoted
+        })
+        .expect("the normal transfer must retain its actual committed proposal");
+    let transferred = &requested.desired_shard;
     assert_eq!(transferred.primary_node_id, promoted);
     assert_eq!(transferred.epoch, retiring.epoch.checked_add(1).unwrap());
     assert_eq!(transferred.file_system_id, retiring.file_system_id);
@@ -280,30 +290,33 @@ fn native_history_retained_content_survives_actual_metadata_authority_handoff() 
             .collect::<BTreeSet<_>>(),
         members,
     );
-    assert!(!overflow.load(Ordering::Acquire));
-    let requested = requested_handoffs
-        .lock()
-        .unwrap()
-        .iter()
-        .map(|handoff| handoff.clone().unwrap())
-        .find(|handoff| handoff.retiring_shard == *retiring && handoff.desired_shard == transferred)
-        .expect("the normal transfer must retain its actual committed proposal");
+    if let Ok(actual) = &transfer_result {
+        assert_eq!(actual, transferred);
+    }
     assert_eq!(
         requested.cause,
         sinomo_dfs::DfsMetadataShardHandoffCause::Membership
     );
 
-    let actual_lineage = || {
+    let actual_lineage = |deadline| {
         let keys = [
             metadata_shard_key(&shard.file_system_id, &shard.shard_id),
+            handoff_key.clone(),
             proof_key.clone(),
         ];
-        let entries = control.with_client(|kv| kv.get_consistent(&keys)).unwrap();
+        let entries = control
+            .with_client(|kv| kv.get_authoritative_consistent_before(&keys, deadline))
+            .unwrap();
+        assert!(Instant::now() <= deadline);
         assert_eq!(entries.len(), keys.len());
         let installed_entry = entries[0].as_ref().unwrap();
-        let latest_entry = entries[1].as_ref().unwrap();
+        assert!(
+            entries[1].is_none(),
+            "the coherent assignment has no pending handoff"
+        );
+        let latest_entry = entries[2].as_ref().unwrap();
         assert_eq!(installed_entry.key, keys[0]);
-        assert_eq!(latest_entry.key, keys[1]);
+        assert_eq!(latest_entry.key, keys[2]);
         let installed = installed_entry.decode::<DfsMetadataShardConfig>().unwrap();
         let latest = latest_entry
             .decode::<DfsMetadataShardMembershipHandoffProof>()
@@ -328,8 +341,55 @@ fn native_history_retained_content_survives_actual_metadata_authority_handoff() 
         assert_eq!(first.desired_shard.primary_node_id, promoted);
         assert_eq!(first.journal_sequence, before_prefix.journal_sequence);
         assert_eq!(first.state_fingerprint, before_prefix.digest);
+        let proposals = requested_handoffs
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|proposal| proposal.clone().unwrap())
+            .collect::<Vec<_>>();
         let mut prior = first;
+        let mut validated_chain = Vec::new();
         for _ in 0..proofs.len() {
+            let proposal = proposals
+                .iter()
+                .find(|proposal| {
+                    proposal.handoff_id == prior.handoff_id
+                        && proposal.cause == prior.cause
+                        && proposal.retiring_shard == prior.retiring_shard
+                        && proposal.desired_shard == prior.desired_shard
+                        && proposal.retiring_primary_fence.is_some()
+                })
+                .expect("each committed proof must retain its exact actual retiring fence");
+            if prior.handoff_id == requested.handoff_id {
+                assert_eq!(
+                    proposal.required_prepared_sequence,
+                    requested.required_prepared_sequence
+                );
+                assert_eq!(
+                    proposal.required_head_watermark,
+                    requested.required_head_watermark
+                );
+            }
+            let fence = proposal.retiring_primary_fence.as_ref().unwrap();
+            assert_eq!(fence.handoff_id, prior.handoff_id);
+            assert_eq!(fence.primary_node_id, prior.retiring_shard.primary_node_id);
+            assert_eq!(fence.journal_sequence, prior.journal_sequence);
+            assert_eq!(fence.state_fingerprint, prior.state_fingerprint);
+            assert!(prior.journal_sequence >= proposal.required_prepared_sequence);
+            if let Some(head) = &proposal.required_head_watermark {
+                assert_eq!(head.file_system_id, prior.retiring_shard.file_system_id);
+                assert_eq!(head.shard_id, prior.retiring_shard.shard_id);
+                assert_eq!(head.primary_node_id, prior.retiring_shard.primary_node_id);
+                assert_eq!(head.epoch, prior.retiring_shard.epoch);
+                assert!(prior.journal_sequence >= head.journal_sequence);
+                if prior.journal_sequence == head.journal_sequence {
+                    assert_eq!(prior.state_fingerprint, head.state_fingerprint);
+                }
+            }
+            assert!(core_test::metadata_handoff_proof_acknowledgements_are_safe(
+                prior
+            ));
+            validated_chain.push((*prior).clone());
             if prior.desired_shard == installed {
                 break;
             }
@@ -352,9 +412,50 @@ fn native_history_retained_content_survives_actual_metadata_authority_handoff() 
             "the bounded actual proof chain must reach the coherent installed assignment"
         );
         assert_eq!(latest, *prior);
-        installed
+        (installed, validated_chain)
     };
-    let installed = actual_lineage();
+    let (installed, validated_chain) = actual_lineage(transfer_deadline);
+    let marker = sinomo_dfs::read_local_dfs_metadata_shard_write_freeze(
+        runtime.data_dir(&requested.retiring_shard.primary_node_id),
+        &DfsMetadataShardId::new(shard.shard_id.clone()),
+    )
+    .unwrap()
+    .expect("the original source retains its actual durable retirement marker");
+    // This same local marker may name a completed successor. Match it only to
+    // a full proof already validated in the original-to-current chain above.
+    let marker_proof = validated_chain
+        .iter()
+        .find(|proof| proof.handoff_id == marker.handoff_id)
+        .expect("the actual source marker belongs to the complete validated handoff chain");
+    let original_source = &requested.retiring_shard.primary_node_id;
+    assert!(
+        marker_proof.retiring_shard.primary_node_id == *original_source
+            || marker_proof
+                .retiring_shard
+                .replica_node_ids
+                .contains(original_source)
+    );
+    assert!(
+        marker_proof.desired_shard.primary_node_id == *original_source
+            || marker_proof
+                .desired_shard
+                .replica_node_ids
+                .contains(original_source)
+    );
+    assert_eq!(marker.retiring_epoch, marker_proof.retiring_shard.epoch);
+    assert_eq!(
+        marker.activated_epoch,
+        Some(marker_proof.desired_shard.epoch)
+    );
+    assert_eq!(marker.journal_sequence, marker_proof.journal_sequence);
+    assert_eq!(marker.state_fingerprint, marker_proof.state_fingerprint);
+    assert_eq!(marker.journal_sequence, before_prefix.journal_sequence);
+    assert_eq!(marker.state_fingerprint, before_prefix.digest);
+    assert_eq!(marker.rebind_prefix_proof, before_prefix);
+    assert!(Instant::now() <= transfer_deadline);
+    // The same bounded coherent cut, full original-to-current proof chain and
+    // actual source marker prove completion even if the caller returned an error.
+    // No successor is required when the original desired assignment is current.
     let target = runtime.client(&promoted).unwrap();
     assert_eq!(
         target
@@ -425,7 +526,7 @@ fn native_history_retained_content_survives_actual_metadata_authority_handoff() 
         before_current
     );
     drop(target);
-    let installed = actual_lineage();
+    let (installed, _) = actual_lineage(Instant::now() + Duration::from_secs(5));
     let mut reader = runtime.client(&installed.primary_node_id).unwrap();
     assert_eq!(
         reader.posix_read_file_distributed(&saved.path).unwrap(),
@@ -3944,10 +4045,13 @@ fn file_history_restore_recovers_a_commit_after_later_edit_and_replays_compacted
         .unwrap(),
         DfsFileHistoryReadOutcome::NotRetained { .. }
     ));
+    // Compact this actual terminal job. A second generic expiry sweep would
+    // retire its already-compacted receipt if Main completed before the first GC.
     runtime
         .gc_metadata_history_on_current_primaries(
             DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 0)
-                .with_now_unix_nanos(u64::MAX),
+                .with_now_unix_nanos(u64::MAX)
+                .with_namespace_job_ids([job.job_id.clone()]),
         )
         .unwrap();
     assert!(
@@ -4656,6 +4760,143 @@ fn file_history_service_capture_and_unpin_preserve_the_current_namespace() {
     );
     drop(dfs);
     runtime.close().unwrap();
+}
+
+#[test]
+fn native_history_registered_provider_replays_exact_capture_and_release() {
+    let nodes = sinomo_dfs::test_support::DfsTestRuntime::ordered_node_ids(
+        "history-registered-pin-replay",
+        2,
+    );
+    let mut runtime = sinomo_dfs::test_support::DfsTestRuntime::new(
+        "history-registered-pin-replay",
+        nodes[0].clone(),
+    )
+    .unwrap();
+    runtime.define_node(nodes[1].clone()).unwrap();
+    runtime
+        .configure_component_factories(vec![Arc::new(crate::component_factory().unwrap())])
+        .unwrap();
+    runtime.start_nodes().unwrap();
+    let owner = runtime
+        .metadata_shards()
+        .unwrap()
+        .into_iter()
+        .find(|shard| shard.shard_id == "services")
+        .unwrap()
+        .primary_node_id;
+    let requester = nodes.iter().find(|node| **node != owner).unwrap().clone();
+    let mut writer = runtime.client(&requester).unwrap();
+    let path = "/services/registered-pin-replay.txt";
+    let bytes = b"retained-original";
+    let stat = writer
+        .posix_write_file(path, bytes, DfsWriteOptions::replicated_eventual(nodes))
+        .unwrap();
+    let identity = history_identity(&stat);
+    drop(writer);
+
+    // Use the ordinary mounted History provider and its Browser mutation path.
+    // Exact replay is required; ordinary Main recovery may race this caller,
+    // but this case does not pause an executor or claim a forced recovery cut.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let remaining = || {
+        deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .expect("registered History replay retains its original five-second window")
+    };
+    let pin_rpc = |request: &DfsFileHistoryPinRequest| -> DfsFileHistoryPinResponse {
+        runtime
+            .rpc_request(
+                &requester,
+                &owner,
+                sinomo_core::network::ObjectRpcRequest::encode_body(
+                    sinomo_api::dfs::DAEMON_DFS_BROWSER_FILE_HISTORY_PIN_ROUTE,
+                    "daemon",
+                    request,
+                )
+                .unwrap(),
+                remaining(),
+            )
+            .unwrap()
+            .decode_body()
+            .unwrap()
+    };
+    let mut request = DfsFileHistoryPinRequest {
+        path: path.into(),
+        identity: identity.clone(),
+        operation: DfsFileHistoryPinOperation::Capture {
+            pin_id: "registered-replay".into(),
+        },
+        operation_id: sinomo_core::Id::generate().to_string(),
+    };
+    // Keep the real first response only for verifier equality. The second call
+    // is an independent authenticated RPC with the SAME semantic operation ID.
+    let capture = pin_rpc(&request);
+    assert_eq!(capture.identity, identity);
+    assert_eq!(pin_rpc(&request), capture);
+    let read: DfsFileHistoryReadOutcome = runtime
+        .rpc_request(
+            &requester,
+            &owner,
+            sinomo_core::network::ObjectRpcRequest::encode_body(
+                sinomo_api::dfs::DAEMON_DFS_BROWSER_FILE_HISTORY_READ_ROUTE,
+                "daemon",
+                &DfsFileHistoryReadRequest {
+                    identity: identity.clone(),
+                    offset: 0,
+                    max_bytes: 64,
+                },
+            )
+            .unwrap(),
+            remaining(),
+        )
+        .unwrap()
+        .decode_body()
+        .unwrap();
+    assert!(matches!(read, DfsFileHistoryReadOutcome::Found { data } if data.bytes == bytes));
+    let mut inspector = runtime.client(&owner).unwrap();
+    let references = inspector
+        .metadata_backend()
+        .unwrap()
+        .version_pins_for_object(&identity.object_id)
+        .unwrap();
+    assert_eq!(references.len(), 1);
+    assert_eq!(references[0].file_system_id, identity.file_system_id);
+    assert_eq!(references[0].object_id, identity.object_id);
+    assert_eq!(references[0].version, identity.version);
+    assert_eq!(references[0].namespace, HISTORY_MODULE_ID);
+    assert_eq!(
+        references[0].pin_id,
+        "ref/module.dfs.history/registered-replay"
+    );
+
+    request.operation = DfsFileHistoryPinOperation::Unpin {
+        pin_id: "registered-replay".into(),
+    };
+    request.operation_id = sinomo_core::Id::generate().to_string();
+    let release = pin_rpc(&request);
+    assert_eq!(release.identity, identity);
+    assert_eq!(pin_rpc(&request), release);
+    assert!(
+        inspector
+            .metadata_backend()
+            .unwrap()
+            .version_pins_for_object(&identity.object_id)
+            .unwrap()
+            .is_empty()
+    );
+    let current = inspector.posix_stat_distributed(path).unwrap();
+    assert_eq!(current.file_system_id, stat.file_system_id);
+    assert_eq!(current.object_id, stat.object_id);
+    assert_eq!(current.version, stat.version);
+    assert_eq!(current.content_hash, stat.content_hash);
+    assert_eq!(current.size_bytes, stat.size_bytes);
+    assert_eq!(current.mode, stat.mode);
+    assert_eq!(inspector.posix_read_file_distributed(path).unwrap(), bytes);
+    drop(inspector);
+    runtime.close().unwrap();
+    assert!(Instant::now() < deadline);
 }
 
 #[test]

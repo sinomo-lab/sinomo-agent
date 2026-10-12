@@ -492,6 +492,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(foreign_primary)
     }
 
+    // Main callers retain an inspection-only job projection. The existing
+    // authoritative read request checks the resident owner's current guards;
+    // Core and served reads keep the local guard below.
+    pub(crate) fn ensure_distributed_read_path_not_in_cross_shard_flight(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        path: &str,
+    ) -> Result<(), DfsError> {
+        if self.transport.delegates_local_namespace_authority() {
+            return Ok(());
+        }
+        self.ensure_path_not_in_cross_shard_flight(file_system_id, path)
+    }
+
     pub(crate) fn ensure_path_not_in_cross_shard_flight(
         &self,
         file_system_id: &DfsFileSystemId,

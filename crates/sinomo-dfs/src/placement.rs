@@ -2425,7 +2425,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             {
                 continue;
             }
-            self.restore_pending_write_for_repair_job(repair)?;
+            if self.restore_pending_write_for_repair_job(repair)?
+                == crate::service_commit::RepairProducerCustodyReadiness::Parked
+            {
+                continue;
+            }
             let Some(pending) = self.writes.pending_writes.get(&repair.intent_id).cloned() else {
                 continue;
             };

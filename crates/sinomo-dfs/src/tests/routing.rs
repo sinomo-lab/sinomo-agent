@@ -104,9 +104,11 @@ fn complete_native_routed_write(
     owner.retry_pending_repairs().unwrap();
     owner.process_incoming().unwrap();
     owner.flush_detached_transport_sends().unwrap();
-    owner
-        .replicate_metadata_shard_to_configured_replicas(&config.file_system_id, &config.shard_id)
+    let publication = runtime
+        .maintenance_tick(&primary, sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
         .unwrap();
+    assert!(publication.outcome.is_ok(), "{:?}", publication.outcome);
+    assert_eq!(publication.omitted_kv_event_count, 0);
     owner.process_incoming().unwrap();
     let actual = owner
         .metadata_backend()
@@ -114,6 +116,7 @@ fn complete_native_routed_write(
         .get_object(&request.object_id)
         .unwrap()
         .unwrap();
+    assert_eq!(actual.file_system_id, config.file_system_id);
     assert_eq!(
         actual.content_hash.as_deref(),
         Some(content_hash(bytes).as_str())
@@ -1377,7 +1380,7 @@ fn sifs_cluster_posix_routed_namespace_ops_have_read_your_write_semantics() {
     let cluster = sifs_posix_cluster("sifs-cluster-ns-ryw", "/users");
     let SifsPosixCluster {
         root,
-        primary_node: _,
+        primary_node,
         writer_node,
         observer_node,
         primary,
@@ -1712,9 +1715,16 @@ fn sifs_cluster_posix_routed_namespace_ops_have_read_your_write_semantics() {
     let mut rejections = Vec::new();
     let deadline = Instant::now() + SIFS_CLUSTER_PUMP_DEADLINE;
     loop {
-        primary
-            .replicate_configured_metadata_shards(&sifs_file_system_id())
-            .expect("publish after routed namespace ops");
+        let publication = _runtime
+            .maintenance_tick(
+                &primary_node,
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT),
+            )
+            .expect("ordinary Main publication after routed namespace ops");
+        assert!(publication.outcome.is_ok(), "{:?}", publication.outcome);
+        assert_eq!(publication.omitted_kv_event_count, 0);
         pump_dfs_services_collect_rejections(
             &mut [
                 ("primary", &mut primary),

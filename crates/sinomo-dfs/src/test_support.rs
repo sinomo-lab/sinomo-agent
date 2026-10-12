@@ -58,6 +58,18 @@ pub fn current_native_metadata_service(
     Ok((runtime, service, config))
 }
 
+/// Check an actual handoff proof with the SAME production joint-ACK predicate.
+/// This pure DATA validation neither publishes nor authorizes an activation.
+pub fn metadata_handoff_proof_acknowledgements_are_safe(
+    proof: &DfsMetadataShardMembershipHandoffProof,
+) -> bool {
+    crate::control_plane::metadata_shard_membership_handoff_acknowledgements_are_safe(
+        &proof.retiring_shard,
+        &proof.desired_shard,
+        &proof.acknowledged_node_ids.iter().cloned().collect(),
+    )
+}
+
 /// Publish a complete fixture body through the actual service-owned mint and
 /// guarded current kernel. The caller supplies its genuine receipts/read set.
 pub fn publish_current_payload<T: DfsMessageTransport>(

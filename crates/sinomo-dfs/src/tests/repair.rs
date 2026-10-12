@@ -3230,9 +3230,14 @@ fn native_fetch_retry_fixture(
     String,
     crate::test_runtime::CapturedFetchReply,
 ) {
-    let (runtime, mut dfs, config) =
+    let (runtime, client, config) =
         crate::test_support::current_native_metadata_service(name, 3, "/services").unwrap();
     let owner = config.primary_node_id;
+    drop(client);
+    // The mounted client delegates mutation to Main. This fixture observes
+    // its actual owning Core's coordinator and transfer state instead.
+    let mut dfs = runtime.metadata_primary_service("/services").unwrap();
+    assert_eq!(dfs.node_id(), &owner);
     let nodes = crate::test_runtime::DfsTestRuntime::ordered_node_ids(name, 3);
     let peers = nodes
         .iter()
@@ -3442,8 +3447,9 @@ fn stale_fetch_request_expiry_wakes_stage_and_repair_retries() {
             "native-stale-fetch-expiry",
             crate::test_runtime::FetchReplyFault::Missing,
         );
-    let DfsNetworkMessage::FetchBlobResponse(response) = captured.routed.message else {
-        unreachable!()
+    let original_request_id = match &captured.routed.message {
+        DfsNetworkMessage::FetchBlobResponse(response) => response.request_id.clone(),
+        _ => unreachable!(),
     };
     // Use the ordinary retry-page clock with the real missing target excluded.
     // Expiry is observed before this target can schedule a replacement fetch.
@@ -3471,10 +3477,75 @@ fn stale_fetch_request_expiry_wakes_stage_and_repair_retries() {
             .unwrap()
             .fetch_inflight_request_ids
             .get(&source),
-        Some(&response.request_id),
+        Some(&original_request_id),
         "expiry preserves the real late response identity"
     );
+    assert!(
+        dfs.content()
+            .read_object_version(request.object_id.as_str(), request.target_version.as_str())
+            .is_err(),
+        "the expired original Fetch has not supplied the missing native body"
+    );
+    // A wrong request identity remains negative even after scheduling expiry.
+    // Only that field changes in this copy of the actual captured native reply.
+    let mut wrong_reply = captured.routed.clone();
+    let DfsNetworkMessage::FetchBlobResponse(wrong) = &mut wrong_reply.message else {
+        unreachable!()
+    };
+    wrong.request_id.push_str(":wrong-late-request");
+    dfs.transport.test_enqueue_protocol_message(wrong_reply);
+    let rejected = dfs.process_incoming().unwrap();
+    assert!(rejected.iter().any(|event| matches!(event,
+        NetworkedDfsServiceEvent::BlobFetchRejected { intent_id, object_id, source_node_id, reason }
+        if intent_id == &intent && object_id == &request.object_id && source_node_id == &source
+            && reason == "unexpected DFS fetch response request id")));
+    assert_eq!(
+        dfs.writes
+            .pending_writes
+            .get(&intent)
+            .unwrap()
+            .fetch_inflight_request_ids
+            .get(&source),
+        Some(&original_request_id)
+    );
+    assert!(
+        dfs.content()
+            .read_object_version(request.object_id.as_str(), request.target_version.as_str())
+            .is_err()
+    );
+    let before_late_reply = runtime.rpc_observations().len();
+    // Replay the unchanged Found DTO captured from the authenticated native
+    // source into the SAME original transport ingress. This adds no second
+    // carrier hop or authority; normal owned processing validates the body.
+    dfs.transport.test_enqueue_protocol_message(captured.routed);
+    let events = dfs.process_incoming().unwrap();
+    assert!(events.iter().any(|event| matches!(event,
+        NetworkedDfsServiceEvent::BlobFetched { intent_id, object_id, version, source_node_id, content_hash: hash }
+        if intent_id == &intent && object_id == &request.object_id && version == &request.target_version
+            && source_node_id == &source && hash == &content_hash(&bytes))));
+    assert!(events.iter().all(|event| !matches!(event,
+        NetworkedDfsServiceEvent::BlobFetchRejected { source_node_id, .. }
+            if source_node_id == &source)));
+    assert_eq!(
+        dfs.content()
+            .read_object_version(request.object_id.as_str(), request.target_version.as_str())
+            .unwrap()
+            .1,
+        bytes,
+        "the exact late original reply supplies the actual missing native body"
+    );
+    let pending = dfs.writes.pending_writes.get(&intent).unwrap();
+    assert!(!pending.fetch_inflight_request_ids.contains_key(&source));
+    assert!(!pending.fetch_inflight_from.contains(&source));
+    assert!(
+        runtime.rpc_observations()[before_late_reply..]
+            .iter()
+            .all(|event| event.route != DFS_DATA_FETCH_BLOB_ROUTE),
+        "accepting the exact late body requires no replacement Fetch"
+    );
     settle_real_fetch_retry(&runtime, &owner, &target, &mut dfs, &request, &bytes);
+    runtime.assert_fault_budgets().unwrap();
+    assert_eq!(runtime.observation_dropped_count(), 0);
     drop(dfs);
     runtime.close().unwrap();
 }
@@ -3665,20 +3736,18 @@ pub(super) fn native_committed_repair_backlog(
     String,
     Option<impl Send + use<>>,
 ) {
-    let (runtime, owner, replica, service) = native_missing_content_repair(name);
+    let (runtime, owner, replica, mut service) = native_missing_content_repair(name);
     let background = intercept_background.then(|| {
         runtime
             .deny_background_replica_before_claim(&owner)
             .unwrap()
     });
-    drop(service);
     let path = format!("/services/{name}.bin");
     let mut policy = DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 2).unwrap();
     policy.required_node_ids = vec![owner.clone(), replica.clone()];
     runtime
         .apply_placement_policy(&owner, &path, DfsPlacementScope::Subtree, policy)
         .unwrap();
-    let mut service = runtime.client(&owner).unwrap();
     let bytes = (0..256 * 1024 + 31)
         .map(|index| (index % 251) as u8)
         .collect::<Vec<_>>();
@@ -3740,8 +3809,16 @@ pub(super) fn native_committed_repair_backlog(
             "actual full owner or exact canonical Current receipt supports normal W-to-N recovery",
         );
     assert!(record.publication.is_current());
+    assert_eq!(record.file_system_id, stat.file_system_id);
+    assert_eq!(record.object_id, stat.object_id);
+    assert_eq!(record.coordinator_node_id, owner);
     assert_eq!(record.target_version, stat.version);
     assert_eq!(record.content_hash, stat.content_hash);
+    assert_eq!(record.policy.min_commit_replicas, 1);
+    assert_eq!(record.policy.desired_replicas, 2);
+    assert_eq!(record.desired_replica_node_ids.len(), 2);
+    assert!(record.desired_replica_node_ids.contains(&owner));
+    assert!(record.desired_replica_node_ids.contains(&replica));
     service
         .retry_pending_repairs_bounded_with_attempts(0, &captured)
         .unwrap();
@@ -5868,6 +5945,483 @@ fn checkpoint_actual_native_custody(
         crate::repair_queue_store::DfsRepairQueueObservedReconcileOutcome::Applied(_)
     ));
     queue
+}
+
+#[test]
+fn native_browser_fresh_repair_custody_reaches_n2_after_healing() {
+    use sinomo_api::dfs::maintenance::DfsRepairTransferKind;
+    use sinomo_core::network::NetworkDeliveryState;
+    let name = "native-browser-fresh-head-ready-tail";
+    let (runtime, client, config) =
+        crate::test_support::current_native_metadata_service(name, 3, "/services").unwrap();
+    drop(client);
+    let owner = config.primary_node_id.clone();
+    let nodes = crate::test_runtime::DfsTestRuntime::ordered_node_ids(name, 3);
+    let mut others = nodes.iter().filter(|node| **node != owner);
+    let replica = others.next().unwrap().clone();
+    let requester = others.next().unwrap().clone();
+    let mut policy = DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 2).unwrap();
+    policy.required_node_ids = vec![owner.clone()];
+    policy.forbidden_node_ids = vec![requester.clone()];
+    runtime
+        .apply_placement_policy(&owner, "/services", DfsPlacementScope::Subtree, policy)
+        .unwrap();
+    let control = runtime.shared_control_plane().unwrap();
+    control.with_client(|kv| {
+        let mut store = DfsControlPlaneStore::new(kv.as_mut());
+        let before = store
+            .get_file_system_config(&config.file_system_id)
+            .unwrap()
+            .unwrap();
+        let mut desired = before.clone();
+        desired.retention_policies.insert(
+            "module.dfs.history".into(),
+            DfsRetentionPolicy {
+                rules: vec![DfsRetentionRule {
+                    path: "/services".into(),
+                    minimum: DfsRetentionMinimum {
+                        keep_last: 1,
+                        keep_for_seconds: 0,
+                    },
+                }],
+            },
+        );
+        assert!(
+            store
+                .compare_and_put_file_system_config(Some(&before), &desired)
+                .unwrap()
+        );
+    });
+    drop(control);
+    let held = runtime
+        .deny_background_replica_before_claim(&owner)
+        .unwrap();
+    for route in [DFS_DATA_STAGE_BLOB_ROUTE, DFS_DATA_REPAIR_REPLICA_ROUTE] {
+        runtime.install_fault(crate::test_runtime::FaultRule {
+            source: Some(owner.clone()),
+            target: Some(replica.clone()),
+            route: Some(route.into()),
+            call_id: None,
+            origin: Some(crate::test_runtime::RpcOrigin::RegisteredHost),
+            remaining_hits: 32,
+            action: crate::test_runtime::FaultAction::BudgetExhausted,
+        });
+    }
+    // Use the normal caller's configured policy resolver, as the CLI does;
+    // the POSIX write API preserves the replication policy in its options.
+    let mut writer = runtime.client(&requester).unwrap();
+    let (resolved, advertisements, managed_policy) = writer
+        .managed_replication_policy_for_path(
+            "/services/unknown-head.bin",
+            DfsObjectPolicy::ReplicatedEventual,
+            nodes.len(),
+        )
+        .unwrap();
+    assert_eq!(resolved.source_path.as_deref(), Some("/services"));
+    assert_eq!(resolved.source_scope, Some(DfsPlacementScope::Subtree));
+    assert_eq!(managed_policy.min_commit_replicas, 1);
+    assert_eq!(managed_policy.desired_replicas, 2);
+    assert_eq!(managed_policy.required_node_ids, vec![owner.clone()]);
+    assert_eq!(managed_policy.forbidden_node_ids, vec![requester.clone()]);
+    assert!(nodes.iter().all(|node| {
+        advertisements
+            .iter()
+            .any(|advertisement| advertisement.node_id == *node && advertisement.accepts_content)
+    }));
+    let options = DfsWriteOptions {
+        replica_candidates: nodes,
+        policy: managed_policy,
+        wait_for_commit: true,
+        foreground_replica_repair: false,
+    };
+    // Use the already registered resident Browser byte producer used by the
+    // daemon-facing CLI, with the same managed policy and real requester.
+    // The unit write response carries no stat, so each subsequent observation
+    // uses the ordinary distributed read. UNKNOWN is proved only below.
+    let first_response = runtime
+        .rpc_request(
+            &requester,
+            &requester,
+            ObjectRpcRequest::encode_body(
+                crate::DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE,
+                sinomo_api::DAEMON_RPC_CATEGORY,
+                &crate::DaemonDfsBrowserWriteFileRequest {
+                    path: "/services/unknown-head.bin".into(),
+                    bytes: b"rule-a".to_vec(),
+                },
+            )
+            .unwrap(),
+            DEFAULT_DFS_POSIX_SYNC_TIMEOUT,
+        )
+        .unwrap();
+    assert_eq!(
+        first_response.route,
+        crate::DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE
+    );
+    let _: crate::DaemonDfsBrowserWriteFileResponse = first_response.decode_body().unwrap();
+    let first = writer
+        .posix_stat_distributed("/services/unknown-head.bin")
+        .unwrap();
+    assert_eq!(first.file_system_id, config.file_system_id);
+    assert_eq!(first.path, "/services/unknown-head.bin");
+    assert_eq!(first.content_hash, Some(content_hash(b"rule-a")));
+    assert_eq!(first.size_bytes, Some(b"rule-a".len() as u64));
+    let middle_response = runtime
+        .rpc_request(
+            &requester,
+            &requester,
+            ObjectRpcRequest::encode_body(
+                crate::DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE,
+                sinomo_api::DAEMON_RPC_CATEGORY,
+                &crate::DaemonDfsBrowserWriteFileRequest {
+                    path: first.path.clone(),
+                    bytes: b"rule-b".to_vec(),
+                },
+            )
+            .unwrap(),
+            DEFAULT_DFS_POSIX_SYNC_TIMEOUT,
+        )
+        .unwrap();
+    assert_eq!(
+        middle_response.route,
+        crate::DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE
+    );
+    let _: crate::DaemonDfsBrowserWriteFileResponse = middle_response.decode_body().unwrap();
+    let middle = writer.posix_stat_distributed(&first.path).unwrap();
+    assert_eq!(middle.file_system_id, config.file_system_id);
+    assert_eq!(middle.path, "/services/unknown-head.bin");
+    assert_eq!(middle.content_hash, Some(content_hash(b"rule-b")));
+    assert_eq!(middle.size_bytes, Some(b"rule-b".len() as u64));
+    let head_response = runtime
+        .rpc_request(
+            &requester,
+            &requester,
+            ObjectRpcRequest::encode_body(
+                crate::DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE,
+                sinomo_api::DAEMON_RPC_CATEGORY,
+                &crate::DaemonDfsBrowserWriteFileRequest {
+                    path: middle.path.clone(),
+                    bytes: b"rule-c".to_vec(),
+                },
+            )
+            .unwrap(),
+            DEFAULT_DFS_POSIX_SYNC_TIMEOUT,
+        )
+        .unwrap();
+    assert_eq!(
+        head_response.route,
+        crate::DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE
+    );
+    let _: crate::DaemonDfsBrowserWriteFileResponse = head_response.decode_body().unwrap();
+    let head = writer.posix_stat_distributed(&middle.path).unwrap();
+    assert_eq!(head.file_system_id, config.file_system_id);
+    assert_eq!(head.path, "/services/unknown-head.bin");
+    assert_eq!(head.content_hash, Some(content_hash(b"rule-c")));
+    assert_eq!(head.size_bytes, Some(b"rule-c".len() as u64));
+    assert_eq!(first.file_system_id, middle.file_system_id);
+    assert_eq!(middle.file_system_id, head.file_system_id);
+    assert_eq!(first.object_id, middle.object_id);
+    assert_eq!(middle.object_id, head.object_id);
+    assert_ne!(first.version, middle.version);
+    assert_ne!(middle.version, head.version);
+    writer.posix_unlink(&head.path).unwrap();
+    assert!(matches!(
+        writer.posix_stat_distributed(&head.path),
+        Err(crate::DfsPosixError::NotFound { .. })
+    ));
+    drop(writer);
+    let queue = LocalDfsRepairQueueStore::new(default_dfs_repair_attempt_snapshot_path(
+        runtime.data_dir(&owner),
+    ));
+    let before = queue.view().unwrap();
+    {
+        let inspect = runtime.metadata_primary_service(&head.path).unwrap();
+        let backend = inspect.metadata_backend().unwrap();
+        let version = backend
+            .get_version(&head.object_id, &head.version)
+            .unwrap()
+            .unwrap();
+        assert!(version.visible);
+        assert_eq!(version.file_system_id, head.file_system_id);
+        assert_eq!(version.object_id, head.object_id);
+        assert_eq!(version.version, head.version);
+        assert_eq!(version.content_hash, head.content_hash);
+        assert_eq!(version.size_bytes, Some(b"rule-c".len() as u64));
+        let receipts = backend
+            .receipts_for_version(&head.object_id, &head.version)
+            .unwrap();
+        assert!(
+            receipts.iter().any(|receipt| {
+                crate::content_durability::receipt_matches_target_version(receipt, &version, &owner)
+            }),
+            "the actual preferred W1 owner has its exact durable target receipt"
+        );
+        assert!(
+            receipts.iter().all(|receipt| {
+                !crate::content_durability::receipt_matches_target_version(
+                    receipt, &version, &replica,
+                ) && !crate::content_durability::receipt_matches_target_version(
+                    receipt, &version, &requester,
+                )
+            }),
+            "the missing replica and outside-plan requester supply no borrowed durable receipt"
+        );
+    }
+    let fresh = before
+        .records
+        .iter()
+        .find(|row| {
+            row.object_id == head.object_id
+                && row.version == head.version
+                && Some(row.content_hash.as_str()) == head.content_hash.as_deref()
+                && row.missing_replica_node_id == replica
+                && row.transfer_delivery_state == Some(NetworkDeliveryState::DefinitelyNotSent)
+                && row.transfer_request_id.is_none()
+                && row.completed_transfer_request_id.is_none()
+        })
+        .expect("the actual Browser producer retains its observed no-send repair custody");
+    assert_eq!(fresh.transfer_kind, Some(DfsRepairTransferKind::Repair));
+    let mut writer = runtime.client(&owner).unwrap();
+    let (tail_resolved, _, tail_policy) = writer
+        .managed_replication_policy_for_path(
+            "/services/ready-tail.bin",
+            DfsObjectPolicy::ReplicatedEventual,
+            options.replica_candidates.len(),
+        )
+        .unwrap();
+    assert_eq!(tail_resolved.source_path.as_deref(), Some("/services"));
+    assert_eq!(tail_resolved.source_scope, Some(DfsPlacementScope::Subtree));
+    assert_eq!(tail_policy, options.policy);
+    let tail_options = DfsWriteOptions {
+        policy: tail_policy,
+        ..options
+    };
+    let bytes = b"actual independent ready tail";
+    let tail = writer
+        .posix_write_file("/services/ready-tail.bin", bytes, tail_options)
+        .unwrap();
+    drop(writer);
+    let queued = queue.view().unwrap();
+    let ready = queued
+        .records
+        .iter()
+        .find(|row| {
+            row.object_id == tail.object_id
+                && row.version == tail.version
+                && Some(row.content_hash.as_str()) == tail.content_hash.as_deref()
+                && row.missing_replica_node_id == replica
+        })
+        .unwrap();
+    assert_eq!(ready.transfer_kind, Some(DfsRepairTransferKind::Repair));
+    assert_eq!(
+        ready.transfer_delivery_state,
+        Some(NetworkDeliveryState::DefinitelyNotSent)
+    );
+    assert!(ready.transfer_request_id.is_none() && !ready.in_flight);
+    let ready_intent = ready.intent_id.clone();
+    let inspect = runtime.metadata_primary_service(&tail.path).unwrap();
+    for (stat, intent_id, actual_requester) in [
+        (&head, fresh.intent_id.as_str(), &requester),
+        (&tail, ready_intent.as_str(), &owner),
+    ] {
+        let history = inspect
+            .metadata_backend()
+            .unwrap()
+            .object_write_intent_history(&stat.object_id)
+            .unwrap();
+        let intent = history
+            .intents
+            .iter()
+            .find(|intent| intent.intent_id == intent_id)
+            .unwrap();
+        assert!(intent.publication.is_current());
+        assert_eq!(intent.status, DfsWriteIntentStatus::Committed);
+        assert_eq!(intent.file_system_id, stat.file_system_id);
+        assert_eq!(intent.object_id, stat.object_id);
+        assert_eq!(intent.target_version, stat.version);
+        assert_eq!(intent.content_hash, stat.content_hash);
+        assert_eq!(&intent.coordinator_node_id, actual_requester);
+        assert!(
+            intent
+                .operation_id
+                .as_ref()
+                .is_some_and(|operation| !operation.is_empty())
+        );
+        assert_eq!(intent.policy.min_commit_replicas, 1);
+        assert_eq!(intent.policy.desired_replicas, 2);
+        assert_eq!(
+            intent
+                .policy
+                .required_node_ids
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([owner.clone()])
+        );
+        assert_eq!(
+            intent
+                .policy
+                .forbidden_node_ids
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([requester.clone()])
+        );
+        assert_eq!(
+            intent
+                .desired_replica_node_ids
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([owner.clone(), replica.clone()])
+        );
+        assert_eq!(intent.desired_replica_node_ids.first(), Some(&owner));
+        let version = inspect
+            .metadata_backend()
+            .unwrap()
+            .get_version(&stat.object_id, &stat.version)
+            .unwrap()
+            .unwrap();
+        assert!(version.visible);
+        assert_eq!(version.file_system_id, stat.file_system_id);
+        assert_eq!(version.object_id, stat.object_id);
+        assert_eq!(version.version, stat.version);
+        assert_eq!(version.content_hash, stat.content_hash);
+        let recorded = version.content_durability.as_ref().unwrap();
+        assert_eq!(recorded.source_version, stat.version);
+        assert_eq!(&recorded.coordinator_node_id, actual_requester);
+        assert_eq!(recorded.owner_epoch, intent.owner_epoch);
+        assert_eq!(recorded.policy, intent.policy);
+        assert_eq!(
+            recorded.desired_replica_node_ids,
+            intent.desired_replica_node_ids
+        );
+    }
+    drop(inspect);
+
+    let original_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    let first_observation = runtime.rpc_observations().len();
+    runtime.clear_faults();
+    drop(held);
+    let remaining = original_deadline
+        .checked_duration_since(Instant::now())
+        .unwrap();
+    let observation = runtime.maintenance_tick(&owner, remaining).unwrap();
+    assert!(
+        observation.outcome.is_ok(),
+        "same bounded ordinary Main owner: {:?}",
+        observation.outcome
+    );
+    assert_eq!(observation.omitted_kv_event_count, 0);
+    // The ordinary tick checkpoints custody before its detached carrier runs.
+    // Its exact terminal record can remain until ordinary queue retirement.
+    let terminal_row = |row: &DfsRepairAttemptRecord| {
+        row.object_id == tail.object_id
+            && row.version == tail.version
+            && Some(row.content_hash.as_str()) == tail.content_hash.as_deref()
+            && row.missing_replica_node_id == replica
+            && row.transfer_kind == Some(DfsRepairTransferKind::Repair)
+            && !crate::service_repair::repair_transfer_custody_unresolved(row)
+            && row.next_retry_unix_nanos == 0
+            && row.last_error.is_none()
+            && row
+                .completed_transfer_request_id
+                .as_deref()
+                .is_some_and(|request| {
+                    runtime.rpc_observations()[first_observation..]
+                        .iter()
+                        .any(|event| {
+                            event.source == owner
+                                && event.target == replica
+                                && event.route == DFS_DATA_REPAIR_REPLICA_ROUTE
+                                && event.phase == crate::test_runtime::RpcPhase::BeforeDispatch
+                                && event.dfs_intent_id.as_deref() == Some(ready_intent.as_str())
+                                && event.dfs_request_id.as_deref() == Some(request)
+                        })
+                })
+    };
+    // Queue DATA alone never certifies the effect: require its native receipt.
+    let (receipts, after) = loop {
+        assert!(
+            Instant::now() < original_deadline,
+            "the current repair completes within its original five-second window"
+        );
+        let inspect = runtime.metadata_primary_service(&tail.path).unwrap();
+        let receipts = inspect
+            .metadata_backend()
+            .unwrap()
+            .receipts_for_version(&tail.object_id, &tail.version)
+            .unwrap();
+        drop(inspect);
+        let after = queue.view().unwrap();
+        let received = receipts.iter().any(|receipt| {
+            receipt.receipt.file_system_id == tail.file_system_id
+                && receipt.receipt.object_id == tail.object_id
+                && receipt.receipt.committed_version == tail.version
+                && receipt.content_hash == tail.content_hash
+                && receipt.replica_node_id == replica
+                && receipt.receipt.owner_node_id == owner
+        });
+        let settled = after
+            .records
+            .iter()
+            .filter(|row| row.intent_id == ready_intent)
+            .all(terminal_row);
+        if received && settled {
+            assert!(
+                Instant::now() < original_deadline,
+                "a receipt observed after the original deadline is not completion"
+            );
+            break (receipts, after);
+        }
+        std::thread::yield_now();
+    };
+    assert!(
+        runtime.rpc_observations()[first_observation..]
+            .iter()
+            .any(|event| {
+                event.source == owner
+                    && event.target == replica
+                    && event.route == DFS_DATA_REPAIR_REPLICA_ROUTE
+                    && event.phase == crate::test_runtime::RpcPhase::BeforeDispatch
+            }),
+        "the current DNS repair reaches its genuine carrier"
+    );
+    assert!(
+        receipts.iter().any(|receipt| {
+            receipt.receipt.file_system_id == tail.file_system_id
+                && receipt.receipt.object_id == tail.object_id
+                && receipt.receipt.committed_version == tail.version
+                && receipt.content_hash == tail.content_hash
+                && receipt.replica_node_id == replica
+                && receipt.receipt.owner_node_id == owner
+        }),
+        "the current N2 target has its actual full-tuple receipt"
+    );
+    assert!(
+        after
+            .records
+            .iter()
+            .filter(|row| row.intent_id == ready_intent)
+            .all(terminal_row),
+        "the completed ready obligation has no unresolved carrier custody"
+    );
+    let mut inspect = runtime.metadata_primary_service(&tail.path).unwrap();
+    assert_eq!(
+        inspect.posix_read_file_distributed(&tail.path).unwrap(),
+        bytes
+    );
+    drop(inspect);
+    assert!(
+        Instant::now() < original_deadline,
+        "the original five-second completion window is unchanged"
+    );
+    assert_eq!(runtime.observation_dropped_count(), 0);
+    runtime.close().unwrap();
+    assert!(
+        Instant::now() < original_deadline,
+        "the same completion window includes close"
+    );
 }
 
 #[test]

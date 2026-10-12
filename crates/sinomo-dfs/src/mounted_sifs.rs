@@ -356,6 +356,11 @@ fn open_mounted_sifs_service_from_context(
         control_plane,
     )?;
     service.set_cancellation(cancellation);
+    if cluster_state.is_some() {
+        // Clustered mounts are clients of the actual Main owner. Select that
+        // existing route before bootstrap can rebind or recover local state.
+        service.transport = service.transport.with_registered_main_namespace_dispatch();
+    }
     service
         .bootstrap_distributed_sifs()
         .map_err(|source| match source {

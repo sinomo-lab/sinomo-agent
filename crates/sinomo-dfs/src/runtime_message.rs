@@ -1002,6 +1002,89 @@ impl Deref for DfsRuntimeMessageServiceLaneHandle {
     }
 }
 
+/// Global scheduler admission still owns this response. Reuse only the live
+/// native fetch owner; durable reconstruction cannot supply this correlation.
+pub(crate) fn existing_fetch_response_service_lane(
+    candidates: &[(
+        crate::DfsMetadataShardConfig,
+        Arc<DfsRuntimeMessageServiceLaneHandle>,
+    )],
+    command: &DfsMessageCommand,
+) -> Result<Option<Arc<DfsRuntimeMessageServiceLaneHandle>>, crate::DfsError> {
+    let crate::DfsNetworkMessage::FetchBlobResponse(response) = &command.routed_message.message
+    else {
+        return Ok(None);
+    };
+    let source = &command.routed_message.source_node_id;
+    if source != &response.source_node_id {
+        return Err(crate::DfsError::Network {
+            message: "DFS fetch response changed its authenticated source".into(),
+        });
+    }
+    let mut owner = None;
+    for (config, handle) in candidates {
+        // The root cache lock has already been released. A busy read of this
+        // actual owner waits under the original global admission/RPC budget;
+        // it must not be mistaken for missing custody and reconstructed.
+        let lane = handle.lock().map_err(|_| crate::DfsError::Network {
+            message: "DFS runtime message lane lock poisoned".into(),
+        })?;
+        let Some(pending) = lane.service.writes.pending_writes.get(&response.intent_id) else {
+            continue;
+        };
+        if pending.object_id != response.object_id
+            || pending.version != response.version
+            || matches!(&response.result, crate::DfsFetchBlobResult::Found { content_hash, .. }
+                if content_hash != &pending.content_hash)
+        {
+            return Err(crate::DfsError::Metadata {
+                message: "DFS fetch response changed the original pending object/version/hash"
+                    .into(),
+            });
+        }
+        // A retained exact request owns its late reply after scheduling expiry.
+        if (!pending.fetch_inflight_from.is_empty()
+            || !pending.fetch_inflight_request_ids.is_empty())
+            && pending.fetch_inflight_request_ids.get(source) != Some(&response.request_id)
+        {
+            return Err(crate::DfsError::Network {
+                message: "unexpected DFS fetch response source or request id".into(),
+            });
+        }
+        // A completed fetch can leave this SAME pending write owning N-W
+        // repair. Its duplicate stays here for the existing full source/body
+        // validation and replay; clearing a fetch ID is not owner retirement.
+        let Some(intent) = lane.service.coordinator.intent(&response.intent_id) else {
+            return Err(crate::DfsError::Metadata {
+                message: "live fetch owner lost its original intent".into(),
+            });
+        };
+        if intent.object_id != pending.object_id || intent.target_version != pending.version {
+            return Err(crate::DfsError::Metadata {
+                message: "native fetch owner changed its original intent object/version".into(),
+            });
+        }
+        if intent.file_system_id != config.file_system_id
+            || config.primary_node_id != *lane.service.node_id()
+            || intent.owner_epoch != config.epoch
+        {
+            return Err(crate::DfsError::StaleOwnerEpoch {
+                file_system_id: intent.file_system_id.clone(),
+                local_node_id: lane.service.node_id().clone(),
+                primary_node_id: config.primary_node_id.clone(),
+                epoch: config.epoch,
+            });
+        }
+        if owner.is_some() {
+            return Err(crate::DfsError::Metadata {
+                message: "multiple native service lanes own the same fetch response".into(),
+            });
+        }
+        owner = Some(Arc::clone(handle));
+    }
+    Ok(owner)
+}
+
 #[derive(Debug)]
 pub(crate) struct DfsRuntimeMessageExecution {
     pub remote_namespace_phase: Option<(
@@ -1051,6 +1134,10 @@ pub(crate) fn execute_runtime_message_command_with_verified_fetch<F>(
 where
     F: FnOnce(Vec<crate::DfsRepairAttemptRecord>) -> Result<usize, crate::DfsError>,
 {
+    let completes_fetch = matches!(
+        &command.routed_message.message,
+        DfsNetworkMessage::FetchBlobResponse(_)
+    );
     let is_verified_fetch = verified_fetch.is_some();
     let is_read_only = is_verified_fetch || crate::dfs_message_is_read_only_request(&command);
     let lane_lock_wait_started = std::time::Instant::now();
@@ -1163,6 +1250,40 @@ where
                 .exact_shard_handle(&lane.file_system_id, &lane.shard_id)
         })
         .transpose();
+    // Main owns pending Fetch work and the terminal write reply emitted by its
+    // Fetch response. Neither belongs to a private caller's inbox pump or to a
+    // discarded background-handler envelope. The existing worker runs only
+    // after this admission is released.
+    let mut fetch_enqueue_error = None;
+    if let Ok(result) = &mut process_report.outcome {
+        result.response.outbound_messages.retain(|message| {
+            let owned_followup = matches!(&message.message, DfsNetworkMessage::FetchBlob(_))
+                || (completes_fetch
+                    && matches!(&message.message,
+                    DfsNetworkMessage::DistributedWriteResponse(response)
+                        if !matches!(&response.result,
+                            crate::DfsDistributedWriteResult::Outcome {
+                                outcome: crate::NetworkedDfsWriteOutcome::Pending { .. }
+                            })));
+            if !owned_followup || fetch_enqueue_error.is_some() {
+                return true;
+            }
+            match crate::DfsMessageTransport::send_detached_routed_message(
+                &mut service_lane.service.transport,
+                &message.target_node_id,
+                message.clone(),
+            ) {
+                Ok(()) => false,
+                Err(error) => {
+                    fetch_enqueue_error = Some(crate::DfsError::from_network(error));
+                    true
+                }
+            }
+        });
+    }
+    if let Some(error) = fetch_enqueue_error {
+        process_report.outcome = Err(error);
+    }
     let deferred_work = if is_read_only && !is_verified_fetch {
         Ok(None)
     } else {

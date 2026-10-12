@@ -2,18 +2,43 @@ use super::*;
 
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DaemonDfsPublishPlanningAttemptOutcome {
+    Complete,
+    AuthorityStale,
+    Failed,
+    Deadline,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DaemonDfsPreDispatchTestPoint<'a> {
     ContentStoreCacheAccess,
     ExactLaneCacheAccess,
     BeforePreflightFence,
     AfterPreflightFence,
-    PublishPlanningAuthorityCaptured,
+    PublishPlanningAuthorityCaptured {
+        /// Whether this exact planner callback still owns its actual admission.
+        admission_held: bool,
+    },
     BeforeResidentPreflight,
     BeforeReplicaContextComparison,
     BeforeResidentBackendOpen,
-    /// Whether the actual direct-replica admission owner has been dropped.
+    /// Whether the captured actual runtime admission owner has been dropped.
     ReplicaAdmissionReleased {
         released: bool,
+    },
+    /// Native prefix call made by this invocation's actual refresh owner.
+    AuthorityNativePrefixRead {
+        prefix: &'static str,
+    },
+    /// Entry into the original bounded outer publication attempt.
+    PublishPlanningAttemptStarted {
+        replan: usize,
+    },
+    /// Typed result of that actual attempt, before error propagation.
+    PublishPlanningAttemptFinished {
+        replan: usize,
+        outcome: DaemonDfsPublishPlanningAttemptOutcome,
     },
     BeforeAuthorityRefresh {
         owner: &'static str,
@@ -30,7 +55,10 @@ pub(crate) enum DaemonDfsPreDispatchTestPoint<'a> {
         /// Exact prior producer row copied before this claim mutates any state.
         prior_transfer: Option<&'a crate::DfsRepairAttemptRecord>,
     },
-    BeforeExecute,
+    BeforeExecute {
+        /// Presence of the original owned runtime admission at execution entry.
+        admission_held: bool,
+    },
     AfterExecute,
     /// Facts from a Running copy job reloaded at its durable step boundary.
     BeforeContentCopyStep {
@@ -1295,15 +1323,21 @@ pub(crate) fn schedule_daemon_dfs_message_deferred_work(
         });
         let response_runtime = tokio_runtime.clone();
         worker.set_background_response_handler(move |message| {
-            let sinomo_dfs::DfsNetworkMessage::RepairReplicaResponse(response) = &message.message
-            else {
-                return Err(sinomo_dfs::DfsError::Network {
-                    message: "background replica dispatch received a non-repair response"
-                        .to_string(),
-                });
+            let request_id = match &message.message {
+                sinomo_dfs::DfsNetworkMessage::RepairReplicaResponse(response) => {
+                    format!("dfs_background_repair_{}", response.request_id)
+                }
+                sinomo_dfs::DfsNetworkMessage::FetchBlobResponse(response) => {
+                    format!("dfs_background_fetch_{}", response.request_id)
+                }
+                _ => {
+                    return Err(sinomo_dfs::DfsError::Network {
+                        message: "background dispatch received an unmatched response family".into(),
+                    });
+                }
             };
             let command = DfsMessageCommand {
-                request_id: format!("dfs_background_repair_{}", response.request_id),
+                request_id,
                 routed_message: message,
             };
             handle_daemon_dfs_message_on_runtime_with_background_response(
@@ -1732,12 +1766,13 @@ pub(crate) fn daemon_dfs_message_cache_exact_admission_is_current(
     peer_snapshot: &DaemonDfsMessagePeerSnapshot,
     key: &DaemonDfsMutationLaneKey,
     runtime: &tokio::runtime::Handle,
+    #[cfg(test)] observed_command: Option<&DfsMessageCommand>,
 ) -> Result<bool, sinomo_dfs::DfsError> {
     #[cfg(test)]
     if let Some(hook) = daemon_dfs_pre_dispatch_test_hook(data_dir) {
         hook(
             DaemonDfsPreDispatchTestPoint::ExactLaneCacheAccess,
-            None,
+            observed_command,
             None,
         )?;
     }
@@ -1765,12 +1800,13 @@ pub(crate) fn daemon_dfs_message_cache_exact_namespace_read_admission_is_current
     peer_snapshot: &DaemonDfsMessagePeerSnapshot,
     command: &sinomo_dfs::DfsNamespaceCommand,
     runtime: &tokio::runtime::Handle,
+    #[cfg(test)] observed_command: Option<&DfsMessageCommand>,
 ) -> Result<bool, sinomo_dfs::DfsError> {
     #[cfg(test)]
     if let Some(hook) = daemon_dfs_pre_dispatch_test_hook(data_dir) {
         hook(
             DaemonDfsPreDispatchTestPoint::ExactLaneCacheAccess,
-            None,
+            observed_command,
             None,
         )?;
     }
@@ -2018,7 +2054,13 @@ pub(crate) async fn warm_daemon_dfs_metadata_authority_for_identity_async(
         local_node_id,
         Some(runtime),
     )?;
-    warm_daemon_dfs_metadata_authority_before_deadline(authority_generation, deadline).await
+    warm_daemon_dfs_metadata_authority_before_deadline(
+        authority_generation,
+        deadline,
+        #[cfg(test)]
+        None,
+    )
+    .await
 }
 
 /// The caller owns one projection budget across native reads, generation
@@ -2026,6 +2068,7 @@ pub(crate) async fn warm_daemon_dfs_metadata_authority_for_identity_async(
 pub(crate) async fn warm_daemon_dfs_metadata_authority_before_deadline(
     authority_generation: Arc<DaemonDfsMetadataAuthorityGeneration>,
     deadline: tokio::time::Instant,
+    #[cfg(test)] native_read_observer: Option<&(dyn Fn(&'static str) + Send + Sync)>,
 ) -> Result<DaemonDfsMetadataAuthorityPreflight, sinomo_dfs::DfsError> {
     let timeout_authority = Arc::clone(&authority_generation);
     let expected_generation = authority_generation.generation();
@@ -2033,7 +2076,9 @@ pub(crate) async fn warm_daemon_dfs_metadata_authority_before_deadline(
     for replan in 0..=2 {
         let expected_generation = authority_generation.generation();
         let proof = authority_generation
-            .ensure_complete_prefix_for_generation_async(expected_generation)
+            .ensure_complete_prefix_for_generation_async(expected_generation,
+    #[cfg(test)] native_read_observer,
+)
             .await;
         if proof.is_some() && authority_generation.generation() == expected_generation {
             return Ok(DaemonDfsMetadataAuthorityPreflight {
@@ -2070,6 +2115,8 @@ pub(crate) async fn warm_daemon_dfs_metadata_authority_for_peer_snapshot_async(
         peer_snapshot,
         runtime,
         tokio::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+        #[cfg(test)]
+        None,
     )
     .await
 }
@@ -2079,6 +2126,7 @@ pub(crate) async fn warm_daemon_dfs_metadata_authority_for_peer_snapshot_before(
     peer_snapshot: &DaemonDfsMessagePeerSnapshot,
     runtime: &tokio::runtime::Handle,
     deadline: tokio::time::Instant,
+    #[cfg(test)] observed_command: Option<&DfsMessageCommand>,
 ) -> Result<DaemonDfsMetadataAuthorityPreflight, sinomo_dfs::DfsError> {
     let authority = daemon_dfs_metadata_authority_generation_for_identity(
         cluster_paths,
@@ -2086,30 +2134,39 @@ pub(crate) async fn warm_daemon_dfs_metadata_authority_for_peer_snapshot_before(
         &peer_snapshot.local_node_id,
         Some(runtime),
     )?;
-    warm_daemon_dfs_metadata_authority_before_deadline(authority, deadline).await
+    #[cfg(test)]
+    let read_hook = observed_command.and_then(|_| {
+        cluster_paths
+            .root
+            .parent()
+            .and_then(|root| daemon_dfs_pre_dispatch_test_hook(&SinomoDataDir::new(root)))
+    });
+    #[cfg(test)]
+    let observe_read = |prefix| {
+        if let Some(hook) = read_hook.as_ref() {
+            hook(
+                DaemonDfsPreDispatchTestPoint::AuthorityNativePrefixRead { prefix },
+                observed_command,
+                None,
+            )
+            .expect("actual invocation native read observer");
+        }
+    };
+    warm_daemon_dfs_metadata_authority_before_deadline(
+        authority,
+        deadline,
+        #[cfg(test)]
+        read_hook
+            .as_ref()
+            .map(|_| &observe_read as &(dyn Fn(&'static str) + Send + Sync)),
+    )
+    .await
 }
 
 /// Open the default-DFS lifecycle backend from an already completed authority
 /// preflight. This function is intentionally synchronous and retained-only: it
 /// may run while global DFS admission is held, so it must never initiate
 /// network I/O or enter an owner-runtime bridge.
-pub(crate) fn daemon_dfs_resident_metadata_backend_after_preflight(
-    data_dir: &SinomoDataDir,
-    cluster_paths: &ClusterPaths,
-    peer_snapshot: &DaemonDfsMessagePeerSnapshot,
-    preflight: &DaemonDfsMetadataAuthorityPreflight,
-    runtime: &tokio::runtime::Handle,
-) -> Result<Option<ResidentLocalShardedMetadataBackend>, sinomo_dfs::DfsError> {
-    try_daemon_dfs_resident_metadata_backend_after_preflight(
-        data_dir,
-        cluster_paths,
-        peer_snapshot,
-        preflight,
-        runtime,
-    )
-    .map_err(DaemonDfsAuthorityPreExecutionError::into_dfs_error)
-}
-
 pub(super) fn try_daemon_dfs_resident_metadata_backend_after_preflight(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
@@ -2347,6 +2404,9 @@ pub(crate) fn daemon_dfs_message_lane(
         kind,
         allow_generation_rollover,
         metadata_authority_preflight,
+        None,
+        #[cfg(test)]
+        None,
     )? {
         DaemonDfsMessageLaneSelection::Ready(lane, wait) => Ok((lane, wait)),
         DaemonDfsMessageLaneSelection::AuthorityPreflightStale(stale) => {
@@ -2363,6 +2423,8 @@ fn select_daemon_dfs_message_lane(
     kind: DaemonDfsMessageLaneKind,
     allow_generation_rollover: bool,
     metadata_authority_preflight: Option<&DaemonDfsMetadataAuthorityPreflight>,
+    response_command: Option<&DfsMessageCommand>,
+    #[cfg(test)] observed_command: Option<&DfsMessageCommand>,
 ) -> Result<DaemonDfsMessageLaneSelection, sinomo_dfs::DfsError> {
     match try_select_daemon_dfs_message_lane(
         data_dir,
@@ -2372,6 +2434,9 @@ fn select_daemon_dfs_message_lane(
         kind,
         allow_generation_rollover,
         metadata_authority_preflight,
+        response_command,
+        #[cfg(test)]
+        observed_command,
     ) {
         Ok(selection) => Ok(selection),
         Err(DaemonDfsAuthorityPreExecutionError::AuthorityPreflightStale(stale)) => Ok(
@@ -2389,6 +2454,8 @@ fn try_select_daemon_dfs_message_lane(
     kind: DaemonDfsMessageLaneKind,
     allow_generation_rollover: bool,
     metadata_authority_preflight: Option<&DaemonDfsMetadataAuthorityPreflight>,
+    response_command: Option<&DfsMessageCommand>,
+    #[cfg(test)] observed_command: Option<&DfsMessageCommand>,
 ) -> Result<DaemonDfsMessageLaneSelection, DaemonDfsAuthorityPreExecutionError> {
     let cache_lock_wait_started = Instant::now();
     let slot = daemon_dfs_message_service_cache().root(&data_dir.root())?;
@@ -2406,7 +2473,7 @@ fn try_select_daemon_dfs_message_lane(
     if let Some(hook) = daemon_dfs_pre_dispatch_test_hook(data_dir) {
         hook(
             DaemonDfsPreDispatchTestPoint::BeforePreflightFence,
-            None,
+            observed_command,
             metadata_authority_preflight,
         )?;
     }
@@ -2426,7 +2493,7 @@ fn try_select_daemon_dfs_message_lane(
     if let Some(hook) = daemon_dfs_pre_dispatch_test_hook(data_dir) {
         hook(
             DaemonDfsPreDispatchTestPoint::AfterPreflightFence,
-            None,
+            observed_command,
             metadata_authority_preflight,
         )?;
     }
@@ -2444,6 +2511,50 @@ fn try_select_daemon_dfs_message_lane(
                 entry.resident_metadata_backend.take(),
             )?;
         entry.resident_metadata_initialized = true;
+    }
+    if matches!(&kind, DaemonDfsMessageLaneKind::MutationGlobal)
+        && let Some(command) = response_command
+        && matches!(
+            &command.routed_message.message,
+            sinomo_dfs::DfsNetworkMessage::FetchBlobResponse(_)
+        )
+    {
+        let mut candidates = Vec::new();
+        if let Some(resident) = entry.resident_metadata_backend.as_ref() {
+            for (key, lane) in &entry.exact_shard_services {
+                let config = resident.shard_config(&key.shard_id)?;
+                if config.file_system_id != key.file_system_id {
+                    return Err(sinomo_dfs::DfsError::Metadata {
+                        message: "cached fetch owner has a different filesystem scope".into(),
+                    }
+                    .into());
+                }
+                candidates.push((config, Arc::clone(lane)));
+            }
+        }
+        let authority = Arc::clone(&entry.metadata_authority_generation);
+        let generation = entry.signature.metadata_authority_generation;
+        drop(cache);
+        let owner =
+            crate::runtime_message::existing_fetch_response_service_lane(&candidates, command)?;
+        daemon_dfs_require_retained_authority(&authority, generation)?;
+        if let Some(owner) = owner {
+            return Ok(DaemonDfsMessageLaneSelection::Ready(owner, cache_lock_wait));
+        }
+        // Unmatched/restarted responses keep the existing conservative global
+        // recovery path. No missing transfer state is turned into NotSent.
+        return try_select_daemon_dfs_message_lane(
+            data_dir,
+            cluster_paths,
+            peer_snapshot,
+            runtime,
+            kind,
+            allow_generation_rollover,
+            metadata_authority_preflight,
+            None,
+            #[cfg(test)]
+            observed_command,
+        );
     }
     let lane_kind = kind.clone();
     let lane = match kind {
@@ -2546,12 +2657,13 @@ pub(crate) fn daemon_dfs_message_content_store(
     cluster_paths: &ClusterPaths,
     peer_snapshot: &DaemonDfsMessagePeerSnapshot,
     runtime: &tokio::runtime::Handle,
+    #[cfg(test)] observed_command: Option<&DfsMessageCommand>,
 ) -> Result<sinomo_dfs::LocalContentStore, sinomo_dfs::DfsError> {
     #[cfg(test)]
     if let Some(hook) = daemon_dfs_pre_dispatch_test_hook(data_dir) {
         hook(
             DaemonDfsPreDispatchTestPoint::ContentStoreCacheAccess,
-            None,
+            observed_command,
             None,
         )?;
     }
@@ -2627,6 +2739,9 @@ pub(super) fn prepare_daemon_dfs_verified_blob_fetch(
         DaemonDfsMessageLaneKind::ContentRead,
         false,
         Some(preflight),
+        None,
+        #[cfg(test)]
+        None,
     )? {
         DaemonDfsMessageLaneSelection::Ready(lane, _) => lane,
         DaemonDfsMessageLaneSelection::AuthorityPreflightStale(_) => return Ok(None),
@@ -2808,6 +2923,12 @@ fn attempt_daemon_dfs_message_command_with_remote_phase(
         lane_kind,
         allow_generation_rollover,
         metadata_authority_preflight.as_ref(),
+        mutation_admission
+            .as_ref()
+            .filter(|admission| admission.is_global())
+            .map(|_| &command),
+        #[cfg(test)]
+        Some(&command),
     )?;
     let (service_lane_handle, cache_lock_wait) = match selection {
         DaemonDfsMessageLaneSelection::Ready(lane, wait) => (lane, wait),
@@ -2846,7 +2967,9 @@ fn attempt_daemon_dfs_message_command_with_remote_phase(
     #[cfg(any(test, feature = "test-support"))]
     if let Some(hook) = execution_test_hook.as_ref() {
         hook(
-            DaemonDfsPreDispatchTestPoint::BeforeExecute,
+            DaemonDfsPreDispatchTestPoint::BeforeExecute {
+                admission_held: mutation_admission.is_some(),
+            },
             observed_command.as_ref(),
             metadata_authority_preflight.as_ref(),
         )?;
@@ -3438,6 +3561,8 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
                 &peer_snapshot,
                 runtime,
                 peer_deadline,
+                #[cfg(test)]
+                Some(&command),
             )
             .await?,
         )
@@ -3449,6 +3574,9 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
         let content_cluster_paths = cluster_paths.clone();
         let content_peer_snapshot = peer_snapshot.clone();
         let content_runtime = runtime.clone();
+        #[cfg(test)]
+        let content_observed_command =
+            daemon_dfs_pre_dispatch_test_hook(&data_dir).map(|_| command.clone());
         let content_traceparent = traceparent.clone();
         let content_data_owner_lock = Arc::clone(&data_owner_lock);
         let content_span = tracing::trace_span!(target: "sinomo.perf",
@@ -3467,6 +3595,8 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
                         &content_cluster_paths,
                         &content_peer_snapshot,
                         &content_runtime,
+                        #[cfg(test)]
+                        content_observed_command.as_ref(),
                     )
                 })
             })
@@ -3641,6 +3771,9 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
             let exact_cluster_paths = cluster_paths.clone();
             let exact_peer_snapshot = peer_snapshot.clone();
             let exact_runtime = runtime.clone();
+            #[cfg(test)]
+            let exact_observed_command =
+                daemon_dfs_pre_dispatch_test_hook(&data_dir).map(|_| command.clone());
             let exact_namespace = exact_namespace_read_command.cloned();
             let exact_scope = execution_scope.clone();
             let exact_traceparent = traceparent.clone();
@@ -3660,6 +3793,8 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
                             &exact_peer_snapshot,
                             namespace,
                             &exact_runtime,
+                            #[cfg(test)]
+                            exact_observed_command.as_ref(),
                         )
                     } else {
                         match DaemonDfsMutationLaneKey::from_scope(&exact_scope) {
@@ -3669,6 +3804,8 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
                                 &exact_peer_snapshot,
                                 &key,
                                 &exact_runtime,
+                                #[cfg(test)]
+                                exact_observed_command.as_ref(),
                             ),
                             None => Ok(false),
                         }
@@ -3749,6 +3886,11 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
         let spawn_started = Instant::now();
         let blocking_queue_started = spawn_started;
         let process_data_owner_lock = Arc::clone(&data_owner_lock);
+        #[cfg(test)]
+        let admission_observation_hook = daemon_dfs_pre_dispatch_test_hook(&data_dir);
+        #[cfg(test)]
+        let admission_observed_command =
+            admission_observation_hook.as_ref().map(|_| command.clone());
         let blocking_span = tracing::trace_span!(target: "sinomo.perf", "dfs.message.blocking",
             stage = "dfs.message.blocking", traceparent = traceparent.as_deref().unwrap_or_default());
         let queue_span = tracing::trace_span!(target: "sinomo.perf", parent: &blocking_span,
@@ -3789,6 +3931,26 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
             // A blocking task keeps running when its async JoinHandle is dropped.
             // Own admission here so a disconnected/cancelled RPC cannot release
             // the shard (or global) guard before the actual DFS mutation stops.
+            #[cfg(test)]
+            {
+                // Observe the actual guard's final owning value through Weak.
+                // An absent value is not proof of another owner's release.
+                if let Some(hook) = admission_observation_hook {
+                    let actual_admission = mutation_admission.take().map(Arc::new);
+                    let previous_admission = actual_admission.as_ref().map(Arc::downgrade);
+                    drop(actual_admission);
+                    let released = previous_admission
+                        .as_ref()
+                        .is_some_and(|admission| admission.upgrade().is_none());
+                    if let Err(error) = hook(
+                        DaemonDfsPreDispatchTestPoint::ReplicaAdmissionReleased { released },
+                        admission_observed_command.as_ref(),
+                        None,
+                    ) {
+                        return (Err(error), blocking_queue, blocking_started.elapsed());
+                    }
+                }
+            }
             drop(mutation_admission);
             (result, blocking_queue, blocking_started.elapsed())
         })

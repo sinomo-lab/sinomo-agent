@@ -137,6 +137,8 @@ pub(crate) struct DfsRepairPageProgress {
     /// Physical bounded input visits; distinct from checkpointable keys.
     pub(crate) examined_record_count: usize,
     pub(crate) examined: BTreeSet<(String, NodeId)>,
+    /// Actual unavailable target observations stay unchanged at checkpoint.
+    pub(crate) parked: BTreeSet<(String, NodeId)>,
     pub(crate) retired_intents: Vec<DfsRepairAttemptRecord>,
 }
 
@@ -361,6 +363,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if remaining > 1
             && let Some(companion) =
                 self.repair_fanout_companion(job, repairs, exclusions, consumed)
+            && self.restore_pending_write_for_repair_job(&companion)?
+                == crate::service_commit::RepairProducerCustodyReadiness::Ready
             && self.prepare_repair_target(&companion.intent_id, &companion.missing_replica_node_id)
         {
             let companion_pending = self
@@ -767,8 +771,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             {
                 break;
             }
-            if self.restore_pending_write_for_repair_job(repair).is_err() {
-                break;
+            if self.restore_pending_write_for_repair_job(repair)?
+                == crate::service_commit::RepairProducerCustodyReadiness::Parked
+            {
+                continue;
             }
             let Some(intent) = self.coordinator.intent(&repair.intent_id).cloned() else {
                 break;
@@ -1731,7 +1737,7 @@ where
         if candidates.is_empty() {
             return Ok(None);
         }
-        self.restore_pending_writes_for_repair_attempt_records(&candidates)?;
+        let candidates = self.restore_pending_writes_for_repair_attempt_records(&candidates)?;
         let mut wake = Vec::new();
         for row in candidates {
             let Some(job) = self
@@ -1810,7 +1816,8 @@ where
             return Ok(DfsRepairPageProgress::default());
         }
         self.prune_idle_transfer_state();
-        self.restore_pending_writes_for_repair_attempt_records(repair_attempts)?;
+        let restored = self.restore_pending_writes_for_repair_attempt_records(repair_attempts)?;
+        let repair_attempts = restored.as_slice();
         self.restore_repair_attempt_records_merging(repair_attempts);
         let settled_keys = repair_attempts
             .iter()
@@ -1864,6 +1871,7 @@ where
                 }));
         let mut retired_intents = Vec::new();
         let mut examined = settled_keys;
+        let mut parked = BTreeSet::new();
         let mut scheduled = Vec::new();
         let mut error = None;
         let mut consumed_repair_targets = skipped_targets.cloned().unwrap_or_default();
@@ -1889,7 +1897,12 @@ where
             }
             consumed_repair_targets
                 .insert((job.intent_id.clone(), job.missing_replica_node_id.clone()));
-            self.restore_pending_write_for_repair_job(&job)?;
+            if self.restore_pending_write_for_repair_job(&job)?
+                == crate::service_commit::RepairProducerCustodyReadiness::Parked
+            {
+                parked.insert((job.intent_id.clone(), job.missing_replica_node_id.clone()));
+                continue;
+            }
             if !self.prepare_repair_target(&job.intent_id, &job.missing_replica_node_id) {
                 continue;
             }
@@ -2132,6 +2145,7 @@ where
             error,
             examined_record_count,
             examined,
+            parked,
             retired_intents,
         })
     }
@@ -2488,7 +2502,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         intent_filter: Option<&BTreeSet<String>>,
     ) -> Result<Vec<DistributedRepairJob>, DfsError> {
         self.prune_idle_transfer_state();
-        self.restore_pending_writes_for_repair_attempt_records(repair_attempts)?;
+        let restored = self.restore_pending_writes_for_repair_attempt_records(repair_attempts)?;
+        let repair_attempts = restored.as_slice();
         self.restore_repair_attempt_records(repair_attempts);
         if (self.writes.pending_writes.is_empty() && self.coordinator.repair_jobs().is_empty())
             || max_scheduled == 0
@@ -2524,7 +2539,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             consumed_repair_targets
                 .insert((job.intent_id.clone(), job.missing_replica_node_id.clone()));
-            self.restore_pending_write_for_repair_job(&job)?;
+            if self.restore_pending_write_for_repair_job(&job)?
+                == crate::service_commit::RepairProducerCustodyReadiness::Parked
+            {
+                continue;
+            }
             if !self.prepare_repair_target(&job.intent_id, &job.missing_replica_node_id) {
                 continue;
             }
@@ -3743,6 +3762,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 if let Some(existing) = self
                     .repair_attempt_records
                     .get(&(intent_id.clone(), replica_node_id.clone()))
+                    && existing.next_retry_unix_nanos == u64::MAX
+                    && self
+                        .coordinator
+                        .repair_job_for_target(intent_id, replica_node_id)
+                        .is_none()
+                {
+                    records.push(existing.clone());
+                    continue;
+                }
+                if let Some(existing) = self
+                    .repair_attempt_records
+                    .get(&(intent_id.clone(), replica_node_id.clone()))
                 {
                     if existing.transfer_kind
                         == Some(sinomo_api::dfs::maintenance::DfsRepairTransferKind::Stage)
@@ -4017,7 +4048,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     fn restore_pending_writes_for_repair_attempt_records(
         &mut self,
         records: &[DfsRepairAttemptRecord],
-    ) -> Result<(), DfsError> {
+    ) -> Result<Vec<DfsRepairAttemptRecord>, DfsError> {
         let span = tracing::Span::current();
         let mut distinct_intents = 0u64;
         let mut checked_intents = 0u64;
@@ -4081,11 +4112,229 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 self.coordinator.rebuild_repair_jobs();
             }
             restore_result?;
+            let mut scheduling = records.to_vec();
+            for record in &pending_records {
+                if !record.publication.is_current()
+                    || record.status != DfsWriteIntentStatus::Committed
+                    || !scheduling.iter().any(|row| {
+                        row.intent_id == record.intent_id
+                            && row.transfer_kind
+                                == Some(sinomo_api::dfs::maintenance::DfsRepairTransferKind::Repair)
+                            && row.in_flight
+                            && row.transfer_request_id.is_some()
+                            && row.completed_transfer_request_id.is_none()
+                    })
+                {
+                    continue;
+                }
+                let expected_intent = distributed_intent_from_record(record);
+                if self.coordinator.intent(&record.intent_id) != Some(&expected_intent) {
+                    continue;
+                }
+                crate::file_history::validate_intent_publication(record)?;
+                record.policy.validate()?;
+                let object = self.current_read_object_metadata(&record.object_id)?;
+                if object.file_system_id != record.file_system_id
+                    || object.object_id != record.object_id
+                    || object.content_hash != record.content_hash
+                {
+                    continue;
+                }
+                let Some(shard) = self.local_metadata_owner_shard_hint_for_object(&object)? else {
+                    continue;
+                };
+                if shard.file_system_id != record.file_system_id {
+                    continue;
+                }
+                let backend = self
+                    .metadata_backend
+                    .as_ref()
+                    .expect("stored repair backend");
+                let Some(version) =
+                    backend.get_version(&record.object_id, &record.target_version)?
+                else {
+                    continue;
+                };
+                let Some(size) = version.size_bytes else {
+                    continue;
+                };
+                if version.file_system_id != record.file_system_id
+                    || version.object_id != record.object_id
+                    || version.version != record.target_version
+                    || version.content_hash != record.content_hash
+                    || version.content_durability.as_deref()
+                        != Some(crate::content_durability::from_intent(&expected_intent).as_ref())
+                {
+                    continue;
+                }
+                if object.content_size_bytes != version.size_bytes {
+                    continue;
+                }
+                if object.version != record.target_version {
+                    let Some(current) = backend.get_version(&record.object_id, &object.version)?
+                    else {
+                        continue;
+                    };
+                    if current.version != object.version
+                        || !crate::content_durability::same_content_lineage(&current, &version)
+                        || current.content_durability != version.content_durability
+                    {
+                        continue;
+                    }
+                }
+                let receipts =
+                    backend.receipts_for_version(&record.object_id, &record.target_version)?;
+                let received = |node: &NodeId| {
+                    receipts.iter().any(|receipt| {
+                        crate::content_durability::receipt_matches_target_version(
+                            receipt, &version, node,
+                        )
+                    })
+                };
+                let fully_satisfied = record
+                    .desired_replica_node_ids
+                    .iter()
+                    .collect::<BTreeSet<_>>()
+                    .len()
+                    >= record.policy.desired_replicas
+                    && record
+                        .desired_replica_node_ids
+                        .iter()
+                        .all(|node| received(node))
+                    && !self
+                        .coordinator
+                        .repair_jobs()
+                        .iter()
+                        .any(|job| job.intent_id == record.intent_id);
+                for row in scheduling
+                    .iter_mut()
+                    .filter(|row| row.intent_id == record.intent_id)
+                {
+                    if row.object_id != record.object_id
+                        || row.version != record.target_version
+                        || Some(row.content_hash.as_str()) != record.content_hash.as_deref()
+                        || !record
+                            .desired_replica_node_ids
+                            .contains(&row.missing_replica_node_id)
+                    {
+                        return Err(DfsError::Metadata {
+                            message: "Current repair scheduling differs from its actual full owner"
+                                .into(),
+                        });
+                    }
+                    if row.transfer_kind
+                        != Some(sinomo_api::dfs::maintenance::DfsRepairTransferKind::Repair)
+                        || !row.in_flight
+                        || row.transfer_request_id.is_none()
+                        || row.completed_transfer_request_id.is_some()
+                    {
+                        continue;
+                    }
+                    let park = fully_satisfied && row.next_retry_unix_nanos != u64::MAX;
+                    let rearm = row.next_retry_unix_nanos == u64::MAX
+                        && row.attempts > 0
+                        && row.last_attempt_unix_nanos > 0
+                        && !received(&row.missing_replica_node_id)
+                        && self
+                            .coordinator
+                            .repair_job_for_target(&row.intent_id, &row.missing_replica_node_id)
+                            .is_some();
+                    // Ordinary active retries retain their existing restore.
+                    // Only a real deadline change needs this additional guard.
+                    if !park && !rearm {
+                        continue;
+                    }
+                    if let Some(prior) = self
+                        .repair_attempt_records
+                        .get(&(row.intent_id.clone(), row.missing_replica_node_id.clone()))
+                    {
+                        let mut same_carrier = prior.clone();
+                        same_carrier.next_retry_unix_nanos = row.next_retry_unix_nanos;
+                        if &same_carrier != row {
+                            tracing::warn!(
+                                target: "sinomo.dfs.repair",
+                                intent = %record.intent_id,
+                                file_system = %record.file_system_id,
+                                object = %row.object_id,
+                                version = %row.version,
+                                replica = %row.missing_replica_node_id,
+                                fully_satisfied,
+                                immutable_tuple_equal = prior.intent_id == row.intent_id
+                                    && prior.object_id == row.object_id
+                                    && prior.version == row.version
+                                    && prior.content_hash == row.content_hash
+                                    && prior.missing_replica_node_id == row.missing_replica_node_id,
+                                kind_equal = prior.transfer_kind == row.transfer_kind,
+                                request_equal = prior.transfer_request_id == row.transfer_request_id,
+                                completed_equal = prior.completed_transfer_request_id == row.completed_transfer_request_id,
+                                delivery_equal = prior.transfer_delivery_state == row.transfer_delivery_state,
+                                in_flight_equal = prior.in_flight == row.in_flight,
+                                attempts_equal = prior.attempts == row.attempts,
+                                last_attempt_equal = prior.last_attempt_unix_nanos == row.last_attempt_unix_nanos,
+                                error_equal = prior.last_error == row.last_error,
+                                input_deadline_is_max = row.next_retry_unix_nanos == u64::MAX,
+                                prior_deadline_is_max = prior.next_retry_unix_nanos == u64::MAX,
+                                input_kind = ?row.transfer_kind,
+                                prior_kind = ?prior.transfer_kind,
+                                input_request_id = ?row.transfer_request_id.as_deref().map(|value| value.chars().take(192).collect::<String>()),
+                                prior_request_id = ?prior.transfer_request_id.as_deref().map(|value| value.chars().take(192).collect::<String>()),
+                                input_completed_id = ?row.completed_transfer_request_id.as_deref().map(|value| value.chars().take(192).collect::<String>()),
+                                prior_completed_id = ?prior.completed_transfer_request_id.as_deref().map(|value| value.chars().take(192).collect::<String>()),
+                                input_delivery = ?row.transfer_delivery_state,
+                                prior_delivery = ?prior.transfer_delivery_state,
+                                input_in_flight = row.in_flight,
+                                prior_in_flight = prior.in_flight,
+                                input_attempts = row.attempts,
+                                prior_attempts = prior.attempts,
+                                input_last_attempt = row.last_attempt_unix_nanos,
+                                prior_last_attempt = prior.last_attempt_unix_nanos,
+                                input_deadline = row.next_retry_unix_nanos,
+                                prior_deadline = prior.next_retry_unix_nanos,
+                                input_error = ?row.last_error.as_deref().map(|value| value.chars().take(192).collect::<String>()),
+                                prior_error = ?prior.last_error.as_deref().map(|value| value.chars().take(192).collect::<String>()),
+                                "Current repair scheduling carrier comparison refused"
+                            );
+                            return Err(DfsError::Metadata {
+                                message: "Current repair scheduling cannot replace changed live carrier custody".into(),
+                            });
+                        }
+                    }
+                    // Receipts retire missing-N execution, never this carrier.
+                    // A real later same-target receipt withdrawal re-arms the
+                    // SAME ID at its normal original producer horizon.
+                    if park {
+                        row.next_retry_unix_nanos = u64::MAX;
+                    } else if rearm {
+                        row.next_retry_unix_nanos = row.last_attempt_unix_nanos.saturating_add(
+                            repair_retry_delay_nanos_for_ticks(
+                                repair_retry_delay_ticks(row.attempts)
+                                    .max(repair_transfer_inflight_timeout_ticks(size)),
+                            ),
+                        );
+                    }
+                }
+            }
             let mut retained_restored = false;
             let restore_result = (|| {
                 for record in pending_records {
                     retained_restored |= !record.publication.is_current();
-                    self.restore_pending_write_from_record(record)?;
+                    if record.publication.is_current()
+                        && let Some(pending) = self.writes.pending_writes.get(&record.intent_id)
+                    {
+                        if pending.object_id != record.object_id
+                            || pending.version != record.target_version
+                            || Some(pending.content_hash.as_str()) != record.content_hash.as_deref()
+                            || self.coordinator.intent(&record.intent_id)
+                                != Some(&distributed_intent_from_record(&record))
+                        {
+                            return Err(DfsError::Metadata {
+                                message: "Current repair restore differs from its live owner"
+                                    .into(),
+                            });
+                        }
+                    } else {
+                        self.restore_pending_write_from_record(record)?;
+                    }
                     restored_records += 1;
                 }
                 Ok::<_, DfsError>(())
@@ -4105,7 +4354,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     self.coordinator.capture_active_repair_jobs(&intent_id);
                 }
             }
-            Ok(())
+            Ok(scheduling)
         })();
         span.record("distinct_intents", distinct_intents);
         span.record("checked_intents", checked_intents);
@@ -4536,6 +4785,14 @@ pub(crate) fn repair_transfer_custody_unresolved(record: &DfsRepairAttemptRecord
         || (record.transfer_delivery_state
             != Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent)
             && record.completed_transfer_request_id.is_none())
+}
+
+/// Negative custody DATA only; this predicate grants no request or dispatch.
+pub(crate) fn repair_record_has_unidentified_producer(record: &DfsRepairAttemptRecord) -> bool {
+    repair_transfer_custody_unresolved(record)
+        && (record.transfer_kind.is_none()
+            || (record.transfer_request_id.is_none()
+                && record.completed_transfer_request_id.is_none()))
 }
 
 pub(crate) fn join_transfer_delivery(

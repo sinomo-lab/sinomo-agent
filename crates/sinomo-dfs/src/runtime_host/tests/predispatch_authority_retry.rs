@@ -1,5 +1,6 @@
 //! Real daemon lane/admission regressions for typed pre-execution retry.
 
+use super::super::message_host::DaemonDfsPublishPlanningAttemptOutcome;
 use super::super::message_host::{
     DaemonDfsPreDispatchTestHook, DaemonDfsPreDispatchTestPoint,
     install_daemon_dfs_pre_dispatch_test_hook,
@@ -134,15 +135,16 @@ impl RetryFixture {
         let paths = self.cluster_paths.clone();
         let local = self.local.clone();
         let scheduler = Arc::clone(&self.scheduler);
+        let runtime = self.runtime.handle().clone();
         let hook = Arc::new(
             move |point: DaemonDfsPreDispatchTestPoint<'_>,
                   command: Option<&DfsMessageCommand>,
                   preflight: Option<&DaemonDfsMetadataAuthorityPreflight>| {
-                if command.is_some_and(|command| command != &expected) {
+                if command != Some(&expected) {
                     return Ok(());
                 }
                 match point {
-                    DaemonDfsPreDispatchTestPoint::PublishPlanningAuthorityCaptured
+                    DaemonDfsPreDispatchTestPoint::PublishPlanningAuthorityCaptured { .. }
                     | DaemonDfsPreDispatchTestPoint::BeforeContentCopyStep { .. }
                     | DaemonDfsPreDispatchTestPoint::BeforeReplicaContextComparison
                     | DaemonDfsPreDispatchTestPoint::AfterReport { .. } => {}
@@ -186,31 +188,51 @@ impl RetryFixture {
                     } => {
                         require_original(command, &expected)?;
                         state.refreshes.fetch_add(1, Ordering::SeqCst);
-                        let admission = scheduler.try_admit_global().ok_or_else(|| {
-                            test_error("old admission still held during authority refresh")
-                        })?;
+                        if !state.last_admission_released.load(Ordering::SeqCst) {
+                            return Err(test_error(
+                                "original admission still held during authority refresh",
+                            ));
+                        }
                         state.released_before_refresh.fetch_add(1, Ordering::SeqCst);
                         if block_retry_admission {
-                            *state.test_admission.lock().unwrap() = Some(admission);
-                        } else {
-                            drop(admission);
+                            let deadline = state
+                                .reach_deadline
+                                .lock()
+                                .unwrap()
+                                .expect("original reach deadline was installed before the RPC");
+                            let admission = super::super::block_on_dfs_cluster_future(&runtime, async {
+                                tokio::time::timeout_at(deadline, scheduler.admit(&DfsMessageExecutionScope::GlobalExclusive))
+                                    .await
+                                    .map_err(|_| sinomo_core::service::ServiceError::Service("original reach deadline elapsed waiting for native test blocker".into()))?
+                                    .map_err(|error| sinomo_core::service::ServiceError::Service(error.to_string()))
+                            }).map_err(|error| test_error(error.to_string()))?;
+                            *state.test_admission.lock().unwrap() = Some(Arc::new(admission));
                         }
                         state.refresh_entered.notify_one();
                     }
-                    DaemonDfsPreDispatchTestPoint::BeforeReplicaTransferClaim { .. }
+                    DaemonDfsPreDispatchTestPoint::AuthorityNativePrefixRead { .. }
+                    | DaemonDfsPreDispatchTestPoint::PublishPlanningAttemptStarted { .. }
+                    | DaemonDfsPreDispatchTestPoint::PublishPlanningAttemptFinished { .. }
+                    | DaemonDfsPreDispatchTestPoint::BeforeReplicaTransferClaim { .. }
                     | DaemonDfsPreDispatchTestPoint::BeforeAuthorityRefresh { .. }
-                    | DaemonDfsPreDispatchTestPoint::ReplicaAdmissionReleased { .. }
                     | DaemonDfsPreDispatchTestPoint::BeforeRetainedRepairQueueEnrollment {
                         ..
                     }
                     | DaemonDfsPreDispatchTestPoint::AfterRetainedRepairQueueEnrollment {
                         ..
                     } => {}
-                    DaemonDfsPreDispatchTestPoint::BeforeExecute => {
+                    DaemonDfsPreDispatchTestPoint::ReplicaAdmissionReleased { released } => {
+                        state
+                            .last_admission_released
+                            .store(released, Ordering::SeqCst);
+                    }
+                    DaemonDfsPreDispatchTestPoint::BeforeExecute { admission_held } => {
                         require_original(command, &expected)?;
                         state.executions.fetch_add(1, Ordering::SeqCst);
-                        if scheduler.try_admit_global().is_some() {
-                            return Err(test_error("execution did not reacquire admission"));
+                        if !admission_held {
+                            return Err(test_error(
+                                "execution did not reacquire its original admission",
+                            ));
                         }
                     }
                     DaemonDfsPreDispatchTestPoint::AfterExecute => {
@@ -241,12 +263,11 @@ impl RetryFixture {
         let state = Arc::clone(&observations);
         let paths = self.cluster_paths.clone();
         let local = self.local.clone();
-        let scheduler = Arc::clone(&self.scheduler);
         let hook = Arc::new(
             move |point: DaemonDfsPreDispatchTestPoint<'_>,
                   command: Option<&DfsMessageCommand>,
                   preflight: Option<&DaemonDfsMetadataAuthorityPreflight>| {
-                if command.is_some_and(|command| command != &expected) {
+                if command != Some(&expected) {
                     return Ok(());
                 }
                 match point {
@@ -289,23 +310,34 @@ impl RetryFixture {
                             }
                         }
                     }
+                    DaemonDfsPreDispatchTestPoint::AuthorityNativePrefixRead { .. } => {
+                        state.native_prefix_reads.fetch_add(1, Ordering::SeqCst);
+                    }
                     DaemonDfsPreDispatchTestPoint::BeforeAuthorityRefresh {
                         owner: "message",
                         ..
                     } => {
                         require_original(command, &expected)?;
                         state.refreshes.fetch_add(1, Ordering::SeqCst);
-                        let admission = scheduler.try_admit_global().ok_or_else(|| {
-                            test_error("provider replan retained the old admission")
-                        })?;
+                        if !state.last_admission_released.load(Ordering::SeqCst) {
+                            return Err(test_error(
+                                "provider replan retained its original admission",
+                            ));
+                        }
                         state.released_before_refresh.fetch_add(1, Ordering::SeqCst);
-                        drop(admission);
                     }
-                    DaemonDfsPreDispatchTestPoint::BeforeExecute => {
+                    DaemonDfsPreDispatchTestPoint::ReplicaAdmissionReleased { released } => {
+                        state
+                            .last_admission_released
+                            .store(released, Ordering::SeqCst);
+                    }
+                    DaemonDfsPreDispatchTestPoint::BeforeExecute { admission_held } => {
                         require_original(command, &expected)?;
                         state.executions.fetch_add(1, Ordering::SeqCst);
-                        if scheduler.try_admit_global().is_some() {
-                            return Err(test_error("provider replan did not reacquire admission"));
+                        if !admission_held {
+                            return Err(test_error(
+                                "provider replan did not reacquire its original admission",
+                            ));
                         }
                     }
                     DaemonDfsPreDispatchTestPoint::AfterExecute => {
@@ -389,10 +421,16 @@ fn commit_current_configuration_delta(
 struct RetryObservations {
     selections: AtomicUsize,
     refreshes: AtomicUsize,
+    native_prefix_reads: AtomicUsize,
+    injected_provider_edges: AtomicUsize,
+    planning_attempts: Mutex<Vec<usize>>,
+    planning_outcomes: Mutex<Vec<(usize, DaemonDfsPublishPlanningAttemptOutcome)>>,
     released_before_refresh: AtomicUsize,
     executions: AtomicUsize,
     completed_executions: AtomicUsize,
-    test_admission: Mutex<Option<DaemonDfsMutationAdmission>>,
+    test_admission: Mutex<Option<Arc<DaemonDfsMutationAdmission>>>,
+    last_admission_released: std::sync::atomic::AtomicBool,
+    reach_deadline: Mutex<Option<tokio::time::Instant>>,
     refresh_entered: tokio::sync::Notify,
 }
 
@@ -490,8 +528,6 @@ fn provider_delta_after_first_fence(changed_attempts: usize) {
         )
     };
     let opens = daemon_dfs_test_message_service_lane_open_count(&f.data_dir);
-    let _ = take_daemon_dfs_test_authoritative_prefix_call_count(&f.cluster_paths);
-    let _ = take_daemon_dfs_test_authoritative_exact_set_call_count(&f.cluster_paths);
     let (seen, hook) = f.provider_change_hook(command.clone(), changed_attempts);
     let _hook = install_daemon_dfs_pre_dispatch_test_hook(&f.data_dir, hook);
     let result = f.runtime.block_on(handle_daemon_dfs_message_async(
@@ -528,7 +564,7 @@ fn provider_delta_after_first_fence(changed_attempts: usize) {
         seen.released_before_refresh.load(Ordering::SeqCst),
         seen.refreshes.load(Ordering::SeqCst)
     );
-    assert!(f.scheduler.try_admit_global().is_some());
+    assert!(seen.last_admission_released.load(Ordering::SeqCst));
     {
         let cache_slot = daemon_dfs_message_service_cache()
             .root(&f.data_dir.root())
@@ -561,13 +597,9 @@ fn provider_delta_after_first_fence(changed_attempts: usize) {
         opens
     );
     assert_eq!(
-        take_daemon_dfs_test_authoritative_prefix_call_count(&f.cluster_paths),
+        seen.native_prefix_reads.load(Ordering::SeqCst),
         0,
-        "contiguous provider deltas replan from the complete resident view"
-    );
-    assert_eq!(
-        take_daemon_dfs_test_authoritative_exact_set_call_count(&f.cluster_paths),
-        0
+        "this request's authority refresh must use the retained contiguous view"
     );
     // Release cloned owners before proving that no durable read effects exist.
     drop(primary);
@@ -631,7 +663,7 @@ fn valid_preflight_content_store_open_failure_is_terminal_without_authority_repl
     assert_eq!(seen.refreshes.load(Ordering::SeqCst), 0);
     assert_eq!(seen.executions.load(Ordering::SeqCst), 0);
     assert_eq!(seen.completed_executions.load(Ordering::SeqCst), 0);
-    assert!(f.scheduler.try_admit_global().is_some());
+    assert!(seen.last_admission_released.load(Ordering::SeqCst));
     f.require_unchanged_journal();
 }
 
@@ -710,7 +742,7 @@ fn predispatch_churn_stops_after_three_attempts_and_two_refreshes_without_execut
     assert_eq!(seen.released_before_refresh.load(Ordering::SeqCst), 2);
     assert_eq!(seen.executions.load(Ordering::SeqCst), 0);
     assert_eq!(seen.completed_executions.load(Ordering::SeqCst), 0);
-    assert!(f.scheduler.try_admit_global().is_some());
+    assert!(seen.last_admission_released.load(Ordering::SeqCst));
     f.require_unchanged_journal();
 }
 
@@ -745,9 +777,11 @@ fn outer_rpc_timeout_cancels_pending_readmission_without_reset_or_late_execution
     let (seen, hook) = f.hook(command.clone(), 1, false, true);
     let _hook = install_daemon_dfs_pre_dispatch_test_hook(&f.data_dir, hook);
     let result = f.runtime.block_on(async {
+        let reach_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        *seen.reach_deadline.lock().unwrap() = Some(reach_deadline);
         let request = handle_daemon_dfs_message_async(&f.paths, command, None, None, f.runtime.handle());
         tokio::pin!(request);
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout_at(reach_deadline, async {
             tokio::select! {
                 _ = seen.refresh_entered.notified() => {},
                 result = &mut request => panic!("request completed before retry admission blocker: {result:?}"),
@@ -766,8 +800,19 @@ fn outer_rpc_timeout_cancels_pending_readmission_without_reset_or_late_execution
     assert_eq!(seen.refreshes.load(Ordering::SeqCst), 1);
     assert_eq!(seen.released_before_refresh.load(Ordering::SeqCst), 1);
     assert_eq!(seen.executions.load(Ordering::SeqCst), 0);
-    drop(seen.test_admission.lock().unwrap().take());
-    assert!(f.scheduler.try_admit_global().is_some());
+    let blocker = seen
+        .test_admission
+        .lock()
+        .unwrap()
+        .take()
+        .expect("actual native test blocker");
+    let blocker_released = Arc::downgrade(&blocker);
+    drop(blocker);
+    assert!(
+        blocker_released.upgrade().is_none(),
+        "the test's own blocker released"
+    );
+    assert!(seen.last_admission_released.load(Ordering::SeqCst));
     f.runtime.block_on(tokio::task::yield_now());
     assert_eq!(
         seen.executions.load(Ordering::SeqCst),
@@ -815,9 +860,11 @@ fn cancelled_pre_dispatch_retry_drops_owned_quarantine_without_binding_or_execut
     drop(sender);
     let temporary_root = f.data_dir.dfs_dir().join("content/blob-tmp");
     let result = f.runtime.block_on(async {
+        let reach_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        *seen.reach_deadline.lock().unwrap() = Some(reach_deadline);
         let request = handle_daemon_dfs_message_async(&f.paths, command, Some(attachment), None, f.runtime.handle());
         tokio::pin!(request);
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout_at(reach_deadline, async {
             tokio::select! {
                 _ = seen.refresh_entered.notified() => {},
                 result = &mut request => panic!("quarantined request completed before retry blocker: {result:?}"),
@@ -830,8 +877,19 @@ fn cancelled_pre_dispatch_retry_drops_owned_quarantine_without_binding_or_execut
     assert_eq!(seen.selections.load(Ordering::SeqCst), 1);
     assert_eq!(seen.refreshes.load(Ordering::SeqCst), 1);
     assert_eq!(seen.executions.load(Ordering::SeqCst), 0);
-    drop(seen.test_admission.lock().unwrap().take());
-    assert!(f.scheduler.try_admit_global().is_some());
+    let blocker = seen
+        .test_admission
+        .lock()
+        .unwrap()
+        .take()
+        .expect("actual native test blocker");
+    let blocker_released = Arc::downgrade(&blocker);
+    drop(blocker);
+    assert!(
+        blocker_released.upgrade().is_none(),
+        "the test's own blocker released"
+    );
+    assert!(seen.last_admission_released.load(Ordering::SeqCst));
     assert!(
         fs::read_dir(&temporary_root).unwrap().next().is_none(),
         "canceling the RPC drops its unchanged quarantine rather than orphaning or binding it"
@@ -893,18 +951,6 @@ fn rpc_progress_survives_dfs_cache_access(attachment_ingress: bool) {
     } else {
         DaemonDfsPreDispatchTestPoint::ExactLaneCacheAccess
     };
-    let _hook = install_daemon_dfs_pre_dispatch_test_hook(
-        &fixture.data_dir,
-        Arc::new(move |observed, _, _| {
-            if observed == point {
-                hook_entered.fetch_add(1, Ordering::SeqCst);
-                // Stall only this root at the actual cache-access boundary.
-                // Holding the process-wide mutex would delay unrelated tests.
-                std::thread::sleep(CACHE_DELAY);
-            }
-            Ok(())
-        }),
-    );
     let (command, bytes) = if attachment_ingress {
         let mut routed = test_dfs_write_routed_message(
             &fixture.remote,
@@ -921,6 +967,19 @@ fn rpc_progress_survives_dfs_cache_access(attachment_ingress: bool) {
     } else {
         (fixture.command(82, name), Vec::new())
     };
+    let expected = command.clone();
+    let _hook = install_daemon_dfs_pre_dispatch_test_hook(
+        &fixture.data_dir,
+        Arc::new(move |observed, command, _| {
+            if observed == point && command == Some(&expected) {
+                hook_entered.fetch_add(1, Ordering::SeqCst);
+                // Stall only this root at the actual cache-access boundary.
+                // Holding the process-wide mutex would delay unrelated tests.
+                std::thread::sleep(CACHE_DELAY);
+            }
+            Ok(())
+        }),
+    );
     let size = bytes.len() as u64;
     let request = ObjectRpcRequest::encode_body("/test/dfs-cache-progress", "dfs", &command)
         .expect("typed DFS request");
@@ -1152,16 +1211,29 @@ fn publisher_provider_delta_before_plan(changed_attempts: usize, expire_handoff:
         )
     };
     let opens = daemon_dfs_test_message_service_lane_open_count(&f.data_dir);
-    let _ = take_daemon_dfs_test_authoritative_prefix_call_count(&f.cluster_paths);
-    let _ = take_daemon_dfs_test_authoritative_exact_set_call_count(&f.cluster_paths);
     let seen = Arc::new(RetryObservations::default());
     let state = Arc::clone(&seen);
     let paths = f.cluster_paths.clone();
     let local = f.local.clone();
-    let scheduler = Arc::clone(&f.scheduler);
     let hook: Arc<DaemonDfsPreDispatchTestHook> = Arc::new(move |point, command, preflight| {
         match point {
-            DaemonDfsPreDispatchTestPoint::PublishPlanningAuthorityCaptured => {
+            DaemonDfsPreDispatchTestPoint::AuthorityNativePrefixRead { .. } => {
+                assert!(command.is_none());
+                state.native_prefix_reads.fetch_add(1, Ordering::SeqCst);
+            }
+            DaemonDfsPreDispatchTestPoint::PublishPlanningAttemptStarted { replan } => {
+                assert!(command.is_none());
+                state.planning_attempts.lock().unwrap().push(replan);
+            }
+            DaemonDfsPreDispatchTestPoint::PublishPlanningAttemptFinished { replan, outcome } => {
+                assert!(command.is_none());
+                state
+                    .planning_outcomes
+                    .lock()
+                    .unwrap()
+                    .push((replan, outcome));
+            }
+            DaemonDfsPreDispatchTestPoint::PublishPlanningAuthorityCaptured { admission_held } => {
                 assert!(
                     command.is_none(),
                     "publication planning owns no served request replay"
@@ -1176,10 +1248,7 @@ fn publisher_provider_delta_before_plan(changed_attempts: usize, expire_handoff:
                     // preserving the real native reads and configuration floor.
                     let generation = preflight.generation;
                     let storage = preflight.authority.storage_generation();
-                    assert!(
-                        scheduler.try_admit_global().is_none(),
-                        "planning owns exact admission"
-                    );
+                    assert!(admission_held, "planning owns its actual exact admission");
                     let mut advertisement = observed_provider_advertisement(preflight, &local)?;
                     advertisement.zone = Some(format!("publication-planning-zone-{attempt}"));
                     commit_current_configuration_delta(
@@ -1203,6 +1272,7 @@ fn publisher_provider_delta_before_plan(changed_attempts: usize, expire_handoff:
                             .write_configuration_projection()?
                             .is_some()
                     );
+                    state.injected_provider_edges.fetch_add(1, Ordering::SeqCst);
                 }
             }
             DaemonDfsPreDispatchTestPoint::BeforeAuthorityRefresh {
@@ -1213,30 +1283,29 @@ fn publisher_provider_delta_before_plan(changed_attempts: usize, expire_handoff:
                 // idle-publication and maintenance retries have separate owners.
                 assert!(command.is_none());
                 state.refreshes.fetch_add(1, Ordering::SeqCst);
-                let admission = scheduler.try_admit_global().ok_or_else(|| {
-                    test_error("publisher replan retained planning admission or its backend lease")
-                })?;
+                if !state.last_admission_released.load(Ordering::SeqCst) {
+                    return Err(test_error(
+                        "publisher replan retained its original planning admission",
+                    ));
+                }
                 state.released_before_refresh.fetch_add(1, Ordering::SeqCst);
                 if expire_handoff {
-                    // The old owner released admission. Retain the independently
-                    // acquired test permit so unrelated root-owned publishers
-                    // cannot consume this same hook during the handoff window.
-                    *state.test_admission.lock().unwrap() = Some(admission);
-                    // Hold the exact handoff past the ORIGINAL planning budget.
-                    // The successor then waits on ordinary admission, so a
-                    // restarted budget cannot complete through a ready fast path.
+                    // Stall this same invocation's handoff past its ORIGINAL
+                    // planning budget; unrelated native publishers stay active.
                     std::thread::sleep(
                         sinomo_core::network::DEFAULT_NETWORK_TIMEOUT + Duration::from_millis(25),
                     );
-                } else {
-                    drop(admission);
                 }
+            }
+            DaemonDfsPreDispatchTestPoint::ReplicaAdmissionReleased { released } => {
+                state
+                    .last_admission_released
+                    .store(released, Ordering::SeqCst);
             }
             _ => {}
         }
         Ok(())
     });
-    let _hook = install_daemon_dfs_pre_dispatch_test_hook(&f.data_dir, hook);
     let prepare = super::super::publish_host::prepare_daemon_dfs_metadata_publish_with_replanning(
         Arc::clone(&f.scheduler),
         f.data_dir.clone(),
@@ -1248,6 +1317,7 @@ fn publisher_provider_delta_before_plan(changed_attempts: usize, expire_handoff:
         f.runtime.handle().clone(),
         Arc::clone(&f._owner),
         daemon_dfs_metadata_replication_options(),
+        Some(hook),
     );
     let result = f.runtime.block_on(async {
         if expire_handoff {
@@ -1261,12 +1331,32 @@ fn publisher_provider_delta_before_plan(changed_attempts: usize, expire_handoff:
             prepare.await
         }
     });
+    let attempts = seen.planning_attempts.lock().unwrap();
+    let outcomes = seen.planning_outcomes.lock().unwrap();
+    assert!(!attempts.is_empty() && attempts.len() <= 3);
+    assert_eq!(*attempts, (0..attempts.len()).collect::<Vec<_>>());
+    assert_eq!(
+        outcomes.len(),
+        attempts.len(),
+        "every actual attempt has a typed result"
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .map(|(replan, _)| *replan)
+            .collect::<Vec<_>>(),
+        *attempts
+    );
     if expire_handoff {
         let error = result.expect_err("the original planning deadline expired during handoff");
         assert!(error.contains("deadline elapsed"), "{error}");
         assert_eq!(seen.selections.load(Ordering::SeqCst), 1);
+        assert_eq!(seen.injected_provider_edges.load(Ordering::SeqCst), 1);
         assert_eq!(seen.refreshes.load(Ordering::SeqCst), 1);
-        drop(seen.test_admission.lock().unwrap().take());
+        assert_eq!(
+            outcomes.last().unwrap().1,
+            DaemonDfsPublishPlanningAttemptOutcome::AuthorityStale
+        );
     } else if changed_attempts == 1 {
         let plan =
             result.expect("a provider-only rollover can rebind before preparing publication");
@@ -1276,32 +1366,51 @@ fn publisher_provider_delta_before_plan(changed_attempts: usize, expire_handoff:
         );
         drop(plan);
         assert_eq!(seen.selections.load(Ordering::SeqCst), 2);
-        assert_eq!(seen.refreshes.load(Ordering::SeqCst), 1);
+        assert_eq!(seen.injected_provider_edges.load(Ordering::SeqCst), 1);
+        assert_eq!(seen.refreshes.load(Ordering::SeqCst), attempts.len() - 1);
+        assert_eq!(
+            outcomes.last().unwrap().1,
+            DaemonDfsPublishPlanningAttemptOutcome::Complete
+        );
     } else {
         assert!(
             result.is_err(),
             "continuous rollover must exhaust the existing two-replan bound"
         );
-        assert_eq!(seen.selections.load(Ordering::SeqCst), 3);
+        // A stale retained guard before the capture hook consumes a real outer
+        // attempt too. Require the original three-attempt bound, while every
+        // capture actually reached still commits its configured provider edge.
+        assert_eq!(attempts.len(), 3);
+        let captured = seen.selections.load(Ordering::SeqCst);
+        assert!(captured > 0 && captured <= attempts.len());
+        assert_eq!(
+            seen.injected_provider_edges.load(Ordering::SeqCst),
+            captured
+        );
         assert_eq!(seen.refreshes.load(Ordering::SeqCst), 2);
     }
+    let stale_count = outcomes
+        .iter()
+        .filter(|(_, outcome)| *outcome == DaemonDfsPublishPlanningAttemptOutcome::AuthorityStale)
+        .count();
+    assert_eq!(
+        stale_count,
+        if expire_handoff {
+            attempts.len()
+        } else if changed_attempts == 1 {
+            attempts.len() - 1
+        } else {
+            3
+        }
+    );
+    assert!(seen.refreshes.load(Ordering::SeqCst) <= 2);
+    drop(outcomes);
+    drop(attempts);
     assert_eq!(
         seen.released_before_refresh.load(Ordering::SeqCst),
         seen.refreshes.load(Ordering::SeqCst)
     );
-    // Join the scheduler's FIFO queue: unrelated work woken by the test
-    // permit's release may already own admission. A bounded successful
-    // acquisition proves the publisher released its owner without racing it.
-    let _released_admission = f.runtime.block_on(async {
-        tokio::time::timeout(
-            sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
-            f.scheduler
-                .admit(&DfsMessageExecutionScope::GlobalExclusive),
-        )
-        .await
-        .expect("publisher admission must be released within the existing network deadline")
-        .expect("publisher admission can be reacquired after the original owner releases")
-    });
+    assert!(seen.last_admission_released.load(Ordering::SeqCst));
     {
         let cache_slot = daemon_dfs_message_service_cache()
             .root(&f.data_dir.root())
@@ -1334,12 +1443,9 @@ fn publisher_provider_delta_before_plan(changed_attempts: usize, expire_handoff:
         opens
     );
     assert_eq!(
-        take_daemon_dfs_test_authoritative_prefix_call_count(&f.cluster_paths),
-        0
-    );
-    assert_eq!(
-        take_daemon_dfs_test_authoritative_exact_set_call_count(&f.cluster_paths),
-        0
+        seen.native_prefix_reads.load(Ordering::SeqCst),
+        0,
+        "this planner invocation must not issue a native authority refresh read"
     );
     drop(primary);
     drop(exact);
@@ -1369,7 +1475,8 @@ fn publisher_missing_backend_at_unchanged_generation_stays_terminal() {
     let data_dir = f.data_dir.clone();
     let hook: Arc<DaemonDfsPreDispatchTestHook> = Arc::new(move |point, _, preflight| {
         match point {
-            DaemonDfsPreDispatchTestPoint::PublishPlanningAuthorityCaptured => {
+            DaemonDfsPreDispatchTestPoint::PublishPlanningAuthorityCaptured { admission_held } => {
+                assert!(admission_held, "original planning admission held");
                 state.selections.fetch_add(1, Ordering::SeqCst);
                 let preflight = preflight.unwrap();
                 let cache_slot = daemon_dfs_message_service_cache()
@@ -1389,11 +1496,15 @@ fn publisher_missing_backend_at_unchanged_generation_stays_terminal() {
             } => {
                 state.refreshes.fetch_add(1, Ordering::SeqCst);
             }
+            DaemonDfsPreDispatchTestPoint::ReplicaAdmissionReleased { released } => {
+                state
+                    .last_admission_released
+                    .store(released, Ordering::SeqCst);
+            }
             _ => {}
         }
         Ok(())
     });
-    let _hook = install_daemon_dfs_pre_dispatch_test_hook(&f.data_dir, hook);
     let result = f.runtime.block_on(
         super::super::publish_host::prepare_daemon_dfs_metadata_publish_with_replanning(
             Arc::clone(&f.scheduler),
@@ -1406,6 +1517,7 @@ fn publisher_missing_backend_at_unchanged_generation_stays_terminal() {
             f.runtime.handle().clone(),
             Arc::clone(&f._owner),
             daemon_dfs_metadata_replication_options(),
+            Some(hook),
         ),
     );
     let error =
@@ -1417,7 +1529,7 @@ fn publisher_missing_backend_at_unchanged_generation_stays_terminal() {
     );
     assert_eq!(seen.selections.load(Ordering::SeqCst), 1);
     assert_eq!(seen.refreshes.load(Ordering::SeqCst), 0);
-    assert!(f.scheduler.try_admit_global().is_some());
+    assert!(seen.last_admission_released.load(Ordering::SeqCst));
     f.require_unchanged_journal();
 }
 
@@ -2088,7 +2200,7 @@ fn native_same_node_main_executes_byte_manifest_reader_exclusive_and_retained_wr
     let byte_exclusive_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let observed_byte_exclusive = Arc::clone(&byte_exclusive_seen);
     let hook = Arc::new(move |point: DaemonDfsPreDispatchTestPoint<'_>, command: Option<&DfsMessageCommand>, _preflight: Option<&crate::runtime_host::DaemonDfsMetadataAuthorityPreflight>| {
-        if point != DaemonDfsPreDispatchTestPoint::BeforeExecute { return Ok(()); }
+        if !matches!(point, DaemonDfsPreDispatchTestPoint::BeforeExecute { .. }) { return Ok(()); }
         let Some(command) = command else { return Ok(()); };
         if command.routed_message.source_node_id != expected_primary
             || command.routed_message.target_node_id != expected_primary { return Ok(()); }

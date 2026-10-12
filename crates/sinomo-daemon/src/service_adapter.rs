@@ -1146,20 +1146,16 @@ impl sinomo_core::cluster::ClusterMembershipServiceHost for DaemonClusterMembers
     fn local_join_challenge<'a>(
         &'a self,
         request: sinomo_core::cluster::ClusterInviteChallengeRequest,
+        cluster: Arc<dyn sinomo_core::service::ClusterAccess>,
     ) -> sinomo_core::cluster::ClusterMembershipServiceFuture<
         'a,
         sinomo_core::cluster::ClusterInviteChallengeProof,
     > {
         let paths = self.paths.clone();
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || {
-                crate::auth::create_cluster_invite_challenge_proof(&paths, &request)
-            })
-            .await
-            .map_err(|source| {
-                ServiceError::Service(format!("cluster join challenge task failed: {source}"))
-            })?
-            .map_err(daemon_error)
+            crate::auth::create_cluster_invite_challenge_proof(&paths, &request, cluster.as_ref())
+                .await
+                .map_err(daemon_error)
         })
     }
 

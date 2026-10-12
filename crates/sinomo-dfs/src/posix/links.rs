@@ -44,9 +44,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<DfsStat> {
         let _namespace_plan = self.namespace_execution.begin_planning();
         self.with_posix_commit_operation_deadline(|service| {
-            service.posix_symlink_with_create_attrs_with_current_deadline(
-                target, link_path, options, attrs,
-            )
+            service.with_metadata_lookup_cache_mut(|service| {
+                service.posix_symlink_with_create_attrs_with_current_deadline(
+                    target, link_path, options, attrs,
+                )
+            })
         })
     }
 
@@ -61,7 +63,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         validate_posix_symlink_target(target)?;
         let (link_path, requires_directory) =
             normalize_posix_path_with_trailing_directory(link_path)?;
-        let link_path = self.resolve_posix_path(&link_path, false)?;
+        let link_path = self.resolve_posix_path_distributed(&link_path, false)?;
         if requires_directory {
             self.ensure_resolved_path_is_directory_no_follow(&link_path)?;
             return Err(DfsPosixError::AlreadyExists { path: link_path });

@@ -38,6 +38,11 @@ pub(crate) fn metadata_publish_lanes_from_authority(
     Ok(lanes)
 }
 
+#[cfg(test)]
+pub(crate) type DfsMetadataPublishPlanningAdmission = Arc<crate::DfsMutationAdmission>;
+#[cfg(not(test))]
+pub(crate) type DfsMetadataPublishPlanningAdmission = crate::DfsMutationAdmission;
+
 pub(crate) async fn run_metadata_publish_lane_planning_with_admission<T, F>(
     mutation_scheduler: Arc<DfsMutationScheduler>,
     lane: DfsMutationLaneKey,
@@ -46,7 +51,9 @@ pub(crate) async fn run_metadata_publish_lane_planning_with_admission<T, F>(
 ) -> Result<T, String>
 where
     T: Send + 'static,
-    F: FnMut(&crate::DfsMutationAdmission) -> Result<DfsMetadataPublishPlanningAttempt<T>, String>
+    F: FnMut(
+            &DfsMetadataPublishPlanningAdmission,
+        ) -> Result<DfsMetadataPublishPlanningAttempt<T>, String>
         + Send
         + 'static,
 {
@@ -59,6 +66,10 @@ where
             .admit(&execution_scope)
             .await
             .map_err(|error| format!("DFS metadata publish admission failed: {error}"))?;
+        // Test observers borrow this actual guard through Weak; they do not
+        // acquire another permit or require unrelated native owners to be idle.
+        #[cfg(test)]
+        let admission = Arc::new(admission);
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         let task = tokio::task::spawn_blocking(move || {
             // A cancelled scheduler future cannot release admission while its
