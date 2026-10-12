@@ -2132,6 +2132,200 @@ mod provider_lifecycle_tests {
     }
 
     #[test]
+    fn native_released_seven_field_namespace_source_reopens_with_current_authority() {
+        use sinomo_core::object::{LengthMode, serde_ext};
+        use sinomo_dfs::{
+            DfsMetadataShardId, DfsNamespaceObjectVersionExpectation,
+            DfsNamespacePathOccupantExpectation, DfsNamespaceTransaction,
+            DfsPreparedOperationStatus, test_support::DfsTestRuntime,
+        };
+        let name = "native-seven-field-namespace-cold-admission";
+        let node = DfsTestRuntime::ordered_node_ids(name, 1).remove(0);
+        let mut native = DfsTestRuntime::new(name, node.clone()).unwrap();
+        native
+            .configure_component_factories(vec![
+                Arc::new(
+                    sinomo_dfs::component_factory_with_storage_preparation(Arc::new(
+                        storage_preparation_provider,
+                    ))
+                    .unwrap(),
+                ),
+                Arc::new(staged_import_component_factory().unwrap()),
+            ])
+            .unwrap();
+        native.start_nodes().unwrap();
+        let path = "/native-seven-field-preserved";
+        let first = b"normal native content before released-source conversion";
+        let options = sinomo_dfs::DfsWriteOptions::replicated_eventual(vec![node.clone()]);
+        let mut client = native.client(&node).unwrap();
+        let object = client
+            .posix_write_file(path, first, options.clone())
+            .unwrap();
+        drop(client);
+        let assignment = native.root_shard().unwrap();
+        assert_eq!(assignment.primary_node_id, node);
+        let root = native.data_dir(&node).dfs_dir().join("metadata/root");
+        let baseline = native
+            .data_dir(&node)
+            .root()
+            .join("native-current-prefix-baseline");
+        native.stop_node(&node).unwrap();
+        assert!(crate::metadata::current_root(&root).unwrap());
+        // The normal host has drained its writers. The existing strict kernel
+        // certifies/replays the genuine journal before exporting the complete cut.
+        let runtime = native.runtime_handle();
+        let entered = runtime.enter();
+        let observed = sinomo_dfs::LocalSobjMetadataBackend::new(
+            DfsMetadataShardId::new(&assignment.shard_id),
+            &root,
+        )
+        .unwrap();
+        let snapshot = observed.export_table_snapshot();
+        assert!(snapshot.materialized_through_sequence > 0);
+        assert_eq!(
+            observed.journal_last_sequence(),
+            snapshot.materialized_through_sequence
+        );
+        assert!(
+            observed
+                .journal_since_limited(snapshot.materialized_through_sequence, 1)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            snapshot.prefix_proof.journal_sequence,
+            snapshot.materialized_through_sequence
+        );
+        assert!(
+            snapshot
+                .tables
+                .objects
+                .iter()
+                .any(|row| row.object_id == object.object_id && row.version == object.version)
+        );
+        drop(observed);
+        drop(entered);
+        // Keep every genuine native file. This modeled released SOURCE checkpoint
+        // copies ALL current table rows; it is not a new journal ACK or author permit.
+        std::fs::rename(&root, &baseline).unwrap();
+        let expected_objects = vec![DfsNamespaceObjectVersionExpectation {
+            object_id: object.object_id.clone(),
+            expected_version: Some(object.version.clone()),
+        }];
+        let expected_paths = vec![DfsNamespacePathOccupantExpectation {
+            path: path.trim_matches('/').into(),
+            expected_object_id: Some(object.object_id.clone()),
+        }];
+        let transaction = DfsNamespaceTransaction {
+            content_reference_identity: None,
+            contribution_digest: None,
+            extension_expectations: Vec::new(),
+            transaction_id: "released-seven-no-effect".into(),
+            file_system_id: assignment.file_system_id.clone(),
+            objects: Vec::new(),
+            versions: Vec::new(),
+            file_version_pins: None,
+            advisory_lock_states: Vec::new(),
+            created_at: time::OffsetDateTime::now_utc(),
+        };
+        let operation = "namespace:released-seven-aborted-read-set";
+        // Actual July 17 producer: seven ordered typed fields, no outcome attachment.
+        // Independently serialize that contract; never use the verifier as oracle.
+        let original_digest = format!(
+            "blake3:{}",
+            blake3::hash(
+                &serde_json::to_vec(&(
+                    operation,
+                    &assignment.file_system_id,
+                    &assignment.shard_id,
+                    assignment.epoch,
+                    &expected_objects,
+                    &expected_paths,
+                    &transaction,
+                ))
+                .unwrap()
+            )
+            .to_hex()
+        );
+        let original_prepare = serde_json::json!({
+            "operation_id":operation,"file_system_id":assignment.file_system_id,"shard_id":assignment.shard_id,
+            "owner_epoch":assignment.epoch,"expected_object_versions":expected_objects,"expected_path_occupants":expected_paths,
+            "transaction":transaction,"operation_digest":original_digest,"content_receipts":[],"status":"aborted"
+        });
+        let mut source = serde_json::to_value(&snapshot).unwrap();
+        source["format_version"] = serde_json::json!(2);
+        source["tables"]["namespace_prepares"] = serde_json::json!([original_prepare]);
+        // Only the SOURCE representation checksum changes. Every logical row
+        // and the real cut remain; all original native files stay in baseline.
+        let mut checksum = source.clone();
+        checksum
+            .as_object_mut()
+            .unwrap()
+            .remove("semantic_state_fingerprint");
+        checksum.as_object_mut().unwrap().remove("prefix_proof");
+        source["semantic_state_fingerprint"] = serde_json::json!(format!(
+            "blake3:{}",
+            blake3::hash(&serde_json::to_vec(&checksum).unwrap()).to_hex()
+        ));
+        let source_bytes = serde_ext::to_bytes(&source, 1, LengthMode::U32).unwrap();
+        let source_path = root.join("records/tables/snapshot.sobj");
+        std::fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+        std::fs::write(&source_path, &source_bytes).unwrap();
+        assert!(!crate::metadata::current_root(&root).unwrap());
+        native
+            .reopen_node(node.clone())
+            .expect("normal cold Main and real MIG provider must admit the released source");
+        assert!(crate::metadata::current_root(&root).unwrap());
+        let current = native.root_shard().unwrap();
+        assert_eq!(current.file_system_id, assignment.file_system_id);
+        assert_eq!(current.shard_id, assignment.shard_id);
+        assert_eq!(current.primary_node_id, assignment.primary_node_id);
+        assert!(current.epoch > assignment.epoch);
+        let marker: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("metadata-import-v7.json")).unwrap())
+                .unwrap();
+        let retained = PathBuf::from(marker["retained_source_root"].as_str().unwrap());
+        assert_eq!(
+            std::fs::read(retained.join("records/tables/snapshot.sobj")).unwrap(),
+            source_bytes
+        );
+        assert_eq!(
+            marker["source_cut"]["source_exact_prefix"],
+            serde_json::to_value(&snapshot.prefix_proof).unwrap()
+        );
+        let owner = native.metadata_primary_service(path).unwrap();
+        let imported = owner
+            .metadata_backend()
+            .unwrap()
+            .prepared_operation_record(operation)
+            .unwrap()
+            .unwrap();
+        assert_eq!(imported.status, DfsPreparedOperationStatus::Aborted);
+        assert_eq!(imported.payload.expected_object_versions, expected_objects);
+        assert_eq!(imported.payload.expected_path_occupants, expected_paths);
+        assert!(imported.payload.completed_request.is_none());
+        assert!(imported.payload.completed_request_completion.is_none());
+        drop(owner);
+        let mut client = native.client(&node).unwrap();
+        assert_eq!(client.posix_read_file_distributed(path).unwrap(), first);
+        let after = b"normal native writer after released-source admission";
+        client.posix_write_file(path, after, options).unwrap();
+        assert_eq!(client.posix_read_file_distributed(path).unwrap(), after);
+        drop(client);
+        native.stop_node(&node).unwrap();
+        native.reopen_node(node.clone()).unwrap();
+        let mut client = native.client(&node).unwrap();
+        assert_eq!(client.posix_read_file_distributed(path).unwrap(), after);
+        assert_eq!(
+            std::fs::read(retained.join("records/tables/snapshot.sobj")).unwrap(),
+            source_bytes
+        );
+        assert!(crate::metadata::current_root(&baseline).unwrap());
+        drop(client);
+        native.close().unwrap();
+    }
+
+    #[test]
     fn native_large_complete_filesystem_prefix_reopens_before_normal_dfs_write() {
         use sinomo_dfs::test_support::DfsTestRuntime;
         const VALUE_BYTES: usize = 3 * 1024 * 1024;

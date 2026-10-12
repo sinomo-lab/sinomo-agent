@@ -560,8 +560,8 @@ pub(crate) fn unpack_original(outer: &Value) -> Result<OriginalPackedPrepare> {
         let locations = object["current_locations"]
             .as_array_mut()
             .ok_or("original object locations invalid")?;
-        locations.sort_by_key(Value::to_string);
-        locations.dedup();
+        let mut seen = BTreeSet::new();
+        locations.retain(|node| seen.insert(node.to_string()));
         if object["kind"] != json!("tombstone") {
             object["tombstone_provenance"] = Value::Null;
         }
@@ -573,8 +573,8 @@ pub(crate) fn unpack_original(outer: &Value) -> Result<OriginalPackedPrepare> {
         let locations = version["locations"]
             .as_array_mut()
             .ok_or("original version locations invalid")?;
-        locations.sort_by_key(Value::to_string);
-        locations.dedup();
+        let mut seen = BTreeSet::new();
+        locations.retain(|node| seen.insert(node.to_string()));
     }
     for lock in result.value["transaction"]["advisory_lock_states"]
         .as_array_mut()
@@ -635,6 +635,42 @@ mod tests {
         assert_eq!(source["shard_id"], "services");
         assert_eq!(source["mutation"]["packed_prepare_v2"]["f"], 6);
         source["mutation"].clone()
+    }
+
+    #[test]
+    fn actual_f3_history_prepare_keeps_its_original_location_priority() {
+        let source = crate::metadata::source_document::decode_original_document(include_bytes!(
+            "testdata/original-f3-users-sequence746.sobj"
+        ))
+        .unwrap();
+        assert_eq!(source["sequence"], 746);
+        let source = &source["mutation"];
+        assert_eq!(source["packed_prepare_v2"]["f"], 3);
+        let decoded = crate::legacy_wire::decode_original_packed_prepare(source).unwrap();
+        assert_eq!(
+            decoded.value["operation_digest"],
+            source["packed_prepare_v2"]["g"]
+        );
+        assert_eq!(
+            decoded.value["transaction"]["versions"][0]["locations"],
+            json!([
+                "01kr4w089vqgdxpb84t6bq1qxn",
+                "01kr3d54d45zkm0p0xgps8k7mt",
+                "01kxfky4pw2rd2cgj85yrs5yk2"
+            ])
+        );
+        // Released normalization removes repeats while retaining the first node's
+        // position. This altered input tests that decoder rule, not source custody.
+        let mut repeated = source.clone();
+        repeated["packed_prepare_v2"]["d"]["l"] = json!({"o":[0,5],"n":[0,1,0,2,1]});
+        let expanded = unpack_original(&repeated).unwrap();
+        assert_eq!(
+            expanded.value["transaction"]["versions"][0]["locations"],
+            decoded.value["transaction"]["versions"][0]["locations"]
+        );
+        let mut changed_order = source.clone();
+        changed_order["packed_prepare_v2"]["d"]["l"]["n"] = json!([1, 0, 2]);
+        assert!(crate::legacy_wire::decode_original_packed_prepare(&changed_order).is_err());
     }
 
     #[test]

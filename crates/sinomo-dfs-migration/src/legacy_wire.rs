@@ -2248,15 +2248,25 @@ pub(crate) fn validate_original_namespace_prepare(
 }
 
 pub(crate) fn verify_raw_namespace_prepare(raw: &Value, forced_legacy: Option<bool>) -> Result<()> {
-    let actual = original_namespace_digest(raw, forced_legacy)?;
-    if raw.get("operation_digest").and_then(Value::as_str) != Some(actual.as_str()) {
-        return Err(invalid(
-            "retained original namespace tuple has a non-canonical source digest",
-        ));
+    let [nine, eight, seven] = original_namespace_digests(raw, forced_legacy)?;
+    let expected = raw.get("operation_digest").and_then(Value::as_str);
+    // Released producers added the routed request (dd87a932) and then its
+    // compact completion (12dcca1b). An older proof cannot omit a real outcome.
+    let no_completion = raw
+        .get("completed_request_completion")
+        .is_none_or(Value::is_null);
+    let no_request = raw.get("completed_request").is_none_or(Value::is_null);
+    if expected == Some(nine.as_str())
+        || (no_completion && expected == Some(eight.as_str()))
+        || (no_completion && no_request && expected == Some(seven.as_str()))
+    {
+        return Ok(());
     }
-    Ok(())
+    Err(invalid(
+        "retained original namespace tuple has a non-canonical source digest",
+    ))
 }
-fn original_namespace_digest(raw: &Value, forced_legacy: Option<bool>) -> Result<String> {
+fn original_namespace_digests(raw: &Value, forced_legacy: Option<bool>) -> Result<[String; 3]> {
     let field = |key: &str| {
         raw.get(key)
             .ok_or_else(|| invalid(format!("original namespace tuple omits {key}")))
@@ -2296,38 +2306,59 @@ fn original_namespace_digest(raw: &Value, forced_legacy: Option<bool>) -> Result
     }
     let empty = Value::Array(Vec::new());
     let null = Value::Null;
+    // Serialize the shared original body once; append only the known released
+    // attachments to the same hash prefix instead of revisiting every object.
+    let prefix = serde_json::to_vec(&(
+        field("operation_id")?,
+        field("file_system_id")?,
+        field("shard_id")?,
+        field("owner_epoch")?,
+        OriginalRouted {
+            value: raw.get("expected_object_versions").unwrap_or(&empty),
+            schema: "list/object-expectation",
+        },
+        OriginalRouted {
+            value: raw.get("expected_path_occupants").unwrap_or(&empty),
+            schema: "list/path-expectation",
+        },
+        OriginalRouted {
+            value: &transaction,
+            schema: "transaction",
+        },
+    ))
+    .map_err(invalid)?;
     let mut hash = blake3::Hasher::new();
+    hash.update(
+        prefix
+            .strip_suffix(b"]")
+            .ok_or_else(|| invalid("original namespace tuple has no JSON terminator"))?,
+    );
+    let finish = |prefix: &blake3::Hasher| {
+        let mut hash = prefix.clone();
+        hash.update(b"]");
+        format!("blake3:{}", hash.finalize().to_hex())
+    };
+    let seven = finish(&hash);
+    hash.update(b",");
     serde_json::to_writer(
         &mut hash,
-        &(
-            field("operation_id")?,
-            field("file_system_id")?,
-            field("shard_id")?,
-            field("owner_epoch")?,
-            OriginalRouted {
-                value: raw.get("expected_object_versions").unwrap_or(&empty),
-                schema: "list/object-expectation",
-            },
-            OriginalRouted {
-                value: raw.get("expected_path_occupants").unwrap_or(&empty),
-                schema: "list/path-expectation",
-            },
-            OriginalRouted {
-                value: &transaction,
-                schema: "transaction",
-            },
-            OriginalRouted {
-                value: raw.get("completed_request").unwrap_or(&null),
-                schema: "request",
-            },
-            OriginalRouted {
-                value: raw.get("completed_request_completion").unwrap_or(&null),
-                schema: "completion",
-            },
-        ),
+        &OriginalRouted {
+            value: raw.get("completed_request").unwrap_or(&null),
+            schema: "request",
+        },
     )
     .map_err(invalid)?;
-    Ok(format!("blake3:{}", hash.finalize().to_hex()))
+    let eight = finish(&hash);
+    hash.update(b",");
+    serde_json::to_writer(
+        &mut hash,
+        &OriginalRouted {
+            value: raw.get("completed_request_completion").unwrap_or(&null),
+            schema: "completion",
+        },
+    )
+    .map_err(invalid)?;
+    Ok([finish(&hash), eight, seven])
 }
 /// Expand and verify ORIGINAL packed source data before any current request,
 /// pin or opaque-metadata DTO can reject its historical representation.
@@ -2829,6 +2860,43 @@ mod original_digest_tests {
     use super::*;
     use serde_json::json;
     use sinomo_core::object::{LengthMode, serde_ext};
+    #[test]
+    fn exact_oracle_july17_namespace_source_uses_its_released_seven_field_digest() {
+        let bytes =
+            include_bytes!("../tests/fixtures/original-oracle-users-namespace-prepare-seq147.sobj");
+        assert_eq!(bytes.len(), 2969);
+        let document = crate::metadata::source_document::decode_original_document(bytes).unwrap();
+        assert_eq!(document["sequence"], 147);
+        let source = &document["mutation"]["prepare"];
+        let digests = original_namespace_digests(source, None).unwrap();
+        assert_eq!(
+            digests,
+            [
+                "blake3:cd15e8dfcf6e15f63a786a869228032ad607bb80ca26ef41234afb9f9938b79b",
+                "blake3:ebe868f8e4d9b9db334aa30167cc703f48ff1064436eea6efefc3750cb666269",
+                "blake3:8ef4daec40b641fa919c0a1a067fcc5b78f828ea59ecdaeeb62615e252d24300",
+            ]
+            .map(str::to_owned)
+        );
+        assert_eq!(source["operation_digest"], digests[2]);
+        verify_raw_namespace_prepare(source, None).unwrap();
+        // Missing and codec-expanded null attachments carry no extra outcome.
+        for digest in digests {
+            let mut reopened = source.clone();
+            reopened["completed_request_completion"] = Value::Null;
+            reopened["operation_digest"] = json!(digest);
+            verify_raw_namespace_prepare(&reopened, None).unwrap();
+        }
+        let mut changed = source.clone();
+        changed["transaction"]["objects"][0]["path"] = json!("/users/changed");
+        assert!(verify_raw_namespace_prepare(&changed, None).is_err());
+        let mut unknown = source.clone();
+        unknown["transaction"]["unsupported_source_field"] = json!(true);
+        assert!(verify_raw_namespace_prepare(&unknown, None).is_err());
+        let mut unknown_digest = source.clone();
+        unknown_digest["operation_digest"] = json!("blake3:unknown");
+        assert!(verify_raw_namespace_prepare(&unknown_digest, None).is_err());
+    }
     #[test]
     fn original_projected_history_hash_never_decodes_current_version_ids_or_fields() {
         let raw = json!({"file_system_id":"old-source-fs","object_id":"old-source-object","version":"old-source-version","created_at":"1970-01-01T00:00:00Z","visible":false,
@@ -4835,6 +4903,23 @@ mod routed_original_digest_tests {
                 "posix_coordination_result":null,"recovery_attempts":0,"last_recovery_error":null,"created_at":"1970-01-01T00:00:00Z","updated_at":"1970-01-01T00:00:01Z"});
         }
         value
+    }
+    #[test]
+    fn released_namespace_tuple_never_discards_non_null_request_or_completion() {
+        for completion in [false, true] {
+            let source = body(completion);
+            let [nine, eight, seven] = original_namespace_digests(&source, None).unwrap();
+            assert_eq!(source["operation_digest"], nine);
+            let mut older = source.clone();
+            older["operation_digest"] = json!(seven);
+            assert!(verify_raw_namespace_prepare(&older, None).is_err());
+            older["operation_digest"] = json!(eight);
+            assert_eq!(
+                verify_raw_namespace_prepare(&older, None).is_err(),
+                completion
+            );
+            verify_raw_namespace_prepare(&source, None).unwrap();
+        }
     }
     #[test]
     fn actual_original_routed_record_and_compact_completion_hash_before_conversion() {
