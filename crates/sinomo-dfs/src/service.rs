@@ -425,13 +425,6 @@ fn component_factory_with_preparation(
                         Ok(())
                     }
                 });
-                crate::runtime_host::replay_daemon_dfs_mounted_mutation_committed_work_on_runtime(
-                    &paths, &runtime,
-                )
-                .map_err(|error| sinomo_module::ComponentError::Component {
-                    component_id: caller.component_id.clone(),
-                    detail: error.to_string(),
-                })?;
                 crate::runtime_host::mount_dfs_runtime_tasks(
                     context,
                     scope,
