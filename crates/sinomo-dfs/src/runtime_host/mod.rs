@@ -1999,6 +1999,52 @@ struct DaemonDfsMetadataAuthorityHost {
     runtime: tokio::runtime::Handle,
 }
 
+impl DaemonDfsMetadataAuthorityHost {
+    async fn prepare_metadata_authority_representation(&self) -> Result<(), sinomo_dfs::DfsError> {
+        loop {
+            let owner =
+                self.task_owner
+                    .upgrade()
+                    .ok_or_else(|| sinomo_dfs::DfsError::Metadata {
+                        message: "authority preparation has no registered runtime host".into(),
+                    })?;
+            let root = self.data_dir.dfs_dir().join("metadata");
+            let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+            let child = self.runtime.spawn_blocking(move || {
+                // The registered provider retains the actual component data
+                // owner throughout native representation preparation.
+                let result = crate::storage_preparation::prepare_storage_root_before_open(
+                    &root,
+                    &crate::DfsStoragePreparationScope::MetadataRouting,
+                );
+                let _ = result_tx.send(result);
+            });
+            // Cancellation cannot detach a native preparation effect from the
+            // component's normal child-task drain.
+            owner.own_task(child);
+            let result = result_rx
+                .await
+                .map_err(|source| sinomo_dfs::DfsError::Metadata {
+                    message: format!(
+                        "authority preparation task stopped before returning: {source}"
+                    ),
+                })?;
+            match result {
+                Ok(()) => return Ok(()),
+                Err(crate::MetadataBackendError::StoragePreparationPending {
+                    processed_records,
+                    ..
+                }) if processed_records > 0 => {
+                    // Positive bounded progress keeps this same cold-read
+                    // owner unfinished. The next cut is read only after Ready.
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+}
+
 impl sinomo_dfs::DfsMetadataAuthorityHost for DaemonDfsMetadataAuthorityHost {
     fn supports_write_configuration_projection(&self) -> bool {
         true
@@ -2039,6 +2085,9 @@ impl sinomo_dfs::DfsMetadataAuthorityHost for DaemonDfsMetadataAuthorityHost {
         #[cfg(test)]
         record_daemon_dfs_test_authoritative_prefix_call(&self.cluster_paths);
         Box::pin(async move {
+            if prefix == DAEMON_DFS_METADATA_AUTHORITY_PREFIX {
+                self.prepare_metadata_authority_representation().await?;
+            }
             self.cluster
                 .kv_range_prefix_complete_authoritative_async(prefix.to_string())
                 .await
@@ -2077,6 +2126,7 @@ impl sinomo_dfs::DfsMetadataAuthorityHost for DaemonDfsMetadataAuthorityHost {
         #[cfg(test)]
         record_daemon_dfs_test_authoritative_prefix_call(&self.cluster_paths);
         Box::pin(async move {
+            self.prepare_metadata_authority_representation().await?;
             self.cluster
                 .kv_range_prefix_complete_authoritative_async(
                     DAEMON_DFS_METADATA_AUTHORITY_PREFIX.to_string(),

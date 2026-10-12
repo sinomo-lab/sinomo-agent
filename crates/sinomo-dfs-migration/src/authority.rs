@@ -1700,17 +1700,17 @@ pub fn storage_preparation_provider(
                 .lock()
                 .map_err(|_| error("routing cache preparation lock poisoned"))?;
             runtime.authority.validate_routing_cache_root(root)?;
-            // This representation is loaded before the physical-shard hooks.
-            // Fresh/current caches do not wait for later filesystem genesis.
-            if routing_cache::current(root)? {
-                return Ok(sinomo_dfs::DfsStoragePreparation::Ready);
-            }
+            // A current routing representation cannot certify the native
+            // configuration schema consumed before the physical-shard hooks.
             let configuration = runtime.authority.prepare_configuration_records(budget)?;
             if matches!(
                 configuration,
                 sinomo_dfs::DfsStoragePreparation::Pending { .. }
             ) {
                 return Ok(configuration);
+            }
+            if routing_cache::current(root)? {
+                return Ok(sinomo_dfs::DfsStoragePreparation::Ready);
             }
             return runtime
                 .authority
@@ -1860,6 +1860,181 @@ pub fn standalone_storage_preparation_provider(
 #[cfg(test)]
 mod provider_lifecycle_tests {
     use super::*;
+
+    #[test]
+    fn native_retired_root_codec_is_normalized_before_cold_current_authority() {
+        use sinomo_dfs::test_support::DfsTestRuntime;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let name = "native-retired-root-codec-admission";
+        let node = DfsTestRuntime::ordered_node_ids(name, 1).remove(0);
+        let mut native = DfsTestRuntime::new(name, node.clone()).unwrap();
+        let inject = Arc::new(AtomicBool::new(false));
+        let captured = Arc::new(Mutex::new(None::<KvEntry>));
+        let mount_inject = Arc::clone(&inject);
+        let mount_capture = Arc::clone(&captured);
+        let builder: sinomo_dfs::DfsStoragePreparationProviderBuilder =
+            Arc::new(move |context, lifecycle| {
+                // Seed one real original native row before the cold DFS host exists.
+                // Normal live refresh cannot consume it before its source is captured.
+                if mount_inject.swap(false, Ordering::SeqCst) {
+                    let cluster = context.cluster_access().unwrap();
+                    let runtime = context.runtime().unwrap();
+                    let key =
+                        sinomo_dfs::metadata_shard_key(&sinomo_dfs::sifs_file_system_id(), "root");
+                    let before = block_native(
+                        runtime,
+                        cluster.kv_get_authoritative_exact_set_async(vec![key.clone()]),
+                    )
+                    .unwrap();
+                    sinomo_core::kv::validate_cluster_kv_current_term_authority_proof(
+                        &before.authority,
+                    )
+                    .unwrap();
+                    let before = before.value[0].clone().unwrap();
+                    assert_eq!(before.key, key);
+                    let expected = before.decode::<DfsMetadataShardConfig>().unwrap();
+                    let mut source = serde_json::to_value(&expected).unwrap();
+                    source["namespace_prepare_codec"] = serde_json::json!("packed-v6");
+                    let source_bytes = sinomo_core::kv::encode_kv_value(&source).unwrap();
+                    let request = KvTxnRequest::generated(KvTxn {
+                        compares: captured_compares(&[MetadataCapturedKvEntry {
+                            key: key.clone(),
+                            entry: Some(before.clone()),
+                        }]),
+                        success: vec![KvOp::Put {
+                            key: key.clone(),
+                            value: source_bytes.clone(),
+                            lease_id: before.lease_id,
+                        }],
+                        failure: Vec::new(),
+                    });
+                    let command_digest =
+                        sinomo_core::kv::kv_command_digest(&KvCommand::Txn(request.txn.clone()))
+                            .unwrap();
+                    let request_id = request.request_id.clone();
+                    let committed =
+                        block_native(runtime, cluster.kv_commit_compact_async(request)).unwrap();
+                    assert_eq!(committed.request_id, request_id);
+                    assert_eq!(committed.submitted_command_digest, Some(command_digest));
+                    assert!(committed.txn_response.unwrap().succeeded);
+                    let original = block_native(
+                        runtime,
+                        cluster.kv_get_authoritative_exact_set_async(vec![key]),
+                    )
+                    .unwrap();
+                    sinomo_core::kv::validate_cluster_kv_current_term_authority_proof(
+                        &original.authority,
+                    )
+                    .unwrap();
+                    let original = original.value[0].clone().unwrap();
+                    assert_eq!(original.value, source_bytes);
+                    assert_eq!(original.lease_id, before.lease_id);
+                    assert!(
+                        original
+                            .decode::<DfsMetadataShardConfig>()
+                            .unwrap_err()
+                            .to_string()
+                            .contains("namespace_prepare_codec")
+                    );
+                    *mount_capture.lock().unwrap() = Some(original);
+                }
+                storage_preparation_provider(context, lifecycle)
+            });
+        native
+            .configure_component_factories(vec![
+                Arc::new(sinomo_dfs::component_factory_with_storage_preparation(builder).unwrap()),
+                Arc::new(staged_import_component_factory().unwrap()),
+            ])
+            .unwrap();
+        native.start_nodes().unwrap();
+        let path = "/native-root-codec-preserved";
+        let first_bytes = b"actual native bytes before authority normalization";
+        let mut client = native.client(&node).unwrap();
+        client
+            .posix_write_file(
+                path,
+                first_bytes,
+                sinomo_dfs::DfsWriteOptions::replicated_eventual(vec![node.clone()]),
+            )
+            .unwrap();
+        drop(client);
+        let metadata_root = native.data_dir(&node).dfs_dir().join("metadata");
+        assert!(crate::metadata::current_root(&metadata_root.join("root")).unwrap());
+        assert!(routing_cache::current(&metadata_root).unwrap());
+        let expected = native.root_shard().unwrap();
+        native.stop_node(&node).unwrap();
+        inject.store(true, Ordering::SeqCst);
+        native.reopen_node(node.clone()).expect(
+            "normal cold startup prepares known original authority before strict current decoding",
+        );
+        assert!(!inject.load(Ordering::SeqCst));
+        let original = captured.lock().unwrap().clone().unwrap();
+        let context = native.component_context(&node).unwrap();
+        let cluster = context.cluster_access().unwrap();
+        let runtime = native.runtime_handle();
+        let current = runtime
+            .block_on(cluster.kv_get_authoritative_exact_set_async(vec![original.key.clone()]))
+            .unwrap();
+        sinomo_core::kv::validate_cluster_kv_current_term_authority_proof(&current.authority)
+            .unwrap();
+        let current = current.value[0].clone().unwrap();
+        assert_eq!(current.key, original.key);
+        assert_eq!(
+            current.decode::<DfsMetadataShardConfig>().unwrap(),
+            expected
+        );
+        assert_eq!(
+            current.value,
+            sinomo_core::kv::encode_kv_value(&expected).unwrap()
+        );
+        assert_eq!(current.lease_id, original.lease_id);
+        assert_eq!(current.create_revision, original.create_revision);
+        assert!(current.modify_revision > original.modify_revision);
+        let migration = placement_work::native_tests::canonical_migration_runtime(&context);
+        let archive = migration
+            .authority
+            .receiver_root
+            .join("configuration-v7")
+            .join(format!("original-{}.json", digest(&original).unwrap()));
+        assert_eq!(
+            std::fs::read(&archive).unwrap(),
+            serde_json::to_vec(&original).unwrap()
+        );
+        drop(migration);
+        let mut client = native.client(&node).unwrap();
+        assert_eq!(
+            client.posix_read_file_distributed(path).unwrap(),
+            first_bytes
+        );
+        let final_bytes = b"actual native writer after authority normalization";
+        client
+            .posix_write_file(
+                path,
+                final_bytes,
+                sinomo_dfs::DfsWriteOptions::replicated_eventual(vec![node.clone()]),
+            )
+            .unwrap();
+        assert_eq!(
+            client.posix_read_file_distributed(path).unwrap(),
+            final_bytes
+        );
+        drop(client);
+        drop(cluster);
+        drop(context);
+        native.stop_node(&node).unwrap();
+        native.reopen_node(node.clone()).unwrap();
+        let mut client = native.client(&node).unwrap();
+        assert_eq!(
+            client.posix_read_file_distributed(path).unwrap(),
+            final_bytes
+        );
+        assert_eq!(
+            std::fs::read(archive).unwrap(),
+            serde_json::to_vec(&original).unwrap()
+        );
+        drop(client);
+        native.close().unwrap();
+    }
 
     #[test]
     fn native_large_complete_filesystem_prefix_reopens_before_normal_dfs_write() {
