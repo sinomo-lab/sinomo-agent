@@ -479,6 +479,33 @@ impl ClusterAccess for DaemonClusterAccess {
         })
     }
 
+    fn kv_request_outcome_authoritative_async<'a>(
+        &'a self,
+        request_id: sinomo_core::kv::KvRequestId,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<sinomo_core::kv::ClusterKvRequestOutcomeRead, ServiceError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let runtime = self.runtime()?;
+            let payload = sinomo_core::kv::cluster_kv_request_outcome_rpc_payload(
+                &sinomo_core::kv::ClusterKvRequestOutcomeRequest { request_id },
+            )?;
+            crate::cluster::handle_daemon_cluster_kv_request_outcome_request_async_on_runtime(
+                &self.paths,
+                &payload.body,
+                true,
+                runtime,
+            )
+            .await
+            .map_err(daemon_error)
+        })
+    }
+
     fn kv_commit_async<'a>(
         &'a self,
         request: sinomo_core::kv::KvTxnRequest,
@@ -535,6 +562,17 @@ struct DaemonComponentObjectRpcTransport {
 }
 
 impl ComponentObjectRpcTransport for DaemonComponentObjectRpcTransport {
+    fn availability(
+        &self,
+        target_node_id: &sinomo_core::node::NodeId,
+    ) -> sinomo_core::network::RoutedAvailability {
+        crate::client::object_rpc_target_availability_with_daemon_paths(
+            &self.paths,
+            target_node_id,
+            &self.runtime,
+        )
+    }
+
     fn call(
         &self,
         target_node_id: &sinomo_core::node::NodeId,
@@ -1108,20 +1146,16 @@ impl sinomo_core::cluster::ClusterMembershipServiceHost for DaemonClusterMembers
     fn local_join_challenge<'a>(
         &'a self,
         request: sinomo_core::cluster::ClusterInviteChallengeRequest,
+        cluster: Arc<dyn sinomo_core::service::ClusterAccess>,
     ) -> sinomo_core::cluster::ClusterMembershipServiceFuture<
         'a,
         sinomo_core::cluster::ClusterInviteChallengeProof,
     > {
         let paths = self.paths.clone();
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || {
-                crate::auth::create_cluster_invite_challenge_proof(&paths, &request)
-            })
-            .await
-            .map_err(|source| {
-                ServiceError::Service(format!("cluster join challenge task failed: {source}"))
-            })?
-            .map_err(daemon_error)
+            crate::auth::create_cluster_invite_challenge_proof(&paths, &request, cluster.as_ref())
+                .await
+                .map_err(daemon_error)
         })
     }
 
@@ -2633,13 +2667,30 @@ impl DaemonServiceRegistryHost {
             }
         }
 
-        self.component_reconciler
-            .lock()
-            .map_err(|_| DaemonError::Network {
-                address: "daemon module hot unload teardown".to_string(),
-                detail: "component reconciler lock poisoned".to_string(),
-            })?
-            .finish_retiring(&reconcile.stopped);
+        let deadline = tokio::time::Instant::from_std(transition_started + drain_timeout);
+        let reconciler = Arc::clone(&self.component_reconciler);
+        let stopped = reconcile.stopped.clone();
+        let runtime = tokio::runtime::Handle::current();
+        // Bridge only component retirement, never replay an effect. The same
+        // reconciler retains scopes/child handles through cancellation or timeout;
+        // physical module release below occurs only after this real join returns.
+        tokio::task::spawn_blocking(move || {
+            let mut reconciler = reconciler.lock().map_err(|_| DaemonError::Network {
+                address: "daemon module hot unload teardown".into(),
+                detail: "component reconciler lock poisoned".into(),
+            })?;
+            runtime
+                .block_on(reconciler.finish_retiring_and_wait(&stopped, deadline))
+                .map_err(|error| DaemonError::Network {
+                    address: "daemon module hot unload teardown".into(),
+                    detail: error.to_string(),
+                })
+        })
+        .await
+        .map_err(|error| DaemonError::Network {
+            address: "daemon module hot unload teardown".into(),
+            detail: format!("component retirement join stopped: {error}"),
+        })??;
         for draining_module_id in &draining_module_ids {
             self.module_runtime
                 .invocations
@@ -2705,12 +2756,41 @@ impl DaemonServiceRegistryHost {
         })
     }
 
-    pub(crate) fn shutdown_components(&self) {
-        if let Ok(mut reconciler) = self.component_reconciler.lock()
-            && let Err(error) = reconciler.shutdown()
-        {
-            tracing::warn!(%error, "daemon component shutdown failed");
-        }
+    pub(crate) fn shutdown_components(
+        &self,
+        runtime: &tokio::runtime::Handle,
+        timeout: Duration,
+    ) -> Result<(), DaemonError> {
+        let mut reconciler =
+            self.component_reconciler
+                .try_lock()
+                .map_err(|error| DaemonError::Network {
+                    address: "daemon component shutdown".into(),
+                    detail: format!(
+                        "component reconciler is unavailable for bounded shutdown: {error}"
+                    ),
+                })?;
+        let shutdown = reconciler.shutdown_and_wait(timeout);
+        let result = if let Ok(current) = tokio::runtime::Handle::try_current() {
+            if !matches!(
+                current.runtime_flavor(),
+                tokio::runtime::RuntimeFlavor::MultiThread
+            ) {
+                return Err(DaemonError::Network {
+                    address: "daemon component shutdown".into(),
+                    detail:
+                        "component shutdown cannot synchronously bridge a current-thread runtime"
+                            .into(),
+                });
+            }
+            tokio::task::block_in_place(|| runtime.block_on(shutdown))
+        } else {
+            runtime.block_on(shutdown)
+        };
+        result.map_err(|error| DaemonError::Network {
+            address: "daemon component shutdown".into(),
+            detail: error.to_string(),
+        })
     }
 }
 

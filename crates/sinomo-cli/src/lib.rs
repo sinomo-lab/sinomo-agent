@@ -172,17 +172,16 @@ use sinomo_runtime::daemon::{
 };
 use sinomo_runtime::dfs::{DaemonDfsInspectionRequest, DaemonDfsInspectionResponse};
 use sinomo_runtime::dfs::{
-    DfsConflictRecord, DfsFileSystemId, DfsMetadataBackend, DfsMetadataShardConfig, DfsObjectId,
-    DfsOperatorConflictVersionView, DfsOperatorConflictVersionsReport, DfsOperatorInspectionCursor,
-    DfsOperatorInspector, DfsOperatorRepairView, DfsVersion, LocalShardedMetadataBackend,
-    LocalSobjMetadataBackend,
+    DfsFileSystemId, DfsMetadataBackend, DfsMetadataShardConfig, DfsObjectId,
+    DfsOperatorInspectionCursor, DfsOperatorInspector, DfsOperatorRepairView, DfsVersion,
+    LocalShardedMetadataBackend, LocalSobjMetadataBackend,
 };
 use sinomo_runtime::dfs::{
     DfsPinAddRequest, add_local_dfs_pin, default_dfs_metadata_root,
     default_dfs_metadata_shards_root, dfs_import_metadata_root, dfs_import_namespace_root,
-    fallback_dfs_node_id, list_local_dfs_pins, metadata_shards_prefix,
-    open_local_sharded_metadata_backend, open_root_local_metadata_backend, remove_local_dfs_pin,
-    resolve_dfs_metadata_root, resolve_dfs_pin_root, sifs_file_system_id,
+    list_local_dfs_pins, metadata_shards_prefix, open_local_sharded_metadata_backend,
+    open_root_local_metadata_backend, remove_local_dfs_pin, resolve_dfs_metadata_root,
+    resolve_dfs_pin_root, sifs_file_system_id,
 };
 use sinomo_runtime::events::{EventStore, InMemoryEventStore};
 use sinomo_runtime::events::{JsonlEventStore, SessionId};

@@ -1096,6 +1096,159 @@ fn cluster_invite_challenge_proof_verification_uses_network_contract() {
     ));
 }
 
+// These two existing signer callers use a genuine single-voter ReadIndex.
+// Unused remote operations fail closed; this host supplies no acknowledgement.
+struct InviteChallengeReadHost;
+impl ClusterObjectRpcAsyncHost for InviteChallengeReadHost {}
+impl ClusterKvQuorumAsyncHost for InviteChallengeReadHost {
+    fn last_local_kv_replication_index_async<'a>(
+        &'a mut self,
+        _paths: &'a ClusterPaths,
+        _state: &'a ClusterBootstrapState,
+    ) -> ClusterMembershipRpcFuture<'a, u64> {
+        Box::pin(async {
+            Err(NetworkError::ClusterReadOnly {
+                detail: "single-voter invite read unexpectedly requested replication".into(),
+            })
+        })
+    }
+    fn build_kv_replication_request_async<'a>(
+        &'a mut self,
+        _paths: &'a ClusterPaths,
+        _state: &'a ClusterBootstrapState,
+        _next_index: u64,
+    ) -> ClusterMembershipRpcFuture<'a, sinomo_kv::ClusterRaftAppendRequest> {
+        Box::pin(async {
+            Err(NetworkError::ClusterReadOnly {
+                detail: "single-voter invite read unexpectedly built replication".into(),
+            })
+        })
+    }
+    fn send_cluster_kv_replication_to_node_async<'a>(
+        &'a mut self,
+        _paths: &'a ClusterPaths,
+        _state: &'a ClusterBootstrapState,
+        _target: &'a NodeId,
+        _request: &'a sinomo_kv::ClusterRaftAppendRequest,
+        _timeout: Duration,
+    ) -> ClusterMembershipRpcFuture<'a, sinomo_kv::ClusterRaftAppendResponse> {
+        Box::pin(async {
+            Err(NetworkError::ClusterReadOnly {
+                detail: "single-voter invite read unexpectedly sent replication".into(),
+            })
+        })
+    }
+}
+impl ClusterStateAuthorityReachabilityAsyncHost for InviteChallengeReadHost {
+    fn probe_cluster_state_authority_node_async<'a>(
+        &'a mut self,
+        _state: &'a ClusterBootstrapState,
+        _target: &'a NodeId,
+        _timeout: Duration,
+    ) -> ClusterMembershipRpcFuture<'a, bool> {
+        Box::pin(async { Ok(false) })
+    }
+}
+impl ClusterKvTxnQuorumAsyncHost for InviteChallengeReadHost {
+    fn request_kv_state_authority_vote_async<'a>(
+        &'a mut self,
+        _state: &'a ClusterBootstrapState,
+        _target: &'a NodeId,
+        _request: &'a sinomo_kv::ClusterKvStateAuthorityVoteRequest,
+        _timeout: Duration,
+    ) -> ClusterMembershipRpcFuture<'a, sinomo_kv::ClusterKvStateAuthorityVoteResponse> {
+        Box::pin(async {
+            Err(NetworkError::ClusterReadOnly {
+                detail: "single-voter invite read unexpectedly requested a vote".into(),
+            })
+        })
+    }
+}
+struct InviteChallengeNativeAccess<'a> {
+    paths: &'a ClusterPaths,
+}
+impl sinomo_service::ClusterAccess for InviteChallengeNativeAccess<'_> {
+    fn kv_get_local(
+        &self,
+        _key: &str,
+    ) -> Result<sinomo_kv::KvLocalRead<Option<sinomo_kv::KvEntry>>, sinomo_service::ServiceError>
+    {
+        Err(sinomo_service::ServiceError::Service(
+            "invite signer must use native exact-set authority".into(),
+        ))
+    }
+    fn kv_range_prefix_local(
+        &self,
+        _prefix: &str,
+    ) -> Result<sinomo_kv::KvLocalRead<Vec<sinomo_kv::KvEntry>>, sinomo_service::ServiceError> {
+        Err(sinomo_service::ServiceError::Service(
+            "invite signer must use native exact-set authority".into(),
+        ))
+    }
+    fn kv_get_authoritative_async<'a>(
+        &'a self,
+        _key: &'a str,
+    ) -> ClusterMembershipServiceFuture<
+        'a,
+        sinomo_kv::KvAuthoritativeRead<Option<sinomo_kv::KvEntry>>,
+    > {
+        Box::pin(async {
+            Err(sinomo_service::ServiceError::Service(
+                "invite signer must use one native exact-set read".into(),
+            ))
+        })
+    }
+    fn kv_get_authoritative_exact_set_async<'a>(
+        &'a self,
+        keys: Vec<String>,
+    ) -> ClusterMembershipServiceFuture<
+        'a,
+        sinomo_kv::KvAuthoritativeRead<Vec<Option<sinomo_kv::KvEntry>>>,
+    > {
+        Box::pin(async move {
+            let mut state = read_cluster_state_without_kv(self.paths)?;
+            let runtime = tokio::runtime::Handle::current();
+            read_cluster_kv_authoritative_entries_async_with_host(
+                &runtime,
+                self.paths,
+                &mut state,
+                keys,
+                ClusterControlPlaneTimeouts::default_daemon_transport()
+                    .kv_txn_quorum_options(false),
+                &mut InviteChallengeReadHost,
+            )
+            .await
+            .map_err(sinomo_service::ServiceError::Network)
+        })
+    }
+    fn kv_commit_async<'a>(
+        &'a self,
+        _request: sinomo_kv::KvTxnRequest,
+    ) -> ClusterMembershipServiceFuture<'a, sinomo_kv::ClusterKvTxnCommitResult> {
+        Box::pin(async {
+            Err(sinomo_service::ServiceError::Service(
+                "invite read adapter cannot commit".into(),
+            ))
+        })
+    }
+}
+fn native_test_invite_challenge_proof(
+    paths: &ClusterPaths,
+    identity: &sinomo_node::NodeIdentity,
+    request: &ClusterInviteChallengeRequest,
+) -> Result<ClusterInviteChallengeProof, NetworkError> {
+    let runtime = tokio::runtime::Runtime::new().map_err(|error| NetworkError::Io {
+        operation: "start native invite read runtime".into(),
+        detail: error.to_string(),
+    })?;
+    runtime.block_on(create_cluster_invite_challenge_proof(
+        paths,
+        identity,
+        request,
+        &InviteChallengeNativeAccess { paths },
+    ))
+}
+
 #[test]
 fn cluster_invite_challenge_proof_creation_uses_network_state() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-invite-challenge-create");
@@ -1107,7 +1260,7 @@ fn cluster_invite_challenge_proof_creation_uses_network_state() {
     let cluster_id =
         ClusterId::from_legacy_named("cluster_invite_challenge_create").expect("cluster");
     let local_node_id = NodeId::from_legacy_named("node_invite_challenge_create").expect("node");
-    let state = ClusterBootstrapState::initialized_locally(
+    let mut state = ClusterBootstrapState::initialized_locally(
         cluster_id.clone(),
         "invite challenge create",
         local_node_id.clone(),
@@ -1115,7 +1268,14 @@ fn cluster_invite_challenge_proof_creation_uses_network_state() {
         identity.public_key.clone(),
         now,
     );
+    ensure_main_daemon_cluster_member(&mut state, Vec::new(), now);
     write_cluster_state(&paths, &state).expect("write state");
+    let mut node = open_cluster_raft_kv_node(&paths, &local_node_id).expect("open native voter");
+    node.become_leader(state.term)
+        .expect("initial sole-voter leader");
+    drop(node);
+    bootstrap_single_voter_cluster_state_to_local_kv(&paths, &state)
+        .expect("publish actual initial member and config");
     let invite = ClusterJoinInvite {
         invite_id: ClusterInviteId::from_legacy_named("invite_challenge_create").expect("invite"),
         cluster_id,
@@ -1139,8 +1299,8 @@ fn cluster_invite_challenge_proof_creation_uses_network_state() {
         challenge: "create-proof-challenge".to_string(),
     };
 
-    let proof = create_cluster_invite_challenge_proof(&paths, &identity, &request, now)
-        .expect("create proof");
+    let proof = native_test_invite_challenge_proof(&paths, &identity, &request)
+        .expect("create native authoritative proof");
 
     assert_eq!(proof.invite_id, invite.invite_id);
     assert_eq!(proof.cluster_id, invite.cluster_id);
@@ -1318,14 +1478,14 @@ fn object_rpc_error_detail_maps_auth_denial() {
 #[test]
 fn object_rpc_error_detail_maps_service_error_with_route_context() {
     let response = ObjectRpcResponse::encode_error(
-        "/daemon/dfs/browser/read-file",
+        "/daemon/dfs/browser/read-file-v7",
         "not found: /services/example.json",
     )
     .expect("rpc error");
 
     match response.error_detail().expect_err("rpc error detail") {
         NetworkError::ObjectRpc { route, detail } => {
-            assert_eq!(route, "/daemon/dfs/browser/read-file");
+            assert_eq!(route, "/daemon/dfs/browser/read-file-v7");
             assert_eq!(detail, "not found: /services/example.json");
         }
         error => panic!("unexpected error: {error}"),
@@ -16914,11 +17074,10 @@ fn cluster_control_plane_driver_owns_join_reconciliation_transport() {
             match request.route.as_str() {
                 CLUSTER_JOIN_CHALLENGE_ROUTE => {
                     let challenge: ClusterInviteChallengeRequest = request.decode_body()?;
-                    let proof = create_cluster_invite_challenge_proof(
+                    let proof = native_test_invite_challenge_proof(
                         &self.paths,
                         &self.identity,
                         &challenge,
-                        OffsetDateTime::now_utc(),
                     )?;
                     ObjectRpcResponse::encode_body(CLUSTER_JOIN_CHALLENGE_ROUTE, &proof)
                 }
@@ -16982,7 +17141,7 @@ fn cluster_control_plane_driver_owns_join_reconciliation_transport() {
     let issuer_identity =
         sinomo_node::load_or_create_main_node_identity(&root).expect("issuer identity");
     let endpoint = daemon_lan_endpoint(&issuer, "10.34.0.2:21353".to_string(), 0);
-    let issuer_state = ClusterBootstrapState::initialized_locally(
+    let mut issuer_state = ClusterBootstrapState::initialized_locally(
         cluster_id.clone(),
         "driver join reconcile",
         issuer.clone(),
@@ -16990,6 +17149,7 @@ fn cluster_control_plane_driver_owns_join_reconciliation_transport() {
         issuer_identity.public_key.clone(),
         now,
     );
+    ensure_main_daemon_cluster_member(&mut issuer_state, vec![endpoint.clone()], now);
     write_cluster_state(&paths, &issuer_state).expect("write issuer state");
     sync_cluster_state_to_local_raft_unchecked(&paths, &issuer_state).expect("sync state");
 

@@ -10,15 +10,14 @@
 //! movement before the prefix is certified.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use sinomo_core::node::NodeId;
 
 use crate::metadata_journal::metadata_prefix_proof_after_exact_frame;
-use crate::metadata_records::{
-    DFS_METADATA_PREFIX_PROOF_VERSION, DfsMetadataPrefixProof, dfs_metadata_prefix_proof_after,
-};
+use crate::metadata_records::DfsMetadataPrefixProof;
 use crate::{
     DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT, DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
     DfsControlPlaneStore, DfsError, DfsFileSystemId, DfsMessageTransport, DfsMetadataBackend,
@@ -182,7 +181,7 @@ pub struct DfsMetadataQuorumSyncTarget {
     /// Frozen checkpoint used only by the authority executing this barrier.
     /// It is deliberately excluded from certificates/wire serialization.
     #[serde(skip)]
-    pub checkpoint_snapshot: Option<crate::DfsMetadataTableSnapshot>,
+    pub checkpoint_snapshot: Option<crate::DfsMetadataSnapshotImage>,
 }
 
 /// Current acknowledgement state for a frozen metadata prefix.
@@ -251,22 +250,51 @@ pub(crate) fn rebind_completed_metadata_shard_membership_handoff(
     if exact_successor_epoch != Some(active.epoch)
         || !marker_matches_active_epoch
         || !proof_matches_marker_and_active
-        || !metadata_shard_prefix_matches_or_extends_marker(
-            backend,
-            &shard_id,
-            freeze.journal_sequence,
-            &freeze.state_fingerprint,
-            freeze.rebind_prefix_proof.as_ref(),
-        )?
     {
         return Ok(false);
     }
+    let Some(checked_prefix) = metadata_shard_prefix_matches_or_extends_marker(
+        backend,
+        &shard_id,
+        freeze.journal_sequence,
+        &freeze.state_fingerprint,
+        &freeze.rebind_prefix_proof,
+    )?
+    else {
+        return Ok(false);
+    };
+    #[cfg(any(test, feature = "test-support"))]
+    let mut native_boundary = crate::native_shard_trace::current_boundary_interest();
+    #[cfg(any(test, feature = "test-support"))]
+    let native_before = native_boundary
+        .as_ref()
+        .and_then(|_| backend.native_held_snapshot_for_scope(&active.file_system_id, &shard_id));
     if active.primary_node_id == *local_node_id {
-        return Ok(backend.clear_metadata_shard_membership_handoff_freeze(
+        let rebound = backend.clear_metadata_shard_membership_handoff_freeze(
             &shard_id,
             &freeze.handoff_id,
             active,
-        )?);
+            &checked_prefix,
+        )?;
+        #[cfg(any(test, feature = "test-support"))]
+        if rebound {
+            if let Some(trace) = native_boundary.as_mut() {
+                let prior_instance_epoch = native_before
+                    .as_ref()
+                    .and_then(|held| held.backend_instance_authority_epoch);
+                trace.observe(
+                    crate::native_shard_trace::NativeBoundaryFactsV1::SuccessorRebound {
+                        active: active.clone(),
+                        proof: proof.clone(),
+                        original_freeze: freeze.clone(),
+                        prior_instance_epoch,
+                    },
+                    native_before,
+                    backend.native_held_snapshot_for_scope(&active.file_system_id, &shard_id),
+                );
+            }
+        }
+        return Ok(rebound);
     }
 
     // The completing process can crash after the control-plane CAS commits
@@ -295,6 +323,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         expected: &DfsMetadataShardConfig,
     ) -> Result<bool, DfsError> {
+        let rebound = self.rebind_completed_local_metadata_shard_instance_if_frozen(expected)?;
+        if rebound {
+            self.hydrate_from_metadata_backend()?;
+        }
+        Ok(rebound)
+    }
+
+    /// Bind only this physical shard. A fresh lazy shell has no operational
+    /// projection to replace; cached services rebuild theirs in the wrapper.
+    pub(crate) fn rebind_completed_local_metadata_shard_instance_if_frozen(
+        &mut self,
+        expected: &DfsMetadataShardConfig,
+    ) -> Result<bool, DfsError> {
         if expected.primary_node_id != self.node_id {
             return Ok(false);
         }
@@ -310,16 +351,46 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let Some(control_plane) = self.control_plane.as_mut() else {
             return Ok(false);
         };
-        if DfsControlPlaneStore::new(control_plane.as_mut())
-            .get_metadata_shard(&expected.file_system_id, &expected.shard_id)?
-            .as_ref()
-            != Some(expected)
-        {
-            return Ok(false);
-        }
-        Ok(self
-            .rebind_completed_local_metadata_shard_membership_handoffs(&expected.file_system_id)?
-            > 0)
+        let (pending, proof) = {
+            let store = DfsControlPlaneStore::new(control_plane.as_mut());
+            if store
+                .get_metadata_shard(&expected.file_system_id, &expected.shard_id)?
+                .as_ref()
+                != Some(expected)
+            {
+                return Ok(false);
+            }
+            (
+                store.get_metadata_shard_membership_handoff(
+                    &expected.file_system_id,
+                    &expected.shard_id,
+                )?,
+                store.get_metadata_shard_membership_handoff_proof(
+                    &expected.file_system_id,
+                    &expected.shard_id,
+                )?,
+            )
+        };
+        #[cfg(any(test, feature = "test-support"))]
+        let native_owner = self.native_publication_owner_for_observation();
+        let rebound = {
+            #[cfg(any(test, feature = "test-support"))]
+            let _native_context = native_owner.as_ref().map(|(root, owner)| {
+                crate::native_shard_trace::enter_boundary_context(root, owner, &shard_id)
+            });
+            let backend = self
+                .metadata_backend
+                .as_deref_mut()
+                .expect("frozen backend checked");
+            rebind_completed_metadata_shard_membership_handoff(
+                backend,
+                &self.node_id,
+                expected,
+                pending.as_ref(),
+                proof.as_ref(),
+            )?
+        };
+        Ok(rebound)
     }
 
     /// Rebinds only completed, exact-proof SIFS metadata handoffs for a newly
@@ -413,11 +484,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .collect::<Result<Vec<_>, sinomo_core::kv::KvError>>()?
         };
 
+        #[cfg(any(test, feature = "test-support"))]
+        let native_owner = self.native_publication_owner_for_observation();
         let Some(backend) = self.metadata_backend.as_deref_mut() else {
             return Ok(0);
         };
         let mut rebound = 0usize;
         for (active, pending, proof) in observed {
+            #[cfg(any(test, feature = "test-support"))]
+            let _native_context = native_owner.as_ref().map(|(root, owner)| {
+                crate::native_shard_trace::enter_boundary_context(
+                    root,
+                    owner,
+                    &DfsMetadataShardId::new(active.shard_id.clone()),
+                )
+            });
             if rebind_completed_metadata_shard_membership_handoff(
                 backend,
                 &self.node_id,
@@ -454,6 +535,23 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         metadata_shards: &[DfsMetadataShardConfig],
         timeout: Duration,
     ) -> Result<usize, DfsError> {
+        self.reconcile_pending_metadata_shard_membership_handoffs_until_cancelled(
+            metadata_shards,
+            timeout,
+            &|| false,
+        )
+        .map(|completed| completed.unwrap_or_default())
+    }
+
+    pub(crate) fn reconcile_pending_metadata_shard_membership_handoffs_until_cancelled(
+        &mut self,
+        metadata_shards: &[DfsMetadataShardConfig],
+        timeout: Duration,
+        should_cancel: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Option<usize>, DfsError> {
+        if should_cancel() {
+            return Ok(None);
+        }
         // Activation does not mutate a different process or service handle's
         // local authority binding. Before looking for work owned by a retiring
         // primary, let this lane prove and bind any completed generation for
@@ -465,10 +563,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         for file_system_id in file_system_ids {
             self.rebind_completed_local_metadata_shard_membership_handoffs(&file_system_id)?;
         }
+        if should_cancel() {
+            return Ok(None);
+        }
         self.refresh_control_plane_latest()?;
         let observed = {
             let Some(control_plane) = self.control_plane.as_mut() else {
-                return Ok(0);
+                return Ok(Some(0));
             };
             let store = DfsControlPlaneStore::new(control_plane.as_mut());
             metadata_shards
@@ -492,6 +593,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
         let mut completed = 0;
         for handoff in pending {
+            if should_cancel() {
+                return Ok(None);
+            }
             let shard_id = DfsMetadataShardId::new(handoff.retiring_shard.shard_id.clone());
             let cancelled_for_prepare_drain = if handoff.retiring_primary_fence.is_none()
                 && self.has_recoverable_standalone_namespace_prepare_on_shard(&shard_id)?
@@ -503,13 +607,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 // decision under the publication guard, drain the prepare
                 // through normal canonical authorization, and let placement
                 // propose a fresh handoff from the resulting head.
-                let _publication_guard = crate::service_replica::metadata_shard_publication_guard(
+                let _publication_guard = self.metadata_shard_fence_guard(
                     &handoff.retiring_shard.file_system_id,
                     &handoff.retiring_shard.shard_id,
-                );
+                )?;
                 self.refresh_control_plane_latest()?;
                 let Some(control_plane) = self.control_plane.as_mut() else {
-                    return Ok(completed);
+                    return Ok(Some(completed));
                 };
                 DfsControlPlaneStore::new(control_plane.as_mut())
                     .cancel_unfenced_metadata_shard_membership_handoff(&handoff)?
@@ -518,13 +622,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             };
             if cancelled_for_prepare_drain {
                 self.recover_durable_namespace_prepares()?;
+                if should_cancel() {
+                    return Ok(None);
+                }
                 continue;
             }
             if self.reconcile_metadata_shard_membership_handoff(&handoff, timeout)? {
                 completed += 1;
+                // An actual activation can invalidate the admitted owner cut.
+                // Keep later proposals durable for normal release/readmission.
+                if should_cancel() {
+                    return Ok(None);
+                }
             }
         }
-        Ok(completed)
+        Ok(Some(completed))
     }
 
     fn reconcile_metadata_shard_membership_handoff(
@@ -541,35 +653,66 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(false);
         }
 
+        // The fresh authority read and the existing prefix exchange share the
+        // caller's original window; an exact read cannot add another timeout.
+        let requested_deadline = Instant::now()
+            .checked_add(timeout)
+            .unwrap_or_else(Instant::now);
+        let deadline = self
+            .transport
+            .operation_deadline()
+            .filter(|existing| *existing < requested_deadline)
+            .unwrap_or(requested_deadline);
+        let trace_operation = if crate::service_trace::dfs_perf_trace_enabled() {
+            format!(
+                "handoff:{}:{}:{}:{}",
+                self.node_id,
+                requested_retiring.file_system_id,
+                requested_retiring.shard_id,
+                requested_handoff.handoff_id
+            )
+        } else {
+            String::new()
+        };
+        let mut timing = crate::service_trace::DfsPhaseTimer::new(&trace_operation);
+        timing.mark("handoff-started");
         let shard_id = DfsMetadataShardId::new(requested_retiring.shard_id.clone());
+        #[cfg(any(test, feature = "test-support"))]
+        let mut native_boundary =
+            self.native_publication_owner_for_observation()
+                .and_then(|(root, owner)| {
+                    crate::native_shard_trace::boundary_interest(&root, Some(&owner), &shard_id)
+                });
+
         let (handoff, fence) = {
             // This is the retiring-primary half of the distributed fence. A
             // canonical commit that already passed validation holds this same
             // guard through its backend publication and therefore finishes
             // before the captured head. A later commit observes the refreshed
             // durable pending handoff and fails validation.
-            let _publication_guard = crate::service_replica::metadata_shard_publication_guard(
+            let _publication_guard = self.metadata_shard_fence_guard(
                 &requested_retiring.file_system_id,
                 &requested_retiring.shard_id,
-            );
-            self.refresh_control_plane_latest()?;
+            )?;
+            timing.mark("handoff-fence-acquired");
             let observed_handoff = {
                 let Some(control_plane) = self.control_plane.as_mut() else {
                     return Ok(false);
                 };
-                let store = DfsControlPlaneStore::new(control_plane.as_mut());
-                if store.get_metadata_shard(
-                    &requested_retiring.file_system_id,
-                    &requested_retiring.shard_id,
-                )? != Some(requested_retiring.clone())
-                {
+                // A retiring fence needs one operation-bound ReadIndex view.
+                // Refreshing a private projection can reuse the host's older
+                // retained snapshot after another owner completes this handoff.
+                let (active, pending) = DfsControlPlaneStore::new(control_plane.as_mut())
+                    .retiring_metadata_shard_handoff_view_before(
+                        &requested_retiring.file_system_id,
+                        &requested_retiring.shard_id,
+                        deadline,
+                    )?;
+                timing.mark("handoff-authority-refreshed");
+                if active != Some(requested_retiring.clone()) {
                     return Ok(false);
                 }
-                let Some(observed) = store.get_metadata_shard_membership_handoff(
-                    &requested_retiring.file_system_id,
-                    &requested_retiring.shard_id,
-                )?
-                else {
+                let Some(observed) = pending else {
                     return Ok(false);
                 };
                 if observed.handoff_id != requested_handoff.handoff_id
@@ -581,6 +724,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 observed
             };
 
+            timing.mark("handoff-pending-validated");
             let backend =
                 self.metadata_backend
                     .as_deref_mut()
@@ -590,6 +734,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             requested_retiring.shard_id
                         ),
                     })?;
+            #[cfg(any(test, feature = "test-support"))]
+            let before = native_boundary.as_ref().and_then(|_| {
+                backend
+                    .native_held_snapshot_for_scope(&requested_retiring.file_system_id, &shard_id)
+            });
             let Some(write_freeze) = backend.freeze_metadata_shard_for_membership_handoff(
                 &shard_id,
                 &observed_handoff.handoff_id,
@@ -598,6 +747,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             else {
                 return Ok(false);
             };
+            timing.mark("handoff-write-freeze-returned");
+            #[cfg(any(test, feature = "test-support"))]
+            if let Some(trace) = native_boundary.as_mut() {
+                let after = backend
+                    .native_held_snapshot_for_scope(&requested_retiring.file_system_id, &shard_id);
+                trace.observe(
+                    crate::native_shard_trace::NativeBoundaryFactsV1::RetiringFreezePersisted {
+                        pending: observed_handoff.clone(),
+                        freeze: write_freeze.clone(),
+                    },
+                    before,
+                    after,
+                );
+            }
             let proposed_fence = DfsMetadataShardMembershipHandoffFence {
                 handoff_id: observed_handoff.handoff_id.clone(),
                 primary_node_id: self.node_id.clone(),
@@ -621,6 +784,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         &proposed_fence,
                     )?
             };
+            timing.mark("handoff-fence-cas-returned");
             let Some(acknowledged_handoff) = acknowledged_handoff else {
                 return Ok(false);
             };
@@ -666,6 +830,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 handoff_id: handoff.handoff_id.clone(),
                 promoted_node_id: handoff.desired_shard.primary_node_id.clone(),
             });
+        timing.mark("handoff-prefix-proofs-started");
         let certificate = self.sync_metadata_shard_to_quorum_with_required_intersection(
             &target,
             &BTreeSet::new(),
@@ -674,8 +839,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 retiring_shard: retiring.clone(),
                 desired_shard: handoff.desired_shard.clone(),
             },
-            timeout,
+            deadline
+                .checked_duration_since(Instant::now())
+                .filter(|remaining| !remaining.is_zero())
+                .ok_or_else(|| DfsError::Network {
+                    message: "metadata handoff authority read exhausted the caller deadline".into(),
+                })?,
         )?;
+        timing.mark("handoff-prefix-proofs-returned");
         let acknowledged_node_ids = certificate
             .acknowledged_node_ids
             .iter()
@@ -692,12 +863,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // Hold the retiring-primary guard across the final exact local-state
         // check and activation CAS. The control-plane transaction also
         // compares the immutable DFS fence acknowledgement.
-        let publication_guard = crate::service_replica::metadata_shard_publication_guard(
-            &retiring.file_system_id,
-            &retiring.shard_id,
-        );
+        let publication_guard =
+            self.metadata_shard_fence_guard(&retiring.file_system_id, &retiring.shard_id)?;
+        timing.mark("handoff-activation-fence-acquired");
         self.refresh_control_plane_latest()?;
-        let unchanged = {
+        timing.mark("handoff-activation-authority-refreshed");
+        let checked_prefix = {
             let backend = self
                 .metadata_backend
                 .as_deref()
@@ -707,15 +878,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .into_iter()
                 .find(|status| status.shard_id == shard_id)
                 .map(|status| status.journal_last_sequence);
-            current_sequence == Some(journal_sequence)
-                && metadata_shard_state_fingerprint_at(backend, &shard_id, journal_sequence)?
-                    == state_fingerprint
+            backend.metadata_prefix_proof(&shard_id)?.filter(|prefix| {
+                prefix.is_well_formed()
+                    && current_sequence == Some(journal_sequence)
+                    && prefix.journal_sequence == journal_sequence
+                    && prefix.digest == state_fingerprint
+            })
         };
-        if !unchanged {
+        timing.mark("handoff-activation-prefix-read");
+        let Some(checked_prefix) = checked_prefix else {
             return Ok(false);
-        }
+        };
 
         let proof = DfsMetadataShardMembershipHandoffProof {
+            cause: handoff.cause.clone(),
             handoff_id: handoff.handoff_id.clone(),
             retiring_shard: retiring.clone(),
             desired_shard: handoff.desired_shard.clone(),
@@ -729,6 +905,23 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let completed = DfsControlPlaneStore::new(control_plane.as_mut())
             .complete_metadata_shard_membership_handoff(retiring, &handoff.desired_shard, &proof)
             .map_err(DfsError::from)?;
+        timing.mark("handoff-activation-cas-returned");
+        #[cfg(any(test, feature = "test-support"))]
+        if completed {
+            if let Some(trace) = native_boundary.as_mut() {
+                let held = self.metadata_backend.as_ref().and_then(|backend| {
+                    backend.native_held_snapshot_for_scope(&retiring.file_system_id, &shard_id)
+                });
+                trace.observe(
+                    crate::native_shard_trace::NativeBoundaryFactsV1::HandoffActivationCompleted {
+                        handoff: handoff.clone(),
+                        proof: proof.clone(),
+                    },
+                    held.clone(),
+                    held,
+                );
+            }
+        }
         if completed {
             let backend = self
                 .metadata_backend
@@ -739,6 +932,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     &shard_id,
                     &handoff.handoff_id,
                     &handoff.desired_shard,
+                    &checked_prefix,
                 )?;
             } else {
                 // Record completion durably but never bind the retiring
@@ -752,7 +946,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 )?;
             }
         }
+        timing.mark("handoff-local-activation-returned");
         drop(publication_guard);
+        timing.mark("handoff-activation-fence-released");
         Ok(completed)
     }
 
@@ -1088,6 +1284,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         probe_barrier_id: &str,
         timeout: Duration,
     ) -> Result<DfsMetadataQuorumSyncCertificate, DfsError> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _native_context =
+            self.native_publication_owner_for_observation()
+                .map(|(root, owner)| {
+                    crate::native_shard_trace::enter_boundary_context(
+                        &root,
+                        &owner,
+                        &requested_target.shard_id,
+                    )
+                });
         let mut target = requested_target.clone();
         if target.primary_node_id != self.node_id {
             let authority_epoch = target.authority_epoch.ok_or_else(|| DfsError::Metadata {
@@ -1144,11 +1350,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             // unrelated incoming work may otherwise advance their live head
             // before the requested historical prefix is delivered.
             let mut rejected_nodes = BTreeSet::new();
+            let mut source_history_gap_node_ids = BTreeSet::new();
             if matches!(purpose, MetadataQuorumSyncPurpose::OrdinaryDurability) {
                 rejected_nodes.extend(self.send_metadata_sync_catchup_batches(
                     &target,
                     probe_barrier_id,
                     &mut pending_catchup_batches,
+                    &mut source_history_gap_node_ids,
                     &mut send_diagnostics,
                 )?);
             }
@@ -1177,6 +1385,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     &mut pending_catchup_batches,
                     &mut pending_checkpoint_snapshots,
                 );
+                source_history_gap_node_ids.clear();
                 freshly_acknowledged.clear();
                 freshly_acknowledged.insert(self.node_id.clone());
             }
@@ -1194,6 +1403,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 &target,
                 probe_barrier_id,
                 &rejected_nodes,
+                &source_history_gap_node_ids,
                 &mut pending_checkpoint_snapshots,
                 purpose,
             )?;
@@ -1201,6 +1411,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 &target,
                 probe_barrier_id,
                 &mut pending_catchup_batches,
+                &mut source_history_gap_node_ids,
                 &mut send_diagnostics,
             )?;
             rejected_nodes.extend(self.send_metadata_sync_prefix_probes(
@@ -1227,6 +1438,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     &mut pending_catchup_batches,
                     &mut pending_checkpoint_snapshots,
                 );
+                source_history_gap_node_ids.clear();
                 freshly_acknowledged.clear();
                 freshly_acknowledged.insert(self.node_id.clone());
             }
@@ -1244,6 +1456,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 &target,
                 probe_barrier_id,
                 &rejected_nodes,
+                &source_history_gap_node_ids,
                 &mut pending_checkpoint_snapshots,
                 purpose,
             )?;
@@ -1256,6 +1469,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 &target,
                 probe_barrier_id,
                 &mut pending_catchup_batches,
+                &mut source_history_gap_node_ids,
                 &mut send_diagnostics,
             )?;
             rejected_nodes.extend(self.send_metadata_sync_prefix_probes(
@@ -1282,6 +1496,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     &mut pending_catchup_batches,
                     &mut pending_checkpoint_snapshots,
                 );
+                source_history_gap_node_ids.clear();
                 freshly_acknowledged.clear();
                 freshly_acknowledged.insert(self.node_id.clone());
             }
@@ -1299,6 +1514,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 &target,
                 probe_barrier_id,
                 &rejected_nodes,
+                &source_history_gap_node_ids,
                 &mut pending_checkpoint_snapshots,
                 purpose,
             )?;
@@ -1454,8 +1670,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// Close an ordinary replica journal lag with contiguous DFS metadata
     /// batches before asking that replica to attest the frozen prefix.
     ///
-    /// The fresh prefix probe remains empty for rolling-upgrade safety. Sending
-    /// it to a replica whose sender cursor is known to be behind would only
+    /// The verification request carries no journal frames. Sending it to a
+    /// replica whose sender cursor is known to be behind would only
     /// manufacture a rejection and force an expensive full-snapshot repair.
     /// Sender cursors are still scheduling hints rather than proof: once they
     /// reach the target, the operation-bound probe below is what certifies the
@@ -1465,6 +1681,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         target: &DfsMetadataQuorumSyncTarget,
         probe_barrier_id: &str,
         pending_catchup_batches: &mut BTreeMap<String, NodeId>,
+        source_history_gap_node_ids: &mut BTreeSet<NodeId>,
         diagnostics: &mut MetadataSyncAttemptDiagnostics,
     ) -> Result<BTreeSet<NodeId>, DfsError> {
         self.replication
@@ -1548,6 +1765,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     prepared
                 };
             let Some(batch) = prepared_batch else {
+                // A retained native checkpoint can outlive its journal frames.
+                // This is local source availability, not a receiver rejection
+                // or an acknowledgement. Repair through the existing verified
+                // snapshot attempt, then obtain the ordinary fresh prefix proof.
+                source_history_gap_node_ids.insert(target_node_id);
                 continue;
             };
             if after_sequence == 0
@@ -1647,6 +1869,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         .collect::<BTreeMap<_, _>>();
                     let mut accepted = BTreeSet::new();
                     for (source_node_id, response) in responses {
+                        tracing::trace!(
+                            target: "sinomo.dfs.perf",
+                            peer = %source_node_id,
+                            request_id = %response.request_id,
+                            shard = %response.shard_id.0,
+                            result = ?response.result,
+                            "metadata-sync-native-catchup-response",
+                        );
                         let response_key = (source_node_id.clone(), response.request_id.clone());
                         let Some(pending) = pending_by_response.remove(&response_key) else {
                             diagnostics.record(
@@ -1715,6 +1945,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     accepted
                 }
                 outcome => {
+                    if let Err(error) = &outcome {
+                        tracing::trace!(target: "sinomo.dfs.perf", %error,
+                            "metadata-sync-native-catchup-send-failed");
+                    }
                     let status = if outcome.is_err() {
                         "transport-error"
                     } else {
@@ -1802,12 +2036,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             state_fingerprint: target.state_fingerprint.clone(),
             primary_handoff_id: None,
         };
-        let probe = DfsMetadataJournalBatch {
+        let probe = crate::DfsMetadataJournalFrameBatch {
             shard_id: target.shard_id.clone(),
-            // This must remain empty for rolling-upgrade safety: a legacy peer
-            // ignores the new probe fields and processes the command as a
-            // harmless no-op instead of jumping its replay cursor.
-            entries: Vec::new(),
+            journal_frames: Vec::new(),
             next_after_sequence: target.journal_sequence,
         };
 
@@ -1856,8 +2087,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // The canonical metadata route owns both the durable prefix floor and
         // the proof-bound promoted-primary marker. Its authoritative context
         // lookup is independent of the long-lived routed message lane, which
-        // can lag a just-committed handoff generation. Keep routed delivery as
-        // a rolling-upgrade/partial-direct fallback only.
+        // can lag a just-committed handoff generation. Routed delivery uses the
+        // same current request when the direct transport is unavailable.
         let direct_requests = candidates
             .iter()
             .map(|(node_id, command, _)| (node_id.clone(), command.clone()))
@@ -1939,6 +2170,33 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             false,
                         );
                         if accepted {
+                            // Observe this SAME normal direct-probe acceptance.
+                            // It bypasses the routed response handler, which
+                            // records the equivalent consumed return there.
+                            #[cfg(any(test, feature = "test-support"))]
+                            if let Some((expected_target, command, required_confirmation)) =
+                                expected
+                                && let Some((root, owner)) =
+                                    self.native_publication_owner_for_observation()
+                                && let Some(mut trace) =
+                                    crate::native_shard_trace::boundary_interest(
+                                        &root,
+                                        Some(&owner),
+                                        &command.batch.shard_id,
+                                    )
+                            {
+                                trace.observe(
+                                    crate::native_shard_trace::NativeBoundaryFactsV1::SourceJournalResponseAccepted {
+                                        authenticated_source_node_id: source_node_id.clone(),
+                                        response: response.clone(),
+                                        expected_target_node_id: expected_target.clone(),
+                                        expected_next_after_sequence: command.batch.next_after_sequence,
+                                        expected_prefix_only: command.verify_prefix_only,
+                                        expected_confirmation_id: required_confirmation.clone(),
+                                    },
+                                    None, None,
+                                );
+                            }
                             directly_accepted_probes
                                 .insert((source_node_id.clone(), response.request_id));
                             freshly_acknowledged.insert(source_node_id);
@@ -2076,11 +2334,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         target: &DfsMetadataQuorumSyncTarget,
         probe_barrier_id: &str,
         rejected_node_ids: &BTreeSet<NodeId>,
+        source_history_gap_node_ids: &BTreeSet<NodeId>,
         pending_checkpoint_snapshots: &mut BTreeMap<String, MetadataCheckpointSnapshotAttempt>,
         purpose: &MetadataQuorumSyncPurpose,
     ) -> Result<(), DfsError> {
         let attempts = rejected_node_ids
-            .iter()
+            .union(source_history_gap_node_ids)
             .map(|target_node_id| {
                 MetadataCheckpointSnapshotAttempt::for_target(target_node_id.clone(), target)
             })
@@ -2091,7 +2350,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             })
             .collect::<Vec<_>>();
         // Filter before exporting, cloning, or validating the materialized
-        // tables. A settled rejection and an unroutable attempt are terminal
+        // tables. A settled repair and an unroutable attempt are terminal
         // for this exact node/head within this invocation.
         if attempts.is_empty() {
             return Ok(());
@@ -2110,18 +2369,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 &target.state_fingerprint,
             )?,
         };
-        if checkpoint_snapshot.materialized_through_sequence != Some(target.journal_sequence)
-            || !crate::metadata_records::dfs_metadata_table_snapshot_matches_checkpoint(
-                &checkpoint_snapshot,
-                target.journal_sequence,
-                &target.state_fingerprint,
-            )
-            .map_err(|source| DfsError::Serialization {
-                message: format!(
-                    "encode metadata shard {} repair checkpoint: {source}",
-                    target.shard_id.0
-                ),
-            })?
+        // Every supplied image carries the same verified native stream cut.
+        checkpoint_snapshot.validate()?;
+        if !checkpoint_snapshot
+            .descriptor()
+            .matches_checkpoint(target.journal_sequence, &target.state_fingerprint)
         {
             return Err(DfsError::Metadata {
                 message: format!(
@@ -2140,7 +2392,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 "snapshot-repair",
                 None,
                 Some(target.journal_sequence),
-                "incremental catch-up rejected; rebuilding the frozen checkpoint",
+                if source_history_gap_node_ids.contains(&target_node_id) {
+                    "native journal frames unavailable; rebuilding the frozen checkpoint"
+                } else {
+                    "incremental catch-up rejected; rebuilding the frozen checkpoint"
+                },
             );
             let request_id = format!(
                 "dfs_sync_checkpoint_{}_{}",
@@ -2157,7 +2413,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     .map(str::to_string),
                 shard_id: target.shard_id.clone(),
                 next_after_sequence: target.journal_sequence,
-                snapshot: checkpoint_snapshot.clone(),
+                snapshot: checkpoint_snapshot.descriptor().clone(),
+                image: Some(checkpoint_snapshot.clone()),
                 reason: format!(
                     "restore frozen POSIX sync checkpoint {}",
                     target.state_fingerprint
@@ -2401,110 +2658,136 @@ pub(crate) fn metadata_shard_state_fingerprint_at(
 /// later fresh lanes reconstruct the hash chain from the durable marker to the
 /// current exact prefix. A missing entry, sequence gap, divergent digest, or
 /// concurrently moving head leaves the lane fenced for a later retry.
+/// Read-only native inspection of the exact installed anchor or its verified
+/// journal descendant. This grants no mutation authority and never performs
+/// writer recovery. Missing/pruned ancestry returns `None`, never a clock-only
+/// acceptance. The existing bounded exact-frame validator owns all lineage.
+pub fn inspect_metadata_prefix_descendant(
+    root: &Path,
+    shard_id: &DfsMetadataShardId,
+    anchor: &DfsMetadataPrefixProof,
+) -> Result<Option<DfsMetadataPrefixProof>, DfsError> {
+    let mut backend =
+        crate::LocalSobjMetadataBackend::open_for_inspection(shard_id.clone(), root.to_owned())?;
+    backend.begin_inspection_snapshot()?;
+    let initial = DfsMetadataBackend::metadata_prefix_proof(&backend, shard_id)?;
+    let through = initial.as_ref().map_or(0, |prefix| prefix.journal_sequence);
+    let result = metadata_shard_prefix_matches_or_extends_marker_with_reader(
+        &backend,
+        shard_id,
+        anchor.journal_sequence,
+        &anchor.digest,
+        anchor,
+        |after| {
+            // The current-format inspection pins the exact closed prefix.
+            // A converter may already own this root's physical writer fence;
+            // inspecting those durable bytes must not acquire it a second time.
+            let limit = usize::try_from(through.saturating_sub(after))
+                .unwrap_or(usize::MAX)
+                .min(DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT);
+            let entries =
+                crate::metadata_journal::durable_journal_entries_since_limited(root, after, limit)?;
+            Ok(crate::metadata_journal::bounded_metadata_journal_batch(
+                shard_id.clone(),
+                after,
+                entries,
+                limit,
+                DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT,
+            )?)
+        },
+    );
+    backend.end_inspection_snapshot();
+    let proof = result?;
+    if proof.is_none() {
+        return Ok(None);
+    }
+    // DATA inspection grants nothing if its independently re-read current
+    // prefix moved while frames were being checked.
+    backend.begin_inspection_snapshot()?;
+    let final_prefix = DfsMetadataBackend::metadata_prefix_proof(&backend, shard_id);
+    backend.end_inspection_snapshot();
+    if final_prefix? != initial {
+        return Ok(None);
+    }
+    Ok(proof)
+}
+
 fn metadata_shard_prefix_matches_or_extends_marker(
     backend: &dyn DfsMetadataBackend,
     shard_id: &DfsMetadataShardId,
     marker_sequence: u64,
     marker_fingerprint: &str,
-    rebind_prefix_proof: Option<&DfsMetadataPrefixProof>,
-) -> Result<bool, DfsError> {
+    rebind_prefix_proof: &DfsMetadataPrefixProof,
+) -> Result<Option<DfsMetadataPrefixProof>, DfsError> {
+    metadata_shard_prefix_matches_or_extends_marker_with_reader(
+        backend,
+        shard_id,
+        marker_sequence,
+        marker_fingerprint,
+        rebind_prefix_proof,
+        |after| {
+            Ok(backend.journal_batch_for_shard_since_limited(
+                shard_id,
+                after,
+                DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
+                DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT,
+            )?)
+        },
+    )
+}
+
+fn metadata_shard_prefix_matches_or_extends_marker_with_reader(
+    backend: &dyn DfsMetadataBackend,
+    shard_id: &DfsMetadataShardId,
+    marker_sequence: u64,
+    marker_fingerprint: &str,
+    rebind_prefix_proof: &DfsMetadataPrefixProof,
+    mut read_batch: impl FnMut(u64) -> Result<Option<DfsMetadataJournalBatch>, DfsError>,
+) -> Result<Option<DfsMetadataPrefixProof>, DfsError> {
     let Some(current) = backend.metadata_prefix_proof(shard_id)? else {
-        return Ok(false);
+        return Ok(None);
     };
-    let Some(marker) =
-        DfsMetadataPrefixProof::from_digest(marker_sequence, marker_fingerprint.to_string())
-    else {
-        return Ok(false);
-    };
-    let mut reconstructed = rebind_prefix_proof
-        .cloned()
-        .unwrap_or_else(|| marker.clone());
-    let legacy_marker = rebind_prefix_proof.is_none();
+    let mut reconstructed = rebind_prefix_proof.clone();
     if !current.is_well_formed()
-        || !marker.is_well_formed()
         || !reconstructed.is_well_formed()
-        || reconstructed.journal_sequence < marker.journal_sequence
-        || (reconstructed.journal_sequence == marker.journal_sequence
-            && reconstructed.digest != marker.digest)
+        || reconstructed.journal_sequence < marker_sequence
         || current.journal_sequence < reconstructed.journal_sequence
     {
-        return Ok(false);
+        return Ok(None);
+    }
+    if reconstructed.journal_sequence == marker_sequence
+        && reconstructed.digest != marker_fingerprint
+    {
+        return Ok(None);
     }
     while reconstructed.journal_sequence < current.journal_sequence {
-        let Some(batch) = backend.journal_batch_for_shard_since_limited(
-            shard_id,
-            reconstructed.journal_sequence,
-            DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
-            DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT,
-        )?
-        else {
-            return Ok(legacy_marker
-                && reconstructed == marker
-                && current.journal_sequence > marker.journal_sequence);
+        let Some(batch) = read_batch(reconstructed.journal_sequence)? else {
+            return Ok(None);
         };
         if batch.entries.is_empty() || batch.shard_id != *shard_id {
-            return Ok(false);
+            return Ok(None);
         }
-        // V1 proofs hash the decoded journal entry's canonical JSON. Keep
-        // that compatibility path until a successful rebind checkpoints the
-        // current proof in the durable marker. V2 proofs instead authenticate
-        // the exact immutable SOBJ frame bytes.
-        let legacy_current = current.version == DFS_METADATA_PREFIX_PROOF_VERSION;
-        if legacy_current && reconstructed.version != DFS_METADATA_PREFIX_PROOF_VERSION {
-            return Ok(false);
+        let frames = backend.journal_frames_for_batch(&batch)?;
+        if frames.len() != batch.entries.len() {
+            return Ok(None);
         }
-        let frames = if legacy_current {
-            None
-        } else {
-            let frames = backend.journal_frames_for_batch(&batch)?;
-            if frames.len() != batch.entries.len() {
-                return Ok(false);
+        for (entry, frame) in batch.entries.iter().zip(frames) {
+            if entry.shard_id != *shard_id
+                || entry.sequence != reconstructed.journal_sequence.checked_add(1).unwrap_or(0)
+                || entry.sequence > current.journal_sequence
+                || frame.sequence != entry.sequence
+            {
+                return Ok(None);
             }
-            Some(frames)
-        };
-        let previous_sequence = reconstructed.journal_sequence;
-        for (index, entry) in batch.entries.iter().enumerate() {
-            if entry.shard_id != *shard_id {
-                return Ok(false);
-            }
-            if entry.sequence != reconstructed.journal_sequence.saturating_add(1) {
-                return Ok(legacy_marker
-                    && reconstructed == marker
-                    && entry.sequence > marker.journal_sequence.saturating_add(1));
-            }
-            if entry.sequence > current.journal_sequence {
-                return Ok(false);
-            }
-            reconstructed = if legacy_current {
-                dfs_metadata_prefix_proof_after(&reconstructed, entry).map_err(|source| {
-                    DfsError::Metadata {
-                        message: format!(
-                            "encode legacy metadata shard {} handoff extension entry {}: {source}",
-                            shard_id.0, entry.sequence
-                        ),
-                    }
-                })?
-            } else {
-                let frame = frames
-                    .as_ref()
-                    .and_then(|frames| frames.get(index))
-                    .expect("the exact frame count was validated above");
-                if frame.sequence != entry.sequence {
-                    return Ok(false);
-                }
-                metadata_prefix_proof_after_exact_frame(
-                    &reconstructed,
-                    entry,
-                    shard_id,
-                    &frame.exact_bytes,
-                )?
-            };
-        }
-        if reconstructed.journal_sequence <= previous_sequence {
-            return Ok(false);
+            reconstructed = metadata_prefix_proof_after_exact_frame(
+                &reconstructed,
+                entry,
+                shard_id,
+                &frame.exact_bytes,
+            )?;
         }
     }
-    Ok(reconstructed == current)
+    Ok((reconstructed == current).then_some(current))
 }
 
 fn metadata_shard_snapshot_at(
@@ -2512,7 +2795,7 @@ fn metadata_shard_snapshot_at(
     shard_id: &DfsMetadataShardId,
     expected_journal_sequence: u64,
     expected_state_fingerprint: &str,
-) -> Result<crate::DfsMetadataTableSnapshot, DfsError> {
+) -> Result<crate::DfsMetadataSnapshotImage, DfsError> {
     #[cfg(test)]
     DFS_METADATA_SYNC_SNAPSHOT_BUILD_CALLS.set(
         DFS_METADATA_SYNC_SNAPSHOT_BUILD_CALLS
@@ -2520,14 +2803,14 @@ fn metadata_shard_snapshot_at(
             .saturating_add(1),
     );
     let snapshot = backend
-        .export_shard_table_snapshot(shard_id)?
+        .export_shard_snapshot_image(shard_id)?
         .ok_or_else(|| DfsError::Metadata {
             message: format!(
                 "metadata shard {} cannot export a materialized snapshot for a durability proof",
                 shard_id.0
             ),
         })?;
-    let materialized_sequence = snapshot.materialized_through_sequence.unwrap_or_default();
+    let materialized_sequence = snapshot.materialized_through_sequence;
     if materialized_sequence != expected_journal_sequence {
         return Err(DfsError::Metadata {
             message: format!(
@@ -2536,17 +2819,10 @@ fn metadata_shard_snapshot_at(
             ),
         });
     }
-    let matches = crate::metadata_records::dfs_metadata_table_snapshot_matches_checkpoint(
-        &snapshot,
-        expected_journal_sequence,
-        expected_state_fingerprint,
-    )
-    .map_err(|source| DfsError::Serialization {
-        message: format!(
-            "encode metadata shard {} repair checkpoint: {source}",
-            shard_id.0
-        ),
-    })?;
+    snapshot.validate()?;
+    let matches = snapshot
+        .descriptor()
+        .matches_checkpoint(expected_journal_sequence, expected_state_fingerprint);
     if !matches {
         return Err(DfsError::Metadata {
             message: format!(
@@ -2670,818 +2946,74 @@ fn record_metadata_sync_prefix_probe_events(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeSet, VecDeque};
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use sinomo_core::DfsObjectPolicy;
-    use sinomo_core::kv::{InProcessKvStore, KvEntry, KvError, KvRevision, KvTxn, KvTxnResponse};
-    use sinomo_core::network::{NetworkError, ObjectRpcRequest};
-
     use super::*;
-    use crate::{
-        DfsControlPlaneKvClient, DfsFileSystem, DfsMetadataJournalBatchResponse,
-        DfsMetadataJournalBatchResult, DfsMetadataShardAssignment,
-        DfsMetadataSnapshotInstallResponse, DfsMetadataSnapshotInstallResult, DfsNetworkMessage,
-        DfsRoutedCall, DfsRoutedMessage, DfsTransportIdentity, LocalContentStore,
-        LocalShardedMetadataBackend, LocalSobjMetadataBackend, SharedDfsControlPlaneKvClient,
-        build_dfs_routed_message, directory_object, sifs_file_system_id,
-    };
+    use crate::*;
 
-    #[derive(Debug)]
-    struct RefreshCountingControlPlane {
-        inner: InProcessKvStore,
-        refresh_calls: Arc<AtomicUsize>,
-    }
-
-    impl DfsControlPlaneKvClient for RefreshCountingControlPlane {
-        fn refresh_latest(&mut self) -> Result<(), KvError> {
-            self.refresh_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
-
-        fn get(&self, key: &str) -> Result<Option<KvEntry>, KvError> {
-            DfsControlPlaneKvClient::get(&self.inner, key)
-        }
-
-        fn range_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>, KvError> {
-            DfsControlPlaneKvClient::range_prefix(&self.inner, prefix)
-        }
-
-        fn put(&mut self, key: String, value: Vec<u8>) -> Result<KvRevision, KvError> {
-            DfsControlPlaneKvClient::put(&mut self.inner, key, value)
-        }
-
-        fn txn(&mut self, txn: KvTxn) -> Result<KvTxnResponse, KvError> {
-            DfsControlPlaneKvClient::txn(&mut self.inner, txn)
-        }
-    }
-
-    #[derive(Debug)]
-    struct MetadataAckTransport {
-        local_node_id: NodeId,
-        acknowledged_nodes: BTreeSet<NodeId>,
-        // Opt-in receivers validate actual durable journal and prefix proofs.
-        checkpoint_receivers: BTreeMap<
-            NodeId,
-            (
-                LocalSobjMetadataBackend,
-                crate::DfsMetadataReplicaShardContext,
-            ),
-        >,
-        checkpoint_exchanges: Vec<(
-            NodeId,
-            DfsMetadataJournalBatchCommand,
-            DfsMetadataJournalBatchResponse,
-        )>,
-        // A second real writer races a frozen probe while this service's
-        // reader remains stale. This is test-only; all receiver proofs below
-        // still come from normal validated journal ingest.
-        checkpoint_advance_on_first_probe: Option<(LocalSobjMetadataBackend, DfsObjectMetadata)>,
-        checkpoint_advance_sequence: Option<u64>,
-        direct_prefix_nodes: BTreeSet<NodeId>,
-        direct_catchup_nodes: BTreeSet<NodeId>,
-        direct_prefix_probe_count: usize,
-        direct_catchup_batch_count: usize,
-        direct_catchup_request_count: usize,
-        omit_direct_misses: bool,
-        routed_prefix_probe_count: usize,
-        routed_fanout_max_inflight: Vec<usize>,
-        routed_fanout_targets: Vec<Vec<NodeId>>,
-        catchup_rpc_requests: Vec<(usize, ObjectRpcRequest)>,
-        snapshot_install_count: usize,
-        reject_catchup_batches: bool,
-        reject_prefix_probes: bool,
-        reject_snapshot_installs: bool,
-        unroutable_nodes: BTreeSet<NodeId>,
-        network_error_nodes: BTreeSet<NodeId>,
-        hold_network_errors_until_operation_deadline: bool,
-        fail_direct_journal_fanout: bool,
-        fail_direct_after_operation_deadline: bool,
-        omit_direct_catchup_confirmation: bool,
-        echoes_prefix_verification: bool,
-        response_sequence_override: Option<u64>,
-        incoming: VecDeque<DfsRoutedMessage>,
-        next_frame_id: u64,
-        operation_deadline: Option<Instant>,
-    }
-
-    impl MetadataAckTransport {
-        fn new(
-            local_node_id: NodeId,
-            acknowledged_nodes: impl IntoIterator<Item = NodeId>,
-        ) -> Self {
-            Self {
-                local_node_id,
-                acknowledged_nodes: acknowledged_nodes.into_iter().collect(),
-                checkpoint_receivers: BTreeMap::new(),
-                checkpoint_exchanges: Vec::new(),
-                checkpoint_advance_on_first_probe: None,
-                checkpoint_advance_sequence: None,
-                direct_prefix_nodes: BTreeSet::new(),
-                direct_catchup_nodes: BTreeSet::new(),
-                direct_prefix_probe_count: 0,
-                direct_catchup_batch_count: 0,
-                direct_catchup_request_count: 0,
-                omit_direct_misses: false,
-                routed_prefix_probe_count: 0,
-                routed_fanout_max_inflight: Vec::new(),
-                routed_fanout_targets: Vec::new(),
-                catchup_rpc_requests: Vec::new(),
-                snapshot_install_count: 0,
-                reject_catchup_batches: false,
-                reject_prefix_probes: false,
-                reject_snapshot_installs: false,
-                unroutable_nodes: BTreeSet::new(),
-                network_error_nodes: BTreeSet::new(),
-                hold_network_errors_until_operation_deadline: false,
-                fail_direct_journal_fanout: false,
-                fail_direct_after_operation_deadline: false,
-                omit_direct_catchup_confirmation: false,
-                echoes_prefix_verification: true,
-                response_sequence_override: None,
-                incoming: VecDeque::new(),
-                next_frame_id: 1,
-                operation_deadline: None,
-            }
-        }
-    }
-
-    impl DfsTransportIdentity for MetadataAckTransport {
-        fn local_node_id(&self) -> &NodeId {
-            &self.local_node_id
-        }
-    }
-
-    impl DfsMessageTransport for MetadataAckTransport {
-        fn send_routed_call(
-            &mut self,
-            target_node_id: &NodeId,
-            call: DfsRoutedCall,
-        ) -> Result<(), NetworkError> {
-            let message = crate::materialize_dfs_routed_call_sync(call)?;
-            if self.unroutable_nodes.contains(target_node_id) {
-                return Err(NetworkError::UnknownNode {
-                    node_id: target_node_id.clone(),
-                });
-            }
-            if self.network_error_nodes.contains(target_node_id) {
-                if self.hold_network_errors_until_operation_deadline
-                    && let Some(deadline) = self.operation_deadline
-                {
-                    std::thread::sleep(
-                        deadline
-                            .saturating_duration_since(Instant::now())
-                            .saturating_add(Duration::from_millis(1)),
-                    );
-                }
-                return Err(NetworkError::Io {
-                    operation: format!("send metadata sync probe to {target_node_id}"),
-                    detail: "test peer is offline after route selection".to_string(),
-                });
-            }
-            match &message.message {
-                DfsNetworkMessage::MetadataJournalBatch(command) if command.verify_prefix_only => {
-                    self.routed_prefix_probe_count =
-                        self.routed_prefix_probe_count.saturating_add(1);
-                }
-                DfsNetworkMessage::MetadataJournalBatch(command)
-                    if !command.verify_prefix_only
-                        && (command.durable_replication.is_some()
-                            || !command.batch.entries.is_empty()) =>
-                {
-                    let batch_bytes = command
-                        .durable_replication
-                        .as_ref()
-                        .map(|replication| {
-                            replication
-                                .journal_frames
-                                .iter()
-                                .map(|frame| frame.exact_bytes.len())
-                                .sum()
-                        })
-                        .unwrap_or_else(|| {
-                            crate::metadata_journal::metadata_journal_batch_encoded_len(
-                                &command.batch,
-                            )
-                            .expect("encode captured metadata catch-up batch")
-                        });
-                    let request =
-                        crate::routes::dfs_message_rpc_request(&crate::DfsMessageCommand {
-                            request_id: format!("dfs_message_{}", message.frame_id),
-                            routed_message: message.clone(),
-                        })
-                        .expect("encode captured routed metadata catch-up RPC");
-                    self.catchup_rpc_requests.push((batch_bytes, request));
-                }
-                DfsNetworkMessage::MetadataSnapshotInstall(_) => {
-                    self.snapshot_install_count = self.snapshot_install_count.saturating_add(1);
-                }
-                _ => {}
-            }
-            if let DfsNetworkMessage::MetadataJournalBatch(command) = &message.message
-                && command.verify_prefix_only
-                && let Some((mut writer, object)) = self.checkpoint_advance_on_first_probe.take()
-            {
-                let old_head = writer.journal_last_sequence();
-                assert!(old_head >= command.batch.next_after_sequence);
-                writer
-                    .put_object(&object)
-                    .expect("second writer publishes a real successor");
-                let batch = writer
-                    .journal_batch_for_shard_since_limited(
-                        &command.batch.shard_id,
-                        command.batch.next_after_sequence,
-                        DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
-                        DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT,
-                    )
-                    .expect("second writer's durable suffix")
-                    .expect("one newly committed frame");
-                let prepared =
-                    crate::metadata_replication::prepare_dfs_metadata_journal_frame_batch(
-                        &writer, &batch,
-                    )
-                    .expect("exact successor frames");
-                self.checkpoint_advance_sequence = Some(writer.journal_last_sequence());
-                for (peer, (receiver, context)) in &mut self.checkpoint_receivers {
-                    let mut advance =
-                        crate::metadata_replication::dfs_metadata_durable_journal_batch_command(
-                            &self.local_node_id,
-                            peer,
-                            &context.shard.file_system_id,
-                            context.shard.epoch,
-                            prepared.clone(),
-                            false,
-                        );
-                    advance.request_id = format!("second-writer-{peer}");
-                    let confirmation = advance
-                        .durable_replication
-                        .as_ref()
-                        .unwrap()
-                        .confirmation_id
-                        .clone();
-                    let response = crate::metadata_replication::process_dfs_metadata_journal_batch(
-                        receiver,
-                        Some(context),
-                        advance.clone(),
-                    );
-                    assert_eq!(response.result, DfsMetadataJournalBatchResult::Applied);
-                    assert_eq!(response.verified_authority_probe_id, Some(confirmation));
-                    self.checkpoint_exchanges
-                        .push((peer.clone(), advance, response));
-                }
-            }
-            if let DfsNetworkMessage::MetadataJournalBatch(command) = &message.message
-                && let Some((receiver, context)) = self.checkpoint_receivers.get_mut(target_node_id)
-            {
-                let response = crate::metadata_replication::process_dfs_metadata_journal_batch(
-                    receiver,
-                    Some(context),
-                    command.clone(),
-                );
-                self.checkpoint_exchanges.push((
-                    target_node_id.clone(),
-                    command.clone(),
-                    response.clone(),
-                ));
-                let frame_id = self.next_frame_id;
-                self.next_frame_id += 1;
-                self.incoming.push_back(build_dfs_routed_message(
-                    target_node_id,
-                    &self.local_node_id,
-                    frame_id,
-                    frame_id,
-                    DfsNetworkMessage::MetadataJournalBatchResponse(response),
-                ));
-                return Ok(());
-            }
-            if !self.acknowledged_nodes.contains(target_node_id) {
-                return Ok(());
-            }
-            let frame_id = self.next_frame_id;
-            self.next_frame_id += 1;
-            let response = match message.message {
-                DfsNetworkMessage::MetadataJournalBatch(command) => {
-                    let rejected = (command.verify_prefix_only && self.reject_prefix_probes)
-                        || (!command.verify_prefix_only && self.reject_catchup_batches);
-                    let verified_authority_probe_id = (!rejected)
-                        .then(|| {
-                            command
-                                .durable_replication
-                                .as_ref()
-                                .map(|replication| replication.confirmation_id.clone())
-                                .or_else(|| {
-                                    command
-                                        .prefix_probe
-                                        .as_ref()
-                                        .and_then(|probe| probe.primary_handoff_id.clone())
-                                })
-                                .or_else(|| {
-                                    command.authority_probe.as_ref().and_then(
-                                        crate::service_replica::metadata_authority_probe_confirmation_id,
-                                    )
-                                })
-                        })
-                        .flatten();
-                    DfsNetworkMessage::MetadataJournalBatchResponse(
-                        DfsMetadataJournalBatchResponse {
-                            request_id: command.request_id,
-                            shard_id: command.batch.shard_id,
-                            next_after_sequence: self
-                                .response_sequence_override
-                                .unwrap_or(command.batch.next_after_sequence),
-                            applied_entries: if rejected {
-                                0
-                            } else {
-                                command
-                                    .durable_replication
-                                    .as_ref()
-                                    .map(|replication| replication.journal_frames.len())
-                                    .unwrap_or(command.batch.entries.len())
-                            },
-                            verified_prefix_only: !rejected
-                                && command.verify_prefix_only
-                                && self.echoes_prefix_verification,
-                            verified_authority_probe_id,
-                            result: if rejected {
-                                DfsMetadataJournalBatchResult::Rejected {
-                                    reason: "test metadata journal rejection".to_string(),
-                                    code: None,
-                                }
-                            } else {
-                                DfsMetadataJournalBatchResult::Applied
-                            },
-                        },
-                    )
-                }
-                DfsNetworkMessage::MetadataSnapshotInstall(command) => {
-                    DfsNetworkMessage::MetadataSnapshotInstallResponse(
-                        DfsMetadataSnapshotInstallResponse {
-                            request_id: command.request_id,
-                            shard_id: command.shard_id,
-                            next_after_sequence: command.next_after_sequence,
-                            result: if self.reject_snapshot_installs {
-                                DfsMetadataSnapshotInstallResult::Rejected {
-                                    reason: "test snapshot rejection".to_string(),
-                                    code: None,
-                                }
-                            } else {
-                                DfsMetadataSnapshotInstallResult::Installed {
-                                    archived_existing: false,
-                                }
-                            },
-                        },
-                    )
-                }
-                _ => return Ok(()),
-            };
-            self.incoming.push_back(build_dfs_routed_message(
-                target_node_id,
-                &self.local_node_id,
-                frame_id,
-                frame_id,
-                response,
-            ));
-            Ok(())
-        }
-
-        fn send_routed_calls_bounded(
-            &mut self,
-            requests: Vec<crate::DfsRoutedSend>,
-            max_inflight: usize,
-        ) -> Result<Vec<crate::DfsRoutedSendOutcome>, NetworkError> {
-            self.routed_fanout_max_inflight.push(max_inflight);
-            self.routed_fanout_targets.push(
-                requests
-                    .iter()
-                    .map(|request| request.target_node_id.clone())
-                    .collect(),
-            );
-            let mut pending = requests.into_iter().enumerate().collect::<Vec<_>>();
-            if self.hold_network_errors_until_operation_deadline && max_inflight > 1 {
-                pending.sort_by_key(|(_, request)| {
-                    self.network_error_nodes.contains(&request.target_node_id)
-                });
-            }
-            let mut outcomes = std::iter::repeat_with(|| None)
-                .take(pending.len())
-                .collect::<Vec<Option<crate::DfsRoutedSendOutcome>>>();
-            for (index, request) in pending {
-                let target_node_id = request.target_node_id;
-                let result = self.send_routed_call(&target_node_id, request.call);
-                outcomes[index] = Some(crate::DfsRoutedSendOutcome {
-                    target_node_id,
-                    result,
-                });
-            }
-            outcomes
-                .into_iter()
-                .map(|outcome| {
-                    outcome.ok_or_else(|| NetworkError::Serialization {
-                        detail: "test routed fan-out omitted an outcome".to_string(),
-                    })
-                })
-                .collect()
-        }
-
-        fn send_metadata_journal_batches_direct(
-            &mut self,
-            requests: &[(NodeId, DfsMetadataJournalBatchCommand)],
-        ) -> Result<Option<Vec<(NodeId, DfsMetadataJournalBatchResponse)>>, NetworkError> {
-            assert!(
-                requests.iter().all(|(_, command)| command
-                    .durable_replication
-                    .as_ref()
-                    .is_none_or(|replication| !replication.background_publication)),
-                "durability and handoff barriers must retain foreground catch-up priority"
-            );
-            if self.fail_direct_journal_fanout {
-                return Err(NetworkError::Io {
-                    operation: "send direct test metadata journal batch".to_string(),
-                    detail: "test direct metadata route is unavailable".to_string(),
-                });
-            }
-            if self.fail_direct_after_operation_deadline
-                && self
-                    .operation_deadline
-                    .is_some_and(|deadline| Instant::now() >= deadline)
-            {
-                return Err(NetworkError::Io {
-                    operation: "send direct test metadata journal batch".to_string(),
-                    detail: "DFS operation deadline expired before routed send".to_string(),
-                });
-            }
-            let prefix_only = requests
-                .iter()
-                .all(|(_, command)| command.verify_prefix_only);
-            let catchup_only = requests
-                .iter()
-                .all(|(_, command)| !command.verify_prefix_only);
-            if !prefix_only && !catchup_only {
-                return Ok(None);
-            }
-            if prefix_only {
-                if self.direct_prefix_nodes.is_empty() {
-                    return Ok(None);
-                }
-                self.direct_prefix_probe_count = self
-                    .direct_prefix_probe_count
-                    .saturating_add(requests.len());
-            } else {
-                if self.direct_catchup_nodes.is_empty() {
-                    return Ok(None);
-                }
-                self.direct_catchup_batch_count = self.direct_catchup_batch_count.saturating_add(1);
-                self.direct_catchup_request_count = self
-                    .direct_catchup_request_count
-                    .saturating_add(requests.len());
-            }
-            Ok(Some(
-                requests
-                    .iter()
-                    .rev()
-                    .filter(|(target_node_id, _)| {
-                        !self.omit_direct_misses
-                            || if prefix_only {
-                                self.direct_prefix_nodes.contains(target_node_id)
-                            } else {
-                                self.direct_catchup_nodes.contains(target_node_id)
-                            }
-                    })
-                    .map(|(target_node_id, command)| {
-                        let accepted = if prefix_only {
-                            self.direct_prefix_nodes.contains(target_node_id)
-                        } else {
-                            self.direct_catchup_nodes.contains(target_node_id)
-                        };
-                        (
-                            target_node_id.clone(),
-                            DfsMetadataJournalBatchResponse {
-                                request_id: command.request_id.clone(),
-                                shard_id: command.batch.shard_id.clone(),
-                                next_after_sequence: command.batch.next_after_sequence,
-                                applied_entries: if accepted {
-                                    command
-                                        .durable_replication
-                                        .as_ref()
-                                        .map(|replication| replication.journal_frames.len())
-                                        .unwrap_or(command.batch.entries.len())
-                                } else {
-                                    0
-                                },
-                                verified_prefix_only: prefix_only && accepted,
-                                verified_authority_probe_id: (accepted
-                                    && !(catchup_only && self.omit_direct_catchup_confirmation))
-                                    .then(|| {
-                                        command
-                                            .durable_replication
-                                            .as_ref()
-                                            .map(|replication| replication.confirmation_id.clone())
-                                            .or_else(|| {
-                                                command.prefix_probe.as_ref().and_then(|probe| {
-                                                    probe.primary_handoff_id.clone()
-                                                })
-                                            })
-                                    })
-                                    .flatten(),
-                                result: if accepted {
-                                    DfsMetadataJournalBatchResult::Applied
-                                } else {
-                                    DfsMetadataJournalBatchResult::Rejected {
-                                        reason: "direct prefix mismatch".to_string(),
-                                        code: None,
-                                    }
-                                },
-                            },
-                        )
-                    })
-                    .collect(),
-            ))
-        }
-
-        fn drain_incoming_messages(&mut self) -> Result<Vec<DfsRoutedMessage>, NetworkError> {
-            Ok(self.incoming.drain(..).collect())
-        }
-
-        fn pending_incoming_count(&self) -> Result<Option<usize>, NetworkError> {
-            Ok(Some(self.incoming.len()))
-        }
-
-        fn set_operation_deadline(&mut self, deadline: Option<Instant>) -> Option<Instant> {
-            std::mem::replace(&mut self.operation_deadline, deadline)
-        }
-
-        fn operation_deadline(&self) -> Option<Instant> {
-            self.operation_deadline
-        }
-    }
-
-    #[derive(Clone, Debug)]
-    struct CountingSyncControlPlane {
-        inner: InProcessKvStore,
-        txn_calls: Arc<AtomicUsize>,
-    }
-
-    impl DfsControlPlaneKvClient for CountingSyncControlPlane {
-        fn get(&self, key: &str) -> Result<Option<KvEntry>, KvError> {
-            DfsControlPlaneKvClient::get(&self.inner, key)
-        }
-
-        fn range_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>, KvError> {
-            DfsControlPlaneKvClient::range_prefix(&self.inner, prefix)
-        }
-
-        fn put(&mut self, key: String, value: Vec<u8>) -> Result<KvRevision, KvError> {
-            DfsControlPlaneKvClient::put(&mut self.inner, key, value)
-        }
-
-        fn txn(&mut self, txn: KvTxn) -> Result<KvTxnResponse, KvError> {
-            self.txn_calls.fetch_add(1, Ordering::SeqCst);
-            DfsControlPlaneKvClient::txn(&mut self.inner, txn)
-        }
-    }
-
-    struct ConfiguredSyncFixture {
-        root: sinomo_testdir::TestDir,
-        control_plane: SharedDfsControlPlaneKvClient<CountingSyncControlPlane>,
-        service: NetworkedDfsService<MetadataAckTransport>,
+    struct NormalSyncFixture {
+        // Drop the live client/metadata lease before the owning runtime.
+        service: NetworkedDfsService<crate::DfsNodeTransport>,
+        runtime: crate::test_runtime::DfsTestRuntime,
+        control_plane_probe: crate::test_runtime::DfsTestControlPlaneProbe,
         object: DfsObjectMetadata,
         shard: DfsMetadataShardConfig,
-        txn_calls: Arc<AtomicUsize>,
     }
 
-    fn node(name: &str) -> NodeId {
-        NodeId::from_legacy_named(name).expect("test node id")
-    }
-
-    fn configured_sync_fixture(
-        name: &str,
-        replica_node_ids: Vec<NodeId>,
-        acknowledged_nodes: Vec<NodeId>,
-    ) -> ConfiguredSyncFixture {
-        let root = sinomo_testdir::TestDir::new(&format!("sinomo-dfs-sync-{name}"));
-        let owner = node(&format!("node_{name}_owner"));
-        let file_system_id = sifs_file_system_id();
-        let txn_calls = Arc::new(AtomicUsize::new(0));
-        let control_plane = SharedDfsControlPlaneKvClient::new(CountingSyncControlPlane {
-            inner: InProcessKvStore::new(),
-            txn_calls: Arc::clone(&txn_calls),
-        });
-        let shard = DfsMetadataShardConfig {
-            file_system_id: file_system_id.clone(),
-            shard_id: "root".to_string(),
-            primary_node_id: owner.clone(),
-            replica_node_ids,
-            epoch: 7,
-            assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
-            default_policy: DfsObjectPolicy::ReplicatedEventual,
-        };
-        control_plane.with_client(|kv| {
-            DfsControlPlaneStore::new(kv)
-                .put_metadata_shard(&shard)
-                .expect("metadata shard config");
-        });
-        let object = directory_object("/", owner.clone());
-        let mut backend = LocalSobjMetadataBackend::new(
-            DfsMetadataShardId::new("root"),
-            root.path().join("metadata"),
-        )
-        .expect("metadata backend");
-        backend
-            .put_file_system(&DfsFileSystem::sifs(owner.clone()))
-            .expect("filesystem");
-        backend.put_object(&object).expect("root metadata");
-        let service = NetworkedDfsService::new(
-            MetadataAckTransport::new(owner.clone(), acknowledged_nodes),
-            LocalContentStore::new(root.path().join("content")).expect("content store"),
-        )
-        .with_control_plane(control_plane.clone())
-        .with_metadata_backend(backend)
-        .expect("metadata-backed service");
-        txn_calls.store(0, Ordering::SeqCst);
-        ConfiguredSyncFixture {
-            root,
-            control_plane,
+    fn configured_normal_sync_fixture(name: &str, replicas: Vec<NodeId>) -> NormalSyncFixture {
+        let owner = crate::test_runtime::DfsTestRuntime::ordered_node_ids(name, replicas.len() + 1)
+            .remove(0);
+        let mut runtime = crate::test_runtime::DfsTestRuntime::new(name, owner.clone())
+            .expect("normal sync runtime");
+        for replica in &replicas {
+            runtime
+                .define_node(replica.clone())
+                .expect("define real replica");
+        }
+        runtime
+            .start_nodes()
+            .expect("ready real Embedded receivers");
+        let shard = runtime.root_shard().expect("normal planned root shard");
+        let (mut service, control_plane_probe) = runtime
+            .client_with_control_plane_probe(&owner)
+            .expect("normal observed primary client");
+        service
+            .bootstrap_distributed_sifs()
+            .expect("normal filesystem bootstrap");
+        let object = service
+            .metadata_backend()
+            .expect("normal metadata backend")
+            .get_object_by_path_on_shard(
+                &DfsMetadataShardId::new("root"),
+                &shard.file_system_id,
+                "/",
+            )
+            .expect("read canonical root object")
+            .expect("bootstrapped root");
+        // This real source-only mutation keeps the fixture's target ahead of
+        // bootstrap receipts without manufacturing any receiver acknowledgement.
+        let mut filesystem = runtime.file_system();
+        filesystem.display_name = format!("normal-sync-{name}");
+        service
+            .add_file_system(filesystem)
+            .expect("append real target generation");
+        NormalSyncFixture {
             service,
+            runtime,
+            control_plane_probe,
             object,
             shard,
-            txn_calls,
         }
     }
 
-    fn complete_local_membership_handoff(
-        control_plane: &SharedDfsControlPlaneKvClient<InProcessKvStore>,
-        backend: &mut LocalSobjMetadataBackend,
-        retiring: &DfsMetadataShardConfig,
-        desired: &DfsMetadataShardConfig,
-    ) -> DfsMetadataShardMembershipHandoff {
-        let handoff = control_plane.with_client(|kv| {
-            DfsControlPlaneStore::new(kv)
-                .begin_metadata_shard_membership_handoff(retiring, desired)
-                .expect("begin local membership handoff")
-                .expect("retiring assignment remains exact")
-        });
-        let shard_id = DfsMetadataShardId::new(retiring.shard_id.clone());
-        let freeze = backend
-            .freeze_metadata_shard_for_membership_handoff(
-                &shard_id,
-                &handoff.handoff_id,
-                retiring.epoch,
-            )
-            .expect("freeze local retiring generation")
-            .expect("local retiring shard");
-        let fence = DfsMetadataShardMembershipHandoffFence {
-            handoff_id: handoff.handoff_id.clone(),
-            primary_node_id: retiring.primary_node_id.clone(),
-            journal_sequence: freeze.journal_sequence,
-            state_fingerprint: freeze.state_fingerprint.clone(),
-        };
-        let acknowledged = control_plane.with_client(|kv| {
-            DfsControlPlaneStore::new(kv)
-                .acknowledge_metadata_shard_membership_handoff_fence(&handoff, &fence)
-                .expect("acknowledge local retiring fence")
-                .expect("pending handoff remains exact")
-        });
-        let acknowledged_node_ids = std::iter::once(retiring.primary_node_id.clone())
-            .chain(retiring.replica_node_ids.iter().cloned())
-            .chain(desired.replica_node_ids.iter().cloned())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        let proof = DfsMetadataShardMembershipHandoffProof {
-            handoff_id: acknowledged.handoff_id.clone(),
-            retiring_shard: retiring.clone(),
-            desired_shard: desired.clone(),
-            journal_sequence: freeze.journal_sequence,
-            state_fingerprint: freeze.state_fingerprint,
-            acknowledged_node_ids,
-        };
-        assert!(control_plane.with_client(|kv| {
-            DfsControlPlaneStore::new(kv)
-                .complete_metadata_shard_membership_handoff(retiring, desired, &proof)
-                .expect("complete exact local membership handoff")
-        }));
-        handoff
-    }
-
-    #[test]
-    fn stale_same_id_lookup_does_not_rebind_completed_handoff_or_write_repair_state() {
-        let root = sinomo_testdir::TestDir::new("sinomo-dfs-stale-lookup-no-rebind");
-        let local = node("node_stale_lookup_local");
-        let requester = node("node_stale_lookup_requester");
-        let replacement_replica = node("node_stale_lookup_replacement");
-        let file_system_id = sifs_file_system_id();
-        let retiring = DfsMetadataShardConfig {
-            file_system_id: file_system_id.clone(),
-            shard_id: "root".to_string(),
-            primary_node_id: local.clone(),
-            replica_node_ids: vec![requester.clone()],
-            epoch: 17,
-            assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
-            default_policy: DfsObjectPolicy::ReplicatedEventual,
-        };
-        let desired = DfsMetadataShardConfig {
-            replica_node_ids: vec![replacement_replica],
-            epoch: retiring.epoch + 1,
-            ..retiring.clone()
-        };
-        let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
-        control_plane.with_client(|kv| {
-            DfsControlPlaneStore::new(kv)
-                .put_metadata_shard(&retiring)
-                .expect("retiring shard config");
-        });
-
-        let shard_id = DfsMetadataShardId::new("root");
-        let mut backend =
-            LocalSobjMetadataBackend::new(shard_id.clone(), root.path().join("metadata"))
-                .expect("metadata backend");
-        backend
-            .put_file_system(&DfsFileSystem::sifs(local.clone()))
-            .expect("filesystem");
-        backend
-            .put_object(&directory_object("/", local.clone()))
-            .expect("root object");
-        let handoff =
-            complete_local_membership_handoff(&control_plane, &mut backend, &retiring, &desired);
-        assert!(
-            backend
-                .metadata_shard_authoritative_writes_frozen(&shard_id)
-                .expect("pre-request handoff fence")
-        );
-
-        let mut service = NetworkedDfsService::new(
-            MetadataAckTransport::new(local.clone(), []),
-            LocalContentStore::new(root.path().join("content")).expect("content store"),
-        )
-        .with_control_plane(control_plane)
-        .with_metadata_backend(backend)
-        .expect("metadata-backed service");
-        let committed_work = crate::DfsCommittedWorkTracker::new();
-        service.set_committed_work_tracker(committed_work.clone());
-        crate::metadata_backend::reset_metadata_journal_write_count();
-        crate::service_hydration::reset_full_metadata_hydration_calls();
-
-        for (request_id, operation) in [
-            (
-                "stale-same-id-lookup-path",
-                crate::DfsNamespaceOperation::LookupPath {
-                    path: "/".to_string(),
-                    inline_range: None,
-                },
-            ),
-            (
-                "stale-same-id-lookup-paths",
-                crate::DfsNamespaceOperation::LookupPaths {
-                    paths: vec!["/".to_string()],
-                },
-            ),
-        ] {
-            let event = service
-                .handle_namespace_request(
-                    requester.clone(),
-                    crate::DfsNamespaceCommand {
-                        request_id: request_id.to_string(),
-                        file_system_id: file_system_id.clone(),
-                        requesting_node_id: requester.clone(),
-                        include_metadata_journal_batches: false,
-                        metadata_journal_after_sequences: Vec::new(),
-                        authority_shards: vec![retiring.clone()],
-                        operation,
-                    },
-                )
-                .expect("serve stale stamped lookup");
-
-            assert!(matches!(
-                event,
-                NetworkedDfsServiceEvent::RemoteNamespaceServed {
-                    result: crate::DfsNamespaceResult::Rejected { ref reason, .. },
-                    mutates_metadata: false,
-                    ..
-                } if reason.contains("authority shard stamp")
-            ));
+    impl NormalSyncFixture {
+        fn finish(self) {
+            let Self {
+                service, runtime, ..
+            } = self;
+            drop(service);
+            runtime
+                .close()
+                .expect("normal sync runtime closes all owned work");
         }
-        assert_eq!(crate::metadata_backend::metadata_journal_write_count(), 0);
-        assert_eq!(crate::service_hydration::full_metadata_hydration_calls(), 0);
-        assert_eq!(committed_work.take(), Default::default());
-        assert!(service.durable_repair_queue_records().is_empty());
-        let marker = service
-            .metadata_backend()
-            .expect("metadata backend")
-            .metadata_shard_write_freeze(&shard_id)
-            .expect("post-request handoff fence")
-            .expect("handoff marker remains durable");
-        assert_eq!(marker.handoff_id, handoff.handoff_id);
-        assert_eq!(marker.activated_epoch, None);
-        assert!(
-            service
-                .metadata_backend()
-                .expect("metadata backend")
-                .metadata_shard_authoritative_writes_frozen(&shard_id)
-                .expect("lookup leaves writer fenced")
-        );
     }
 
     #[test]
@@ -3493,1570 +3025,72 @@ mod tests {
     }
 
     #[test]
-    fn posix_catchup_uses_direct_batch_and_advances_all_replica_cursors() {
-        let replicas = (0..3)
-            .map(|index| node(&format!("node_sync_direct_catchup_replica_{index}")))
-            .collect::<Vec<_>>();
-        let mut fixture =
-            configured_sync_fixture("direct_catchup", replicas.clone(), replicas.clone());
-        fixture.service.transport.direct_catchup_nodes = replicas.iter().cloned().collect();
-        let target = fixture
-            .service
-            .capture_metadata_quorum_sync_target(&fixture.object)
-            .expect("capture direct catch-up target");
-        let mut pending_catchups = BTreeMap::new();
-        fixture
-            .service
-            .send_metadata_sync_catchup_batches(
-                &target,
-                "direct-catchup-probe",
-                &mut pending_catchups,
-                &mut MetadataSyncAttemptDiagnostics::default(),
-            )
-            .expect("send concurrent direct catch-up batch");
-
-        assert_eq!(fixture.service.transport.direct_catchup_batch_count, 1);
-        assert_eq!(
-            fixture.service.transport.direct_catchup_request_count,
-            replicas.len()
-        );
-        assert!(
-            fixture.service.transport.catchup_rpc_requests.is_empty(),
-            "the canonical direct batch must avoid the sequential routed fallback"
-        );
-        assert!(
-            fixture
-                .service
-                .replication
-                .pending_metadata_replications
-                .is_empty()
-        );
-        let backend = fixture
-            .service
-            .metadata_backend
-            .as_deref()
-            .expect("metadata backend");
-        for replica in replicas {
-            assert_eq!(
-                backend
-                    .metadata_replication_cursor(&replica, &target.shard_id)
-                    .expect("replica cursor"),
-                target.journal_sequence,
-                "reversed direct responses must settle every replica independently"
-            );
-        }
-    }
-
-    #[test]
-    fn partial_direct_catchup_routes_only_unresolved_replicas() {
-        let replicas = (0..3)
-            .map(|index| node(&format!("node_sync_partial_direct_catchup_replica_{index}")))
-            .collect::<Vec<_>>();
-        let mut fixture =
-            configured_sync_fixture("partial_direct_catchup", replicas.clone(), replicas.clone());
-        fixture
-            .service
-            .transport
-            .direct_catchup_nodes
-            .insert(replicas[0].clone());
-        fixture.service.transport.omit_direct_misses = true;
-        let target = fixture
-            .service
-            .capture_metadata_quorum_sync_target(&fixture.object)
-            .expect("capture partial direct catch-up target");
-        let mut pending_catchups = BTreeMap::new();
-        fixture
-            .service
-            .send_metadata_sync_catchup_batches(
-                &target,
-                "partial-direct-catchup-probe",
-                &mut pending_catchups,
-                &mut MetadataSyncAttemptDiagnostics::default(),
-            )
-            .expect("fall back omitted direct catch-ups to routed sends");
-
-        assert_eq!(fixture.service.transport.direct_catchup_batch_count, 1);
-        assert_eq!(
-            fixture.service.transport.direct_catchup_request_count,
-            replicas.len()
-        );
-        assert_eq!(
-            fixture.service.transport.catchup_rpc_requests.len(),
-            replicas.len() - 1,
-            "only direct omissions should use the routed fallback"
-        );
-        assert_eq!(
-            fixture
-                .service
-                .replication
-                .pending_metadata_replications
-                .len(),
-            replicas.len() - 1,
-            "routed omissions must remain request-scoped until their replies arrive"
-        );
-
-        fixture
-            .service
-            .process_incoming()
-            .expect("settle routed catch-up responses");
-        let backend = fixture
-            .service
-            .metadata_backend
-            .as_deref()
-            .expect("metadata backend");
-        for replica in replicas {
-            assert_eq!(
-                backend
-                    .metadata_replication_cursor(&replica, &target.shard_id)
-                    .expect("replica cursor"),
-                target.journal_sequence,
-                "direct and routed siblings must converge on the same frozen prefix"
-            );
-        }
-        assert!(
-            fixture
-                .service
-                .replication
-                .pending_metadata_replications
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn partial_direct_prefix_probe_routes_only_unresolved_replicas() {
-        let replicas = (0..3)
-            .map(|index| node(&format!("node_sync_partial_direct_prefix_replica_{index}")))
-            .collect::<Vec<_>>();
-        let mut fixture =
-            configured_sync_fixture("partial_direct_prefix", replicas.clone(), replicas.clone());
-        fixture.service.transport.direct_catchup_nodes = replicas.iter().cloned().collect();
-        let target = fixture
-            .service
-            .capture_metadata_quorum_sync_target(&fixture.object)
-            .expect("capture partial direct prefix target");
-        let mut pending_catchups = BTreeMap::new();
-        fixture
-            .service
-            .send_metadata_sync_catchup_batches(
-                &target,
-                "partial-direct-prefix-catchup",
-                &mut pending_catchups,
-                &mut MetadataSyncAttemptDiagnostics::default(),
-            )
-            .expect("prime every replica cursor");
-
-        fixture.service.transport.direct_prefix_nodes = BTreeSet::from([replicas[0].clone()]);
-        fixture.service.transport.omit_direct_misses = true;
-        let mut freshly_acknowledged = BTreeSet::from([fixture.shard.primary_node_id.clone()]);
-        let mut pending_prefix_probes = BTreeMap::new();
-        let rejected = fixture
-            .service
-            .send_metadata_sync_prefix_probes(
-                &target,
-                "partial-direct-prefix-probe",
-                &mut freshly_acknowledged,
-                &mut pending_prefix_probes,
-                &MetadataQuorumSyncPurpose::OrdinaryDurability,
-                &mut MetadataSyncAttemptDiagnostics::default(),
-            )
-            .expect("fall back omitted direct prefix probes to routed sends");
-
-        assert!(rejected.is_empty());
-        assert!(freshly_acknowledged.contains(&replicas[0]));
-        assert_eq!(
-            fixture.service.transport.routed_prefix_probe_count,
-            replicas.len() - 1,
-            "only direct omissions should use routed prefix probes"
-        );
-        assert_eq!(pending_prefix_probes.len(), replicas.len() - 1);
-        assert_eq!(
-            fixture
-                .service
-                .replication
-                .pending_metadata_replications
-                .len(),
-            replicas.len() - 1
-        );
-    }
-
-    #[test]
-    fn direct_journal_fanout_error_falls_back_to_routed_catchup_and_probe() {
-        let replica = node("node_sync_direct_error_fallback_replica");
-        let mut fixture = configured_sync_fixture(
-            "direct_error_fallback",
-            vec![replica.clone()],
-            vec![replica.clone()],
-        );
-        fixture.service.transport.fail_direct_journal_fanout = true;
-        let target = fixture
-            .service
-            .capture_metadata_quorum_sync_target(&fixture.object)
-            .expect("capture direct-error fallback target");
-
-        let mut pending_catchups = BTreeMap::new();
-        fixture
-            .service
-            .send_metadata_sync_catchup_batches(
-                &target,
-                "direct-error-catchup",
-                &mut pending_catchups,
-                &mut MetadataSyncAttemptDiagnostics::default(),
-            )
-            .expect("route catch-up after the direct lane fails");
-        assert_eq!(
-            fixture.service.transport.catchup_rpc_requests.len(),
-            1,
-            "a direct transport error must not abort the canonical routed catch-up"
-        );
-        fixture
-            .service
-            .process_incoming()
-            .expect("settle routed catch-up response");
-
-        let mut freshly_acknowledged = BTreeSet::from([fixture.shard.primary_node_id.clone()]);
-        let mut pending_prefix_probes = BTreeMap::new();
-        let rejected = fixture
-            .service
-            .send_metadata_sync_prefix_probes(
-                &target,
-                "direct-error-probe",
-                &mut freshly_acknowledged,
-                &mut pending_prefix_probes,
-                &MetadataQuorumSyncPurpose::OrdinaryDurability,
-                &mut MetadataSyncAttemptDiagnostics::default(),
-            )
-            .expect("route prefix probe after the direct lane fails");
-
-        assert!(rejected.is_empty());
-        assert_eq!(fixture.service.transport.routed_prefix_probe_count, 1);
-        assert_eq!(pending_prefix_probes.len(), 1);
-    }
-
-    #[test]
-    fn direct_catchup_without_exact_durable_confirmation_uses_routed_fallback() {
-        let replica = node("node_sync_direct_confirmation_fallback_replica");
-        let mut fixture = configured_sync_fixture(
-            "direct_confirmation_fallback",
-            vec![replica.clone()],
-            vec![replica.clone()],
-        );
-        fixture
-            .service
-            .transport
-            .direct_catchup_nodes
-            .insert(replica.clone());
-        fixture.service.transport.omit_direct_catchup_confirmation = true;
-        let target = fixture
-            .service
-            .capture_metadata_quorum_sync_target(&fixture.object)
-            .expect("capture confirmation fallback target");
-
-        let mut pending_catchups = BTreeMap::new();
-        fixture
-            .service
-            .send_metadata_sync_catchup_batches(
-                &target,
-                "direct-confirmation-fallback",
-                &mut pending_catchups,
-                &mut MetadataSyncAttemptDiagnostics::default(),
-            )
-            .expect("route catch-up after an unconfirmed direct response");
-
-        assert_eq!(fixture.service.transport.direct_catchup_batch_count, 1);
-        assert_eq!(
-            fixture.service.transport.catchup_rpc_requests.len(),
-            1,
-            "response completion without the exact durable confirmation must not suppress fallback"
-        );
-        assert_eq!(
-            fixture
-                .service
-                .replication
-                .pending_metadata_replications
-                .len(),
-            1
-        );
-        assert_eq!(
-            fixture
-                .service
-                .metadata_backend
-                .as_deref()
-                .expect("metadata backend")
-                .metadata_replication_cursor(&replica, &target.shard_id)
-                .expect("replica cursor before routed acknowledgement"),
-            0,
-            "the mismatched direct acknowledgement must not advance the sender cursor"
-        );
-
-        fixture
-            .service
-            .process_incoming()
-            .expect("settle exact routed catch-up response");
-        assert_eq!(
-            fixture
-                .service
-                .metadata_backend
-                .as_deref()
-                .expect("metadata backend")
-                .metadata_replication_cursor(&replica, &target.shard_id)
-                .expect("replica cursor after routed acknowledgement"),
-            target.journal_sequence
-        );
-        assert!(
-            fixture
-                .service
-                .replication
-                .pending_metadata_replications
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn barrier_cleanup_preserves_unrelated_same_shard_replication() {
-        let replica = node("node_sync_scoped_cleanup_replica");
-        let mut fixture = configured_sync_fixture(
-            "scoped_cleanup",
-            vec![replica.clone()],
-            vec![replica.clone()],
-        );
-        let target = fixture
-            .service
-            .capture_metadata_quorum_sync_target(&fixture.object)
-            .expect("capture scoped cleanup target");
-        let pending = PendingMetadataReplication {
-            target_node_id: replica,
-            shard_id: target.shard_id,
-            next_after_sequence: target.journal_sequence,
-            expected_response_kind: PendingMetadataReplicationResponseKind::JournalBatch,
-            verify_prefix_only: false,
-            required_authority_confirmation_id: None,
-            created_at: Instant::now(),
-        };
-        for request_id in [
-            "dfs_sync_catchup_owned-barrier_1",
-            "dfs_sync_probe_owned-barrier_2",
-            "dfs_sync_checkpoint_owned-barrier_3",
-            "unrelated_same_shard_replication",
-        ] {
-            fixture
-                .service
-                .replication
-                .pending_metadata_replications
-                .insert(request_id.to_string(), pending.clone());
-        }
-
-        fixture
-            .service
-            .clear_pending_metadata_sync_replications_for_barrier("owned-barrier");
-
-        assert_eq!(
-            fixture
-                .service
-                .replication
-                .pending_metadata_replications
-                .len(),
-            1
-        );
-        assert!(
-            fixture
-                .service
-                .replication
-                .pending_metadata_replications
-                .contains_key("unrelated_same_shard_replication"),
-            "cleanup must remove only request identities owned by this barrier"
-        );
-    }
-
-    #[test]
-    fn posix_catchup_routes_large_metadata_batch_without_transport_switch() {
-        let replica = node("node_sync_large_catchup_replica");
-        let mut fixture = configured_sync_fixture(
-            "large_catchup",
-            vec![replica.clone()],
-            vec![replica.clone()],
-        );
-        let owner = fixture.shard.primary_node_id.clone();
-        for index in 0..32 {
-            let path = format!("/large-catchup-{index}-{}", "x".repeat(3_000));
-            fixture
-                .service
-                .metadata_backend
-                .as_deref_mut()
-                .expect("metadata backend")
-                .put_object(&directory_object(&path, owner.clone()))
-                .expect("append large catch-up entry");
-        }
-        let target = fixture
-            .service
-            .capture_metadata_quorum_sync_target(&fixture.object)
-            .expect("capture target");
-
-        let mut pending_catchups = BTreeMap::new();
-        fixture
-            .service
-            .send_metadata_sync_catchup_batches(
-                &target,
-                "large-catchup-probe",
-                &mut pending_catchups,
-                &mut MetadataSyncAttemptDiagnostics::default(),
-            )
-            .expect("send large POSIX catch-up");
-        let [(batch_bytes, request)] = fixture.service.transport.catchup_rpc_requests.as_slice()
-        else {
-            panic!("expected one captured POSIX catch-up RPC");
-        };
-        assert!(*batch_bytes > 0);
-        assert!(!request.body.is_empty());
-        assert_eq!(fixture.service.transport.snapshot_install_count, 0);
-    }
-
-    #[test]
-    fn posix_single_large_catchup_entry_uses_same_routed_message() {
-        let replica = node("node_sync_single_large_catchup_replica");
-        let mut fixture = configured_sync_fixture(
-            "single_large_catchup",
-            vec![replica.clone()],
-            vec![replica.clone()],
-        );
-        let initial_target = fixture
-            .service
-            .capture_metadata_quorum_sync_target(&fixture.object)
-            .expect("capture initial target");
-        fixture
-            .service
-            .metadata_backend
-            .as_deref_mut()
-            .expect("metadata backend")
-            .put_metadata_replication_cursor(
-                &replica,
-                &initial_target.shard_id,
-                initial_target.journal_sequence,
-            )
-            .expect("advance replica to the oversized entry");
-
-        let large = directory_object(
-            &format!(
-                "/single-large-entry-{}",
-                "x".repeat(DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT + 1024)
-            ),
-            fixture.shard.primary_node_id.clone(),
-        );
-        fixture
-            .service
-            .metadata_backend
-            .as_deref_mut()
-            .expect("metadata backend")
-            .put_object(&large)
-            .expect("append large metadata entry");
-        let target = fixture
-            .service
-            .capture_metadata_quorum_sync_target(&large)
-            .expect("capture large target");
-
-        let mut pending_catchups = BTreeMap::new();
-        fixture
-            .service
-            .send_metadata_sync_catchup_batches(
-                &target,
-                "single-large-catchup-probe",
-                &mut pending_catchups,
-                &mut MetadataSyncAttemptDiagnostics::default(),
-            )
-            .expect("route the large entry");
-
-        let [(batch_bytes, request)] = fixture.service.transport.catchup_rpc_requests.as_slice()
-        else {
-            panic!("expected one routed large-entry catch-up RPC");
-        };
-        assert!(*batch_bytes > DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT);
-        assert!(!request.body.is_empty());
-        assert_eq!(fixture.service.transport.snapshot_install_count, 0);
-    }
-
-    #[test]
-    fn unconfigured_single_node_metadata_sync_succeeds_locally() {
-        let root = sinomo_testdir::TestDir::new("sinomo-dfs-sync-single-node");
-        let owner = node("node_sync_single_owner");
-        let backend = LocalSobjMetadataBackend::new(
-            DfsMetadataShardId::new("root"),
-            root.path().join("metadata"),
-        )
-        .expect("metadata backend");
-        let mut service = NetworkedDfsService::new(
-            MetadataAckTransport::new(owner.clone(), []),
-            LocalContentStore::new(root.path().join("content")).expect("content store"),
-        )
-        .with_metadata_backend(backend)
-        .expect("metadata-backed service");
-        service
-            .add_file_system(DfsFileSystem::sifs(owner.clone()))
-            .expect("filesystem");
-        let object = directory_object("/", owner.clone());
-        service
-            .add_object_metadata(object.clone())
-            .expect("root metadata");
-
-        let target = service
-            .capture_metadata_quorum_sync_target(&object)
-            .expect("capture target");
-        assert_eq!(target.authority_epoch, None);
-        let certificate = service
-            .sync_metadata_shard_to_quorum(&target, Duration::ZERO)
-            .expect("single-node certificate");
-
-        assert_eq!(certificate.quorum_size, 1);
-        assert_eq!(certificate.acknowledged_node_ids, vec![owner]);
-    }
-
-    #[test]
-    fn configured_metadata_sync_uses_transferred_control_plane_authority() {
-        let root = sinomo_testdir::TestDir::new("sinomo-dfs-sync-transferred-primary");
-        let former_primary = node("node_sync_transferred_former");
-        let current_primary = node("node_sync_transferred_current");
-        let file_system_id = sifs_file_system_id();
-        let opened_shard = DfsMetadataShardConfig {
-            file_system_id: file_system_id.clone(),
-            shard_id: "root".to_string(),
-            primary_node_id: former_primary,
-            replica_node_ids: vec![current_primary.clone()],
-            epoch: 1,
-            assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
-            default_policy: DfsObjectPolicy::ReplicatedEventual,
-        };
-        let current_shard = DfsMetadataShardConfig {
-            primary_node_id: current_primary.clone(),
-            replica_node_ids: Vec::new(),
-            epoch: 2,
-            ..opened_shard.clone()
-        };
-        let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
-        control_plane.with_client(|kv| {
-            DfsControlPlaneStore::new(kv)
-                .put_metadata_shard(&current_shard)
-                .expect("transferred metadata shard config");
-        });
-        let backend =
-            LocalShardedMetadataBackend::new(root.path().join("metadata"), vec![opened_shard])
-                .expect("backend opened under former authority");
-        let mut service = NetworkedDfsService::new(
-            MetadataAckTransport::new(current_primary.clone(), []),
-            LocalContentStore::new(root.path().join("content")).expect("content store"),
-        )
-        .with_control_plane(control_plane)
-        .with_metadata_backend(backend)
-        .expect("metadata-backed service");
-        service
-            .add_file_system(DfsFileSystem::sifs(current_primary.clone()))
-            .expect("filesystem");
-        let object = directory_object("/", current_primary.clone());
-        service
-            .add_object_metadata(object.clone())
-            .expect("root metadata");
-
-        let target = service
-            .capture_metadata_quorum_sync_target(&object)
-            .expect("current certified primary captures stale-opened backend");
-        assert_eq!(target.primary_node_id, current_primary);
-        assert_eq!(target.authority_epoch, Some(2));
-        let progress = service
-            .metadata_quorum_sync_progress(&target)
-            .expect("stale backend authority fields do not reject clustered progress");
-        assert!(progress.quorum_reached());
-        service
-            .sync_metadata_shard_to_quorum(&target, Duration::ZERO)
-            .expect("current certified primary syncs after transfer");
-    }
-
-    #[test]
-    fn configured_metadata_sync_partial_replica_set_uses_operation_bound_fallback() {
-        let replica_a = node("node_sync_quorum_replica_a");
-        let replica_b = node("node_sync_quorum_replica_b");
-        let mut fixture = configured_sync_fixture(
-            "quorum",
-            vec![replica_a.clone(), replica_b],
-            vec![replica_a.clone()],
-        );
-        let target = fixture
-            .service
-            .capture_metadata_quorum_sync_target(&fixture.object)
-            .expect("capture target");
-        let second_target = fixture
-            .service
-            .capture_metadata_quorum_sync_target(&fixture.object)
-            .expect("capture second target");
-        assert_ne!(target.barrier_id, second_target.barrier_id);
-        assert_eq!(target.state_fingerprint, second_target.state_fingerprint);
-
-        let certificate = fixture
-            .service
-            .sync_metadata_shard_to_quorum(&target, Duration::ZERO)
-            .expect("operation-bound metadata quorum fallback");
-
-        assert_eq!(certificate.quorum_size, 2);
-        assert!(
-            certificate
-                .acknowledged_node_ids
-                .contains(&fixture.shard.primary_node_id)
-        );
-        assert!(certificate.acknowledged_node_ids.contains(&replica_a));
-        assert_eq!(fixture.txn_calls.load(Ordering::SeqCst), 1);
-        assert!(fixture.root.path().join("metadata").exists());
-    }
-
-    #[test]
-    fn configured_metadata_sync_full_shard_uses_no_control_plane_transaction() {
-        let replica_a = node("node_sync_full_shard_replica_a");
-        let replica_b = node("node_sync_full_shard_replica_b");
-        let mut fixture = configured_sync_fixture(
-            "full_shard",
-            vec![replica_a.clone(), replica_b.clone()],
-            vec![replica_a, replica_b],
-        );
-        crate::metadata_records::reset_dfs_metadata_full_snapshot_fingerprint_calls();
-        let target = fixture
-            .service
-            .capture_metadata_quorum_sync_target(&fixture.object)
-            .expect("capture target");
-        assert!(target.checkpoint_snapshot.is_none());
-        assert_eq!(
-            crate::metadata_records::dfs_metadata_full_snapshot_fingerprint_calls(),
-            0,
-            "healthy target capture must use the durable O(1) prefix proof"
-        );
-
-        let certificate = fixture
-            .service
-            .sync_metadata_shard_to_quorum(&target, Duration::ZERO)
-            .expect("fresh full-shard certificate");
-
-        assert_eq!(certificate.acknowledged_node_ids.len(), 3);
-        assert_eq!(fixture.txn_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(
-            crate::metadata_records::dfs_metadata_full_snapshot_fingerprint_calls(),
-            0,
-            "healthy full-shard prefix verification must not export/hash a snapshot"
-        );
-    }
-
-    #[test]
-    fn pending_membership_handoff_carries_exact_union_state_before_activation() {
-        let old_replica = node("node_sync_membership_old_replica");
-        let new_replica = node("node_sync_membership_new_replica");
-        let mut fixture = configured_sync_fixture(
-            "membership_handoff",
-            vec![old_replica.clone()],
-            vec![old_replica.clone(), new_replica.clone()],
-        );
-        let desired = DfsMetadataShardConfig {
-            replica_node_ids: vec![new_replica.clone()],
-            epoch: fixture.shard.epoch + 1,
-            ..fixture.shard.clone()
-        };
-        fixture.control_plane.with_client(|kv| {
-            DfsControlPlaneStore::new(kv)
-                .begin_metadata_shard_membership_handoff(&fixture.shard, &desired)
-                .expect("begin membership handoff")
-                .expect("retiring assignment is exact")
-        });
-
-        assert_eq!(
-            fixture
-                .service
-                .reconcile_pending_metadata_shard_membership_handoffs(
-                    &[fixture.shard.clone()],
-                    Duration::from_secs(1),
-                )
-                .expect("repair and activate pending membership"),
-            1
-        );
-
-        let (active, pending, proof) = fixture.control_plane.with_client(|kv| {
-            let store = DfsControlPlaneStore::new(kv);
-            (
-                store
-                    .get_metadata_shard(&desired.file_system_id, &desired.shard_id)
-                    .expect("active shard"),
-                store
-                    .get_metadata_shard_membership_handoff(
-                        &desired.file_system_id,
-                        &desired.shard_id,
-                    )
-                    .expect("pending handoff"),
-                store
-                    .get_metadata_shard_membership_handoff_proof(
-                        &desired.file_system_id,
-                        &desired.shard_id,
-                    )
-                    .expect("handoff proof")
-                    .expect("durable handoff proof"),
-            )
-        });
-        assert_eq!(active, Some(desired.clone()));
-        assert!(pending.is_none());
-        let expected_union = std::iter::once(fixture.shard.primary_node_id.clone())
-            .chain([old_replica, new_replica.clone()])
-            .collect::<BTreeSet<_>>();
-        assert_eq!(
-            proof
-                .acknowledged_node_ids
-                .iter()
-                .cloned()
-                .collect::<BTreeSet<_>>(),
-            expected_union
-        );
-        assert!(proof.journal_sequence > 0);
-        assert!(!proof.state_fingerprint.is_empty());
-    }
-
-    #[test]
-    fn ordinary_handoff_prefix_probes_use_the_canonical_direct_backend_lane() {
-        let old_replica = node("node_sync_direct_lane_old_replica");
-        let new_replica = node("node_sync_direct_lane_new_replica");
-        let mut fixture = configured_sync_fixture(
-            "direct_lane_membership_handoff",
-            vec![old_replica.clone()],
-            vec![old_replica.clone(), new_replica.clone()],
-        );
-        fixture.service.transport.direct_prefix_nodes =
-            BTreeSet::from([old_replica.clone(), new_replica.clone()]);
-        let desired = DfsMetadataShardConfig {
-            replica_node_ids: vec![new_replica],
-            epoch: fixture.shard.epoch + 1,
-            ..fixture.shard.clone()
-        };
-        fixture.control_plane.with_client(|kv| {
-            DfsControlPlaneStore::new(kv)
-                .begin_metadata_shard_membership_handoff(&fixture.shard, &desired)
-                .expect("begin membership handoff")
-                .expect("retiring assignment is exact")
-        });
-
-        assert_eq!(
-            fixture
-                .service
-                .reconcile_pending_metadata_shard_membership_handoffs(
-                    std::slice::from_ref(&fixture.shard),
-                    Duration::from_secs(1),
-                )
-                .expect("canonical direct prefix probes complete the handoff"),
-            1
-        );
-        assert_eq!(fixture.service.transport.direct_prefix_probe_count, 2);
-        assert_eq!(
-            fixture.service.transport.routed_prefix_probe_count, 0,
-            "ordinary probes must not consult the stale routed message-lane backend"
-        );
-    }
-
-    #[test]
-    fn primary_handoff_prefix_probes_use_the_canonical_direct_backend_lane() {
-        let mut candidates = vec![
-            node("node_sync_direct_primary_a"),
-            node("node_sync_direct_primary_b"),
-            node("node_sync_direct_primary_c"),
-        ];
-        candidates.sort();
-        let promoted = candidates[0].clone();
-        let mut fixture = configured_sync_fixture(
-            "direct_lane_primary_handoff",
-            candidates.clone(),
-            Vec::new(),
-        );
-        fixture.service.transport.direct_prefix_nodes = candidates.clone().into_iter().collect();
-        let checkpoint = fixture
-            .service
-            .capture_metadata_quorum_sync_target(&fixture.object)
-            .expect("capture exact checkpoint");
-        for replica_node_id in &candidates {
-            fixture
-                .service
-                .metadata_backend
-                .as_deref_mut()
-                .expect("metadata backend")
-                .put_metadata_replication_cursor(
-                    replica_node_id,
-                    &checkpoint.shard_id,
-                    checkpoint.journal_sequence,
-                )
-                .expect("seed exact replica cursor");
-        }
-        let retiring = fixture.shard.clone();
-        let desired = DfsMetadataShardConfig {
-            primary_node_id: promoted,
-            replica_node_ids: crate::control_plane::topology_preserving_metadata_shard_replicas(
-                &retiring,
-                &candidates[0],
-            )
-            .expect("promoted replica preserves the configured node ring"),
-            epoch: retiring.epoch + 1,
-            ..retiring.clone()
-        };
-        fixture.control_plane.with_client(|kv| {
-            DfsControlPlaneStore::new(kv)
-                .begin_metadata_shard_membership_handoff(&retiring, &desired)
-                .expect("begin primary handoff")
-                .expect("retiring assignment is exact")
-        });
-
-        assert_eq!(
-            fixture
-                .service
-                .reconcile_pending_metadata_shard_membership_handoffs(
-                    std::slice::from_ref(&retiring),
-                    Duration::from_secs(1),
-                )
-                .expect("canonical direct probes complete the primary handoff"),
-            1
-        );
-        assert_eq!(
-            fixture.service.transport.direct_prefix_probe_count,
-            candidates.len()
-        );
-        assert_eq!(
-            fixture.service.transport.routed_prefix_probe_count, 0,
-            "a current canonical route must install and echo the promotion marker"
-        );
-        let (active, pending) = fixture.control_plane.with_client(|kv| {
-            let store = DfsControlPlaneStore::new(kv);
-            (
-                store
-                    .get_metadata_shard(&desired.file_system_id, &desired.shard_id)
-                    .expect("active shard"),
-                store
-                    .get_metadata_shard_membership_handoff(
-                        &desired.file_system_id,
-                        &desired.shard_id,
-                    )
-                    .expect("pending handoff"),
-            )
-        });
-        assert_eq!(active, Some(desired));
-        assert!(pending.is_none());
-    }
-
-    #[test]
-    fn primary_handoff_routes_quorum_probes_concurrently_around_one_offline_member() {
-        let mut candidates = [
-            node("node_sync_handoff_fanout_a"),
-            node("node_sync_handoff_fanout_b"),
-            node("node_sync_handoff_fanout_c"),
-        ];
-        candidates.sort();
-        let promoted = candidates[0].clone();
-        let offline = candidates[1].clone();
-        let healthy = candidates[2].clone();
-        let mut fixture = configured_sync_fixture(
-            "membership_handoff_fanout",
-            vec![promoted.clone(), offline.clone(), healthy.clone()],
-            vec![promoted.clone(), healthy.clone()],
-        );
-        let checkpoint = fixture
-            .service
-            .capture_metadata_quorum_sync_target(&fixture.object)
-            .expect("capture exact checkpoint");
-        for replica_node_id in [&promoted, &offline, &healthy] {
-            fixture
-                .service
-                .metadata_backend
-                .as_deref_mut()
-                .expect("metadata backend")
-                .put_metadata_replication_cursor(
-                    replica_node_id,
-                    &checkpoint.shard_id,
-                    checkpoint.journal_sequence,
-                )
-                .expect("seed exact replica cursor");
-        }
-        fixture
-            .service
-            .transport
-            .network_error_nodes
-            .insert(offline.clone());
-        fixture
-            .service
-            .transport
-            .hold_network_errors_until_operation_deadline = true;
-        fixture
-            .service
-            .transport
-            .fail_direct_after_operation_deadline = true;
-        let retiring = fixture.shard.clone();
-        let desired = DfsMetadataShardConfig {
-            primary_node_id: promoted.clone(),
-            replica_node_ids: crate::control_plane::topology_preserving_metadata_shard_replicas(
-                &retiring, &promoted,
-            )
-            .expect("promoted replica preserves the configured node ring"),
-            epoch: retiring.epoch + 1,
-            ..retiring.clone()
-        };
-        fixture.control_plane.with_client(|kv| {
-            DfsControlPlaneStore::new(kv)
-                .begin_metadata_shard_membership_handoff(&retiring, &desired)
-                .expect("begin primary handoff")
-                .expect("retiring assignment is exact")
-        });
-
-        assert_eq!(
-            fixture
-                .service
-                .reconcile_pending_metadata_shard_membership_handoffs(
-                    std::slice::from_ref(&retiring),
-                    Duration::from_millis(80),
-                )
-                .expect("one offline member must not starve a joint quorum"),
-            1
-        );
-
-        let expected_targets = vec![promoted.clone(), offline.clone(), healthy.clone()];
-        assert!(
-            fixture
-                .service
-                .transport
-                .routed_fanout_targets
-                .iter()
-                .any(|targets| targets == &expected_targets),
-            "all unresolved probes must enter the same bounded routed fan-out"
-        );
-        assert!(
-            fixture
-                .service
-                .transport
-                .routed_fanout_max_inflight
-                .contains(&DFS_METADATA_SYNC_ROUTED_FANOUT_CAP),
-            "the routed fallback must keep a second worker available around one offline member"
-        );
-
-        let (active, pending, proof) = fixture.control_plane.with_client(|kv| {
-            let store = DfsControlPlaneStore::new(kv);
-            (
-                store
-                    .get_metadata_shard(&desired.file_system_id, &desired.shard_id)
-                    .expect("active shard"),
-                store
-                    .get_metadata_shard_membership_handoff(
-                        &desired.file_system_id,
-                        &desired.shard_id,
-                    )
-                    .expect("pending handoff"),
-                store
-                    .get_metadata_shard_membership_handoff_proof(
-                        &desired.file_system_id,
-                        &desired.shard_id,
-                    )
-                    .expect("handoff proof")
-                    .expect("durable handoff proof"),
-            )
-        });
-        assert_eq!(active, Some(desired));
-        assert!(pending.is_none());
-        let acknowledged_node_ids = proof
-            .acknowledged_node_ids
-            .into_iter()
-            .collect::<BTreeSet<_>>();
-        assert_eq!(
-            acknowledged_node_ids,
-            BTreeSet::from([retiring.primary_node_id, promoted, healthy])
-        );
-        assert!(!acknowledged_node_ids.contains(&offline));
-    }
-
-    #[test]
-    fn primary_handoff_probes_ready_quorum_before_offline_replica_catchup() {
-        let mut candidates = [
-            node("node_sync_handoff_ready_quorum_a"),
-            node("node_sync_handoff_ready_quorum_b"),
-            node("node_sync_handoff_ready_quorum_c"),
-        ];
-        candidates.sort();
-        let promoted = candidates[0].clone();
-        let offline = candidates[1].clone();
-        let healthy = candidates[2].clone();
-        let mut fixture = configured_sync_fixture(
-            "membership_handoff_ready_quorum",
-            vec![promoted.clone(), offline.clone(), healthy.clone()],
-            vec![promoted.clone(), healthy.clone()],
-        );
-        let checkpoint = fixture
-            .service
-            .capture_metadata_quorum_sync_target(&fixture.object)
-            .expect("capture exact checkpoint");
-        for replica_node_id in [&promoted, &healthy] {
-            fixture
-                .service
-                .metadata_backend
-                .as_deref_mut()
-                .expect("metadata backend")
-                .put_metadata_replication_cursor(
-                    replica_node_id,
-                    &checkpoint.shard_id,
-                    checkpoint.journal_sequence,
-                )
-                .expect("seed exact healthy replica cursor");
-        }
-        fixture
-            .service
-            .transport
-            .network_error_nodes
-            .insert(offline.clone());
-        fixture
-            .service
-            .transport
-            .hold_network_errors_until_operation_deadline = true;
-        fixture
-            .service
-            .transport
-            .fail_direct_after_operation_deadline = true;
-        let retiring = fixture.shard.clone();
-        let desired = DfsMetadataShardConfig {
-            primary_node_id: promoted.clone(),
-            replica_node_ids: crate::control_plane::topology_preserving_metadata_shard_replicas(
-                &retiring, &promoted,
-            )
-            .expect("promoted replica preserves the configured node ring"),
-            epoch: retiring.epoch + 1,
-            ..retiring.clone()
-        };
-        fixture.control_plane.with_client(|kv| {
-            DfsControlPlaneStore::new(kv)
-                .begin_metadata_shard_membership_handoff(&retiring, &desired)
-                .expect("begin primary handoff")
-                .expect("retiring assignment is exact")
-        });
-
-        assert_eq!(
-            fixture
-                .service
-                .reconcile_pending_metadata_shard_membership_handoffs(
-                    std::slice::from_ref(&retiring),
-                    Duration::from_millis(80),
-                )
-                .expect("ready joint quorum must not wait for offline catch-up"),
-            1
-        );
-        assert!(
-            fixture.service.transport.catchup_rpc_requests.is_empty(),
-            "the offline laggard must not consume the handoff deadline before a ready quorum probe"
-        );
-
-        let (active, pending, proof) = fixture.control_plane.with_client(|kv| {
-            let store = DfsControlPlaneStore::new(kv);
-            (
-                store
-                    .get_metadata_shard(&desired.file_system_id, &desired.shard_id)
-                    .expect("active shard"),
-                store
-                    .get_metadata_shard_membership_handoff(
-                        &desired.file_system_id,
-                        &desired.shard_id,
-                    )
-                    .expect("pending handoff"),
-                store
-                    .get_metadata_shard_membership_handoff_proof(
-                        &desired.file_system_id,
-                        &desired.shard_id,
-                    )
-                    .expect("handoff proof")
-                    .expect("durable handoff proof"),
-            )
-        });
-        assert_eq!(active, Some(desired));
-        assert!(pending.is_none());
-        let acknowledged_node_ids = proof
-            .acknowledged_node_ids
-            .into_iter()
-            .collect::<BTreeSet<_>>();
-        assert_eq!(
-            acknowledged_node_ids,
-            BTreeSet::from([retiring.primary_node_id, promoted, healthy])
-        );
-        assert!(!acknowledged_node_ids.contains(&offline));
-    }
-
-    #[test]
-    fn pending_membership_handoff_retries_until_both_assignment_quorums_ack() {
-        let old_replica = node("node_sync_handoff_retry_old_replica");
-        let new_replica = node("node_sync_handoff_retry_new_replica");
-        let mut fixture = configured_sync_fixture(
-            "membership_handoff_retry",
-            vec![old_replica.clone()],
-            vec![new_replica.clone()],
-        );
-        let retiring = fixture.shard.clone();
-        let desired = DfsMetadataShardConfig {
-            replica_node_ids: vec![new_replica.clone()],
-            epoch: retiring.epoch + 1,
-            ..retiring.clone()
-        };
-        let handoff = fixture.control_plane.with_client(|kv| {
-            DfsControlPlaneStore::new(kv)
-                .begin_metadata_shard_membership_handoff(&retiring, &desired)
-                .expect("begin membership handoff")
-                .expect("retiring assignment is exact")
-        });
-
-        let error = fixture
-            .service
-            .reconcile_pending_metadata_shard_membership_handoffs(
-                std::slice::from_ref(&retiring),
-                Duration::ZERO,
-            )
-            .expect_err("a desired-only quorum must remain pending");
-        assert!(
-            matches!(error, DfsError::Network { ref message } if message.contains("2/3 acknowledgements")),
-            "the joint-quorum attempt must time out cleanly without activating partial DFS state: {error}"
-        );
-
-        let (active, pending, proof) = fixture.control_plane.with_client(|kv| {
-            let store = DfsControlPlaneStore::new(kv);
-            (
-                store
-                    .get_metadata_shard(&retiring.file_system_id, &retiring.shard_id)
-                    .expect("active shard"),
-                store
-                    .get_metadata_shard_membership_handoff(
-                        &retiring.file_system_id,
-                        &retiring.shard_id,
-                    )
-                    .expect("pending handoff"),
-                store
-                    .get_metadata_shard_membership_handoff_proof(
-                        &retiring.file_system_id,
-                        &retiring.shard_id,
-                    )
-                    .expect("handoff proof"),
-            )
-        });
-        assert_eq!(active, Some(retiring.clone()));
-        let pending = pending.expect("handoff remains pending after partial union");
-        assert_eq!(pending.handoff_id, handoff.handoff_id);
-        assert_eq!(pending.retiring_shard, handoff.retiring_shard);
-        assert_eq!(pending.desired_shard, handoff.desired_shard);
-        assert!(
-            pending.retiring_primary_fence.is_some(),
-            "the exact retiring-primary fence remains durable for retry"
-        );
-        assert!(proof.is_none());
-        assert_eq!(
-            fixture
-                .service
-                .metadata_backend
-                .as_deref()
-                .expect("metadata backend")
-                .metadata_shard_write_freeze(&DfsMetadataShardId::new(&retiring.shard_id))
-                .expect("durable handoff freeze")
-                .map(|freeze| freeze.handoff_id),
-            Some(handoff.handoff_id.clone())
-        );
-
-        fixture
-            .service
-            .transport
-            .acknowledged_nodes
-            .insert(old_replica.clone());
-        assert_eq!(
-            fixture
-                .service
-                .reconcile_pending_metadata_shard_membership_handoffs(
-                    std::slice::from_ref(&retiring),
-                    Duration::from_secs(1),
-                )
-                .expect("retry joint membership quorum"),
-            1
-        );
-
-        let (active, pending, proof) = fixture.control_plane.with_client(|kv| {
-            let store = DfsControlPlaneStore::new(kv);
-            (
-                store
-                    .get_metadata_shard(&desired.file_system_id, &desired.shard_id)
-                    .expect("activated shard"),
-                store
-                    .get_metadata_shard_membership_handoff(
-                        &desired.file_system_id,
-                        &desired.shard_id,
-                    )
-                    .expect("cleared pending handoff"),
-                store
-                    .get_metadata_shard_membership_handoff_proof(
-                        &desired.file_system_id,
-                        &desired.shard_id,
-                    )
-                    .expect("completed handoff proof")
-                    .expect("durable completed handoff proof"),
-            )
-        });
-        assert_eq!(active, Some(desired));
-        assert!(pending.is_none());
-        assert_eq!(
-            proof
-                .acknowledged_node_ids
-                .into_iter()
-                .collect::<BTreeSet<_>>(),
-            std::iter::once(retiring.primary_node_id)
-                .chain([old_replica, new_replica])
-                .collect()
-        );
-    }
-
-    #[test]
-    fn removal_handoff_joint_quorum_tolerates_offline_retiring_replica() {
-        let retained_replica = node("node_sync_handoff_removal_retained_replica");
-        let removed_replica = node("node_sync_handoff_removal_removed_replica");
-        let mut fixture = configured_sync_fixture(
-            "membership_handoff_removal_retry",
-            vec![retained_replica.clone(), removed_replica.clone()],
-            vec![retained_replica.clone()],
-        );
-        let retiring = fixture.shard.clone();
-        let desired = DfsMetadataShardConfig {
-            replica_node_ids: vec![retained_replica.clone()],
-            epoch: retiring.epoch + 1,
-            ..retiring.clone()
-        };
-        fixture.control_plane.with_client(|kv| {
-            DfsControlPlaneStore::new(kv)
-                .begin_metadata_shard_membership_handoff(&retiring, &desired)
-                .expect("begin removal-only membership handoff")
-                .expect("retiring assignment is exact")
-        });
-        fixture
-            .service
-            .transport
-            .network_error_nodes
-            .insert(removed_replica.clone());
-
-        assert_eq!(
-            fixture
-                .service
-                .reconcile_pending_metadata_shard_membership_handoffs(
-                    std::slice::from_ref(&retiring),
-                    Duration::ZERO,
-                )
-                .expect("joint quorum activates without removed offline replica"),
-            1
-        );
-        assert_eq!(
-            fixture.service.transport.operation_deadline, None,
-            "the handoff deadline must not leak into later DFS operations"
-        );
-
-        let (active, pending, proof) = fixture.control_plane.with_client(|kv| {
-            let store = DfsControlPlaneStore::new(kv);
-            (
-                store
-                    .get_metadata_shard(&desired.file_system_id, &desired.shard_id)
-                    .expect("activated shard"),
-                store
-                    .get_metadata_shard_membership_handoff(
-                        &desired.file_system_id,
-                        &desired.shard_id,
-                    )
-                    .expect("cleared pending handoff"),
-                store
-                    .get_metadata_shard_membership_handoff_proof(
-                        &desired.file_system_id,
-                        &desired.shard_id,
-                    )
-                    .expect("completed handoff proof")
-                    .expect("durable completed handoff proof"),
-            )
-        });
-        assert_eq!(active, Some(desired));
-        assert!(pending.is_none());
-        let acknowledged_node_ids = proof
-            .acknowledged_node_ids
-            .iter()
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        assert_eq!(
-            acknowledged_node_ids,
-            std::iter::once(retiring.primary_node_id)
-                .chain([retained_replica])
-                .collect()
-        );
-        assert!(
-            !acknowledged_node_ids.contains(&removed_replica),
-            "an offline retiring-only replica must not be fabricated into the proof"
-        );
-    }
-
-    #[test]
-    fn primary_rotation_joint_quorum_leaves_retiring_lane_fenced() {
-        let promoted = node("node_sync_primary_rotation_promoted");
-        let retained_replica = node("node_sync_primary_rotation_retained");
-        let mut fixture = configured_sync_fixture(
-            "primary_rotation",
-            vec![promoted.clone(), retained_replica.clone()],
-            vec![promoted.clone()],
-        );
-        let retiring = fixture.shard.clone();
-        let desired = DfsMetadataShardConfig {
-            primary_node_id: promoted.clone(),
-            replica_node_ids: crate::control_plane::topology_preserving_metadata_shard_replicas(
-                &retiring, &promoted,
-            )
-            .expect("promoted node is an existing replica"),
-            epoch: retiring.epoch + 1,
-            ..retiring.clone()
-        };
-        let handoff = fixture.control_plane.with_client(|kv| {
-            DfsControlPlaneStore::new(kv)
-                .begin_metadata_shard_membership_handoff(&retiring, &desired)
-                .expect("begin proof-bound primary handoff")
-                .expect("retiring assignment is exact")
-        });
-
-        assert_eq!(
-            fixture
-                .service
-                .reconcile_pending_metadata_shard_membership_handoffs(
-                    std::slice::from_ref(&retiring),
-                    Duration::from_secs(1),
-                )
-                .expect("complete joint-quorum primary handoff"),
-            1
-        );
-
-        let (active, pending, proof) = fixture.control_plane.with_client(|kv| {
-            let store = DfsControlPlaneStore::new(kv);
-            (
-                store
-                    .get_metadata_shard(&desired.file_system_id, &desired.shard_id)
-                    .expect("active primary"),
-                store
-                    .get_metadata_shard_membership_handoff(
-                        &desired.file_system_id,
-                        &desired.shard_id,
-                    )
-                    .expect("pending primary handoff"),
-                store
-                    .get_metadata_shard_membership_handoff_proof(
-                        &desired.file_system_id,
-                        &desired.shard_id,
-                    )
-                    .expect("primary handoff proof")
-                    .expect("durable primary handoff proof"),
-            )
-        });
-        assert_eq!(active, Some(desired.clone()));
-        assert!(pending.is_none());
-        assert_eq!(proof.handoff_id, handoff.handoff_id);
-        assert_eq!(
-            proof
-                .acknowledged_node_ids
-                .into_iter()
-                .collect::<BTreeSet<_>>(),
-            std::iter::once(retiring.primary_node_id.clone())
-                .chain([promoted])
-                .collect()
-        );
-
-        let shard_id = DfsMetadataShardId::new(&retiring.shard_id);
-        let freeze = fixture
-            .service
-            .metadata_backend
-            .as_deref()
-            .expect("retiring backend")
-            .metadata_shard_write_freeze(&shard_id)
-            .expect("retiring freeze")
-            .expect("durable retiring marker");
-        assert_eq!(freeze.handoff_id, handoff.handoff_id);
-        assert_eq!(freeze.activated_epoch, Some(desired.epoch));
-        let error = fixture
-            .service
-            .metadata_backend
-            .as_deref_mut()
-            .expect("retiring backend")
-            .put_object(&directory_object(
-                "/retiring-lane-must-stay-fenced",
-                retiring.primary_node_id,
-            ))
-            .expect_err("retiring primary must not bind the promoted epoch");
-        assert!(error.to_string().contains("frozen"));
-    }
-
-    #[test]
-    fn completed_primary_rotation_recovers_retiring_marker_after_restart() {
-        let root = sinomo_testdir::TestDir::new("sinomo-dfs-retiring-handoff-restart");
-        let retiring_primary = node("node_handoff_restart_retiring");
-        let promoted_primary = node("node_handoff_restart_promoted");
-        let file_system_id = sifs_file_system_id();
-        let retiring = DfsMetadataShardConfig {
-            file_system_id: file_system_id.clone(),
-            shard_id: "root".to_string(),
-            primary_node_id: retiring_primary.clone(),
-            replica_node_ids: vec![promoted_primary.clone()],
-            epoch: 15,
-            assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
-            default_policy: DfsObjectPolicy::ReplicatedEventual,
-        };
-        let active = DfsMetadataShardConfig {
-            primary_node_id: promoted_primary.clone(),
-            replica_node_ids: vec![retiring_primary.clone()],
-            epoch: retiring.epoch + 1,
-            ..retiring.clone()
-        };
-        let shard_id = DfsMetadataShardId::new("root");
-        let metadata_root = root.path().join("metadata");
-        let mut backend = LocalSobjMetadataBackend::new(shard_id.clone(), &metadata_root)
-            .expect("retiring backend");
-        backend
-            .put_file_system(&DfsFileSystem::sifs(retiring_primary.clone()))
-            .expect("filesystem");
-        backend
-            .put_object(&directory_object("/", retiring_primary.clone()))
-            .expect("root object");
-        let handoff_id = "handoff-completed-before-retiring-marker";
-        let freeze = backend
-            .freeze_metadata_shard_for_membership_handoff(&shard_id, handoff_id, retiring.epoch)
-            .expect("freeze retiring generation")
-            .expect("local shard");
-        drop(backend);
-
-        let mut reopened = LocalSobjMetadataBackend::new(shard_id.clone(), &metadata_root)
-            .expect("restart with pending retiring marker");
-        let proof = DfsMetadataShardMembershipHandoffProof {
-            handoff_id: handoff_id.to_string(),
-            retiring_shard: retiring,
-            desired_shard: active.clone(),
-            journal_sequence: freeze.journal_sequence,
-            state_fingerprint: freeze.state_fingerprint,
-            acknowledged_node_ids: vec![retiring_primary.clone(), promoted_primary],
-        };
-
-        assert!(
-            rebind_completed_metadata_shard_membership_handoff(
-                &mut reopened,
-                &retiring_primary,
-                &active,
-                None,
-                Some(&proof),
-            )
-            .expect("recover completed retiring marker")
-        );
-        let activated = reopened
-            .metadata_shard_write_freeze(&shard_id)
-            .expect("read recovered marker")
-            .expect("durable recovered marker");
-        assert_eq!(activated.handoff_id, handoff_id);
-        assert_eq!(activated.activated_epoch, Some(active.epoch));
-        assert!(
-            reopened
-                .metadata_shard_authoritative_writes_frozen(&shard_id)
-                .expect("retiring authority remains fenced"),
-            "recovering a retired marker must not grant successor write authority"
-        );
-        assert!(matches!(
-            reopened.put_object(&directory_object(
-                "/retiring-restart-must-stay-fenced",
-                retiring_primary,
-            )),
-            Err(crate::MetadataBackendError::MembershipHandoffFrozen { .. })
-        ));
-
-        let next = reopened
-            .freeze_metadata_shard_for_membership_handoff(
-                &shard_id,
-                "handoff-after-retiring-restart",
-                active.epoch,
-            )
-            .expect("later handoff may supersede completed marker")
-            .expect("local shard");
-        assert_eq!(next.handoff_id, "handoff-after-retiring-restart");
-        assert_eq!(next.activated_epoch, None);
-    }
-
-    #[test]
     fn retiring_primary_freeze_rejects_new_prepare_without_wedging_activation() {
-        let old_replica = node("node_sync_frozen_handoff_old_replica");
-        let new_replica = node("node_sync_frozen_handoff_new_replica");
-        let mut fixture = configured_sync_fixture(
-            "frozen_membership_handoff",
-            vec![old_replica.clone()],
-            vec![old_replica, new_replica.clone()],
-        );
+        let name = "native-retiring-freeze-current-prepare";
+        let nodes = crate::test_runtime::DfsTestRuntime::ordered_node_ids(name, 3);
+        let mut fixture = configured_normal_sync_fixture(name, nodes[1..].to_vec());
         let desired = DfsMetadataShardConfig {
-            replica_node_ids: vec![new_replica],
+            primary_node_id: nodes[1].clone(),
+            replica_node_ids: crate::control_plane::topology_preserving_metadata_shard_replicas(
+                &fixture.shard,
+                &nodes[1],
+            )
+            .expect("promoted primary remains in the actual configured ring"),
             epoch: fixture.shard.epoch + 1,
             ..fixture.shard.clone()
         };
-        let handoff = fixture.control_plane.with_client(|kv| {
-            DfsControlPlaneStore::new(kv)
+        let control = fixture.runtime.shared_control_plane().unwrap();
+        let handoff = control.with_client(|client| {
+            DfsControlPlaneStore::new(client.as_mut())
                 .begin_metadata_shard_membership_handoff(&fixture.shard, &desired)
-                .expect("begin membership handoff")
-                .expect("retiring assignment is exact")
+                .unwrap()
+                .unwrap()
         });
-        let shard_id = DfsMetadataShardId::new(fixture.shard.shard_id.clone());
+        let shard_id = DfsMetadataShardId::new(&fixture.shard.shard_id);
         let freeze = fixture
             .service
             .metadata_backend
             .as_deref_mut()
-            .expect("metadata backend")
+            .unwrap()
             .freeze_metadata_shard_for_membership_handoff(
                 &shard_id,
                 &handoff.handoff_id,
                 fixture.shard.epoch,
             )
-            .expect("install retiring-primary freeze")
-            .expect("local retiring shard");
+            .unwrap()
+            .unwrap();
         let retiring_fence = DfsMetadataShardMembershipHandoffFence {
             handoff_id: handoff.handoff_id.clone(),
             primary_node_id: fixture.shard.primary_node_id.clone(),
             journal_sequence: freeze.journal_sequence,
             state_fingerprint: freeze.state_fingerprint.clone(),
         };
-        fixture.control_plane.with_client(|kv| {
-            DfsControlPlaneStore::new(kv)
+        control.with_client(|client| {
+            DfsControlPlaneStore::new(client.as_mut())
                 .acknowledge_metadata_shard_membership_handoff_fence(&handoff, &retiring_fence)
-                .expect("acknowledge retiring-primary fence")
-                .expect("pending handoff remains exact")
+                .unwrap();
         });
-
-        let mut moved = fixture.object.clone();
-        moved.path = "/must-not-append-after-fence".to_string();
-        let mut prepare = crate::DfsNamespacePrepareRecord {
-            operation_id: "namespace:must-not-append-after-fence".to_string(),
-            file_system_id: moved.file_system_id.clone(),
-            shard_id: shard_id.clone(),
-            owner_epoch: fixture.shard.epoch,
-            operation_digest: String::new(),
-            expected_object_versions: vec![crate::DfsNamespaceObjectVersionExpectation {
-                object_id: moved.object_id.clone(),
-                expected_version: Some(fixture.object.version.clone()),
-            }],
-            expected_path_occupants: vec![crate::DfsNamespacePathOccupantExpectation {
-                path: fixture.object.path.clone(),
-                expected_object_id: Some(fixture.object.object_id.clone()),
-            }],
-            content_receipts: Vec::new(),
-            transaction: crate::DfsNamespaceTransaction {
-                content_reference_identity: None,
-                extension_expectations: Vec::new(),
-                contribution_digest: None,
-                file_version_pins: None,
-                transaction_id: "transaction:must-not-append-after-fence".to_string(),
-                file_system_id: moved.file_system_id.clone(),
-                objects: vec![moved],
-                versions: Vec::new(),
-                advisory_lock_states: Vec::new(),
-                created_at: time::OffsetDateTime::UNIX_EPOCH,
+        let payload = crate::DfsPreparedOperationPayload::for_metadata_effects(
+            crate::DfsPreparedOperationScope {
+                operation_id: "native:must-not-append-after-fence".into(),
+                file_system_id: fixture.shard.file_system_id.clone(),
+                shard_id: shard_id.clone(),
+                owner_epoch: fixture.shard.epoch,
             },
-            completed_request: None,
-            completed_request_completion: None,
-            status: crate::DfsNamespacePrepareStatus::Prepared,
-        };
-        prepare.operation_digest =
-            crate::service_replica::metadata_namespace_prepare_payload_digest(&prepare)
-                .expect("prepare digest");
+            Vec::new(),
+            Vec::new(),
+            vec![crate::DfsPreparedMetadataEffect::PutFileSystem {
+                file_system: fixture.runtime.file_system(),
+            }],
+            time::OffsetDateTime::UNIX_EPOCH,
+        )
+        .unwrap();
         let rejected = fixture
             .service
             .metadata_backend
             .as_deref_mut()
-            .expect("metadata backend")
-            .prepare_namespace_transaction(&prepare);
+            .unwrap()
+            .prepare_operation(payload, None);
         assert!(matches!(
             rejected,
             Err(crate::MetadataBackendError::MembershipHandoffFrozen { .. })
@@ -5066,1743 +3100,506 @@ mod tests {
                 .service
                 .metadata_backend
                 .as_deref()
-                .expect("metadata backend")
+                .unwrap()
                 .journal_last_sequence()
-                .expect("journal head"),
+                .unwrap(),
             freeze.journal_sequence
         );
-
-        assert_eq!(
-            fixture
-                .service
-                .reconcile_pending_metadata_shard_membership_handoffs(
-                    &[fixture.shard.clone()],
-                    Duration::from_secs(1),
-                )
-                .expect("activate the unchanged exact frozen head"),
-            1
-        );
-        assert_eq!(
-            fixture
-                .service
-                .metadata_backend
-                .as_deref()
-                .expect("metadata backend")
-                .metadata_shard_write_freeze(&shard_id)
-                .expect("read activated authority generation")
-                .and_then(|fence| fence.activated_epoch),
-            Some(desired.epoch)
-        );
-    }
-
-    #[test]
-    fn later_pending_handoff_reconciles_after_prior_activation_marker_survives() {
-        let old_replica = node("node_sync_handoff_chain_old_replica");
-        let middle_replica = node("node_sync_handoff_chain_middle_replica");
-        let new_replica = node("node_sync_handoff_chain_new_replica");
-        let mut fixture = configured_sync_fixture(
-            "membership_handoff_chain",
-            vec![old_replica.clone()],
-            vec![old_replica, middle_replica.clone(), new_replica.clone()],
-        );
-        let middle = DfsMetadataShardConfig {
-            replica_node_ids: vec![middle_replica],
-            epoch: fixture.shard.epoch + 1,
-            ..fixture.shard.clone()
-        };
-        fixture.control_plane.with_client(|kv| {
-            DfsControlPlaneStore::new(kv)
-                .begin_metadata_shard_membership_handoff(&fixture.shard, &middle)
-                .expect("begin first membership handoff")
-                .expect("first retiring assignment is exact")
-        });
-        assert_eq!(
-            fixture
-                .service
-                .reconcile_pending_metadata_shard_membership_handoffs(
-                    &[fixture.shard.clone()],
-                    Duration::from_secs(1),
-                )
-                .expect("activate first membership handoff"),
-            1
-        );
-
-        let shard_id = DfsMetadataShardId::new(middle.shard_id.clone());
-        let first_marker = fixture
+        let deadline = Instant::now() + crate::DEFAULT_DFS_POSIX_SYNC_TIMEOUT;
+        let reconciled = fixture
             .service
-            .metadata_backend
-            .as_deref()
-            .expect("metadata backend")
-            .metadata_shard_write_freeze(&shard_id)
-            .expect("read first activated marker")
-            .expect("first activated marker remains durable");
-        assert_eq!(first_marker.activated_epoch, Some(middle.epoch));
-
-        let desired = DfsMetadataShardConfig {
-            replica_node_ids: vec![new_replica],
-            epoch: middle.epoch + 1,
-            ..middle.clone()
-        };
-        let second_handoff = fixture.control_plane.with_client(|kv| {
-            DfsControlPlaneStore::new(kv)
-                .begin_metadata_shard_membership_handoff(&middle, &desired)
-                .expect("begin second membership handoff")
-                .expect("second retiring assignment is exact")
-        });
-
-        assert_eq!(
-            fixture
-                .service
-                .reconcile_pending_metadata_shard_membership_handoffs(
-                    std::slice::from_ref(&middle),
-                    Duration::from_secs(1),
-                )
-                .expect("advance surviving marker and activate second handoff"),
-            1
-        );
-
-        let (active, pending) = fixture.control_plane.with_client(|kv| {
-            let store = DfsControlPlaneStore::new(kv);
+            .reconcile_pending_metadata_shard_membership_handoffs(
+                &[fixture.shard.clone()],
+                deadline.saturating_duration_since(Instant::now()),
+            );
+        if let Err(error) = reconciled {
+            // The same normal background owner can finish this handoff first.
+            // A stale retiring caller is acceptable only with the exact
+            // completed assignment, original proof and durable marker below.
+            match error {
+                DfsError::StaleOwnerEpoch {
+                    file_system_id,
+                    local_node_id,
+                    primary_node_id,
+                    epoch,
+                } if file_system_id == desired.file_system_id
+                    && local_node_id == fixture.shard.primary_node_id
+                    && primary_node_id == desired.primary_node_id
+                    && epoch == desired.epoch => {}
+                other => panic!("original handoff reconciliation failed: {other}"),
+            }
+        }
+        let keys = [
+            crate::control_plane::metadata_shard_key(&desired.file_system_id, &desired.shard_id),
+            crate::control_plane::metadata_shard_membership_handoff_key(
+                &desired.file_system_id,
+                &desired.shard_id,
+            ),
+            crate::control_plane::metadata_shard_membership_handoff_proof_key(
+                &desired.file_system_id,
+                &desired.shard_id,
+            ),
+        ];
+        let (actual, pending, proof) = control.with_client(|client| {
+            // All three records come from one actual bounded native read cut,
+            // within the same original reconciliation window.
+            let entries = client
+                .get_authoritative_consistent_before(&keys, deadline)
+                .unwrap();
+            assert_eq!(entries.len(), keys.len());
+            for (entry, key) in entries.iter().zip(&keys) {
+                if let Some(entry) = entry {
+                    assert_eq!(&entry.key, key);
+                }
+            }
             (
-                store
-                    .get_metadata_shard(&desired.file_system_id, &desired.shard_id)
-                    .expect("read active assignment"),
-                store
-                    .get_metadata_shard_membership_handoff(
-                        &desired.file_system_id,
-                        &desired.shard_id,
-                    )
-                    .expect("read pending assignment"),
+                entries[0]
+                    .as_ref()
+                    .expect("actual activated assignment")
+                    .decode::<DfsMetadataShardConfig>()
+                    .unwrap(),
+                entries[1]
+                    .as_ref()
+                    .map(|entry| entry.decode::<DfsMetadataShardMembershipHandoff>().unwrap()),
+                entries[2]
+                    .as_ref()
+                    .expect("actual original completion proof")
+                    .decode::<DfsMetadataShardMembershipHandoffProof>()
+                    .unwrap(),
             )
         });
-        assert_eq!(active, Some(desired.clone()));
         assert!(pending.is_none());
-        let final_marker = fixture
-            .service
-            .metadata_backend
-            .as_deref()
-            .expect("metadata backend")
-            .metadata_shard_write_freeze(&shard_id)
-            .expect("read second activated marker")
-            .expect("second activated marker remains durable");
-        assert_eq!(final_marker.handoff_id, second_handoff.handoff_id);
-        assert_eq!(final_marker.retiring_epoch, middle.epoch);
-        assert_eq!(final_marker.activated_epoch, Some(desired.epoch));
-    }
-
-    #[test]
-    fn handoff_marker_prefix_requires_equal_or_contiguous_extension() {
-        let root = sinomo_testdir::TestDir::new("sinomo-dfs-handoff-prefix-extension");
-        let shard_id = DfsMetadataShardId::new("root");
-        let local = node("node_handoff_prefix_extension");
-        let mut backend =
-            LocalSobjMetadataBackend::new(shard_id.clone(), root.path()).expect("metadata backend");
-        backend
-            .put_file_system(&DfsFileSystem::sifs(local.clone()))
-            .expect("filesystem");
-        let marker = backend
-            .metadata_prefix_proof()
-            .expect("marker prefix proof");
-        backend
-            .put_object(&directory_object("/after-marker", local))
-            .expect("post-marker append");
-
+        assert_eq!(proof.handoff_id, handoff.handoff_id);
+        assert_eq!(proof.cause, handoff.cause);
+        assert_eq!(proof.retiring_shard, fixture.shard);
+        assert_eq!(proof.desired_shard, desired);
+        assert_eq!(proof.journal_sequence, freeze.journal_sequence);
+        assert_eq!(proof.state_fingerprint, freeze.state_fingerprint);
         assert!(
-            metadata_shard_prefix_matches_or_extends_marker(
-                &backend,
-                &shard_id,
-                marker.journal_sequence,
-                &marker.digest,
-                Some(&marker),
+            crate::control_plane::metadata_shard_membership_handoff_acknowledgements_are_safe(
+                &proof.retiring_shard,
+                &proof.desired_shard,
+                &proof.acknowledged_node_ids.iter().cloned().collect(),
             )
-            .expect("verify contiguous extension")
         );
-        let divergent = format!("dfs-metadata-prefix-v1:blake3:{}", "0".repeat(64));
-        assert!(
-            !metadata_shard_prefix_matches_or_extends_marker(
-                &backend,
-                &shard_id,
-                marker.journal_sequence,
-                &divergent,
-                Some(&marker),
-            )
-            .expect("reject divergent extension")
-        );
-    }
-
-    #[test]
-    fn handoff_marker_replays_a_persisted_multi_page_v1_tail_without_switching_to_v2() {
-        let root = sinomo_testdir::TestDir::new("sinomo-dfs-handoff-v1-prefix-extension");
-        let shard_id = DfsMetadataShardId::new("services");
-        let local = node("node_handoff_v1_prefix_extension");
-        let file_system = DfsFileSystem::sifs(local);
-        let seed = {
-            let backend = LocalSobjMetadataBackend::new(shard_id.clone(), root.path())
-                .expect("initialize metadata backend");
-            backend.metadata_prefix_proof().expect("legacy V1 seed")
-        };
-        assert_eq!(seed.version, DFS_METADATA_PREFIX_PROOF_VERSION);
-
-        // The live regression had more than one bounded journal page between
-        // its activated marker and current head. Persist 513 legacy entries so
-        // both the V1 compatibility choice and loop continuation are covered.
-        let mut entries = Vec::with_capacity(DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT + 1);
-        let mut expected = seed.clone();
-        for sequence in 1..=(DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT as u64 + 1) {
-            let entry = crate::DfsMetadataJournalEntry {
-                shard_id: shard_id.clone(),
-                sequence,
-                created_at: time::OffsetDateTime::UNIX_EPOCH,
-                mutation: crate::DfsMetadataMutation::PutFileSystem {
-                    file_system_id: file_system.file_system_id.clone(),
-                    file_system: Some(file_system.clone()),
-                },
-            };
-            expected = dfs_metadata_prefix_proof_after(&expected, &entry)
-                .expect("extend legacy V1 prefix");
-            entries.push(entry);
-        }
-        let entry_refs = entries.iter().collect::<Vec<_>>();
-        crate::metadata_journal::append_segmented_journal_entries(root.path(), &entry_refs)
-            .expect("persist legacy journal tail");
-        crate::metadata_table_store::append_metadata_table_batch(
-            root.path(),
-            &crate::metadata_records::DfsMetadataTableBatch {
-                sequence: expected.journal_sequence,
-                ops: vec![crate::metadata_records::DfsMetadataTableOp::PutFileSystem {
-                    file_system,
-                }],
-                prefix_proof: Some(expected.clone()),
-                journal_reference_replay_cost_bytes: 0,
-            },
-        )
-        .expect("persist legacy materialized head");
-
-        let backend = LocalSobjMetadataBackend::new(shard_id.clone(), root.path())
-            .expect("reopen legacy metadata backend");
-        assert_eq!(
-            backend.metadata_prefix_proof().expect("current V1 proof"),
-            expected
-        );
-        assert!(
-            metadata_shard_prefix_matches_or_extends_marker(
-                &backend,
-                &shard_id,
-                seed.journal_sequence,
-                &seed.digest,
-                Some(&seed),
-            )
-            .expect("verify persisted multi-page V1 extension")
-        );
-    }
-
-    #[test]
-    fn legacy_handoff_rebinds_after_process_restart_and_compaction() {
-        let root = sinomo_testdir::TestDir::new("sinomo-dfs-legacy-handoff-pruned-prefix");
-        let local = node("node_legacy_handoff_pruned_prefix");
-        let replica = node("node_legacy_handoff_pruned_prefix_replica");
-        let file_system_id = sifs_file_system_id();
-        let retiring = DfsMetadataShardConfig {
-            file_system_id: file_system_id.clone(),
-            shard_id: "services".to_string(),
-            primary_node_id: local.clone(),
-            replica_node_ids: vec![replica.clone()],
-            epoch: 18,
-            assignment: DfsMetadataShardAssignment::PathPrefix {
-                prefix: "/services".to_string(),
-            },
-            namespace_prepare_codec: Default::default(),
-            default_policy: DfsObjectPolicy::ReplicatedEventual,
-        };
-        let active = DfsMetadataShardConfig {
-            epoch: retiring.epoch + 1,
-            ..retiring.clone()
-        };
-        let shard_id = DfsMetadataShardId::new(&retiring.shard_id);
-        let metadata_root = root.path().join("metadata");
-        let mut backend = LocalSobjMetadataBackend::new(shard_id.clone(), &metadata_root)
-            .expect("metadata backend");
-        backend
-            .put_file_system(&DfsFileSystem::sifs(local.clone()))
-            .expect("filesystem");
-        let handoff_id = "handoff-legacy-pruned-prefix";
-        let freeze = backend
-            .freeze_metadata_shard_for_membership_handoff(&shard_id, handoff_id, retiring.epoch)
-            .expect("freeze retiring generation")
-            .expect("local shard");
-        backend
-            .clear_metadata_shard_membership_handoff_freeze(&shard_id, handoff_id, &active)
-            .expect("bind activated generation");
-        backend
-            .put_object(&directory_object("/services/after-handoff", local.clone()))
-            .expect("post-handoff append");
-        let current = backend
-            .metadata_prefix_proof()
-            .expect("current exact prefix");
-
-        let marker = backend
-            .metadata_shard_write_freeze(&shard_id)
-            .expect("active marker")
-            .expect("durable active marker");
-        let segment_path = metadata_root
-            .join("journal")
-            .join("segments")
-            .join(format!("{:020}.slog", 1));
-        backend
-            .persist_current_metadata_checkpoint_for_test()
-            .expect("persist the checkpoint before simulating journal pruning");
-        std::fs::remove_file(&segment_path).expect("simulate checkpoint-pruned marker segment");
-        assert!(
-            !metadata_shard_prefix_matches_or_extends_marker(
-                &backend,
-                &shard_id,
-                marker.journal_sequence,
-                &marker.state_fingerprint,
-                marker.rebind_prefix_proof.as_ref(),
-            )
-            .expect("a current marker must fail closed when its checkpoint history is missing")
-        );
-
-        let mut legacy_marker = marker;
-        legacy_marker.rebind_prefix_proof = None;
-        legacy_marker.state_fingerprint =
-            format!("dfs-metadata-prefix-v1:blake3:{}", "0".repeat(64));
-        let legacy_state_fingerprint = legacy_marker.state_fingerprint.clone();
-        crate::metadata_io::write_sobj_atomic(
-            &metadata_root
-                .join("journal")
-                .join("membership-handoff-write-freeze.sobj"),
-            &legacy_marker,
-        )
-        .expect("install legacy activated marker");
-        drop(backend);
-
-        let mut reopened = LocalSobjMetadataBackend::new(shard_id.clone(), &metadata_root)
-            .expect("reopen checkpointed legacy marker");
-        let proof = DfsMetadataShardMembershipHandoffProof {
-            handoff_id: handoff_id.to_string(),
-            retiring_shard: retiring,
-            desired_shard: active.clone(),
-            journal_sequence: freeze.journal_sequence,
-            state_fingerprint: legacy_state_fingerprint,
-            acknowledged_node_ids: vec![local.clone(), replica],
-        };
-        assert!(
-            rebind_completed_metadata_shard_membership_handoff(
-                &mut reopened,
-                &local,
-                &active,
-                None,
-                Some(&proof),
-            )
-            .expect("rebind completed legacy handoff")
-        );
-        let upgraded = reopened
-            .metadata_shard_write_freeze(&shard_id)
-            .expect("read upgraded marker")
-            .expect("upgraded marker remains durable");
-        assert_eq!(upgraded.rebind_prefix_proof, Some(current));
-        assert!(
-            !reopened
-                .metadata_shard_authoritative_writes_frozen(&shard_id)
-                .expect("fresh lane authority"),
-            "the exact completed legacy handoff must restore authoritative writes"
-        );
-        drop(reopened);
-
-        let mut after_process_restart =
-            LocalSobjMetadataBackend::new(shard_id, &metadata_root).expect("second process reopen");
-        assert!(
-            rebind_completed_metadata_shard_membership_handoff(
-                &mut after_process_restart,
-                &local,
-                &active,
-                None,
-                Some(&proof),
-            )
-            .expect("repeat exact rebind after process restart"),
-            "a restarted process must be able to rebind from the compacted completion proof"
-        );
-        after_process_restart
-            .put_object(&directory_object("/services/after-process-restart", local))
-            .expect("authoritative write after compacted legacy handoff rebind");
-    }
-
-    #[test]
-    fn long_lived_mounted_lane_refreshes_before_rebinding_completed_generation() {
-        let root = sinomo_testdir::TestDir::new("sinomo-dfs-mounted-handoff-rebind");
-        let local = node("node_mounted_handoff_local");
-        let old_replica = node("node_mounted_handoff_old_replica");
-        let new_replica = node("node_mounted_handoff_new_replica");
-        let file_system_id = sifs_file_system_id();
-        let retiring = DfsMetadataShardConfig {
-            file_system_id: file_system_id.clone(),
-            shard_id: "root".to_string(),
-            primary_node_id: local.clone(),
-            replica_node_ids: vec![old_replica],
-            epoch: 31,
-            assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
-            default_policy: DfsObjectPolicy::ReplicatedEventual,
-        };
-        let desired = DfsMetadataShardConfig {
-            replica_node_ids: vec![new_replica],
-            epoch: retiring.epoch + 1,
-            ..retiring.clone()
-        };
-        let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
-        control_plane.with_client(|kv| {
-            DfsControlPlaneStore::new(kv)
-                .put_metadata_shard(&retiring)
-                .expect("retiring shard config");
-        });
-
-        let metadata_root = root.path().join("metadata");
-        let shard_id = DfsMetadataShardId::new("root");
-        let mut completing = LocalSobjMetadataBackend::new(shard_id.clone(), &metadata_root)
-            .expect("completing backend");
-        completing
-            .put_file_system(&DfsFileSystem::sifs(local.clone()))
-            .expect("filesystem");
-        let root_object = directory_object("/", local.clone());
-        completing.put_object(&root_object).expect("root object");
-        let mut stale = LocalSobjMetadataBackend::new(shard_id.clone(), &metadata_root)
-            .expect("independently opened pre-activation backend");
-
-        let mounted_backend = LocalSobjMetadataBackend::new(shard_id.clone(), &metadata_root)
-            .expect("mounted-like long-lived backend");
-        let mut mounted = NetworkedDfsService::new(
-            MetadataAckTransport::new(local.clone(), []),
-            LocalContentStore::new(root.path().join("mounted-content")).expect("content store"),
-        )
-        .with_control_plane(control_plane.clone())
-        .with_metadata_backend(mounted_backend)
-        .expect("mounted-like service");
-        let mounted_prefix_before = mounted
-            .metadata_backend()
-            .expect("mounted backend")
-            .metadata_prefix_proof(&shard_id)
-            .expect("mounted prefix")
-            .expect("mounted exact prefix");
-        let caught_up_after_mount_open =
-            directory_object("/caught-up-after-mount-open", local.clone());
-        completing
-            .put_object(&caught_up_after_mount_open)
-            .expect("canonical handle advances before handoff freeze");
-        assert!(
-            mounted
-                .metadata()
-                .object(&caught_up_after_mount_open.object_id)
-                .is_none(),
-            "the mounted lane must begin behind the later handoff marker"
-        );
-
-        let handoff =
-            complete_local_membership_handoff(&control_plane, &mut completing, &retiring, &desired);
-        let handoff_marker = completing
-            .metadata_shard_write_freeze(&shard_id)
-            .expect("handoff marker")
-            .expect("durable handoff marker");
-        assert!(
-            mounted_prefix_before.journal_sequence < handoff_marker.journal_sequence,
-            "the regression requires a service prefix behind the completed handoff marker"
-        );
-
-        completing
-            .clear_metadata_shard_membership_handoff_freeze(
-                &shard_id,
-                &handoff.handoff_id,
-                &desired,
-            )
-            .expect("completing process activates local marker");
-        let recovered_after_mount_open = directory_object("/recovered-after-open", local.clone());
-        completing
-            .put_object(&recovered_after_mount_open)
-            .expect("active process appends state after mounted hydration");
-        assert!(
-            mounted
-                .metadata()
-                .object(&recovered_after_mount_open.object_id)
-                .is_none(),
-            "mounted in-memory metadata should still reflect its pre-rebind hydration"
-        );
-        assert!(
-            mounted
-                .metadata_backend()
-                .expect("mounted backend")
-                .metadata_shard_authoritative_writes_frozen(&shard_id)
-                .expect("mounted frozen state"),
-            "an activated marker still fences a long-lived instance until exact rebind"
-        );
-
-        // A process opened after that legitimate active-generation append sees
-        // a current prefix beyond the completion marker. It must reconstruct
-        // and prove the contiguous extension before binding.
-        let fresh_after_append_backend =
-            LocalSobjMetadataBackend::new(shard_id.clone(), &metadata_root)
-                .expect("fresh backend after active append");
-        let mut fresh_after_append = NetworkedDfsService::new(
-            MetadataAckTransport::new(local.clone(), []),
-            LocalContentStore::new(root.path().join("fresh-after-append-content"))
-                .expect("content store"),
-        )
-        .with_control_plane(control_plane.clone())
-        .with_metadata_backend(fresh_after_append_backend)
-        .expect("fresh service after active append");
-        crate::service_hydration::reset_full_metadata_hydration_calls();
-        fresh_after_append
-            .bootstrap_distributed_sifs()
-            .expect("contiguous post-activation prefix rebinds");
-        assert_eq!(
-            crate::service_hydration::full_metadata_hydration_calls(),
-            1,
-            "promotion must hydrate even an already-current durable prefix because replica ingestion does not retain a visible service-state mirror"
-        );
-        assert_eq!(
-            fresh_after_append
-                .metadata()
-                .object(&recovered_after_mount_open.object_id),
-            Some(&recovered_after_mount_open)
-        );
-
-        crate::service_hydration::reset_full_metadata_hydration_calls();
-        mounted
-            .bootstrap_distributed_sifs()
-            .expect("bootstrap rebinds the exact completed generation");
-        assert_eq!(
-            crate::service_hydration::full_metadata_hydration_calls(),
-            1,
-            "a durable prefix advanced after initial hydration must be rehydrated"
-        );
-        assert_eq!(
-            mounted
-                .metadata()
-                .object(&recovered_after_mount_open.object_id),
-            Some(&recovered_after_mount_open),
-            "rebind must rehydrate state refreshed or recovered by the backend"
-        );
-        assert_eq!(
-            mounted
-                .metadata()
-                .object(&caught_up_after_mount_open.object_id),
-            Some(&caught_up_after_mount_open),
-            "rebind must first refresh a prefix that was behind the completion marker"
-        );
-        assert!(
-            !mounted
-                .metadata_backend()
-                .expect("mounted backend")
-                .metadata_shard_authoritative_writes_frozen(&shard_id)
-                .expect("mounted rebound state"),
-            "the convergence gate must observe the rebound current-primary lane as writable"
-        );
-        let after_rebind = directory_object("/after-mounted-rebind", local.clone());
-        mounted
-            .metadata_backend
-            .as_deref_mut()
-            .expect("mounted metadata backend")
-            .put_object(&after_rebind)
-            .expect("newly rebound mounted handle may append");
-        assert!(matches!(
-            stale.put_object(&directory_object("/stale-must-stay-fenced", local)),
-            Err(crate::MetadataBackendError::MembershipHandoffFrozen {
-                ref handoff_id,
-                ..
-            }) if handoff_id == &handoff.handoff_id
-        ));
-        assert_eq!(
-            mounted
-                .metadata_backend()
-                .expect("mounted backend")
-                .metadata_shard_write_freeze(&shard_id)
-                .expect("durable active marker")
-                .and_then(|marker| marker.activated_epoch),
-            Some(desired.epoch),
-            "the durable marker remains to fence independently opened stale handles"
-        );
-    }
-
-    #[test]
-    fn mounted_like_reopen_leaves_pending_membership_marker_frozen() {
-        let root = sinomo_testdir::TestDir::new("sinomo-dfs-mounted-pending-handoff");
-        let local = node("node_mounted_pending_local");
-        let old_replica = node("node_mounted_pending_old_replica");
-        let new_replica = node("node_mounted_pending_new_replica");
-        let file_system_id = sifs_file_system_id();
-        let retiring = DfsMetadataShardConfig {
-            file_system_id: file_system_id.clone(),
-            shard_id: "root".to_string(),
-            primary_node_id: local.clone(),
-            replica_node_ids: vec![old_replica],
-            epoch: 41,
-            assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
-            default_policy: DfsObjectPolicy::ReplicatedEventual,
-        };
-        let desired = DfsMetadataShardConfig {
-            replica_node_ids: vec![new_replica],
-            epoch: retiring.epoch + 1,
-            ..retiring.clone()
-        };
-        let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
-        control_plane.with_client(|kv| {
-            DfsControlPlaneStore::new(kv)
-                .put_metadata_shard(&retiring)
-                .expect("retiring shard config");
-        });
-        let metadata_root = root.path().join("metadata");
-        let shard_id = DfsMetadataShardId::new("root");
-        let mut backend = LocalSobjMetadataBackend::new(shard_id.clone(), &metadata_root)
-            .expect("retiring backend");
-        backend
-            .put_file_system(&DfsFileSystem::sifs(local.clone()))
-            .expect("filesystem");
-        backend
-            .put_object(&directory_object("/", local.clone()))
-            .expect("root object");
-        let pending = control_plane.with_client(|kv| {
-            DfsControlPlaneStore::new(kv)
-                .begin_metadata_shard_membership_handoff(&retiring, &desired)
-                .expect("begin pending membership handoff")
-                .expect("retiring assignment remains exact")
-        });
-        backend
-            .freeze_metadata_shard_for_membership_handoff(
-                &shard_id,
-                &pending.handoff_id,
-                retiring.epoch,
-            )
-            .expect("freeze pending generation")
-            .expect("local shard");
-
-        let reopened = LocalSobjMetadataBackend::new(shard_id.clone(), &metadata_root)
-            .expect("mounted-like pending backend");
-        let mut mounted = NetworkedDfsService::new(
-            MetadataAckTransport::new(local.clone(), []),
-            LocalContentStore::new(root.path().join("mounted-content")).expect("content store"),
-        )
-        .with_control_plane(control_plane.clone())
-        .with_metadata_backend(reopened)
-        .expect("mounted-like pending service");
-
-        assert_eq!(
-            mounted
-                .rebind_completed_local_metadata_shard_membership_handoffs(&file_system_id)
-                .expect("pending marker is observed read-only"),
-            0
-        );
-        assert!(matches!(
-            mounted
-                .metadata_backend
-                .as_deref_mut()
-                .expect("mounted backend")
-                .put_object(&directory_object("/must-remain-frozen", local)),
-            Err(crate::MetadataBackendError::MembershipHandoffFrozen {
-                ref handoff_id,
-                ..
-            }) if handoff_id == &pending.handoff_id
-        ));
-        let (active, still_pending, proof) = control_plane.with_client(|kv| {
-            let store = DfsControlPlaneStore::new(kv);
-            (
-                store
-                    .get_metadata_shard(&file_system_id, &retiring.shard_id)
-                    .expect("active shard"),
-                store
-                    .get_metadata_shard_membership_handoff(&file_system_id, &retiring.shard_id)
-                    .expect("pending handoff"),
-                store
-                    .get_metadata_shard_membership_handoff_proof(
-                        &file_system_id,
-                        &retiring.shard_id,
-                    )
-                    .expect("completion proof"),
-            )
-        });
-        assert_eq!(active, Some(retiring));
-        assert_eq!(still_pending, Some(pending));
-        assert!(proof.is_none());
-    }
-
-    #[test]
-    fn retired_replica_marker_does_not_refresh_control_plane_during_cold_open() {
-        let root = sinomo_testdir::TestDir::new("sinomo-dfs-retired-replica-cold-open");
-        let local = node("node_retired_replica_local");
-        let primary = node("node_retired_replica_primary");
-        let file_system_id = sifs_file_system_id();
-        let shard = DfsMetadataShardConfig {
-            file_system_id: file_system_id.clone(),
-            shard_id: "services".to_string(),
-            primary_node_id: primary,
-            replica_node_ids: vec![local.clone()],
-            epoch: 9,
-            assignment: DfsMetadataShardAssignment::PathPrefix {
-                prefix: "/services".to_string(),
-            },
-            namespace_prepare_codec: Default::default(),
-            default_policy: DfsObjectPolicy::ReplicatedEventual,
-        };
-        let mut inner = InProcessKvStore::new();
-        DfsControlPlaneStore::new(&mut inner)
-            .put_metadata_shard(&shard)
-            .expect("active remote-primary shard");
-        let refresh_calls = Arc::new(AtomicUsize::new(0));
-        let control_plane = RefreshCountingControlPlane {
-            inner,
-            refresh_calls: Arc::clone(&refresh_calls),
-        };
-
-        let shard_id = DfsMetadataShardId::new(&shard.shard_id);
-        let mut backend = LocalSobjMetadataBackend::new(shard_id.clone(), root.path())
-            .expect("retired replica backend");
-        backend
-            .put_file_system(&DfsFileSystem::sifs(local.clone()))
-            .expect("filesystem");
-        backend
-            .freeze_metadata_shard_for_membership_handoff(
-                &shard_id,
-                "completed-retired-replica-handoff",
-                shard.epoch - 1,
-            )
-            .expect("freeze retired replica")
-            .expect("matching local shard");
-        backend
-            .mark_metadata_shard_membership_handoff_activated(
-                &shard_id,
-                "completed-retired-replica-handoff",
-                shard.epoch,
-            )
-            .expect("activate retired replica marker");
-
-        let mut service = NetworkedDfsService::new(
-            MetadataAckTransport::new(local, []),
-            LocalContentStore::new(root.path().join("content")).expect("content store"),
-        )
-        .with_control_plane(control_plane)
-        .with_metadata_backend(backend)
-        .expect("retired replica service");
-
-        assert_eq!(
-            service
-                .rebind_completed_local_metadata_shard_membership_handoffs(&file_system_id)
-                .expect("retired marker cold-open check"),
-            0
-        );
-        assert_eq!(
-            refresh_calls.load(Ordering::SeqCst),
-            0,
-            "a durable marker on a remote-primary replica must not schedule an authoritative KV refresh"
-        );
-        assert!(
-            service
-                .metadata_backend()
-                .expect("metadata backend")
-                .metadata_shard_authoritative_writes_frozen(&shard_id)
-                .expect("retired replica marker"),
-            "the retired replica must remain fail-closed"
-        );
-    }
-
-    #[test]
-    fn local_primary_rebind_probes_only_the_candidate_then_hydrates_on_promotion() {
-        let root = sinomo_testdir::TestDir::new("sinomo-dfs-local-rebind-lazy-slots");
-        let metadata_root = root.path().join("metadata");
-        let local = node("node_local_rebind_lazy_users");
-        let root_primary = node("node_local_rebind_lazy_root");
-        let services_primary = node("node_local_rebind_lazy_services");
-        let file_system_id = sifs_file_system_id();
-        let root_shard = DfsMetadataShardConfig {
-            file_system_id: file_system_id.clone(),
-            shard_id: "root".to_string(),
-            primary_node_id: root_primary.clone(),
-            replica_node_ids: vec![local.clone()],
-            epoch: 2,
-            assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
-            default_policy: DfsObjectPolicy::ReplicatedEventual,
-        };
-        let services_shard = DfsMetadataShardConfig {
-            file_system_id: file_system_id.clone(),
-            shard_id: "services".to_string(),
-            primary_node_id: services_primary.clone(),
-            replica_node_ids: vec![local.clone()],
-            epoch: 2,
-            assignment: DfsMetadataShardAssignment::PathPrefix {
-                prefix: "/services".to_string(),
-            },
-            namespace_prepare_codec: Default::default(),
-            default_policy: DfsObjectPolicy::ReplicatedEventual,
-        };
-        let retiring_users = DfsMetadataShardConfig {
-            file_system_id: file_system_id.clone(),
-            shard_id: "users".to_string(),
-            primary_node_id: local.clone(),
-            replica_node_ids: vec![root_primary],
-            epoch: 1,
-            assignment: DfsMetadataShardAssignment::PathPrefix {
-                prefix: "/users".to_string(),
-            },
-            namespace_prepare_codec: Default::default(),
-            default_policy: DfsObjectPolicy::ReplicatedEventual,
-        };
-        let active_users = DfsMetadataShardConfig {
-            replica_node_ids: vec![services_primary],
-            epoch: retiring_users.epoch + 1,
-            ..retiring_users.clone()
-        };
-        let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
-        control_plane.with_client(|kv| {
-            let mut store = DfsControlPlaneStore::new(kv);
-            store
-                .put_metadata_shard(&root_shard)
-                .expect("root shard config");
-            store
-                .put_metadata_shard(&services_shard)
-                .expect("services shard config");
-            store
-                .put_metadata_shard(&retiring_users)
-                .expect("retiring users shard config");
-        });
-
-        let users_shard_id = DfsMetadataShardId::new("users");
-        let mut users_backend =
-            LocalSobjMetadataBackend::new(users_shard_id.clone(), metadata_root.join("users"))
-                .expect("users metadata backend");
-        users_backend
-            .put_file_system(&DfsFileSystem::sifs(local.clone()))
-            .expect("users filesystem");
-        let promoted_object = directory_object("/users/promoted-visible", local.clone());
-        users_backend
-            .put_object(&promoted_object)
-            .expect("promoted users object");
-        complete_local_membership_handoff(
-            &control_plane,
-            &mut users_backend,
-            &retiring_users,
-            &active_users,
-        );
-        drop(users_backend);
-
-        let remote_shard_paths = [metadata_root.join("root"), metadata_root.join("services")];
-        let sharded = LocalShardedMetadataBackend::new_with_replica_repair(
-            &metadata_root,
-            vec![root_shard, services_shard, active_users.clone()],
-            &local,
-        )
-        .expect("node-aware sharded backend");
-        assert!(
-            remote_shard_paths.iter().all(|path| !path.exists()),
-            "deferred remote replica slots must start unopened"
-        );
-
-        let mut service = NetworkedDfsService::new(
-            MetadataAckTransport::new(local, []),
-            LocalContentStore::new(root.path().join("content")).expect("content store"),
-        )
-        .with_control_plane(control_plane);
-        service.set_metadata_backend_unhydrated(sharded);
-
-        crate::service_hydration::reset_full_metadata_hydration_calls();
-        assert_eq!(
-            service
-                .rebind_completed_local_metadata_shard_membership_handoffs(&file_system_id)
-                .expect("rebind local users shard"),
-            1
-        );
-        assert_eq!(
-            crate::service_hydration::full_metadata_hydration_calls(),
-            1,
-            "successful promotion must rebuild service state that replica ingestion intentionally does not mirror"
-        );
-        assert_eq!(
-            service.metadata().object(&promoted_object.object_id),
-            Some(&promoted_object),
-            "the first mutation after promotion must observe the complete authoritative state"
-        );
-        let backend = service.metadata_backend().expect("metadata backend");
-        assert!(
-            !backend
-                .metadata_shard_authoritative_writes_frozen(&users_shard_id)
-                .expect("users authority state"),
-            "exact completed users generation must be bound to this service"
-        );
-        assert_eq!(
-            backend
-                .metadata_shard_write_freeze(&users_shard_id)
-                .expect("users handoff marker")
-                .and_then(|marker| marker.activated_epoch),
-            Some(active_users.epoch)
-        );
-    }
-
-    #[test]
-    fn configured_metadata_sync_rejects_a_legacy_sequence_only_ack() {
-        let replica_a = node("node_sync_legacy_replica_a");
-        let replica_b = node("node_sync_legacy_replica_b");
-        let mut fixture = configured_sync_fixture(
-            "legacy_ack",
-            vec![replica_a.clone(), replica_b],
-            vec![replica_a],
-        );
-        fixture.service.transport.echoes_prefix_verification = false;
-        let target = fixture
-            .service
-            .capture_metadata_quorum_sync_target(&fixture.object)
-            .expect("capture target");
-
-        let error = fixture
-            .service
-            .sync_metadata_shard_to_quorum(&target, Duration::ZERO)
-            .expect_err("a peer that cannot echo exact-prefix verification is not a fresh ack");
-        assert!(matches!(error, DfsError::Network { .. }));
-    }
-
-    #[test]
-    fn configured_metadata_sync_rejects_a_replayed_response_for_another_head() {
-        let replica_a = node("node_sync_replayed_replica_a");
-        let replica_b = node("node_sync_replayed_replica_b");
-        let mut fixture = configured_sync_fixture(
-            "replayed_ack",
-            vec![replica_a.clone(), replica_b],
-            vec![replica_a],
-        );
-        let target = fixture
-            .service
-            .capture_metadata_quorum_sync_target(&fixture.object)
-            .expect("capture target");
-        fixture.service.transport.response_sequence_override =
-            Some(target.journal_sequence.saturating_sub(1));
-
-        let error = fixture
-            .service
-            .sync_metadata_shard_to_quorum(&target, Duration::ZERO)
-            .expect_err("a delayed acknowledgement for another head must not be promoted");
-        assert!(matches!(error, DfsError::Network { .. }));
-    }
-
-    #[test]
-    fn metadata_sync_rejects_an_authority_epoch_change() {
-        let replica = node("node_sync_epoch_replica");
-        let mut fixture =
-            configured_sync_fixture("epoch_change", vec![replica.clone()], vec![replica.clone()]);
-        let target = fixture
-            .service
-            .capture_metadata_quorum_sync_target(&fixture.object)
-            .expect("capture target");
-        let mut transferred = fixture.shard.clone();
-        transferred.primary_node_id = replica;
-        transferred.replica_node_ids = vec![fixture.shard.primary_node_id.clone()];
-        transferred.epoch += 1;
-        fixture.control_plane.with_client(|kv| {
-            DfsControlPlaneStore::new(kv)
-                .put_metadata_shard(&transferred)
-                .expect("transfer metadata authority");
-        });
-
-        let error = fixture
-            .service
-            .sync_metadata_shard_to_quorum(&target, Duration::ZERO)
-            .expect_err("stale target must be fenced");
-        assert!(matches!(error, DfsError::StaleOwnerEpoch { epoch: 8, .. }));
-    }
-
-    #[test]
-    fn metadata_sync_times_out_without_a_replica_ack() {
-        let replica = node("node_sync_timeout_replica");
-        let mut fixture = configured_sync_fixture("timeout", vec![replica], Vec::new());
-        let target = fixture
-            .service
-            .capture_metadata_quorum_sync_target(&fixture.object)
-            .expect("capture target");
-
-        let error = fixture
-            .service
-            .sync_metadata_shard_to_quorum(&target, Duration::ZERO)
-            .expect_err("missing acknowledgement must time out");
-        assert!(
-            matches!(error, DfsError::Network { message } if message.contains("1/2 acknowledgements"))
-        );
-    }
-
-    #[test]
-    fn sync_refreshes_a_stale_owned_handle_after_real_receivers_reject_its_frozen_prefix() {
-        let replicas = (0..5)
-            .map(|index| node(&format!("node_sync_stale_reader_replica_{index}")))
-            .collect::<Vec<_>>();
-        let mut fixture =
-            configured_sync_fixture("stale_owned_prefix", replicas.clone(), replicas.clone());
-        let initial = fixture
-            .service
-            .capture_metadata_quorum_sync_target(&fixture.object)
-            .expect("initial real checkpoint");
-        for peer in &replicas {
-            fixture
-                .service
-                .metadata_backend
-                .as_deref_mut()
-                .unwrap()
-                .put_metadata_replication_cursor(peer, &initial.shard_id, initial.journal_sequence)
-                .expect("persist the previously acknowledged scheduling hint");
-        }
-        let target = fixture
-            .service
-            .capture_metadata_quorum_sync_target(&fixture.object)
-            .expect("freeze the old reader's exact head");
-        assert_eq!(target.journal_sequence, initial.journal_sequence);
-        let baseline_batch = fixture
+        let activated = fixture
             .service
             .metadata_backend
             .as_deref()
             .unwrap()
-            .journal_batch_for_shard_since_limited(
-                &target.shard_id,
-                0,
-                DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
-                DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT,
-            )
-            .expect("baseline journal")
-            .expect("nonempty baseline");
-        let baseline = crate::metadata_replication::prepare_dfs_metadata_journal_frame_batch(
-            fixture.service.metadata_backend.as_deref().unwrap(),
-            &baseline_batch,
-        )
-        .expect("exact baseline frames");
-        for (index, peer) in replicas.iter().enumerate() {
-            let mut receiver = LocalSobjMetadataBackend::new(
-                target.shard_id.clone(),
-                fixture
-                    .root
-                    .path()
-                    .join(format!("stale-reader-receiver-{index}")),
-            )
-            .expect("real independent receiver");
-            let context = crate::DfsMetadataReplicaShardContext {
-                local_node_id: peer.clone(),
-                shard: fixture.shard.clone(),
-                pending_membership_handoff: None,
-            };
-            let mut command =
-                crate::metadata_replication::dfs_metadata_durable_journal_batch_command(
-                    &fixture.shard.primary_node_id,
-                    peer,
-                    &fixture.shard.file_system_id,
-                    fixture.shard.epoch,
-                    baseline.clone(),
-                    false,
-                );
-            command.request_id = format!("baseline-{index}");
-            let confirmation = command
-                .durable_replication
-                .as_ref()
-                .unwrap()
-                .confirmation_id
-                .clone();
-            let response = crate::metadata_replication::process_dfs_metadata_journal_batch(
-                &mut receiver,
-                Some(&context),
-                command,
-            );
-            assert_eq!(response.result, DfsMetadataJournalBatchResult::Applied);
-            assert_eq!(response.verified_authority_probe_id, Some(confirmation));
-            receiver
-                .refresh_metadata_shard_attestation_view(&target.shard_id)
-                .expect("materialize the durably accepted prefix before inspecting its proof");
-            assert_eq!(
-                metadata_shard_state_fingerprint_at(
-                    &receiver,
-                    &target.shard_id,
-                    target.journal_sequence
-                )
-                .unwrap(),
-                target.state_fingerprint
-            );
-            fixture
-                .service
-                .transport
-                .checkpoint_receivers
-                .insert(peer.clone(), (receiver, context));
-        }
-        // Open the independent writer before the barrier. It advances only
-        // once the barrier actually sends its frozen prefix to a real peer.
-        let mut writer = LocalSobjMetadataBackend::new(
-            target.shard_id.clone(),
-            fixture.root.path().join("metadata"),
-        )
-        .expect("second handle on the same authoritative store");
-        assert_eq!(writer.journal_last_sequence(), target.journal_sequence);
-        writer
-            .put_object(&directory_object(
-                "/before-sync",
-                fixture.shard.primary_node_id.clone(),
-            ))
-            .expect("real external publication before barrier entry");
-        let intermediate_head = writer.journal_last_sequence();
-        assert!(intermediate_head > target.journal_sequence);
+            .metadata_shard_write_freeze(&shard_id)
+            .unwrap()
+            .expect("actual retiring backend keeps its durable fence");
+        assert_eq!(activated.handoff_id, freeze.handoff_id);
+        assert_eq!(activated.retiring_epoch, freeze.retiring_epoch);
+        assert_eq!(activated.activated_epoch, Some(desired.epoch));
+        assert_eq!(activated.journal_sequence, freeze.journal_sequence);
+        assert_eq!(activated.state_fingerprint, freeze.state_fingerprint);
         assert_eq!(
-            fixture
-                .service
-                .metadata_backend
-                .as_deref()
-                .unwrap()
-                .metadata_shard_statuses()
-                .unwrap()[0]
-                .journal_last_sequence,
-            target.journal_sequence,
-            "first handle is genuinely stale after the second writer committed"
+            actual, desired,
+            "rejected hidden prepare cannot wedge genuine joint activation"
         );
-        let successor_object =
-            directory_object("/concurrent-prefix", fixture.shard.primary_node_id.clone());
-        let successor_id = successor_object.object_id.clone();
-        fixture.service.transport.checkpoint_advance_on_first_probe =
-            Some((writer, successor_object));
-        // A successful snapshot accelerator cannot mask the fresh journal
-        // proof requirement in this regression.
-        fixture.service.transport.reject_snapshot_installs = true;
-        let certificate = fixture
-            .service
-            .sync_metadata_shard_to_quorum(&target, DEFAULT_DFS_POSIX_SYNC_TIMEOUT)
-            .expect("refresh the stale handle and certify the actual stronger prefix");
-        let successor = fixture
-            .service
-            .transport
-            .checkpoint_advance_sequence
-            .expect("real external write ran");
-        assert!(successor > target.journal_sequence);
-        assert_eq!(certificate.target.journal_sequence, successor);
-        assert_eq!(certificate.target.authority_epoch, target.authority_epoch);
-        assert_eq!(certificate.target.expected_shard, target.expected_shard);
-        assert_eq!(certificate.quorum_size, 4);
-        assert_eq!(
-            certificate
-                .acknowledged_node_ids
-                .iter()
-                .cloned()
-                .collect::<BTreeSet<_>>(),
-            std::iter::once(fixture.shard.primary_node_id.clone())
-                .chain(replicas.iter().cloned())
-                .collect()
-        );
-        let rejected = fixture
-            .service
-            .transport
-            .checkpoint_exchanges
-            .iter()
-            .filter(|(_, command, response)| {
-                command.verify_prefix_only
-                    && command.batch.next_after_sequence == intermediate_head
-                    && matches!(
-                        response.result,
-                        DfsMetadataJournalBatchResult::Rejected {
-                            code: Some(crate::DfsMetadataRejectionCode::PrefixMismatch),
-                            ..
-                        }
-                    )
-            })
-            .map(|(peer, _, _)| peer.clone())
-            .collect::<BTreeSet<_>>();
-        assert_eq!(
-            rejected,
-            replicas.iter().cloned().collect(),
-            "all real peers reject the old exact head"
-        );
-        let accepted = fixture
-            .service
-            .transport
-            .checkpoint_exchanges
-            .iter()
-            .filter(|(_, command, response)| {
-                command.verify_prefix_only
-                    && command.batch.next_after_sequence == successor
-                    && response.verified_prefix_only
-                    && matches!(response.result, DfsMetadataJournalBatchResult::Applied)
-            })
-            .map(|(peer, _, _)| peer.clone())
-            .collect::<BTreeSet<_>>();
-        assert_eq!(
-            accepted,
-            replicas.iter().cloned().collect(),
-            "all certificate ACKs come from real fresh proofs"
-        );
-        for (receiver, _) in fixture.service.transport.checkpoint_receivers.values() {
-            assert_eq!(receiver.journal_last_sequence(), successor);
-            assert!(receiver.get_object(&successor_id).unwrap().is_some());
-            assert_eq!(
-                metadata_shard_state_fingerprint_at(receiver, &target.shard_id, successor).unwrap(),
-                certificate.target.state_fingerprint
-            );
-        }
-        assert_eq!(
-            fixture
-                .service
-                .metadata_backend
-                .as_deref()
-                .unwrap()
-                .metadata_shard_statuses()
-                .unwrap()[0]
-                .journal_last_sequence,
-            successor
-        );
-        assert_eq!(
-            fixture.txn_calls.load(Ordering::SeqCst),
-            0,
-            "full fresh proof needs no Raft fallback"
-        );
-        let reopened = LocalSobjMetadataBackend::new(
-            target.shard_id.clone(),
-            fixture.root.path().join("metadata"),
-        )
-        .expect("reopen unchanged authoritative journal");
-        assert_eq!(reopened.journal_last_sequence(), successor);
-        assert!(reopened.get_object(&successor_id).unwrap().is_some());
+        fixture.finish();
     }
 
     #[test]
-    fn six_member_sync_cursor_gate_requires_fresh_frozen_prefix_from_all_five_receivers() {
-        let replicas = (0..5)
-            .map(|index| node(&format!("node_sync_checkpoint_receiver_{index}")))
-            .collect::<Vec<_>>();
-        let mut fixture =
-            configured_sync_fixture("six_member_checkpoint", replicas.clone(), replicas.clone());
-        for (index, replica) in replicas.iter().enumerate() {
-            let receiver = LocalSobjMetadataBackend::new(
-                DfsMetadataShardId::new(&fixture.shard.shard_id),
-                fixture.root.path().join(format!("receiver-{index}")),
-            )
-            .expect("independent receiver backend");
-            fixture.service.transport.checkpoint_receivers.insert(
-                replica.clone(),
-                (
-                    receiver,
-                    crate::DfsMetadataReplicaShardContext {
-                        local_node_id: replica.clone(),
-                        shard: fixture.shard.clone(),
-                        pending_membership_handoff: None,
-                    },
-                ),
-            );
-        }
-        let target = fixture
-            .service
-            .capture_metadata_quorum_sync_target(&fixture.object)
-            .expect("freeze checkpoint before unrelated local append");
-        fixture
-            .service
-            .metadata_backend
-            .as_deref_mut()
-            .expect("primary backend")
-            .put_object(&directory_object(
-                "/checkpoint-successor",
-                fixture.shard.primary_node_id.clone(),
-            ))
-            .expect("append a real successor after target capture");
-        let mut fresh = BTreeSet::from([fixture.shard.primary_node_id.clone()]);
-        let mut prefixes = BTreeMap::new();
-        let mut catchups = BTreeMap::new();
-        let purpose = MetadataQuorumSyncPurpose::OrdinaryDurability;
-
-        fixture
-            .service
-            .send_metadata_sync_prefix_probes(
-                &target,
-                "frozen",
-                &mut fresh,
-                &mut prefixes,
-                &purpose,
-                &mut MetadataSyncAttemptDiagnostics::for_target(&target),
-            )
-            .expect("prefix scheduling before catch-up");
-        assert!(
-            prefixes.is_empty(),
-            "all five zero cursors must gate probes"
-        );
-        assert!(fixture.service.transport.checkpoint_exchanges.is_empty());
-        fixture
-            .service
-            .send_metadata_sync_catchup_batches(
-                &target,
-                "frozen",
-                &mut catchups,
-                &mut MetadataSyncAttemptDiagnostics::for_target(&target),
-            )
-            .expect("send frozen catch-up to all five receivers");
-        assert_eq!(catchups.len(), 5);
-        let events = fixture
-            .service
-            .process_incoming()
-            .expect("settle durable catch-up replies");
-        assert!(
-            record_metadata_sync_prefix_probe_events(
-                events,
-                &target,
-                &mut prefixes,
-                &mut catchups,
-                &mut fresh,
-            )
-            .is_empty()
-        );
-        assert!(catchups.is_empty());
-        assert_eq!(fresh.len(), 1, "catch-up is not a fresh prefix certificate");
-        assert_eq!(fixture.service.transport.checkpoint_exchanges.len(), 5);
-        for (peer, command, response) in &fixture.service.transport.checkpoint_exchanges {
-            assert!(replicas.contains(peer));
-            assert_eq!(
-                command.source_node_id.as_ref(),
-                Some(&fixture.shard.primary_node_id)
-            );
-            assert_eq!(
-                command.file_system_id.as_ref(),
-                Some(&fixture.shard.file_system_id)
-            );
-            assert_eq!(command.authority_epoch, Some(fixture.shard.epoch));
-            assert!(!command.verify_prefix_only);
-            assert_eq!(command.batch.next_after_sequence, target.journal_sequence);
-            assert_eq!(response.result, DfsMetadataJournalBatchResult::Applied);
-            let (receiver, _) = fixture
+    fn supplied_checkpoint_snapshot_rejects_invalid_frozen_prefix_before_send() {
+        for invalidity in ["sequence", "fingerprint"] {
+            let name = format!("native-supplied-checkpoint-{invalidity}");
+            let nodes = crate::test_runtime::DfsTestRuntime::ordered_node_ids(&name, 2);
+            let replica = nodes[1].clone();
+            let mut fixture = configured_normal_sync_fixture(&name, vec![replica.clone()]);
+            let mut target = fixture
                 .service
-                .transport
-                .checkpoint_receivers
-                .get_mut(peer)
-                .expect("real receiver");
-            receiver
-                .refresh_metadata_shard_attestation_view(&target.shard_id)
-                .expect("materialize the durably accepted prefix before inspecting its proof");
-            assert_eq!(
-                receiver.journal_last_sequence(),
-                target.journal_sequence,
-                "a frozen catch-up must not push the already appended successor"
-            );
-            assert_eq!(
-                metadata_shard_state_fingerprint_at(
-                    receiver,
-                    &target.shard_id,
-                    target.journal_sequence
-                )
-                .expect("receiver durable prefix"),
-                target.state_fingerprint
-            );
-        }
-
-        fixture
-            .service
-            .send_metadata_sync_prefix_probes(
-                &target,
-                "frozen",
-                &mut fresh,
-                &mut prefixes,
-                &purpose,
-                &mut MetadataSyncAttemptDiagnostics::for_target(&target),
-            )
-            .expect("fresh exact probes after every catch-up reply");
-        assert_eq!(prefixes.len(), 5);
-        let proofs = fixture.service.transport.checkpoint_exchanges[5..].to_vec();
-        assert_eq!(proofs.len(), 5);
-        let mut request_ids = BTreeSet::new();
-        fixture.service.transport.incoming.clear();
-        let mut exact_events = Vec::new();
-        for (peer, command, response) in proofs {
-            assert!(
-                request_ids.insert(command.request_id.clone()),
-                "one request identity per peer"
-            );
-            let probe = command
-                .prefix_probe
-                .as_ref()
-                .expect("exact checkpoint probe");
-            assert_eq!(probe.barrier_id, "frozen");
-            assert_eq!(probe.journal_sequence, target.journal_sequence);
-            assert_eq!(probe.state_fingerprint, target.state_fingerprint);
-            assert!(command.batch.entries.is_empty());
-            assert!(response.verified_prefix_only);
-            assert_eq!(response.result, DfsMetadataJournalBatchResult::Applied);
-
-            // These are corrupt copies of an actual durable receiver response.
-            // No malformed copy may consume the outstanding exact request.
-            for fault in 0..5 {
-                let mut corrupted = response.clone();
-                let mut source = peer.clone();
-                match fault {
-                    0 => corrupted.request_id = format!("stale-{}", corrupted.request_id),
-                    1 => source = node("node_sync_checkpoint_wrong_source"),
-                    2 => corrupted.next_after_sequence = target.journal_sequence + 1,
-                    3 => corrupted.verified_prefix_only = false,
-                    4 => corrupted.verified_authority_probe_id = Some("foreign-proof".into()),
-                    _ => unreachable!(),
-                }
-                assert!(
-                    fixture
-                        .service
-                        .handle_metadata_journal_batch_response(source, corrupted)
-                        .expect("classify malformed receiver response")
-                        .is_none()
-                );
-                assert!(
-                    fixture
-                        .service
-                        .replication
-                        .pending_metadata_replications
-                        .contains_key(&command.request_id)
-                );
-            }
-
-            // Fingerprint eligibility belongs to the real receiver verifier,
-            // rather than to an echo-only test transport.
-            let mut divergent_probe = command.clone();
-            divergent_probe.request_id = format!("divergent-{}", command.request_id);
-            divergent_probe
-                .prefix_probe
-                .as_mut()
-                .unwrap()
-                .state_fingerprint
-                .push_str("-wrong");
-            let (receiver, context) = fixture
-                .service
-                .transport
-                .checkpoint_receivers
-                .get_mut(&peer)
-                .expect("real receiver");
-            let rejected = crate::metadata_replication::process_dfs_metadata_journal_batch(
-                receiver,
-                Some(context),
-                divergent_probe,
-            );
-            assert!(matches!(
-                rejected.result,
-                DfsMetadataJournalBatchResult::Rejected {
-                    code: Some(crate::DfsMetadataRejectionCode::PrefixMismatch),
-                    ..
-                }
-            ));
-            assert!(!rejected.verified_prefix_only);
-            exact_events.push(
-                fixture
-                    .service
-                    .handle_metadata_journal_batch_response(peer, response)
-                    .expect("accept exact durable receiver response")
-                    .expect("fresh prefix event"),
-            );
-        }
-        assert!(
-            record_metadata_sync_prefix_probe_events(
-                exact_events,
-                &target,
-                &mut prefixes,
-                &mut catchups,
-                &mut fresh,
-            )
-            .is_empty()
-        );
-        assert!(prefixes.is_empty());
-        assert_eq!(fresh.len(), 6);
-
-        let mut successor = target.clone();
-        assert!(
-            fixture
-                .service
-                .refresh_metadata_sync_target_to_current_head(&mut successor)
-                .expect("advance frozen target to actual successor")
-        );
-        assert!(successor.journal_sequence > target.journal_sequence);
-        let exchanged = fixture.service.transport.checkpoint_exchanges.len();
-        fixture
-            .service
-            .send_metadata_sync_catchup_batches(
-                &successor,
-                "lost-catchup",
-                &mut catchups,
-                &mut MetadataSyncAttemptDiagnostics::for_target(&target),
-            )
-            .expect("durably apply successor at all five receivers");
-        let delayed = fixture.service.transport.checkpoint_exchanges[exchanged..].to_vec();
-        assert_eq!(delayed.len(), 5);
-        fixture.service.transport.incoming.clear(); // Deliberately discard actual catch-up replies.
-        let mut fresh_successor = BTreeSet::from([fixture.shard.primary_node_id.clone()]);
-        fixture
-            .service
-            .send_metadata_sync_prefix_probes(
-                &successor,
-                "lost-catchup",
-                &mut fresh_successor,
-                &mut prefixes,
-                &purpose,
-                &mut MetadataSyncAttemptDiagnostics::for_target(&target),
-            )
-            .expect("cursor-gated successor probe");
-        assert!(prefixes.is_empty());
-        assert_eq!(
-            fixture.service.transport.checkpoint_exchanges.len(),
-            exchanged + 5
-        );
-        for peer in &replicas {
-            assert_eq!(
+                .capture_metadata_quorum_sync_target(&fixture.object)
+                .expect("capture supplied checkpoint target");
+            let snapshot = metadata_shard_snapshot_at(
                 fixture
                     .service
                     .metadata_backend
                     .as_deref()
-                    .unwrap()
-                    .metadata_replication_cursor(peer, &successor.shard_id)
-                    .unwrap(),
-                target.journal_sequence
-            );
-            assert_eq!(
-                fixture.service.transport.checkpoint_receivers[peer]
-                    .0
-                    .journal_last_sequence(),
-                successor.journal_sequence
-            );
-        }
-        let error = fixture
-            .service
-            .sync_metadata_shard_to_quorum(&successor, Duration::ZERO)
-            .expect_err("pending catch-up plus old sender cursors cannot authorize a certificate");
-        let DfsError::Network { message } = error else {
-            panic!("unexpected failure: {error:?}");
-        };
-        assert!(message.contains("1/6 acknowledgements"));
-        assert!(message.contains(&format!("through sequence {}", successor.journal_sequence)));
-        for peer in &replicas {
-            assert!(message.contains(&peer.to_string()), "missing peer {peer}");
-        }
-        assert_eq!(fixture.txn_calls.load(Ordering::SeqCst), 0);
+                    .expect("metadata backend"),
+                &target.shard_id,
+                target.journal_sequence,
+                &target.state_fingerprint,
+            )
+            .expect("build valid supplied checkpoint");
+            match invalidity {
+                "sequence" => {
+                    target.journal_sequence = target.journal_sequence.saturating_add(1);
+                }
+                "fingerprint" => {
+                    let last = target
+                        .state_fingerprint
+                        .pop()
+                        .expect("nonempty prefix digest");
+                    target
+                        .state_fingerprint
+                        .push(if last == '0' { '1' } else { '0' });
+                }
+                _ => unreachable!(),
+            }
+            target.checkpoint_snapshot = Some(snapshot);
+            let before_calls = fixture
+                .runtime
+                .rpc_observations()
+                .iter()
+                .filter(|observation| {
+                    observation.origin == crate::test_runtime::RpcOrigin::RegisteredHost
+                        && observation.source == fixture.shard.primary_node_id
+                        && observation.target == replica
+                })
+                .count();
+            let rejected = BTreeSet::from([replica.clone()]);
+            let mut attempts = BTreeMap::new();
+            reset_metadata_sync_snapshot_build_calls();
 
-        // Deliver the original durable replies, preserving their live request
-        // identities; this is delayed delivery, not an invented ACK.
-        let events = delayed
-            .into_iter()
-            .map(|(peer, _, response)| {
+            let error = fixture
+                .service
+                .send_metadata_sync_checkpoint_snapshots(
+                    &target,
+                    "invalid-supplied-checkpoint",
+                    &rejected,
+                    &BTreeSet::new(),
+                    &mut attempts,
+                    &MetadataQuorumSyncPurpose::OrdinaryDurability,
+                )
+                .expect_err("invalid supplied checkpoint must fail before send");
+            let expected_message = format!(
+                "metadata shard {} repair snapshot does not match frozen prefix {}",
+                target.shard_id.0, target.state_fingerprint
+            );
+            assert!(
+                matches!(error, DfsError::Metadata { message } if message == expected_message),
+                "invalid supplied {invalidity} must retain the metadata error"
+            );
+            assert_eq!(metadata_sync_snapshot_build_calls(), 0);
+            assert_eq!(
+                fixture
+                    .runtime
+                    .rpc_observations()
+                    .iter()
+                    .filter(|observation| {
+                        observation.origin == crate::test_runtime::RpcOrigin::RegisteredHost
+                            && observation.source == fixture.shard.primary_node_id
+                            && observation.target == replica
+                    })
+                    .count(),
+                before_calls,
+                "invalid supplied snapshot cannot dispatch a peer call"
+            );
+            assert!(attempts.is_empty());
+            assert!(
                 fixture
                     .service
-                    .handle_metadata_journal_batch_response(peer, response)
-                    .expect("delayed catch-up response")
-                    .expect("durable catch-up event")
-            })
-            .collect();
-        assert!(
-            record_metadata_sync_prefix_probe_events(
-                events,
-                &successor,
-                &mut prefixes,
-                &mut catchups,
-                &mut fresh_successor
-            )
-            .is_empty()
-        );
-        assert_eq!(fresh_successor.len(), 1);
-        let certificate = fixture
+                    .replication
+                    .pending_metadata_replications
+                    .is_empty()
+            );
+            assert_eq!(
+                fixture.service.transport.pending_incoming_count().unwrap(),
+                Some(0)
+            );
+            fixture.finish();
+        }
+    }
+
+    #[test]
+    fn native_full_shard_sync_uses_real_receivers_without_raft_write_fallback() {
+        let name = "native-full-shard-sync";
+        let nodes = crate::test_runtime::DfsTestRuntime::ordered_node_ids(name, 3);
+        let mut fixture = configured_normal_sync_fixture(name, nodes[1..].to_vec());
+        let target = fixture
             .service
-            .sync_metadata_shard_to_quorum(&successor, Duration::ZERO)
-            .expect("all five fresh exact-prefix probes recover the full-shard barrier");
-        assert_eq!(certificate.acknowledged_node_ids.len(), 6);
+            .capture_metadata_quorum_sync_target(&fixture.object)
+            .unwrap();
+        let before = fixture.control_plane_probe.txn_calls();
+        let progress = fixture
+            .service
+            .sync_metadata_shard_to_quorum(&target, Duration::from_secs(5))
+            .unwrap();
+        let expected = target
+            .replica_node_ids
+            .iter()
+            .cloned()
+            .chain([fixture.shard.primary_node_id.clone()])
+            .collect::<BTreeSet<_>>();
         assert_eq!(
-            certificate
+            progress
                 .acknowledged_node_ids
                 .iter()
                 .cloned()
                 .collect::<BTreeSet<_>>(),
-            fresh
+            expected
         );
-        assert_eq!(certificate.quorum_size, 4);
-        assert_eq!(
-            certificate.target.journal_sequence,
-            successor.journal_sequence
+        assert!(progress.acknowledged_node_ids.len() >= progress.quorum_size);
+        assert_eq!(fixture.control_plane_probe.txn_calls(), before);
+        assert!(
+            fixture
+                .runtime
+                .rpc_observations()
+                .iter()
+                .any(|call| target.replica_node_ids.contains(&call.target)
+                    && call.phase == crate::test_runtime::RpcPhase::Completed)
         );
-        assert_eq!(fixture.txn_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(fixture.service.transport.snapshot_install_count, 0);
+        fixture.finish();
     }
 
     #[test]
-    fn sender_cursor_at_target_cannot_replace_a_fresh_replica_ack() {
-        let replica = node("node_sync_sender_hint_replica");
-        let mut fixture = configured_sync_fixture("sender_hint", vec![replica.clone()], Vec::new());
+    fn native_cached_sender_cursor_cannot_replace_a_fresh_receiver_ack() {
+        let name = "native-sync-cursor-not-proof";
+        let nodes = crate::test_runtime::DfsTestRuntime::ordered_node_ids(name, 2);
+        let mut fixture = configured_normal_sync_fixture(name, nodes[1..].to_vec());
         let target = fixture
             .service
             .capture_metadata_quorum_sync_target(&fixture.object)
-            .expect("capture target");
+            .unwrap();
         fixture
             .service
-            .metadata_backend
-            .as_mut()
-            .unwrap()
-            .put_metadata_replication_cursor(&replica, &target.shard_id, target.journal_sequence)
-            .expect("checkpoint prior acknowledgement hint");
+            .sync_metadata_shard_to_quorum(&target, Duration::from_secs(5))
+            .unwrap();
+        fixture.runtime.stop_node(&nodes[1]).unwrap();
         let error = fixture
             .service
-            .sync_metadata_shard_to_quorum(&target, Duration::ZERO)
-            .expect_err("an at-head sender hint cannot authorize a new sync barrier");
-        assert!(
-            matches!(error, DfsError::Network { message } if message.contains("1/2 acknowledgements"))
-        );
-    }
-
-    #[test]
-    fn rejected_catchup_escalates_to_checkpoint_snapshot() {
-        let replica = node("node_sync_rejected_catchup_replica");
-        let mut fixture = configured_sync_fixture(
-            "rejected_catchup",
-            vec![replica.clone()],
-            vec![replica.clone()],
-        );
-        fixture.service.transport.reject_catchup_batches = true;
-        let target = fixture
-            .service
-            .capture_metadata_quorum_sync_target(&fixture.object)
-            .expect("capture rejected catch-up target");
-
-        let certificate = fixture
-            .service
-            .sync_metadata_shard_to_quorum(&target, Duration::from_millis(35))
-            .expect("a checkpoint snapshot must recover a rejected journal catch-up");
-
-        assert!(certificate.acknowledged_node_ids.contains(&replica));
-        assert_eq!(
-            fixture.service.transport.snapshot_install_count, 1,
-            "one catch-up rejection must trigger one exact checkpoint repair"
-        );
-    }
-
-    #[test]
-    fn rejected_checkpoint_snapshot_is_built_and_sent_once_per_frozen_target() {
-        let replica = node("node_sync_rejected_checkpoint_replica");
-        let mut fixture =
-            configured_sync_fixture("rejected_checkpoint", vec![replica.clone()], vec![replica]);
-        fixture.service.transport.reject_prefix_probes = true;
-        fixture.service.transport.reject_snapshot_installs = true;
-        let target = fixture
-            .service
-            .capture_metadata_quorum_sync_target(&fixture.object)
-            .expect("capture rejected checkpoint target");
-        assert!(target.checkpoint_snapshot.is_none());
-        reset_metadata_sync_snapshot_build_calls();
-
-        let error = fixture
-            .service
-            .sync_metadata_shard_to_quorum(&target, Duration::from_millis(35))
-            .expect_err("an exact replica that rejects repair must not certify durability");
-
-        assert!(
-            matches!(error, DfsError::Network { message } if message.contains("1/2 acknowledgements")),
-            "a rejected repair must remain fail closed"
-        );
-        assert!(
-            fixture.service.transport.routed_prefix_probe_count > 3,
-            "the fixture must exercise repeated rejection across sync pump iterations"
-        );
-        assert_eq!(
-            metadata_sync_snapshot_build_calls(),
-            1,
-            "one frozen target must not repeatedly export and validate the same deep snapshot"
-        );
-        assert_eq!(
-            fixture.service.transport.snapshot_install_count, 1,
-            "one frozen target must attempt at most one snapshot install per replica"
-        );
-    }
-
-    #[test]
-    fn unroutable_checkpoint_snapshot_is_not_rebuilt_for_same_frozen_target() {
-        let replica = node("node_sync_unroutable_checkpoint_replica");
-        let mut fixture =
-            configured_sync_fixture("unroutable_checkpoint", vec![replica.clone()], Vec::new());
-        fixture
-            .service
-            .transport
-            .unroutable_nodes
-            .insert(replica.clone());
-        let mut target = fixture
-            .service
-            .capture_metadata_quorum_sync_target(&fixture.object)
-            .expect("capture unroutable checkpoint target");
-        let rejected = BTreeSet::from([replica]);
-        let mut attempts = BTreeMap::new();
-        reset_metadata_sync_snapshot_build_calls();
-
-        fixture
-            .service
-            .send_metadata_sync_checkpoint_snapshots(
-                &target,
-                "unroutable-checkpoint",
-                &rejected,
-                &mut attempts,
-                &MetadataQuorumSyncPurpose::OrdinaryDurability,
-            )
-            .expect("first unroutable attempt is best effort");
-        fixture
-            .service
-            .send_metadata_sync_checkpoint_snapshots(
-                &target,
-                "unroutable-checkpoint",
-                &rejected,
-                &mut attempts,
-                &MetadataQuorumSyncPurpose::OrdinaryDurability,
-            )
-            .expect("identical unroutable attempt remains settled");
-
-        assert_eq!(metadata_sync_snapshot_build_calls(), 1);
-        assert_eq!(attempts.len(), 1);
-        assert_eq!(fixture.service.transport.snapshot_install_count, 0);
+            .sync_metadata_shard_to_quorum(&target, Duration::from_millis(100))
+            .expect_err("an earlier sender cursor is not a new receiver acknowledgement");
+        assert!(matches!(
+            error,
+            DfsError::Network { .. } | DfsError::NetworkDelivery { .. }
+        ));
         assert!(
             fixture
                 .service
                 .replication
                 .pending_metadata_replications
-                .is_empty()
+                .is_empty(),
+            "failed barrier releases only its own pending probe slots"
         );
-
-        fixture
+        fixture.runtime.reopen_node(nodes[1].clone()).unwrap();
+        let fresh = fixture
             .service
-            .metadata_backend
-            .as_deref_mut()
-            .expect("metadata backend")
-            .put_object(&directory_object(
-                "/unroutable-checkpoint-next-head",
-                fixture.shard.primary_node_id.clone(),
-            ))
-            .expect("advance exact metadata head");
-        assert!(
-            fixture
-                .service
-                .refresh_metadata_sync_target_to_current_head(&mut target)
-                .expect("refresh exact metadata target")
-        );
-        let mut pending_prefix_probes = BTreeMap::new();
-        let mut pending_catchups = BTreeMap::new();
-        fixture.service.clear_superseded_metadata_sync_requests(
-            &mut pending_prefix_probes,
-            &mut pending_catchups,
-            &mut attempts,
-        );
-        fixture
-            .service
-            .send_metadata_sync_checkpoint_snapshots(
-                &target,
-                "unroutable-checkpoint-next-head",
-                &rejected,
-                &mut attempts,
-                &MetadataQuorumSyncPurpose::OrdinaryDurability,
-            )
-            .expect("changed exact head permits one new repair attempt");
-
-        assert_eq!(metadata_sync_snapshot_build_calls(), 2);
-        assert_eq!(attempts.len(), 1);
+            .sync_metadata_shard_to_quorum(&target, Duration::from_secs(5))
+            .unwrap();
+        assert!(fresh.acknowledged_node_ids.contains(&nodes[1]));
+        fixture.finish();
     }
 
     #[test]
-    fn file_metadata_sync_does_not_accept_a_disjoint_majority() {
-        let content_holder = node("node_sync_intersection_content");
-        let metadata_only = node("node_sync_intersection_metadata");
-        let mut fixture = configured_sync_fixture(
-            "intersection",
-            vec![content_holder.clone(), metadata_only.clone()],
-            vec![metadata_only],
+    fn native_primary_rotation_preserves_joint_proof_fences_and_restart_visibility() {
+        let name = "native-sync-primary-handoff";
+        let nodes = crate::test_runtime::DfsTestRuntime::ordered_node_ids(name, 3);
+        let mut fixture = configured_normal_sync_fixture(name, nodes[1..].to_vec());
+        fixture
+            .service
+            .posix_mkdir("/native-before-primary-handoff")
+            .unwrap();
+        let stat = fixture
+            .service
+            .posix_stat("/native-before-primary-handoff")
+            .unwrap();
+        fixture
+            .runtime
+            .reassign_metadata_shard(
+                &fixture.shard.file_system_id,
+                "root",
+                nodes[1].clone(),
+                vec![nodes[0].clone(), nodes[2].clone()],
+            )
+            .unwrap();
+        let control = fixture.runtime.shared_control_plane().unwrap();
+        let (active, proof, pending) = control.with_client(|kv| {
+            let store = DfsControlPlaneStore::new(kv.as_mut());
+            (
+                store
+                    .get_metadata_shard(&fixture.shard.file_system_id, "root")
+                    .unwrap()
+                    .unwrap(),
+                store
+                    .get_metadata_shard_membership_handoff_proof(
+                        &fixture.shard.file_system_id,
+                        "root",
+                    )
+                    .unwrap()
+                    .unwrap(),
+                store
+                    .get_metadata_shard_membership_handoff(&fixture.shard.file_system_id, "root")
+                    .unwrap(),
+            )
+        });
+        assert_eq!(active.primary_node_id, nodes[1]);
+        assert_eq!(proof.retiring_shard, fixture.shard);
+        assert_eq!(proof.desired_shard, active);
+        assert!(proof.acknowledged_node_ids.contains(&nodes[0]));
+        assert!(proof.acknowledged_node_ids.contains(&nodes[1]));
+        assert!(pending.is_none());
+        let shard_id = DfsMetadataShardId::new("root");
+        assert!(
+            fixture
+                .service
+                .metadata_backend()
+                .unwrap()
+                .metadata_shard_authoritative_writes_frozen(&shard_id)
+                .unwrap(),
+            "the retiring writer stays fenced after activation"
         );
+        let mut promoted = fixture.runtime.client(&nodes[1]).unwrap();
+        assert_eq!(
+            promoted
+                .posix_stat("/native-before-primary-handoff")
+                .unwrap()
+                .object_id,
+            stat.object_id
+        );
+        promoted
+            .posix_mkdir("/native-after-primary-handoff")
+            .unwrap();
+        drop(promoted);
+        drop(fixture.service);
+        fixture.runtime.reopen_node(nodes[0].clone()).unwrap();
+        fixture.service = fixture.runtime.client(&nodes[0]).unwrap();
+        assert!(
+            fixture
+                .service
+                .metadata_backend()
+                .unwrap()
+                .metadata_shard_authoritative_writes_frozen(&shard_id)
+                .unwrap()
+        );
+        assert_eq!(
+            fixture
+                .service
+                .posix_stat("/native-before-primary-handoff")
+                .unwrap()
+                .object_id,
+            stat.object_id
+        );
+        assert!(
+            fixture
+                .service
+                .posix_stat("/native-after-primary-handoff")
+                .is_ok()
+        );
+        fixture.finish();
+    }
+
+    #[test]
+    fn native_successive_handoffs_reconcile_the_previous_retiring_marker() {
+        let name = "native-sync-successive-handoff";
+        let nodes = crate::test_runtime::DfsTestRuntime::ordered_node_ids(name, 3);
+        let mut fixture = configured_normal_sync_fixture(name, nodes[1..].to_vec());
+        fixture
+            .runtime
+            .reassign_metadata_shard(
+                &fixture.shard.file_system_id,
+                "root",
+                nodes[1].clone(),
+                vec![nodes[0].clone(), nodes[2].clone()],
+            )
+            .unwrap();
+        fixture
+            .runtime
+            .reassign_metadata_shard(
+                &fixture.shard.file_system_id,
+                "root",
+                nodes[0].clone(),
+                vec![nodes[1].clone(), nodes[2].clone()],
+            )
+            .unwrap();
+        drop(fixture.service);
+        fixture.service = fixture.runtime.client(&nodes[0]).unwrap();
+        let active = fixture.runtime.root_shard().unwrap();
+        assert_eq!(active.primary_node_id, nodes[0]);
+        assert_eq!(active.epoch, fixture.shard.epoch + 2);
+        fixture
+            .service
+            .posix_mkdir("/native-after-two-handoffs")
+            .unwrap();
+        fixture.runtime.stop_node(&nodes[1]).unwrap();
+        fixture.runtime.reopen_node(nodes[1].clone()).unwrap();
+        let mut replica = fixture.runtime.client(&nodes[1]).unwrap();
+        assert!(replica.posix_stat("/native-after-two-handoffs").is_ok());
+        drop(replica);
+        fixture.finish();
+    }
+
+    #[test]
+    fn native_target_epoch_change_rejects_a_stale_sync_scope() {
+        let name = "native-sync-stale-epoch";
+        let nodes = crate::test_runtime::DfsTestRuntime::ordered_node_ids(name, 2);
+        let mut fixture = configured_normal_sync_fixture(name, nodes[1..].to_vec());
         let target = fixture
             .service
             .capture_metadata_quorum_sync_target(&fixture.object)
-            .expect("capture target");
+            .unwrap();
+        fixture
+            .runtime
+            .reassign_metadata_shard(
+                &fixture.shard.file_system_id,
+                "root",
+                nodes[1].clone(),
+                vec![nodes[0].clone()],
+            )
+            .unwrap();
+        assert!(matches!(
+            fixture
+                .service
+                .sync_metadata_shard_to_quorum(&target, Duration::from_millis(100)),
+            Err(DfsError::StaleOwnerEpoch { .. })
+        ));
+        fixture.finish();
+    }
 
-        let error = fixture
+    #[test]
+    fn native_sync_rejects_uncorrelated_or_sequence_only_ack_events() {
+        let name = "native-sync-ack-correlation";
+        let nodes = crate::test_runtime::DfsTestRuntime::ordered_node_ids(name, 3);
+        let mut fixture = configured_normal_sync_fixture(name, nodes[1..].to_vec());
+        let target = fixture
             .service
-            .sync_metadata_shard_to_quorum_intersecting(&target, &[content_holder], Duration::ZERO)
-            .expect_err("disjoint metadata quorum is not a file-sync certificate");
-        assert!(matches!(error, DfsError::Network { .. }));
+            .capture_metadata_quorum_sync_target(&fixture.object)
+            .unwrap();
+        // Healthy acknowledgements above come from actual hosted receivers.
+        // These are explicitly malformed event inputs to the same correlation
+        // validator; none may create positive authority or model evidence.
+        for invalid in ["request", "sender", "shard", "sequence", "prefix-flag"] {
+            let mut request = "expected-native-probe".to_string();
+            let mut source = nodes[1].clone();
+            let mut shard = target.shard_id.clone();
+            let mut sequence = target.journal_sequence;
+            let mut prefix = true;
+            match invalid {
+                "request" => request = "another-probe".into(),
+                "sender" => source = nodes[2].clone(),
+                "shard" => shard = DfsMetadataShardId::new("another-shard"),
+                "sequence" => sequence += 1,
+                "prefix-flag" => prefix = false,
+                _ => unreachable!(),
+            }
+            let event = NetworkedDfsServiceEvent::MetadataJournalBatchApplied {
+                request_id: request,
+                source_node_id: source,
+                shard_id: shard,
+                applied_entries: 0,
+                next_after_sequence: sequence,
+                verified_prefix_only: prefix,
+            };
+            let mut probes =
+                BTreeMap::from([("expected-native-probe".to_string(), nodes[1].clone())]);
+            let mut catchup = BTreeMap::new();
+            let mut acknowledged = BTreeSet::from([nodes[0].clone()]);
+            record_metadata_sync_prefix_probe_events(
+                vec![event],
+                &target,
+                &mut probes,
+                &mut catchup,
+                &mut acknowledged,
+            );
+            assert_eq!(
+                acknowledged,
+                BTreeSet::from([nodes[0].clone()]),
+                "malformed {invalid} cannot acknowledge another target"
+            );
+        }
+        fixture.finish();
     }
 }

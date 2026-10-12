@@ -412,16 +412,30 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         shard_snapshot: Option<&[DfsMetadataShardConfig]>,
     ) -> Result<(String, Option<DfsObjectMetadata>, Option<DfsReadRangeData>)> {
         for _ in 0..POSIX_ROUTED_SYNC_RETRY_ROUNDS {
-            let local_object = self.lookup_sifs_path(&resolved)?;
+            let local_object = if self.transport.delegates_local_namespace_authority() {
+                None
+            } else {
+                let speculative = self.namespace_execution.begin_independent_planning();
+                let local = self.lookup_sifs_path(&resolved);
+                drop(speculative);
+                local?
+            };
             let Some(shard) = shard_snapshot
                 .map(|shards| self.routed_namespace_shard_for_path_from_snapshot(&resolved, shards))
                 .transpose()?
                 .flatten()
             else {
+                if self.transport.delegates_local_namespace_authority() {
+                    return Err(DfsPosixError::Dfs(DfsError::Metadata {
+                        message: "Main caller lookup has no current metadata shard authority"
+                            .into(),
+                    }));
+                }
                 if let Some(object) = local_object
                     && object.kind != DfsObjectKind::Tombstone
                 {
-                    return Ok((resolved, Some(object), None));
+                    let object = self.record_selected_synced_path(&resolved, Some(object));
+                    return Ok((resolved, object, None));
                 }
                 break;
             };
@@ -448,10 +462,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 };
                 match routed {
                     Ok((Some(object), range)) if object.kind != DfsObjectKind::Tombstone => {
-                        return Ok((resolved, Some(object), range));
+                        let object = self.record_selected_synced_path(&resolved, Some(object));
+                        return Ok((resolved, object, range));
                     }
-                    Ok((Some(object), range)) => return Ok((resolved, Some(object), range)),
-                    Ok((None, _)) => return Ok((resolved, None, None)),
+                    Ok((Some(object), range)) => {
+                        let object = self.record_selected_synced_path(&resolved, Some(object));
+                        return Ok((resolved, object, range));
+                    }
+                    Ok((None, _)) => {
+                        self.record_selected_synced_path(&resolved, None);
+                        return Ok((resolved, None, None));
+                    }
+                    Err(error) if self.transport.delegates_local_namespace_authority() => {
+                        return Err(error.into());
+                    }
                     Err(error) if namespace_lookup_error_is_uncorroborated_redirect(&error) => {
                         let current_shard =
                             self.select_sifs_metadata_shard_for_path_fresh(&resolved)?;
@@ -461,7 +485,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             .as_ref()
                             .is_some_and(|object| object.kind != DfsObjectKind::Tombstone)
                         {
-                            return Ok((resolved, local_object, None));
+                            let object = self.record_selected_synced_path(&resolved, local_object);
+                            return Ok((resolved, object, None));
                         }
                         return Err(error.into());
                     }
@@ -478,12 +503,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 && let Some(object) = local_object.as_ref()
                 && object.kind != DfsObjectKind::Tombstone
             {
-                return Ok((resolved, local_object, None));
+                let object = self.record_selected_synced_path(&resolved, local_object);
+                return Ok((resolved, object, None));
             }
             if let Some(object) = local_object
                 && object.kind != DfsObjectKind::Tombstone
             {
-                return Ok((resolved, Some(object), None));
+                let object = self.record_selected_synced_path(&resolved, Some(object));
+                return Ok((resolved, object, None));
             }
             if self.is_local_metadata_replica_for_shard(&shard) {
                 break;
@@ -539,6 +566,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         )
     }
 
+    /// Record only the lookup result used by the caller. A speculative local
+    /// fallback does not replace the original predicate of a previous read.
+    fn record_selected_synced_path(
+        &self,
+        path: &str,
+        object: Option<DfsObjectMetadata>,
+    ) -> Option<DfsObjectMetadata> {
+        let fs = sifs_file_system_id();
+        self.namespace_execution
+            .observe_path(&fs, path, object.as_ref());
+        if self.metadata_lookup_cache_is_active() {
+            if let Ok(mut cache) = self.metadata_lookup_cache.lock() {
+                cache.insert((fs, crate::namespace::metadata_path(path)), object.clone());
+            }
+        }
+        object
+    }
+
     /// Exact-path variant that reuses a caller's request-scoped topology.
     ///
     /// No-link capability walks call this once per component. Keeping the
@@ -551,16 +596,29 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<Option<DfsObjectMetadata>> {
         let path = normalize_posix_path(path)?;
         for _ in 0..POSIX_ROUTED_SYNC_RETRY_ROUNDS {
-            let local_object = self.lookup_sifs_path(&path)?;
+            let local_object = if self.transport.delegates_local_namespace_authority() {
+                None
+            } else {
+                let speculative = self.namespace_execution.begin_independent_planning();
+                let local = self.lookup_sifs_path(&path);
+                drop(speculative);
+                local?
+            };
             let Some(shard) = shard_snapshot
                 .map(|shards| self.routed_namespace_shard_for_path_from_snapshot(&path, shards))
                 .transpose()?
                 .flatten()
             else {
+                if self.transport.delegates_local_namespace_authority() {
+                    return Err(DfsPosixError::Dfs(DfsError::Metadata {
+                        message: "Main caller lookup has no current metadata shard authority"
+                            .into(),
+                    }));
+                }
                 if let Some(object) = local_object
                     && object.kind != DfsObjectKind::Tombstone
                 {
-                    return Ok(Some(object));
+                    return Ok(self.record_selected_synced_path(&path, Some(object)));
                 }
                 break;
             };
@@ -574,10 +632,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     POSIX_READ_FRESHNESS_SYNC_TIMEOUT,
                 ) {
                     Ok(Some(object)) if object.kind != DfsObjectKind::Tombstone => {
-                        return Ok(Some(object));
+                        return Ok(self.record_selected_synced_path(&path, Some(object)));
                     }
-                    Ok(Some(object)) => return Ok(Some(object)),
-                    Ok(None) => return Ok(None),
+                    Ok(Some(object)) => {
+                        return Ok(self.record_selected_synced_path(&path, Some(object)));
+                    }
+                    Ok(None) => return Ok(self.record_selected_synced_path(&path, None)),
+                    Err(error) if self.transport.delegates_local_namespace_authority() => {
+                        return Err(error.into());
+                    }
                     Err(error) if namespace_lookup_error_is_uncorroborated_redirect(&error) => {
                         // The response was discarded, so refresh membership
                         // again and use no response-derived state. A current
@@ -593,7 +656,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             .as_ref()
                             .is_some_and(|object| object.kind != DfsObjectKind::Tombstone)
                         {
-                            return Ok(local_object);
+                            return Ok(self.record_selected_synced_path(&path, local_object));
                         }
                         return Err(error.into());
                     }
@@ -610,12 +673,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 && let Some(object) = local_object.as_ref()
                 && object.kind != DfsObjectKind::Tombstone
             {
-                return Ok(local_object);
+                return Ok(self.record_selected_synced_path(&path, local_object));
             }
             if let Some(object) = local_object
                 && object.kind != DfsObjectKind::Tombstone
             {
-                return Ok(Some(object));
+                return Ok(self.record_selected_synced_path(&path, Some(object)));
             }
             if self.is_local_metadata_replica_for_shard(&shard) {
                 break;
@@ -963,6 +1026,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         operation: &DfsNamespaceOperation,
     ) -> Result<()> {
+        let _source_scope = match operation {
+            DfsNamespaceOperation::AdoptObjectAtPath { source_offer, .. } => {
+                Some(self.source_adoption.install(source_offer.clone()))
+            }
+            _ => None,
+        };
         if let DfsNamespaceOperation::ContentReference { request } = operation {
             self.ensure_path_not_in_cross_shard_flight(
                 &request.identity.file_system_id,
@@ -975,20 +1044,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         match operation {
             DfsNamespaceOperation::Unlink { path }
             | DfsNamespaceOperation::ConditionalUnlink { path, .. } => {
-                if self.resume_or_replay_hardlink_alias_mutation_for_active_request(
+                if self.resume_or_replay_cross_shard_mutation_for_active_request(
                     &sifs_file_system_id(),
                     path,
-                    path,
+                    None,
+                    &[
+                        DfsNamespaceJobKind::HardlinkAliasMutationAcrossShardPrimaries,
+                        DfsNamespaceJobKind::RenameObjectAcrossShardPrimaries,
+                    ],
                 )? {
                     return Ok(());
                 }
             }
             DfsNamespaceOperation::Rename { from, to }
             | DfsNamespaceOperation::ConditionalRename { from, to, .. }
-                if self.resume_or_replay_hardlink_alias_mutation_for_active_request(
+                if self.resume_or_replay_cross_shard_mutation_for_active_request(
                     &sifs_file_system_id(),
                     from,
-                    to,
+                    Some(to),
+                    &[DfsNamespaceJobKind::HardlinkAliasMutationAcrossShardPrimaries],
                 )? =>
             {
                 return Ok(());
@@ -1184,13 +1258,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 )
                 .map_err(DfsPosixError::from),
             DfsNamespaceOperation::BeginContentCopy { .. }
+            | DfsNamespaceOperation::AbortPendingWrite { .. }
             | DfsNamespaceOperation::PollNamespaceChanges { .. }
             | DfsNamespaceOperation::AdvisoryLock { .. }
             | DfsNamespaceOperation::FileSync { .. }
             | DfsNamespaceOperation::DirectorySync { .. }
             | DfsNamespaceOperation::RenameDirectoryBounded { .. }
             | DfsNamespaceOperation::ResumeNamespaceJobBounded { .. }
-            | DfsNamespaceOperation::AdvisoryLockMigrationPrepare { .. }
             | DfsNamespaceOperation::FinalizeObjectFamilyAdoption { .. }
             | DfsNamespaceOperation::VerifyObjectFamilyAdoption { .. } => {
                 Err(DfsPosixError::Dfs(DfsError::Distributed {
@@ -1198,6 +1272,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }))
             }
             DfsNamespaceOperation::AdoptObjectAtPath {
+                source_offer: _,
                 object,
                 source_path,
                 pin_transfer_id,
@@ -1210,7 +1285,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 intent_receipt_retention,
                 content_reference_outcomes,
                 content_reference_outcome_retention,
-                conflicts,
                 advisory_lock_state,
             } => self
                 .adopt_object_at_path_local(
@@ -1226,7 +1300,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     intent_receipt_retention,
                     content_reference_outcomes,
                     content_reference_outcome_retention.as_ref(),
-                    conflicts,
                     advisory_lock_state.as_ref(),
                 )
                 .map(drop),
@@ -1253,6 +1326,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         path: &str,
         follow: bool,
     ) -> Result<DfsStat> {
+        if self.transport.delegates_local_namespace_authority() {
+            return if follow {
+                self.posix_stat_distributed(path)
+            } else {
+                self.posix_lstat_distributed(path)
+            };
+        }
         for _ in 0..POSIX_ROUTED_SYNC_RETRY_ROUNDS {
             self.check_cancelled("routed stat sync")?;
             let attempt = if follow {
@@ -1277,6 +1357,22 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// Tombstone stat for routed unlink/rmdir results, with the same bounded
     /// catch-up retry as `stat_routed_namespace_result`.
     pub(super) fn stat_replayed_tombstone_synced(&mut self, path: &str) -> Result<DfsStat> {
+        if self.transport.delegates_local_namespace_authority() {
+            let shards = self.refresh_sifs_metadata_shards()?.ok_or_else(|| {
+                DfsPosixError::Dfs(DfsError::Metadata {
+                    message: "Main caller lookup has no current metadata shard authority".into(),
+                })
+            })?;
+            // The authority tombstones the canonical entry after following parent
+            // links. Resolve that result through one current routing cut, while
+            // preserving the final entry itself instead of following it.
+            let resolved =
+                self.resolve_posix_path_distributed_from_snapshot(path, false, &shards)?;
+            let object = self
+                .lookup_sifs_path_direct_distributed_synced_from_snapshot(&resolved, Some(&shards))?
+                .ok_or_else(|| DfsPosixError::NotFound { path: resolved })?;
+            return self.stat_object(&object);
+        }
         for _ in 0..POSIX_ROUTED_SYNC_RETRY_ROUNDS {
             match self.stat_replayed_tombstone(path) {
                 Err(DfsPosixError::NotFound { .. }) => {
@@ -1352,14 +1448,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             current,
                         )
                         .map_err(DfsPosixError::Dfs)?;
-                    if primary == self.node_id {
+                    if primary == self.node_id
+                        && !self.transport.delegates_local_namespace_authority()
+                    {
                         return self.execute_namespace_operation_local(&operation);
                     }
                 }
                 DfsNamespaceResult::Rejected {
                     current_primary_node_id: Some(current),
                     ..
-                } if current == self.node_id => {
+                } if current == self.node_id
+                    && !self.transport.delegates_local_namespace_authority() =>
+                {
                     return self.execute_namespace_operation_local(&operation);
                 }
                 DfsNamespaceResult::Rejected {
@@ -1417,31 +1517,10 @@ fn namespace_lookup_error_is_uncorroborated_redirect(error: &DfsError) -> bool {
     )
 }
 
-fn validate_cross_shard_adoption_receipt(
+pub(super) fn validate_cross_shard_adoption_receipt(
     operation: &DfsNamespaceOperation,
     result: Option<&DfsPosixCoordinationResult>,
 ) -> Result<()> {
-    if let DfsNamespaceOperation::AdvisoryLockMigrationPrepare {
-        object_id,
-        state_fingerprint,
-        ..
-    } = operation
-    {
-        if matches!(
-            result,
-            Some(DfsPosixCoordinationResult::AdvisoryLockMigrationPrepared {
-                object_id: prepared_object_id,
-                state_fingerprint: prepared_fingerprint,
-            }) if prepared_object_id == object_id && prepared_fingerprint == state_fingerprint
-        ) {
-            return Ok(());
-        }
-        return Err(DfsPosixError::Dfs(DfsError::Distributed {
-            message: format!(
-                "destination does not support exact advisory-lock migration preparation for {object_id}"
-            ),
-        }));
-    }
     if let DfsNamespaceOperation::FinalizeObjectFamilyAdoption {
         object_id,
         pin_transfer_id,
@@ -1546,18 +1625,12 @@ fn validate_cross_shard_adoption_receipt(
                 ),
             }));
         }
-        if !version_pins.is_empty() || expected_outcome_fingerprint.is_some() {
-            return Err(DfsPosixError::Dfs(DfsError::Distributed {
-                message: format!(
-                    "destination did not return an exact quorum-durable version-pin receipt for {}; retry after every involved metadata authority supports durable pin adoption",
-                    object.object_id
-                ),
-            }));
-        }
-        // Empty pin sets retain rolling compatibility. A legacy destination
-        // may ignore the optional fingerprint and return no typed receipt;
-        // lock-bearing operations still fall through to their older exact
-        // lock receipt below.
+        return Err(DfsPosixError::Dfs(DfsError::Distributed {
+            message: format!(
+                "destination did not return an exact current object-family adoption receipt for {}",
+                object.object_id
+            ),
+        }));
     }
     let DfsNamespaceOperation::AdoptObjectAtPath {
         object,
@@ -1779,242 +1852,4 @@ mod tests {
         directory_object,
     };
     use time::OffsetDateTime;
-
-    fn pin(object: &DfsObjectMetadata, version: &str, pin_id: &str) -> DfsMetadataVersionPinRecord {
-        DfsMetadataVersionPinRecord {
-            namespace: None,
-            file_system_id: object.file_system_id.clone(),
-            object_id: object.object_id.clone(),
-            version: DfsVersion::from_legacy_named(version).expect("version"),
-            pin_id: pin_id.to_string(),
-            created_at: OffsetDateTime::UNIX_EPOCH,
-        }
-    }
-
-    fn adoption_operation(
-        object: DfsObjectMetadata,
-        version_pins: Vec<DfsMetadataVersionPinRecord>,
-        advisory_lock_state: Option<DfsAdvisoryLockStateRecord>,
-    ) -> DfsNamespaceOperation {
-        let version_pin_set_fingerprint =
-            crate::protocol::cross_shard_version_pin_set_fingerprint(&object, &version_pins)
-                .expect("pin fingerprint");
-        let pin_transfer_id = crate::protocol::cross_shard_pin_transfer_id(&object, "/source")
-            .expect("pin transfer id");
-        DfsNamespaceOperation::AdoptObjectAtPath {
-            object,
-            source_path: "/source".to_string(),
-            pin_transfer_id: Some(pin_transfer_id),
-            versions: Vec::new(),
-            version_pins,
-            version_pin_set_fingerprint: Some(version_pin_set_fingerprint),
-            receipts: Vec::new(),
-            intents: Vec::new(),
-            intent_receipts: Vec::new(),
-            intent_receipt_retention: crate::DfsWriteIntentReceiptRetentionState::default(),
-            content_reference_outcomes: Vec::new(),
-            content_reference_outcome_retention: None,
-            conflicts: Vec::new(),
-            advisory_lock_state,
-        }
-    }
-
-    #[test]
-    fn lock_bearing_adoption_requires_an_exact_typed_receipt() {
-        let owner = NodeId::from_legacy_named("node_lock_migration_receipt").expect("node");
-        let object = directory_object("/moved", owner);
-        let state = DfsAdvisoryLockStateRecord::empty(
-            object.file_system_id.clone(),
-            object.object_id.clone(),
-            7,
-        );
-        let operation = DfsNamespaceOperation::AdoptObjectAtPath {
-            object: object.clone(),
-            source_path: "/source".to_string(),
-            pin_transfer_id: None,
-            versions: Vec::new(),
-            version_pins: Vec::new(),
-            version_pin_set_fingerprint: None,
-            receipts: Vec::new(),
-            intents: Vec::new(),
-            intent_receipts: Vec::new(),
-            intent_receipt_retention: crate::DfsWriteIntentReceiptRetentionState::default(),
-            content_reference_outcomes: Vec::new(),
-            content_reference_outcome_retention: None,
-            conflicts: Vec::new(),
-            advisory_lock_state: Some(state.clone()),
-        };
-        assert!(validate_cross_shard_adoption_receipt(&operation, None).is_err());
-
-        let mut rebound = state;
-        rebound.authority_rebind_required = true;
-        let fingerprint = crate::advisory_lock::advisory_lock_state_fingerprint(&rebound)
-            .expect("state fingerprint");
-        validate_cross_shard_adoption_receipt(
-            &operation,
-            Some(&DfsPosixCoordinationResult::AdvisoryLockMigration {
-                object_id: object.object_id,
-                state_fingerprint: fingerprint,
-                durable_through_sequence: 1,
-            }),
-        )
-        .expect("exact receipt");
-    }
-
-    #[test]
-    fn nonempty_pin_adoption_rejects_old_or_mismatched_destination_receipts() {
-        let owner = NodeId::from_legacy_named("node_pin_receipt").expect("node");
-        let object = directory_object("/moved", owner);
-        let version_pin = pin(&object, "version_pinned", "checkpoint");
-        let operation = adoption_operation(object.clone(), vec![version_pin], None);
-        let DfsNamespaceOperation::AdoptObjectAtPath {
-            version_pin_set_fingerprint: Some(expected_fingerprint),
-            pin_transfer_id: Some(expected_transfer_id),
-            ..
-        } = &operation
-        else {
-            panic!("adoption operation");
-        };
-
-        assert!(
-            validate_cross_shard_adoption_receipt(&operation, None).is_err(),
-            "an old destination that only returns Applied must not release pinned source state"
-        );
-        assert!(
-            validate_cross_shard_adoption_receipt(
-                &operation,
-                Some(&DfsPosixCoordinationResult::ObjectFamilyAdoption {
-                    object_id: object.object_id.clone(),
-                    target_version: object.version.clone(),
-                    pin_transfer_id: expected_transfer_id.clone(),
-                    pin_transfer_active: true,
-                    version_pin_set_fingerprint: "blake3:wrong".to_string(),
-                    advisory_lock_state_fingerprint: None,
-                    content_reference_outcome_fingerprint: None,
-                    durable_through_sequence: 1,
-                }),
-            )
-            .is_err(),
-            "a mismatched pin family must not release source state"
-        );
-        assert!(
-            validate_cross_shard_adoption_receipt(
-                &operation,
-                Some(&DfsPosixCoordinationResult::ObjectFamilyAdoption {
-                    object_id: object.object_id.clone(),
-                    target_version: DfsVersion::from_legacy_named("version_wrong_receipt")
-                        .expect("version"),
-                    pin_transfer_id: expected_transfer_id.clone(),
-                    pin_transfer_active: true,
-                    version_pin_set_fingerprint: expected_fingerprint.clone(),
-                    advisory_lock_state_fingerprint: None,
-                    content_reference_outcome_fingerprint: None,
-                    durable_through_sequence: 1,
-                }),
-            )
-            .is_err(),
-            "a receipt for a different target generation must not release source state"
-        );
-        validate_cross_shard_adoption_receipt(
-            &operation,
-            Some(&DfsPosixCoordinationResult::ObjectFamilyAdoption {
-                object_id: object.object_id.clone(),
-                target_version: object.version.clone(),
-                pin_transfer_id: expected_transfer_id.clone(),
-                pin_transfer_active: true,
-                version_pin_set_fingerprint: expected_fingerprint.clone(),
-                advisory_lock_state_fingerprint: None,
-                content_reference_outcome_fingerprint: None,
-                durable_through_sequence: 1,
-            }),
-        )
-        .expect("exact quorum-durable receipt");
-    }
-
-    #[test]
-    fn empty_pin_adoption_remains_compatible_with_an_old_destination() {
-        let owner = NodeId::from_legacy_named("node_empty_pin_receipt").expect("node");
-        let operation = adoption_operation(directory_object("/moved", owner), Vec::new(), None);
-        validate_cross_shard_adoption_receipt(&operation, None)
-            .expect("legacy Applied response for empty pin family");
-    }
-
-    #[test]
-    fn reference_outcome_expiry_transfer_requires_an_exact_durable_receipt() {
-        let owner = NodeId::from_legacy_named("node_reference_outcome_receipt").unwrap();
-        let object = directory_object("/moved", owner);
-        let mut operation = adoption_operation(object.clone(), Vec::new(), None);
-        let DfsNamespaceOperation::AdoptObjectAtPath {
-            content_reference_outcome_retention,
-            version_pin_set_fingerprint,
-            pin_transfer_id,
-            ..
-        } = &mut operation
-        else {
-            unreachable!()
-        };
-        *content_reference_outcome_retention = Some(
-            crate::metadata_records::DfsContentReferenceOutcomeRetention {
-                file_system_id: object.file_system_id.clone(),
-                max_evicted_operation_order_token: None,
-                opaque_operation_history_evicted: true,
-            },
-        );
-        let expected_outcome_fingerprint =
-            crate::protocol::content_reference_outcome_family_fingerprint(
-                &object,
-                &[],
-                content_reference_outcome_retention.as_ref(),
-            )
-            .unwrap();
-        let mut receipt = DfsPosixCoordinationResult::ObjectFamilyAdoption {
-            object_id: object.object_id.clone(),
-            target_version: object.version.clone(),
-            pin_transfer_id: pin_transfer_id.clone().unwrap(),
-            pin_transfer_active: true,
-            version_pin_set_fingerprint: version_pin_set_fingerprint.clone().unwrap(),
-            advisory_lock_state_fingerprint: None,
-            content_reference_outcome_fingerprint: None,
-            durable_through_sequence: 1,
-        };
-        assert!(validate_cross_shard_adoption_receipt(&operation, None).is_err());
-        assert!(validate_cross_shard_adoption_receipt(&operation, Some(&receipt)).is_err());
-        let DfsPosixCoordinationResult::ObjectFamilyAdoption {
-            content_reference_outcome_fingerprint,
-            ..
-        } = &mut receipt
-        else {
-            unreachable!()
-        };
-        *content_reference_outcome_fingerprint = expected_outcome_fingerprint;
-        validate_cross_shard_adoption_receipt(&operation, Some(&receipt)).unwrap();
-    }
-
-    #[test]
-    fn source_pin_revalidation_detects_late_put_and_late_unpin() {
-        let owner = NodeId::from_legacy_named("node_pin_revalidation").expect("node");
-        let object = directory_object("/moved", owner);
-        let captured = pin(&object, "version_pinned", "checkpoint");
-        let operation = adoption_operation(object.clone(), vec![captured.clone()], None);
-
-        validate_cross_shard_adoption_source_pin_records(
-            &operation,
-            std::slice::from_ref(&captured),
-        )
-        .expect("unchanged source pin set");
-
-        let late = pin(&object, "version_late", "late-checkpoint");
-        assert!(
-            validate_cross_shard_adoption_source_pin_records(
-                &operation,
-                &[captured.clone(), late],
-            )
-            .is_err(),
-            "a pin created during the first copy must force a recopy before source eviction"
-        );
-        assert!(
-            validate_cross_shard_adoption_source_pin_records(&operation, &[]).is_err(),
-            "an unpin after the first copy must force an exact empty-set retry"
-        );
-    }
 }

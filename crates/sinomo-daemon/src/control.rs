@@ -1118,7 +1118,8 @@ pub fn run_daemon_control_loop_with_prepared_listener(
         shutdown_tx,
         shutdown_rx.clone(),
     ))?;
-    service_host.shutdown_components();
+    let component_shutdown =
+        service_host.shutdown_components(&daemon_runtime_handle, DAEMON_RUNTIME_TASK_JOIN_TIMEOUT);
     let _ = shutdown_signal.send(true);
     daemon_cluster_maintenance_notify().notify_waiters();
     for (task_label, task) in runtime_tasks {
@@ -1132,10 +1133,21 @@ pub fn run_daemon_control_loop_with_prepared_listener(
     drain_daemon_runtime_after_task_shutdown(&daemon_runtime);
     crate::append_operational_event_best_effort(
         &paths,
-        crate::OperationalSeverity::Info,
+        if component_shutdown.is_ok() {
+            crate::OperationalSeverity::Info
+        } else {
+            crate::OperationalSeverity::Error
+        },
         "daemon-control",
-        "daemon.lifecycle.stopped",
-        format!("sinomo {label} stopped"),
+        if component_shutdown.is_ok() {
+            "daemon.lifecycle.stopped"
+        } else {
+            "daemon.lifecycle.stop-incomplete"
+        },
+        match &component_shutdown {
+            Ok(()) => format!("sinomo {label} stopped"),
+            Err(error) => format!("sinomo {label} component shutdown remains incomplete: {error}"),
+        },
         None,
         serde_json::json!({
             "label": label,
@@ -1144,7 +1156,7 @@ pub fn run_daemon_control_loop_with_prepared_listener(
         }),
     );
     daemon_runtime.shutdown_timeout(DAEMON_RUNTIME_SHUTDOWN_TIMEOUT);
-    Ok(())
+    component_shutdown
 }
 
 fn join_daemon_runtime_task(
@@ -4246,8 +4258,9 @@ mod tests {
         let status =
             sinomo_dfs::decode_dfs_status_rpc_response(&response).expect("dfs status response");
         assert_eq!(status.file_system_count, 0);
-        service_host.shutdown_components();
-        runtime.block_on(async { tokio::time::sleep(Duration::from_millis(50)).await });
+        service_host
+            .shutdown_components(runtime.handle(), DAEMON_RUNTIME_TASK_JOIN_TIMEOUT)
+            .expect("normal bounded component shutdown");
     }
 
     #[test]
@@ -4358,7 +4371,9 @@ mod tests {
             sinomo_core::kv::DurableRaftKvNode::open(target_node, wal_paths)
                 .expect("fresh main can acquire node.lock after shadow rejection"),
         );
-        service_host.shutdown_components();
+        service_host
+            .shutdown_components(runtime.handle(), DAEMON_RUNTIME_TASK_JOIN_TIMEOUT)
+            .expect("normal bounded component shutdown");
     }
 
     #[test]

@@ -5862,6 +5862,9 @@ mod tests {
 
     fn mount_open_repair_record(label: &str) -> dfs::DfsRepairAttemptRecord {
         dfs::DfsRepairAttemptRecord {
+            transfer_delivery_state: None,
+            completed_transfer_request_id: None,
+            transfer_kind: None,
             intent_id: format!("intent-{label}"),
             object_id: dfs::DfsObjectId::from_legacy_named(format!("object-{label}"))
                 .expect("repair object ID"),
@@ -5876,77 +5879,6 @@ mod tests {
             next_retry_unix_nanos: 0,
             transfer_request_id: None,
             last_error: None,
-        }
-    }
-
-    #[derive(Debug)]
-    struct MountedReadPolicyProbeTransport {
-        local_node_id: dfs::DfsNodeId,
-        primary_node_id: dfs::DfsNodeId,
-        calls: Arc<Mutex<Vec<&'static str>>>,
-        incoming: VecDeque<dfs::DfsRoutedMessage>,
-    }
-
-    impl dfs::DfsTransportIdentity for MountedReadPolicyProbeTransport {
-        fn local_node_id(&self) -> &dfs::DfsNodeId {
-            &self.local_node_id
-        }
-    }
-
-    impl dfs::DfsMessageTransport for MountedReadPolicyProbeTransport {
-        fn send_routed_call(
-            &mut self,
-            target_node_id: &dfs::DfsNodeId,
-            call: dfs::DfsRoutedCall,
-        ) -> Result<(), sinomo_runtime::network::NetworkError> {
-            assert_eq!(target_node_id, &self.primary_node_id);
-            let routed = call.message;
-            let dfs::DfsNetworkMessage::NamespaceRequest(namespace) = &routed.message else {
-                panic!(
-                    "unexpected Cloud Files mounted-read request: {:?}",
-                    routed.message
-                );
-            };
-            let label = match &namespace.operation {
-                dfs::DfsNamespaceOperation::LookupPath { .. } => "lookup-path",
-                dfs::DfsNamespaceOperation::SyncPath { .. } => "sync-path",
-                operation => {
-                    panic!("unexpected Cloud Files mounted-read namespace operation: {operation:?}")
-                }
-            };
-            self.calls.lock().expect("mounted read calls").push(label);
-            self.incoming.push_back(dfs::DfsRoutedMessage {
-                source_node_id: self.primary_node_id.clone(),
-                target_node_id: self.local_node_id.clone(),
-                frame_id: routed.frame_id.saturating_add(1),
-                message_id: routed.message_id.saturating_add(1),
-                message: dfs::DfsNetworkMessage::NamespaceResponse(dfs::DfsNamespaceResponse {
-                    request_id: namespace.request_id.clone(),
-                    result: dfs::DfsNamespaceResult::Rejected {
-                        reason: "injected authoritative lookup failure".to_string(),
-                        posix_error: None,
-                        current_primary_node_id: None,
-                    },
-                    synced_path_object: None,
-                    synced_path_objects: Vec::new(),
-                    metadata_journal_batches: Vec::new(),
-                    metadata_journal_has_more: None,
-                    posix_coordination_result: None,
-                }),
-            });
-            Ok(())
-        }
-
-        fn drain_incoming_messages(
-            &mut self,
-        ) -> Result<Vec<dfs::DfsRoutedMessage>, sinomo_runtime::network::NetworkError> {
-            Ok(self.incoming.drain(..).collect())
-        }
-
-        fn pending_incoming_count(
-            &self,
-        ) -> Result<Option<usize>, sinomo_runtime::network::NetworkError> {
-            Ok(Some(self.incoming.len()))
         }
     }
 
@@ -6063,60 +5995,143 @@ mod tests {
 
     #[test]
     fn production_mounted_read_policy_never_escalates_stat_or_lstat_to_sync_path() {
-        let root = TestRoot::new("mounted-read-policy");
-        let local_node =
-            dfs::DfsNodeId::from_legacy_named("node_cloud_files_mounted_read").expect("local node");
-        let primary_node =
-            dfs::DfsNodeId::from_legacy_named("node_cloud_files_mounted_read_primary")
-                .expect("primary node");
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let transport = MountedReadPolicyProbeTransport {
-            local_node_id: local_node,
-            primary_node_id: primary_node.clone(),
-            calls: Arc::clone(&calls),
-            incoming: VecDeque::new(),
+        use dfs::test_support::{
+            DfsTestFaultAction, DfsTestFaultRule, DfsTestRpcOrigin, DfsTestRpcPhase, DfsTestRuntime,
         };
-        let control_plane =
-            dfs::SharedDfsControlPlaneKvClient::new(sinomo_runtime::kv::InProcessKvStore::new());
-        let shard = dfs::DfsMetadataShardConfig {
-            file_system_id: dfs::sifs_file_system_id(),
-            shard_id: "root".to_string(),
-            primary_node_id: primary_node,
-            replica_node_ids: Vec::new(),
-            epoch: 1,
-            assignment: dfs::DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
-            default_policy: sinomo_runtime::core::DfsObjectPolicy::ReplicatedEventual,
+
+        let (runtime, nodes) = DfsTestRuntime::start_cluster("cloud-files-mounted-read-policy", 2)
+            .expect("normal mounted-read owners");
+        let prefix = "/services/cloud-files-mounted-read-policy";
+        let shard = runtime
+            .bootstrap_empty_metadata_prefix("cloud-files-mounted-read-policy", prefix)
+            .expect("guarded native empty-scope bootstrap");
+        let local_node = nodes
+            .iter()
+            .find(|node| **node != shard.primary_node_id && !shard.replica_node_ids.contains(node))
+            .expect("mounted reader must be outside the actual shard member ring")
+            .clone();
+        let mut service = runtime
+            .client(&local_node)
+            .expect("normal mounted-read NodeTransport client");
+        let assert_current_reader_is_outside = || {
+            let actual = runtime
+                .metadata_shards()
+                .expect("actual current native assignments")
+                .into_iter()
+                .find(|actual| actual.shard_id == shard.shard_id)
+                .expect("native mounted-read scope remains assigned");
+            assert_eq!(
+                actual, shard,
+                "the full assignment must stay exact across each faulted lookup"
+            );
+            assert!(
+                actual.primary_node_id != local_node
+                    && !actual.replica_node_ids.contains(&local_node),
+                "replica locality must not mask the disabled implicit-sync branch"
+            );
         };
-        control_plane.with_client(|kv| {
-            dfs::DfsControlPlaneStore::new(kv)
-                .put_metadata_shard(&shard)
-                .expect("mounted-read authority shard")
-        });
-        let mut service = dfs::NetworkedDfsService::new(
-            transport,
-            dfs::LocalContentStore::new(root.0.join("content")).expect("mounted-read content"),
-        )
-        .with_control_plane(control_plane);
 
         // This is the exact policy hook invoked by open_sifs_service after its
         // Armed-window bootstrap and before the service can reach CFAPI.
         configure_cloud_files_mounted_read_policy(&mut service);
+
+        assert_current_reader_is_outside();
+        let baseline = runtime.rpc_observations().len();
+        assert!(matches!(
+            service.posix_lstat_distributed(&format!("{prefix}/missing-baseline.txt")),
+            Err(dfs::DfsPosixError::NotFound { .. })
+        ));
+        assert!(
+            runtime.rpc_observations()[baseline..].iter().any(|event| {
+                event.source == local_node
+                    && event.target == shard.primary_node_id
+                    && event.route == dfs::DFS_DATA_NAMESPACE_ROUTE
+                    && event.origin == DfsTestRpcOrigin::RegisteredHost
+                    && event.phase == DfsTestRpcPhase::Completed
+            }),
+            "the unfaulted lookup must receive the actual Main response"
+        );
+
+        runtime.install_fault(DfsTestFaultRule {
+            source: Some(local_node.clone()),
+            target: Some(shard.primary_node_id.clone()),
+            route: Some(dfs::DFS_DATA_NAMESPACE_ROUTE.into()),
+            call_id: None,
+            origin: Some(DfsTestRpcOrigin::RegisteredHost),
+            remaining_hits: 2,
+            action: DfsTestFaultAction::BudgetExhausted,
+        });
+        assert_current_reader_is_outside();
+        let before_stat = runtime.rpc_observations().len();
         assert!(
             service
-                .posix_stat_distributed("/services/missing-stat.txt")
+                .posix_stat_distributed(&format!("{prefix}/missing-stat.txt"))
                 .is_err()
         );
+        assert_current_reader_is_outside();
+        let before_lstat = runtime.rpc_observations().len();
+        assert_current_reader_is_outside();
         assert!(
             service
-                .posix_lstat_distributed("/services/missing-lstat.txt")
+                .posix_lstat_distributed(&format!("{prefix}/missing-lstat.txt"))
                 .is_err()
         );
+        assert_current_reader_is_outside();
+        let observations = runtime.rpc_observations();
+        let is_namespace_attempt = |event: &&dfs::test_support::DfsTestRpcObservation| {
+            event.source == local_node
+                && event.target == shard.primary_node_id
+                && event.route == dfs::DFS_DATA_NAMESPACE_ROUTE
+                && event.origin == DfsTestRpcOrigin::RegisteredHost
+                && event.phase == DfsTestRpcPhase::BeforeDispatch
+        };
         assert_eq!(
-            calls.lock().expect("mounted read calls").as_slice(),
-            ["lookup-path", "lookup-path"],
+            [
+                observations[before_stat..before_lstat]
+                    .iter()
+                    .filter(is_namespace_attempt)
+                    .count(),
+                observations[before_lstat..]
+                    .iter()
+                    .filter(is_namespace_attempt)
+                    .count(),
+            ],
+            [1, 1],
             "Cloud Files stat/lstat must never perform an unowned SyncPath ingest"
         );
+        for attempt in observations[before_stat..]
+            .iter()
+            .filter(is_namespace_attempt)
+        {
+            assert!(
+                observations[before_stat..].iter().any(|event| {
+                    event.call_id == attempt.call_id
+                        && event.phase == DfsTestRpcPhase::EndedWithoutResponse
+                }),
+                "each lookup must exercise the real negative dispatch fault"
+            );
+        }
+        assert!(
+            observations[before_stat..].iter().all(|event| {
+                event.source != local_node
+                    || event.phase != DfsTestRpcPhase::BeforeDispatch
+                    || ![
+                        dfs::DFS_METADATA_JOURNAL_BATCH_ROUTE,
+                        dfs::DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
+                        dfs::DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE,
+                        dfs::DFS_DATA_METADATA_SNAPSHOT_INSTALL_ROUTE,
+                    ]
+                    .contains(&event.route.as_str())
+            }),
+            "failed mounted lookups must not initiate replica ingest"
+        );
+        assert_eq!(runtime.observation_dropped_count(), 0);
+        runtime
+            .assert_fault_budgets()
+            .expect("no extra namespace attempt exceeded the real negative fault budget");
+        drop(service);
+        runtime.clear_faults();
+        runtime.close().expect("normal mounted-read shutdown");
     }
 
     #[test]

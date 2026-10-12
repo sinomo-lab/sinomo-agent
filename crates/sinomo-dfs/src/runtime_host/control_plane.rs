@@ -38,7 +38,6 @@ pub(crate) struct DaemonDfsControlPlaneKvClient {
     pub(super) data_owner_lock: Option<Weak<DaemonDataOwnerLock>>,
     /// Sandbox services may outlive the handler which opened them, so those
     /// services explicitly retain the strong capability for their lifetime.
-    pub(super) _owned_data_owner_lock: Option<Arc<DaemonDataOwnerLock>>,
     #[cfg(test)]
     pub(super) full_snapshot_refresh_calls: Arc<AtomicUsize>,
     #[cfg(test)]
@@ -66,37 +65,6 @@ impl DaemonDfsControlPlaneKvClient {
             write_configuration_projection_required: false,
             retained_metadata_projection_generation: Arc::new(AtomicU64::new(0)),
             data_owner_lock: data_owner_lock.as_ref().map(Arc::downgrade),
-            _owned_data_owner_lock: None,
-            #[cfg(test)]
-            full_snapshot_refresh_calls: Arc::new(AtomicUsize::new(0)),
-            #[cfg(test)]
-            authoritative_exact_set_calls: Arc::new(AtomicUsize::new(0)),
-            #[cfg(test)]
-            authoritative_prefix_calls: Arc::new(AtomicUsize::new(0)),
-            #[cfg(test)]
-            authoritative_exact_set_deadlines: Arc::new(Mutex::new(Vec::new())),
-            #[cfg(test)]
-            authoritative_exact_set_outcomes: Arc::new(Mutex::new(VecDeque::new())),
-        }
-    }
-
-    pub(super) fn new_owned_on_runtime(
-        cluster_paths: &ClusterPaths,
-        runtime: &tokio::runtime::Handle,
-    ) -> Self {
-        let data_owner_lock = Self::discover_data_owner_lock(cluster_paths);
-        Self {
-            cluster_paths: cluster_paths.clone(),
-            runtime: runtime.clone(),
-            projection: Arc::new(Mutex::new(DaemonDfsAuthoritativeProjection::default())),
-            retained_metadata_authority: Self::discover_retained_metadata_authority(
-                cluster_paths,
-                runtime,
-            ),
-            write_configuration_projection_required: true,
-            retained_metadata_projection_generation: Arc::new(AtomicU64::new(0)),
-            data_owner_lock: data_owner_lock.as_ref().map(Arc::downgrade),
-            _owned_data_owner_lock: data_owner_lock,
             #[cfg(test)]
             full_snapshot_refresh_calls: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
@@ -236,7 +204,11 @@ impl DaemonDfsControlPlaneKvClient {
                 // can change topology or be superseded by a newer revision;
                 // replan against the resulting generation, never the old one.
                 authority
-                    .ensure_complete_prefix_for_generation_async(generation)
+                    .ensure_complete_prefix_for_generation_async(
+                        generation,
+                        #[cfg(test)]
+                        None,
+                    )
                     .await;
                 if let Some(synchronized) = self.try_synchronize_retained_metadata_authority()? {
                     return Ok(synchronized);
@@ -275,9 +247,23 @@ impl DaemonDfsControlPlaneKvClient {
                 return Ok(Some(DaemonDfsRetainedMetadataSync::Current));
             }
             let authority_generation = authority.generation();
-            let Some(authoritative_prefix) =
-                authority.load_complete_prefix_for_generation(authority_generation)
-            else {
+            #[cfg(any(test, feature = "test-support"))]
+            let (authoritative_prefix, native_seed) = if let (Some(root), Some(owner)) =
+                (self.cluster_paths.root.parent(), self.data_owner_lock())
+            {
+                crate::native_shard_trace::capture_retained_metadata_seed(root, &owner, || {
+                    authority.load_complete_prefix_for_generation(authority_generation)
+                })
+            } else {
+                (
+                    authority.load_complete_prefix_for_generation(authority_generation),
+                    None,
+                )
+            };
+            #[cfg(not(any(test, feature = "test-support")))]
+            let authoritative_prefix =
+                authority.load_complete_prefix_for_generation(authority_generation);
+            let Some(authoritative_prefix) = authoritative_prefix else {
                 self.invalidate_retained_metadata_authority_seed();
                 return Ok(None);
             };
@@ -312,12 +298,30 @@ impl DaemonDfsControlPlaneKvClient {
                     requested_bytes: DFS_AUTHORITY_PROJECTION_MAX_BYTES.saturating_add(1),
                 });
             }
+            #[cfg(any(test, feature = "test-support"))]
+            {
+                projection.native_retained_seed = native_seed.filter(|seed| {
+                    seed.revision == revision
+                        && seed.projection_generation == projection_generation
+                        && projection
+                            .prefix_entries
+                            .get(DAEMON_DFS_METADATA_AUTHORITY_PREFIX)
+                            == Some(&seed.entries)
+                });
+            }
             self.retained_metadata_projection_generation
                 .store(projection_generation, Ordering::Release);
             drop(projection);
             if authority.generation() == authority_generation
                 && authority.projection_generation() == projection_generation
             {
+                #[cfg(any(test, feature = "test-support"))]
+                self.record_native_retained_use(
+                    crate::native_shard_trace::NativeControlConsumptionScopeV1::RetainedPrefixSeed {
+                        prefix: DAEMON_DFS_METADATA_AUTHORITY_PREFIX,
+                    },
+                    None,
+                );
                 return Ok(Some(DaemonDfsRetainedMetadataSync::Current));
             }
             self.invalidate_retained_metadata_authority_seed();
@@ -334,6 +338,45 @@ impl DaemonDfsControlPlaneKvClient {
             .map(SinomoDataDir::new)
             .map(|data_dir| DaemonPaths::new(&data_dir))
             .and_then(|paths| daemon_dfs_data_owner_lock(&paths).ok().flatten())
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn record_native_retained_use(
+        &self,
+        scope: crate::native_shard_trace::NativeControlConsumptionScopeV1,
+        expected: Option<(u64, KvRevision)>,
+    ) {
+        let (Some(root), Some(owner)) = (self.cluster_paths.root.parent(), self.data_owner_lock())
+        else {
+            return;
+        };
+        if !crate::native_shard_trace::has_root_interest(root, &owner) {
+            return;
+        }
+        let Ok(projection) = self.projection.lock() else {
+            return;
+        };
+        if expected.is_some_and(|(generation, revision)| {
+            projection.generation != generation || projection.revision != revision
+        }) {
+            return;
+        }
+        let Some(seed) = projection.native_retained_seed.as_ref() else {
+            return;
+        };
+        if seed.revision != projection.revision
+            || self
+                .retained_metadata_projection_generation
+                .load(Ordering::Acquire)
+                != seed.projection_generation
+            || projection
+                .prefix_entries
+                .get(DAEMON_DFS_METADATA_AUTHORITY_PREFIX)
+                != Some(&seed.entries)
+        {
+            return;
+        }
+        crate::native_shard_trace::record_retained_control_use(root, &owner, seed, scope);
     }
 
     pub(super) fn data_owner_lock(&self) -> Option<Arc<DaemonDataOwnerLock>> {
@@ -936,6 +979,17 @@ impl sinomo_dfs::DfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient {
         {
             return Ok(crate::DfsWriteConfigurationReadiness::Pending);
         }
+        #[cfg(any(test, feature = "test-support"))]
+        if let crate::DfsWriteConfigurationReadiness::Ready(Some(view)) = &readiness {
+            if let Some(root) = self.cluster_paths.root.parent() {
+                crate::native_shard_trace::record_configuration_cut(
+                    root,
+                    self.data_owner_lock().as_ref(),
+                    view,
+                    generation,
+                );
+            }
+        }
         Ok(readiness)
     }
 
@@ -981,6 +1035,13 @@ impl sinomo_dfs::DfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient {
         })
     }
 
+    #[cfg(feature = "storage-conversion")]
+    fn storage_import_placement_snapshot(&self) -> Option<Arc<sinomo_dfs::DfsPlacementSnapshot>> {
+        let _owner = self.data_owner_lock()?;
+        let data_dir = self.cluster_paths.root.parent().map(SinomoDataDir::new)?;
+        super::placement_environment::retained_storage_import_placement_snapshot(&data_dir)
+    }
+
     fn authorizes_prior_process_placement_authority_recovery(
         &self,
         local_node_id: &NodeId,
@@ -1016,6 +1077,29 @@ impl sinomo_dfs::DfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient {
                     self.invalidate_retained_metadata_authority_seed();
                     continue;
                 }
+                #[cfg(any(test, feature = "test-support"))]
+                if self
+                    .retained_metadata_authority
+                    .as_ref()
+                    .is_some_and(|authority| {
+                        crate::test_runtime::native_operation_floor_read_is_denied(
+                            authority.as_ref(),
+                            key,
+                        )
+                    })
+                {
+                    return Err(KvError::Io {
+                        path: self.cluster_paths.root.display().to_string(),
+                        detail: "resident Raft view changed after ReadIndex quorum; retry the read (injected native operation-floor return)".into(),
+                    });
+                }
+                #[cfg(any(test, feature = "test-support"))]
+                if retained && retained_sync == DaemonDfsRetainedMetadataSync::Current {
+                    self.record_native_retained_use(
+                        crate::native_shard_trace::NativeControlConsumptionScopeV1::RetainedKeysReturned { keys: keys.to_vec(), values: vec![cached.clone()] },
+                        Some((generation, _minimum_revision)),
+                    );
+                }
                 return Ok(cached);
             }
             if retained && retained_sync == DaemonDfsRetainedMetadataSync::Current {
@@ -1028,6 +1112,22 @@ impl sinomo_dfs::DfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient {
             }
             let read = self.fetch_authoritative_entries(&keys)?;
             if self.merge_authoritative_entries(generation, &keys, &read)? {
+                #[cfg(any(test, feature = "test-support"))]
+                if self
+                    .retained_metadata_authority
+                    .as_ref()
+                    .is_some_and(|authority| {
+                        crate::test_runtime::native_operation_floor_read_is_denied(
+                            authority.as_ref(),
+                            key,
+                        )
+                    })
+                {
+                    return Err(KvError::Io {
+                        path: self.cluster_paths.root.display().to_string(),
+                        detail: "resident Raft view changed after ReadIndex quorum; retry the read (injected native operation-floor return)".into(),
+                    });
+                }
                 return Ok(read.value.into_iter().next().flatten());
             }
         }
@@ -1051,6 +1151,13 @@ impl sinomo_dfs::DfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient {
                 {
                     self.invalidate_retained_metadata_authority_seed();
                     continue;
+                }
+                #[cfg(any(test, feature = "test-support"))]
+                if retained && retained_sync == DaemonDfsRetainedMetadataSync::Current {
+                    self.record_native_retained_use(
+                        crate::native_shard_trace::NativeControlConsumptionScopeV1::RetainedKeysReturned { keys: keys.to_vec(), values: cached.clone() },
+                        Some((generation, _minimum_revision)),
+                    );
                 }
                 return Ok(cached);
             }
@@ -1113,6 +1220,16 @@ impl sinomo_dfs::DfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient {
             let (generation, _minimum_revision, _) = self.entries_read_plan(keys)?;
             let read = self.fetch_authoritative_entries_before(keys, deadline)?;
             if self.merge_authoritative_entries(generation, keys, &read)? {
+                #[cfg(any(test, feature = "test-support"))]
+                if let Some(data_root) = self.cluster_paths.root.parent() {
+                    crate::native_shard_trace::record_authoritative_read(
+                        data_root,
+                        self.data_owner_lock().as_ref(),
+                        keys,
+                        &read,
+                        generation,
+                    );
+                }
                 return Ok(read.value);
             }
         }
@@ -1134,6 +1251,13 @@ impl sinomo_dfs::DfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient {
                 {
                     self.invalidate_retained_metadata_authority_seed();
                     continue;
+                }
+                #[cfg(any(test, feature = "test-support"))]
+                if retained && retained_sync == DaemonDfsRetainedMetadataSync::Current {
+                    self.record_native_retained_use(
+                        crate::native_shard_trace::NativeControlConsumptionScopeV1::RetainedPrefixReturned { prefix: prefix.to_string(), entries: cached.clone() },
+                        Some((generation, _minimum_revision)),
+                    );
                 }
                 return Ok(cached);
             }
@@ -1188,22 +1312,74 @@ impl sinomo_dfs::DfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient {
         let notify_handoff =
             daemon_dfs_txn_puts_local_membership_handoff(&self.cluster_paths, &txn);
         let cluster = self.cluster_access()?;
-        // DFS consumes the response and revision, never a full snapshot. A
-        // forwarded full-result commit can fail its optional snapshot fetch
-        // after the transaction has already committed on the authority.
-        let response = block_on_dfs_cluster_future(
-            &self.runtime,
-            cluster.kv_commit_compact_async(sinomo_core::kv::KvTxnRequest::generated(txn)),
-        )?
-        .txn_response
-        .ok_or_else(|| KvError::Serialization {
-            detail: "component cluster commit returned no transaction response".to_string(),
+        let request = sinomo_core::kv::KvTxnRequest::generated(txn);
+        #[cfg(any(test, feature = "test-support"))]
+        let native_request = self.cluster_paths.root.parent().and_then(|root| {
+            let owner = self.data_owner_lock()?;
+            crate::native_shard_trace::has_root_interest(root, &owner).then(|| request.clone())
+        });
+        let result =
+            block_on_dfs_cluster_future(&self.runtime, cluster.kv_commit_compact_async(request))?;
+        #[cfg(any(test, feature = "test-support"))]
+        if let (Some(root), Some(request)) =
+            (self.cluster_paths.root.parent(), native_request.as_ref())
+        {
+            crate::native_shard_trace::record_native_control_commit(
+                root,
+                self.data_owner_lock().as_ref(),
+                request,
+                &result,
+            );
+        }
+        let response = result.txn_response.ok_or_else(|| KvError::Serialization {
+            detail: "component cluster commit returned no transaction response".into(),
         })?;
         if response.succeeded && notify_handoff {
-            notify_daemon_dfs_maintenance_work();
+            if let Some(root) = self.cluster_paths.root.parent() {
+                notify_daemon_dfs_maintenance_work(&SinomoDataDir::new(root));
+            }
         }
         self.begin_authoritative_generation_at_revision(response.revision)?;
         Ok(response)
+    }
+
+    fn txn_with_native_authority(
+        &mut self,
+        txn: KvTxn,
+    ) -> Result<(KvTxnResponse, Option<crate::DfsNativeTxnCommit>), KvError> {
+        let notify_handoff =
+            daemon_dfs_txn_puts_local_membership_handoff(&self.cluster_paths, &txn);
+        let cluster = self.cluster_access()?;
+        let request = sinomo_core::kv::KvTxnRequest::generated(txn);
+        let result = block_on_dfs_cluster_future(
+            &self.runtime,
+            cluster.kv_commit_compact_async(request.clone()),
+        )?;
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(root) = self.cluster_paths.root.parent() {
+            crate::native_shard_trace::record_native_control_commit(
+                root,
+                self.data_owner_lock().as_ref(),
+                &request,
+                &result,
+            );
+        }
+        let response = result
+            .txn_response
+            .clone()
+            .ok_or_else(|| KvError::Serialization {
+                detail: "component cluster commit returned no transaction response".into(),
+            })?;
+        if response.succeeded && notify_handoff {
+            if let Some(root) = self.cluster_paths.root.parent() {
+                notify_daemon_dfs_maintenance_work(&SinomoDataDir::new(root));
+            }
+        }
+        self.begin_authoritative_generation_at_revision(response.revision)?;
+        Ok((
+            response,
+            Some(crate::DfsNativeTxnCommit { request, result }),
+        ))
     }
 }
 
@@ -1234,6 +1410,13 @@ impl sinomo_dfs::AsyncDfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient 
                     {
                         self.invalidate_retained_metadata_authority_seed();
                         continue;
+                    }
+                    #[cfg(any(test, feature = "test-support"))]
+                    if retained && retained_sync == DaemonDfsRetainedMetadataSync::Current {
+                        self.record_native_retained_use(
+                        crate::native_shard_trace::NativeControlConsumptionScopeV1::RetainedKeysReturned { keys: keys.clone(), values: vec![cached.clone()] },
+                        Some((generation, _minimum_revision)),
+                    );
                     }
                     return Ok(cached);
                 }
@@ -1272,6 +1455,13 @@ impl sinomo_dfs::AsyncDfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient 
                     {
                         self.invalidate_retained_metadata_authority_seed();
                         continue;
+                    }
+                    #[cfg(any(test, feature = "test-support"))]
+                    if retained && retained_sync == DaemonDfsRetainedMetadataSync::Current {
+                        self.record_native_retained_use(
+                        crate::native_shard_trace::NativeControlConsumptionScopeV1::RetainedKeysReturned { keys: keys.clone(), values: cached.clone() },
+                        Some((generation, _minimum_revision)),
+                    );
                     }
                     return Ok(cached);
                 }
@@ -1369,6 +1559,13 @@ impl sinomo_dfs::AsyncDfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient 
                         self.invalidate_retained_metadata_authority_seed();
                         continue;
                     }
+                    #[cfg(any(test, feature = "test-support"))]
+                    if retained && retained_sync == DaemonDfsRetainedMetadataSync::Current {
+                        self.record_native_retained_use(
+                        crate::native_shard_trace::NativeControlConsumptionScopeV1::RetainedPrefixReturned { prefix: prefix.to_string(), entries: cached.clone() },
+                        Some((generation, _minimum_revision)),
+                    );
+                    }
                     return Ok(cached);
                 }
                 if retained && retained_sync == DaemonDfsRetainedMetadataSync::Current {
@@ -1414,17 +1611,35 @@ impl sinomo_dfs::AsyncDfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient 
         Box::pin(async move {
             let notify_handoff =
                 daemon_dfs_txn_puts_local_membership_handoff(&self.cluster_paths, &txn);
-            let response = self
+            let request = sinomo_core::kv::KvTxnRequest::generated(txn);
+            #[cfg(any(test, feature = "test-support"))]
+            let native_request = self.cluster_paths.root.parent().and_then(|root| {
+                let owner = self.data_owner_lock()?;
+                crate::native_shard_trace::has_root_interest(root, &owner).then(|| request.clone())
+            });
+            let result = self
                 .cluster_access()?
-                .kv_commit_compact_async(sinomo_core::kv::KvTxnRequest::generated(txn))
+                .kv_commit_compact_async(request)
                 .await
-                .map_err(dfs_cluster_service_error)?
-                .txn_response
-                .ok_or_else(|| KvError::Serialization {
-                    detail: "component cluster commit returned no transaction response".to_string(),
-                })?;
+                .map_err(dfs_cluster_service_error)?;
+            #[cfg(any(test, feature = "test-support"))]
+            if let (Some(root), Some(request)) =
+                (self.cluster_paths.root.parent(), native_request.as_ref())
+            {
+                crate::native_shard_trace::record_native_control_commit(
+                    root,
+                    self.data_owner_lock().as_ref(),
+                    request,
+                    &result,
+                );
+            }
+            let response = result.txn_response.ok_or_else(|| KvError::Serialization {
+                detail: "component cluster commit returned no transaction response".to_string(),
+            })?;
             if response.succeeded && notify_handoff {
-                notify_daemon_dfs_maintenance_work();
+                if let Some(root) = self.cluster_paths.root.parent() {
+                    notify_daemon_dfs_maintenance_work(&SinomoDataDir::new(root));
+                }
             }
             self.begin_authoritative_generation_at_revision(response.revision)?;
             Ok(response)
@@ -1515,6 +1730,21 @@ impl sinomo_dfs::DfsControlPlaneKvClient for GatedNativePlacementControlPlane {
             "async placement progress must not enter synchronous native RPC"
         );
         sinomo_dfs::DfsControlPlaneKvClient::txn(&mut self.client, txn)
+    }
+    fn txn_with_native_authority(
+        &mut self,
+        txn: KvTxn,
+    ) -> Result<(KvTxnResponse, Option<crate::DfsNativeTxnCommit>), KvError> {
+        let is_progress = txn.success.iter().chain(&txn.failure).any(|op| {
+            matches!(
+                op, KvOp::Put { key, .. } if key.ends_with("/placement-test-job")
+            )
+        });
+        assert!(
+            !is_progress || !self.gate.armed.load(Ordering::Acquire),
+            "async placement progress must not enter synchronous native RPC"
+        );
+        sinomo_dfs::DfsControlPlaneKvClient::txn_with_native_authority(&mut self.client, txn)
     }
 }
 

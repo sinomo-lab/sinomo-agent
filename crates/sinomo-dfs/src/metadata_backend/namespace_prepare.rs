@@ -1,50 +1,5 @@
-//! Namespace prepare for the local metadata backend.
-
+//! Current immutable-operation and namespace precondition validation.
 use super::*;
-
-#[cfg(test)]
-pub(super) fn namespace_prepared_commit_reference_planner_calls() -> usize {
-    NAMESPACE_PREPARED_COMMIT_REFERENCE_PLANNER_CALLS.get()
-}
-
-#[cfg(test)]
-pub(super) fn namespace_prepare_history_scan_calls() -> usize {
-    NAMESPACE_PREPARE_HISTORY_SCAN_CALLS.get()
-}
-
-pub(super) fn namespace_prepare_payload_matches(
-    left: &DfsNamespacePrepareRecord,
-    right: &DfsNamespacePrepareRecord,
-) -> bool {
-    left.operation_id == right.operation_id
-        && left.file_system_id == right.file_system_id
-        && left.shard_id == right.shard_id
-        && left.owner_epoch == right.owner_epoch
-        && left.operation_digest == right.operation_digest
-        && left.expected_object_versions == right.expected_object_versions
-        && left.expected_path_occupants == right.expected_path_occupants
-        && left.content_receipts == right.content_receipts
-        && left.transaction == right.transaction
-        && left.completed_request == right.completed_request
-        && left.completed_request_completion == right.completed_request_completion
-}
-
-pub(super) fn namespace_prepare_rebind_payload_matches(
-    left: &DfsNamespacePrepareRecord,
-    right: &DfsNamespacePrepareRecord,
-) -> bool {
-    left.operation_id == right.operation_id
-        && left.file_system_id == right.file_system_id
-        && left.shard_id == right.shard_id
-        && left.expected_object_versions == right.expected_object_versions
-        && left.expected_path_occupants == right.expected_path_occupants
-        && left.content_receipts == right.content_receipts
-        && left.transaction == right.transaction
-        && left.completed_request == right.completed_request
-        && left.completed_request_completion == right.completed_request_completion
-        && left.status == DfsNamespacePrepareStatus::Prepared
-        && right.status == DfsNamespacePrepareStatus::Prepared
-}
 
 pub(super) fn validate_namespace_request_shape(request: &DfsNamespaceRequestRecord) -> Result<()> {
     if request.request_id.trim().is_empty()
@@ -137,79 +92,12 @@ pub(super) fn namespace_request_transition_is_valid(
     }
 }
 
-pub(super) fn pending_namespace_request_admission_from_completion(
-    completion: &DfsNamespaceRequestRecord,
-) -> DfsNamespaceRequestRecord {
-    let mut pending = completion.clone();
-    pending.status = DfsNamespaceRequestStatus::Pending;
-    pending.result = None;
-    pending.posix_coordination_result = None;
-    pending.recovery_attempts = 0;
-    pending.last_recovery_error = None;
-    pending.updated_at = pending.created_at;
-    pending
-}
-
-pub(super) fn namespace_prepare_can_repair_terminal_request(
-    tables: &DfsMetadataTables,
-    prepare: &DfsNamespacePrepareRecord,
-    existing_request: &DfsNamespaceRequestRecord,
-    prepared_completion: &DfsNamespaceRequestRecord,
-) -> bool {
-    existing_request.status == DfsNamespaceRequestStatus::Completed
-        && prepared_completion.status == DfsNamespaceRequestStatus::Completed
-        && matches!(
-            prepared_completion.result,
-            Some(DfsNamespaceResult::Applied)
-        )
-        && tables
-            .namespace_prepares
-            .get(&prepare.operation_id)
-            .is_some_and(|existing_prepare| {
-                existing_prepare.status != DfsNamespacePrepareStatus::Aborted
-                    && namespace_prepare_payload_matches(existing_prepare, prepare)
-            })
-}
-
-pub(super) fn prepared_write_intent_rebind_payload_matches(
-    left: &DfsWriteIntentRecord,
-    right: &DfsWriteIntentRecord,
-) -> bool {
-    left.intent_id == right.intent_id
-        && left.file_system_id == right.file_system_id
-        && left.object_id == right.object_id
-        && left.base_version == right.base_version
-        && left.target_version == right.target_version
-        && left.coordinator_node_id == right.coordinator_node_id
-        && left.desired_replica_node_ids == right.desired_replica_node_ids
-        && left.policy == right.policy
-        && left.status == right.status
-        && left.content_hash == right.content_hash
-        && left.object_metadata == right.object_metadata
-        && left.touch_parent_on_create == right.touch_parent_on_create
-        && left.create_predecessor_object_id == right.create_predecessor_object_id
-        && left.created_at == right.created_at
-}
-
-pub(super) fn validate_namespace_prepare_shape(
+pub(super) fn validate_prepared_operation_shape(
     tables: &DfsMetadataTables,
     shard_id: &DfsMetadataShardId,
-    prepare: &DfsNamespacePrepareRecord,
+    prepare: &DfsPreparedOperationRecord,
 ) -> Result<ValidatedNamespacePreparePlan> {
-    prepare
-        .validate_default_layout_migration_fence()
-        .map_err(MetadataBackendError::Serde)?;
-    if prepare.operation_id.trim().is_empty() || prepare.operation_digest.trim().is_empty() {
-        return Err(MetadataBackendError::Serde(
-            "namespace prepare requires a non-empty operation id and digest".to_string(),
-        ));
-    }
-    if prepare.owner_epoch == 0 {
-        return Err(MetadataBackendError::Serde(format!(
-            "namespace prepare {} requires a non-zero owner epoch",
-            prepare.operation_id
-        )));
-    }
+    prepare.validate()?;
     if &prepare.shard_id != shard_id {
         return Err(MetadataBackendError::Serde(format!(
             "namespace prepare {} targets shard {}, not local shard {}",
@@ -234,6 +122,7 @@ pub(super) fn validate_namespace_prepare_shape(
     if prepare.transaction.objects.is_empty()
         && prepare.transaction.versions.is_empty()
         && prepare.transaction.advisory_lock_states.is_empty()
+        && prepare.metadata_effects.is_empty()
     {
         // A V6 reference release can definitively do nothing while still
         // committing its immutable retry outcome. Require its annotation,
@@ -362,7 +251,25 @@ pub(super) fn validate_namespace_prepare_shape(
         .map(|version| ((&version.object_id, &version.version), version))
         .collect::<BTreeMap<(&DfsObjectId, &DfsVersion), _>>();
     let mut receipt_keys = BTreeSet::new();
-    let retained_content = crate::file_history::validate_retained_content_prepare(tables, prepare)?;
+    let retained_content = prepare.prepared_intent.as_ref().is_some_and(|intent| {
+        matches!(
+            intent.publication,
+            crate::DfsWritePublication::Retained { .. }
+        )
+    });
+    if !retained_content
+        && prepare.transaction.objects.is_empty()
+        && prepare.transaction.versions.iter().any(|version| {
+            version.has_retention_grant()
+                && !tables
+                    .versions
+                    .contains_key(&(version.object_id.clone(), version.version.clone()))
+        })
+    {
+        return Err(MetadataBackendError::Serde(
+            "new retained content requires a complete sealed write body".into(),
+        ));
+    }
     for receipt in &prepare.content_receipts {
         let key = (
             &receipt.receipt.object_id,
@@ -420,15 +327,28 @@ pub(super) fn validate_namespace_prepare_shape(
             prepare.operation_id
         )));
     }
+    let attached_identity_matches = |attached_operation_id: &str| {
+        if let Some(journal_id) = prepare.journal_operation_id.as_deref() {
+            journal_id == attached_operation_id
+                && prepare.operation_id
+                    == crate::metadata_records::compound_prepared_operation_id(
+                        journal_id,
+                        &prepare.transaction.transaction_id,
+                    )
+        } else {
+            prepare.operation_id
+                == format!(
+                    "namespace-request:{attached_operation_id}:{}",
+                    prepare.transaction.transaction_id
+                )
+        }
+    };
     if let Some(completed_request) = &prepare.completed_request {
         validate_namespace_request_shape(completed_request)?;
         if completed_request.status != DfsNamespaceRequestStatus::Completed
             || completed_request.file_system_id != prepare.file_system_id
             || completed_request.authority_shard_id != prepare.shard_id
-            || !prepare.operation_id.starts_with(&format!(
-                "namespace-request:{}:",
-                completed_request.operation_id
-            ))
+            || !attached_identity_matches(&completed_request.operation_id)
         {
             return Err(MetadataBackendError::Serde(format!(
                 "namespace prepare {} has an invalid completed request attachment",
@@ -441,9 +361,7 @@ pub(super) fn validate_namespace_prepare_shape(
         if completion.file_system_id != prepare.file_system_id
             || completion.authority_shard_id != prepare.shard_id
             || completion.transaction_id != prepare.transaction.transaction_id
-            || !prepare
-                .operation_id
-                .starts_with(&format!("namespace-request:{}:", completion.operation_id))
+            || !attached_identity_matches(&completion.operation_id)
         {
             return Err(MetadataBackendError::Serde(format!(
                 "namespace prepare {} has an invalid compact completed request attachment",
@@ -468,16 +386,9 @@ pub(super) fn validate_namespace_prepare_shape(
 /// while the Prepared footprint remains reserved.
 pub(super) fn validate_namespace_prepare_current_state(
     tables: &DfsMetadataTables,
-    prepare: &DfsNamespacePrepareRecord,
-    effective_status: &DfsNamespacePrepareStatus,
+    prepare: &DfsPreparedOperationRecord,
+    effective_status: &DfsPreparedOperationStatus,
 ) -> Result<()> {
-    if crate::metadata_records::is_default_layout_migration_fence(&prepare.operation_id)
-        && *effective_status == DfsNamespacePrepareStatus::Committed
-    {
-        return Err(MetadataBackendError::Serde(
-            "default layout migration fences cannot be committed or recovered as mutations".into(),
-        ));
-    }
     for receipt in &prepare.content_receipts {
         if let Some(existing) = tables.receipts.get(&(
             receipt.receipt.object_id.clone(),
@@ -493,16 +404,6 @@ pub(super) fn validate_namespace_prepare_current_state(
                 receipt.replica_node_id
             )));
         }
-    }
-    if let Some(existing) = tables
-        .namespace_transactions
-        .get(&prepare.transaction.transaction_id)
-        && existing != &prepare.transaction
-    {
-        return Err(MetadataBackendError::Serde(format!(
-            "namespace prepare {} reuses transaction id {} with a different payload",
-            prepare.operation_id, prepare.transaction.transaction_id
-        )));
     }
     if let Some(completed_request) = &prepare.completed_request {
         let request_key = (
@@ -522,21 +423,6 @@ pub(super) fn validate_namespace_prepare_current_state(
             match tables.namespace_requests.get(&request_key) {
                 Some(existing)
                     if namespace_request_transition_is_valid(existing, completed_request) => {}
-                Some(existing)
-                    if namespace_prepare_can_repair_terminal_request(
-                        tables,
-                        prepare,
-                        existing,
-                        completed_request,
-                    ) =>
-                {
-                    // Once the exact hidden request-owned prepare is durable, its
-                    // attached outcome owns crash recovery. An outer ambiguous
-                    // failure used to record a contradictory terminal rejection
-                    // after this point. Permit only that already-durable prepare
-                    // to repair the request when it commits; a newly introduced
-                    // prepare still cannot rewrite a terminal request.
-                }
                 Some(_) => {
                     return Err(MetadataBackendError::Serde(format!(
                         "namespace prepare {} completed request conflicts with {}/{}",
@@ -545,7 +431,7 @@ pub(super) fn validate_namespace_prepare_current_state(
                         completed_request.request_id
                     )));
                 }
-                None if effective_status == &DfsNamespacePrepareStatus::Prepared => {
+                None if effective_status == &DfsPreparedOperationStatus::Prepared => {
                     // A request-owned prepare is itself the first durable
                     // operation boundary for the fused admission path. The table
                     // planner below materializes a derived Pending admission in
@@ -584,17 +470,18 @@ pub(super) fn validate_namespace_prepare_current_state(
                         prepare.operation_id, completion.requester_node_id, completion.request_id
                     )));
                 }
-                None if effective_status == &DfsNamespacePrepareStatus::Prepared => {
+                None if effective_status == &DfsPreparedOperationStatus::Prepared => {
                     // The compact attachment and hidden prepare are the first
                     // durable boundary. Unlike the legacy full attachment, no
                     // duplicate Pending request body is materialized.
                 }
                 None if tables
-                    .namespace_prepares
+                    .prepared_operations_v7
                     .get(&prepare.operation_id)
                     .is_some_and(|existing_prepare| {
-                        existing_prepare.status != DfsNamespacePrepareStatus::Aborted
-                            && namespace_prepare_payload_matches(existing_prepare, prepare)
+                        existing_prepare.status != DfsPreparedOperationStatus::Aborted
+                            && existing_prepare.digest == prepare.digest
+                            && existing_prepare.payload == prepare.payload
                     }) =>
                 {
                     // Commit/abort validation may run against the durable
@@ -615,68 +502,18 @@ pub(super) fn validate_namespace_prepare_current_state(
 
 pub(super) fn validate_prepared_namespace_commit_state(
     tables: &DfsMetadataTables,
-    prepare: &DfsNamespacePrepareRecord,
+    prepare: &DfsPreparedOperationRecord,
 ) -> Result<()> {
-    validate_namespace_prepare_current_state(tables, prepare, &DfsNamespacePrepareStatus::Committed)
-}
-
-pub(super) fn namespace_prepare_request_completion_is_materialized(
-    tables: &DfsMetadataTables,
-    prepare: &DfsNamespacePrepareRecord,
-) -> bool {
-    prepare
-        .completed_request
-        .as_ref()
-        .is_none_or(|completion| tables.namespace_request_completion_is_materialized(completion))
-        && prepare
-            .completed_request_completion
-            .as_ref()
-            .is_none_or(|completion| {
-                tables.compact_namespace_request_completion_is_materialized(completion)
-            })
-}
-
-pub(super) fn namespace_prepare_content_receipts_are_complete(
-    tables: &DfsMetadataTables,
-    prepare: &DfsNamespacePrepareRecord,
-) -> bool {
-    prepare.content_receipts.iter().all(|receipt| {
-        tables
-            .receipts
-            .get(&(
-                receipt.receipt.object_id.clone(),
-                receipt.receipt.committed_version.clone(),
-                receipt.replica_node_id.clone(),
-            ))
-            .is_some_and(|existing| replay_receipt_matches_existing(existing, receipt))
-    })
-}
-
-pub(super) fn missing_namespace_prepare_content_receipt_ops(
-    tables: &DfsMetadataTables,
-    prepare: &DfsNamespacePrepareRecord,
-) -> Vec<DfsMetadataTableOp> {
-    prepare
-        .content_receipts
-        .iter()
-        .filter(|receipt| {
-            !tables
-                .receipts
-                .get(&(
-                    receipt.receipt.object_id.clone(),
-                    receipt.receipt.committed_version.clone(),
-                    receipt.replica_node_id.clone(),
-                ))
-                .is_some_and(|existing| replay_receipt_matches_existing(existing, receipt))
-        })
-        .cloned()
-        .map(|receipt| DfsMetadataTableOp::PutReceipt { receipt })
-        .collect()
+    validate_namespace_prepare_current_state(
+        tables,
+        prepare,
+        &DfsPreparedOperationStatus::Committed,
+    )
 }
 
 pub(super) fn validate_namespace_prepare_expectations(
     tables: &DfsMetadataTables,
-    prepare: &DfsNamespacePrepareRecord,
+    prepare: &DfsPreparedOperationRecord,
 ) -> Result<()> {
     validate_namespace_read_set(
         tables,
@@ -698,11 +535,6 @@ pub(super) fn validate_namespace_read_set(
         let current = tables
             .objects
             .get(&expected.object_id)
-            .or_else(|| {
-                crate::metadata_records::is_default_layout_migration_fence(operation_id)
-                    .then(|| tables.compacted_tombstones.get(&expected.object_id))
-                    .flatten()
-            })
             .map(|object| object.version.clone());
         if current != expected.expected_version {
             if let (Some(expected_version), Some(current_version)) =
@@ -735,7 +567,7 @@ pub(super) fn validate_namespace_read_set(
 
 pub(super) fn validate_namespace_prepare_does_not_overlap(
     tables: &DfsMetadataTables,
-    prepare: &DfsNamespacePrepareRecord,
+    prepare: &DfsPreparedOperationRecord,
     footprint: &DfsNamespacePrepareFootprint,
 ) -> Result<()> {
     for object_id in footprint.object_ids() {
@@ -765,381 +597,4 @@ pub(super) fn validate_namespace_prepare_does_not_overlap(
         }
     }
     Ok(())
-}
-
-#[cfg(test)]
-pub(super) fn validate_namespace_prepare_does_not_overlap_reference(
-    tables: &DfsMetadataTables,
-    prepare: &DfsNamespacePrepareRecord,
-) -> Result<()> {
-    NAMESPACE_PREPARE_HISTORY_SCAN_CALLS
-        .set(NAMESPACE_PREPARE_HISTORY_SCAN_CALLS.get().saturating_add(1));
-    let footprint = namespace_prepare_footprint(prepare);
-    for existing in tables.namespace_prepares.values().filter(|existing| {
-        existing.status == DfsNamespacePrepareStatus::Prepared
-            && existing.operation_id != prepare.operation_id
-            && existing.file_system_id == prepare.file_system_id
-    }) {
-        let existing_footprint = namespace_prepare_footprint(existing);
-        if !footprint
-            .object_ids()
-            .is_disjoint(existing_footprint.object_ids())
-            || !footprint
-                .normalized_paths()
-                .is_disjoint(existing_footprint.normalized_paths())
-        {
-            return Err(MetadataBackendError::replica_diverged(format!(
-                "namespace prepare {} overlaps active prepare {}",
-                prepare.operation_id, existing.operation_id
-            )));
-        }
-    }
-    Ok(())
-}
-
-pub(super) fn namespace_prepare_table_ops_for_record(
-    tables: &DfsMetadataTables,
-    shard_id: &DfsMetadataShardId,
-    prepare: &DfsNamespacePrepareRecord,
-) -> Result<Vec<DfsMetadataTableOp>> {
-    namespace_prepare_table_plan_for_payload(tables, shard_id, Cow::Borrowed(prepare))
-        .map(|plan| plan.ops)
-}
-
-pub(super) fn namespace_prepare_table_ops_for_owned_record(
-    tables: &DfsMetadataTables,
-    shard_id: &DfsMetadataShardId,
-    prepare: DfsNamespacePrepareRecord,
-) -> Result<Vec<DfsMetadataTableOp>> {
-    namespace_prepare_table_plan_for_payload(tables, shard_id, Cow::Owned(prepare))
-        .map(|plan| plan.ops)
-}
-
-pub(super) fn namespace_prepare_table_plan_for_payload(
-    tables: &DfsMetadataTables,
-    shard_id: &DfsMetadataShardId,
-    prepare: Cow<'_, DfsNamespacePrepareRecord>,
-) -> Result<NamespacePrepareTablePlan> {
-    let validated = validate_namespace_prepare_shape(tables, shard_id, prepare.as_ref())?;
-    let existing = tables.namespace_prepares.get(&prepare.operation_id);
-    match &prepare.status {
-        DfsNamespacePrepareStatus::Prepared => {
-            if let Some(existing) = existing {
-                if !namespace_prepare_payload_matches(existing, prepare.as_ref()) {
-                    return Err(MetadataBackendError::Serde(format!(
-                        "namespace prepare {} reuses an operation id with a different payload",
-                        prepare.operation_id
-                    )));
-                }
-                if existing.status != DfsNamespacePrepareStatus::Prepared {
-                    return Err(MetadataBackendError::Serde(format!(
-                        "namespace prepare {} cannot move from {:?} back to prepared",
-                        prepare.operation_id, existing.status
-                    )));
-                }
-            }
-            validate_namespace_prepare_expectations(tables, prepare.as_ref())?;
-            validate_namespace_prepare_does_not_overlap(
-                tables,
-                prepare.as_ref(),
-                &validated.footprint,
-            )?;
-            validate_namespace_transaction_preconditions(tables, &prepare.transaction)?;
-            let mut ops = Vec::with_capacity(2);
-            if let Some(completion) = prepare.completed_request.as_ref() {
-                let request_key = (
-                    completion.requester_node_id.clone(),
-                    completion.request_id.clone(),
-                );
-                if !tables.namespace_requests.contains_key(&request_key) {
-                    ops.push(DfsMetadataTableOp::put_namespace_request(
-                        pending_namespace_request_admission_from_completion(completion),
-                    ));
-                }
-            }
-            ops.push(DfsMetadataTableOp::put_namespace_prepare(
-                prepare.into_owned(),
-            ));
-            Ok(NamespacePrepareTablePlan {
-                ops,
-                prepared_footprint: Some(validated.footprint),
-            })
-        }
-        DfsNamespacePrepareStatus::Committed => {
-            let existing = existing.ok_or_else(|| {
-                MetadataBackendError::Serde(format!(
-                    "namespace prepare {} cannot commit before it is prepared",
-                    prepare.operation_id
-                ))
-            })?;
-            if !namespace_prepare_payload_matches(existing, prepare.as_ref()) {
-                return Err(MetadataBackendError::Serde(format!(
-                    "namespace prepare {} commit payload does not match the durable prepare",
-                    prepare.operation_id
-                )));
-            }
-            if existing.status == DfsNamespacePrepareStatus::Aborted {
-                return Err(MetadataBackendError::Serde(format!(
-                    "namespace prepare {} is aborted",
-                    prepare.operation_id
-                )));
-            }
-            if existing.status == DfsNamespacePrepareStatus::Committed
-                && existing == prepare.as_ref()
-                && namespace_transaction_recovery_is_complete(tables, &prepare.transaction)
-                && namespace_prepare_content_receipts_are_complete(tables, prepare.as_ref())
-                && namespace_prepare_request_completion_is_materialized(tables, prepare.as_ref())
-            {
-                return Ok(NamespacePrepareTablePlan {
-                    ops: Vec::new(),
-                    prepared_footprint: None,
-                });
-            }
-            if existing.status != DfsNamespacePrepareStatus::Committed {
-                validate_namespace_prepare_expectations(tables, prepare.as_ref())?;
-                validate_namespace_prepare_does_not_overlap(
-                    tables,
-                    prepare.as_ref(),
-                    &validated.footprint,
-                )?;
-                validate_namespace_transaction_preconditions(tables, &prepare.transaction)?;
-                return Ok(NamespacePrepareTablePlan {
-                    ops: vec![DfsMetadataTableOp::CommitNamespacePrepare {
-                        operation_id: prepare.operation_id.clone(),
-                        operation_digest: prepare.operation_digest.clone(),
-                        owner_epoch: prepare.owner_epoch,
-                        retained_at: None,
-                    }],
-                    prepared_footprint: None,
-                });
-            }
-            let mut ops = missing_namespace_prepare_content_receipt_ops(tables, prepare.as_ref());
-            ops.extend(plan_namespace_transaction_recovery_table_ops(
-                tables,
-                &prepare.transaction,
-            ));
-            let prepare_insert_index = ops.len();
-            if let Some(request) = &prepare.completed_request {
-                ops.extend(tables.missing_namespace_request_completion_op(Cow::Borrowed(request)));
-            }
-            if let Some(completion) = &prepare.completed_request_completion {
-                ops.extend(tables.missing_compact_namespace_request_completion_op(completion));
-            }
-            ops.insert(
-                prepare_insert_index,
-                DfsMetadataTableOp::put_namespace_prepare(prepare.into_owned()),
-            );
-            Ok(NamespacePrepareTablePlan {
-                ops,
-                prepared_footprint: None,
-            })
-        }
-        DfsNamespacePrepareStatus::Aborted => {
-            let existing = existing.ok_or_else(|| {
-                MetadataBackendError::Serde(format!(
-                    "namespace prepare {} cannot abort before it is prepared",
-                    prepare.operation_id
-                ))
-            })?;
-            if !namespace_prepare_payload_matches(existing, prepare.as_ref()) {
-                return Err(MetadataBackendError::Serde(format!(
-                    "namespace prepare {} abort payload does not match the durable prepare",
-                    prepare.operation_id
-                )));
-            }
-            if existing.status == DfsNamespacePrepareStatus::Committed {
-                return Err(MetadataBackendError::Serde(format!(
-                    "namespace prepare {} is already committed",
-                    prepare.operation_id
-                )));
-            }
-            if existing == prepare.as_ref() {
-                return Ok(NamespacePrepareTablePlan {
-                    ops: Vec::new(),
-                    prepared_footprint: None,
-                });
-            }
-            Ok(NamespacePrepareTablePlan {
-                ops: vec![DfsMetadataTableOp::put_namespace_prepare(
-                    prepare.into_owned(),
-                )],
-                prepared_footprint: None,
-            })
-        }
-    }
-}
-
-pub(super) fn namespace_prepare_journal_reference_from_validated(
-    entry: &DfsMetadataJournalEntry,
-    prepare: &DfsNamespacePrepareRecord,
-    journal_prepare: &DfsNamespacePreparePayloadRef<'_>,
-) -> Result<DfsMetadataTableOp> {
-    let DfsMetadataMutation::PutNamespacePrepare {
-        file_system_id,
-        operation_id,
-        status,
-        ..
-    } = &entry.mutation
-    else {
-        return Err(MetadataBackendError::Serde(format!(
-            "journal entry {} cannot back namespace prepare {} table materialization",
-            entry.sequence, prepare.operation_id
-        )));
-    };
-    if entry.sequence == 0
-        || entry.shard_id != prepare.shard_id
-        || file_system_id != &prepare.file_system_id
-        || operation_id != &prepare.operation_id
-        || status != &prepare.status
-        || !journal_prepare.matches_prepare_identity(prepare)
-    {
-        return Err(MetadataBackendError::Serde(format!(
-            "journal entry {} does not match namespace prepare {} table reference fences",
-            entry.sequence, prepare.operation_id
-        )));
-    }
-    Ok(DfsMetadataTableOp::PutNamespacePrepareJournalReference {
-        shard_id: prepare.shard_id.clone(),
-        journal_sequence: entry.sequence,
-        file_system_id: prepare.file_system_id.clone(),
-        operation_id: prepare.operation_id.clone(),
-        operation_digest: prepare.operation_digest.clone(),
-        owner_epoch: prepare.owner_epoch,
-        status: prepare.status.clone(),
-    })
-}
-
-pub(super) fn namespace_prepare_persisted_table_ops(
-    entry: &DfsMetadataJournalEntry,
-    apply_ops: &[DfsMetadataTableOp],
-) -> Result<Vec<DfsMetadataTableOp>> {
-    // This helper is called only for an entry just authored from the same
-    // canonical prepare that produced `apply_ops`. Packing constructed a
-    // structurally valid representation, so preserve that proof instead of
-    // rescanning the complete body before replacing the table record with its
-    // compact journal reference.
-    let journal_prepare = entry
-        .mutation
-        .namespace_prepare_payload_ref_prevalidated()
-        .ok_or_else(|| {
-            MetadataBackendError::Serde(format!(
-                "journal entry {} cannot back namespace prepare table materialization without one payload",
-                entry.sequence
-            ))
-        })?;
-    let mut prepare_references = 0usize;
-    let mut persisted_ops = Vec::with_capacity(apply_ops.len());
-    for op in apply_ops {
-        match op {
-            DfsMetadataTableOp::PutNamespacePrepare { prepare } => {
-                persisted_ops.push(namespace_prepare_journal_reference_from_validated(
-                    entry,
-                    prepare,
-                    &journal_prepare,
-                )?);
-                prepare_references = prepare_references.saturating_add(1);
-            }
-            op => persisted_ops.push(op.clone()),
-        }
-    }
-    if prepare_references != 1 {
-        return Err(MetadataBackendError::Serde(format!(
-            "journal entry {} namespace prepare table materialization produced {prepare_references} prepare references",
-            entry.sequence
-        )));
-    }
-    Ok(persisted_ops)
-}
-
-pub(super) fn namespace_prepare_commit_table_ops_for_reference(
-    tables: &DfsMetadataTables,
-    shard_id: &DfsMetadataShardId,
-    file_system_id: &DfsFileSystemId,
-    operation_id: &str,
-    operation_digest: &str,
-    owner_epoch: u64,
-    object_ids: &[DfsObjectId],
-    retained_at: OffsetDateTime,
-) -> Result<Vec<DfsMetadataTableOp>> {
-    if crate::metadata_records::is_default_layout_migration_fence(operation_id) {
-        return Err(MetadataBackendError::Serde(
-            "default layout migration fences cannot replay a compact commit".into(),
-        ));
-    }
-    if object_ids.windows(2).any(|ids| ids[0] >= ids[1]) {
-        return Err(MetadataBackendError::Serde(format!(
-            "compact namespace commit {operation_id} object ids are not sorted and unique"
-        )));
-    }
-    if let Some(receipt) = tables.namespace_prepare_receipts.get(operation_id) {
-        if receipt.file_system_id != *file_system_id
-            || receipt.operation_id != operation_id
-            || receipt.operation_digest != operation_digest
-            || receipt.owner_epoch != owner_epoch
-        {
-            return Err(MetadataBackendError::Serde(format!(
-                "compact namespace commit {operation_id} conflicts with its terminal receipt"
-            )));
-        }
-        if receipt.status == DfsNamespacePrepareStatus::Aborted {
-            return Err(MetadataBackendError::Serde(format!(
-                "compact namespace commit {operation_id} refers to an aborted prepare"
-            )));
-        }
-        if receipt.status != DfsNamespacePrepareStatus::Committed {
-            return Err(MetadataBackendError::Serde(format!(
-                "compact namespace commit {operation_id} has a non-terminal prepare receipt"
-            )));
-        }
-        return Ok(Vec::new());
-    }
-
-    let mut prepare = tables
-        .namespace_prepares
-        .get(operation_id)
-        .cloned()
-        .ok_or_else(|| {
-            MetadataBackendError::Serde(format!(
-                "compact namespace commit {operation_id} has no preceding durable prepare"
-            ))
-        })?;
-    if prepare.file_system_id != *file_system_id
-        || prepare.operation_id != operation_id
-        || prepare.shard_id != *shard_id
-        || prepare.operation_digest != operation_digest
-        || prepare.owner_epoch != owner_epoch
-    {
-        return Err(MetadataBackendError::Serde(format!(
-            "compact namespace commit {operation_id} scope/digest/epoch fence mismatch"
-        )));
-    }
-    let DfsMetadataMutation::CommitNamespacePrepare {
-        object_ids: expected_object_ids,
-        ..
-    } = DfsMetadataMutation::commit_namespace_prepare(&prepare)
-    else {
-        unreachable!("namespace prepare commit constructor returned another mutation");
-    };
-    if object_ids != expected_object_ids {
-        return Err(MetadataBackendError::Serde(format!(
-            "compact namespace commit {operation_id} affected-object fence mismatch"
-        )));
-    }
-    if prepare.status == DfsNamespacePrepareStatus::Aborted {
-        return Err(MetadataBackendError::Serde(format!(
-            "compact namespace commit {operation_id} refers to an aborted prepare"
-        )));
-    }
-    prepare.status = DfsNamespacePrepareStatus::Committed;
-    let mut ops = namespace_prepare_table_ops_for_record(tables, shard_id, &prepare)?;
-    for op in &mut ops {
-        if let DfsMetadataTableOp::CommitNamespacePrepare {
-            retained_at: marker_retained_at,
-            ..
-        } = op
-        {
-            *marker_retained_at = Some(retained_at);
-        }
-    }
-    Ok(ops)
 }

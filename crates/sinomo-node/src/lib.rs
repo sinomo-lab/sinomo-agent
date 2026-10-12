@@ -267,10 +267,7 @@ mod tests {
         assert!(voter_capabilities.iter().any(|capability| {
             capability.as_str() == DFS_PLACEMENT_RECONCILIATION_V1_CAPABILITY
         }));
-        for capability in [
-            DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY,
-            DFS_METADATA_PACKED_NAMESPACE_PREPARE_V2_CAPABILITY,
-        ] {
+        for capability in [DFS_METADATA_PREPARED_OPERATION_V7_CAPABILITY] {
             assert!(
                 voter_capabilities
                     .iter()

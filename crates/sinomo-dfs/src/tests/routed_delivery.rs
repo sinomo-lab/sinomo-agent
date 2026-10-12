@@ -1,550 +1,375 @@
-//! Requester ownership survives an ambiguous routed-write dispatch.
-
+//! Delivery failures on the shared embedded runtime and real receiver.
 use super::*;
+use crate::test_runtime::{DfsTestRuntime, FaultAction, FaultRule, RpcPhase};
 use sinomo_core::network::NetworkDeliveryState;
 
-struct RoutedWriteDeliveryFailureTransport {
-    node_id: NodeId,
-    failures: VecDeque<NetworkDeliveryState>,
-    observed: Vec<DfsDistributedWriteCommand>,
-    registration_failures: VecDeque<bool>,
-    registration_attempts: usize,
-    registered_objects: Vec<(String, DfsObjectId)>,
+const PAYLOAD: &[u8] = b"one immutable routed write payload";
+
+#[derive(Clone, Copy)]
+enum Body {
+    Bytes,
+    Manifest,
+    Reader,
 }
 
-impl DfsTransportIdentity for RoutedWriteDeliveryFailureTransport {
-    fn local_node_id(&self) -> &NodeId {
-        &self.node_id
-    }
-}
-
-impl DfsMessageTransport for RoutedWriteDeliveryFailureTransport {
-    fn register_routed_write_response_owner(
-        &mut self,
-        canonical: &str,
-        object_id: &DfsObjectId,
-        _aliases: &[String],
-    ) -> Result<(), NetworkError> {
-        self.registration_attempts += 1;
-        if self.registration_failures.pop_front().unwrap_or(false) {
-            return Err(NetworkError::delivery_failed(
-                "injected response registration",
-                NetworkDeliveryState::DefinitelyNotSent,
-                "registration rejected before dispatch",
-            ));
-        }
-        self.registered_objects
-            .push((canonical.to_owned(), object_id.clone()));
-        Ok(())
-    }
-    fn send_routed_call(
-        &mut self,
-        _target_node_id: &NodeId,
-        call: DfsRoutedCall,
-    ) -> Result<(), NetworkError> {
-        let DfsNetworkMessage::DistributedWriteRequest(command) = call.message.message else {
-            panic!("only the original write may be dispatched");
-        };
-        self.observed.push(command);
-        let state = self.failures.pop_front().expect("one caller-owned attempt");
-        Err(NetworkError::delivery_failed(
-            "injected routed-write delivery",
-            state,
-            "request bytes may have reached the primary before the reply was lost",
-        ))
-    }
-
-    fn drain_incoming_messages(&mut self) -> Result<Vec<DfsRoutedMessage>, NetworkError> {
-        Ok(Vec::new())
-    }
-}
-
-fn routed_delivery_fixture(
-    label: &str,
-    failures: impl IntoIterator<Item = NetworkDeliveryState>,
-) -> (
-    NetworkedDfsService<RoutedWriteDeliveryFailureTransport>,
-    DfsObjectMetadata,
-    DfsMetadataShardConfig,
-    sinomo_testdir::TestDir,
-) {
-    let root = temp_root(label);
-    let requester = NodeId::from_legacy_named(format!("{label}-requester")).unwrap();
-    let primary = NodeId::from_legacy_named(format!("{label}-primary")).unwrap();
-    let shard = test_routed_authority_shard(&primary, 1);
-    let mut object = file_metadata(primary);
-    object.file_system_id = sifs_file_system_id();
-    object.path = "/routed-delivery.bin".into();
-    object.policy = DfsObjectPolicy::ReplicatedEventual;
-    let service = NetworkedDfsService::new(
-        RoutedWriteDeliveryFailureTransport {
-            node_id: requester,
-            failures: failures.into_iter().collect(),
-            observed: Vec::new(),
-            registration_failures: VecDeque::new(),
-            registration_attempts: 0,
-            registered_objects: Vec::new(),
-        },
-        LocalContentStore::new(root.join("content")).unwrap(),
-    )
-    .with_control_plane(test_routed_authority_control_plane(&shard));
-    (service, object, shard, root)
-}
-
-fn routed_delivery_request(
-    service: &NetworkedDfsService<RoutedWriteDeliveryFailureTransport>,
+fn route(
+    client: &mut NetworkedDfsService<DfsNodeTransport>,
     object: &DfsObjectMetadata,
-) -> DfsWriteRequest {
-    DfsWriteRequest {
+    shard: &DfsMetadataShardConfig,
+    version: &DfsVersion,
+    operation: &str,
+    body: Body,
+) -> Result<NetworkedDfsWriteOutcome, DfsError> {
+    let request = DfsWriteRequest {
         file_system_id: object.file_system_id.clone(),
         object_id: object.object_id.clone(),
-        target_version: DfsVersion::from_legacy_named("routed-delivery-target").unwrap(),
-        requesting_node_id: service.node_id.clone(),
+        target_version: version.clone(),
+        requesting_node_id: client.node_id.clone(),
+    };
+    let replicas = vec![client.node_id.clone(), shard.primary_node_id.clone()];
+    let policy = DfsReplicationPolicy::new(1, 2).unwrap();
+    let options = DfsDistributedWriteOptions {
+        operation_id: Some(operation.into()),
+        repair: crate::service_write::DfsWriteRepair::Background,
+        ..Default::default()
+    };
+    match body {
+        Body::Bytes => client.route_distributed_bytes(
+            request,
+            Some(object.version.clone()),
+            PAYLOAD.to_vec(),
+            replicas,
+            policy,
+            object.clone(),
+            shard.clone(),
+            options,
+        ),
+        Body::Manifest => {
+            client.content.put_object_version(
+                object.object_id.as_str(),
+                version.as_str(),
+                PAYLOAD,
+            )?;
+            client.route_distributed_manifest(
+                request,
+                Some(object.version.clone()),
+                content_hash(PAYLOAD),
+                PAYLOAD.len() as u64,
+                replicas,
+                policy,
+                object.clone(),
+                shard.clone(),
+                options,
+            )
+        }
+        Body::Reader => client.route_distributed_reader(
+            request,
+            Some(object.version.clone()),
+            std::io::Cursor::new(PAYLOAD),
+            replicas,
+            policy,
+            object.clone(),
+            shard.clone(),
+            options,
+        ),
     }
 }
 
-fn route_delivery_bytes(
-    service: &mut NetworkedDfsService<RoutedWriteDeliveryFailureTransport>,
-    object: &DfsObjectMetadata,
-    shard: &DfsMetadataShardConfig,
-) -> Result<NetworkedDfsWriteOutcome, DfsError> {
-    service.route_distributed_bytes(
-        routed_delivery_request(service, object),
-        Some(object.version.clone()),
-        b"one immutable write payload".to_vec(),
-        vec![service.node_id.clone(), shard.primary_node_id.clone()],
-        DfsReplicationPolicy::new(1, 2).unwrap(),
-        object.clone(),
-        shard.clone(),
-        DfsDistributedWriteOptions {
-            operation_id: Some("routed-delivery-operation".into()),
-            ..Default::default()
-        },
-    )
-}
-
-fn deliver_late_commit(
-    service: &mut NetworkedDfsService<RoutedWriteDeliveryFailureTransport>,
-    object: &DfsObjectMetadata,
-    shard: &DfsMetadataShardConfig,
-) {
-    let request = routed_delivery_request(service, object);
-    let outcome = NetworkedDfsWriteOutcome::Committed {
-        intent_id: "remote-durable-intent".into(),
-        version: request.target_version,
-        content_hash: content_hash(b"one immutable write payload"),
-        repair_jobs: Vec::new(),
+fn native_delivery_case(body: Body, uncertain: bool, close_owner: bool) {
+    let nodes = DfsTestRuntime::ordered_node_ids("native-routed-delivery", 3);
+    let mut runtime = DfsTestRuntime::new("native-routed-delivery", nodes[0].clone()).unwrap();
+    for node in &nodes[1..] {
+        runtime.define_node(node.clone()).unwrap();
+    }
+    let case_id = match (body, uncertain, close_owner) {
+        (Body::Bytes, true, false) => "native-attachment-lost-reply",
+        (Body::Manifest, true, false) => "native-manifest-lost-reply",
+        (Body::Reader, true, false) => "native-reader-lost-reply",
+        (_, false, _) => "native-unsent-no-effect",
+        (_, true, true) => "native-closed-response-owner",
     };
-    assert!(matches!(
-        service
-            .handle_distributed_write_response(
-                shard.primary_node_id.clone(),
-                DfsDistributedWriteResponse {
-                    request_id: "routed-delivery-operation".into(),
-                    object_id: object.object_id.clone(),
-                    result: DfsDistributedWriteResult::Outcome {
-                        outcome: outcome.clone(),
-                    },
-                    metadata_journal_batches: Vec::new(),
-                },
-            )
-            .unwrap(),
-        NetworkedDfsServiceEvent::RemoteWriteCompleted { .. }
-    ));
-    assert_eq!(
-        service.write_outcome("routed-delivery-operation").unwrap(),
-        outcome
-    );
-}
-
-#[test]
-fn ambiguous_attachment_write_preserves_compact_owner_and_accepts_late_commit() {
-    let (mut service, object, shard, root) = routed_delivery_fixture(
-        "ambiguous-attachment",
-        [NetworkDeliveryState::PossiblyApplied],
-    );
-    let error = route_delivery_bytes(&mut service, &object, &shard).unwrap_err();
-    assert!(matches!(
-        error,
-        DfsError::NetworkDelivery {
-            delivery_state: NetworkDeliveryState::PossiblyApplied,
-            ref message,
-        } if message.contains("routed-delivery-operation")
-    ));
-    let pending = &service.writes.pending_routed_writes["routed-delivery-operation"];
-    assert!(pending.command.is_none() && pending.attachment_bytes.is_none());
-    assert!(pending.result.is_none() && pending.compact_retained_at.is_some());
-    assert_eq!(pending.durable_receipts, 0);
-    assert_eq!(
-        service.transport.observed.len(),
-        1,
-        "no implicit fresh retry"
-    );
-    deliver_late_commit(&mut service, &object, &shard);
-    std::fs::remove_dir_all(root).ok();
-}
-
-#[test]
-fn definitely_unsent_attachment_write_releases_requester_owner() {
-    let (mut service, object, shard, root) = routed_delivery_fixture(
-        "unsent-attachment",
-        [NetworkDeliveryState::DefinitelyNotSent],
-    );
-    assert!(matches!(
-        route_delivery_bytes(&mut service, &object, &shard).unwrap_err(),
-        DfsError::NetworkDelivery {
-            delivery_state: NetworkDeliveryState::DefinitelyNotSent,
-            ..
-        }
-    ));
-    assert!(service.writes.pending_routed_writes.is_empty());
-    assert_eq!(service.transport.observed.len(), 1);
-    std::fs::remove_dir_all(root).ok();
-}
-
-#[test]
-fn unsent_explicit_exact_id_retry_cannot_erase_earlier_ambiguous_write() {
-    let (mut service, object, shard, root) = routed_delivery_fixture(
-        "ambiguous-then-unsent",
-        [
-            NetworkDeliveryState::PossiblyApplied,
-            NetworkDeliveryState::DefinitelyNotSent,
-        ],
-    );
-    route_delivery_bytes(&mut service, &object, &shard).unwrap_err();
-    let previous = service.writes.pending_routed_writes["routed-delivery-operation"].clone();
-    assert!(matches!(
-        route_delivery_bytes(&mut service, &object, &shard).unwrap_err(),
-        DfsError::NetworkDelivery {
-            delivery_state: NetworkDeliveryState::PossiblyApplied,
-            ..
-        }
-    ));
-    assert_eq!(
-        service.writes.pending_routed_writes["routed-delivery-operation"],
-        previous
-    );
-    assert_eq!(service.transport.observed.len(), 2);
-    assert_eq!(service.transport.observed[0], service.transport.observed[1]);
-    deliver_late_commit(&mut service, &object, &shard);
-    std::fs::remove_dir_all(root).ok();
-}
-
-#[test]
-fn manifest_and_reader_dispatch_failure_retain_exact_identity_without_counting_receipts() {
-    for reader in [false, true] {
-        let (mut service, object, shard, root) = routed_delivery_fixture(
-            if reader {
-                "ambiguous-reader"
-            } else {
-                "ambiguous-manifest"
-            },
-            [NetworkDeliveryState::PossiblyApplied],
-        );
-        let request = routed_delivery_request(&service, &object);
-        let bytes = b"one immutable write payload".to_vec();
-        let options = DfsDistributedWriteOptions {
-            operation_id: Some("routed-delivery-operation".into()),
-            ..Default::default()
-        };
-        let replicas = vec![service.node_id.clone(), shard.primary_node_id.clone()];
-        let policy = DfsReplicationPolicy::new(2, 2).unwrap();
-        let result = if reader {
-            service.route_distributed_reader(
-                request,
-                Some(object.version.clone()),
-                std::io::Cursor::new(bytes),
-                replicas,
-                policy,
-                object.clone(),
-                shard.clone(),
-                options,
-            )
+    let trace = crate::test_support::NativeShardTraceArtifactSession::from_environment(
+        case_id,
+        nodes
+            .iter()
+            .map(|node| (node.clone(), runtime.data_dir(node).root().to_owned())),
+        DfsMetadataShardId::new("root"),
+    )
+    .expect("actual normal loss capture setup before mount");
+    runtime.start_nodes().unwrap();
+    let shard = runtime.root_shard().unwrap();
+    let primary = shard.primary_node_id.clone();
+    let requester = nodes.iter().find(|node| **node != primary).unwrap().clone();
+    let mut authority = runtime.client(&primary).unwrap();
+    let original = authority
+        .posix_write_file(
+            "/routed-delivery",
+            b"original",
+            DfsWriteOptions::replicated_eventual(vec![primary.clone()]),
+        )
+        .unwrap();
+    let object = authority
+        .metadata_backend()
+        .unwrap()
+        .get_object(&original.object_id)
+        .unwrap()
+        .unwrap();
+    let mut client = runtime.client(&requester).unwrap();
+    let target = DfsVersion::generate();
+    let operation = sinomo_core::Id::generate().to_string();
+    let baseline = runtime.rpc_observations().len();
+    runtime.install_fault(FaultRule {
+        source: Some(requester.clone()),
+        target: Some(primary.clone()),
+        route: Some(crate::DFS_DATA_DISTRIBUTED_WRITE_ROUTE.into()),
+        call_id: None,
+        origin: None,
+        remaining_hits: 8,
+        action: if uncertain {
+            FaultAction::LoseReplyAfterDispatch
         } else {
-            service.route_distributed_manifest(
-                request,
-                Some(object.version.clone()),
-                content_hash(&bytes),
-                bytes.len() as u64,
-                replicas,
-                policy,
-                object.clone(),
-                shard.clone(),
-                options,
-            )
-        };
-        assert!(matches!(
-            result,
+            FaultAction::BudgetExhausted
+        },
+    });
+    let error = route(&mut client, &object, &shard, &target, &operation, body).unwrap_err();
+    assert!(
+        matches!(error, DfsError::NetworkDelivery { delivery_state, .. } if delivery_state == if uncertain { NetworkDeliveryState::PossiblyApplied } else { NetworkDeliveryState::DefinitelyNotSent })
+    );
+    if uncertain {
+        let pending = client.writes.pending_routed_writes[&operation].clone();
+        assert!(pending.command.is_none() && pending.attachment_bytes.is_none());
+        assert_eq!(
+            pending.durable_receipts, 0,
+            "a lost reply supplies no receipt"
+        );
+        runtime.clear_faults();
+        if close_owner {
+            if let Some(trace) = &trace {
+                trace.close().unwrap();
+            }
+            runtime.stop_node(&requester).unwrap();
+            let previous = client.writes.pending_routed_writes.clone();
+            let before = runtime.rpc_observations().len();
+            assert!(route(&mut client, &object, &shard, &target, &operation, body).is_err());
+            assert_eq!(client.writes.pending_routed_writes, previous);
+            assert_eq!(
+                runtime.rpc_observations().len(),
+                before,
+                "closed response custody rejects before dispatch"
+            );
+        } else {
+            runtime.install_fault(FaultRule {
+                source: Some(requester.clone()),
+                target: Some(primary.clone()),
+                route: Some(crate::DFS_DATA_DISTRIBUTED_WRITE_ROUTE.into()),
+                call_id: None,
+                origin: None,
+                remaining_hits: 8,
+                action: FaultAction::BudgetExhausted,
+            });
+            let previous = client.writes.pending_routed_writes.clone();
+            assert!(matches!(
+                route(&mut client, &object, &shard, &target, &operation, body).unwrap_err(),
+                DfsError::NetworkDelivery {
+                    delivery_state: NetworkDeliveryState::PossiblyApplied,
+                    ..
+                }
+            ));
+            assert_eq!(client.writes.pending_routed_writes, previous);
+            runtime.clear_faults();
+            route(&mut client, &object, &shard, &target, &operation, body).unwrap();
+            let deadline =
+                std::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+            loop {
+                client
+                    .process_incoming_without_deferred_parent_touches()
+                    .unwrap();
+                if matches!(client.write_outcome(&operation).unwrap(), NetworkedDfsWriteOutcome::Committed { ref version, .. } if version == &target)
+                {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "exact retry must resolve the actual receiver's outcome"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let alias =
+                crate::intent::stable_write_intent_id(&requester, &object.object_id, &operation);
+            assert_eq!(
+                client.write_outcome(&alias).unwrap(),
+                client.write_outcome(&operation).unwrap()
+            );
+            assert_eq!(client.posix_read_file("/routed-delivery").unwrap(), PAYLOAD);
+        }
+    } else {
+        assert!(client.writes.pending_routed_writes.is_empty());
+        assert_eq!(
+            authority.posix_read_file("/routed-delivery").unwrap(),
+            b"original"
+        );
+        assert!(
+            !runtime
+                .rpc_observations()
+                .iter()
+                .skip(baseline)
+                .any(
+                    |event| event.route == crate::DFS_DATA_DISTRIBUTED_WRITE_ROUTE
+                        && event.phase == RpcPhase::AfterDispatch
+                )
+        );
+    }
+    runtime.clear_faults();
+    runtime.assert_fault_budgets().unwrap();
+    assert_eq!(runtime.observation_dropped_count(), 0);
+    drop((client, authority));
+    if let Some(trace) = &trace {
+        trace.close().unwrap();
+    }
+    runtime.close().unwrap();
+    if let Some(trace) = trace {
+        trace.export().unwrap();
+    }
+}
+
+#[test]
+fn native_attachment_lost_reply_and_exact_retry() {
+    native_delivery_case(Body::Bytes, true, false);
+}
+#[test]
+fn native_manifest_lost_reply_and_exact_retry() {
+    native_delivery_case(Body::Manifest, true, false);
+}
+#[test]
+fn native_reader_lost_reply_and_exact_retry() {
+    native_delivery_case(Body::Reader, true, false);
+}
+#[test]
+fn native_unsent_write_has_no_receiver_effect() {
+    native_delivery_case(Body::Bytes, false, false);
+}
+#[test]
+fn native_closed_response_owner_preserves_uncertain_write() {
+    native_delivery_case(Body::Bytes, true, true);
+}
+
+#[test]
+fn native_stale_authority_redirect_keeps_original_identity_after_lost_reply() {
+    let nodes = DfsTestRuntime::ordered_node_ids("native-routed-handoff", 3);
+    let mut runtime = DfsTestRuntime::new("native-routed-handoff", nodes[0].clone()).unwrap();
+    for node in &nodes[1..] {
+        runtime.define_node(node.clone()).unwrap();
+    }
+    runtime.start_nodes().unwrap();
+    let retired = runtime.root_shard().unwrap();
+    let old_primary = retired.primary_node_id.clone();
+    let new_primary = nodes
+        .iter()
+        .find(|node| **node != old_primary)
+        .unwrap()
+        .clone();
+    let requester = nodes
+        .iter()
+        .find(|node| **node != old_primary && **node != new_primary)
+        .unwrap()
+        .clone();
+    let mut old = runtime.client(&old_primary).unwrap();
+    let original = old
+        .posix_write_file(
+            "/handoff-delivery",
+            b"original",
+            DfsWriteOptions::replicated_eventual(vec![old_primary.clone()]),
+        )
+        .unwrap();
+    let object = old
+        .metadata_backend()
+        .unwrap()
+        .get_object(&original.object_id)
+        .unwrap()
+        .unwrap();
+    let mut client = runtime.client(&requester).unwrap();
+    let active = runtime
+        .reassign_metadata_shard(
+            &retired.file_system_id,
+            &retired.shard_id,
+            new_primary.clone(),
+            nodes
+                .iter()
+                .filter(|node| **node != new_primary)
+                .cloned()
+                .collect(),
+        )
+        .unwrap();
+    runtime.install_fault(FaultRule {
+        source: Some(requester.clone()),
+        target: Some(new_primary.clone()),
+        route: Some(crate::DFS_DATA_DISTRIBUTED_WRITE_ROUTE.into()),
+        call_id: None,
+        origin: None,
+        remaining_hits: 8,
+        action: FaultAction::LoseReplyAfterDispatch,
+    });
+    let operation = sinomo_core::Id::generate().to_string();
+    let target = DfsVersion::generate();
+    route(
+        &mut client,
+        &object,
+        &retired,
+        &target,
+        &operation,
+        Body::Bytes,
+    )
+    .unwrap();
+    let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    loop {
+        match client.process_incoming_without_deferred_parent_touches() {
             Err(DfsError::NetworkDelivery {
                 delivery_state: NetworkDeliveryState::PossiblyApplied,
                 ..
-            })
-        ));
-        let pending = &service.writes.pending_routed_writes["routed-delivery-operation"];
-        assert_eq!(pending.durable_receipts, 0);
-        assert!(pending.command.is_none());
-        assert_eq!(service.transport.observed.len(), 1);
-        assert_eq!(
-            service.transport.observed[0].request_id,
-            "routed-delivery-operation"
-        );
-        deliver_late_commit(&mut service, &object, &shard);
-        std::fs::remove_dir_all(root).ok();
+            }) => break,
+            Err(error) => panic!("native redirect failed unexpectedly: {error}"),
+            Ok(_) => assert!(
+                Instant::now() < deadline,
+                "native retired primary must redirect"
+            ),
+        }
+        std::thread::sleep(Duration::from_millis(1));
     }
-}
-
-#[test]
-fn authority_redirect_lost_reply_preserves_new_target_for_late_completion() {
-    let (mut service, object, retiring_shard, root) = routed_delivery_fixture(
-        "redirect-lost-reply",
-        [NetworkDeliveryState::PossiblyApplied],
-    );
-    let mut active_shard = retiring_shard.clone();
-    active_shard.primary_node_id = NodeId::from_legacy_named("redirect-active-primary").unwrap();
-    active_shard.epoch += 1;
-    service.control_plane = Some(Box::new(test_routed_authority_control_plane(&active_shard)));
-    let mut pending = test_pending_routed_write(
-        "routed-delivery-operation",
-        &service.node_id,
-        &object.object_id,
-        &retiring_shard.primary_node_id,
-        retiring_shard.clone(),
-    );
-    let command = pending.command.as_mut().unwrap();
-    command.request = routed_delivery_request(&service, &object);
-    command.object_metadata = Some(object.clone());
-    command.authority_shard = Some(retiring_shard.clone());
-    command.content_hash = None;
-    command.content_size_bytes = None;
-    command.requester_blob_pre_staged = false;
-    pending.attachment_bytes = Some(bytes::Bytes::from_static(b"one immutable write payload"));
-    service
-        .writes
-        .pending_routed_writes
-        .insert("routed-delivery-operation".into(), pending);
-
-    let error = service
-        .handle_distributed_write_response(
-            retiring_shard.primary_node_id,
-            DfsDistributedWriteResponse {
-                request_id: "routed-delivery-operation".into(),
-                object_id: object.object_id.clone(),
-                result: DfsDistributedWriteResult::Rejected {
-                    reason: "metadata authority retired".into(),
-                    current_primary_node_id: Some(active_shard.primary_node_id.clone()),
-                },
-                metadata_journal_batches: Vec::new(),
-            },
-        )
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        DfsError::NetworkDelivery {
-            delivery_state: NetworkDeliveryState::PossiblyApplied,
-            ..
-        }
-    ));
-    let pending = &service.writes.pending_routed_writes["routed-delivery-operation"];
-    assert_eq!(pending.primary_node_id, active_shard.primary_node_id);
-    assert_eq!(pending.authority_shard, active_shard);
-    assert!(pending.result.is_none() && pending.command.is_none());
-    assert!(pending.attachment_bytes.is_none());
+    let pending = &client.writes.pending_routed_writes[&operation];
+    assert_eq!(pending.primary_node_id, new_primary);
+    assert_eq!(pending.authority_shard, active);
+    assert!(pending.command.is_none() && pending.attachment_bytes.is_none());
     assert_eq!(pending.durable_receipts, 0);
-    assert_eq!(service.transport.observed.len(), 1);
-    assert_eq!(
-        service.transport.observed[0].request_id,
-        "routed-delivery-operation"
-    );
-    assert_eq!(
-        service.transport.observed[0].authority_shard,
-        Some(active_shard.clone())
-    );
-    deliver_late_commit(&mut service, &object, &active_shard);
-    std::fs::remove_dir_all(root).ok();
-}
-
-#[test]
-fn routed_response_registration_is_once_before_send_and_failed_retry_preserves_prior_owner() {
-    let (mut service, object, shard, root) = routed_delivery_fixture(
-        "registration-before-send",
-        [NetworkDeliveryState::PossiblyApplied],
-    );
-    service.transport.registration_failures = [false, true].into_iter().collect();
-    assert!(matches!(
-        route_delivery_bytes(&mut service, &object, &shard).unwrap_err(),
-        DfsError::NetworkDelivery {
-            delivery_state: NetworkDeliveryState::PossiblyApplied,
-            ..
+    runtime.clear_faults();
+    route(
+        &mut client,
+        &object,
+        &active,
+        &target,
+        &operation,
+        Body::Bytes,
+    )
+    .unwrap();
+    loop {
+        client
+            .process_incoming_without_deferred_parent_touches()
+            .unwrap();
+        if matches!(client.write_outcome(&operation).unwrap(), NetworkedDfsWriteOutcome::Committed { ref version, .. } if version == &target)
+        {
+            break;
         }
-    ));
+        assert!(
+            Instant::now() < deadline,
+            "the original exact retry must settle after handoff"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
     assert_eq!(
-        service.transport.registration_attempts, 1,
-        "canonical and stable alias are reserved once before either state is installed"
+        client.posix_read_file("/handoff-delivery").unwrap(),
+        PAYLOAD
     );
-    let previous = service.writes.pending_routed_writes.clone();
-    assert!(
-        matches!(
-            route_delivery_bytes(&mut service, &object, &shard).unwrap_err(),
-            DfsError::NetworkDelivery {
-                delivery_state: NetworkDeliveryState::PossiblyApplied,
-                ..
-            }
-        ),
-        "a pre-dispatch failure cannot reclassify the earlier unresolved operation as definitely unsent"
-    );
-    assert_eq!(service.writes.pending_routed_writes, previous);
-    assert_eq!(service.transport.registration_attempts, 2);
-    assert_eq!(
-        service.transport.observed.len(),
-        1,
-        "the rejected registration cannot dispatch another write"
-    );
-    deliver_late_commit(&mut service, &object, &shard);
-    std::fs::remove_dir_all(root).ok();
-}
-
-#[test]
-fn routed_alias_tracks_the_current_canonical_attempt_after_ambiguous_exact_retry() {
-    let (mut service, object, shard, root) = routed_delivery_fixture(
-        "completed-alias-retry",
-        [
-            NetworkDeliveryState::PossiblyApplied,
-            NetworkDeliveryState::PossiblyApplied,
-        ],
-    );
-    route_delivery_bytes(&mut service, &object, &shard).unwrap_err();
-    deliver_late_commit(&mut service, &object, &shard);
-    assert!(matches!(
-        service.write_outcome("remote-durable-intent").unwrap(),
-        NetworkedDfsWriteOutcome::Committed { .. }
-    ));
-    route_delivery_bytes(&mut service, &object, &shard).unwrap_err();
-    let canonical = service.write_outcome("routed-delivery-operation").unwrap();
-    assert!(matches!(
-        canonical,
-        NetworkedDfsWriteOutcome::Pending { .. }
-    ));
-    assert_eq!(
-        service.write_outcome("remote-durable-intent").unwrap(),
-        canonical,
-        "an alias cannot retain a completed copy while its canonical attempt is unresolved"
-    );
-    assert_eq!(service.transport.observed.len(), 2);
-    deliver_late_commit(&mut service, &object, &shard);
-    std::fs::remove_dir_all(root).ok();
-}
-
-#[test]
-fn definitely_unsent_retry_restores_completed_canonical_and_alias_state() {
-    let (mut service, object, shard, root) = routed_delivery_fixture(
-        "completed-alias-unsent",
-        [
-            NetworkDeliveryState::PossiblyApplied,
-            NetworkDeliveryState::DefinitelyNotSent,
-        ],
-    );
-    route_delivery_bytes(&mut service, &object, &shard).unwrap_err();
-    deliver_late_commit(&mut service, &object, &shard);
-    let previous = service.writes.pending_routed_writes.clone();
-    let completed = service.write_outcome("routed-delivery-operation").unwrap();
-    assert!(matches!(
-        route_delivery_bytes(&mut service, &object, &shard).unwrap_err(),
-        DfsError::NetworkDelivery {
-            delivery_state: NetworkDeliveryState::DefinitelyNotSent,
-            ..
-        }
-    ));
-    assert_eq!(
-        service.writes.pending_routed_writes, previous,
-        "unsent retry restores all prior service alias state"
-    );
-    assert_eq!(
-        service.write_outcome("remote-durable-intent").unwrap(),
-        completed
-    );
-    assert_eq!(
-        service.write_outcome("routed-delivery-operation").unwrap(),
-        completed
-    );
-    std::fs::remove_dir_all(root).ok();
-}
-
-#[test]
-fn redirected_rebased_write_registers_the_new_object_before_dispatch_and_keeps_budget() {
-    let (mut service, old_object, retiring, root) = routed_delivery_fixture(
-        "redirect-rebased-scope",
-        [NetworkDeliveryState::PossiblyApplied],
-    );
-    let mut active = retiring.clone();
-    active.primary_node_id = NodeId::from_legacy_named("rebased-active-primary").unwrap();
-    active.epoch += 1;
-    service.control_plane = Some(Box::new(test_routed_authority_control_plane(&active)));
-    let mut object = old_object.clone();
-    object.object_id = DfsObjectId::from_legacy_named("rebased-new-object").unwrap();
-    let mut pending = test_pending_routed_write(
-        "routed-delivery-operation",
-        &service.node_id,
-        &old_object.object_id,
-        &retiring.primary_node_id,
-        retiring.clone(),
-    );
-    pending.authority_redirects_remaining = 2;
-    let command = pending.command.as_mut().unwrap();
-    command.request = routed_delivery_request(&service, &object);
-    command.object_metadata = Some(object.clone());
-    command.authority_shard = Some(retiring.clone());
-    command.content_hash = None;
-    command.content_size_bytes = None;
-    command.requester_blob_pre_staged = false;
-    pending.attachment_bytes = Some(bytes::Bytes::from_static(b"one immutable write payload"));
-    service
-        .writes
-        .pending_routed_writes
-        .insert("routed-delivery-operation".into(), pending);
-    assert!(matches!(
-        service
-            .handle_distributed_write_response(
-                retiring.primary_node_id,
-                DfsDistributedWriteResponse {
-                    request_id: "routed-delivery-operation".into(),
-                    object_id: old_object.object_id,
-                    result: DfsDistributedWriteResult::Rejected {
-                        reason: "authority moved after object rebase".into(),
-                        current_primary_node_id: Some(active.primary_node_id.clone())
-                    },
-                    metadata_journal_batches: Vec::new()
-                }
-            )
-            .unwrap_err(),
-        DfsError::NetworkDelivery {
-            delivery_state: NetworkDeliveryState::PossiblyApplied,
-            ..
-        }
-    ));
-    assert_eq!(
-        service.transport.registered_objects,
-        vec![("routed-delivery-operation".into(), object.object_id.clone())]
-    );
-    assert_eq!(service.transport.observed.len(), 1);
-    assert_eq!(
-        service.transport.observed[0].request.object_id,
-        object.object_id
-    );
-    let pending = &service.writes.pending_routed_writes["routed-delivery-operation"];
-    assert_eq!(pending.object_id, object.object_id);
-    assert_eq!(
-        pending.authority_redirects_remaining, 1,
-        "redirect cannot replenish its budget"
-    );
-    let alias = crate::intent::stable_write_intent_id(
-        &service.node_id,
-        &object.object_id,
-        "routed-delivery-operation",
-    );
-    assert!(
-        service.writes.pending_routed_writes.contains_key(&alias),
-        "new scoped alias exists before any Pending reply"
-    );
-    deliver_late_commit(&mut service, &object, &active);
-    std::fs::remove_dir_all(root).ok();
+    runtime.assert_fault_budgets().unwrap();
+    assert_eq!(runtime.observation_dropped_count(), 0);
+    drop((old, client));
+    runtime.close().unwrap();
 }

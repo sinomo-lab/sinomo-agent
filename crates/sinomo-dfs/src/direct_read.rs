@@ -58,9 +58,6 @@ pub enum DfsDirectReadClientResult {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DfsReadStreamCompletion {
     pub content_size_bytes: usize,
-    /// Retained for API compatibility. Ordinary reads return `None` because
-    /// the advertised content identity is not a proof of the received bytes.
-    pub verified_content_hash: Option<String>,
 }
 
 /// Stream-native DFS response body with incremental length validation.
@@ -197,7 +194,6 @@ impl DfsVerifiedReadStream {
         }
         self.completion = Some(DfsReadStreamCompletion {
             content_size_bytes: self.observed_size_bytes,
-            verified_content_hash: None,
         });
         Ok(())
     }
@@ -232,7 +228,7 @@ impl DfsDirectReadClientResponse {
             DfsDirectReadClientResult::Found(data) => {
                 let (bytes, completion) =
                     data.stream.collect_to_vec(data.content_size_bytes).await?;
-                debug_assert!(completion.verified_content_hash.is_none());
+                debug_assert_eq!(completion.content_size_bytes, bytes.len());
                 DfsReadResult::Found(DfsReadData {
                     object_id: data.object_id,
                     version: data.version,
@@ -242,7 +238,7 @@ impl DfsDirectReadClientResponse {
             }
             DfsDirectReadClientResult::RangeFound(data) => {
                 let (bytes, completion) = data.stream.collect_to_vec(data.range_size_bytes).await?;
-                debug_assert!(completion.verified_content_hash.is_none());
+                debug_assert_eq!(completion.content_size_bytes, bytes.len());
                 DfsReadResult::RangeFound(DfsReadRangeData {
                     object_id: data.object_id,
                     version: data.version,

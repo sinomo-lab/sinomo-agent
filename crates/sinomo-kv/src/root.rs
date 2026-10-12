@@ -343,7 +343,7 @@ pub use observations::{
     KvCommittedObservationPayload, KvCommittedObservationReceipt,
     KvCommittedObservationSubscription, KvCommittedObservationValue, KvObservationCapacityPermit,
     KvObservationOwnerFence, KvObservationProposalCustodyHandle, KvObservationProposalOwnership,
-    subscribe_committed_observations, try_admit_committed_observation,
+    KvOriginalCurrentTermCommit, subscribe_committed_observations, try_admit_committed_observation,
 };
 pub type InProcessKvCluster = InProcessRaftKvCluster;
 pub use model::{

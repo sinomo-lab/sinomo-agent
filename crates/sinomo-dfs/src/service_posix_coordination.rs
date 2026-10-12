@@ -10,10 +10,84 @@ use crate::posix::locks::DEFAULT_DFS_ADVISORY_LOCK_RPC_TIMEOUT;
 use crate::*;
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
+    pub(crate) fn finalize_object_family_pin_transfer(
+        &mut self,
+        object: &DfsObjectMetadata,
+        source_path: &str,
+        transfer_id: &str,
+    ) -> Result<(), DfsError> {
+        let scope = self.metadata_effect_scope_for_object(
+            object,
+            format!("pin-transfer-finalize:{}", sinomo_core::Id::generate()),
+        )?;
+        let _execution = self.acquire_prepared_execution(&scope)?;
+        let backend = self
+            .metadata_backend
+            .as_ref()
+            .ok_or_else(|| DfsError::Metadata {
+                message: "pin finalization requires current durable metadata".into(),
+            })?;
+        let transfer = backend
+            .cross_shard_pin_transfers_for_object(&object.object_id)?
+            .into_iter()
+            .find(|record| record.transfer_id == transfer_id);
+        let Some(transfer) = transfer else {
+            return Ok(());
+        };
+        if transfer.file_system_id != object.file_system_id
+            || transfer.object_id != object.object_id
+            || transfer.target_version != object.version
+            || crate::metadata_keys::normalize_posix_path(&transfer.target_path)
+                != crate::metadata_keys::normalize_posix_path(&object.path)
+            || crate::metadata_keys::normalize_posix_path(&transfer.source_path)
+                != crate::metadata_keys::normalize_posix_path(source_path)
+        {
+            return Err(DfsError::Metadata {
+                message: "pin finalization changed its captured transfer family".into(),
+            });
+        }
+        let cut = backend
+            .export_shard_table_snapshot(&scope.shard_id)?
+            .ok_or_else(|| DfsError::Metadata {
+                message: "pin finalization has no current shard cut".into(),
+            })?;
+        let current = backend.get_object_on_shard(&scope.shard_id, &object.object_id)?;
+        let occupant = backend.get_object_by_path_on_shard(
+            &scope.shard_id,
+            &object.file_system_id,
+            &object.path,
+        )?;
+        let mut payload = DfsPreparedOperationPayload::for_metadata_effects(
+            scope,
+            vec![DfsNamespaceObjectVersionExpectation {
+                object_id: object.object_id.clone(),
+                expected_version: current.map(|row| row.version),
+            }],
+            vec![DfsNamespacePathOccupantExpectation {
+                path: object.path.clone(),
+                expected_object_id: occupant.map(|row| row.object_id),
+            }],
+            vec![DfsPreparedMetadataEffect::RemoveCrossShardPinTransfer {
+                object_id: object.object_id.clone(),
+                transfer_id: transfer_id.to_owned(),
+            }],
+            time::OffsetDateTime::now_utc(),
+        )?;
+        payload.expected_journal_sequence = Some(cut.prefix_proof.journal_sequence);
+        self.publish_prepared_operation(payload)?;
+        Ok(())
+    }
+
     pub(crate) fn execute_posix_coordination_operation_local(
         &mut self,
         operation: &DfsNamespaceOperation,
     ) -> posix_model::Result<Option<DfsPosixCoordinationResult>> {
+        let _source_scope = match operation {
+            DfsNamespaceOperation::AdoptObjectAtPath { source_offer, .. } => {
+                Some(self.source_adoption.install(source_offer.clone()))
+            }
+            _ => None,
+        };
         match operation {
             DfsNamespaceOperation::BeginContentCopy {
                 path,
@@ -67,25 +141,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .posix_sync_directory_local(target, DEFAULT_DFS_POSIX_SYNC_TIMEOUT)
                 .map(DfsPosixCoordinationResult::DirectorySync)
                 .map(Some),
-            DfsNamespaceOperation::AdvisoryLockMigrationPrepare {
-                object_id,
-                state_fingerprint,
-                ..
-            } => {
-                if state_fingerprint.is_empty() {
-                    return Err(DfsPosixError::Dfs(DfsError::Distributed {
-                        message: "advisory-lock migration prepare omitted its state fingerprint"
-                            .to_string(),
-                    }));
-                }
-                Ok(Some(
-                    DfsPosixCoordinationResult::AdvisoryLockMigrationPrepared {
-                        object_id: object_id.clone(),
-                        state_fingerprint: state_fingerprint.clone(),
-                    },
-                ))
-            }
+
             DfsNamespaceOperation::AdoptObjectAtPath {
+                source_offer: _,
                 object,
                 source_path,
                 pin_transfer_id: Some(pin_transfer_id),
@@ -98,7 +156,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 intent_receipt_retention,
                 content_reference_outcomes,
                 content_reference_outcome_retention,
-                conflicts,
                 advisory_lock_state,
             } => {
                 let canonical_pin_fingerprint =
@@ -125,7 +182,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     intent_receipt_retention,
                     content_reference_outcomes,
                     content_reference_outcome_retention.as_ref(),
-                    conflicts,
                     advisory_lock_state.as_ref(),
                 )?;
 
@@ -328,14 +384,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
                 let mut transfer_object = object;
                 transfer_object.version = target_version.clone();
-                self.metadata_backend
-                    .as_mut()
-                    .expect("metadata backend checked above")
-                    .finalize_cross_shard_pin_transfer(
-                        pin_transfer_id,
-                        &transfer_object,
-                        source_path,
-                    )?;
+                self.finalize_object_family_pin_transfer(
+                    &transfer_object,
+                    source_path,
+                    pin_transfer_id,
+                )?;
                 let metadata_target = self
                     .capture_metadata_quorum_sync_target(&transfer_object)
                     .map_err(DfsPosixError::from)?;

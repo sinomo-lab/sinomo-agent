@@ -748,63 +748,23 @@ fn best_effort_release_grant<T: DfsMessageTransport>(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
     use std::path::Path;
 
-    use sinomo_core::network::NetworkError;
     use sinomo_core::node::NodeId;
 
     use super::*;
     use crate::{
-        DfsMessageTransport, DfsReplicationPolicy, DfsRoutedCall, DfsRoutedMessage,
-        DfsTransportIdentity, DfsWriteOptions, LocalContentStore, NetworkedDfsService,
+        DfsReplicationPolicy, DfsWriteOptions, LocalContentStore, NetworkedDfsService,
         open_root_local_metadata_backend,
     };
-
-    #[derive(Debug)]
-    struct LocalOnlyTransport {
-        node_id: NodeId,
-        incoming: VecDeque<DfsRoutedMessage>,
-    }
-
-    impl LocalOnlyTransport {
-        fn new(node_id: NodeId) -> Self {
-            Self {
-                node_id,
-                incoming: VecDeque::new(),
-            }
-        }
-    }
-
-    impl DfsTransportIdentity for LocalOnlyTransport {
-        fn local_node_id(&self) -> &NodeId {
-            &self.node_id
-        }
-    }
-
-    impl DfsMessageTransport for LocalOnlyTransport {
-        fn send_routed_call(
-            &mut self,
-            target_node_id: &NodeId,
-            _call: DfsRoutedCall,
-        ) -> Result<(), NetworkError> {
-            Err(NetworkError::UnknownNode {
-                node_id: target_node_id.clone(),
-            })
-        }
-
-        fn drain_incoming_messages(&mut self) -> Result<Vec<DfsRoutedMessage>, NetworkError> {
-            Ok(self.incoming.drain(..).collect())
-        }
-    }
 
     fn open_service(
         root: &Path,
         node_id: NodeId,
         content_name: &str,
-    ) -> NetworkedDfsService<LocalOnlyTransport> {
+    ) -> NetworkedDfsService<crate::DfsNodeTransport> {
         NetworkedDfsService::new(
-            LocalOnlyTransport::new(node_id),
+            crate::test_runtime::DfsTestRuntime::local_transport(node_id),
             LocalContentStore::new(root.join(content_name)).expect("lease test content store"),
         )
         .with_metadata_backend(
@@ -818,8 +778,8 @@ mod tests {
         name: &str,
     ) -> (
         sinomo_testdir::TestDir,
-        Arc<Mutex<NetworkedDfsService<LocalOnlyTransport>>>,
-        Arc<Mutex<NetworkedDfsService<LocalOnlyTransport>>>,
+        Arc<Mutex<NetworkedDfsService<crate::DfsNodeTransport>>>,
+        Arc<Mutex<NetworkedDfsService<crate::DfsNodeTransport>>>,
         DfsRenewableLeaseAnchor,
     ) {
         let root = sinomo_testdir::TestDir::new(&format!("sinomo-dfs-{name}"));

@@ -84,6 +84,9 @@ fn pending_higher_term_gate_for_root(
             path: root.display().to_string(),
             detail: format!("pending higher Raft term gate registry poisoned: {error}"),
         })?;
+    if let Some(gate) = gates.get(root) {
+        return Ok(Arc::clone(gate));
+    }
     // A strong registry entry is required while a floor is pending: a
     // Weak-only table could forget the fence after publication returns but
     // before its persistence worker starts. Retain the process-known durable
@@ -5632,6 +5635,24 @@ where
         host.commit_cluster_raft_index_compact(entry.index)
     };
     let commit = post_append_try!(commit_result, "local apply after quorum", true);
+    let authority = KvAuthorityProof {
+        term: entry.term,
+        commit_index: entry.index,
+        revision: commit.committed_request.revision,
+        basis: KvAuthorityBasis::CurrentTermQuorum {
+            voter_acks: voter_acks.len(),
+            required_quorum: quorum_size,
+        },
+    };
+    if let Some(receipt) = commit.observation_receipt.as_ref() {
+        receipt.observe_original_current_term_commits(
+            &state.local_node_id,
+            &request_for_outcome,
+            &commit.committed_request,
+            &entry,
+            authority,
+        );
+    }
     command_metrics.finish("committed");
     host.release_cluster_raft_command_session_after_commit();
     // Append, quorum confirmation, and durable local apply are the serialized
@@ -5698,15 +5719,7 @@ where
         compacted_revision: commit.compacted_revision,
         checkpoint_snapshot: (commit.checkpoint_snapshot).map(Into::into),
         final_key_states: (commit.final_key_states).into(),
-        authority: KvAuthorityProof {
-            term: entry.term,
-            commit_index: entry.index,
-            revision: commit.committed_request.revision,
-            basis: KvAuthorityBasis::CurrentTermQuorum {
-                voter_acks: voter_acks.len(),
-                required_quorum: quorum_size,
-            },
-        },
+        authority,
         replayed_committed_request: false,
     })
 }
@@ -6391,6 +6404,37 @@ where
             .await
     };
     let commit = post_append_try_async!(commit_result, "local apply after quorum", true);
+    let authority = KvAuthorityProof {
+        term: entry.term,
+        commit_index: entry.index,
+        revision: commit.committed_request.revision,
+        basis: KvAuthorityBasis::CurrentTermQuorum {
+            voter_acks: voter_acks.len(),
+            required_quorum: quorum_size,
+        },
+    };
+    let applied_authority =
+        (commit.read_state.commit_index > entry.index).then(|| KvAuthorityProof {
+            term: entry.term,
+            commit_index: commit.read_state.commit_index,
+            revision: commit.read_state.revision,
+            basis: KvAuthorityBasis::CurrentTermQuorum {
+                voter_acks: matched_prefixes
+                    .iter()
+                    .filter(|index| **index >= commit.read_state.commit_index)
+                    .count(),
+                required_quorum: quorum_size,
+            },
+        });
+    if let Some(receipt) = commit.observation_receipt.as_ref() {
+        receipt.observe_original_current_term_commits(
+            &state.local_node_id,
+            &request_for_outcome,
+            &commit.committed_request,
+            &entry,
+            applied_authority.unwrap_or(authority),
+        );
+    }
     command_metrics.finish("committed");
     if let Err(error) = host
         .release_cluster_raft_command_session_after_commit_async()
@@ -6457,19 +6501,6 @@ where
     if let Some(error) = publication_failure {
         return Err(error);
     }
-    let applied_authority =
-        (commit.read_state.commit_index > entry.index).then(|| KvAuthorityProof {
-            term: entry.term,
-            commit_index: commit.read_state.commit_index,
-            revision: commit.read_state.revision,
-            basis: KvAuthorityBasis::CurrentTermQuorum {
-                voter_acks: matched_prefixes
-                    .iter()
-                    .filter(|index| **index >= commit.read_state.commit_index)
-                    .count(),
-                required_quorum: quorum_size,
-            },
-        });
     Ok(ClusterKvRaftQuorumCompactCommitResult {
         applied_authority,
         txn_response: commit.txn_response,
@@ -6477,15 +6508,7 @@ where
         compacted_revision: commit.compacted_revision,
         checkpoint_snapshot: (commit.checkpoint_snapshot).map(Into::into),
         final_key_states: (commit.final_key_states).into(),
-        authority: KvAuthorityProof {
-            term: entry.term,
-            commit_index: entry.index,
-            revision: commit.committed_request.revision,
-            basis: KvAuthorityBasis::CurrentTermQuorum {
-                voter_acks: voter_acks.len(),
-                required_quorum: quorum_size,
-            },
-        },
+        authority,
         replayed_committed_request: false,
     })
 }
@@ -10247,6 +10270,12 @@ where
     }
 
     fn node_mut(&mut self) -> Result<&mut DurableRaftKvNode, KvError> {
+        let _checkout = tracing::trace_span!(
+            target: "sinomo.perf", "kv.raft.resident_checkout",
+            stage = "kv.raft.resident_checkout", root = %self.store.paths().root.display(),
+            node = %self.node_id,
+        )
+        .entered();
         self.node_mut_with_open_mode(false)
     }
 
@@ -11098,6 +11127,9 @@ where
             // commit exactly once.
             let events = node.store().events_after_revision(before_revision)?;
             let final_key_states = committed_final_key_states(node.store(), &events)?;
+            if let Some(receipt) = node.observation_receipt() {
+                receipt.capture_original_current_term_requests(node, before_index, commit_index);
+            }
             let checkpoint_snapshot = store.compact_node_if_needed_with_checkpoint(node)?;
             let committed_request = node
                 .log_entry_at(index)

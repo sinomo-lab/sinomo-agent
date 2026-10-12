@@ -2,73 +2,6 @@
 
 use super::*;
 
-pub(super) fn file_version_capture_table_ops(
-    tables: &DfsMetadataTables,
-    record: &DfsObjectVersionRecord,
-    pin: &DfsMetadataVersionPinRecord,
-) -> Result<Vec<DfsMetadataTableOp>> {
-    crate::file_history::validate_file_version_record(record)?;
-    if !record.has_retention_grant() {
-        return Err(MetadataBackendError::Serde(
-            "file capture requires explicit provenance".into(),
-        ));
-    }
-    validate_version_pin_payload(
-        &record.file_system_id,
-        &record.object_id,
-        &record.version,
-        &pin.pin_id,
-        pin,
-    )?;
-    if !tables.file_systems.contains_key(&record.file_system_id) {
-        return Err(MetadataBackendError::UnknownFileSystem {
-            file_system_id: record.file_system_id.clone(),
-        });
-    }
-    if tables
-        .cross_shard_pin_transfer_fence(&record.object_id, &record.version, &pin.pin_id)
-        .is_some()
-    {
-        return Err(MetadataBackendError::Serde(
-            "file capture is fenced by a cross-shard transfer".into(),
-        ));
-    }
-    let existing = tables
-        .versions
-        .get(&(record.object_id.clone(), record.version.clone()));
-    if existing.is_some_and(|existing| {
-        existing.content_hash != record.content_hash
-            || existing.size_bytes != record.size_bytes
-            || existing.file_system_id != record.file_system_id
-            || (existing.has_retention_grant() && existing.retention != record.retention)
-    }) {
-        return Err(MetadataBackendError::Serde(
-            "file capture conflicts with an existing immutable version".into(),
-        ));
-    }
-    let existing_pin = tables.version_pins.get(&(
-        pin.object_id.clone(),
-        pin.version.clone(),
-        pin.pin_id.clone(),
-    ));
-    if existing_pin.is_some_and(|existing| existing != pin) {
-        return Err(MetadataBackendError::Serde(
-            "file capture pin identity was reused with a different payload".into(),
-        ));
-    }
-    let mut ops = Vec::with_capacity(2);
-    if existing != Some(record) {
-        ops.push(DfsMetadataTableOp::PutVersion {
-            version: record.clone(),
-        });
-    }
-    if existing_pin.is_none() {
-        require_version_pin_capacity_for_new(tables, &record.object_id)?;
-        ops.push(DfsMetadataTableOp::PutVersionPin { pin: pin.clone() });
-    }
-    Ok(ops)
-}
-
 pub(super) fn validate_version_pin_payload(
     file_system_id: &DfsFileSystemId,
     object_id: &DfsObjectId,
@@ -81,13 +14,11 @@ pub(super) fn validate_version_pin_payload(
             "metadata version pin id must contain 1..=1024 bytes".to_string(),
         ));
     }
-    if let Some(namespace) = &pin.namespace {
-        crate::validate_metadata_namespace(namespace).map_err(MetadataBackendError::Serde)?;
-        if !pin.pin_id.starts_with(&format!("ref/{namespace}/")) {
-            return Err(MetadataBackendError::Serde(
-                "content reference key has another namespace".into(),
-            ));
-        }
+    crate::validate_metadata_namespace(&pin.namespace).map_err(MetadataBackendError::Serde)?;
+    if !pin.pin_id.starts_with(&format!("ref/{}/", pin.namespace)) {
+        return Err(MetadataBackendError::Serde(
+            "content reference key has another namespace".into(),
+        ));
     }
     if &pin.file_system_id != file_system_id
         || &pin.object_id != object_id

@@ -103,6 +103,10 @@ pub fn base_component_catalog(
             sinomo_runtime::dfs::register_storage_paths,
         )?
         .register_storage_contributor(
+            "dfs-migration",
+            sinomo_runtime::dfs_migration::register_storage_paths,
+        )?
+        .register_storage_contributor(
             attachments_component_id,
             sinomo_runtime::dfs_attachments::register_storage_paths,
         )?
@@ -175,9 +179,15 @@ pub fn base_component_catalog(
             builder = register_module_factory(
                 builder,
                 dfs_registration,
-                sinomo_runtime::dfs::component_factory()
-                    .expect("DFS product component descriptor must be valid"),
+                sinomo_runtime::dfs::component_factory_with_storage_preparation(Arc::new(
+                    sinomo_runtime::dfs_migration::storage_preparation_provider,
+                ))
+                .expect("DFS product component descriptor must be valid"),
             )?;
+            builder = builder.register_factory(Arc::new(
+                sinomo_runtime::dfs_migration::staged_import_component_factory()
+                    .expect("DFS migration component descriptor must be valid"),
+            ))?;
         } else {
             builder = builder.register_module(dfs_registration)?;
         }
@@ -493,6 +503,26 @@ mod tests {
 
         assert!(layout.owner_for("build/jobs/example/status.sobj").is_some());
         assert!(layout.owner_for("dfs/metadata").is_some());
+        for (path, expected_owner) in [
+            ("dfs/content/blob-packs/index.sobj", "sinomo-dfs-migration"),
+            ("dfs/content/legacy-readers.lock", "sinomo-dfs-migration"),
+            (
+                "dfs/content/content-reservations/ab/abcdef.sobj",
+                "sinomo-dfs-migration",
+            ),
+            ("dfs/content/file-readers-v2.lock", "sinomo-dfs"),
+            ("dfs/content/content-reservations/write.lock", "sinomo-dfs"),
+            (
+                "dfs/content/content-reservations/00/batch-format-v1.sobj",
+                "sinomo-dfs",
+            ),
+        ] {
+            let actual = match layout.owner_for(path).expect("composed owner") {
+                sinomo_runtime::core::storage::StoragePathOwner::File(contract) => &contract.module,
+                sinomo_runtime::core::storage::StoragePathOwner::Escape(escape) => &escape.module,
+            };
+            assert_eq!(actual, expected_owner, "{path}");
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 

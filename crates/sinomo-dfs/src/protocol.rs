@@ -1,7 +1,7 @@
-use crate::DfsFileHistoryShardQuery;
+use crate::DfsMetadataShardQuery;
 use crate::DfsMetadataShardResponse;
 use crate::{
-    DfsAdvisoryLockCommand, DfsAdvisoryLockOutcome, DfsAdvisoryLockStateRecord, DfsConflictRecord,
+    DfsAdvisoryLockCommand, DfsAdvisoryLockOutcome, DfsAdvisoryLockStateRecord,
     DfsContentReferenceRequest, DfsContentRootCatalogPage, DfsContentRootCatalogPageRequest,
     DfsFileSystemId, DfsMetadataJournalBatch, DfsMetadataJournalFrameRecord,
     DfsMetadataPrefixProof, DfsMetadataShardConfig, DfsMetadataShardId, DfsMetadataTableSnapshot,
@@ -16,10 +16,6 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use sinomo_core::node::NodeId;
 use sinomo_core::{DfsObjectPolicy, DfsWriteReceipt, DfsWriteRequest};
-
-fn default_true() -> bool {
-    true
-}
 
 fn default_advisory_lock_timeout_millis() -> u64 {
     45_000
@@ -52,6 +48,14 @@ pub(crate) fn content_reference_outcome_family_fingerprint(
 /// are transient scheduling output; the fields below are the authoritative
 /// identity needed to prove which object generation and content the operation
 /// committed (or why its durable admission terminated without committing).
+fn required_optional<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsStableWriteOperationReceipt {
     pub operation_id: String,
@@ -281,13 +285,28 @@ pub enum DfsWriteResult {
     },
 }
 
+/// Exact input and base identity for a Main-owned ranged write. The enclosing
+/// command retains the actual requester, object, base/target versions and shard.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DfsDistributedWritePatch {
+    pub base_content_hash: String,
+    pub base_size_bytes: u64,
+    pub offset: u64,
+    pub patch_hash: String,
+    pub patch_size_bytes: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct DfsDistributedWriteCommand {
     #[serde(
         default,
         skip_serializing_if = "crate::DfsWritePublication::is_current"
     )]
     pub publication: crate::DfsWritePublication,
+    #[serde(deserialize_with = "required_optional")]
+    pub patch: Option<DfsDistributedWritePatch>,
     pub request_id: String,
     pub request: DfsWriteRequest,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -302,10 +321,8 @@ pub struct DfsDistributedWriteCommand {
     pub content_size_bytes: Option<u64>,
     /// Whether the requesting node already has this exact blob durably staged.
     ///
-    /// Legacy and manifest-routed writes retain the original `true` default.
-    /// Direct streamed writes set this to `false`; the metadata primary then
-    /// records only replicas that actually own the ingested content.
-    #[serde(default = "default_true")]
+    /// The caller explicitly states its actual staged-byte evidence. A streamed
+    /// request sets false until the receiver has durably ingested the body.
     pub requester_blob_pre_staged: bool,
     pub desired_replica_nodes: Vec<NodeId>,
     pub policy: DfsReplicationPolicy,
@@ -313,19 +330,14 @@ pub struct DfsDistributedWriteCommand {
     pub object_metadata: Option<DfsObjectMetadata>,
     /// Exact metadata authority selected by the sender for this path.
     ///
-    /// This additive stamp lets the daemon admit independent authority-shard
-    /// requests concurrently. The receiver validates the complete committed
-    /// assignment before mutating; missing stamps retain the serial rolling-
-    /// upgrade path.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Native requests carry the complete assignment. Explicit null is reserved
+    /// for an actual epoch-zero local execution; omitted stamps are invalid.
+    #[serde(deserialize_with = "required_optional")]
     pub authority_shard: Option<DfsMetadataShardConfig>,
-    #[serde(default = "default_true")]
     pub touch_parent_on_create: bool,
-    #[serde(default = "default_true")]
     pub foreground_replica_repair: bool,
     /// Reject the write at the metadata authority if the path already names a
     /// current object. Used by POSIX O_EXCL/mknod and symlink creation.
-    #[serde(default)]
     pub exclusive_create: bool,
 }
 
@@ -357,6 +369,7 @@ impl DfsDistributedWriteCommand {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct DfsDistributedWriteResponse {
     pub request_id: String,
     pub object_id: DfsObjectId,
@@ -365,7 +378,7 @@ pub struct DfsDistributedWriteResponse {
     /// cursor through the committed write, so the requester reads its own
     /// write. Bounded by the primary's per-response batch cap.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub metadata_journal_batches: Vec<DfsMetadataJournalBatch>,
+    pub metadata_journal_batches: Vec<DfsMetadataJournalFrameBatch>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -397,6 +410,7 @@ pub enum DfsDistributedWriteResult {
 /// metadata, and replies with catch-up journal batches so the requester reads
 /// its own namespace write.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct DfsNamespaceCommand {
     pub request_id: String,
     pub file_system_id: DfsFileSystemId,
@@ -405,35 +419,15 @@ pub struct DfsNamespaceCommand {
     /// replay response journals or consume mutation path objects locally.
     /// Lookup and explicit sync operations still return their requested path
     /// objects without journal replay.
-    #[serde(
-        default = "default_include_metadata_journal_batches",
-        skip_serializing_if = "bool_is_true"
-    )]
     pub include_metadata_journal_batches: bool,
     /// The requester's last applied journal sequence per locally known shard,
     /// so the response batches replay exactly the missing entries.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub metadata_journal_after_sequences: Vec<DfsNamespaceShardCursor>,
-    /// Complete metadata-shard configurations used by the requester to route
-    /// this operation. New peers use a single stamped shard as a safe daemon
-    /// concurrency identity; receivers always recompute and validate the full
-    /// stamp before mutating namespace state. Empty preserves compatibility
-    /// with requests sent by older peers.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Exact current metadata-shard configurations used to route this request.
+    /// Network receivers recompute and validate the complete stamp.
     pub authority_shards: Vec<DfsMetadataShardConfig>,
     pub operation: DfsNamespaceOperation,
-}
-
-fn default_include_metadata_journal_batches() -> bool {
-    true
-}
-
-fn bool_is_true(value: &bool) -> bool {
-    *value
-}
-
-fn bool_is_false(value: &bool) -> bool {
-    !*value
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -515,18 +509,15 @@ pub(crate) const DFS_NAMESPACE_LOOKUP_INLINE_RANGE_MAX_BYTES: usize = 64 * 1024;
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum DfsNamespaceOperation {
-    #[serde(rename = "file-history-restore-begin-v1")]
     BeginContentCopy {
         path: String,
         request: crate::DfsContentCopyRequest,
         options: crate::DfsWriteOptions,
     },
-    #[serde(rename = "file-history-query-v1")]
     MetadataQuery {
-        query: DfsFileHistoryShardQuery,
+        query: DfsMetadataShardQuery,
     },
-    /// Explicit file history mutation, unknown to legacy metadata primaries.
-    #[serde(rename = "file-history-pin-v1", alias = "content-reference-v1")]
+    /// Explicit content-reference mutation.
     ContentReference {
         request: DfsContentReferenceRequest,
     },
@@ -657,11 +648,8 @@ pub enum DfsNamespaceOperation {
     /// it in memory but do not replay journals or write it to the local mirror.
     LookupPath {
         path: String,
-        /// New peers may serve this bounded immutable content range in the
-        /// same response. Older peers ignore the additive field and return the
-        /// metadata-only response, which callers transparently follow with the
-        /// existing exact-content RPC.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// Explicit optional content range bound to this lookup.
+        #[serde(deserialize_with = "required_optional")]
         inline_range: Option<DfsNamespaceLookupRangeRequest>,
     },
     /// Batched read-only lookups against one metadata primary.
@@ -679,9 +667,6 @@ pub enum DfsNamespaceOperation {
     /// object's metadata primary. The operation updates the object's policy,
     /// records a committed repair intent for missing desired replicas, and
     /// retires superseded locations only after every desired replica exists.
-    /// The v1 wire name is deliberately unknown to legacy metadata primaries,
-    /// so a stale capability view cannot make an old daemon execute it.
-    #[serde(rename = "reconcile-placement-v1", alias = "reconcile-placement")]
     ReconcilePlacement {
         job_id: String,
         path: String,
@@ -690,6 +675,14 @@ pub enum DfsNamespaceOperation {
         object_policy: DfsObjectPolicy,
         replication_policy: DfsReplicationPolicy,
         desired_replica_node_ids: Vec<NodeId>,
+    },
+    /// Abort only the original requester's exact durable pending write.
+    AbortPendingWrite {
+        path: String,
+        object_id: DfsObjectId,
+        target_version: DfsVersion,
+        intent_id: String,
+        write_operation_id: String,
     },
     /// Whole-file advisory-lock command routed to the metadata authority for
     /// the stable object. `path` is used only for shard routing and for
@@ -714,24 +707,19 @@ pub enum DfsNamespaceOperation {
         path: String,
         target: DfsPosixDirectorySyncTarget,
     },
-    /// Non-mutating capability handshake required before a lock-bearing
-    /// cross-shard adoption. Peers that do not understand this variant reject
-    /// it before they can expose a partial destination object.
-    AdvisoryLockMigrationPrepare {
-        path: String,
-        source_path: String,
-        object_id: DfsObjectId,
-        state_fingerprint: String,
-    },
+
     /// Cross-shard-primary move, sent by the source-shard primary
     /// (coordinator) to the destination-shard primary: atomically validate
     /// the destination and install the moved object record at its new path,
-    /// together with its version, receipt, intent, and conflict history so
+    /// together with its versions, receipts, intents and retained references so
     /// the destination shard owns the complete record set (mirroring
     /// same-node shard migration). `source_path` is the record's previous
     /// path; the receiver verifies the sender is that path's shard primary
     /// before accepting the adoption.
     AdoptObjectAtPath {
+        /// Current live source custody offer. Deserialization grants no
+        /// permission; the target claims it from the authenticated source actor.
+        source_offer: crate::DfsSourceAdoptionOffer,
         object: DfsObjectMetadata,
         source_path: String,
         /// Stable identity for the pin-family handoff. It remains unchanged
@@ -743,9 +731,10 @@ pub enum DfsNamespaceOperation {
         versions: Vec<DfsObjectVersionRecord>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         version_pins: Vec<DfsMetadataVersionPinRecord>,
-        /// Capability-bearing digest of the exact source-authority pin set.
-        /// New sources always send this, including for an empty set. A missing
-        /// digest identifies a legacy sender and retains add-only behavior.
+        /// Digest identity of the exact source-authority pin set. The live
+        /// source witness establishes authority; this digest alone grants none.
+        /// Current sources send this for every exact pin set, including empty
+        /// sets. Missing identity or evidence is rejected before any effect.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         version_pin_set_fingerprint: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -764,8 +753,6 @@ pub enum DfsNamespaceOperation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         content_reference_outcome_retention:
             Option<crate::metadata_records::DfsContentReferenceOutcomeRetention>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        conflicts: Vec<DfsConflictRecord>,
         /// Object-scoped lock state copied atomically with the destination
         /// record. The destination marks it for epoch rebinding before any
         /// new grant can be issued.
@@ -815,10 +802,10 @@ impl DfsNamespaceOperation {
                 | Self::SyncPath { .. }
                 | Self::LookupPath { .. }
                 | Self::LookupPaths { .. }
+                | Self::AbortPendingWrite { .. }
                 | Self::AdvisoryLock { .. }
                 | Self::FileSync { .. }
                 | Self::DirectorySync { .. }
-                | Self::AdvisoryLockMigrationPrepare { .. }
                 | Self::InstallHardlinkTargetFence { .. }
                 | Self::VerifyObjectFamilyAdoption { .. }
                 | Self::ContentReference { .. }
@@ -856,11 +843,11 @@ impl DfsNamespaceOperation {
             | DfsNamespaceOperation::SyncPath { path }
             | DfsNamespaceOperation::LookupPath { path, .. }
             | DfsNamespaceOperation::ReconcilePlacement { path, .. }
+            | DfsNamespaceOperation::AbortPendingWrite { path, .. }
             | DfsNamespaceOperation::AdvisoryLock { path, .. }
             | DfsNamespaceOperation::FileSync { path, .. }
             | DfsNamespaceOperation::DirectorySync { path, .. }
             | DfsNamespaceOperation::ResumeNamespaceJobBounded { path, .. }
-            | DfsNamespaceOperation::AdvisoryLockMigrationPrepare { path, .. }
             | DfsNamespaceOperation::CommitHardlinkTargetFence {
                 target_path: path, ..
             } => Some(path.as_str()),
@@ -920,6 +907,7 @@ impl DfsNamespaceOperation {
             | DfsNamespaceOperation::SyncPath { path }
             | DfsNamespaceOperation::LookupPath { path, .. }
             | DfsNamespaceOperation::ReconcilePlacement { path, .. }
+            | DfsNamespaceOperation::AbortPendingWrite { path, .. }
             | DfsNamespaceOperation::ResumeNamespaceJobBounded { path, .. }
             | DfsNamespaceOperation::CommitHardlinkTargetFence {
                 target_path: path, ..
@@ -947,8 +935,7 @@ impl DfsNamespaceOperation {
                 .collect(),
             DfsNamespaceOperation::AdvisoryLock { path, .. }
             | DfsNamespaceOperation::FileSync { path, .. }
-            | DfsNamespaceOperation::DirectorySync { path, .. }
-            | DfsNamespaceOperation::AdvisoryLockMigrationPrepare { path, .. } => vec![path],
+            | DfsNamespaceOperation::DirectorySync { path, .. } => vec![path],
             DfsNamespaceOperation::AdoptObjectAtPath { object, .. } => vec![object.path.as_str()],
             DfsNamespaceOperation::FinalizeObjectFamilyAdoption { path, .. } => {
                 // `source_path` authenticates the sending source authority
@@ -1052,8 +1039,12 @@ pub(crate) fn cross_shard_version_pin_set_fingerprint(
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct DfsNamespaceResponse {
     pub request_id: String,
+    /// Exact work recorded by this served mutation, independent of its result.
+    /// This is scheduling evidence, never publication or durability authority.
+    pub committed_work: crate::DfsCommittedWork,
     pub result: DfsNamespaceResult,
     /// For SyncPath, the primary may include the authoritative object at the
     /// requested path so an outsider read is not blocked on unrelated shard
@@ -1065,12 +1056,9 @@ pub struct DfsNamespaceResponse {
     /// Journal catch-up batches for every shard the operation touched, built
     /// from the requester's reported cursors.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub metadata_journal_batches: Vec<DfsMetadataJournalBatch>,
-    /// Whether the authority still had journal history beyond the bounded
-    /// batches carried by this response. `None` identifies an older peer, for
-    /// which the receiver retains the conservative legacy limit heuristic.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub metadata_journal_has_more: Option<bool>,
+    pub metadata_journal_batches: Vec<DfsMetadataJournalFrameBatch>,
+    /// Explicit completeness of the authority's bounded journal response.
+    pub metadata_journal_has_more: bool,
     /// Typed result for namespace reads and POSIX coordination operations.
     /// Keeping this separate from `result` preserves the existing namespace
     /// success/error contract while allowing semantic feed batches, locks, and
@@ -1082,30 +1070,25 @@ pub struct DfsNamespaceResponse {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum DfsPosixCoordinationResult {
-    #[serde(rename = "file-history")]
+    /// The exact Main-produced durable aborted intent, not a success-derived claim.
+    AbortedWriteIntent(Box<crate::DistributedWriteIntent>),
     MetadataQuery(DfsMetadataShardResponse),
     NamespaceChanges(DfsNamespaceChangePollResponse),
     NamespaceJob(DfsNamespaceJobRecord),
     /// Content read from the exact object/version returned by the same pinned
     /// authoritative lookup. Absence means the caller must use the ordinary
-    /// exact-content read path, including when talking to an older peer.
+    /// exact-content read path.
     LookupPathRange(DfsReadRangeData),
     AdvisoryLock(DfsAdvisoryLockOutcome),
-    /// Capability acknowledgement for a lock-bearing cross-shard adoption.
-    /// An older destination that ignores the optional lock aggregate cannot
-    /// fabricate this exact-state receipt, so the source will not evict.
+    /// Exact acknowledgement for an installed advisory-lock aggregate.
     AdvisoryLockMigration {
         object_id: DfsObjectId,
         state_fingerprint: String,
         durable_through_sequence: u64,
     },
-    AdvisoryLockMigrationPrepared {
-        object_id: DfsObjectId,
-        state_fingerprint: String,
-    },
+
     /// Exact, quorum-durable acknowledgement for a pin-aware object-family
-    /// adoption. Older destinations cannot fabricate this enum variant, while
-    /// the fingerprints prevent a partial or mismatched family from releasing
+    /// adoption. The fingerprints prevent a partial or mismatched family from releasing
     /// the source authority's copy.
     ObjectFamilyAdoption {
         object_id: DfsObjectId,
@@ -1194,9 +1177,7 @@ pub enum DfsNamespacePosixError {
     /// not yet readable at the location needed to continue path resolution.
     SymlinkContentPending {
         path: String,
-        #[serde(default)]
         stage: String,
-        #[serde(default)]
         detail: String,
     },
     /// Retriable: the path is part of an in-flight cross-shard move.
@@ -1206,6 +1187,7 @@ pub enum DfsNamespacePosixError {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct DfsStageBlobCommand {
     pub request_id: String,
     pub intent_id: String,
@@ -1219,7 +1201,7 @@ pub struct DfsStageBlobCommand {
     pub bytes: Vec<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object_metadata: Option<DfsObjectMetadata>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "required_optional")]
     pub authority_shard: Option<DfsMetadataShardConfig>,
 }
 
@@ -1235,6 +1217,7 @@ pub struct DfsStageBlobResponse {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct DfsStagePatchCommand {
     pub request_id: String,
     pub intent_id: String,
@@ -1249,11 +1232,12 @@ pub struct DfsStagePatchCommand {
     pub bytes: Vec<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object_metadata: Option<DfsObjectMetadata>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "required_optional")]
     pub authority_shard: Option<DfsMetadataShardConfig>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct DfsCommitVersionCommand {
     pub request_id: String,
     pub intent_id: String,
@@ -1265,7 +1249,7 @@ pub struct DfsCommitVersionCommand {
     pub content_hash: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object_metadata: Option<DfsObjectMetadata>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "required_optional")]
     pub authority_shard: Option<DfsMetadataShardConfig>,
 }
 
@@ -1281,13 +1265,13 @@ pub struct DfsCommitVersionResponse {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct DfsRepairReplicaCommand {
     pub request_id: String,
     /// Scheduling hint for a background repair dispatched after the sender has
     /// released its mutation admission. This does not grant repair authority or
     /// change the receiver's global admission and durable validation.
-    /// Missing/false preserves foreground priority for legacy and write repairs.
-    #[serde(default, skip_serializing_if = "bool_is_false")]
+    /// Explicit scheduling priority; it grants no effect authority.
     pub background_repair: bool,
     pub intent_id: String,
     pub file_system_id: DfsFileSystemId,
@@ -1300,7 +1284,7 @@ pub struct DfsRepairReplicaCommand {
     pub bytes: Vec<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object_metadata: Option<DfsObjectMetadata>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "required_optional")]
     pub authority_shard: Option<DfsMetadataShardConfig>,
 }
 
@@ -1316,13 +1300,14 @@ pub struct DfsRepairReplicaResponse {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct DfsFetchBlobCommand {
     pub request_id: String,
     pub intent_id: String,
     pub object_id: DfsObjectId,
     pub version: DfsVersion,
     pub content_hash: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "required_optional")]
     pub authority_shard: Option<DfsMetadataShardConfig>,
 }
 
@@ -1351,111 +1336,107 @@ pub enum DfsFetchBlobResult {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct DfsMetadataJournalBatchCommand {
-    pub request_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_node_id: Option<NodeId>,
-    /// Exact filesystem whose committed shard assignment authorizes this
-    /// journal stream. Optional on the wire for rolling compatibility, but
-    /// required at clustered admission for ordinary batches that mutate the
-    /// receiver.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub file_system_id: Option<DfsFileSystemId>,
-    /// Exact committed shard epoch that authorizes this journal stream.
-    /// Optional on the wire for rolling compatibility; clustered receivers
-    /// reject ordinary applied batches when it is absent or stale.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub authority_epoch: Option<u64>,
-    /// Verify that the receiver already has the exact materialized metadata
-    /// state described by `prefix_probe`, without applying `batch`. The batch
-    /// must be empty so an older peer that ignores this flag cannot skip or
-    /// poison its journal replay cursor during a rolling upgrade.
-    #[serde(default)]
-    pub verify_prefix_only: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prefix_probe: Option<DfsMetadataPrefixProbe>,
-    /// Verify only that the receiver is reachable and observes this exact
-    /// committed shard assignment. The batch must be empty so older peers
-    /// safely process it as a no-op; because they cannot echo `probe_id`, they
-    /// cannot accidentally satisfy the new authority fast path.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub authority_probe: Option<DfsMetadataAuthorityProbe>,
-    /// Versioned durable-journal carrier for ordinary replica catch-up. The
-    /// typed legacy batch stays empty so the authoritative entry is not encoded
-    /// twice. A sender may advance its replica cursor only when the receiver
-    /// echoes `confirmation_id` after validating and persisting the exact
-    /// frames. Older receivers safely treat the empty batch as a no-op but
-    /// cannot produce that confirmation.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub durable_replication: Option<DfsMetadataDurableReplication>,
-    pub batch: DfsMetadataJournalBatch,
+#[serde(deny_unknown_fields)]
+pub struct DfsMetadataJournalFrameBatch {
+    pub shard_id: DfsMetadataShardId,
+    pub next_after_sequence: u64,
+    pub journal_frames: Vec<DfsMetadataJournalFrameRecord>,
+}
+impl DfsMetadataJournalFrameBatch {
+    pub(crate) fn decoded(&self) -> Result<DfsMetadataJournalBatch, crate::MetadataBackendError> {
+        let mut previous: Option<u64> = None;
+        let mut entries = Vec::with_capacity(self.journal_frames.len());
+        for frame in &self.journal_frames {
+            if previous.is_some_and(|sequence| Some(frame.sequence) != sequence.checked_add(1)) {
+                return Err(crate::MetadataBackendError::Serde(
+                    "journal frames are not contiguous".into(),
+                ));
+            }
+            let entry = crate::metadata_journal::decode_metadata_journal_frame_record(frame)?;
+            if entry.shard_id != self.shard_id {
+                return Err(crate::MetadataBackendError::Serde(
+                    "journal frame belongs to another shard".into(),
+                ));
+            }
+            previous = Some(frame.sequence);
+            entries.push(entry);
+        }
+        if previous != Some(self.next_after_sequence) {
+            return Err(crate::MetadataBackendError::Serde(
+                "journal frames do not reach their declared head".into(),
+            ));
+        }
+        Ok(DfsMetadataJournalBatch {
+            shard_id: self.shard_id.clone(),
+            next_after_sequence: self.next_after_sequence,
+            entries,
+        })
+    }
+    pub(crate) fn header(&self) -> DfsMetadataJournalBatch {
+        DfsMetadataJournalBatch {
+            shard_id: self.shard_id.clone(),
+            entries: Vec::new(),
+            next_after_sequence: self.next_after_sequence,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct DfsMetadataDurableReplication {
-    pub confirmation_id: String,
-    pub journal_frames: Vec<DfsMetadataJournalFrameRecord>,
-    /// Ordinary asynchronous publication may wait behind receiver maintenance.
-    /// Missing/false retains foreground preemption for legacy senders and
-    /// synchronous durability or handoff catch-up. This changes queue priority
-    /// only; authority checks and durable-prefix confirmation remain mandatory.
-    #[serde(default, skip_serializing_if = "background_publication_is_false")]
-    pub background_publication: bool,
+#[serde(deny_unknown_fields)]
+pub struct DfsMetadataJournalBatchCommand {
+    pub request_id: String,
+    #[serde(deserialize_with = "required_optional")]
+    pub source_node_id: Option<NodeId>,
+    #[serde(deserialize_with = "required_optional")]
+    pub file_system_id: Option<DfsFileSystemId>,
+    #[serde(deserialize_with = "required_optional")]
+    pub authority_epoch: Option<u64>,
+    pub verify_prefix_only: bool,
+    #[serde(deserialize_with = "required_optional")]
+    pub prefix_probe: Option<DfsMetadataPrefixProbe>,
+    #[serde(deserialize_with = "required_optional")]
+    pub authority_probe: Option<DfsMetadataAuthorityProbe>,
+    #[serde(deserialize_with = "required_optional")]
+    pub durable_replication: Option<DfsMetadataDurableReplication>,
+    pub batch: DfsMetadataJournalFrameBatch,
 }
 
-fn background_publication_is_false(value: &bool) -> bool {
-    !*value
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DfsMetadataDurableReplication {
+    pub confirmation_id: String,
+    pub background_publication: bool,
 }
 
 /// Restart-unique, exact-state identity used by a fresh metadata durability
 /// acknowledgement. A receiver may acknowledge only when its full
 /// materialized shard snapshot has this fingerprint at this exact head.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct DfsMetadataPrefixProbe {
     pub barrier_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "required_optional")]
     pub file_system_id: Option<DfsFileSystemId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "required_optional")]
     pub authority_epoch: Option<u64>,
     pub shard_id: DfsMetadataShardId,
     pub journal_sequence: u64,
     pub state_fingerprint: String,
     /// Present only for the existing replica being promoted by a pending
     /// primary-only handoff. The receiver may echo this identity only after it
-    /// durably installs the matching local freeze marker. Older peers omit the
-    /// echo and therefore cannot accidentally authorize promotion.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// durably installs the matching local freeze marker.
+    #[serde(deserialize_with = "required_optional")]
     pub primary_handoff_id: Option<String>,
 }
 
-/// Fresh, request-bound identity for an ordinary-write authority probe.
-/// The operation identity prevents replay across mutations; `prepared_prefix`
-/// additionally binds an acknowledgement to the primary's complete exact
-/// history through that operation. Older peers omit the prefix-bound response
-/// identity and therefore cannot contribute to the full-shard publication
-/// proof.
+/// Fresh request identity bound to the complete durable prepared prefix.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct DfsMetadataAuthorityProbe {
     pub probe_id: String,
     pub expected_shard: DfsMetadataShardConfig,
     pub operation: DfsMetadataAuthorityOperation,
-    /// Request the versioned durable-journal acknowledgement path. A peer may
-    /// echo the corresponding confirmation only after the exact journal
-    /// prefix and operation payload are durable, even when its rebuildable
-    /// materialized tables are intentionally caught up after the response.
-    ///
-    /// Older peers ignore this field and emit the legacy confirmation
-    /// identity, so they cannot accidentally satisfy the stronger boundary.
-    #[serde(default)]
-    pub durable_journal_ack: bool,
-    /// Exact journal frames for the durable-ACK path. New senders leave the
-    /// legacy typed batch empty, avoiding a second serialization of the same
-    /// prepare. Older receivers ignore these frames and cannot produce the V2
-    /// confirmation identity.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub journal_frames: Vec<DfsMetadataJournalFrameRecord>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prepared_prefix: Option<DfsMetadataPrefixProof>,
+    pub prepared_prefix: DfsMetadataPrefixProof,
 }
 
 /// Exact canonical mutation covered by a metadata-shard authority probe.
@@ -1466,26 +1447,11 @@ pub struct DfsMetadataAuthorityProbe {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case", tag = "kind")]
 pub enum DfsMetadataAuthorityOperation {
-    WriteIntent {
-        intent_id: String,
-        file_system_id: DfsFileSystemId,
-        object_id: DfsObjectId,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        base_version: Option<DfsVersion>,
-        target_version: DfsVersion,
-        owner_epoch: u64,
-        content_hash: String,
-        receipt_node_ids: Vec<NodeId>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        namespace_prepare_operation_id: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        namespace_prepare_digest: Option<String>,
-        prepare_sequence: u64,
-        payload_digest: String,
-    },
-    NamespaceMutation {
+    PreparedOperation {
         operation_id: String,
         file_system_id: DfsFileSystemId,
+        shard_id: DfsMetadataShardId,
+        owner_epoch: u64,
         prepare_sequence: u64,
         payload_digest: String,
     },
@@ -1511,6 +1477,12 @@ pub enum DfsCanonicalAuthorization {
         operation_digest: String,
         expected_shard: DfsMetadataShardConfig,
         permit_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        native_permit: Option<crate::DfsMetadataOperationPermit>,
+        /// Actual correlated metadata-prepare ACKs; never content receipts or
+        /// Raft votes. The private guard mint binds this recovery certificate.
+        #[serde(default)]
+        acknowledged_node_ids: Vec<NodeId>,
     },
 }
 
@@ -1520,37 +1492,68 @@ pub struct DfsMetadataJournalBatchResponse {
     pub shard_id: DfsMetadataShardId,
     pub next_after_sequence: u64,
     pub applied_entries: usize,
-    /// True only when the receiver understood and verified an exact
-    /// `verify_prefix_only` probe. This prevents mixed-version peers from
-    /// accidentally satisfying the stronger durability certificate.
-    #[serde(default)]
+    /// True only after this receiver verifies the exact prefix probe.
     pub verified_prefix_only: bool,
     /// Echoed only after the receiver validates an exact write-authority probe,
     /// persists an ordinary durable-replication prefix, or durably installs the
-    /// marker named by a primary-handoff prefix probe. Missing on older peers,
-    /// which forces the sender onto the safe path.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// marker named by a primary-handoff prefix probe.
+    #[serde(deserialize_with = "required_optional")]
     pub verified_authority_probe_id: Option<String>,
     pub result: DfsMetadataJournalBatchResult,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DfsMetadataSnapshotInstallCommand {
     pub request_id: String,
     pub source_node_id: NodeId,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "required_optional")]
     pub file_system_id: Option<DfsFileSystemId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "required_optional")]
     pub authority_epoch: Option<u64>,
     /// Exact pending primary handoff that authorizes a frozen promoted replica
     /// to accept this checkpoint repair from the retiring primary.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "required_optional")]
     pub primary_handoff_id: Option<String>,
     pub shard_id: DfsMetadataShardId,
     pub next_after_sequence: u64,
-    pub snapshot: DfsMetadataTableSnapshot,
+    pub snapshot: crate::DfsMetadataSnapshotImageDescriptor,
+    /// Runtime image DATA; serialized heads cannot construct a file resource.
+    #[serde(skip)]
+    pub image: Option<crate::DfsMetadataSnapshotImage>,
     pub reason: String,
 }
+impl DfsMetadataSnapshotInstallCommand {
+    pub(crate) fn image(
+        &self,
+    ) -> Result<&crate::DfsMetadataSnapshotImage, crate::MetadataBackendError> {
+        let image = self.image.as_ref().ok_or_else(|| {
+            crate::MetadataBackendError::Serde(
+                "snapshot install requires its delivered native image attachment".into(),
+            )
+        })?;
+        if image.descriptor() != &self.snapshot {
+            return Err(crate::MetadataBackendError::Serde(
+                "snapshot resource differs from command descriptor".into(),
+            ));
+        }
+        Ok(image)
+    }
+}
+impl PartialEq for DfsMetadataSnapshotInstallCommand {
+    fn eq(&self, other: &Self) -> bool {
+        self.request_id == other.request_id
+            && self.source_node_id == other.source_node_id
+            && self.file_system_id == other.file_system_id
+            && self.authority_epoch == other.authority_epoch
+            && self.primary_handoff_id == other.primary_handoff_id
+            && self.shard_id == other.shard_id
+            && self.next_after_sequence == other.next_after_sequence
+            && self.snapshot == other.snapshot
+            && self.reason == other.reason
+    }
+}
+impl Eq for DfsMetadataSnapshotInstallCommand {}
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsMetadataSnapshotInstallResponse {
@@ -1587,8 +1590,7 @@ pub enum DfsMetadataJournalBatchResult {
     Applied,
     Rejected {
         reason: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        code: Option<crate::DfsMetadataRejectionCode>,
+        code: crate::DfsMetadataRejectionCode,
     },
 }
 
@@ -1600,8 +1602,7 @@ pub enum DfsMetadataSnapshotInstallResult {
     },
     Rejected {
         reason: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        code: Option<crate::DfsMetadataRejectionCode>,
+        code: crate::DfsMetadataRejectionCode,
     },
 }
 
@@ -1623,11 +1624,9 @@ pub enum DfsNetworkMessage {
     WriteRequest(DfsWriteCommand),
     WriteResponse(DfsWriteResponse),
     DistributedWriteRequest(DfsDistributedWriteCommand),
-    /// Exclusive namespace creation. Kept as a distinct message variant so
-    /// older peers reject it instead of ignoring an additive flag and
-    /// accidentally executing it as an overwrite-capable write.
+    /// Exclusive namespace creation is a distinct semantic operation.
     ExclusiveCreateRequest(DfsDistributedWriteCommand),
-    /// Explicit retained content. Older peers must reject this variant.
+    /// Explicit retained content.
     RetainedWriteRequest(DfsDistributedWriteCommand),
     DistributedWriteResponse(DfsDistributedWriteResponse),
     StableWriteReconciliationRequest(DfsStableWriteReconciliationRequest),
@@ -1637,8 +1636,7 @@ pub enum DfsNetworkMessage {
     StableNamespaceReconciliationRequest(DfsStableNamespaceReconciliationRequest),
     StableNamespaceReconciliationResponse(DfsStableNamespaceReconciliationResponse),
     StageBlob(DfsStageBlobCommand),
-    /// Immutable retained content only. Old peers must reject this variant;
-    /// treating it as an ordinary stage could interfere with the current head.
+    /// Immutable retained content only; current-head publication is separate.
     StageRetainedBlob(DfsStageBlobCommand),
     /// Repair retained bytes without publishing a current replica generation.
     RepairRetainedBlob(DfsStageBlobCommand),
@@ -1667,15 +1665,13 @@ impl DfsMetadataJournalBatchResult {
     pub fn rejected(code: crate::DfsMetadataRejectionCode, reason: impl Into<String>) -> Self {
         Self::Rejected {
             reason: reason.into(),
-            code: Some(code),
+            code,
         }
     }
 
     pub fn rejection_code(&self) -> Option<crate::DfsMetadataRejectionCode> {
         match self {
-            Self::Rejected { reason, code } => {
-                Some(crate::DfsMetadataRejectionCode::resolve(*code, reason))
-            }
+            Self::Rejected { code, .. } => Some(*code),
             _ => None,
         }
     }
@@ -1690,15 +1686,13 @@ impl DfsMetadataSnapshotInstallResult {
     pub fn rejected(code: crate::DfsMetadataRejectionCode, reason: impl Into<String>) -> Self {
         Self::Rejected {
             reason: reason.into(),
-            code: Some(code),
+            code,
         }
     }
 
     pub fn rejection_code(&self) -> Option<crate::DfsMetadataRejectionCode> {
         match self {
-            Self::Rejected { reason, code } => {
-                Some(crate::DfsMetadataRejectionCode::resolve(*code, reason))
-            }
+            Self::Rejected { code, .. } => Some(*code),
             _ => None,
         }
     }
@@ -1709,26 +1703,20 @@ mod reactive_namespace_event_tests {
     use super::DfsNamespaceOperation;
 
     #[test]
-    fn lookup_path_without_inline_range_remains_wire_compatible() {
-        let legacy = serde_json::json!({
-            "lookup-path": {
-                "path": "/services/reactive"
-            }
-        });
-        let decoded = serde_json::from_value::<DfsNamespaceOperation>(legacy.clone())
-            .expect("deserialize legacy lookup-path operation");
-
+    fn lookup_path_requires_explicit_inline_range() {
+        let mut wire = serde_json::json!({"lookup-path":{"path":"/services/reactive"}});
+        assert!(serde_json::from_value::<DfsNamespaceOperation>(wire.clone()).is_err());
+        wire["lookup-path"]["inline_range"] = serde_json::Value::Null;
+        let decoded = serde_json::from_value::<DfsNamespaceOperation>(wire.clone())
+            .expect("explicit metadata-only lookup");
         assert_eq!(
             decoded,
             DfsNamespaceOperation::LookupPath {
-                path: "/services/reactive".to_string(),
-                inline_range: None,
+                path: "/services/reactive".into(),
+                inline_range: None
             }
         );
-        assert_eq!(
-            serde_json::to_value(decoded).expect("serialize metadata-only lookup-path operation"),
-            legacy
-        );
+        assert_eq!(serde_json::to_value(decoded).unwrap(), wire);
     }
 
     #[test]

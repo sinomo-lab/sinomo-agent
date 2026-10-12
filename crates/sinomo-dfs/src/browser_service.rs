@@ -31,7 +31,6 @@ pub const DFS_CORE_BROWSER_ROUTES: &[&str] = &[
     DAEMON_DFS_BROWSER_NAMESPACE_LSTAT_ROUTE,
     DAEMON_DFS_BROWSER_LIST_ROUTE,
     DAEMON_DFS_BROWSER_READ_FILE_ROUTE,
-    DAEMON_DFS_BROWSER_READ_FILE_BYTES_ROUTE,
     DAEMON_DFS_BROWSER_READ_OBJECT_VERSION_ROUTE,
     DAEMON_DFS_BROWSER_READ_FILE_PREFIX_ROUTE,
     DAEMON_DFS_BROWSER_READ_FILES_ROUTE,
@@ -46,7 +45,6 @@ pub const DFS_CORE_BROWSER_ROUTES: &[&str] = &[
     DAEMON_DFS_BROWSER_UNPIN_CONTENT_ROUTE,
     DAEMON_DFS_BROWSER_TRANSFER_METADATA_PRIMARY_ROUTE,
     DAEMON_DFS_BROWSER_PLACEMENT_PREVIEW_ROUTE,
-    DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_ROUTE,
     DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_V2_ROUTE,
     DAEMON_DFS_BROWSER_PLACEMENT_PROGRESS_ROUTE,
     DAEMON_DFS_BROWSER_PLACEMENT_ACTIVITY_ROUTE,
@@ -122,6 +120,14 @@ pub trait DfsBrowserServiceHost: Send + Sync + 'static {
         Box::pin(async { Ok(()) })
     }
     fn operation_guard(&self) -> Result<Option<Arc<dyn Send + Sync>>, ServiceError> {
+        Ok(None)
+    }
+    /// Retain native execution ownership before borrowing the mutation service.
+    /// Empty paths denote an opaque operation that may touch multiple shards.
+    fn publication_execution_provider(
+        &self,
+        _paths: &[&str],
+    ) -> Result<Option<Arc<crate::DfsPublicationExecutionProvider>>, ServiceError> {
         Ok(None)
     }
     fn control_plane_client(
@@ -405,6 +411,7 @@ struct BrowserMutation<'a> {
     service: std::sync::MutexGuard<'a, crate::MountedSifsService>,
     tracker: crate::DfsCommittedWorkTracker,
     previous: Option<crate::DfsCommittedWorkTracker>,
+    _publication_scope: Option<crate::publication_guard::DfsPublicationProviderRestore>,
     host: &'a dyn DfsBrowserServiceHost,
     origin_node_id: &'a sinomo_core::node::NodeId,
 }
@@ -434,6 +441,9 @@ impl Drop for BrowserMutation<'_> {
                 Vec::new(),
             );
         }
+        // Restore capability custody while the service mutex is still held.
+        // A later borrower must never inherit or erase this owner's scope.
+        drop(self._publication_scope.take());
     }
 }
 
@@ -606,13 +616,21 @@ impl DfsBrowserBackend {
     }
 
     fn lock_mutation(&self) -> Result<BrowserMutation<'_>, ServiceError> {
+        // Feature callbacks and placement operations supply no bounded path set.
+        self.lock_mutation_for_paths(&[])
+    }
+
+    fn lock_mutation_for_paths(&self, paths: &[&str]) -> Result<BrowserMutation<'_>, ServiceError> {
+        let owners = self.host.publication_execution_provider(paths)?;
         let mut service = self.lock_service()?;
+        let publication_scope = owners.map(|owners| service.publication_provider.install(owners));
         let tracker = crate::DfsCommittedWorkTracker::new();
         let previous = service.committed_work_tracker.replace(tracker.clone());
         Ok(BrowserMutation {
             service,
             tracker,
             previous,
+            _publication_scope: publication_scope,
             host: self.host.as_ref(),
             origin_node_id: &self.node_id,
         })
@@ -700,7 +718,7 @@ impl DfsBrowserBackend {
                 )
                 .map_err(dfs_browser_service_error)
             }
-            None => Ok(vec![crate::fallback_dfs_node_id()]),
+            None => Ok(vec![self.node_id.clone()]),
         }
     }
 
@@ -1143,7 +1161,7 @@ impl DfsBrowserBackend {
                 });
             }
         };
-        let mut service = self.lock_mutation()?;
+        let mut service = self.lock_mutation_for_paths(&[path.as_str()])?;
         let replica_candidates = self.content_replica_candidates()?;
         let options = match sifs_browser_write_options(&mut service, &path, &replica_candidates) {
             Ok(options) => options,
@@ -1201,7 +1219,12 @@ impl DfsBrowserBackend {
     ) -> Result<crate::DaemonDfsBrowserRenameResponse, ServiceError> {
         let from = normalize_sifs_browser_path(&request.from)?;
         let to = normalize_sifs_browser_path(&request.to)?;
-        let mut service = self.lock_mutation()?;
+        let source_parent = crate::posix_path::parent_posix_path(&from);
+        let target_parent = crate::posix_path::parent_posix_path(&to);
+        let mut paths = vec![from.as_str(), to.as_str()];
+        paths.extend(source_parent.as_deref());
+        paths.extend(target_parent.as_deref());
+        let mut service = self.lock_mutation_for_paths(&paths)?;
         service
             .posix_rename(&from, &to)
             .map_err(dfs_browser_service_error)?;
@@ -1214,7 +1237,12 @@ impl DfsBrowserBackend {
         request: crate::DaemonDfsBrowserDeleteRequest,
     ) -> Result<crate::DaemonDfsBrowserDeleteResponse, ServiceError> {
         let path = normalize_sifs_browser_path(&request.path)?;
-        let mut service = self.lock_mutation()?;
+        let parent = crate::posix_path::parent_posix_path(&path);
+        let mut paths = vec![path.as_str()];
+        if let Some(parent) = parent.as_deref() {
+            paths.push(parent);
+        }
+        let mut service = self.lock_mutation_for_paths(&paths)?;
         if request.directory {
             service
                 .posix_rmdir(&path)
@@ -1510,33 +1538,18 @@ impl DfsBrowserBackend {
             .unix_timestamp_nanos()
             .try_into()
             .unwrap_or(1_000_000_000);
-        let reconciliation = crate::DfsPlacementReconciliationJob {
-            schema_version: crate::DFS_PLACEMENT_RECONCILIATION_SCHEMA_VERSION,
-            job_id: sinomo_core::Id::generate().to_string(),
-            file_system_id: desired.file_system_id.clone(),
+        let reconciliation = crate::control_plane::build_placement_reconciliation_job(
+            sinomo_core::Id::generate().to_string(),
+            &desired,
             path,
             scope,
             unavailable_node_ids,
             candidate_snapshot,
             placement_snapshot,
-            adaptive: false,
-            adaptive_budget: None,
-            processed_content_bytes: 0,
-            accepted_config: Some(desired.clone()),
-            state: crate::DfsPlacementReconciliationState::Pending,
-            cursor: None,
-            total_object_count: 0,
-            scanned_object_count: 0,
-            matched_object_count: 0,
-            updated_object_count: 0,
-            scheduled_repair_count: 0,
-            completed_repair_count: 0,
-            pending_repair_count: 0,
-            revision: 0,
-            created_at_unix_nanos: now,
-            updated_at_unix_nanos: now,
-            last_error: None,
-        };
+            now,
+        )
+        .map_err(dfs_browser_service_error)?;
+
         require_accepted_daemon_dfs_browser_placement_update(
             store.compare_and_put_placement_update(&expected, &desired, &reconciliation),
             &desired.file_system_id,
@@ -1961,25 +1974,7 @@ impl Service for HostedDfsBrowserService {
                     .await?;
                     ctx.respond_value(DAEMON_DFS_BROWSER_READ_FILE_ROUTE, result)?;
                 }
-                DAEMON_DFS_BROWSER_READ_FILE_BYTES_ROUTE => {
-                    let payload = ctx.decode_request_body(&request).await?;
-                    let result = run_blocking_browser_task(
-                        Arc::clone(&data_dir),
-                        route.clone(),
-                        "DFS browser bulk-byte read file",
-                        move || {
-                            DfsBrowserBackend::for_data_dir(
-                                data_dir,
-                                &runtime,
-                                Arc::clone(&backend_host),
-                            )?
-                            .read_file(payload)
-                            .map(crate::DaemonDfsBrowserReadFileBytesResponse::from)
-                        },
-                    )
-                    .await?;
-                    ctx.respond_value(DAEMON_DFS_BROWSER_READ_FILE_BYTES_ROUTE, result)?;
-                }
+
                 DAEMON_DFS_BROWSER_READ_OBJECT_VERSION_ROUTE => {
                     let payload = ctx.decode_request_body(&request).await?;
                     let result = run_blocking_browser_task(
@@ -2428,11 +2423,7 @@ impl Service for HostedDfsBrowserService {
                     .await?;
                     ctx.respond_value(DAEMON_DFS_BROWSER_PLACEMENT_PREVIEW_ROUTE, result)?;
                 }
-                DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_ROUTE => {
-                    let _: crate::DaemonDfsBrowserPlacementUpdateRequest =
-                        ctx.decode_request_body(&request).await?;
-                    return Err(legacy_daemon_dfs_browser_placement_update_error());
-                }
+
                 DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_V2_ROUTE => {
                     let payload: crate::DaemonDfsBrowserPlacementUpdateV2Request =
                         ctx.decode_request_body(&request).await?;
@@ -2508,7 +2499,6 @@ pub fn daemon_dfs_browser_route_is_path_access(route: &str) -> bool {
             | DAEMON_DFS_BROWSER_NAMESPACE_LSTAT_ROUTE
             | DAEMON_DFS_BROWSER_LIST_ROUTE
             | DAEMON_DFS_BROWSER_READ_FILE_ROUTE
-            | DAEMON_DFS_BROWSER_READ_FILE_BYTES_ROUTE
             | DAEMON_DFS_BROWSER_READ_OBJECT_VERSION_ROUTE
             | DAEMON_DFS_BROWSER_READ_FILE_PREFIX_ROUTE
             | DAEMON_DFS_BROWSER_READ_FILES_ROUTE
@@ -2765,7 +2755,7 @@ fn daemon_dfs_browser_health_summary(
         object_count: status.object_count,
         version_count: status.version_count,
         pending_write_count: status.pending_write_count,
-        open_conflict_count: status.open_conflict_count,
+
         pending_repair_count: status.pending_repair_count,
         pending_namespace_job_count: status.pending_namespace_job_count,
         failed_namespace_job_count: status.failed_namespace_job_count,
@@ -2819,7 +2809,7 @@ fn daemon_dfs_browser_object_health(
         version_count: view.versions.len(),
         receipt_count: view.receipts.len(),
         intent_count: view.intents.len(),
-        open_conflict_count: view.conflicts.len(),
+
         pending_repair_count: view.repairs.len(),
         missing_replica_nodes,
     })
@@ -3203,13 +3193,6 @@ pub fn require_satisfiable_daemon_dfs_browser_placement(
     )))
 }
 
-fn legacy_daemon_dfs_browser_placement_update_error() -> ServiceError {
-    ServiceError::Service(
-        "legacy SIFS placement Apply is disabled because it cannot verify the reviewed preview; refresh the preview and retry with a client that uses /daemon/dfs/browser/placement-update-v2"
-            .to_string(),
-    )
-}
-
 fn require_accepted_daemon_dfs_browser_placement_update(
     result: Result<bool, KvError>,
     file_system_id: &crate::DfsFileSystemId,
@@ -3514,9 +3497,12 @@ mod tests {
     #[test]
     fn browser_parent_preparation_creates_missing_chain_and_preserves_non_directory() {
         let root = sinomo_testdir::TestDir::new("browser-write-parent-preparation");
-        let mut service = crate::open_mounted_sifs_service(Some(root.path().to_path_buf()))
-            .expect("standalone SIFS")
-            .service;
+        let (native, node) = crate::test_support::DfsTestRuntime::start_single_node_in_data_dir(
+            "browser_parent_preparation_creates_missing_chain_and_preserves_non_directory",
+            SinomoDataDir::new(root.path()),
+        )
+        .expect("normal initialized native browser owner");
+        let mut service = native.client(&node).expect("normal native DFS client");
         let path = "/services/browser/new-parent/child.txt";
         prepare_sifs_browser_write_parent(&mut service, path).expect("create missing parents");
         let options = crate::DfsWriteOptions::replicated_eventual(vec![service.node_id().clone()]);
@@ -3535,6 +3521,9 @@ mod tests {
             service.posix_read_file(path).expect("preserved file"),
             b"replacement"
         );
+
+        drop(service);
+        native.close().expect("normal native browser shutdown");
     }
 
     impl DfsBrowserServiceHost for UnusedHost {
@@ -3601,13 +3590,18 @@ mod tests {
     fn committed_browser_tracker_publishes_semantic_wake_without_a_response() {
         let root = sinomo_testdir::TestDir::new("browser-response-independent-semantic-wake");
         let data_dir = SinomoDataDir::new(root.path());
-        let opened = crate::open_mounted_sifs_service(Some(root.path().to_path_buf())).unwrap();
+        let (native, node) = crate::test_support::DfsTestRuntime::start_single_node_in_data_dir(
+            "committed_browser_tracker_publishes_semantic_wake_without_a_response",
+            data_dir.clone(),
+        )
+        .expect("normal initialized native browser owner");
+        let service = native.client(&node).expect("normal native DFS client");
         let host = Arc::new(UnusedHost::default());
         let backend = DfsBrowserBackend {
-            node_id: opened.service.node_id().clone(),
+            node_id: service.node_id().clone(),
             data_dir,
             host: host.clone(),
-            service: Mutex::new(opened.service),
+            service: Mutex::new(service),
             replica_control_plane: Mutex::new(None),
             peer_targets_refreshed_at: Mutex::new(None),
             stat_cache: Mutex::new(HashMap::new()),
@@ -3651,20 +3645,27 @@ mod tests {
             1,
             "an outer runtime/handoff tracker owns emission, so the browser does not duplicate it"
         );
+
+        drop(backend);
+        native.close().expect("normal native browser shutdown");
     }
 
     #[test]
     fn browser_identity_remains_available_while_namespace_service_is_busy() {
         let root = sinomo_testdir::TestDir::new("browser-identity-during-mutation");
         let data_dir = SinomoDataDir::new(root.path());
-        let opened = crate::open_mounted_sifs_service(Some(root.path().to_path_buf()))
-            .expect("standalone SIFS");
-        let node_id = opened.service.node_id().clone();
+        let (native, node) = crate::test_support::DfsTestRuntime::start_single_node_in_data_dir(
+            "browser_identity_remains_available_while_namespace_service_is_busy",
+            data_dir.clone(),
+        )
+        .expect("normal initialized native browser owner");
+        let service = native.client(&node).expect("normal native DFS client");
+        let node_id = service.node_id().clone();
         let backend = DfsBrowserBackend {
             data_dir,
             host: Arc::new(UnusedHost::default()),
             node_id: node_id.clone(),
-            service: Mutex::new(opened.service),
+            service: Mutex::new(service),
             replica_control_plane: Mutex::new(None),
             peer_targets_refreshed_at: Mutex::new(None),
             stat_cache: Mutex::new(HashMap::new()),
@@ -3680,15 +3681,22 @@ mod tests {
                 .expect("committed mutation provenance"),
             node_id
         );
+
+        drop(_busy);
+        drop(backend);
+        native.close().expect("normal native browser shutdown");
     }
 
     #[test]
     fn namespace_lstat_route_preserves_missing_entries_and_dangling_link_metadata() {
         let root = sinomo_testdir::TestDir::new("browser-namespace-lstat-contract");
         let data_dir = SinomoDataDir::new(root.path());
-        let mut service = crate::open_mounted_sifs_service(Some(root.path().to_path_buf()))
-            .unwrap()
-            .service;
+        let (native, node) = crate::test_support::DfsTestRuntime::start_single_node_in_data_dir(
+            "namespace_lstat_route_preserves_missing_entries_and_dangling_link_metadata",
+            data_dir.clone(),
+        )
+        .expect("normal initialized native browser owner");
+        let mut service = native.client(&node).expect("normal native DFS client");
         service.posix_mkdir_all("/services/namespace-test").unwrap();
         let options = crate::DfsWriteOptions::replicated_eventual(vec![service.node_id().clone()]);
         service
@@ -3777,15 +3785,21 @@ mod tests {
                     .iter()
                     .any(|route| route == DAEMON_DFS_BROWSER_NAMESPACE_LSTAT_ROUTE)
         }));
+
+        drop(backend);
+        native.close().expect("normal native browser shutdown");
     }
 
     #[test]
     fn versioned_bulk_read_reuses_core_namespace_outcomes_and_path_access_offer() {
         let root = sinomo_testdir::TestDir::new("browser-bulk-read-core-contract");
         let data_dir = SinomoDataDir::new(root.path());
-        let mut service = crate::open_mounted_sifs_service(Some(root.path().to_path_buf()))
-            .unwrap()
-            .service;
+        let (native, node) = crate::test_support::DfsTestRuntime::start_single_node_in_data_dir(
+            "versioned_bulk_read_reuses_core_namespace_outcomes_and_path_access_offer",
+            data_dir.clone(),
+        )
+        .expect("normal initialized native browser owner");
+        let mut service = native.client(&node).expect("normal native DFS client");
         service.posix_mkdir_all("/services/bulk-read-test").unwrap();
         let options = crate::DfsWriteOptions::replicated_eventual(vec![service.node_id().clone()]);
         let bytes = (0..65536usize).map(|index| index as u8).collect::<Vec<_>>();
@@ -3806,42 +3820,30 @@ mod tests {
                 path: "/services/bulk-read-test/data.bin".into(),
             })
             .unwrap();
-        let old = sinomo_core::network::ObjectRpcResponse::encode_body(
-            DAEMON_DFS_BROWSER_READ_FILE_ROUTE,
-            &response,
-        )
-        .unwrap();
-        let response = crate::DaemonDfsBrowserReadFileBytesResponse::from(response);
-        let bulk = sinomo_core::network::ObjectRpcResponse::encode_body(
-            DAEMON_DFS_BROWSER_READ_FILE_BYTES_ROUTE,
-            &response,
-        )
-        .unwrap();
-        let old: crate::DaemonDfsBrowserReadFileResponse = old.decode_body().unwrap();
-        let new: crate::DaemonDfsBrowserReadFileBytesResponse = bulk.decode_body().unwrap();
-        assert_eq!(old.into_result().unwrap(), bytes);
-        assert_eq!(new.into_result().unwrap(), bytes);
+        let bulk =
+            sinomo_core::network::ObjectRpcResponse::encode_body("native-browser-read", &response)
+                .unwrap();
+        let decoded: crate::DaemonDfsBrowserReadFileResponse = bulk.decode_body().unwrap();
+        assert_eq!(decoded.into_result().unwrap(), bytes);
         let absent = backend
             .read_file(crate::DaemonDfsBrowserReadFileRequest {
                 path: "/services/bulk-read-test/missing.bin".into(),
             })
             .unwrap();
-        assert!(
-            matches!(crate::DaemonDfsBrowserReadFileBytesResponse::from(absent).into_result(),
-            Err(crate::DaemonDfsBrowserReadFileFailure::NotFound { path }) if path.ends_with("/missing.bin"))
-        );
+        assert!(matches!(absent.into_result(),
+            Err(crate::DaemonDfsBrowserReadFileFailure::NotFound { path }) if path.ends_with("/missing.bin")));
 
         // This route belongs to the core browser, independent of History/Attachments components.
-        assert!(DFS_CORE_BROWSER_ROUTES.contains(&DAEMON_DFS_BROWSER_READ_FILE_BYTES_ROUTE));
+        assert!(DFS_CORE_BROWSER_ROUTES.contains(&DAEMON_DFS_BROWSER_READ_FILE_ROUTE));
         assert!(daemon_dfs_browser_route_is_path_access(
-            DAEMON_DFS_BROWSER_READ_FILE_BYTES_ROUTE
+            DAEMON_DFS_BROWSER_READ_FILE_ROUTE
         ));
         use sinomo_module::ComponentFactory as _;
         let hosted = HostedDfsBrowserService::new(None, Arc::new(UnusedHost::default()));
         let route = hosted
             .route_categories()
             .into_iter()
-            .find(|route| route.route == DAEMON_DFS_BROWSER_READ_FILE_BYTES_ROUTE)
+            .find(|route| route.route == DAEMON_DFS_BROWSER_READ_FILE_ROUTE)
             .unwrap();
         assert_eq!(
             route.auth_scope.as_deref(),
@@ -3868,8 +3870,11 @@ mod tests {
                 && offer
                     .routes
                     .iter()
-                    .any(|route| route == DAEMON_DFS_BROWSER_READ_FILE_BYTES_ROUTE)
+                    .any(|route| route == DAEMON_DFS_BROWSER_READ_FILE_ROUTE)
         }));
+
+        drop(backend);
+        native.close().expect("normal native browser shutdown");
     }
 
     #[test]
@@ -3886,12 +3891,17 @@ mod tests {
         }
         let root = sinomo_testdir::TestDir::new("browser-hosted-identity-admission");
         let data_dir = Arc::new(SinomoDataDir::new(root.path()));
-        let opened = crate::open_mounted_sifs_service(Some(root.path().to_path_buf())).unwrap();
+        let (native, node) = crate::test_support::DfsTestRuntime::start_single_node_in_data_dir(
+            "hosted_browser_identity_bypasses_namespace_admission",
+            (*data_dir).clone(),
+        )
+        .expect("normal initialized native browser owner");
+        let service = native.client(&node).expect("normal native DFS client");
         let backend = Arc::new(DfsBrowserBackend {
-            node_id: opened.service.node_id().clone(),
+            node_id: service.node_id().clone(),
             data_dir: (*data_dir).clone(),
             host: Arc::new(UnusedHost::default()),
-            service: Mutex::new(opened.service),
+            service: Mutex::new(service),
             replica_control_plane: Mutex::new(None),
             peer_targets_refreshed_at: Mutex::new(None),
             stat_cache: Mutex::new(HashMap::new()),
@@ -3903,7 +3913,7 @@ mod tests {
             let _queued = slot.execution.lock().await;
             let responded = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let ctx = ServiceContext::new(
-                data_dir,
+                data_dir.clone(),
                 None,
                 ServiceSigner::Local,
                 sinomo_core::network::ObjectRpcIncomingBody::empty(),
@@ -3925,6 +3935,12 @@ mod tests {
                 .unwrap();
             assert!(responded.load(std::sync::atomic::Ordering::Acquire));
         });
+
+        drop(_busy);
+        *slot.backend.lock().unwrap() = None;
+        drop(slot);
+        drop(backend);
+        native.close().expect("normal native browser shutdown");
     }
 
     #[test]
@@ -3942,18 +3958,22 @@ mod tests {
         }
         let root = sinomo_testdir::TestDir::new("browser-concurrent-hosted-reads");
         let data_dir = Arc::new(SinomoDataDir::new(root.path()));
-        let mut opened = crate::open_mounted_sifs_service(Some(root.path().to_path_buf())).unwrap();
-        let node = opened.service.node_id().clone();
+        let (native, node) = crate::test_support::DfsTestRuntime::start_single_node_in_data_dir(
+            "hosted_browser_reads_wait_for_a_slow_mutation_and_return_its_committed_bytes",
+            (*data_dir).clone(),
+        )
+        .expect("normal initialized native browser owner");
+        let mut service = native.client(&node).expect("normal native DFS client");
+        let node = service.node_id().clone();
         let options = crate::DfsWriteOptions::replicated_eventual(vec![node.clone()]);
-        opened
-            .service
+        service
             .posix_write_file("/admission.txt", b"base", options.clone())
             .unwrap();
         let backend = Arc::new(DfsBrowserBackend {
             node_id: node,
             data_dir: (*data_dir).clone(),
             host: Arc::new(UnusedHost::default()),
-            service: Mutex::new(opened.service),
+            service: Mutex::new(service),
             replica_control_plane: Mutex::new(None),
             peer_targets_refreshed_at: Mutex::new(None),
             stat_cache: Mutex::new(HashMap::new()),
@@ -4012,8 +4032,9 @@ mod tests {
             }
             // Negative control: the old direct blocking-worker path rejects
             // this exact contention. The hosted calls above must keep waiting.
+            let legacy_backend = Arc::clone(&backend);
             let legacy = tokio::task::spawn_blocking(move || {
-                backend.read_file(crate::DaemonDfsBrowserReadFileRequest {
+                legacy_backend.read_file(crate::DaemonDfsBrowserReadFileRequest {
                     path: "/admission.txt".into(),
                 })
             })
@@ -4045,6 +4066,14 @@ mod tests {
                 assert_eq!(response.into_result().unwrap(), b"committed winner");
             }
         });
+
+        *browser_backend_slot(&data_dir)
+            .unwrap()
+            .backend
+            .lock()
+            .unwrap() = None;
+        drop(backend);
+        native.close().expect("normal native browser shutdown");
     }
 }
 

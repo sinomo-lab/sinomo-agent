@@ -14,6 +14,7 @@ use crate::*;
 pub(crate) struct DfsBestEffortMessageSendOutcome {
     pub(crate) sent: bool,
     pub(crate) last_error: Option<String>,
+    pub(crate) delivery_state: Option<sinomo_core::network::NetworkDeliveryState>,
 }
 
 /// Refinement of `StageFanoutCap` in the verified repair-content model.
@@ -81,20 +82,43 @@ fn validate_replica_body_fanout_outcomes(
             }
             Ok(match outcome.result {
                 Ok(()) => StageBlobSendOutcome {
+                    delivery_state: Some(
+                        sinomo_core::network::NetworkDeliveryState::PossiblyApplied,
+                    ),
                     sent: true,
                     last_error: None,
                 },
                 Err(NetworkError::UnknownNode { .. }) => StageBlobSendOutcome {
+                    delivery_state: None,
                     sent: false,
                     last_error: None,
                 },
                 Err(error) => StageBlobSendOutcome {
+                    delivery_state: error.delivery_state(),
                     sent: false,
                     last_error: Some(error.to_string()),
                 },
             })
         })
         .collect()
+}
+
+fn replica_transfer_identity(message: &DfsNetworkMessage) -> Option<(String, String, bool)> {
+    match message {
+        DfsNetworkMessage::StageBlob(command) | DfsNetworkMessage::StageRetainedBlob(command) => {
+            Some((command.intent_id.clone(), command.request_id.clone(), true))
+        }
+        DfsNetworkMessage::StagePatch(command) => {
+            Some((command.intent_id.clone(), command.request_id.clone(), true))
+        }
+        DfsNetworkMessage::RepairRetainedBlob(command) => {
+            Some((command.intent_id.clone(), command.request_id.clone(), false))
+        }
+        DfsNetworkMessage::RepairReplica(command) => {
+            Some((command.intent_id.clone(), command.request_id.clone(), false))
+        }
+        _ => None,
+    }
 }
 
 impl<T> NetworkedDfsService<T>
@@ -140,6 +164,7 @@ where
             )
             .await?;
         Ok(StageBlobSendOutcome {
+            delivery_state: send_outcome.delivery_state,
             sent: send_outcome.sent,
             last_error: send_outcome.last_error,
         })
@@ -178,12 +203,16 @@ where
                 kind: ReplicaTransferKind::Stage,
             },
         )?;
-        let outcomes = self
-            .transport
-            .send_routed_calls_bounded_async(requests, DFS_REPLICA_BODY_FANOUT_CAP)
-            .await
-            .map_err(DfsError::from_network)?;
-        validate_replica_body_fanout_outcomes(&expected_targets, outcomes)
+        let identities = self.begin_replica_sends(&requests)?;
+        let outcomes = {
+            #[cfg(any(test, feature = "test-support"))]
+            let _native_context = self.native_stage_send_context(&requests);
+            self.transport
+                .send_routed_calls_bounded_async(requests, DFS_REPLICA_BODY_FANOUT_CAP)
+        }
+        .await;
+        let outcomes = self.observe_replica_fanout_result(&identities, outcomes)?;
+        self.finish_replica_sends(&identities, &expected_targets, outcomes)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -250,12 +279,13 @@ where
             requests,
             expected_targets,
         } = prepared;
+        let identities = self.begin_replica_sends(&requests)?;
         let outcomes = self
             .transport
             .send_routed_calls_bounded_async(requests, DFS_REPLICA_BODY_FANOUT_CAP)
-            .await
-            .map_err(DfsError::from_network)?;
-        validate_replica_body_fanout_outcomes(&expected_targets, outcomes)
+            .await;
+        let outcomes = self.observe_replica_fanout_result(&identities, outcomes)?;
+        self.finish_replica_sends(&identities, &expected_targets, outcomes)
     }
 
     pub(crate) async fn send_best_effort_message_if_routable_async(
@@ -274,8 +304,19 @@ where
         message: DfsNetworkMessage,
         attachment: DfsOutboundAttachment,
     ) -> Result<DfsBestEffortMessageSendOutcome, DfsError> {
+        let transfer = replica_transfer_identity(&message);
+        let background_repair = matches!(&message, DfsNetworkMessage::RepairReplica(command) if command.background_repair);
+        if let Some((intent, request_id, stage)) = &transfer {
+            self.begin_replica_transfer_attempt(
+                intent,
+                target_node_id,
+                request_id,
+                *stage,
+                background_repair,
+            )?;
+        }
         let routed_message = self.next_dfs_routed_message(target_node_id, message);
-        match self
+        let outcome = match self
             .transport
             .send_routed_call_async(
                 target_node_id,
@@ -283,19 +324,36 @@ where
             )
             .await
         {
-            Ok(()) => Ok(DfsBestEffortMessageSendOutcome {
+            Ok(()) => DfsBestEffortMessageSendOutcome {
+                delivery_state: Some(sinomo_core::network::NetworkDeliveryState::PossiblyApplied),
                 sent: true,
                 last_error: None,
-            }),
-            Err(NetworkError::UnknownNode { .. }) => Ok(DfsBestEffortMessageSendOutcome {
+            },
+            Err(NetworkError::UnknownNode { .. }) => DfsBestEffortMessageSendOutcome {
+                delivery_state: None,
                 sent: false,
                 last_error: None,
-            }),
-            Err(error) => Ok(DfsBestEffortMessageSendOutcome {
+            },
+            Err(error) => DfsBestEffortMessageSendOutcome {
+                delivery_state: error.delivery_state(),
                 sent: false,
                 last_error: Some(error.to_string()),
-            }),
+            },
+        };
+        if let Some((intent, request_id, stage)) = transfer {
+            self.observe_replica_transfer_delivery(
+                &intent,
+                target_node_id,
+                &request_id,
+                stage,
+                &StageBlobSendOutcome {
+                    sent: outcome.sent,
+                    last_error: outcome.last_error.clone(),
+                    delivery_state: outcome.delivery_state,
+                },
+            )?;
         }
+        Ok(outcome)
     }
 
     pub(crate) async fn send_best_effort_message_if_routable_outcome_async(
@@ -303,24 +361,144 @@ where
         target_node_id: &NodeId,
         message: DfsNetworkMessage,
     ) -> Result<DfsBestEffortMessageSendOutcome, DfsError> {
-        match self
-            .send_dfs_message_if_routable_async(target_node_id, message)
-            .await
-        {
-            Ok(sent) => Ok(DfsBestEffortMessageSendOutcome {
-                sent,
-                last_error: None,
-            }),
-            Err(DfsError::Network { message }) => Ok(DfsBestEffortMessageSendOutcome {
-                sent: false,
-                last_error: Some(message),
-            }),
-            Err(error) => Err(error),
+        let transfer = replica_transfer_identity(&message);
+        let background_repair = matches!(&message, DfsNetworkMessage::RepairReplica(command) if command.background_repair);
+        let routed = self.next_dfs_routed_message(target_node_id, message);
+        let call = crate::message_transport::native_snapshot_routed_call(routed)?;
+        if let Some((intent, request_id, stage)) = &transfer {
+            self.begin_replica_transfer_attempt(
+                intent,
+                target_node_id,
+                request_id,
+                *stage,
+                background_repair,
+            )?;
         }
+        let result = self
+            .transport
+            .send_routed_call_async(target_node_id, call)
+            .await;
+        let outcome = match result {
+            Ok(()) => DfsBestEffortMessageSendOutcome {
+                sent: true,
+                last_error: None,
+                delivery_state: Some(sinomo_core::network::NetworkDeliveryState::PossiblyApplied),
+            },
+            Err(error) => DfsBestEffortMessageSendOutcome {
+                sent: false,
+                delivery_state: error.delivery_state(),
+                last_error: if matches!(&error, NetworkError::UnknownNode { .. }) {
+                    None
+                } else {
+                    Some(error.to_string())
+                },
+            },
+        };
+        if let Some((intent, request_id, stage)) = transfer {
+            self.observe_replica_transfer_delivery(
+                &intent,
+                target_node_id,
+                &request_id,
+                stage,
+                &StageBlobSendOutcome {
+                    sent: outcome.sent,
+                    last_error: outcome.last_error.clone(),
+                    delivery_state: outcome.delivery_state,
+                },
+            )?;
+        }
+        Ok(outcome)
     }
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
+    #[cfg(any(test, feature = "test-support"))]
+    fn native_stage_send_context(
+        &self,
+        requests: &[DfsRoutedSend],
+    ) -> Option<crate::native_shard_trace::NativeBoundaryContextLease> {
+        let DfsNetworkMessage::StageBlob(command) = &requests.first()?.call.message.message else {
+            return None;
+        };
+        let shard = command.authority_shard.as_ref()?;
+        let (root, owner) = self.native_publication_owner_for_observation()?;
+        Some(crate::native_shard_trace::enter_boundary_context(
+            &root,
+            &owner,
+            &DfsMetadataShardId::new(shard.shard_id.clone()),
+        ))
+    }
+
+    fn begin_replica_sends(
+        &mut self,
+        requests: &[DfsRoutedSend],
+    ) -> Result<Vec<(NodeId, String, String, bool)>, DfsError> {
+        let identities = requests
+            .iter()
+            .filter_map(|request| {
+                replica_transfer_identity(&request.call.message.message).map(
+                    |(intent, request_id, stage)| {
+                        (request.target_node_id.clone(), intent, request_id, stage)
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        if identities.len() != requests.len() {
+            return Err(DfsError::Metadata {
+                message: "replica fanout omitted an actual transfer identity".into(),
+            });
+        }
+        for ((target, intent, request_id, stage), request) in identities.iter().zip(requests) {
+            self.begin_replica_transfer_attempt(intent, target, request_id, *stage,
+                matches!(&request.call.message.message, DfsNetworkMessage::RepairReplica(command) if command.background_repair))?;
+        }
+        Ok(identities)
+    }
+
+    fn finish_replica_sends(
+        &mut self,
+        identities: &[(NodeId, String, String, bool)],
+        expected_targets: &[NodeId],
+        outcomes: Vec<DfsRoutedSendOutcome>,
+    ) -> Result<Vec<StageBlobSendOutcome>, DfsError> {
+        let outcomes = validate_replica_body_fanout_outcomes(expected_targets, outcomes)?;
+        if identities.len() != outcomes.len() {
+            return Err(DfsError::Metadata {
+                message: "replica send results omitted actual attempt identities".into(),
+            });
+        }
+        for ((target, intent, request_id, stage), outcome) in identities.iter().zip(&outcomes) {
+            self.observe_replica_transfer_delivery(intent, target, request_id, *stage, outcome)?;
+        }
+        Ok(outcomes)
+    }
+
+    fn observe_replica_fanout_result(
+        &mut self,
+        identities: &[(NodeId, String, String, bool)],
+        result: Result<Vec<DfsRoutedSendOutcome>, NetworkError>,
+    ) -> Result<Vec<DfsRoutedSendOutcome>, DfsError> {
+        match result {
+            Ok(outcomes) => Ok(outcomes),
+            Err(error) => {
+                let delivery_state = error.delivery_state().filter(|state| {
+                    *state == sinomo_core::network::NetworkDeliveryState::PossiblyApplied
+                });
+                let outcome = StageBlobSendOutcome {
+                    sent: false,
+                    last_error: Some(error.to_string()),
+                    delivery_state,
+                };
+                for (target, intent, request_id, stage) in identities {
+                    self.observe_replica_transfer_delivery(
+                        intent, target, request_id, *stage, &outcome,
+                    )?;
+                }
+                Err(DfsError::from_network(error))
+            }
+        }
+    }
+
     /// The grouped repair owner must reach its durable queue checkpoint without
     /// an asynchronous retained-transfer fallback after retiring other work.
     /// Validate the immutable packet kind and hand off only to the existing
@@ -338,16 +516,72 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             requests,
             expected_targets,
         } = prepared;
-        self.transport
-            .prepare_background_replica_dispatch(requests)
-            .map_err(DfsError::from_network)?;
-        Ok(expected_targets
-            .into_iter()
+        let identities = self.begin_replica_sends(&requests)?;
+        // Bind original producer evidence while this same admitted service owns
+        // the actual claims, before either queue checkpoint or payload handoff.
+        // A later service generation cannot reinterpret these owned readers.
+        let producer_delivery = requests
+            .iter()
+            .map(|request| {
+                let DfsNetworkMessage::RepairReplica(command) = &request.call.message.message
+                else {
+                    return None;
+                };
+                if command.background_repair
+                    && request.target_node_id == request.call.message.target_node_id
+                    && request.call.message.source_node_id == self.node_id
+                    && self
+                        .coordinator
+                        .intent(&command.intent_id)
+                        .is_some_and(|intent| {
+                            intent.file_system_id == command.file_system_id
+                                && intent.object_id == command.object_id
+                                && intent.target_version == command.version
+                                && intent.base_version == command.expected_base_version
+                        })
+                    && let Some(pending) = self.writes.pending_writes.get(&command.intent_id)
+                    && pending.object_id == command.object_id
+                    && pending.version == command.version
+                    && pending.content_hash == command.content_hash
+                    && pending
+                        .repair_inflight_request_ids
+                        .get(&request.target_node_id)
+                        == Some(&command.request_id)
+                    && !pending
+                        .stage_inflight_request_ids
+                        .contains_key(&request.target_node_id)
+                    && let Some(state) = pending.repair_retries.get(&request.target_node_id)
+                    && !state.unresolved_custody_without_request
+                    && state.completed_transfer_request_id.is_none()
+                {
+                    Some((
+                        state.retrying_unresolved_transfer,
+                        state.previous_transfer_delivery_state,
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        if let Err(error) = self
+            .transport
+            .prepare_background_replica_dispatch(requests, &producer_delivery)
+        {
+            self.observe_replica_fanout_result(&identities, Err(error))?;
+            unreachable!("failed fanout result returns its error");
+        }
+        let outcomes = expected_targets
+            .iter()
             .map(|_| StageBlobSendOutcome {
                 sent: true,
                 last_error: None,
+                delivery_state: Some(sinomo_core::network::NetworkDeliveryState::PossiblyApplied),
             })
-            .collect())
+            .collect::<Vec<_>>();
+        for ((target, intent, request_id, stage), outcome) in identities.iter().zip(&outcomes) {
+            self.observe_replica_transfer_delivery(intent, target, request_id, *stage, outcome)?;
+        }
+        Ok(outcomes)
     }
 
     pub(crate) fn prepare_current_background_repair_replica_sends(
@@ -492,10 +726,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         message: DfsNetworkMessage,
     ) -> Result<bool, DfsError> {
         let routed_message = self.next_dfs_routed_message(target_node_id, message);
-        match self
-            .transport
-            .send_routed_call(target_node_id, DfsRoutedCall::value(routed_message))
-        {
+        match self.transport.send_routed_call(
+            target_node_id,
+            crate::message_transport::native_snapshot_routed_call(routed_message)?,
+        ) {
             Ok(()) => Ok(true),
             Err(NetworkError::UnknownNode { .. }) => Ok(false),
             Err(error) => Err(DfsError::from_network(error)),
@@ -513,6 +747,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         target_node_id: &NodeId,
         message: DfsNetworkMessage,
     ) -> Result<bool, DfsError> {
+        if matches!(&message, DfsNetworkMessage::MetadataSnapshotInstall(_)) {
+            return Err(DfsError::Distributed {
+                message: "snapshot images require the ordinary streamed call owner".into(),
+            });
+        }
         let routed_message = self.next_dfs_routed_message(target_node_id, message);
         match self
             .transport
@@ -561,6 +800,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             DfsOutboundAttachment::from_reader(reader, patch_size_bytes, patch_hash),
         )?;
         Ok(StageBlobSendOutcome {
+            delivery_state: send_outcome.delivery_state,
             sent: send_outcome.sent,
             last_error: send_outcome.last_error,
         })
@@ -599,11 +839,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 kind: ReplicaTransferKind::Stage,
             },
         )?;
+        let identities = self.begin_replica_sends(&requests)?;
+        #[cfg(any(test, feature = "test-support"))]
+        let _native_context = self.native_stage_send_context(&requests);
         let outcomes = self
             .transport
-            .send_routed_calls_bounded(requests, DFS_REPLICA_BODY_FANOUT_CAP)
-            .map_err(DfsError::from_network)?;
-        validate_replica_body_fanout_outcomes(&expected_targets, outcomes)
+            .send_routed_calls_bounded(requests, DFS_REPLICA_BODY_FANOUT_CAP);
+        let outcomes = self.observe_replica_fanout_result(&identities, outcomes)?;
+        self.finish_replica_sends(&identities, &expected_targets, outcomes)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -639,11 +882,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 kind: ReplicaTransferKind::Repair,
             },
         )?;
+        let identities = self.begin_replica_sends(&requests)?;
         let outcomes = self
             .transport
-            .send_routed_calls_bounded(requests, DFS_REPLICA_BODY_FANOUT_CAP)
-            .map_err(DfsError::from_network)?;
-        validate_replica_body_fanout_outcomes(&expected_targets, outcomes)
+            .send_routed_calls_bounded(requests, DFS_REPLICA_BODY_FANOUT_CAP);
+        let outcomes = self.observe_replica_fanout_result(&identities, outcomes)?;
+        self.finish_replica_sends(&identities, &expected_targets, outcomes)
     }
 
     pub(crate) fn send_best_effort_message_if_routable(
@@ -679,24 +923,52 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         message: DfsNetworkMessage,
         attachment: DfsOutboundAttachment,
     ) -> Result<DfsBestEffortMessageSendOutcome, DfsError> {
+        let transfer = replica_transfer_identity(&message);
+        let background_repair = matches!(&message, DfsNetworkMessage::RepairReplica(command) if command.background_repair);
+        if let Some((intent, request_id, stage)) = &transfer {
+            self.begin_replica_transfer_attempt(
+                intent,
+                target_node_id,
+                request_id,
+                *stage,
+                background_repair,
+            )?;
+        }
         let routed_message = self.next_dfs_routed_message(target_node_id, message);
-        match self.transport.send_routed_call(
+        let outcome = match self.transport.send_routed_call(
             target_node_id,
             DfsRoutedCall::with_attachment(routed_message, attachment),
         ) {
-            Ok(()) => Ok(DfsBestEffortMessageSendOutcome {
+            Ok(()) => DfsBestEffortMessageSendOutcome {
+                delivery_state: Some(sinomo_core::network::NetworkDeliveryState::PossiblyApplied),
                 sent: true,
                 last_error: None,
-            }),
-            Err(NetworkError::UnknownNode { .. }) => Ok(DfsBestEffortMessageSendOutcome {
+            },
+            Err(NetworkError::UnknownNode { .. }) => DfsBestEffortMessageSendOutcome {
+                delivery_state: None,
                 sent: false,
                 last_error: None,
-            }),
-            Err(error) => Ok(DfsBestEffortMessageSendOutcome {
+            },
+            Err(error) => DfsBestEffortMessageSendOutcome {
+                delivery_state: error.delivery_state(),
                 sent: false,
                 last_error: Some(error.to_string()),
-            }),
+            },
+        };
+        if let Some((intent, request_id, stage)) = transfer {
+            self.observe_replica_transfer_delivery(
+                &intent,
+                target_node_id,
+                &request_id,
+                stage,
+                &StageBlobSendOutcome {
+                    sent: outcome.sent,
+                    last_error: outcome.last_error.clone(),
+                    delivery_state: outcome.delivery_state,
+                },
+            )?;
         }
+        Ok(outcome)
     }
 
     pub(crate) fn send_best_effort_message_if_routable_outcome(
@@ -704,17 +976,50 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         target_node_id: &NodeId,
         message: DfsNetworkMessage,
     ) -> Result<DfsBestEffortMessageSendOutcome, DfsError> {
-        match self.send_dfs_message_if_routable(target_node_id, message) {
-            Ok(sent) => Ok(DfsBestEffortMessageSendOutcome {
-                sent,
-                last_error: None,
-            }),
-            Err(DfsError::Network { message }) => Ok(DfsBestEffortMessageSendOutcome {
-                sent: false,
-                last_error: Some(message),
-            }),
-            Err(error) => Err(error),
+        let transfer = replica_transfer_identity(&message);
+        let background_repair = matches!(&message, DfsNetworkMessage::RepairReplica(command) if command.background_repair);
+        let routed = self.next_dfs_routed_message(target_node_id, message);
+        let call = crate::message_transport::native_snapshot_routed_call(routed)?;
+        if let Some((intent, request_id, stage)) = &transfer {
+            self.begin_replica_transfer_attempt(
+                intent,
+                target_node_id,
+                request_id,
+                *stage,
+                background_repair,
+            )?;
         }
+        let result = self.transport.send_routed_call(target_node_id, call);
+        let outcome = match result {
+            Ok(()) => DfsBestEffortMessageSendOutcome {
+                sent: true,
+                last_error: None,
+                delivery_state: Some(sinomo_core::network::NetworkDeliveryState::PossiblyApplied),
+            },
+            Err(error) => DfsBestEffortMessageSendOutcome {
+                sent: false,
+                delivery_state: error.delivery_state(),
+                last_error: if matches!(&error, NetworkError::UnknownNode { .. }) {
+                    None
+                } else {
+                    Some(error.to_string())
+                },
+            },
+        };
+        if let Some((intent, request_id, stage)) = transfer {
+            self.observe_replica_transfer_delivery(
+                &intent,
+                target_node_id,
+                &request_id,
+                stage,
+                &StageBlobSendOutcome {
+                    sent: outcome.sent,
+                    last_error: outcome.last_error.clone(),
+                    delivery_state: outcome.delivery_state,
+                },
+            )?;
+        }
+        Ok(outcome)
     }
 
     pub(crate) fn next_request_id(&mut self) -> String {

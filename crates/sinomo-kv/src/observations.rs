@@ -31,6 +31,18 @@ pub enum KvCommittedObservationKind {
     Replacement,
 }
 
+/// One actual newly applied request/result under its enclosing native quorum.
+/// This observation grants no authority and is never synthesized for replay.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct KvOriginalCurrentTermCommit {
+    pub root: PathBuf,
+    pub node_id: sinomo_node::NodeId,
+    pub request: crate::KvCommandRequest,
+    pub committed: crate::KvCommittedRequestRecord,
+    /// The actual certified enclosing prefix; the stored request keeps its own coordinates.
+    pub authority: crate::KvAuthorityProof,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KvCommittedObservationPayload {
     pub delta: Option<Arc<ClusterKvCommittedDelta>>,
@@ -75,6 +87,7 @@ pub struct KvCommittedObservation {
     pub applied_index: Option<u64>,
     pub kind: KvCommittedObservationKind,
     pub value: KvCommittedObservationValue,
+    pub original_current_term_commits: Option<Arc<Vec<Arc<KvOriginalCurrentTermCommit>>>>,
     preparation: OnceLock<()>,
     delivery: Arc<DeliveryStatus>,
 }
@@ -98,6 +111,7 @@ impl PartialEq for KvCommittedObservation {
             && self.applied_index == other.applied_index
             && self.kind == other.kind
             && self.value == other.value
+            && self.original_current_term_commits == other.original_current_term_commits
     }
 }
 impl Eq for KvCommittedObservation {}
@@ -135,6 +149,9 @@ enum Slot {
         storage_released: bool,
         proposal_released: bool,
         resolution: Option<Resolution>,
+        original_current_term_commits: Option<Arc<Vec<Arc<KvOriginalCurrentTermCommit>>>>,
+        uncertified_original_requests:
+            Vec<(crate::KvCommandRequest, crate::KvCommittedRequestRecord)>,
     },
     Delivering {
         lease: u64,
@@ -153,6 +170,7 @@ struct QueueState {
     drainer_thread: Option<std::thread::ThreadId>,
     next_subscription: u64,
     subscribers: BTreeMap<u64, Observer>,
+    original_commit_interests: BTreeSet<u64>,
     failure_events: u64,
     suppressed_failures: u64,
 }
@@ -181,6 +199,7 @@ impl Queue {
                 drainer_thread: None,
                 next_subscription: 1,
                 subscribers: BTreeMap::new(),
+                original_commit_interests: BTreeSet::new(),
                 failure_events: 0,
                 suppressed_failures: 0,
             }),
@@ -231,13 +250,20 @@ impl Queue {
                     metadata,
                     delivery,
                     resolution,
+                    original_current_term_commits,
                     ..
                 } = std::mem::replace(&mut state.slots[index], Slot::Free)
                 else {
                     unreachable!("eligible committed slot")
                 };
                 state.slots[index] = Slot::Delivering { lease };
-                guard.in_flight = Some((index, lease, metadata, Arc::clone(&delivery)));
+                guard.in_flight = Some((
+                    index,
+                    lease,
+                    metadata,
+                    Arc::clone(&delivery),
+                    original_current_term_commits.clone(),
+                ));
                 let resolution = resolution.expect("eligible resolution");
                 let observers = if matches!(resolution, Resolution::NoEffect) {
                     Vec::new()
@@ -248,9 +274,25 @@ impl Queue {
                         .map(|(id, observer)| (*id, Arc::clone(observer)))
                         .collect::<Vec<_>>()
                 };
-                (index, lease, metadata, delivery, resolution, observers)
+                (
+                    index,
+                    lease,
+                    metadata,
+                    delivery,
+                    resolution,
+                    original_current_term_commits,
+                    observers,
+                )
             };
-            let (index, lease, metadata, delivery, resolution, observers) = next;
+            let (
+                index,
+                lease,
+                metadata,
+                delivery,
+                resolution,
+                original_current_term_commits,
+                observers,
+            ) = next;
             let failed = std::cell::RefCell::new(BTreeSet::new());
             let mark_failed = |subscriber_id| {
                 if failed.borrow_mut().insert(subscriber_id) {
@@ -271,6 +313,7 @@ impl Queue {
                     applied_index,
                     kind,
                     value,
+                    original_current_term_commits: original_current_term_commits.clone(),
                     preparation: OnceLock::new(),
                     delivery: Arc::clone(&delivery),
                 };
@@ -294,6 +337,7 @@ impl Queue {
                                     subscriber_id: *subscriber_id,
                                 },
                             ),
+                            original_current_term_commits: None,
                             preparation: OnceLock::new(),
                             delivery: Arc::clone(&delivery),
                         };
@@ -407,7 +451,13 @@ impl Queue {
 
 struct DrainGuard {
     queue: Arc<Queue>,
-    in_flight: Option<(usize, u64, Metadata, Arc<DeliveryStatus>)>,
+    in_flight: Option<(
+        usize,
+        u64,
+        Metadata,
+        Arc<DeliveryStatus>,
+        Option<Arc<Vec<Arc<KvOriginalCurrentTermCommit>>>>,
+    )>,
     armed: bool,
 }
 
@@ -421,7 +471,9 @@ impl Drop for DrainGuard {
             .state
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if let Some((index, lease, metadata, delivery)) = self.in_flight.take() {
+        if let Some((index, lease, metadata, delivery, original_current_term_commits)) =
+            self.in_flight.take()
+        {
             if matches!(state.slots[index], Slot::Delivering { lease: current } if current == lease)
             {
                 state.slots[index] = Slot::Committed {
@@ -433,6 +485,8 @@ impl Drop for DrainGuard {
                     resolution: Some(Resolution::Gap(
                         KvCommittedObservationDiscontinuity::PublicationAbandoned,
                     )),
+                    original_current_term_commits,
+                    uncertified_original_requests: Vec::new(),
                 };
             }
         }
@@ -819,6 +873,8 @@ impl KvObservationCapacityPermit {
             storage_released: false,
             proposal_released: proposal.is_none(),
             resolution: None,
+            original_current_term_commits: None,
+            uncertified_original_requests: Vec::new(),
         };
         source.committed = Some((metadata, storage, proposal));
         Ok(KvCommittedObservationReceipt { receipt })
@@ -921,6 +977,138 @@ struct Receipt {
 }
 
 impl KvCommittedObservationReceipt {
+    /// Copy actual newly applied DATA while its same resident node is held,
+    /// before checkpoint compaction. No proof, callback or authority is created.
+    pub(crate) fn capture_original_current_term_requests(
+        &self,
+        node: &crate::raft::DurableRaftKvNode,
+        before_index: u64,
+        committed_index: u64,
+    ) {
+        let mut state = self
+            .receipt
+            .queue
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if state.original_commit_interests.is_empty() {
+            return;
+        }
+        let entries = node
+            .log()
+            .iter()
+            .filter(|entry| before_index < entry.index && entry.index <= committed_index);
+        // A changed native voter configuration cannot inherit this wave's voter
+        // fence. Its own existing configuration operation retains its own proof.
+        if entries
+            .clone()
+            .any(|entry| crate::raft::command_may_mutate_cluster_raft_config(&entry.command))
+        {
+            return;
+        }
+        let Slot::Committed {
+            lease,
+            uncertified_original_requests,
+            ..
+        } = &mut state.slots[self.receipt.index]
+        else {
+            return;
+        };
+        if *lease != self.receipt.lease {
+            return;
+        }
+        for entry in entries.filter(|entry| entry.term == node.hard_state().current_term) {
+            let Some(committed) = node.store().committed_request(&entry.request_id) else {
+                continue;
+            };
+            if committed.term != entry.term || committed.log_index != entry.index {
+                continue;
+            }
+            let request =
+                crate::KvCommandRequest::new(entry.request_id.clone(), entry.command.clone());
+            if uncertified_original_requests
+                .iter()
+                .any(|(prior, _)| prior.request_id == request.request_id)
+            {
+                continue;
+            }
+            uncertified_original_requests.push((request, committed.clone()));
+        }
+    }
+
+    /// Attach only the existing actual wave's certified prefix to its copied
+    /// stored requests. Same receipt and exact release latches own every fact.
+    pub(crate) fn observe_original_current_term_commits(
+        &self,
+        node_id: &sinomo_node::NodeId,
+        request: &crate::KvCommandRequest,
+        committed: &crate::KvCommittedRequestRecord,
+        entry: &crate::raft::KvLogEntry,
+        authority: crate::KvAuthorityProof,
+    ) {
+        let mut state = self
+            .receipt
+            .queue
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if state.original_commit_interests.is_empty() {
+            return;
+        }
+        if !matches!(authority.basis, crate::KvAuthorityBasis::CurrentTermQuorum { voter_acks, required_quorum }
+            if required_quorum > 0 && voter_acks >= required_quorum)
+            || request.request_id != committed.request_id
+            || entry.request_id != request.request_id
+            || entry.command != request.command
+            || entry.term != committed.term
+            || entry.index != committed.log_index
+            || authority.term != committed.term
+            || authority.commit_index < committed.log_index
+            || authority.revision < committed.revision
+        {
+            return;
+        }
+        if let Slot::Committed {
+            lease,
+            metadata,
+            original_current_term_commits,
+            uncertified_original_requests,
+            ..
+        } = &mut state.slots[self.receipt.index]
+            && *lease == self.receipt.lease
+            && metadata.applied_index == Some(authority.commit_index)
+            && metadata.revision == Some(authority.revision)
+        {
+            let mut copied = std::mem::take(uncertified_original_requests);
+            if !copied
+                .iter()
+                .any(|(prior, _)| prior.request_id == request.request_id)
+            {
+                copied.push((request.clone(), committed.clone()));
+            }
+            let originals = Arc::make_mut(
+                original_current_term_commits.get_or_insert_with(|| Arc::new(Vec::new())),
+            );
+            for (request, committed) in copied {
+                if committed.term != authority.term
+                    || committed.log_index > authority.commit_index
+                    || committed.revision > authority.revision
+                    || originals
+                        .iter()
+                        .any(|prior| prior.request.request_id == request.request_id)
+                {
+                    continue;
+                }
+                originals.push(Arc::new(KvOriginalCurrentTermCommit {
+                    root: self.receipt.queue.root.clone(),
+                    node_id: node_id.clone(),
+                    request,
+                    committed,
+                    authority,
+                }));
+            }
+        }
+    }
     /// Causal preparation evidence for this receipt's own delivered event.
     /// Inspect after completion; neither subscriber presence nor another
     /// publication's preparation can set this flag.
@@ -1309,15 +1497,33 @@ pub fn subscribe_committed_observations(
     KvCommittedObservationSubscription { queue, id }
 }
 
+impl KvCommittedObservationSubscription {
+    /// Opt this SAME lifecycle-owned subscription into copying original producer
+    /// facts. Ordinary subscriptions copy none. This grants no KV authority.
+    pub fn include_original_current_term_commits(&self, enabled: bool) {
+        let mut state = self
+            .queue
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if enabled && state.subscribers.contains_key(&self.id) {
+            state.original_commit_interests.insert(self.id);
+        } else {
+            state.original_commit_interests.remove(&self.id);
+        }
+    }
+}
+
 impl Drop for KvCommittedObservationSubscription {
     fn drop(&mut self) {
         let removed = {
-            self.queue
+            let mut state = self
+                .queue
                 .state
                 .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .subscribers
-                .remove(&self.id)
+                .unwrap_or_else(|error| error.into_inner());
+            state.original_commit_interests.remove(&self.id);
+            state.subscribers.remove(&self.id)
         };
         // Callback captures may have arbitrary reentrant destructors.
         drop(removed);

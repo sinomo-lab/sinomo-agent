@@ -387,8 +387,11 @@ Stale intents may remain after a primary handoff, but `commitVisibleVersion`
 requires current primary and epoch, so stale intents must be retried or aborted
 rather than becoming visible writes.
 
-The `dfs_canonical_write_eligibility_safety.safety` invariant refines the
-ordinary, non-local-first canonical write gate:
+The `dfs_canonical_write_eligibility_safety.safety` invariant focuses on the
+ordinary, non-local-first canonical write gate. Its handoff transition retains
+an older full-union restriction, so it omits accepted joint-majority activation
+paths and does not establish complete current handoff conformance. The current
+logical contract is:
 
 - content durability is a DFS concern: a publish needs `W` exact-operation
   receipts from desired content replicas, not a per-file KV entry;
@@ -414,12 +417,14 @@ ordinary, non-local-first canonical write gate:
   backend write freeze, and acknowledges the exact frozen journal head and
   fingerprint. The freeze survives restart and rejects all authoritative
   metadata-table mutations while still allowing replay and handoff transfer;
-- activation copies that exact fenced prefix to the union of the retiring and
-  desired metadata assignments, requires exact acknowledgements from every
-  member of that union, and accepts only a completion proof equal to the
-  immutable retiring-primary fence. This carries writes which finished after
-  the quorum-side pending decision but before the retiring primary observed it;
-- only after the union proof succeeds does the desired assignment become the
+- activation transfers the exact fenced prefix across the retiring and desired
+  assignments and requires a majority of each assignment, explicit
+  acknowledgements from both primaries, and no foreign acknowledger. The
+  completion proof must equal the immutable retiring-primary fence and carry
+  the captured operation floor and exact Raft watermark. This permits an
+  offline configured replica while carrying writes admitted before the pending
+  decision and finished before the retiring freeze;
+- only after the joint proof succeeds does the desired assignment become the
   active writer. The durable local marker advances to the activated epoch;
   only an instance rebound after observing that exact generation may write,
   so independently opened stale instances remain fenced. A proof-carrying
@@ -440,8 +445,8 @@ staging through the metadata primary. This is a refinement target for the
 manifest routing decision; namespace admission, concrete wire validation,
 storage barriers, and canonical rebasing are additionally exercised in Rust.
 
-This is a current-behavior refinement of the canonical publication decision,
-not a model of storing file metadata in KV. Cluster KV supplies committed DFS
+This is a focused canonical publication contract with the handoff coverage
+restriction above, not a model of storing file metadata in KV. Cluster KV supplies committed DFS
 configuration facts plus the bounded operation permit and head watermark used
 when the exact metadata shard cannot all acknowledge the operation. This
 reuses the cluster's existing Raft election, commit index, and linearizable log;
@@ -451,8 +456,115 @@ cases deliberately set `W=1`, below cluster quorum, so the unsafe minority-side
 case remains reachable. POSIX fsync/lock and all local-first models are kept
 unchanged and outside this slice.
 
+### Whole-shard prepare, publication and handoff
+
+The `dfs-whole-shard` case composes `prepare(payload)`, digest-bound commit,
+ordinary full-shard authority, degraded recovery, handoff and exact replay in
+one logical transition system. State and actions live in
+`models/dfs/whole_shard.qnt`; predicates and witnesses live in
+`checks/dfs/whole_shard_safety.qnt`. This is a **bounded abstract target
+contract**. Conformance is established only for the exact Rust build, source,
+schema and model bound to a successfully replayed native capture. Its degraded
+path requires the actual metadata recovery majority and operation-bound native
+KV permit; content receipts and Raft votes cannot substitute for that evidence.
+
+The whole-shard refinement assumes the independently verified R0 atomic-KV
+contract. A permit must retain the same ordinary call's exact request and result,
+matching submitted and committed digests, a current-term quorum receipt with
+nonzero term/index and matching revision, and the exact scoped compares/effects
+decoded from their original SOBJ bytes. The adapter does not serialize another
+digest input or infer voter identities from an ACK count. Detailed multi-voter
+identity scenarios remain unavailable when the native receipt lacks those IDs.
+
+The bound is at most four eligible nodes, an immutable exact native voter
+configuration, one observed writer lane per node, one object, two operations, four semantic journal events,
+two epochs and one handoff. Exploration defaults to content `W=1`; native replay
+uses the exact supported captured W and target set. Full canonical current V7
+configuration identity is represented by an equality token; different policies
+or assignments,
+multiple lanes on one node and cluster-voter reconfiguration are outside this
+finite exploration. Native replay initializes a validated immutable profile
+with the exact node, voter, metadata, content-target and required-W sets.
+The default exploration uses three voters; the one-voter scenario retains
+one KV voter with distinct metadata members and does not relabel learners. A native trace with unsupported identities or additional
+effects must be reported unavailable, never coerced into this bound.
+
+Healthy publication needs exact prepare acknowledgements from every configured
+metadata member. The complete transaction remains hidden until its matching
+commit. Content `W` alone cannot publish. Both typed authorization paths acquire
+the same publication guard and revalidate the exact shard configuration plus
+absence of a pending handoff. Admission and durable commit are separate model
+actions: an already admitted writer may finish after the pending Raft decision,
+but freeze waits for guard release and a cached permit cannot admit another
+writer after that decision.
+
+Handoff captures a native prepared-operation floor and an exact native Raft
+watermark, separately from the local journal height at the pending decision.
+The retiring freeze captures the complete immutable prefix. Activation needs
+majorities of both assignments, both primary acknowledgements, an exact frozen
+prefix and the captured floor/watermark. A promoted primary persists its marker
+before its acknowledgement counts. A typed StorageImport cause may advance the
+epoch with the same primary and members through these same freeze and activation
+gates; its exact source cut, current image and pending mapping remain bound.
+Activation does not bind a process-local
+writer; binding additionally verifies the completion generation and a matching
+or certified contiguous local extension. Lost replies and restart do not undo
+durable commit, and exact retry cannot append a second logical commit.
+
+Run the registered simulation, required deterministic witnesses and deliberately
+broken gates with:
+
+```bash
+QUINT_RUN_SEED=0x51a020261006 bash scripts/formal/check-quint.sh whole-shard
+```
+
+This uses Quint 0.32.0, the TypeScript simulator, 1,000 random traces of 40 steps
+and nine deterministic scenarios. The scenarios require healthy
+authority, degraded permit/minority rejection, a late admitted write carried
+through joint activation with an offline member, promotion/rebind/stale epoch,
+cached-permit rejection after pending, digest/divergent-prefix rejection and
+watermark carry, and healthy/degraded paths with one actual model voter. Four negative controls remove the metadata authority, joint
+certificate, pending-handoff admission or digest gate and must produce an actual
+invariant violation. A disabled or truncated trace is not an expected
+counterexample. Override simulation bounds with
+`QUINT_WHOLE_SHARD_MAX_SAMPLES` and `QUINT_WHOLE_SHARD_MAX_STEPS`.
+
+The registered symbolic case is deep-tier, with default depth eight and the
+repository's Apalache 0.56.1 pin. Simulation, deterministic reachability,
+symbolic bounded checking and native implementation conformance are separate
+evidence classes. The model hides native Raft elections, storage-byte barriers,
+wire validation, scheduling and unbounded liveness.
+
+Native conformance requires versioned events from the actual runtime owners,
+independent observed state projection and replay through enabled Quint actions
+to the complete terminal cursor. It must retain exact u64 values, certified
+initial cuts, complete native journal intervals, owner/root/lane incarnation,
+whole configuration, operation/payload identities and native quorum/prefix
+proofs. A bootstrap cut cannot be replaced by literal genesis or arithmetic
+sequence subtraction. Complete transaction visibility must be checked from
+actual rows, not inferred from a commit label. Missing, dropped, discontinuous,
+truncated, unsupported or unresolved observations fail availability; only
+observed transitions proven irrelevant to every modeled field may stutter.
+The shared verifier `scripts/formal/check-shard-trace.py` validates the versioned
+`scripts/formal/shard-trace-v1.schema.json` envelope and checks a complete finite
+boundary with actual enabled Quint actions and `.expect` on independently
+observed post-state. It requires the complete terminal cursor, so a safe
+but disabled prefix fails. Both the transition model and its invariant suite
+are included in the `model_sha256` binding. Native u64 values use checked
+canonical decimal strings. `scripts/formal/test-shard-trace.py` exercises this
+boundary and explicitly labels its generated inputs as synthetic sensitivity
+tests. The native held-table/initial-cut/atomic-footprint projector remains
+unavailable until the actual Rust hooks supply that complete semantic evidence;
+the verifier therefore cannot currently return native conformance success.
+
+Model-generated traces establish checker sensitivity only. Until a complete
+native Rust trace passes that replay boundary, this remains a target contract.
+
 The `dfs_metadata_handoff_union_sync_safety.safety` invariant isolates the
-exact-union sync primitive used after the retiring-primary fence:
+older, stronger exact-union sync primitive after the retiring-primary fence.
+Its removal-only full-union requirement below is not the current native
+activation threshold; the native joint validator also admits partial unions
+meeting both majorities and both primary acknowledgements:
 
 - the retiring assignment is `{N1,N2}`, the desired assignment is `{N1,N3}`,
   and activation requires the complete union `{N1,N2,N3}`;

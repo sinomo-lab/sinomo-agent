@@ -1,0 +1,377 @@
+{
+  "source_journal_sha256": "ae500b3e4d8ceb242daf5f7d5f01719a658e98440758be4048b84db01a7979bf",
+  "prepare": {
+    "shard_id": "services",
+    "sequence": 7,
+    "created_at": "2026-10-09T03:24:47.902376049Z",
+    "mutation": {
+      "type": "prepare-operation-v7",
+      "file_system_id": "3m3x1ehfwt2cca4jkz8r1jwq9g",
+      "operation_id": "namespace-request:req-b12c9386a7faa520c0b7a3ca:file-history:capture-01m4fb28n0h66cfx78xm8kyjfk",
+      "record": {
+        "digest": {
+          "protocol_version": 7,
+          "file_system_id": "3m3x1ehfwt2cca4jkz8r1jwq9g",
+          "shard_id": "services",
+          "owner_epoch": 1,
+          "operation_id": "namespace-request:req-b12c9386a7faa520c0b7a3ca:file-history:capture-01m4fb28n0h66cfx78xm8kyjfk",
+          "payload_digest": "dfs-prepared-operation-v7:blake3:6b282403c82bf142434d7a2f7ee205b28f7c1883bb7f10e1c3e7113f4a444b53",
+          "prepare_sequence": 7
+        },
+        "payload": {
+          "protocol_version": 7,
+          "file_system_id": "3m3x1ehfwt2cca4jkz8r1jwq9g",
+          "shard_id": "services",
+          "owner_epoch": 1,
+          "operation_id": "namespace-request:req-b12c9386a7faa520c0b7a3ca:file-history:capture-01m4fb28n0h66cfx78xm8kyjfk",
+          "journal_operation_id": null,
+          "expected_journal_sequence": null,
+          "expected_object_versions": [
+            {
+              "object_id": "42nkpta2m4bdva474t611pnvzc",
+              "expected_version": "01m4fb28n0h66cfx78xm8kyjfk"
+            }
+          ],
+          "expected_path_occupants": [
+            {
+              "path": "services/granted-file",
+              "expected_object_id": "42nkpta2m4bdva474t611pnvzc"
+            }
+          ],
+          "transaction": {
+            "content_reference_identity": {
+              "file_system_id": "3m3x1ehfwt2cca4jkz8r1jwq9g",
+              "object_id": "42nkpta2m4bdva474t611pnvzc",
+              "version": "01m4fb28n0h66cfx78xm8kyjfk"
+            },
+            "contribution_digest": "ec5058b6bcf0087845be188ce0d47ba2f5f4bc014a52bad7019179d008ec6484",
+            "extension_expectations": [
+              {
+                "object_id": "42nkpta2m4bdva474t611pnvzc",
+                "version": "01m4fb28n0h66cfx78xm8kyjfk",
+                "expected": {
+                  "file_system_id": "3m3x1ehfwt2cca4jkz8r1jwq9g",
+                  "object_id": "42nkpta2m4bdva474t611pnvzc",
+                  "version": "01m4fb28n0h66cfx78xm8kyjfk",
+                  "content_hash": "blake3:77d1f35e34a6c8c8e65a32cf0336e1fccc3fb4d1c611ebe09970dd2074abe5dc",
+                  "size_bytes": 8,
+                  "locations": [
+                    "01m4fb26m58fq56fpcgt2xvdcg"
+                  ],
+                  "created_by_event_id": "01m4fb28nn45mqdc1nr7ddqdwr",
+                  "created_at": "2026-10-09T03:24:47.669437001Z",
+                  "visible": true,
+                  "retention": {},
+                  "module_metadata": {},
+                  "content_durability": {
+                    "source_version": "01m4fb28n0h66cfx78xm8kyjfk",
+                    "coordinator_node_id": "01m4fb26m58fq56fpcgt2xvdcg",
+                    "owner_epoch": 1,
+                    "desired_replica_node_ids": [
+                      "01m4fb26m58fq56fpcgt2xvdcg"
+                    ],
+                    "policy": {
+                      "min_commit_replicas": 1,
+                      "desired_replicas": 1
+                    }
+                  }
+                }
+              }
+            ],
+            "transaction_id": "file-history:capture-01m4fb28n0h66cfx78xm8kyjfk",
+            "file_system_id": "3m3x1ehfwt2cca4jkz8r1jwq9g",
+            "objects": [],
+            "versions": [
+              {
+                "file_system_id": "3m3x1ehfwt2cca4jkz8r1jwq9g",
+                "object_id": "42nkpta2m4bdva474t611pnvzc",
+                "version": "01m4fb28n0h66cfx78xm8kyjfk",
+                "content_hash": "blake3:77d1f35e34a6c8c8e65a32cf0336e1fccc3fb4d1c611ebe09970dd2074abe5dc",
+                "size_bytes": 8,
+                "locations": [
+                  "01m4fb26m58fq56fpcgt2xvdcg"
+                ],
+                "created_by_event_id": "01m4fb28nn45mqdc1nr7ddqdwr",
+                "created_at": "2026-10-09T03:24:47.669437001Z",
+                "visible": true,
+                "retention": {
+                  "module.dfs.history": {
+                    "order": 0,
+                    "grant": {
+                      "object": {
+                        "object_id": "42nkpta2m4bdva474t611pnvzc",
+                        "file_system_id": "3m3x1ehfwt2cca4jkz8r1jwq9g",
+                        "path": "/services/granted-file",
+                        "kind": "file",
+                        "owner_node_id": "01m4fb26m58fq56fpcgt2xvdcg",
+                        "current_locations": [
+                          "01m4fb26m58fq56fpcgt2xvdcg"
+                        ],
+                        "content_hash": "blake3:77d1f35e34a6c8c8e65a32cf0336e1fccc3fb4d1c611ebe09970dd2074abe5dc",
+                        "content_size_bytes": 8,
+                        "mode": 420,
+                        "uid": 0,
+                        "gid": 0,
+                        "accessed_at_unix_nanos": 1791516287647883326,
+                        "modified_at_unix_nanos": 1791516287669425404,
+                        "created_at_unix_nanos": 1791516287647883326,
+                        "changed_at_unix_nanos": 1791516287669425404,
+                        "version": "01m4fb28n0h66cfx78xm8kyjfk",
+                        "policy": "replicated-eventual",
+                        "last_modified_by_event_id": "01m4fb28nn45mqdc1nr7ddqdwr"
+                      },
+                      "granted_at_unix_nanos": 1791516287900956557,
+                      "origin": "explicit-operation"
+                    }
+                  }
+                },
+                "module_metadata": {
+                  "module.dfs.history": {
+                    "schema_version": 1,
+                    "payload": [
+                      123,
+                      34,
+                      107,
+                      105,
+                      110,
+                      100,
+                      34,
+                      58,
+                      34,
+                      99,
+                      104,
+                      101,
+                      99,
+                      107,
+                      112,
+                      111,
+                      105,
+                      110,
+                      116,
+                      34,
+                      44,
+                      34,
+                      111,
+                      112,
+                      101,
+                      114,
+                      97,
+                      116,
+                      105,
+                      111,
+                      110,
+                      95,
+                      105,
+                      100,
+                      34,
+                      58,
+                      34,
+                      99,
+                      97,
+                      112,
+                      116,
+                      117,
+                      114,
+                      101,
+                      45,
+                      48,
+                      49,
+                      109,
+                      52,
+                      102,
+                      98,
+                      50,
+                      56,
+                      110,
+                      48,
+                      104,
+                      54,
+                      54,
+                      99,
+                      102,
+                      120,
+                      55,
+                      56,
+                      120,
+                      109,
+                      56,
+                      107,
+                      121,
+                      106,
+                      102,
+                      107,
+                      34,
+                      125
+                    ]
+                  }
+                },
+                "content_durability": {
+                  "source_version": "01m4fb28n0h66cfx78xm8kyjfk",
+                  "coordinator_node_id": "01m4fb26m58fq56fpcgt2xvdcg",
+                  "owner_epoch": 1,
+                  "desired_replica_node_ids": [
+                    "01m4fb26m58fq56fpcgt2xvdcg"
+                  ],
+                  "policy": {
+                    "min_commit_replicas": 1,
+                    "desired_replicas": 1
+                  }
+                }
+              }
+            ],
+            "file_version_pins": {
+              "add": [
+                {
+                  "namespace": "module.dfs.history",
+                  "file_system_id": "3m3x1ehfwt2cca4jkz8r1jwq9g",
+                  "object_id": "42nkpta2m4bdva474t611pnvzc",
+                  "version": "01m4fb28n0h66cfx78xm8kyjfk",
+                  "pin_id": "ref/module.dfs.history/checkpoint",
+                  "created_at": "2026-10-09T03:24:47.901011978Z"
+                }
+              ]
+            },
+            "created_at": "2026-10-09T03:24:47.801222019Z"
+          },
+          "metadata_effects": [],
+          "content_receipts": [],
+          "required_replica_node_ids": [],
+          "prepared_intent": null,
+          "terminal_intent": null,
+          "completed_request": {
+            "file_system_id": "3m3x1ehfwt2cca4jkz8r1jwq9g",
+            "requester_node_id": "01m4fb26m58fq56fpcgt2xvdcg",
+            "request_id": "capture-01m4fb28n0h66cfx78xm8kyjfk",
+            "operation_id": "req-b12c9386a7faa520c0b7a3ca",
+            "authority_shard_id": "services",
+            "operation": {
+              "content-reference": {
+                "request": {
+                  "namespace": "module.dfs.history",
+                  "path": "/services/granted-file",
+                  "identity": {
+                    "file_system_id": "3m3x1ehfwt2cca4jkz8r1jwq9g",
+                    "object_id": "42nkpta2m4bdva474t611pnvzc",
+                    "version": "01m4fb28n0h66cfx78xm8kyjfk"
+                  },
+                  "operation": {
+                    "operation": "capture-current",
+                    "reference_id": "checkpoint",
+                    "metadata": {
+                      "schema_version": 1,
+                      "payload": [
+                        123,
+                        34,
+                        107,
+                        105,
+                        110,
+                        100,
+                        34,
+                        58,
+                        34,
+                        99,
+                        104,
+                        101,
+                        99,
+                        107,
+                        112,
+                        111,
+                        105,
+                        110,
+                        116,
+                        34,
+                        44,
+                        34,
+                        111,
+                        112,
+                        101,
+                        114,
+                        97,
+                        116,
+                        105,
+                        111,
+                        110,
+                        95,
+                        105,
+                        100,
+                        34,
+                        58,
+                        34,
+                        99,
+                        97,
+                        112,
+                        116,
+                        117,
+                        114,
+                        101,
+                        45,
+                        48,
+                        49,
+                        109,
+                        52,
+                        102,
+                        98,
+                        50,
+                        56,
+                        110,
+                        48,
+                        104,
+                        54,
+                        54,
+                        99,
+                        102,
+                        120,
+                        55,
+                        56,
+                        120,
+                        109,
+                        56,
+                        107,
+                        121,
+                        106,
+                        102,
+                        107,
+                        34,
+                        125
+                      ]
+                    }
+                  },
+                  "operation_id": "capture-01m4fb28n0h66cfx78xm8kyjfk"
+                }
+              }
+            },
+            "command_digest": "blake3:a02015229f795ca4fd3b5b6a5e1cdedb6d977a74c58f7ab54dcb8709703a203c",
+            "status": "completed",
+            "result": "applied",
+            "posix_coordination_result": null,
+            "recovery_attempts": 0,
+            "last_recovery_error": null,
+            "created_at": "2026-10-09T03:24:47.801222019Z",
+            "updated_at": "2026-10-09T03:24:47.901201327Z"
+          },
+          "completed_request_completion": null
+        },
+        "status": "prepared"
+      }
+    }
+  },
+  "commit": {
+    "shard_id": "services",
+    "sequence": 8,
+    "created_at": "2026-10-09T03:24:47.916682455Z",
+    "mutation": {
+      "type": "commit-prepared-operation-v7",
+      "file_system_id": "3m3x1ehfwt2cca4jkz8r1jwq9g",
+      "operation_id": "namespace-request:req-b12c9386a7faa520c0b7a3ca:file-history:capture-01m4fb28n0h66cfx78xm8kyjfk",
+      "digest": {
+        "protocol_version": 7,
+        "file_system_id": "3m3x1ehfwt2cca4jkz8r1jwq9g",
+        "shard_id": "services",
+        "owner_epoch": 1,
+        "operation_id": "namespace-request:req-b12c9386a7faa520c0b7a3ca:file-history:capture-01m4fb28n0h66cfx78xm8kyjfk",
+        "payload_digest": "dfs-prepared-operation-v7:blake3:6b282403c82bf142434d7a2f7ee205b28f7c1883bb7f10e1c3e7113f4a444b53",
+        "prepare_sequence": 7
+      }
+    }
+  }
+}

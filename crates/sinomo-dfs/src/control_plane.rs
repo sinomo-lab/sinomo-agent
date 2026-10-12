@@ -22,11 +22,8 @@ use sinomo_core::kv::{
     InProcessKvStore, KvCompare, KvEntry, KvError, KvOp, KvRevision, KvTxn, KvTxnResponse,
 };
 use sinomo_core::node::{
-    ClusterCapabilityPolicyRecord, DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY,
-    DFS_METADATA_PACKED_NAMESPACE_PREPARE_V2_CAPABILITY,
-    DFS_METADATA_PACKED_NAMESPACE_PREPARE_V3_CAPABILITY,
-    DFS_METADATA_PACKED_NAMESPACE_PREPARE_V6_CAPABILITY, NodeId, cluster_capability_policy_key,
-    cluster_member_key,
+    ClusterCapabilityPolicyRecord, DFS_METADATA_PREPARED_OPERATION_V7_CAPABILITY, NodeId,
+    cluster_capability_policy_key, cluster_member_key,
 };
 use sinomo_core::{ClusterMemberRecord, ClusterMemberState, DfsObjectPolicy};
 use std::collections::{BTreeMap, BTreeSet};
@@ -49,9 +46,26 @@ const MAX_RECENT_PLACEMENT_RECONCILIATION_ACTIVITIES: usize = 256;
 const FILE_SYSTEM_CONFIG_CAS_RETRIES: usize = 8;
 const PLACEMENT_AUTHORITY_RECOVERY_CAS_RETRIES: usize = 4;
 
+/// The exact native R0 response, retained without a second authority read.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsNativeTxnCommit {
+    pub request: sinomo_core::kv::KvTxnRequest,
+    pub result: sinomo_core::kv::ClusterKvTxnCompactCommitResult,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsMetadataOperationPermit {
+    pub file_system_id: DfsFileSystemId,
+    pub shard_id: String,
+    pub owner_epoch: u64,
+    pub operation_digest: String,
+    pub prepare_sequence: u64,
+    pub permit_id: String,
+    pub native_commit: Option<DfsNativeTxnCommit>,
+}
+
 #[derive(Debug, Eq, PartialEq)]
 enum MetadataOperationPermitAttempt {
-    Certified(String),
+    Certified(DfsMetadataOperationPermit),
     Rejected,
     RetryAfterCompareMiss,
 }
@@ -113,15 +127,13 @@ pub const DFS_PLACEMENT_AUTHORITY_BREAK_GLASS_ACKNOWLEDGEMENT: &str =
 /// process after acquiring the exclusive local data-owner lock. There is
 /// intentionally no time-based or cross-node automatic recovery path.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 struct DfsPlacementAuthorityPermitRecord {
     job_id: String,
     holder_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    holder_cluster_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    holder_node_id: Option<NodeId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    holder_session_id: Option<String>,
+    holder_cluster_id: String,
+    holder_node_id: NodeId,
+    holder_session_id: String,
 }
 
 #[derive(Debug)]
@@ -139,8 +151,6 @@ pub struct DfsPlacementAuthorityProcessIdentity {
     pub cluster_id: String,
     pub process_session_id: String,
 }
-
-pub use sinomo_api::dfs::control_plane::DfsPlacementAuthorityPermitHolderKind;
 
 pub use sinomo_api::dfs::control_plane::DfsPlacementAuthorityPermitStatus;
 
@@ -355,26 +365,9 @@ pub(crate) fn placement_authority_permit_value_requires_local_process_recovery(
     process: &DfsPlacementAuthorityProcessIdentity,
 ) -> Result<bool, KvError> {
     let record: DfsPlacementAuthorityPermitRecord = sinomo_core::kv::decode_kv_value(value)?;
-    Ok(
-        record.holder_cluster_id.as_deref() == Some(process.cluster_id.as_str())
-            && record.holder_node_id.as_ref() == Some(local_node_id)
-            && record.holder_session_id.is_some()
-            && record.holder_session_id.as_deref() != Some(process.process_session_id.as_str()),
-    )
-}
-
-fn placement_authority_permit_holder_kind(
-    record: &DfsPlacementAuthorityPermitRecord,
-) -> DfsPlacementAuthorityPermitHolderKind {
-    match (
-        &record.holder_cluster_id,
-        &record.holder_node_id,
-        &record.holder_session_id,
-    ) {
-        (Some(_), Some(_), Some(_)) => DfsPlacementAuthorityPermitHolderKind::Identified,
-        (None, None, None) => DfsPlacementAuthorityPermitHolderKind::Legacy,
-        _ => DfsPlacementAuthorityPermitHolderKind::Partial,
-    }
+    Ok(record.holder_cluster_id == process.cluster_id
+        && &record.holder_node_id == local_node_id
+        && record.holder_session_id != process.process_session_id)
 }
 
 fn placement_authority_permit_recovery_token(entry: &KvEntry) -> String {
@@ -394,11 +387,9 @@ fn placement_authority_permit_status_from_entry(
     entry: &KvEntry,
 ) -> Result<DfsPlacementAuthorityPermitStatus, KvError> {
     let record = entry.decode::<DfsPlacementAuthorityPermitRecord>()?;
-    let holder_kind = placement_authority_permit_holder_kind(&record);
     Ok(DfsPlacementAuthorityPermitStatus {
         file_system_id: file_system_id.clone(),
         job_id: record.job_id,
-        holder_kind,
         holder_cluster_id: record.holder_cluster_id,
         holder_node_id: record.holder_node_id,
         recovery_token: placement_authority_permit_recovery_token(entry),
@@ -409,16 +400,10 @@ fn placement_authority_busy_path(
     file_system_id: &DfsFileSystemId,
     record: &DfsPlacementAuthorityPermitRecord,
 ) -> String {
-    let holder = match (
-        &record.holder_cluster_id,
-        &record.holder_node_id,
-        &record.holder_session_id,
-    ) {
-        (Some(cluster_id), Some(node_id), Some(session_id)) => {
-            format!("held by node {node_id} in cluster {cluster_id}, daemon session {session_id}")
-        }
-        _ => "held by an unknown legacy session".to_string(),
-    };
+    let holder = format!(
+        "held by node {} in cluster {}, daemon session {}",
+        record.holder_node_id, record.holder_cluster_id, record.holder_session_id
+    );
     format!(
         "{}; active placement metadata mutation permit {holder} cannot be auto-expired; restart the owning daemon for guarded local-session recovery; a permanently removed node requires operator intervention after member revocation",
         placement_authority_permit_key(file_system_id),
@@ -463,18 +448,6 @@ fn merge_file_system_config_defaults(
     merged
 }
 
-fn legacy_placement_reconciliations_prefix(file_system_id: &DfsFileSystemId) -> String {
-    format!("{DFS_KV_PREFIX}/filesystems/{file_system_id}/placement-reconciliations/")
-}
-
-fn legacy_placement_reconciliation_key(file_system_id: &DfsFileSystemId, job_id: &str) -> String {
-    format!(
-        "{}{}",
-        legacy_placement_reconciliations_prefix(file_system_id),
-        normalize_segment(job_id)
-    )
-}
-
 fn validate_v1_placement_reconciliation_job(
     job: &DfsPlacementReconciliationJob,
 ) -> Result<(), KvError> {
@@ -486,14 +459,17 @@ fn validate_v1_placement_reconciliation_job(
             ),
         });
     }
-    let Some(accepted_config) = job.accepted_config.as_ref() else {
-        return Err(KvError::Serialization {
-            detail: format!(
-                "placement reconciliation job {} is missing its accepted config snapshot",
-                job.job_id
-            ),
-        });
-    };
+    let accepted_config = &job.accepted_config;
+    for rule in &accepted_config.subtree_policies {
+        crate::placement::placement_policy_from_rule(rule).map_err(|error| {
+            KvError::Serialization {
+                detail: format!(
+                    "placement reconciliation job {} has invalid policy at {}: {error}",
+                    job.job_id, rule.path_prefix
+                ),
+            }
+        })?;
+    }
     if accepted_config.file_system_id != job.file_system_id {
         return Err(KvError::Serialization {
             detail: format!(
@@ -540,6 +516,84 @@ fn validate_v1_placement_reconciliation_job(
         }
     }
     Ok(())
+}
+
+/// Build the same immutable reconciliation input consumed by normal placement
+/// publication. This function owns no KV, queue, samples, admission or authority.
+#[allow(clippy::too_many_arguments)]
+pub fn build_placement_reconciliation_job(
+    job_id: String,
+    config: &DfsFileSystemConfig,
+    path: String,
+    scope: crate::DfsPlacementScope,
+    unavailable_node_ids: BTreeSet<NodeId>,
+    candidate_snapshot: Vec<crate::DfsNodeAdvertisement>,
+    placement_snapshot: Option<crate::DfsPlacementSnapshot>,
+    created_at_unix_nanos: u64,
+) -> Result<DfsPlacementReconciliationJob, KvError> {
+    let mut job = DfsPlacementReconciliationJob {
+        schema_version: DFS_PLACEMENT_RECONCILIATION_SCHEMA_VERSION,
+        job_id,
+        file_system_id: config.file_system_id.clone(),
+        path,
+        scope,
+        unavailable_node_ids,
+        candidate_snapshot,
+        placement_snapshot,
+        adaptive: false,
+        adaptive_budget: None,
+        processed_content_bytes: 0,
+        accepted_config: config.clone(),
+        state: crate::DfsPlacementReconciliationState::Pending,
+        cursor: None,
+        total_object_count: 0,
+        scanned_object_count: 0,
+        matched_object_count: 0,
+        updated_object_count: 0,
+        scheduled_repair_count: 0,
+        completed_repair_count: 0,
+        pending_repair_count: 0,
+        revision: 0,
+        created_at_unix_nanos,
+        updated_at_unix_nanos: created_at_unix_nanos,
+        last_error: None,
+    };
+    job.accepted_config = scoped_placement_config_for_job(config, &job);
+    validate_v1_placement_reconciliation_job(&job)?;
+    Ok(job)
+}
+
+/// The normal adaptive producer and source conversion share this same job
+/// factory. All observations/configuration are supplied current DATA; budgets
+/// remain exact per-tick constraints and spent bytes remain cumulative DATA.
+#[allow(clippy::too_many_arguments)]
+pub fn build_adaptive_placement_reconciliation_job(
+    job_id: String,
+    config: &DfsFileSystemConfig,
+    path: String,
+    scope: crate::DfsPlacementScope,
+    unavailable_node_ids: BTreeSet<NodeId>,
+    candidate_snapshot: Vec<crate::DfsNodeAdvertisement>,
+    placement_snapshot: crate::DfsPlacementSnapshot,
+    budget: crate::DfsAdaptivePlacementBudget,
+    processed_content_bytes: u64,
+    created_at_unix_nanos: u64,
+) -> Result<DfsPlacementReconciliationJob, KvError> {
+    let mut job = build_placement_reconciliation_job(
+        job_id,
+        config,
+        path,
+        scope,
+        unavailable_node_ids,
+        candidate_snapshot,
+        Some(placement_snapshot),
+        created_at_unix_nanos,
+    )?;
+    job.adaptive = true;
+    job.adaptive_budget = Some(budget);
+    job.processed_content_bytes = processed_content_bytes;
+    validate_v1_placement_reconciliation_job(&job)?;
+    Ok(job)
 }
 
 fn validate_placement_reconciliation_queue(
@@ -862,7 +916,10 @@ pub fn metadata_shard_authority_barrier_key(
 /// ordinary authority checks overwrite that generic barrier, while an
 /// operation permit must remain effective until a later prepared operation
 /// advances this single per-shard floor.
-fn metadata_shard_operation_floor_key(file_system_id: &DfsFileSystemId, shard_id: &str) -> String {
+pub fn metadata_shard_operation_floor_key(
+    file_system_id: &DfsFileSystemId,
+    shard_id: &str,
+) -> String {
     format!(
         "{DFS_KV_PREFIX}/filesystems/{file_system_id}/metadata-operation-floors/{}",
         normalize_segment(shard_id)
@@ -912,100 +969,8 @@ pub fn metadata_shard_head_watermark_key(
 
 pub use sinomo_api::dfs::control_plane::DfsFileSystemConfig;
 
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "kebab-case")]
-pub enum DfsMetadataNamespacePrepareCodec {
-    /// Canonical full [`crate::DfsNamespacePrepareRecord`] journal payload.
-    #[default]
-    Legacy,
-    /// Packed-v1 authoritative journal payload. This may be selected only
-    /// after every assigned metadata member advertises decoder support.
-    /// Activation is one-way until a future rollback protocol proves a
-    /// legacy-readable snapshot and replay floor beyond all packed records.
-    PackedV1,
-    /// Indexed packed-v2 authoritative journal payload. This capability is
-    /// cumulative with every earlier codec and is selected only after every
-    /// assigned metadata member advertises the matching decoder capability.
-    PackedV2,
-    /// Complete file history: retained versions, transactional pins, repair
-    /// owners, and durability plans across metadata generations and retry GC.
-    /// Every assigned member must advertise the packed-v3 capability.
-    PackedV3,
-    /// Read-only interim history contracts. New binaries migrate these through
-    /// the ordinary fenced shard transition; they never author these formats.
-    #[serde(rename = "packed-v4")]
-    LegacyPackedV4,
-    #[serde(rename = "packed-v5")]
-    LegacyPackedV5,
-    /// Namespaced module metadata and independent durable revision grants.
-    /// Every assigned metadata member must advertise this cumulative decoder.
-    PackedV6,
-}
-
-impl DfsMetadataNamespacePrepareCodec {
-    pub(crate) const fn rank(self) -> u8 {
-        match self {
-            Self::Legacy => 0,
-            Self::PackedV1 => 1,
-            Self::PackedV2 => 2,
-            Self::PackedV3 | Self::LegacyPackedV4 | Self::LegacyPackedV5 => 3,
-            Self::PackedV6 => 6,
-        }
-    }
-
-    pub(crate) const fn label(self) -> &'static str {
-        match self {
-            Self::Legacy => "legacy",
-            Self::PackedV1 => "packed-v1",
-            Self::PackedV2 => "packed-v2",
-            Self::PackedV3 => "packed-v3",
-            Self::LegacyPackedV4 => "packed-v4",
-            Self::LegacyPackedV5 => "packed-v5",
-            Self::PackedV6 => "packed-v6",
-        }
-    }
-
-    pub(crate) const fn required_capability(self) -> Option<&'static str> {
-        match self {
-            Self::Legacy => None,
-            Self::PackedV1 => Some(DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY),
-            Self::PackedV2 => Some(DFS_METADATA_PACKED_NAMESPACE_PREPARE_V2_CAPABILITY),
-            Self::PackedV3 => Some(DFS_METADATA_PACKED_NAMESPACE_PREPARE_V3_CAPABILITY),
-            Self::LegacyPackedV4 => Some("dfs.metadata.file-history-repair.v1"),
-            Self::LegacyPackedV5 => Some("dfs.metadata.content-durability.v1"),
-            Self::PackedV6 => Some(DFS_METADATA_PACKED_NAMESPACE_PREPARE_V6_CAPABILITY),
-        }
-    }
-
-    pub(crate) const fn is_packed(self) -> bool {
-        !matches!(self, Self::Legacy)
-    }
-
-    pub const fn supports_file_history(self) -> bool {
-        matches!(
-            self,
-            Self::PackedV3 | Self::LegacyPackedV4 | Self::LegacyPackedV5 | Self::PackedV6
-        )
-    }
-
-    pub(crate) const fn supports_file_history_mutations(self) -> bool {
-        self.supports_retention_metadata_mutations()
-    }
-
-    pub const fn supports_retention_metadata_mutations(self) -> bool {
-        matches!(self, Self::PackedV6)
-    }
-
-    pub(crate) const fn supports_retained_repair_owners(self) -> bool {
-        self.supports_file_history()
-    }
-}
-
-fn metadata_namespace_prepare_codec_is_legacy(codec: &DfsMetadataNamespacePrepareCodec) -> bool {
-    *codec == DfsMetadataNamespacePrepareCodec::Legacy
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct DfsMetadataShardConfig {
     pub file_system_id: DfsFileSystemId,
     pub shard_id: String,
@@ -1014,11 +979,6 @@ pub struct DfsMetadataShardConfig {
     pub replica_node_ids: Vec<NodeId>,
     pub epoch: u64,
     pub assignment: DfsMetadataShardAssignment,
-    #[serde(
-        default,
-        skip_serializing_if = "metadata_namespace_prepare_codec_is_legacy"
-    )]
-    pub namespace_prepare_codec: DfsMetadataNamespacePrepareCodec,
     pub default_policy: DfsObjectPolicy,
 }
 
@@ -1048,6 +1008,27 @@ struct DfsMetadataShardOperationFloor {
     permit_id: String,
 }
 
+/// The current handoff protocol also certifies storage representation changes.
+/// The DFS runtime compares opaque source identity; legacy decoding stays in
+/// the migration component. None of these values grants author permission.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum DfsMetadataShardHandoffCause {
+    Membership,
+    StorageImport { cut: DfsMetadataStorageImportCut },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DfsMetadataStorageImportCut {
+    pub source_cut_digest: String,
+    pub source_journal_sequence: u64,
+    pub source_state_fingerprint: String,
+    pub target_prefix: crate::DfsMetadataPrefixProof,
+    pub converted_image_fingerprint: String,
+    pub pending_mapping_digest: String,
+}
+
 /// Quorum-committed fence separating a retiring metadata assignment from a
 /// desired assignment or primary role.
 ///
@@ -1057,6 +1038,7 @@ struct DfsMetadataShardOperationFloor {
 /// members and then provide [`DfsMetadataShardMembershipHandoffProof`].
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsMetadataShardMembershipHandoff {
+    pub cause: DfsMetadataShardHandoffCause,
     pub handoff_id: String,
     pub retiring_shard: DfsMetadataShardConfig,
     pub desired_shard: DfsMetadataShardConfig,
@@ -1091,6 +1073,7 @@ pub struct DfsMetadataShardMembershipHandoffFence {
 /// Exact DFS-state evidence consumed to activate a fenced reconfiguration.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsMetadataShardMembershipHandoffProof {
+    pub cause: DfsMetadataShardHandoffCause,
     pub handoff_id: String,
     pub retiring_shard: DfsMetadataShardConfig,
     pub desired_shard: DfsMetadataShardConfig,
@@ -1246,6 +1229,14 @@ pub trait DfsControlPlaneKvClient: std::fmt::Debug + Send {
         None
     }
 
+    /// Borrow only a snapshot already published by the normal host environment.
+    /// Source restoration waits without sampling, opening DFS or creating a
+    /// cache/registry when this retained observation is unavailable.
+    #[cfg(feature = "storage-conversion")]
+    fn storage_import_placement_snapshot(&self) -> Option<Arc<crate::DfsPlacementSnapshot>> {
+        None
+    }
+
     /// Confirm that this client is backed by the host's current exclusive
     /// ownership proof before recovering a permit from an earlier process.
     ///
@@ -1335,6 +1326,15 @@ pub trait DfsControlPlaneKvClient: std::fmt::Debug + Send {
 
     fn put(&mut self, key: String, value: Vec<u8>) -> Result<KvRevision, KvError>;
     fn txn(&mut self, txn: KvTxn) -> Result<KvTxnResponse, KvError>;
+
+    /// The default preserves ordinary transaction behavior but supplies no
+    /// native authority certificate. It cannot authorize a V7 recovery commit.
+    fn txn_with_native_authority(
+        &mut self,
+        txn: KvTxn,
+    ) -> Result<(KvTxnResponse, Option<DfsNativeTxnCommit>), KvError> {
+        Ok((self.txn(txn)?, None))
+    }
 
     /// Compare a control-plane value through the client's linearizable write
     /// path. The fresh barrier write is intentional: a compare-only or
@@ -1446,9 +1446,17 @@ pub trait AsyncDfsControlPlaneKvClient: std::fmt::Debug + Send {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct SharedDfsControlPlaneKvClient<C> {
     inner: Arc<Mutex<C>>,
+}
+
+impl<C> Clone for SharedDfsControlPlaneKvClient<C> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
 }
 
 impl<C> SharedDfsControlPlaneKvClient<C> {
@@ -1589,6 +1597,17 @@ where
                 detail: "control-plane KV client lock poisoned".to_string(),
             })?
             .txn(txn)
+    }
+    fn txn_with_native_authority(
+        &mut self,
+        txn: KvTxn,
+    ) -> Result<(KvTxnResponse, Option<DfsNativeTxnCommit>), KvError> {
+        self.inner
+            .lock()
+            .map_err(|_| KvError::Serialization {
+                detail: "control-plane KV client lock poisoned".into(),
+            })?
+            .txn_with_native_authority(txn)
     }
 }
 
@@ -1792,12 +1811,11 @@ impl<'a> PlacementUpdatePublication<'a> {
         job: &DfsPlacementReconciliationJob,
     ) -> Result<Self, KvError> {
         let mut durable_job = job.clone();
-        durable_job.accepted_config = Some(scoped_placement_config_for_job(desired, job));
+        durable_job.accepted_config = scoped_placement_config_for_job(desired, job);
         validate_v1_placement_reconciliation_job(&durable_job)?;
         let keys = vec![
             file_system_config_key(&expected.file_system_id),
             placement_reconciliation_key(&job.file_system_id, &job.job_id),
-            legacy_placement_reconciliation_key(&job.file_system_id, &job.job_id),
             placement_reconciliation_activity_record_key(&job.file_system_id, &job.job_id),
             placement_reconciliation_queue_key(&job.file_system_id),
             placement_reconciliation_activity_index_key(&job.file_system_id),
@@ -1815,23 +1833,15 @@ impl<'a> PlacementUpdatePublication<'a> {
         &self,
         entries: Vec<Option<KvEntry>>,
     ) -> Result<Option<PlacementUpdateInputs>, KvError> {
-        let [
-            config,
-            job,
-            legacy_job,
-            activity_record,
-            queue,
-            activity,
-            permit,
-        ]: [Option<KvEntry>; 7] = entries.try_into().map_err(|_| KvError::Serialization {
-            detail: "placement update exact-key projection has the wrong length".into(),
-        })?;
+        let [config, job, activity_record, queue, activity, permit]: [Option<KvEntry>; 6] =
+            entries.try_into().map_err(|_| KvError::Serialization {
+                detail: "placement update exact-key projection has the wrong length".into(),
+            })?;
         let Some(config) = config else {
             return Ok(None);
         };
         if config.decode::<DfsFileSystemConfig>()? != *self.expected
             || job.is_some()
-            || legacy_job.is_some()
             || activity_record.is_some()
         {
             return Ok(None);
@@ -1885,27 +1895,10 @@ impl<'a> PlacementUpdatePublication<'a> {
         }
         let queue = match inputs.queue.as_ref() {
             Some(entry) => entry.decode::<DfsPlacementReconciliationQueue>()?,
-            None => {
-                // Preserve legacy reconstruction semantics: terminal history
-                // does not consume active queue capacity. Bound the active
-                // input before sorting or building another publication image.
-                jobs.retain(|job| !job.state.is_terminal());
-                if jobs.len() > MAX_ACTIVE_PLACEMENT_RECONCILIATIONS {
-                    return Err(KvError::RangeLimit {
-                        prefix: placement_reconciliations_prefix(&self.job.file_system_id),
-                        max_entries: MAX_ACTIVE_PLACEMENT_RECONCILIATIONS,
-                    });
-                }
-                jobs.sort_by(|left, right| {
-                    left.created_at_unix_nanos
-                        .cmp(&right.created_at_unix_nanos)
-                        .then_with(|| left.job_id.cmp(&right.job_id))
-                });
-                DfsPlacementReconciliationQueue {
-                    schema_version: PLACEMENT_RECONCILIATION_QUEUE_SCHEMA_VERSION,
-                    job_ids: jobs.iter().map(|job| job.job_id.clone()).collect(),
-                }
-            }
+            None => DfsPlacementReconciliationQueue {
+                schema_version: PLACEMENT_RECONCILIATION_QUEUE_SCHEMA_VERSION,
+                job_ids: Vec::new(),
+            },
         };
         let jobs = jobs
             .into_iter()
@@ -1939,21 +1932,18 @@ impl<'a> PlacementUpdatePublication<'a> {
             KvCompare::Missing {
                 key: self.keys[2].clone(),
             },
-            KvCompare::Missing {
-                key: self.keys[3].clone(),
-            },
-            compare_entry(self.keys[4].clone(), inputs.queue),
+            compare_entry(self.keys[3].clone(), inputs.queue),
             permit_compare,
         ];
         let mut success = vec![
             KvOp::put_serde(self.keys[0].clone(), self.desired, None)?,
             KvOp::put_serde(self.keys[1].clone(), &self.job, None)?,
             KvOp::put_serde(
-                self.keys[3].clone(),
+                self.keys[2].clone(),
                 &DfsPlacementReconciliationActivityRecord::from(&self.job),
                 None,
             )?,
-            KvOp::put_serde(self.keys[4].clone(), &queue, None)?,
+            KvOp::put_serde(self.keys[3].clone(), &queue, None)?,
         ];
         if let Some((compare, operation)) = activity_index_update {
             compares.push(compare);
@@ -1977,6 +1967,117 @@ impl<'a> PlacementUpdatePublication<'a> {
     }
 }
 
+/// Pure current publication planning for the owned storage converter. Captured
+/// entries are DATA; only the caller's real native commit can establish effect
+/// authority. No reader, recovery owner or queue engine is created here.
+#[cfg(feature = "storage-conversion")]
+pub struct DfsPlacementUpdatePlan<'a> {
+    publication: PlacementUpdatePublication<'a>,
+}
+#[cfg(feature = "storage-conversion")]
+impl<'a> DfsPlacementUpdatePlan<'a> {
+    pub fn new(
+        expected: &'a DfsFileSystemConfig,
+        desired: &'a DfsFileSystemConfig,
+        job: &DfsPlacementReconciliationJob,
+    ) -> Result<Self, KvError> {
+        if expected.file_system_id != desired.file_system_id
+            || job.file_system_id != expected.file_system_id
+        {
+            return Err(KvError::Serialization {
+                detail: "placement input plan changes its filesystem identity".into(),
+            });
+        }
+        Ok(Self {
+            publication: PlacementUpdatePublication::new(expected, desired, job)?,
+        })
+    }
+    /// Config, new job, new activity, queue, activity index and permit, in order.
+    pub fn keys(&self) -> &[String] {
+        &self.publication.keys
+    }
+    fn checked_inputs(
+        &self,
+        entries: Vec<Option<KvEntry>>,
+    ) -> Result<Option<PlacementUpdateInputs>, KvError> {
+        if entries.len() != self.keys().len()
+            || entries
+                .iter()
+                .zip(self.keys())
+                .any(|(entry, key)| entry.as_ref().is_some_and(|entry| &entry.key != key))
+        {
+            return Err(KvError::Serialization {
+                detail: "placement input plan has incomplete or differently scoped native entries"
+                    .into(),
+            });
+        }
+        if entries.last().is_some_and(Option::is_some) {
+            return Err(KvError::Busy {
+                path: self.keys()[5].clone(),
+            });
+        }
+        self.publication.inputs(entries)
+    }
+    pub fn queued_job_keys(
+        &self,
+        entries: Vec<Option<KvEntry>>,
+    ) -> Result<Option<Vec<String>>, KvError> {
+        let Some(inputs) = self.checked_inputs(entries)? else {
+            return Ok(None);
+        };
+        Ok(Some(
+            self.publication
+                .queued_job_keys(&inputs)?
+                .unwrap_or_default(),
+        ))
+    }
+    /// Build the existing normal transaction from complete ordered read images.
+    /// Missing queued rows are explicit; present rows cannot be omitted or renamed.
+    pub fn transaction(
+        &self,
+        entries: Vec<Option<KvEntry>>,
+        queued_entries: Vec<Option<KvEntry>>,
+    ) -> Result<Option<KvTxn>, KvError> {
+        let Some(inputs) = self.checked_inputs(entries)? else {
+            return Ok(None);
+        };
+        let keys = self
+            .publication
+            .queued_job_keys(&inputs)?
+            .unwrap_or_default();
+        if queued_entries.len() != keys.len() {
+            return Err(KvError::Serialization {
+                detail: "placement input plan omitted a queued native identity".into(),
+            });
+        }
+        let mut jobs = Vec::with_capacity(queued_entries.len());
+        for (key, entry) in keys.iter().zip(queued_entries) {
+            if let Some(entry) = entry {
+                let job = entry.decode::<DfsPlacementReconciliationJob>()?;
+                validate_v1_placement_reconciliation_job(&job)?;
+                if entry.key != *key
+                    || job.file_system_id != self.publication.job.file_system_id
+                    || placement_reconciliation_key(&job.file_system_id, &job.job_id) != *key
+                {
+                    return Err(KvError::Serialization {
+                        detail: "placement input plan changed a queued job's exact identity".into(),
+                    });
+                }
+                jobs.push(entry);
+            }
+        }
+        self.publication
+            .transaction(
+                inputs,
+                jobs,
+                KvCompare::Missing {
+                    key: self.keys()[5].clone(),
+                },
+            )
+            .map(Some)
+    }
+}
+
 fn compact_placement_queue_from_jobs(
     file_system_id: &DfsFileSystemId,
     queue: DfsPlacementReconciliationQueue,
@@ -1994,9 +2095,11 @@ fn compact_placement_queue_from_jobs(
         if job.state.is_terminal() {
             continue;
         }
-        let target = if job.accepted_config.as_ref().is_some_and(|accepted| {
-            placement_config_remains_authoritative_for_job(accepted, desired_config, job)
-        }) {
+        let target = if placement_config_remains_authoritative_for_job(
+            &job.accepted_config,
+            desired_config,
+            job,
+        ) {
             &mut authoritative
         } else {
             &mut superseded
@@ -2172,24 +2275,19 @@ impl<'a> DfsControlPlaneStore<'a> {
             ))?;
             if entries.is_empty() {
                 return Err(KvError::Serialization {
-                    detail: "retention metadata requires configured packed-v6 metadata shards"
-                        .into(),
+                    detail: "retention metadata requires configured current metadata shards".into(),
                 });
             }
             for entry in entries {
                 let shard: DfsMetadataShardConfig = entry.decode()?;
-                if shard.file_system_id != desired.file_system_id
-                    || !shard
-                        .namespace_prepare_codec
-                        .supports_file_history_mutations()
-                {
-                    return Err(KvError::Serialization { detail: "namespaced retention metadata requires packed-v6 on every assigned metadata shard".into() });
+                if shard.file_system_id != desired.file_system_id {
+                    return Err(KvError::Serialization { detail: "namespaced retention metadata requires current support on every assigned metadata shard".into() });
                 }
                 compares.push(KvCompare::ValueEquals {
                     key: entry.key,
                     value: entry.value,
                 });
-                compares.extend(metadata_namespace_prepare_codec_admission_compares(
+                compares.extend(metadata_prepared_operation_admission_compares(
                     self.kv, &shard,
                 )?);
             }
@@ -2254,6 +2352,33 @@ impl<'a> DfsControlPlaneStore<'a> {
         })
     }
 
+    /// Storage conversion uses the same exact pending-release and actual-host
+    /// prior-process recovery as ordinary placement. DATA cannot grant custody.
+    /// sinomo:kv-consistency: Recover only the exact normal placement latch before a source-import retirement CAS.
+    #[cfg(feature = "storage-conversion")]
+    pub fn prepare_storage_import_placement_retirement(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        local_node_id: &NodeId,
+    ) -> Result<KvCompare, KvError> {
+        // First reconcile the normal exact in-process release handle.
+        match self.placement_authority_permit_missing_compare(file_system_id) {
+            Ok(compare) => return Ok(compare),
+            Err(KvError::Busy { .. }) => {}
+            Err(failed) => return Err(failed),
+        }
+        self.kv.refresh_latest()?;
+        if let Some(process) = self.kv.placement_authority_process_identity() {
+            self.recover_prior_process_placement_authority_permit_for_local_node(
+                file_system_id,
+                local_node_id,
+                &process,
+            )?;
+        }
+        // A current/foreign/unidentified live holder remains typed Busy.
+        self.placement_authority_permit_missing_compare(file_system_id)
+    }
+
     /// Inspect the current placement mutation permit without exposing its
     /// random holder id or process-session id. The returned recovery token is
     /// bound to the exact encoded value and KV generation.
@@ -2274,7 +2399,7 @@ impl<'a> DfsControlPlaneStore<'a> {
     /// cluster. Absence from membership is checked in the same quorum
     /// transaction as the exact permit delete; an explicitly `Removed` record
     /// is accepted only under an exact-value membership compare. Offline,
-    /// suspect, pending, active, local, foreign, and partial holders fail
+    /// suspect, pending, active, local, and foreign holders fail
     /// closed.
     ///
     /// Membership removal does not fence an already-running metadata writer,
@@ -2302,15 +2427,8 @@ impl<'a> DfsControlPlaneStore<'a> {
             return Ok(DfsPlacementAuthorityRecoveryOutcome::Changed);
         }
         let record = permit_entry.decode::<DfsPlacementAuthorityPermitRecord>()?;
-        let (Some(holder_cluster_id), Some(holder_node_id), Some(_holder_session_id)) = (
-            record.holder_cluster_id.as_deref(),
-            record.holder_node_id.as_ref(),
-            record.holder_session_id.as_deref(),
-        ) else {
-            return Ok(DfsPlacementAuthorityRecoveryOutcome::Refused {
-                reason: DfsPlacementAuthorityRecoveryRefusal::IncompleteHolderIdentity,
-            });
-        };
+        let holder_cluster_id = record.holder_cluster_id.as_str();
+        let holder_node_id = &record.holder_node_id;
         if holder_cluster_id != current_cluster_id {
             return Ok(DfsPlacementAuthorityRecoveryOutcome::Refused {
                 reason: DfsPlacementAuthorityRecoveryRefusal::ForeignCluster,
@@ -2373,8 +2491,8 @@ impl<'a> DfsControlPlaneStore<'a> {
         Ok(DfsPlacementAuthorityRecoveryOutcome::Cleared)
     }
 
-    /// Deliberately exceptional recovery for a foreign-cluster or incomplete
-    /// legacy permit whose owner cannot be proven through current membership.
+    /// Deliberately exceptional recovery for a foreign-cluster
+    /// permit whose owner cannot be proven through current membership.
     /// The exact acknowledgement phrase and exact-generation token are both
     /// required. Fully identified same-cluster holders must use the normal
     /// removed-node recovery path and can never cross this escape hatch.
@@ -2399,15 +2517,7 @@ impl<'a> DfsControlPlaneStore<'a> {
             return Ok(DfsPlacementAuthorityRecoveryOutcome::Changed);
         }
         let record = permit_entry.decode::<DfsPlacementAuthorityPermitRecord>()?;
-        let fully_identified_same_cluster = matches!(
-            (
-                record.holder_cluster_id.as_deref(),
-                record.holder_node_id.as_ref(),
-                record.holder_session_id.as_deref(),
-            ),
-            (Some(cluster_id), Some(_), Some(_)) if cluster_id == current_cluster_id
-        );
-        if fully_identified_same_cluster {
+        if record.holder_cluster_id == current_cluster_id {
             return Ok(DfsPlacementAuthorityRecoveryOutcome::Refused {
                 reason: DfsPlacementAuthorityRecoveryRefusal::NormalRecoveryRequired,
             });
@@ -2439,7 +2549,7 @@ impl<'a> DfsControlPlaneStore<'a> {
     /// The caller must hold the node's exclusive daemon and data-owner locks,
     /// and must refresh its control-plane view before invoking this method.
     /// Those locks prove the prior local process is gone. Unknown legacy
-    /// records, current-process holders, and records owned by another node are
+    /// current-process holders and records owned by another node are
     /// deliberately left intact. The delete itself compares the exact encoded
     /// record, so it cannot remove a concurrently replaced holder.
     pub fn recover_prior_process_placement_authority_permit_for_local_node(
@@ -2464,12 +2574,9 @@ impl<'a> DfsControlPlaneStore<'a> {
             return Ok(false);
         };
         let record = entry.decode::<DfsPlacementAuthorityPermitRecord>()?;
-        if record.holder_cluster_id.as_deref() != Some(current_process.cluster_id.as_str())
-            || record.holder_node_id.as_ref() != Some(local_node_id)
-            || record
-                .holder_session_id
-                .as_deref()
-                .is_none_or(|session_id| session_id == current_process.process_session_id)
+        if record.holder_cluster_id != current_process.cluster_id
+            || &record.holder_node_id != local_node_id
+            || record.holder_session_id == current_process.process_session_id
         {
             return Ok(false);
         }
@@ -2521,9 +2628,9 @@ impl<'a> DfsControlPlaneStore<'a> {
         let record = DfsPlacementAuthorityPermitRecord {
             job_id: expected_job.job_id.clone(),
             holder_id,
-            holder_cluster_id: Some(holder_process.cluster_id.clone()),
-            holder_node_id: Some(holder_node_id.clone()),
-            holder_session_id: Some(holder_process.process_session_id.clone()),
+            holder_cluster_id: holder_process.cluster_id.clone(),
+            holder_node_id: holder_node_id.clone(),
+            holder_session_id: holder_process.process_session_id.clone(),
         };
         let permit_key = placement_authority_permit_key(&expected_job.file_system_id);
         let permit_compare =
@@ -2602,62 +2709,20 @@ impl<'a> DfsControlPlaneStore<'a> {
         self.get_serde(&placement_reconciliation_key(file_system_id, job_id))
     }
 
-    fn initial_placement_reconciliation_queue(
-        &self,
-        file_system_id: &DfsFileSystemId,
-        current_config: &DfsFileSystemConfig,
-    ) -> Result<DfsPlacementReconciliationQueue, KvError> {
-        let mut jobs = self
-            .kv
-            .range_prefix(&placement_reconciliations_prefix(file_system_id))?
-            .into_iter()
-            .map(|entry| entry.decode::<DfsPlacementReconciliationJob>())
-            .collect::<Result<Vec<_>, _>>()?;
-        for job in &jobs {
-            validate_v1_placement_reconciliation_job(job)?;
-        }
-        jobs.retain(|job| !job.state.is_terminal());
-        jobs.sort_by(|left, right| {
-            left.created_at_unix_nanos
-                .cmp(&right.created_at_unix_nanos)
-                .then_with(|| left.job_id.cmp(&right.job_id))
-        });
-        if jobs.len() > MAX_ACTIVE_PLACEMENT_RECONCILIATIONS {
-            return Err(KvError::RangeLimit {
-                prefix: placement_reconciliations_prefix(file_system_id),
-                max_entries: MAX_ACTIVE_PLACEMENT_RECONCILIATIONS,
-            });
-        }
-
-        // Run jobs that are still authoritative before stale work. Repeated
-        // same-path Apply operations therefore put the newest useful job at
-        // the head without starving older jobs for unrelated scopes.
-        let (authoritative, superseded): (Vec<_>, Vec<_>) = jobs.into_iter().partition(|job| {
-            job.accepted_config.as_ref().is_some_and(|accepted| {
-                placement_config_remains_authoritative_for_job(accepted, current_config, job)
-            })
-        });
-        let job_ids = authoritative
-            .into_iter()
-            .chain(superseded)
-            .map(|job| job.job_id)
-            .collect();
-        Ok(DfsPlacementReconciliationQueue {
-            schema_version: PLACEMENT_RECONCILIATION_QUEUE_SCHEMA_VERSION,
-            job_ids,
-        })
-    }
-
     fn placement_reconciliation_queue_snapshot(
         &self,
         file_system_id: &DfsFileSystemId,
-        current_config: &DfsFileSystemConfig,
+        _current_config: &DfsFileSystemConfig,
     ) -> Result<(Option<KvEntry>, DfsPlacementReconciliationQueue), KvError> {
         let key = placement_reconciliation_queue_key(file_system_id);
         let Some(entry) = self.kv.get(&key)? else {
-            return self
-                .initial_placement_reconciliation_queue(file_system_id, current_config)
-                .map(|queue| (None, queue));
+            return Ok((
+                None,
+                DfsPlacementReconciliationQueue {
+                    schema_version: PLACEMENT_RECONCILIATION_QUEUE_SCHEMA_VERSION,
+                    job_ids: Vec::new(),
+                },
+            ));
         };
         let queue = placement_reconciliation_queue_from_entry(file_system_id, &entry)?;
         Ok((Some(entry), queue))
@@ -2705,15 +2770,13 @@ impl<'a> DfsControlPlaneStore<'a> {
                     };
                     entries.into_iter().flatten().collect()
                 }
-                None => self
-                    .kv
-                    .range_prefix(&placement_reconciliations_prefix(&job.file_system_id))?,
+                None => Vec::new(),
             };
             let permit_compare = if inputs.permit.is_some() {
                 self.placement_authority_permit_missing_compare(&job.file_system_id)?
             } else {
                 KvCompare::Missing {
-                    key: publication.keys[6].clone(),
+                    key: publication.keys[5].clone(),
                 }
             };
             let txn = publication.transaction(inputs, job_entries, permit_compare)?;
@@ -2770,10 +2833,7 @@ impl<'a> DfsControlPlaneStore<'a> {
         file_system_id: &DfsFileSystemId,
         job_id: &str,
     ) -> Result<Option<DfsPlacementReconciliationJob>, KvError> {
-        if let Some(job) = self.v1_placement_reconciliation(file_system_id, job_id)? {
-            return Ok(Some(job));
-        }
-        self.get_serde(&legacy_placement_reconciliation_key(file_system_id, job_id))
+        self.v1_placement_reconciliation(file_system_id, job_id)
     }
 
     pub(crate) fn has_v1_placement_reconciliation_state(
@@ -2803,19 +2863,6 @@ impl<'a> DfsControlPlaneStore<'a> {
             .into_iter()
             .map(|entry| entry.decode::<DfsPlacementReconciliationJob>())
             .collect::<Result<Vec<_>, _>>()?;
-        let v1_job_ids = jobs
-            .iter()
-            .map(|job| job.job_id.clone())
-            .collect::<BTreeSet<_>>();
-        jobs.extend(
-            self.kv
-                .range_prefix(&legacy_placement_reconciliations_prefix(file_system_id))?
-                .into_iter()
-                .map(|entry| entry.decode::<DfsPlacementReconciliationJob>())
-                .collect::<Result<Vec<_>, _>>()?
-                .into_iter()
-                .filter(|job| !v1_job_ids.contains(&job.job_id)),
-        );
         jobs.sort_by(|left: &DfsPlacementReconciliationJob, right| {
             left.created_at_unix_nanos
                 .cmp(&right.created_at_unix_nanos)
@@ -2875,12 +2922,6 @@ impl<'a> DfsControlPlaneStore<'a> {
                 let queue = entry.decode::<DfsPlacementReconciliationQueue>()?;
                 validate_placement_reconciliation_queue(file_system_id, &queue)?;
                 job_ids.extend(queue.job_ids);
-            } else if index_entry.is_none() {
-                // A pre-queue/pre-index daemon may still have legacy terminal
-                // or active jobs. Reporting the compatibility gap is safer
-                // than an unbounded history scan on every UI poll.
-                partial = true;
-                history_truncated = true;
             }
         }
 
@@ -2888,7 +2929,7 @@ impl<'a> DfsControlPlaneStore<'a> {
         for job_id in job_ids {
             let activity_key =
                 placement_reconciliation_activity_record_key(file_system_id, &job_id);
-            let (mut activity, from_compact_record) = match self.kv.get(&activity_key)? {
+            let activity = match self.kv.get(&activity_key)? {
                 Some(entry) => {
                     let record = entry.decode::<DfsPlacementReconciliationActivityRecord>()?;
                     validate_placement_reconciliation_activity_record(
@@ -2896,57 +2937,14 @@ impl<'a> DfsControlPlaneStore<'a> {
                         &job_id,
                         &record,
                     )?;
-                    (record.activity, true)
+                    record.activity
                 }
                 None => {
                     partial = true;
-                    let Some(job) = self.v1_placement_reconciliation(file_system_id, &job_id)?
-                    else {
-                        history_truncated = true;
-                        continue;
-                    };
-                    validate_v1_placement_reconciliation_job(&job)?;
-                    if job.file_system_id != *file_system_id || job.job_id != job_id {
-                        return Err(KvError::Serialization {
-                            detail: format!(
-                                "placement reconciliation job {job_id} does not match its filesystem or job key"
-                            ),
-                        });
-                    }
-                    (DfsPlacementReconciliationActivitySummary::from(&job), false)
-                }
-            };
-            if from_compact_record && !activity.phase.is_terminal() {
-                // A rolling-upgrade writer can advance the full v1 job without
-                // knowing about compact activity records. Reconcile every
-                // projected nonterminal against that one bounded point read so
-                // stale `Running` cannot survive a terminal transition.
-                let Some(job) = self.v1_placement_reconciliation(file_system_id, &job_id)? else {
-                    partial = true;
                     history_truncated = true;
                     continue;
-                };
-                validate_v1_placement_reconciliation_job(&job)?;
-                if job.file_system_id != *file_system_id || job.job_id != job_id {
-                    return Err(KvError::Serialization {
-                        detail: format!(
-                            "placement reconciliation job {job_id} does not match its filesystem or job key"
-                        ),
-                    });
                 }
-                let current = DfsPlacementReconciliationActivitySummary::from(&job);
-                if current.revision < activity.revision {
-                    return Err(KvError::Serialization {
-                        detail: format!(
-                            "placement reconciliation activity record {job_id} is newer than its durable job"
-                        ),
-                    });
-                }
-                if current != activity {
-                    activity = current;
-                    partial = true;
-                }
-            }
+            };
             if indexed_creation_times
                 .get(&job_id)
                 .is_some_and(|created_at| *created_at != activity.created_at_unix_nanos)
@@ -2972,9 +2970,8 @@ impl<'a> DfsControlPlaneStore<'a> {
         Ok(page)
     }
 
-    /// Return the next executable v1 placement job without loading terminal
-    /// history. A missing queue is initialized once from the v1 namespace;
-    /// Later ticks read the compact active queue; adaptive coalescing inspects
+    /// Return the next executable placement job from its compact active queue.
+    /// Adaptive coalescing inspects
     /// only its bounded active identities, never terminal history or DFS objects.
     pub fn next_placement_reconciliation(
         &mut self,
@@ -3104,9 +3101,11 @@ impl<'a> DfsControlPlaneStore<'a> {
             let index = jobs.len();
             jobs.push((entry, job));
             let job = &jobs[index].1;
-            if job.accepted_config.as_ref().is_some_and(|accepted| {
-                placement_config_remains_authoritative_for_job(accepted, current_config, job)
-            }) && newest.get(&scope).is_none_or(|previous| {
+            if placement_config_remains_authoritative_for_job(
+                &job.accepted_config,
+                current_config,
+                job,
+            ) && newest.get(&scope).is_none_or(|previous| {
                 jobs[*previous].1.created_at_unix_nanos < job.created_at_unix_nanos
             }) {
                 newest.insert(scope, index);
@@ -3203,7 +3202,7 @@ impl<'a> DfsControlPlaneStore<'a> {
             let current_entry = self.kv.get(&key)?;
             if let Some(entry) = current_entry.as_ref() {
                 let current = entry.decode::<DfsMetadataShardConfig>()?;
-                validate_raw_metadata_namespace_prepare_codec_write(&current, shard)?;
+                validate_raw_metadata_shard_write(&current, shard)?;
                 if current == *shard {
                     return Ok(());
                 }
@@ -3216,7 +3215,7 @@ impl<'a> DfsControlPlaneStore<'a> {
                 None => KvCompare::Missing { key: key.clone() },
             }];
             if current_entry.is_none() {
-                compares.extend(metadata_namespace_prepare_codec_admission_compares(
+                compares.extend(metadata_prepared_operation_admission_compares(
                     self.kv, shard,
                 )?);
             }
@@ -3269,7 +3268,27 @@ impl<'a> DfsControlPlaneStore<'a> {
             return Ok(false);
         }
         if expected.is_none() {
-            compares.extend(metadata_namespace_prepare_codec_admission_compares(
+            compares.extend([
+                KvCompare::Missing {
+                    key: metadata_shard_membership_handoff_key(
+                        &desired.file_system_id,
+                        &desired.shard_id,
+                    ),
+                },
+                KvCompare::Missing {
+                    key: metadata_shard_operation_floor_key(
+                        &desired.file_system_id,
+                        &desired.shard_id,
+                    ),
+                },
+                KvCompare::Missing {
+                    key: metadata_shard_head_watermark_key(
+                        &desired.file_system_id,
+                        &desired.shard_id,
+                    ),
+                },
+            ]);
+            compares.extend(metadata_prepared_operation_admission_compares(
                 self.kv, desired,
             )?);
         }
@@ -3309,6 +3328,19 @@ impl<'a> DfsControlPlaneStore<'a> {
         retiring: &DfsMetadataShardConfig,
         desired: &DfsMetadataShardConfig,
     ) -> Result<Option<DfsMetadataShardMembershipHandoff>, KvError> {
+        self.begin_metadata_shard_handoff_with_cause(
+            retiring,
+            desired,
+            DfsMetadataShardHandoffCause::Membership,
+        )
+    }
+
+    pub fn begin_metadata_shard_handoff_with_cause(
+        &mut self,
+        retiring: &DfsMetadataShardConfig,
+        desired: &DfsMetadataShardConfig,
+        cause: DfsMetadataShardHandoffCause,
+    ) -> Result<Option<DfsMetadataShardMembershipHandoff>, KvError> {
         validate_metadata_shard_cas_identity(Some(retiring), desired)?;
         if retiring == desired {
             return Err(KvError::Serialization {
@@ -3318,7 +3350,7 @@ impl<'a> DfsControlPlaneStore<'a> {
                 ),
             });
         }
-        validate_metadata_shard_cas_reconfiguration(retiring, desired)?;
+        validate_metadata_shard_handoff_cause(retiring, desired, &cause)?;
         let shard_key = metadata_shard_key(&retiring.file_system_id, &retiring.shard_id);
         let floor_key =
             metadata_shard_operation_floor_key(&retiring.file_system_id, &retiring.shard_id);
@@ -3336,7 +3368,8 @@ impl<'a> DfsControlPlaneStore<'a> {
             if let Some(entry) = self.kv.get(&handoff_key)? {
                 let handoff = entry.decode::<DfsMetadataShardMembershipHandoff>()?;
                 return Ok((handoff.retiring_shard == *retiring
-                    && handoff.desired_shard == *desired)
+                    && handoff.desired_shard == *desired
+                    && handoff.cause == cause)
                     .then_some(handoff));
             }
 
@@ -3367,7 +3400,21 @@ impl<'a> DfsControlPlaneStore<'a> {
                 .unwrap_or(0)
                 .max(floor_sequence);
             let handoff = DfsMetadataShardMembershipHandoff {
-                handoff_id: sinomo_core::Id::generate().to_string(),
+                cause: cause.clone(),
+                handoff_id: match &cause {
+                    DfsMetadataShardHandoffCause::Membership => sinomo_core::Id::generate(),
+                    DfsMetadataShardHandoffCause::StorageImport { cut } => {
+                        sinomo_core::Id::derived(
+                            "dfs-storage-import-handoff-v7",
+                            serde_json::to_vec(&(retiring, desired, cut)).map_err(|e| {
+                                KvError::Serialization {
+                                    detail: e.to_string(),
+                                }
+                            })?,
+                        )
+                    }
+                }
+                .to_string(),
                 retiring_shard: retiring.clone(),
                 desired_shard: desired.clone(),
                 required_prepared_sequence,
@@ -3403,7 +3450,7 @@ impl<'a> DfsControlPlaneStore<'a> {
                     key: handoff_key.clone(),
                 },
             ];
-            compares.extend(metadata_namespace_prepare_codec_admission_compares(
+            compares.extend(metadata_prepared_operation_admission_compares(
                 self.kv, desired,
             )?);
             let response = self.kv.txn(KvTxn {
@@ -3568,7 +3615,7 @@ impl<'a> DfsControlPlaneStore<'a> {
         proof: &DfsMetadataShardMembershipHandoffProof,
     ) -> Result<bool, KvError> {
         validate_metadata_shard_cas_identity(Some(retiring), desired)?;
-        validate_metadata_shard_cas_reconfiguration(retiring, desired)?;
+
         let shard_key = metadata_shard_key(&retiring.file_system_id, &retiring.shard_id);
         let floor_key =
             metadata_shard_operation_floor_key(&retiring.file_system_id, &retiring.shard_id);
@@ -3591,6 +3638,7 @@ impl<'a> DfsControlPlaneStore<'a> {
             return Ok(false);
         };
         let handoff = handoff_entry.decode::<DfsMetadataShardMembershipHandoff>()?;
+        validate_metadata_shard_handoff_cause(retiring, desired, &handoff.cause)?;
         if handoff.retiring_shard != *retiring || handoff.desired_shard != *desired {
             return Ok(false);
         }
@@ -3641,7 +3689,7 @@ impl<'a> DfsControlPlaneStore<'a> {
             floor_compare,
             watermark_compare,
         ];
-        compares.extend(metadata_namespace_prepare_codec_admission_compares(
+        compares.extend(metadata_prepared_operation_admission_compares(
             self.kv, desired,
         )?);
         Ok(self
@@ -3657,6 +3705,49 @@ impl<'a> DfsControlPlaneStore<'a> {
                 failure: Vec::new(),
             })?
             .succeeded)
+    }
+
+    /// Read only the active assignment and pending handoff for one retiring
+    /// shard under its caller-held publication fence and original deadline.
+    /// sinomo:kv-consistency: Fence retiring-shard publication against a concurrently completed metadata handoff using one exact authoritative key set.
+    pub(crate) fn retiring_metadata_shard_handoff_view_before(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        shard_id: &str,
+        deadline: Instant,
+    ) -> Result<
+        (
+            Option<DfsMetadataShardConfig>,
+            Option<DfsMetadataShardMembershipHandoff>,
+        ),
+        crate::DfsError,
+    > {
+        let keys = [
+            metadata_shard_key(file_system_id, shard_id),
+            metadata_shard_membership_handoff_key(file_system_id, shard_id),
+        ];
+        let entries = self
+            .kv
+            .get_authoritative_consistent_before(&keys, deadline)?;
+        if entries.len() != keys.len()
+            || entries
+                .iter()
+                .zip(&keys)
+                .any(|(entry, key)| entry.as_ref().is_some_and(|entry| &entry.key != key))
+        {
+            return Err(crate::DfsError::Metadata {
+                message: "handoff authority read returned a differently scoped key set".into(),
+            });
+        }
+        let active = entries[0]
+            .as_ref()
+            .map(|entry| entry.decode::<DfsMetadataShardConfig>())
+            .transpose()?;
+        let pending = entries[1]
+            .as_ref()
+            .map(|entry| entry.decode::<DfsMetadataShardMembershipHandoff>())
+            .transpose()?;
+        Ok((active, pending))
     }
 
     /// sinomo:kv-configuration: Read the configured handoff proposal; this does not authorize activation.
@@ -3894,6 +3985,25 @@ impl<'a> DfsControlPlaneStore<'a> {
         operation_digest: &str,
         prepared_sequence: u64,
     ) -> Result<Option<String>, KvError> {
+        self.certify_metadata_shard_operation_with_native_authority(
+            expected,
+            operation_digest,
+            prepared_sequence,
+        )
+        .map(|permit| permit.map(|permit| permit.permit_id))
+    }
+
+    /// The degraded metadata path has already retained its real DFS recovery
+    /// quorum. Mint only this operation's Raft floor/barrier against the exact
+    /// assignment, prior floor and absent handoff; compact-view retry retains
+    /// the same digest/prepare sequence and the existing retry budget.
+    /// sinomo:kv-consistency: Mint an exact operation-bound Raft permit against assignment/floor bytes and absent handoff after DFS recovery quorum.
+    pub(crate) fn certify_metadata_shard_operation_with_native_authority(
+        &mut self,
+        expected: &DfsMetadataShardConfig,
+        operation_digest: &str,
+        prepared_sequence: u64,
+    ) -> Result<Option<DfsMetadataOperationPermit>, KvError> {
         if operation_digest.is_empty() || prepared_sequence == 0 {
             return Ok(None);
         }
@@ -3972,7 +4082,7 @@ impl<'a> DfsControlPlaneStore<'a> {
                 // The floor may come from an observational projection. Reuse
                 // its permit only after an authoritative transaction verifies
                 // the assignment, exact floor bytes, and missing handoff.
-                let response = self.kv.txn(KvTxn {
+                let (response, native_commit) = self.kv.txn_with_native_authority(KvTxn {
                     compares: vec![
                         KvCompare::ValueEquals {
                             key: shard_key.to_string(),
@@ -4000,7 +4110,15 @@ impl<'a> DfsControlPlaneStore<'a> {
                 })?;
                 return if response.succeeded {
                     Ok(MetadataOperationPermitAttempt::Certified(
-                        previous.permit_id,
+                        DfsMetadataOperationPermit {
+                            file_system_id: expected.file_system_id.clone(),
+                            shard_id: expected.shard_id.clone(),
+                            owner_epoch: expected.epoch,
+                            operation_digest: operation_digest.to_string(),
+                            prepare_sequence: prepared_sequence,
+                            permit_id: previous.permit_id,
+                            native_commit,
+                        },
                     ))
                 } else {
                     Ok(MetadataOperationPermitAttempt::RetryAfterCompareMiss)
@@ -4031,7 +4149,7 @@ impl<'a> DfsControlPlaneStore<'a> {
                 key: floor_key.to_string(),
             },
         };
-        let response = self.kv.txn(KvTxn {
+        let (response, native_commit) = self.kv.txn_with_native_authority(KvTxn {
             compares: vec![
                 KvCompare::ValueEquals {
                     key: shard_key.to_string(),
@@ -4046,7 +4164,17 @@ impl<'a> DfsControlPlaneStore<'a> {
             failure: Vec::new(),
         })?;
         if response.succeeded {
-            Ok(MetadataOperationPermitAttempt::Certified(permit_id))
+            Ok(MetadataOperationPermitAttempt::Certified(
+                DfsMetadataOperationPermit {
+                    file_system_id: expected.file_system_id.clone(),
+                    shard_id: expected.shard_id.clone(),
+                    owner_epoch: expected.epoch,
+                    operation_digest: operation_digest.to_string(),
+                    prepare_sequence: prepared_sequence,
+                    permit_id,
+                    native_commit,
+                },
+            ))
         } else {
             Ok(MetadataOperationPermitAttempt::RetryAfterCompareMiss)
         }
@@ -4443,26 +4571,20 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
                 .await?;
             if entries.is_empty() {
                 return Err(KvError::Serialization {
-                    detail: "retention metadata requires configured packed-v6 metadata shards"
-                        .into(),
+                    detail: "retention metadata requires configured current metadata shards".into(),
                 });
             }
             for entry in entries {
                 let shard: DfsMetadataShardConfig = entry.decode()?;
-                if shard.file_system_id != desired.file_system_id
-                    || !shard
-                        .namespace_prepare_codec
-                        .supports_file_history_mutations()
-                {
-                    return Err(KvError::Serialization { detail: "namespaced retention metadata requires packed-v6 on every assigned metadata shard".into() });
+                if shard.file_system_id != desired.file_system_id {
+                    return Err(KvError::Serialization { detail: "namespaced retention metadata requires current support on every assigned metadata shard".into() });
                 }
                 compares.push(KvCompare::ValueEquals {
                     key: entry.key,
                     value: entry.value,
                 });
                 compares.extend(
-                    metadata_namespace_prepare_codec_admission_compares_async(self.kv, &shard)
-                        .await?,
+                    metadata_prepared_operation_admission_compares_async(self.kv, &shard).await?,
                 );
             }
         }
@@ -4521,18 +4643,14 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
                     };
                     entries.into_iter().flatten().collect()
                 }
-                None => {
-                    self.kv
-                        .range_prefix_async(&placement_reconciliations_prefix(&job.file_system_id))
-                        .await?
-                }
+                None => Vec::new(),
             };
             let permit_compare = if inputs.permit.is_some() {
                 self.placement_authority_permit_missing_compare(&job.file_system_id)
                     .await?
             } else {
                 KvCompare::Missing {
-                    key: publication.keys[6].clone(),
+                    key: publication.keys[5].clone(),
                 }
             };
             let txn = publication.transaction(inputs, job_entries, permit_compare)?;
@@ -4591,7 +4709,7 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
             let current_entry = self.kv.get_async(&key).await?;
             if let Some(entry) = current_entry.as_ref() {
                 let current = entry.decode::<DfsMetadataShardConfig>()?;
-                validate_raw_metadata_namespace_prepare_codec_write(&current, shard)?;
+                validate_raw_metadata_shard_write(&current, shard)?;
                 if current == *shard {
                     return Ok(());
                 }
@@ -4605,8 +4723,7 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
             }];
             if current_entry.is_none() {
                 compares.extend(
-                    metadata_namespace_prepare_codec_admission_compares_async(self.kv, shard)
-                        .await?,
+                    metadata_prepared_operation_admission_compares_async(self.kv, shard).await?,
                 );
             }
             if self
@@ -4655,8 +4772,28 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
             return Ok(false);
         }
         if expected.is_none() {
+            compares.extend([
+                KvCompare::Missing {
+                    key: metadata_shard_membership_handoff_key(
+                        &desired.file_system_id,
+                        &desired.shard_id,
+                    ),
+                },
+                KvCompare::Missing {
+                    key: metadata_shard_operation_floor_key(
+                        &desired.file_system_id,
+                        &desired.shard_id,
+                    ),
+                },
+                KvCompare::Missing {
+                    key: metadata_shard_head_watermark_key(
+                        &desired.file_system_id,
+                        &desired.shard_id,
+                    ),
+                },
+            ]);
             compares.extend(
-                metadata_namespace_prepare_codec_admission_compares_async(self.kv, desired).await?,
+                metadata_prepared_operation_admission_compares_async(self.kv, desired).await?,
             );
         }
         Ok(self
@@ -4685,6 +4822,20 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
         retiring: &DfsMetadataShardConfig,
         desired: &DfsMetadataShardConfig,
     ) -> Result<Option<DfsMetadataShardMembershipHandoff>, KvError> {
+        self.begin_metadata_shard_handoff_with_cause(
+            retiring,
+            desired,
+            DfsMetadataShardHandoffCause::Membership,
+        )
+        .await
+    }
+
+    pub async fn begin_metadata_shard_handoff_with_cause(
+        &mut self,
+        retiring: &DfsMetadataShardConfig,
+        desired: &DfsMetadataShardConfig,
+        cause: DfsMetadataShardHandoffCause,
+    ) -> Result<Option<DfsMetadataShardMembershipHandoff>, KvError> {
         validate_metadata_shard_cas_identity(Some(retiring), desired)?;
         if retiring == desired {
             return Err(KvError::Serialization {
@@ -4694,7 +4845,7 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
                 ),
             });
         }
-        validate_metadata_shard_cas_reconfiguration(retiring, desired)?;
+        validate_metadata_shard_handoff_cause(retiring, desired, &cause)?;
         let shard_key = metadata_shard_key(&retiring.file_system_id, &retiring.shard_id);
         let floor_key =
             metadata_shard_operation_floor_key(&retiring.file_system_id, &retiring.shard_id);
@@ -4712,7 +4863,8 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
             if let Some(entry) = self.kv.get_async(&handoff_key).await? {
                 let handoff = entry.decode::<DfsMetadataShardMembershipHandoff>()?;
                 return Ok((handoff.retiring_shard == *retiring
-                    && handoff.desired_shard == *desired)
+                    && handoff.desired_shard == *desired
+                    && handoff.cause == cause)
                     .then_some(handoff));
             }
 
@@ -4743,7 +4895,21 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
                 .unwrap_or(0)
                 .max(floor_sequence);
             let handoff = DfsMetadataShardMembershipHandoff {
-                handoff_id: sinomo_core::Id::generate().to_string(),
+                cause: cause.clone(),
+                handoff_id: match &cause {
+                    DfsMetadataShardHandoffCause::Membership => sinomo_core::Id::generate(),
+                    DfsMetadataShardHandoffCause::StorageImport { cut } => {
+                        sinomo_core::Id::derived(
+                            "dfs-storage-import-handoff-v7",
+                            serde_json::to_vec(&(retiring, desired, cut)).map_err(|e| {
+                                KvError::Serialization {
+                                    detail: e.to_string(),
+                                }
+                            })?,
+                        )
+                    }
+                }
+                .to_string(),
                 retiring_shard: retiring.clone(),
                 desired_shard: desired.clone(),
                 required_prepared_sequence,
@@ -4780,7 +4946,7 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
                 },
             ];
             compares.extend(
-                metadata_namespace_prepare_codec_admission_compares_async(self.kv, desired).await?,
+                metadata_prepared_operation_admission_compares_async(self.kv, desired).await?,
             );
             let response = self
                 .kv
@@ -4891,7 +5057,7 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
         proof: &DfsMetadataShardMembershipHandoffProof,
     ) -> Result<bool, KvError> {
         validate_metadata_shard_cas_identity(Some(retiring), desired)?;
-        validate_metadata_shard_cas_reconfiguration(retiring, desired)?;
+
         let shard_key = metadata_shard_key(&retiring.file_system_id, &retiring.shard_id);
         let floor_key =
             metadata_shard_operation_floor_key(&retiring.file_system_id, &retiring.shard_id);
@@ -4914,6 +5080,7 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
             return Ok(false);
         };
         let handoff = handoff_entry.decode::<DfsMetadataShardMembershipHandoff>()?;
+        validate_metadata_shard_handoff_cause(retiring, desired, &handoff.cause)?;
         if handoff.retiring_shard != *retiring || handoff.desired_shard != *desired {
             return Ok(false);
         }
@@ -4964,9 +5131,8 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
             floor_compare,
             watermark_compare,
         ];
-        compares.extend(
-            metadata_namespace_prepare_codec_admission_compares_async(self.kv, desired).await?,
-        );
+        compares
+            .extend(metadata_prepared_operation_admission_compares_async(self.kv, desired).await?);
         Ok(self
             .kv
             .txn_async(KvTxn {
@@ -4984,7 +5150,7 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
     }
 
     pub async fn get_metadata_shard_membership_handoff(
-        &self,
+        &mut self,
         file_system_id: &DfsFileSystemId,
         shard_id: &str,
     ) -> Result<Option<DfsMetadataShardMembershipHandoff>, KvError> {
@@ -4996,7 +5162,7 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
     }
 
     pub async fn get_metadata_shard_membership_handoff_proof(
-        &self,
+        &mut self,
         file_system_id: &DfsFileSystemId,
         shard_id: &str,
     ) -> Result<Option<DfsMetadataShardMembershipHandoffProof>, KvError> {
@@ -5008,7 +5174,7 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
     }
 
     pub async fn get_metadata_shard(
-        &self,
+        &mut self,
         file_system_id: &DfsFileSystemId,
         shard_id: &str,
     ) -> Result<Option<DfsMetadataShardConfig>, KvError> {
@@ -5109,7 +5275,7 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
     }
 
     pub async fn list_metadata_shards(
-        &self,
+        &mut self,
         file_system_id: &DfsFileSystemId,
     ) -> Result<Vec<DfsMetadataShardConfig>, KvError> {
         let mut shards: Vec<DfsMetadataShardConfig> = self
@@ -5124,25 +5290,25 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
     }
 
     pub async fn select_metadata_shard_for_path(
-        &self,
+        &mut self,
         file_system_id: &DfsFileSystemId,
         path: &str,
     ) -> Result<Option<DfsMetadataShardConfig>, KvError> {
         select_metadata_shard_config_for_path(
             file_system_id,
-            &self.list_metadata_shards(file_system_id).await?,
+            &mut self.list_metadata_shards(file_system_id).await?,
             path,
         )
     }
 
     pub async fn select_metadata_shard_for_path_strict_default_sifs_split(
-        &self,
+        &mut self,
         file_system_id: &DfsFileSystemId,
         path: &str,
     ) -> Result<Option<DfsMetadataShardConfig>, KvError> {
         select_metadata_shard_config_for_path_strict_default_sifs_split(
             file_system_id,
-            &self.list_metadata_shards(file_system_id).await?,
+            &mut self.list_metadata_shards(file_system_id).await?,
             path,
         )
     }
@@ -5270,7 +5436,7 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
         reject_kv_only_metadata_shard_primary_transfer(&current, &new_primary_node_id)
     }
 
-    async fn get_serde<T>(&self, key: &str) -> Result<Option<T>, KvError>
+    async fn get_serde<T>(&mut self, key: &str) -> Result<Option<T>, KvError>
     where
         T: DeserializeOwned,
     {
@@ -5308,6 +5474,42 @@ fn validate_metadata_shard_cas_identity(
 /// older binary may reopen the shard. The current handoff proof does not carry
 /// that stronger evidence, so accepting a packed-to-legacy transition would
 /// advertise a downgrade that is not actually restart-safe.
+fn validate_metadata_shard_handoff_cause(
+    retiring: &DfsMetadataShardConfig,
+    desired: &DfsMetadataShardConfig,
+    cause: &DfsMetadataShardHandoffCause,
+) -> Result<(), KvError> {
+    match cause {
+        DfsMetadataShardHandoffCause::Membership => {
+            validate_metadata_shard_cas_reconfiguration(retiring, desired)
+        }
+        DfsMetadataShardHandoffCause::StorageImport { cut } => {
+            let mut next = retiring.clone();
+            next.epoch = retiring
+                .epoch
+                .checked_add(1)
+                .ok_or_else(|| KvError::Serialization {
+                    detail: "storage import owner epoch is exhausted".into(),
+                })?;
+            let digest = |value: &str| {
+                value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+            };
+            if *desired != next
+                || !digest(&cut.source_cut_digest)
+                || !digest(&cut.pending_mapping_digest)
+                || cut.source_state_fingerprint.is_empty()
+                || cut.converted_image_fingerprint.is_empty()
+                || cut.target_prefix.version != 2
+                || !cut.target_prefix.is_well_formed()
+                || cut.target_prefix.journal_sequence < cut.source_journal_sequence
+            {
+                return Err(KvError::Serialization { detail: "storage import requires an exact next epoch, unchanged assignment and complete source/image/pending cut".into() });
+            }
+            Ok(())
+        }
+    }
+}
+
 fn validate_metadata_shard_cas_reconfiguration(
     expected: &DfsMetadataShardConfig,
     desired: &DfsMetadataShardConfig,
@@ -5338,16 +5540,14 @@ fn validate_metadata_shard_cas_reconfiguration(
             ),
         });
     }
-    validate_metadata_namespace_prepare_codec_transition(expected, desired)?;
 
     if expected.primary_node_id == desired.primary_node_id {
         let membership_changed = metadata_shard_configured_node_ids(expected)
             != metadata_shard_configured_node_ids(desired);
-        let codec_changed = expected.namespace_prepare_codec != desired.namespace_prepare_codec;
-        if !membership_changed && !codec_changed {
+        if !membership_changed {
             return Err(KvError::Serialization {
                 detail: format!(
-                    "metadata shard {} handoff must change the configured replica set or namespace prepare codec",
+                    "metadata shard {} handoff must change the configured replica set",
                     expected.shard_id
                 ),
             });
@@ -5376,46 +5576,15 @@ fn validate_metadata_shard_cas_reconfiguration(
     Ok(())
 }
 
-fn validate_metadata_namespace_prepare_codec_transition(
-    expected: &DfsMetadataShardConfig,
-    desired: &DfsMetadataShardConfig,
-) -> Result<(), KvError> {
-    if matches!(
-        desired.namespace_prepare_codec,
-        DfsMetadataNamespacePrepareCodec::LegacyPackedV4
-            | DfsMetadataNamespacePrepareCodec::LegacyPackedV5
-    ) && desired.namespace_prepare_codec != expected.namespace_prepare_codec
-    {
-        return Err(KvError::Serialization {
-            detail: "interim history codecs are read-only migration sources".into(),
-        });
-    }
-    if desired.namespace_prepare_codec.rank() < expected.namespace_prepare_codec.rank() {
-        return Err(KvError::Serialization {
-            detail: format!(
-                "metadata shard {} cannot downgrade namespace prepare codec {} to {} without a compatible snapshot, including a legacy-readable snapshot when required, and replay-floor proof",
-                expected.shard_id,
-                expected.namespace_prepare_codec.label(),
-                desired.namespace_prepare_codec.label(),
-            ),
-        });
-    }
-    Ok(())
-}
-
-fn validate_raw_metadata_namespace_prepare_codec_write(
+fn validate_raw_metadata_shard_write(
     current: &DfsMetadataShardConfig,
     desired: &DfsMetadataShardConfig,
 ) -> Result<(), KvError> {
-    validate_metadata_namespace_prepare_codec_transition(current, desired)?;
-    if current.namespace_prepare_codec != desired.namespace_prepare_codec
-        || (current.namespace_prepare_codec.is_packed() && current != desired)
-    {
+    if current != desired {
         return Err(KvError::Serialization {
             detail: format!(
-                "metadata shard {} cannot activate or reconfigure {} namespace prepares through a raw put; use the capability-validated metadata membership handoff",
-                current.shard_id,
-                desired.namespace_prepare_codec.label(),
+                "metadata shard {} reconfiguration requires its native membership handoff",
+                current.shard_id
             ),
         });
     }
@@ -5429,50 +5598,67 @@ fn validate_raw_metadata_namespace_prepare_codec_write(
     skip_all,
     fields(stage = "dfs.metadata.codec_admission")
 )]
-fn metadata_namespace_prepare_codec_admission_compares(
+fn metadata_prepared_operation_admission_compares(
     kv: &(impl DfsControlPlaneKvClient + ?Sized),
     desired: &DfsMetadataShardConfig,
 ) -> Result<Vec<KvCompare>, KvError> {
-    if matches!(
-        desired.namespace_prepare_codec,
-        DfsMetadataNamespacePrepareCodec::LegacyPackedV4
-            | DfsMetadataNamespacePrepareCodec::LegacyPackedV5
-    ) {
+    let nodes = metadata_shard_configured_node_ids(desired);
+    let keys = nodes
+        .iter()
+        .flat_map(|node| {
+            [
+                cluster_member_key(node),
+                cluster_capability_policy_key(node),
+            ]
+        })
+        .collect::<Vec<_>>();
+    let trace_operation = if crate::service_trace::dfs_perf_trace_enabled() {
+        format!(
+            "codec:{}:{}:{}:{}",
+            desired.file_system_id, desired.shard_id, desired.epoch, desired.primary_node_id
+        )
+    } else {
+        String::new()
+    };
+    let mut timing = crate::service_trace::DfsPhaseTimer::new(&trace_operation);
+    let entries = tracing::trace_span!(target: "sinomo.perf", "dfs.metadata.codec_read",
+        stage = "dfs.metadata.codec_read", phase = "members-and-policies")
+    .in_scope(|| kv.get_consistent(&keys))?;
+    timing.mark("codec-member-policy-read-returned");
+    if entries.len() != keys.len() {
         return Err(KvError::Serialization {
-            detail: "interim history codecs are read-only migration sources".into(),
+            detail: "metadata participant read set changed its exact key count".into(),
         });
     }
-    let Some(required_capability) = desired.namespace_prepare_codec.required_capability() else {
-        return Ok(Vec::new());
-    };
     let mut cluster_id = None;
     let mut compares = Vec::new();
-    for node_id in metadata_shard_configured_node_ids(desired) {
+    for (index, node_id) in nodes.into_iter().enumerate() {
         let _member = tracing::trace_span!(target: "sinomo.perf", "dfs.metadata.codec_member",
             stage = "dfs.metadata.codec_member", peer_node_id = %node_id)
         .entered();
-        let member_key = cluster_member_key(&node_id);
-        let member_entry =
-            tracing::trace_span!(target: "sinomo.perf", "dfs.metadata.codec_read",
-                stage = "dfs.metadata.codec_read", phase = "member")
-                .in_scope(|| kv.get(&member_key))?
-                .ok_or_else(|| KvError::Serialization {
-                    detail: format!(
-                        "metadata shard {} cannot activate {} namespace prepares: assigned node {} has no authoritative cluster member capability record",
-                        desired.shard_id,
-                        desired.namespace_prepare_codec.label(),
-                        node_id,
-                    ),
-                })?;
-        let policy_key = cluster_capability_policy_key(&node_id);
-        let policy_entry = tracing::trace_span!(target: "sinomo.perf", "dfs.metadata.codec_read",
-            stage = "dfs.metadata.codec_read", phase = "policy")
-        .in_scope(|| kv.get(&policy_key))?;
+        let member_key = keys[2 * index].clone();
+        let policy_key = keys[2 * index + 1].clone();
+        let member_entry = entries[2 * index].clone().ok_or_else(|| KvError::Serialization {
+            detail: format!(
+                "metadata shard {} cannot activate {} namespace prepares: assigned node {} has no authoritative cluster member capability record",
+                desired.shard_id, "prepared-v7", node_id,
+            ),
+        })?;
+        let policy_entry = entries[2 * index + 1].clone();
+        if member_entry.key != member_key
+            || policy_entry
+                .as_ref()
+                .is_some_and(|entry| entry.key != policy_key)
+        {
+            return Err(KvError::Serialization {
+                detail: "metadata participant read set changed its exact key scope".into(),
+            });
+        }
         let _validation =
             tracing::trace_span!(target: "sinomo.perf", "dfs.metadata.codec_validate",
             stage = "dfs.metadata.codec_validate")
             .entered();
-        compares.extend(metadata_namespace_prepare_codec_member_compares(
+        compares.extend(metadata_prepared_operation_member_compares(
             desired,
             &node_id,
             member_key,
@@ -5480,46 +5666,70 @@ fn metadata_namespace_prepare_codec_admission_compares(
             policy_key,
             policy_entry,
             &mut cluster_id,
-            required_capability,
+            DFS_METADATA_PREPARED_OPERATION_V7_CAPABILITY,
         )?);
     }
+    timing.mark("codec-member-policy-validation-returned");
     Ok(compares)
 }
 
-async fn metadata_namespace_prepare_codec_admission_compares_async(
+async fn metadata_prepared_operation_admission_compares_async(
     kv: &mut (impl AsyncDfsControlPlaneKvClient + ?Sized),
     desired: &DfsMetadataShardConfig,
 ) -> Result<Vec<KvCompare>, KvError> {
-    if matches!(
-        desired.namespace_prepare_codec,
-        DfsMetadataNamespacePrepareCodec::LegacyPackedV4
-            | DfsMetadataNamespacePrepareCodec::LegacyPackedV5
-    ) {
+    let nodes = metadata_shard_configured_node_ids(desired);
+    let keys = nodes
+        .iter()
+        .flat_map(|node| {
+            [
+                cluster_member_key(node),
+                cluster_capability_policy_key(node),
+            ]
+        })
+        .collect::<Vec<_>>();
+    let trace_operation = if crate::service_trace::dfs_perf_trace_enabled() {
+        format!(
+            "codec:{}:{}:{}:{}",
+            desired.file_system_id, desired.shard_id, desired.epoch, desired.primary_node_id
+        )
+    } else {
+        String::new()
+    };
+    let mut timing = crate::service_trace::DfsPhaseTimer::new(&trace_operation);
+    let entries = tracing::Instrument::instrument(
+        kv.get_consistent_async(keys.clone()),
+        tracing::trace_span!(target: "sinomo.perf", "dfs.metadata.codec_read",
+            stage = "dfs.metadata.codec_read", phase = "members-and-policies"),
+    )
+    .await?;
+    timing.mark("codec-member-policy-read-returned");
+    if entries.len() != keys.len() {
         return Err(KvError::Serialization {
-            detail: "interim history codecs are read-only migration sources".into(),
+            detail: "metadata participant read set changed its exact key count".into(),
         });
     }
-    let Some(required_capability) = desired.namespace_prepare_codec.required_capability() else {
-        return Ok(Vec::new());
-    };
     let mut cluster_id = None;
     let mut compares = Vec::new();
-    for node_id in metadata_shard_configured_node_ids(desired) {
-        let member_key = cluster_member_key(&node_id);
-        let member_entry = kv
-            .get_async(&member_key)
-            .await?
-            .ok_or_else(|| KvError::Serialization {
-                detail: format!(
-                    "metadata shard {} cannot activate {} namespace prepares: assigned node {} has no authoritative cluster member capability record",
-                    desired.shard_id,
-                    desired.namespace_prepare_codec.label(),
-                    node_id,
-                ),
-            })?;
-        let policy_key = cluster_capability_policy_key(&node_id);
-        let policy_entry = kv.get_async(&policy_key).await?;
-        compares.extend(metadata_namespace_prepare_codec_member_compares(
+    for (index, node_id) in nodes.into_iter().enumerate() {
+        let member_key = keys[2 * index].clone();
+        let policy_key = keys[2 * index + 1].clone();
+        let member_entry = entries[2 * index].clone().ok_or_else(|| KvError::Serialization {
+            detail: format!(
+                "metadata shard {} cannot activate {} namespace prepares: assigned node {} has no authoritative cluster member capability record",
+                desired.shard_id, "prepared-v7", node_id,
+            ),
+        })?;
+        let policy_entry = entries[2 * index + 1].clone();
+        if member_entry.key != member_key
+            || policy_entry
+                .as_ref()
+                .is_some_and(|entry| entry.key != policy_key)
+        {
+            return Err(KvError::Serialization {
+                detail: "metadata participant read set changed its exact key scope".into(),
+            });
+        }
+        compares.extend(metadata_prepared_operation_member_compares(
             desired,
             &node_id,
             member_key,
@@ -5527,13 +5737,14 @@ async fn metadata_namespace_prepare_codec_admission_compares_async(
             policy_key,
             policy_entry,
             &mut cluster_id,
-            required_capability,
+            DFS_METADATA_PREPARED_OPERATION_V7_CAPABILITY,
         )?);
     }
+    timing.mark("codec-member-policy-validation-returned");
     Ok(compares)
 }
 
-fn metadata_namespace_prepare_codec_member_compares(
+fn metadata_prepared_operation_member_compares(
     desired: &DfsMetadataShardConfig,
     node_id: &NodeId,
     member_key: String,
@@ -5548,9 +5759,7 @@ fn metadata_namespace_prepare_codec_member_compares(
         return Err(KvError::Serialization {
             detail: format!(
                 "metadata shard {} cannot activate {} namespace prepares: assigned node {} is not an authorized cluster member",
-                desired.shard_id,
-                desired.namespace_prepare_codec.label(),
-                node_id,
+                desired.shard_id, "prepared-v7", node_id,
             ),
         });
     }
@@ -5565,9 +5774,7 @@ fn metadata_namespace_prepare_codec_member_compares(
         return Err(KvError::Serialization {
             detail: format!(
                 "metadata shard {} cannot activate {} namespace prepares: assigned node {} has an inconsistent authoritative capability policy",
-                desired.shard_id,
-                desired.namespace_prepare_codec.label(),
-                node_id,
+                desired.shard_id, "prepared-v7", node_id,
             ),
         });
     }
@@ -5582,10 +5789,7 @@ fn metadata_namespace_prepare_codec_member_compares(
         return Err(KvError::Serialization {
             detail: format!(
                 "metadata shard {} cannot activate {} namespace prepares: assigned node {} effective capability policy does not advertise {}",
-                desired.shard_id,
-                desired.namespace_prepare_codec.label(),
-                node_id,
-                required_capability,
+                desired.shard_id, "prepared-v7", node_id, required_capability,
             ),
         });
     }
@@ -5596,8 +5800,7 @@ fn metadata_namespace_prepare_codec_member_compares(
         return Err(KvError::Serialization {
             detail: format!(
                 "metadata shard {} cannot activate {} namespace prepares across inconsistent cluster member records",
-                desired.shard_id,
-                desired.namespace_prepare_codec.label(),
+                desired.shard_id, "prepared-v7",
             ),
         });
     }
@@ -5778,6 +5981,7 @@ fn normalize_metadata_shard_membership_handoff_proof(
 ) -> Result<DfsMetadataShardMembershipHandoffProof, KvError> {
     if handoff.handoff_id.is_empty()
         || proof.handoff_id != handoff.handoff_id
+        || proof.cause != handoff.cause
         || proof.retiring_shard != handoff.retiring_shard
         || proof.desired_shard != handoff.desired_shard
     {
@@ -5804,9 +6008,27 @@ fn normalize_metadata_shard_membership_handoff_proof(
             ),
         });
     };
-    if proof.journal_sequence != retiring_fence.journal_sequence
-        || proof.state_fingerprint != retiring_fence.state_fingerprint
-    {
+    let expected_target = match &handoff.cause {
+        DfsMetadataShardHandoffCause::Membership => (
+            retiring_fence.journal_sequence,
+            retiring_fence.state_fingerprint.as_str(),
+        ),
+        DfsMetadataShardHandoffCause::StorageImport { cut } => {
+            if retiring_fence.journal_sequence != cut.source_journal_sequence
+                || retiring_fence.state_fingerprint != cut.source_state_fingerprint
+            {
+                return Err(KvError::Serialization {
+                    detail: "storage import retiring fence differs from its captured source cut"
+                        .into(),
+                });
+            }
+            (
+                cut.target_prefix.journal_sequence,
+                cut.converted_image_fingerprint.as_str(),
+            )
+        }
+    };
+    if proof.journal_sequence != expected_target.0 || proof.state_fingerprint != expected_target.1 {
         return Err(KvError::Serialization {
             detail: format!(
                 "metadata shard {} membership handoff proof does not carry the exact retiring-primary fenced head",
@@ -5837,7 +6059,8 @@ fn normalize_metadata_shard_membership_handoff_proof(
             ),
         });
     }
-    if let Some(required_head_watermark) = handoff.required_head_watermark.as_ref()
+    if matches!(handoff.cause, DfsMetadataShardHandoffCause::Membership)
+        && let Some(required_head_watermark) = handoff.required_head_watermark.as_ref()
         && proof.journal_sequence == required_head_watermark.journal_sequence
         && proof.state_fingerprint != required_head_watermark.state_fingerprint
     {
@@ -5877,6 +6100,7 @@ fn normalize_metadata_shard_membership_handoff_proof(
     }
 
     Ok(DfsMetadataShardMembershipHandoffProof {
+        cause: proof.cause.clone(),
         handoff_id: proof.handoff_id.clone(),
         retiring_shard: proof.retiring_shard.clone(),
         desired_shard: proof.desired_shard.clone(),
@@ -6479,6 +6703,77 @@ fn metadata_hash_range_width(start_inclusive: u64, end_exclusive: u64) -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn placement_job_factory_rejects_invalid_structural_policies_for_manual_and_adaptive_data() {
+        let owner = NodeId::generate();
+        let candidate = crate::DfsNodeAdvertisement::content(owner.clone());
+        let snapshot = crate::DfsPlacementSnapshot::empty(owner.clone());
+        let budget = crate::DfsAdaptivePlacementBudget::default();
+        for (w, n, valid) in [
+            (1, 1, true),
+            (1, 3, true),
+            (2, 2, true),
+            (2, 1, false),
+            (0, 1, false),
+            (1, 0, false),
+        ] {
+            let config = DfsFileSystemConfig {
+                file_system_id: DfsFileSystemId::generate(),
+                display_name: "structural-policy-DATA".into(),
+                owner_node_id: owner.clone(),
+                retention_policies: Default::default(),
+                module_metadata: Default::default(),
+                subtree_policies: vec![crate::DfsSubtreePolicy::new(
+                    "/data",
+                    DfsObjectPolicy::ReplicatedEventual,
+                    w,
+                    n,
+                )],
+            };
+            let manual = build_placement_reconciliation_job(
+                format!("manual-W{w}-N{n}"),
+                &config,
+                "/data".into(),
+                crate::DfsPlacementScope::Subtree,
+                BTreeSet::new(),
+                vec![candidate.clone()],
+                None,
+                1,
+            );
+            let adaptive = build_adaptive_placement_reconciliation_job(
+                format!("adaptive-W{w}-N{n}"),
+                &config,
+                "/data".into(),
+                crate::DfsPlacementScope::Subtree,
+                BTreeSet::new(),
+                vec![candidate.clone()],
+                snapshot.clone(),
+                budget.clone(),
+                7,
+                1,
+            );
+            assert_eq!(manual.is_ok(), valid, "manual W{w}/N{n}");
+            assert_eq!(adaptive.is_ok(), valid, "adaptive W{w}/N{n}");
+            if valid {
+                let manual = manual.unwrap();
+                let adaptive = adaptive.unwrap();
+                assert_eq!(manual.accepted_config, config);
+                assert_eq!(adaptive.accepted_config, config);
+                assert_eq!(adaptive.adaptive_budget, Some(budget.clone()));
+                assert_eq!(adaptive.processed_content_bytes, 7);
+                assert_eq!(adaptive.placement_snapshot, Some(snapshot.clone()));
+                assert!(adaptive.adaptive);
+            } else {
+                assert!(
+                    matches!(manual, Err(KvError::Serialization { detail }) if detail.contains("invalid policy"))
+                );
+                assert!(
+                    matches!(adaptive, Err(KvError::Serialization { detail }) if detail.contains("invalid policy"))
+                );
+            }
+        }
+    }
+
     use crate::{DfsFileSystem, DfsSubtreePolicy};
     use crate::{DfsNodeAdvertisement, DfsPlacementReconciliationState, DfsPlacementScope};
     use std::collections::VecDeque;
@@ -6668,7 +6963,9 @@ mod tests {
         }
 
         fn range_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>, KvError> {
-            if prefix == placement_reconciliations_prefix(&file_system_id()) {
+            if prefix.starts_with("/dfs/filesystems/")
+                && prefix.ends_with("/placement-reconciliations-v1/")
+            {
                 return Err(KvError::Serialization {
                     detail: "placement history range must not be loaded after queue initialization"
                         .to_string(),
@@ -6682,73 +6979,6 @@ mod tests {
         }
 
         fn txn(&mut self, txn: KvTxn) -> Result<KvTxnResponse, KvError> {
-            self.inner.txn(txn)
-        }
-    }
-
-    #[derive(Debug)]
-    enum PackedCapabilityRecordKind {
-        Member,
-        Policy,
-    }
-
-    #[derive(Debug)]
-    struct DropPackedCapabilityBeforeTxnKv {
-        inner: InProcessKvStore,
-        record_key: String,
-        record_kind: PackedCapabilityRecordKind,
-        drop_before_next_txn: bool,
-    }
-
-    impl DfsControlPlaneKvClient for DropPackedCapabilityBeforeTxnKv {
-        fn get(&self, key: &str) -> Result<Option<KvEntry>, KvError> {
-            Ok(self.inner.get(key).cloned())
-        }
-
-        fn range_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>, KvError> {
-            self.inner.range_prefix(prefix)
-        }
-
-        fn put(&mut self, key: String, value: Vec<u8>) -> Result<KvRevision, KvError> {
-            self.inner.put(key, value, None)
-        }
-
-        fn txn(&mut self, txn: KvTxn) -> Result<KvTxnResponse, KvError> {
-            if self.drop_before_next_txn {
-                match self.record_kind {
-                    PackedCapabilityRecordKind::Member => {
-                        let mut member = self
-                            .inner
-                            .get(&self.record_key)
-                            .expect("member capability record")
-                            .decode::<ClusterMemberRecord>()
-                            .expect("decode member capability record");
-                        member.capabilities.retain(|capability| {
-                            capability.as_str()
-                                != DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY
-                        });
-                        self.inner
-                            .put_serde(self.record_key.clone(), &member, None)
-                            .expect("drop packed prepare member capability");
-                    }
-                    PackedCapabilityRecordKind::Policy => {
-                        let mut policy = self
-                            .inner
-                            .get(&self.record_key)
-                            .expect("capability policy record")
-                            .decode::<ClusterCapabilityPolicyRecord>()
-                            .expect("decode capability policy record");
-                        policy.capabilities.retain(|capability| {
-                            capability.as_str()
-                                != DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY
-                        });
-                        self.inner
-                            .put_serde(self.record_key.clone(), &policy, None)
-                            .expect("drop packed prepare policy capability");
-                    }
-                }
-                self.drop_before_next_txn = false;
-            }
             self.inner.txn(txn)
         }
     }
@@ -6787,49 +7017,6 @@ mod tests {
 
         fn txn(&mut self, txn: KvTxn) -> Result<KvTxnResponse, KvError> {
             self.authoritative.txn(txn)
-        }
-    }
-
-    #[derive(Debug)]
-    struct RetryAuthoritativeViewKv {
-        inner: InProcessKvStore,
-        remaining_retryable_get_failures: AtomicUsize,
-        refresh_calls: AtomicUsize,
-    }
-
-    impl DfsControlPlaneKvClient for RetryAuthoritativeViewKv {
-        fn refresh_latest(&mut self) -> Result<(), KvError> {
-            self.refresh_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
-
-        fn get(&self, key: &str) -> Result<Option<KvEntry>, KvError> {
-            if self
-                .remaining_retryable_get_failures
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                    (remaining > 0).then(|| remaining - 1)
-                })
-                .is_ok()
-            {
-                return Err(KvError::Io {
-                    path: "test-cluster-authoritative-view".to_string(),
-                    detail: "resident Raft view changed after ReadIndex quorum; retry the read"
-                        .to_string(),
-                });
-            }
-            Ok(self.inner.get(key).cloned())
-        }
-
-        fn range_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>, KvError> {
-            self.inner.range_prefix(prefix)
-        }
-
-        fn put(&mut self, key: String, value: Vec<u8>) -> Result<KvRevision, KvError> {
-            self.inner.put(key, value, None)
-        }
-
-        fn txn(&mut self, txn: KvTxn) -> Result<KvTxnResponse, KvError> {
-            self.inner.txn(txn)
         }
     }
 
@@ -6893,7 +7080,6 @@ mod tests {
         desired_replicas: usize,
     ) -> DfsFileSystemConfig {
         DfsFileSystemConfig {
-            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: file_system_id(),
@@ -6903,8 +7089,8 @@ mod tests {
                 path_prefix: "/users/team".to_string(),
                 policy: DfsObjectPolicy::ReplicatedEventual,
                 scope: DfsPlacementScope::Subtree,
-                min_commit_replicas: Some(1),
-                desired_replicas: Some(desired_replicas),
+                min_commit_replicas: 1,
+                desired_replicas: desired_replicas,
                 required_node_ids: Vec::new(),
                 forbidden_node_ids: Vec::new(),
                 min_distinct_zones: 0,
@@ -6930,7 +7116,7 @@ mod tests {
             adaptive: false,
             adaptive_budget: None,
             processed_content_bytes: 0,
-            accepted_config: None,
+            accepted_config: placement_authority_test_config(owner, 1),
             state: DfsPlacementReconciliationState::Pending,
             cursor: None,
             total_object_count: 0,
@@ -6969,7 +7155,6 @@ mod tests {
             replica_node_ids: Vec::new(),
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         kv.put(
@@ -7015,7 +7200,7 @@ mod tests {
             ("terminal", DfsPlacementReconciliationState::Completed),
         ] {
             let mut job = placement_authority_test_job(id, &fs_id, &owner, 1);
-            job.accepted_config = Some(config.clone());
+            job.accepted_config = config.clone();
             job.state = state;
             kv.put(
                 placement_reconciliation_key(&fs_id, id),
@@ -7085,7 +7270,7 @@ mod tests {
         let mut config = placement_authority_test_config(&owner, 2);
         config.file_system_id = fs_id.clone();
         let mut job = placement_authority_test_job("waiting", &fs_id, &owner, 1);
-        job.accepted_config = Some(config);
+        job.accepted_config = config;
         job.state = DfsPlacementReconciliationState::Repairing;
         job.pending_repair_count = 1;
         let mut kv = InProcessKvStore::new();
@@ -7097,6 +7282,9 @@ mod tests {
         )
         .unwrap();
         let repairs = vec![crate::DfsRepairAttemptRecord {
+            transfer_delivery_state: None,
+            completed_transfer_request_id: None,
+            transfer_kind: None,
             intent_id: "waiting-repair".into(),
             object_id: crate::DfsObjectId::from_legacy_named("waiting-repair-object").unwrap(),
             version: crate::DfsVersion::from_legacy_named("waiting-repair-version").unwrap(),
@@ -7542,9 +7730,9 @@ mod tests {
         let record = |holder_node_id, holder_session_id| DfsPlacementAuthorityPermitRecord {
             job_id: "job".to_string(),
             holder_id: "holder".to_string(),
-            holder_cluster_id: Some(process.cluster_id.clone()),
-            holder_node_id: Some(holder_node_id),
-            holder_session_id: Some(holder_session_id),
+            holder_cluster_id: process.cluster_id.clone(),
+            holder_node_id: holder_node_id,
+            holder_session_id: holder_session_id,
         };
         let current = sinomo_core::kv::encode_kv_value(&record(
             local_node_id.clone(),
@@ -7600,9 +7788,11 @@ mod tests {
         DfsPlacementAuthorityPermitRecord {
             job_id: "placement-operator-recovery-job".to_string(),
             holder_id: sinomo_core::Id::generate().to_string(),
-            holder_cluster_id: cluster_id.map(ToString::to_string),
-            holder_node_id,
-            holder_session_id: holder_session_id.map(ToString::to_string),
+            holder_cluster_id: cluster_id.expect("identified cluster").to_string(),
+            holder_node_id: holder_node_id.expect("identified node"),
+            holder_session_id: holder_session_id
+                .expect("identified process session")
+                .to_string(),
         }
     }
 
@@ -7631,70 +7821,169 @@ mod tests {
         member
     }
 
-    fn put_packed_namespace_prepare_capable_members<'a>(
+    fn copy_current_prepare_member_fixture_data<'a>(
         kv: &mut InProcessKvStore,
         node_ids: impl IntoIterator<Item = &'a NodeId>,
     ) {
-        let cluster_id = sinomo_core::Id::from_legacy_named("packed-prepare-capability-cluster")
-            .expect("cluster id");
-        let capability =
-            sinomo_core::CapabilityName::new(DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY)
-                .expect("static capability");
-        for node_id in node_ids {
-            let mut member = ClusterMemberRecord::local_non_voting(
-                cluster_id.clone(),
-                node_id.clone(),
-                "packed prepare capable member",
-                format!("{node_id}-public-key"),
-                time::OffsetDateTime::UNIX_EPOCH,
+        copy_native_member_fixture_data(kv, node_ids.into_iter().cloned().collect());
+    }
+
+    #[cfg(feature = "storage-conversion")]
+    #[test]
+    fn converter_placement_plan_is_the_normal_native_publication_transaction() {
+        let (native, service, shard) = crate::test_support::current_native_metadata_service(
+            "native-placement-input-plan",
+            1,
+            "/",
+        )
+        .unwrap();
+        let control = native.shared_control_plane().unwrap();
+        let candidates = control
+            .with_client(|kv| DfsControlPlaneStore::new(kv.as_mut()).cluster_view())
+            .unwrap()
+            .content_nodes;
+        assert!(
+            !candidates.is_empty(),
+            "the mounted normal content advertisement must exist"
+        );
+        let config = control
+            .with_client(|kv| {
+                DfsControlPlaneStore::new(kv.as_mut()).get_file_system_config(&shard.file_system_id)
+            })
+            .unwrap()
+            .unwrap();
+        // Complete the normal empty-queue initialization before capturing the
+        // publication DATA baseline. The same maintenance producer can do this
+        // concurrently; its legitimate CAS retry is not another publication.
+        control.with_client(|kv| {
+            let mut store = DfsControlPlaneStore::new(kv.as_mut());
+            assert!(
+                store
+                    .next_placement_reconciliation(&shard.file_system_id, &config)
+                    .unwrap()
+                    .is_none()
             );
-            member.state = ClusterMemberState::Active;
-            member.capabilities.push(capability.clone());
-            kv.put_serde(cluster_member_key(node_id), &member, None)
-                .expect("put packed prepare capability member");
-        }
+            let entry = store
+                .kv
+                .get(&placement_reconciliation_queue_key(&shard.file_system_id))
+                .unwrap()
+                .unwrap();
+            let queue: DfsPlacementReconciliationQueue = entry.decode().unwrap();
+            assert_eq!(
+                queue.schema_version,
+                PLACEMENT_RECONCILIATION_QUEUE_SCHEMA_VERSION
+            );
+            assert!(queue.job_ids.is_empty());
+        });
+        let now = crate::dfs_now_unix_nanos();
+        let job = build_placement_reconciliation_job(
+            sinomo_core::Id::generate().to_string(),
+            &config,
+            "/services".into(),
+            crate::DfsPlacementScope::SelfOnly,
+            BTreeSet::new(),
+            candidates,
+            None,
+            now,
+        )
+        .unwrap();
+        let plan = DfsPlacementUpdatePlan::new(&config, &config, &job).unwrap();
+        let entries = control
+            .with_client(|kv| kv.get_consistent(plan.keys()))
+            .unwrap();
+        let queued_keys = plan.queued_job_keys(entries.clone()).unwrap().unwrap();
+        let queued = control
+            .with_client(|kv| kv.get_consistent(&queued_keys))
+            .unwrap();
+        let expected = plan.transaction(entries.clone(), queued).unwrap().unwrap();
+        let submitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let copied = std::sync::Arc::clone(&submitted);
+        let job_key = placement_reconciliation_key(&job.file_system_id, &job.job_id);
+        let hook = native
+            .native_kv_request_hook(&shard.primary_node_id, move |request| {
+                if request.txn.success.iter().any(|op| {
+                    matches!(op,
+                KvOp::Put { key, .. } if key == &job_key)
+                }) {
+                    copied.lock().unwrap().push(request.txn.clone());
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            control
+                .with_client(|kv| DfsControlPlaneStore::new(kv.as_mut())
+                    .compare_and_put_placement_update(&config, &config, &job))
+                .unwrap()
+        );
+        assert_eq!(submitted.lock().unwrap().as_slice(), &[expected]);
+        drop(hook);
+        let mut wrong_scope = entries.clone();
+        wrong_scope[0].as_mut().unwrap().key.push_str("-unrelated");
+        assert!(plan.transaction(wrong_scope, Vec::new()).is_err());
+        let mut present_permit = entries;
+        let mut actual_entry = present_permit[0].as_ref().unwrap().clone();
+        actual_entry.key = plan.keys()[5].clone();
+        present_permit[5] = Some(actual_entry);
+        assert!(
+            plan.transaction(present_permit, Vec::new()).is_err(),
+            "data planning cannot relax the normal Missing permit predicate"
+        );
+        drop(service);
+        drop(control);
+        native.close().unwrap();
     }
 
-    fn add_namespace_prepare_capability<'a>(
-        kv: &mut InProcessKvStore,
-        required_capability: &str,
-        node_ids: impl IntoIterator<Item = &'a NodeId>,
-    ) {
-        let capability =
-            sinomo_core::CapabilityName::new(required_capability).expect("static capability");
-        for node_id in node_ids {
-            let key = cluster_member_key(node_id);
-            let mut member = kv
-                .get(&key)
-                .expect("cluster member capability record")
-                .decode::<ClusterMemberRecord>()
-                .expect("decode cluster member capability record");
-            if !member.capabilities.contains(&capability) {
-                member.capabilities.push(capability.clone());
-            }
-            kv.put_serde(key, &member, None)
-                .expect("add prepare capability");
+    #[test]
+    fn current_placement_job_requires_exact_config_and_candidate_fields() {
+        let owner = node("required-current-placement-fields");
+        let config = placement_authority_test_config(&owner, 1);
+        let candidates = vec![DfsNodeAdvertisement::content(owner)];
+        let job = build_placement_reconciliation_job(
+            "current-required-fields".into(),
+            &config,
+            "/users/team".into(),
+            DfsPlacementScope::Subtree,
+            BTreeSet::new(),
+            candidates,
+            None,
+            42,
+        )
+        .unwrap();
+        assert_eq!(
+            job.accepted_config,
+            scoped_placement_config_for_job(&config, &job)
+        );
+        assert_eq!(job.state, DfsPlacementReconciliationState::Pending);
+        let encoded = serde_json::to_value(&job).unwrap();
+        for field in ["schema_version", "accepted_config", "candidate_snapshot"] {
+            let mut missing = encoded.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<DfsPlacementReconciliationJob>(missing).is_err(),
+                "current durable input must not restore a missing {field}"
+            );
         }
-    }
-
-    fn put_packed_namespace_prepare_capability_policy(
-        kv: &mut InProcessKvStore,
-        node_id: &NodeId,
-        capable: bool,
-    ) {
-        let member = kv
-            .get(&cluster_member_key(node_id))
-            .expect("cluster member")
-            .decode::<ClusterMemberRecord>()
-            .expect("decode cluster member");
-        let mut policy = ClusterCapabilityPolicyRecord::from(&member);
-        if !capable {
-            policy.capabilities.retain(|capability| {
-                capability.as_str() != DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY
-            });
-        }
-        kv.put_serde(cluster_capability_policy_key(node_id), &policy, None)
-            .expect("put packed prepare capability policy");
+        let mut unqualified = encoded;
+        unqualified
+            .as_object_mut()
+            .unwrap()
+            .insert("legacy_holder".into(), serde_json::json!("old"));
+        assert!(serde_json::from_value::<DfsPlacementReconciliationJob>(unqualified).is_err());
+        assert!(
+            build_placement_reconciliation_job(
+                "empty-current-candidates".into(),
+                &config,
+                "/users/team".into(),
+                DfsPlacementScope::Subtree,
+                BTreeSet::new(),
+                Vec::new(),
+                None,
+                42,
+            )
+            .is_err(),
+            "current work requires actual accepted candidate data"
+        );
     }
 
     #[test]
@@ -7702,7 +7991,6 @@ mod tests {
         let mut kv = InProcessKvStore::new();
         let file_system_id = file_system_id();
         let expected = DfsFileSystemConfig {
-            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: file_system_id.clone(),
@@ -7715,8 +8003,8 @@ mod tests {
             path_prefix: "/users/team".to_string(),
             policy: DfsObjectPolicy::ReplicatedEventual,
             scope: DfsPlacementScope::Subtree,
-            min_commit_replicas: Some(1),
-            desired_replicas: Some(3),
+            min_commit_replicas: 1,
+            desired_replicas: 3,
             required_node_ids: vec![node("placement-required")],
             forbidden_node_ids: Vec::new(),
             min_distinct_zones: 2,
@@ -7725,8 +8013,8 @@ mod tests {
             path_prefix: "/elsewhere".to_string(),
             policy: DfsObjectPolicy::ReplicatedEventual,
             scope: DfsPlacementScope::Subtree,
-            min_commit_replicas: Some(1),
-            desired_replicas: Some(1),
+            min_commit_replicas: 1,
+            desired_replicas: 1,
             required_node_ids: Vec::new(),
             forbidden_node_ids: Vec::new(),
             min_distinct_zones: 0,
@@ -7743,7 +8031,7 @@ mod tests {
             adaptive: false,
             adaptive_budget: None,
             processed_content_bytes: 0,
-            accepted_config: None,
+            accepted_config: desired.clone(),
             state: DfsPlacementReconciliationState::Pending,
             cursor: None,
             total_object_count: 0,
@@ -7774,12 +8062,10 @@ mod tests {
             Some(desired.clone())
         );
         let mut durable_job = job.clone();
-        durable_job.accepted_config = Some(scoped_placement_config_for_job(&desired, &job));
+        durable_job.accepted_config = scoped_placement_config_for_job(&desired, &job);
         assert_eq!(
             durable_job
                 .accepted_config
-                .as_ref()
-                .expect("accepted config")
                 .subtree_policies
                 .iter()
                 .map(|rule| rule.path_prefix.as_str())
@@ -7816,14 +8102,6 @@ mod tests {
         assert!(
             placement_reconciliation_key(&file_system_id, &job.job_id)
                 .starts_with(&placement_reconciliations_prefix(&file_system_id))
-        );
-        assert!(
-            store
-                .kv
-                .range_prefix(&legacy_placement_reconciliations_prefix(&file_system_id))
-                .expect("legacy placement prefix")
-                .is_empty(),
-            "a legacy worker must not be able to list a v1 reconciliation job"
         );
 
         let mut stripped = durable_job.clone();
@@ -7911,120 +8189,68 @@ mod tests {
     }
 
     #[test]
-    fn placement_activity_rolling_upgrade_fallback_is_bounded_and_explicitly_partial() {
-        let file_system_id = file_system_id();
-        let owner = node("placement-activity-fallback-owner");
-        let config = placement_authority_test_config(&owner, 1);
-        let mut job = placement_authority_test_job(
-            "placement-activity-fallback-job",
-            &file_system_id,
-            &owner,
-            7,
+    fn placement_activity_missing_current_record_is_bounded_and_explicitly_partial() {
+        let (mut data, actual) =
+            native_placement_activity_fixture_data("native-activity-negative-gap");
+        let before = DfsControlPlaneStore::new(&mut data)
+            .placement_reconciliation_activity(&actual.file_system_id, &[], None, None, 10)
+            .unwrap();
+        assert!(
+            before
+                .activities
+                .iter()
+                .any(|row| row.job_id == actual.job_id)
         );
-        job.accepted_config = Some(scoped_placement_config_for_job(&config, &job));
-
-        // Model a v1 daemon from before compact activity records. It has the
-        // bounded active queue and full job, but no activity index/record.
-        let mut kv = InProcessKvStore::new();
-        kv.put_serde(file_system_config_key(&file_system_id), &config, None)
-            .expect("put legacy-compatible config");
-        kv.put_serde(
-            placement_reconciliation_key(&file_system_id, &job.job_id),
-            &job,
-            None,
-        )
-        .expect("put legacy-compatible active job");
-        kv.put_serde(
-            placement_reconciliation_queue_key(&file_system_id),
-            &DfsPlacementReconciliationQueue {
-                schema_version: PLACEMENT_RECONCILIATION_QUEUE_SCHEMA_VERSION,
-                job_ids: vec![job.job_id.clone()],
-            },
-            None,
-        )
-        .expect("put active queue");
-
-        let mut kv = RejectPlacementHistoryRangeKv { inner: kv };
-        let store = DfsControlPlaneStore::new(&mut kv);
-        let page = store
-            .placement_reconciliation_activity(
-                &file_system_id,
-                &[DfsPlacementReconciliationActivityStatus::Running],
-                Some("/users"),
-                None,
-                10,
-            )
-            .expect("bounded rolling-upgrade activity");
-        assert_eq!(page.activities.len(), 1);
-        assert_eq!(page.activities[0].job_id, job.job_id);
+        // Negative omission of a compact record produced by the SAME normal
+        // Apply. Full job DATA is not a replacement healthy activity producer.
+        data.txn(KvTxn {
+            compares: Vec::new(),
+            success: vec![KvOp::Delete {
+                key: placement_reconciliation_activity_record_key(
+                    &actual.file_system_id,
+                    &actual.job_id,
+                ),
+            }],
+            failure: Vec::new(),
+        })
+        .unwrap();
+        let mut data = RejectPlacementHistoryRangeKv { inner: data };
+        let page = DfsControlPlaneStore::new(&mut data)
+            .placement_reconciliation_activity(&actual.file_system_id, &[], None, None, 10)
+            .unwrap();
+        assert!(page.activities.is_empty());
         assert!(page.partial);
         assert!(page.history_truncated);
     }
 
     #[test]
-    fn placement_activity_prefers_a_newer_full_job_from_an_older_writer() {
-        let file_system_id = file_system_id();
-        let owner = node("placement-activity-mixed-writer-owner");
-        let base = DfsFileSystemConfig {
-            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
-            retention_policies: Default::default(),
-            module_metadata: Default::default(),
-            file_system_id: file_system_id.clone(),
-            display_name: "sifs".to_string(),
-            owner_node_id: owner.clone(),
-            subtree_policies: Vec::new(),
-        };
-        let desired = placement_authority_test_config(&owner, 1);
-        let job = placement_authority_test_job(
-            "placement-activity-mixed-writer-job",
-            &file_system_id,
-            &owner,
-            9,
-        );
-        let mut kv = InProcessKvStore::new();
-        let mut store = DfsControlPlaneStore::new(&mut kv);
-        store.put_file_system_config(&base).expect("base config");
+    fn placement_activity_uses_actual_compact_record_without_full_job_scan() {
+        let (mut data, actual) =
+            native_placement_activity_fixture_data("native-activity-without-full-row");
+        let before = DfsControlPlaneStore::new(&mut data)
+            .placement_reconciliation_activity(&actual.file_system_id, &[], None, None, 10)
+            .unwrap();
         assert!(
-            store
-                .compare_and_put_placement_update(&base, &desired, &job)
-                .expect("new-writer Apply")
+            before
+                .activities
+                .iter()
+                .any(|row| row.job_id == actual.job_id)
         );
-        let durable = store
-            .placement_reconciliation(&file_system_id, &job.job_id)
-            .expect("durable job read")
-            .expect("durable job");
-
-        // Model an older v1 daemon: it knows the full job and active queue but
-        // not the compact activity record introduced by this change.
-        let mut completed = durable;
-        completed.state = DfsPlacementReconciliationState::Completed;
-        completed.revision = 1;
-        completed.updated_at_unix_nanos = 10;
-        kv.put_serde(
-            placement_reconciliation_key(&file_system_id, &completed.job_id),
-            &completed,
-            None,
-        )
-        .expect("older writer completes full job");
-        kv.put_serde(
-            placement_reconciliation_queue_key(&file_system_id),
-            &DfsPlacementReconciliationQueue::default(),
-            None,
-        )
-        .expect("older writer removes active queue id");
-
-        let mut kv = RejectPlacementHistoryRangeKv { inner: kv };
-        let store = DfsControlPlaneStore::new(&mut kv);
-        let page = store
-            .placement_reconciliation_activity(&file_system_id, &[], None, None, 10)
-            .expect("mixed-writer activity");
-        assert_eq!(page.activities.len(), 1);
-        assert_eq!(page.activities[0].revision, 1);
-        assert_eq!(
-            page.activities[0].status,
-            DfsPlacementReconciliationActivityStatus::Completed
-        );
-        assert!(page.partial, "the compact projection was stale");
+        // Lose only the full execution DATA row. The actual native compact
+        // record stays unchanged; no completion state or summary is invented.
+        data.txn(KvTxn {
+            compares: Vec::new(),
+            success: vec![KvOp::Delete {
+                key: placement_reconciliation_key(&actual.file_system_id, &actual.job_id),
+            }],
+            failure: Vec::new(),
+        })
+        .unwrap();
+        let mut data = RejectPlacementHistoryRangeKv { inner: data };
+        let page = DfsControlPlaneStore::new(&mut data)
+            .placement_reconciliation_activity(&actual.file_system_id, &[], None, None, 10)
+            .unwrap();
+        assert_eq!(page, before);
     }
 
     #[test]
@@ -8032,7 +8258,6 @@ mod tests {
         let file_system_id = file_system_id();
         let owner = node("placement-activity-monotonic-partial-owner");
         let base = DfsFileSystemConfig {
-            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: file_system_id.clone(),
@@ -8047,7 +8272,7 @@ mod tests {
             &owner,
             1,
         );
-        old_terminal.accepted_config = Some(scoped_placement_config_for_job(&base, &old_terminal));
+        old_terminal.accepted_config = scoped_placement_config_for_job(&base, &old_terminal);
         old_terminal.state = DfsPlacementReconciliationState::Completed;
         let new_job = placement_authority_test_job(
             "placement-activity-post-upgrade",
@@ -8131,7 +8356,7 @@ mod tests {
             1,
         );
         let active_config = placement_authority_test_config(&owner, 1);
-        active.accepted_config = Some(scoped_placement_config_for_job(&active_config, &active));
+        active.accepted_config = scoped_placement_config_for_job(&active_config, &active);
         kv.put_serde(
             placement_reconciliation_key(&file_system_id, &active.job_id),
             &active,
@@ -8266,8 +8491,7 @@ mod tests {
             &owner,
             2_000,
         );
-        newest_active.accepted_config =
-            Some(scoped_placement_config_for_job(&config, &newest_active));
+        newest_active.accepted_config = scoped_placement_config_for_job(&config, &newest_active);
         kv.put_serde(
             placement_reconciliation_key(&file_system_id, &newest_active.job_id),
             &newest_active,
@@ -8311,8 +8535,7 @@ mod tests {
             &owner,
             1,
         );
-        oldest_active.accepted_config =
-            Some(scoped_placement_config_for_job(&config, &oldest_active));
+        oldest_active.accepted_config = scoped_placement_config_for_job(&config, &oldest_active);
         store
             .put_serde(
                 &placement_reconciliation_key(&file_system_id, &oldest_active.job_id),
@@ -8391,7 +8614,6 @@ mod tests {
 
         store
             .put_file_system_config(&DfsFileSystemConfig {
-                metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
                 retention_policies: Default::default(),
                 module_metadata: Default::default(),
                 file_system_id: custom.file_system_id.clone(),
@@ -8409,7 +8631,6 @@ mod tests {
         assert_eq!(published.subtree_policies, custom.subtree_policies);
 
         let defaults = DfsFileSystemConfig {
-            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: custom.file_system_id.clone(),
@@ -8419,8 +8640,8 @@ mod tests {
                 path_prefix: "/services".to_string(),
                 policy: DfsObjectPolicy::ReplicatedEventual,
                 scope: DfsPlacementScope::Subtree,
-                min_commit_replicas: Some(1),
-                desired_replicas: Some(1),
+                min_commit_replicas: 1,
+                desired_replicas: 1,
                 required_node_ids: Vec::new(),
                 forbidden_node_ids: Vec::new(),
                 min_distinct_zones: 0,
@@ -8449,7 +8670,6 @@ mod tests {
         let mut kv = InProcessKvStore::new();
         let owner = node("placement-publication-deleted-policy-owner");
         let deleted = DfsFileSystemConfig {
-            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: file_system_id(),
@@ -8546,7 +8766,7 @@ mod tests {
         assert_eq!(durable.job_id, proposal.job_id);
         assert_eq!(
             durable.accepted_config,
-            Some(scoped_placement_config_for_job(&desired, &proposal))
+            scoped_placement_config_for_job(&desired, &proposal)
         );
     }
 
@@ -8555,7 +8775,6 @@ mod tests {
         let mut kv = InProcessKvStore::new();
         let owner = node("placement-permit-owner");
         let base = DfsFileSystemConfig {
-            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: file_system_id(),
@@ -8599,8 +8818,8 @@ mod tests {
             path_prefix: "/services".to_string(),
             policy: DfsObjectPolicy::ReplicatedEventual,
             scope: DfsPlacementScope::Subtree,
-            min_commit_replicas: Some(1),
-            desired_replicas: Some(1),
+            min_commit_replicas: 1,
+            desired_replicas: 1,
             required_node_ids: Vec::new(),
             forbidden_node_ids: Vec::new(),
             min_distinct_zones: 0,
@@ -8653,7 +8872,6 @@ mod tests {
     fn stale_observed_generation_cannot_pass_the_authoritative_permit_transaction() {
         let owner = node("placement-stale-observed-owner");
         let base = DfsFileSystemConfig {
-            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: file_system_id(),
@@ -8735,7 +8953,6 @@ mod tests {
         let mut kv = InProcessKvStore::new();
         let owner = node("placement-permanent-permit-owner");
         let base = DfsFileSystemConfig {
-            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: file_system_id(),
@@ -8843,7 +9060,6 @@ mod tests {
     fn placement_failed_release_survives_ephemeral_store_and_fresh_store_finishes_exact_delete() {
         let owner = node("placement-release-recovery-owner");
         let base = DfsFileSystemConfig {
-            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: file_system_id(),
@@ -8923,7 +9139,6 @@ mod tests {
     fn placement_ambiguous_acquisition_is_queued_before_any_metadata_mutation() {
         let owner = node("placement-ambiguous-acquisition-owner");
         let base = DfsFileSystemConfig {
-            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: file_system_id(),
@@ -9009,9 +9224,9 @@ mod tests {
         let record = DfsPlacementAuthorityPermitRecord {
             job_id: "placement-recovery-unauthorized-job".to_string(),
             holder_id: "placement-recovery-unauthorized-holder".to_string(),
-            holder_cluster_id: Some(current_process.cluster_id.clone()),
-            holder_node_id: Some(owner.clone()),
-            holder_session_id: Some("placement-recovery-unauthorized-prior-session".to_string()),
+            holder_cluster_id: current_process.cluster_id.clone(),
+            holder_node_id: owner.clone(),
+            holder_session_id: "placement-recovery-unauthorized-prior-session".to_string(),
         };
         let key = placement_authority_permit_key(&file_system_id);
         let mut client = RejectPlacementHistoryRangeKv {
@@ -9044,7 +9259,6 @@ mod tests {
         let mut kv = InProcessKvStore::new();
         let owner = node("placement-prior-process-owner");
         let base = DfsFileSystemConfig {
-            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: file_system_id(),
@@ -9136,97 +9350,6 @@ mod tests {
     }
 
     #[test]
-    fn placement_prior_process_recovery_exact_cas_preserves_replacement_and_legacy_records() {
-        let file_system_id = file_system_id();
-        let owner = node("placement-recovery-cas-owner");
-        let current_process = DfsPlacementAuthorityProcessIdentity {
-            cluster_id: "placement-recovery-cas-cluster".to_string(),
-            process_session_id: "placement-recovery-cas-current-session".to_string(),
-        };
-        let old = DfsPlacementAuthorityPermitRecord {
-            job_id: "placement-recovery-cas-old-job".to_string(),
-            holder_id: "placement-recovery-cas-old-holder".to_string(),
-            holder_cluster_id: Some(current_process.cluster_id.clone()),
-            holder_node_id: Some(owner.clone()),
-            holder_session_id: Some("placement-recovery-cas-prior-session".to_string()),
-        };
-        let replacement = DfsPlacementAuthorityPermitRecord {
-            job_id: "placement-recovery-cas-new-job".to_string(),
-            holder_id: "placement-recovery-cas-new-holder".to_string(),
-            holder_cluster_id: Some(current_process.cluster_id.clone()),
-            holder_node_id: Some(owner.clone()),
-            holder_session_id: Some(current_process.process_session_id.clone()),
-        };
-        let key = placement_authority_permit_key(&file_system_id);
-        let mut observed = InProcessKvStore::new();
-        observed
-            .put(
-                key.clone(),
-                sinomo_core::kv::encode_kv_value(&old).expect("old record encoding"),
-                None,
-            )
-            .expect("observed old record");
-        let mut authoritative = InProcessKvStore::new();
-        authoritative
-            .put(
-                key.clone(),
-                sinomo_core::kv::encode_kv_value(&replacement)
-                    .expect("replacement record encoding"),
-                None,
-            )
-            .expect("authoritative replacement");
-        let mut client = StaleObservedAuthoritativeTxnKv {
-            observed,
-            authoritative,
-        };
-        let mut store = DfsControlPlaneStore::new(&mut client);
-        assert!(
-            !store
-                .recover_prior_process_placement_authority_permit_for_local_node(
-                    &file_system_id,
-                    &owner,
-                    &current_process,
-                )
-                .expect("stale recovery compare")
-        );
-        assert_eq!(
-            client
-                .authoritative
-                .get(&key)
-                .expect("replacement remains")
-                .decode::<DfsPlacementAuthorityPermitRecord>()
-                .expect("replacement decoding"),
-            replacement
-        );
-
-        let legacy = DfsPlacementAuthorityPermitRecord {
-            job_id: "placement-recovery-legacy-job".to_string(),
-            holder_id: "placement-recovery-legacy-holder".to_string(),
-            holder_cluster_id: None,
-            holder_node_id: None,
-            holder_session_id: None,
-        };
-        let mut kv = InProcessKvStore::new();
-        kv.put(
-            key.clone(),
-            sinomo_core::kv::encode_kv_value(&legacy).expect("legacy record encoding"),
-            None,
-        )
-        .expect("legacy record");
-        let mut store = DfsControlPlaneStore::new(&mut kv);
-        assert!(
-            !store
-                .recover_prior_process_placement_authority_permit_for_local_node(
-                    &file_system_id,
-                    &owner,
-                    &current_process,
-                )
-                .expect("legacy recovery is rejected")
-        );
-        assert!(store.kv.get(&key).expect("legacy record read").is_some());
-    }
-
-    #[test]
     fn placement_operator_inspection_is_sanitized_and_missing_member_clear_is_guarded() {
         let file_system_id = file_system_id();
         let cluster_id = placement_authority_operator_test_cluster_id();
@@ -9244,12 +9367,8 @@ mod tests {
             .placement_authority_permit_status(&file_system_id)
             .expect("inspect permit")
             .expect("permit status");
-        assert_eq!(
-            status.holder_kind,
-            DfsPlacementAuthorityPermitHolderKind::Identified
-        );
-        assert_eq!(status.holder_cluster_id, Some(cluster_id.to_string()));
-        assert_eq!(status.holder_node_id, Some(holder_node_id));
+        assert_eq!(status.holder_cluster_id, cluster_id.to_string());
+        assert_eq!(status.holder_node_id, holder_node_id);
         assert!(status.recovery_token.starts_with("v1:"));
         let encoded = serde_json::to_string(&status).expect("status json");
         assert!(!encoded.contains("private-holder-session"));
@@ -9384,7 +9503,7 @@ mod tests {
     }
 
     #[test]
-    fn placement_operator_break_glass_is_explicit_and_limited_to_foreign_or_incomplete_holders() {
+    fn placement_operator_break_glass_is_explicit_and_limited_to_foreign_holders() {
         let file_system_id = file_system_id();
         let current_cluster_id = placement_authority_operator_test_cluster_id();
         let foreign_cluster_id =
@@ -9393,19 +9512,11 @@ mod tests {
         let holder_node_id = node("placement-operator-break-glass-holder");
         let local_node_id = node("placement-operator-break-glass-local");
 
-        let cases = [
-            placement_authority_operator_test_record(
-                Some(&foreign_cluster_id),
-                Some(holder_node_id.clone()),
-                Some("foreign-session"),
-            ),
-            placement_authority_operator_test_record(
-                Some(&current_cluster_id),
-                Some(holder_node_id.clone()),
-                None,
-            ),
-            placement_authority_operator_test_record(None, None, None),
-        ];
+        let cases = [placement_authority_operator_test_record(
+            Some(&foreign_cluster_id),
+            Some(holder_node_id.clone()),
+            Some("foreign-session"),
+        )];
         for record in cases {
             let mut kv = InProcessKvStore::new();
             put_placement_authority_operator_test_record(&mut kv, &file_system_id, &record);
@@ -9414,15 +9525,7 @@ mod tests {
                 .placement_authority_permit_status(&file_system_id)
                 .expect("inspect break-glass permit")
                 .expect("break-glass permit");
-            let normal_reason = if record.holder_cluster_id.as_deref()
-                == Some(current_cluster_id.to_string().as_str())
-            {
-                DfsPlacementAuthorityRecoveryRefusal::IncompleteHolderIdentity
-            } else if record.holder_cluster_id.is_some() {
-                DfsPlacementAuthorityRecoveryRefusal::ForeignCluster
-            } else {
-                DfsPlacementAuthorityRecoveryRefusal::IncompleteHolderIdentity
-            };
+            let normal_reason = DfsPlacementAuthorityRecoveryRefusal::ForeignCluster;
             assert_eq!(
                 store
                     .recover_removed_node_placement_authority_permit(
@@ -9606,6 +9709,7 @@ mod tests {
             .map(|fence| fence.state_fingerprint.clone())
             .unwrap_or_else(|| format!("blake3:membership-handoff-{journal_sequence}"));
         DfsMetadataShardMembershipHandoffProof {
+            cause: crate::DfsMetadataShardHandoffCause::Membership,
             handoff_id: handoff.handoff_id.clone(),
             retiring_shard: handoff.retiring_shard.clone(),
             desired_shard: handoff.desired_shard.clone(),
@@ -9644,16 +9748,20 @@ mod tests {
         let node_owner = node("node_owner");
         let node_replica = node("node_replica");
         let mut kv = InProcessKvStore::new();
+        // These names are structural assignment DATA; admitted member bytes
+        // come unchanged from their actual ordinary native source owner.
+        copy_native_member_fixture_data(&mut kv, vec![node("node_owner"), node("node_replica")]);
         let file_system = DfsFileSystem {
-            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: file_system_id(),
             display_name: "repo".to_string(),
             owner_node_id: node_owner.clone(),
-            subtree_policies: vec![DfsSubtreePolicy::legacy(
+            subtree_policies: vec![DfsSubtreePolicy::new(
                 ".",
                 DfsObjectPolicy::ReplicatedEventual,
+                1,
+                2,
             )],
         };
         let file_system_config = DfsFileSystemConfig::from(&file_system);
@@ -9664,7 +9772,6 @@ mod tests {
             replica_node_ids: vec![node_replica],
             epoch: 7,
             assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
 
@@ -9690,537 +9797,54 @@ mod tests {
         );
     }
 
-    #[test]
-    fn raw_metadata_shard_put_rejects_unproven_packed_downgrade() {
-        let file_system_id = file_system_id();
-        let packed = DfsMetadataShardConfig {
-            file_system_id: file_system_id.clone(),
-            shard_id: "root".to_string(),
-            primary_node_id: node("node_raw_codec_owner"),
-            replica_node_ids: vec![node("node_raw_codec_replica")],
-            epoch: 7,
-            assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV1,
-            default_policy: DfsObjectPolicy::ReplicatedEventual,
-        };
-        let legacy = DfsMetadataShardConfig {
-            epoch: packed.epoch + 1,
-            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::Legacy,
-            ..packed.clone()
-        };
-        let mut kv = InProcessKvStore::new();
-        put_packed_namespace_prepare_capable_members(
-            &mut kv,
-            std::iter::once(&packed.primary_node_id).chain(packed.replica_node_ids.iter()),
-        );
-        DfsControlPlaneStore::new(&mut kv)
-            .put_metadata_shard(&packed)
-            .expect("put packed shard");
-
-        let changed_packed = DfsMetadataShardConfig {
-            replica_node_ids: vec![node("node_raw_codec_uncapable_replica")],
-            epoch: packed.epoch + 1,
-            ..packed.clone()
-        };
-        assert!(matches!(
-            DfsControlPlaneStore::new(&mut kv).put_metadata_shard(&changed_packed),
-            Err(KvError::Serialization { detail })
-                if detail.contains("capability-validated")
-                    && detail.contains("membership handoff")
-        ));
-        assert!(matches!(
-            DfsControlPlaneStore::new(&mut kv).put_metadata_shard(&legacy),
-            Err(KvError::Serialization { detail })
-                if detail.contains("legacy-readable snapshot")
-                    && detail.contains("replay-floor proof")
-        ));
-        assert_eq!(
-            DfsControlPlaneStore::new(&mut kv)
-                .get_metadata_shard(&file_system_id, "root")
-                .expect("read retained packed shard"),
-            Some(packed)
-        );
-    }
-
-    #[test]
-    fn raw_metadata_shard_put_rejects_unproven_packed_activation() {
-        let file_system_id = file_system_id();
-        let legacy = DfsMetadataShardConfig {
-            file_system_id: file_system_id.clone(),
-            shard_id: "root".to_string(),
-            primary_node_id: node("node_raw_activation_owner"),
-            replica_node_ids: vec![node("node_raw_activation_replica")],
-            epoch: 7,
-            assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::Legacy,
-            default_policy: DfsObjectPolicy::ReplicatedEventual,
-        };
-        let packed = DfsMetadataShardConfig {
-            epoch: legacy.epoch + 1,
-            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV1,
-            ..legacy.clone()
-        };
-        let mut kv = InProcessKvStore::new();
-        DfsControlPlaneStore::new(&mut kv)
-            .put_metadata_shard(&legacy)
-            .expect("put legacy shard");
-
-        assert!(matches!(
-            DfsControlPlaneStore::new(&mut kv).put_metadata_shard(&packed),
-            Err(KvError::Serialization { detail })
-                if detail.contains("capability-validated")
-                    && detail.contains("membership handoff")
-        ));
-        assert!(matches!(
-            DfsControlPlaneStore::new(&mut kv)
-                .begin_metadata_shard_membership_handoff(&legacy, &packed),
-            Err(KvError::Serialization { detail })
-                if detail.contains("authoritative cluster member capability record")
-        ));
-        put_packed_namespace_prepare_capable_members(
-            &mut kv,
-            std::iter::once(&packed.primary_node_id).chain(packed.replica_node_ids.iter()),
-        );
-        assert!(
-            DfsControlPlaneStore::new(&mut kv)
-                .begin_metadata_shard_membership_handoff(&legacy, &packed)
-                .expect("capability-proved packed handoff")
-                .is_some()
-        );
-        assert_eq!(
-            DfsControlPlaneStore::new(&mut kv)
-                .get_metadata_shard(&file_system_id, "root")
-                .expect("read retained legacy shard"),
-            Some(legacy)
-        );
-    }
-
-    #[test]
-    fn metadata_namespace_prepare_codec_transitions_are_monotonic_through_v3() {
-        let legacy = DfsMetadataShardConfig {
+    #[tokio::test]
+    async fn async_raw_metadata_shard_put_rejects_unproven_reconfiguration() {
+        let shard = DfsMetadataShardConfig {
             file_system_id: file_system_id(),
-            shard_id: "root".to_string(),
-            primary_node_id: node("node_codec_transition_owner"),
-            replica_node_ids: vec![node("node_codec_transition_replica")],
-            epoch: 1,
+            shard_id: "root".into(),
+            primary_node_id: node("node_async_raw_current_owner"),
+            replica_node_ids: vec![node("node_async_raw_current_replica")],
+            epoch: 7,
             assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::Legacy,
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
-        let packed_v1 = DfsMetadataShardConfig {
-            epoch: 2,
-            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV1,
-            ..legacy.clone()
+        let mut data = InProcessKvStore::new();
+        copy_native_member_fixture_data(
+            &mut data,
+            std::iter::once(shard.primary_node_id.clone())
+                .chain(shard.replica_node_ids.clone())
+                .collect(),
+        );
+        DfsControlPlaneAsyncStore::new(&mut data)
+            .put_metadata_shard(&shard)
+            .await
+            .unwrap();
+        let altered_membership = DfsMetadataShardConfig {
+            replica_node_ids: vec![node("negative-raw-reconfiguration-outsider")],
+            epoch: shard.epoch + 1,
+            ..shard.clone()
         };
-        let packed_v2 = DfsMetadataShardConfig {
-            epoch: 3,
-            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV2,
-            ..legacy.clone()
+        let altered_epoch = DfsMetadataShardConfig {
+            epoch: shard.epoch + 1,
+            ..shard.clone()
         };
-
-        let packed_v3 = DfsMetadataShardConfig {
-            epoch: 4,
-            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV3,
-            ..legacy.clone()
-        };
-        validate_metadata_namespace_prepare_codec_transition(&packed_v2, &packed_v3)
-            .expect("packed-v2 to packed-v3 upgrade");
-        for desired in [&packed_v2, &packed_v1, &legacy] {
+        for changed in [&altered_membership, &altered_epoch] {
             assert!(
-                validate_metadata_namespace_prepare_codec_transition(&packed_v3, desired).is_err()
+                matches!(DfsControlPlaneAsyncStore::new(&mut data).put_metadata_shard(changed).await,
+                Err(KvError::Serialization { detail }) if detail.contains("native membership handoff"))
             );
         }
-
-        validate_metadata_namespace_prepare_codec_transition(&legacy, &packed_v1)
-            .expect("legacy to packed-v1 upgrade");
-        validate_metadata_namespace_prepare_codec_transition(&packed_v1, &packed_v2)
-            .expect("packed-v1 to packed-v2 upgrade");
-        validate_metadata_namespace_prepare_codec_transition(&legacy, &packed_v2)
-            .expect("a fully capable new generation may activate packed-v2 directly");
-        for desired in [&packed_v1, &legacy] {
-            assert!(matches!(
-                validate_metadata_namespace_prepare_codec_transition(&packed_v2, desired),
-                Err(KvError::Serialization { detail })
-                    if detail.contains("cannot downgrade")
-                        && detail.contains("packed-v2")
-                        && detail.contains(desired.namespace_prepare_codec.label())
-            ));
-        }
-    }
-
-    #[test]
-    fn interim_history_contracts_are_read_only_sources_for_v3_handoff() {
-        for (raw, codec) in [
-            (
-                "packed-v4",
-                DfsMetadataNamespacePrepareCodec::LegacyPackedV4,
-            ),
-            (
-                "packed-v5",
-                DfsMetadataNamespacePrepareCodec::LegacyPackedV5,
-            ),
-        ] {
-            assert_eq!(
-                serde_json::from_value::<DfsMetadataNamespacePrepareCodec>(serde_json::json!(raw))
-                    .unwrap(),
-                codec
-            );
-            assert!(codec.supports_file_history());
-            assert!(!codec.supports_file_history_mutations());
-            let old = DfsMetadataShardConfig {
-                file_system_id: file_system_id(),
-                shard_id: "root".into(),
-                primary_node_id: node("migration-primary"),
-                replica_node_ids: Vec::new(),
-                epoch: 1,
-                assignment: DfsMetadataShardAssignment::Root,
-                namespace_prepare_codec: codec,
-                default_policy: DfsObjectPolicy::ReplicatedEventual,
-            };
-            let current = DfsMetadataShardConfig {
-                namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV3,
-                epoch: 2,
-                ..old.clone()
-            };
-            validate_metadata_namespace_prepare_codec_transition(&old, &current).unwrap();
-            assert!(validate_metadata_namespace_prepare_codec_transition(&current, &old).is_err());
-        }
-    }
-
-    #[test]
-    fn initial_packed_metadata_shards_require_their_exact_capability() {
-        for codec in [
-            DfsMetadataNamespacePrepareCodec::PackedV2,
-            DfsMetadataNamespacePrepareCodec::PackedV3,
-            DfsMetadataNamespacePrepareCodec::PackedV6,
-        ] {
-            let required_capability = codec.required_capability().unwrap();
-            let packed = DfsMetadataShardConfig {
-                file_system_id: file_system_id(),
-                shard_id: "root".to_string(),
-                primary_node_id: node("node_initial_packed_v2_owner"),
-                replica_node_ids: vec![node("node_initial_packed_v2_replica")],
-                epoch: 1,
-                assignment: DfsMetadataShardAssignment::Root,
-                namespace_prepare_codec: codec,
-                default_policy: DfsObjectPolicy::ReplicatedEventual,
-            };
-            let configured_node_ids = std::iter::once(&packed.primary_node_id)
-                .chain(packed.replica_node_ids.iter())
-                .cloned()
-                .collect::<Vec<_>>();
-            let mut kv = InProcessKvStore::new();
-            put_packed_namespace_prepare_capable_members(&mut kv, configured_node_ids.iter());
-
-            assert!(matches!(
-                DfsControlPlaneStore::new(&mut kv).put_metadata_shard(&packed),
-                Err(KvError::Serialization { detail })
-                    if detail.contains(codec.label())
-                        && detail.contains(required_capability)
-            ));
-
-            add_namespace_prepare_capability(
-                &mut kv,
-                required_capability,
-                configured_node_ids.iter(),
-            );
-            let denied_node_id = &packed.replica_node_ids[0];
-            let denied_member = kv
-                .get(&cluster_member_key(denied_node_id))
-                .expect("packed member")
-                .decode::<ClusterMemberRecord>()
-                .expect("decode packed member");
-            let mut denied_policy = ClusterCapabilityPolicyRecord::from(&denied_member);
-            denied_policy
-                .capabilities
-                .retain(|capability| capability.as_str() != required_capability);
-            kv.put_serde(
-                cluster_capability_policy_key(denied_node_id),
-                &denied_policy,
-                None,
-            )
-            .expect("put packed denying policy");
-            assert!(matches!(
-                DfsControlPlaneStore::new(&mut kv).put_metadata_shard(&packed),
-                Err(KvError::Serialization { detail })
-                    if detail.contains("effective capability policy")
-                        && detail.contains(required_capability)
-            ));
-
-            let allowed_policy = ClusterCapabilityPolicyRecord::from(&denied_member);
-            kv.put_serde(
-                cluster_capability_policy_key(denied_node_id),
-                &allowed_policy,
-                None,
-            )
-            .expect("put packed allowing policy");
-            DfsControlPlaneStore::new(&mut kv)
-                .put_metadata_shard(&packed)
-                .expect("capability-proved packed create");
-        }
-    }
-
-    #[test]
-    fn initial_packed_metadata_shard_requires_authoritative_member_capabilities() {
-        let packed = DfsMetadataShardConfig {
-            file_system_id: file_system_id(),
-            shard_id: "root".to_string(),
-            primary_node_id: node("node_initial_packed_owner"),
-            replica_node_ids: vec![node("node_initial_packed_replica")],
-            epoch: 1,
-            assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV1,
-            default_policy: DfsObjectPolicy::ReplicatedEventual,
-        };
-        let mut raw_kv = InProcessKvStore::new();
-        assert!(matches!(
-            DfsControlPlaneStore::new(&mut raw_kv).put_metadata_shard(&packed),
-            Err(KvError::Serialization { detail })
-                if detail.contains("authoritative cluster member capability record")
-        ));
-        put_packed_namespace_prepare_capable_members(
-            &mut raw_kv,
-            std::iter::once(&packed.primary_node_id).chain(packed.replica_node_ids.iter()),
-        );
-        put_packed_namespace_prepare_capability_policy(
-            &mut raw_kv,
-            &packed.replica_node_ids[0],
-            false,
-        );
-        assert!(matches!(
-            DfsControlPlaneStore::new(&mut raw_kv).put_metadata_shard(&packed),
-            Err(KvError::Serialization { detail })
-                if detail.contains("effective capability policy")
-        ));
-        put_packed_namespace_prepare_capability_policy(
-            &mut raw_kv,
-            &packed.replica_node_ids[0],
-            true,
-        );
-        DfsControlPlaneStore::new(&mut raw_kv)
-            .put_metadata_shard(&packed)
-            .expect("capability-proved raw create");
-
-        let mut cas_kv = InProcessKvStore::new();
-        assert!(matches!(
-            DfsControlPlaneStore::new(&mut cas_kv)
-                .compare_and_put_metadata_shard(None, &packed),
-            Err(KvError::Serialization { detail })
-                if detail.contains("authoritative cluster member capability record")
-        ));
-        put_packed_namespace_prepare_capable_members(
-            &mut cas_kv,
-            std::iter::once(&packed.primary_node_id).chain(packed.replica_node_ids.iter()),
-        );
-        assert!(
-            DfsControlPlaneStore::new(&mut cas_kv)
-                .compare_and_put_metadata_shard(None, &packed)
-                .expect("capability-proved CAS create")
-        );
-    }
-
-    #[test]
-    fn initial_packed_metadata_shard_fences_concurrent_capability_loss() {
-        let packed = DfsMetadataShardConfig {
-            file_system_id: file_system_id(),
-            shard_id: "root".to_string(),
-            primary_node_id: node("node_racing_packed_owner"),
-            replica_node_ids: vec![node("node_racing_packed_replica")],
-            epoch: 1,
-            assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV1,
-            default_policy: DfsObjectPolicy::ReplicatedEventual,
-        };
-        let mut inner = InProcessKvStore::new();
-        put_packed_namespace_prepare_capable_members(
-            &mut inner,
-            std::iter::once(&packed.primary_node_id).chain(packed.replica_node_ids.iter()),
-        );
-        let replica_member_key = cluster_member_key(&packed.replica_node_ids[0]);
-        let mut kv = DropPackedCapabilityBeforeTxnKv {
-            inner,
-            record_key: replica_member_key,
-            record_kind: PackedCapabilityRecordKind::Member,
-            drop_before_next_txn: true,
-        };
-
-        assert!(matches!(
-            DfsControlPlaneStore::new(&mut kv).put_metadata_shard(&packed),
-            Err(KvError::Serialization { detail })
-                if detail.contains(DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY)
-        ));
-        assert!(
-            DfsControlPlaneStore::new(&mut kv)
-                .get_metadata_shard(&packed.file_system_id, &packed.shard_id)
-                .expect("read fenced shard")
-                .is_none(),
-            "the member capability compare must fence the shard create transaction"
-        );
-    }
-
-    #[test]
-    fn initial_packed_metadata_shard_fences_concurrent_policy_capability_loss() {
-        let packed = DfsMetadataShardConfig {
-            file_system_id: file_system_id(),
-            shard_id: "root".to_string(),
-            primary_node_id: node("node_racing_packed_policy_owner"),
-            replica_node_ids: vec![node("node_racing_packed_policy_replica")],
-            epoch: 1,
-            assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV1,
-            default_policy: DfsObjectPolicy::ReplicatedEventual,
-        };
-        let mut inner = InProcessKvStore::new();
-        put_packed_namespace_prepare_capable_members(
-            &mut inner,
-            std::iter::once(&packed.primary_node_id).chain(packed.replica_node_ids.iter()),
-        );
-        put_packed_namespace_prepare_capability_policy(
-            &mut inner,
-            &packed.replica_node_ids[0],
-            true,
-        );
-        let replica_policy_key = cluster_capability_policy_key(&packed.replica_node_ids[0]);
-        let mut kv = DropPackedCapabilityBeforeTxnKv {
-            inner,
-            record_key: replica_policy_key,
-            record_kind: PackedCapabilityRecordKind::Policy,
-            drop_before_next_txn: true,
-        };
-
-        assert!(matches!(
-            DfsControlPlaneStore::new(&mut kv).put_metadata_shard(&packed),
-            Err(KvError::Serialization { detail })
-                if detail.contains("effective capability policy")
-        ));
-        assert!(
-            DfsControlPlaneStore::new(&mut kv)
-                .get_metadata_shard(&packed.file_system_id, &packed.shard_id)
-                .expect("read policy-fenced shard")
-                .is_none(),
-            "the capability-policy compare must fence the shard create transaction"
-        );
-    }
-
-    #[tokio::test]
-    async fn async_raw_metadata_shard_put_rejects_unproven_packed_downgrade() {
-        let file_system_id = file_system_id();
-        let packed = DfsMetadataShardConfig {
-            file_system_id: file_system_id.clone(),
-            shard_id: "root".to_string(),
-            primary_node_id: node("node_async_raw_codec_owner"),
-            replica_node_ids: vec![node("node_async_raw_codec_replica")],
-            epoch: 7,
-            assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV1,
-            default_policy: DfsObjectPolicy::ReplicatedEventual,
-        };
-        let legacy = DfsMetadataShardConfig {
-            epoch: packed.epoch + 1,
-            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::Legacy,
-            ..packed.clone()
-        };
-        let mut kv = InProcessKvStore::new();
-        put_packed_namespace_prepare_capable_members(
-            &mut kv,
-            std::iter::once(&packed.primary_node_id).chain(packed.replica_node_ids.iter()),
-        );
-        DfsControlPlaneAsyncStore::new(&mut kv)
-            .put_metadata_shard(&packed)
-            .await
-            .expect("put packed shard");
-
-        let changed_packed = DfsMetadataShardConfig {
-            replica_node_ids: vec![node("node_async_raw_codec_uncapable_replica")],
-            epoch: packed.epoch + 1,
-            ..packed.clone()
-        };
-        assert!(matches!(
-            DfsControlPlaneAsyncStore::new(&mut kv)
-                .put_metadata_shard(&changed_packed)
-                .await,
-            Err(KvError::Serialization { detail })
-                if detail.contains("capability-validated")
-                    && detail.contains("membership handoff")
-        ));
-        assert!(matches!(
-            DfsControlPlaneAsyncStore::new(&mut kv)
-                .put_metadata_shard(&legacy)
-                .await,
-            Err(KvError::Serialization { detail })
-                if detail.contains("legacy-readable snapshot")
-                    && detail.contains("replay-floor proof")
-        ));
         assert_eq!(
-            DfsControlPlaneAsyncStore::new(&mut kv)
-                .get_metadata_shard(&file_system_id, "root")
+            DfsControlPlaneAsyncStore::new(&mut data)
+                .get_metadata_shard(&shard.file_system_id, &shard.shard_id)
                 .await
-                .expect("read retained packed shard"),
-            Some(packed)
+                .unwrap(),
+            Some(shard)
         );
     }
 
     #[tokio::test]
-    async fn async_raw_metadata_shard_put_rejects_unproven_packed_activation() {
-        let file_system_id = file_system_id();
-        let legacy = DfsMetadataShardConfig {
-            file_system_id: file_system_id.clone(),
-            shard_id: "root".to_string(),
-            primary_node_id: node("node_async_raw_activation_owner"),
-            replica_node_ids: vec![node("node_async_raw_activation_replica")],
-            epoch: 7,
-            assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::Legacy,
-            default_policy: DfsObjectPolicy::ReplicatedEventual,
-        };
-        let packed = DfsMetadataShardConfig {
-            epoch: legacy.epoch + 1,
-            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV1,
-            ..legacy.clone()
-        };
-        let mut kv = InProcessKvStore::new();
-        DfsControlPlaneAsyncStore::new(&mut kv)
-            .put_metadata_shard(&legacy)
-            .await
-            .expect("put legacy shard");
-
-        assert!(matches!(
-            DfsControlPlaneAsyncStore::new(&mut kv)
-                .put_metadata_shard(&packed)
-                .await,
-            Err(KvError::Serialization { detail })
-                if detail.contains("capability-validated")
-                    && detail.contains("membership handoff")
-        ));
-        assert!(matches!(
-            DfsControlPlaneAsyncStore::new(&mut kv)
-                .begin_metadata_shard_membership_handoff(&legacy, &packed)
-                .await,
-            Err(KvError::Serialization { detail })
-                if detail.contains("authoritative cluster member capability record")
-        ));
-        put_packed_namespace_prepare_capable_members(
-            &mut kv,
-            std::iter::once(&packed.primary_node_id).chain(packed.replica_node_ids.iter()),
-        );
-        assert!(
-            DfsControlPlaneAsyncStore::new(&mut kv)
-                .begin_metadata_shard_membership_handoff(&legacy, &packed)
-                .await
-                .expect("capability-proved async packed handoff")
-                .is_some()
-        );
-        assert_eq!(
-            DfsControlPlaneAsyncStore::new(&mut kv)
-                .get_metadata_shard(&file_system_id, "root")
-                .await
-                .expect("read retained legacy shard"),
-            Some(legacy)
-        );
-    }
-
-    #[tokio::test]
-    async fn async_initial_packed_metadata_shard_requires_authoritative_member_capabilities() {
+    async fn async_initial_metadata_shard_requires_current_member_capabilities() {
         let packed = DfsMetadataShardConfig {
             file_system_id: file_system_id(),
             shard_id: "root".to_string(),
@@ -10228,7 +9852,6 @@ mod tests {
             replica_node_ids: vec![node("node_async_initial_packed_replica")],
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV1,
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         let mut raw_kv = InProcessKvStore::new();
@@ -10239,7 +9862,7 @@ mod tests {
             Err(KvError::Serialization { detail })
                 if detail.contains("authoritative cluster member capability record")
         ));
-        put_packed_namespace_prepare_capable_members(
+        copy_current_prepare_member_fixture_data(
             &mut raw_kv,
             std::iter::once(&packed.primary_node_id).chain(packed.replica_node_ids.iter()),
         );
@@ -10256,7 +9879,7 @@ mod tests {
             Err(KvError::Serialization { detail })
                 if detail.contains("authoritative cluster member capability record")
         ));
-        put_packed_namespace_prepare_capable_members(
+        copy_current_prepare_member_fixture_data(
             &mut cas_kv,
             std::iter::once(&packed.primary_node_id).chain(packed.replica_node_ids.iter()),
         );
@@ -10270,229 +9893,148 @@ mod tests {
 
     #[test]
     fn metadata_shard_primary_transfer_preserves_epoch_compare_and_idempotence() {
-        let node_owner = node("node_owner");
-        let node_replica = node("node_replica");
-        let mut kv = InProcessKvStore::new();
-        let file_system_id = file_system_id();
-        let shard = DfsMetadataShardConfig {
-            file_system_id: file_system_id.clone(),
-            shard_id: "root".to_string(),
-            primary_node_id: node_owner.clone(),
-            replica_node_ids: vec![node_replica.clone()],
-            epoch: 7,
-            assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
-            default_policy: DfsObjectPolicy::ReplicatedEventual,
-        };
-        let mut control = DfsControlPlaneStore::new(&mut kv);
-        control.put_metadata_shard(&shard).expect("put shard");
+        let name = "native-cp-transfer-negative-compare";
+        let nodes = crate::test_runtime::DfsTestRuntime::ordered_node_ids(name, 2);
+        let (mut data, shard) = native_control_plane_fixture_data(name, nodes);
+        let promoted = shard.replica_node_ids[0].clone();
         assert!(
-            DfsControlPlaneStore::new(&mut kv)
-                .transfer_metadata_shard_primary(&file_system_id, "root", 6, node_replica.clone(),)
-                .expect("stale transfer")
+            DfsControlPlaneStore::new(&mut data)
+                .transfer_metadata_shard_primary(
+                    &shard.file_system_id,
+                    &shard.shard_id,
+                    shard.epoch.saturating_sub(1),
+                    promoted.clone()
+                )
+                .unwrap()
                 .is_none()
         );
         assert_eq!(
-            DfsControlPlaneStore::new(&mut kv)
-                .transfer_metadata_shard_primary(&file_system_id, "root", 7, node_owner)
-                .expect("idempotent transfer"),
+            DfsControlPlaneStore::new(&mut data)
+                .transfer_metadata_shard_primary(
+                    &shard.file_system_id,
+                    &shard.shard_id,
+                    shard.epoch,
+                    shard.primary_node_id.clone()
+                )
+                .unwrap(),
             Some(shard.clone())
         );
-        assert!(matches!(
-            DfsControlPlaneStore::new(&mut kv).transfer_metadata_shard_primary(
-                &file_system_id,
-                "root",
-                7,
-                node_replica,
-            ),
-            Err(KvError::Serialization { detail })
-                if detail.contains("current operation-bound DFS prefix fence")
-        ));
+        assert!(
+            matches!(DfsControlPlaneStore::new(&mut data).transfer_metadata_shard_primary(
+            &shard.file_system_id, &shard.shard_id, shard.epoch, promoted),
+            Err(KvError::Serialization { detail }) if detail.contains("current operation-bound DFS prefix fence"))
+        );
         assert_eq!(
-            DfsControlPlaneStore::new(&mut kv)
-                .get_metadata_shard(&file_system_id, "root")
-                .expect("read unchanged shard"),
+            DfsControlPlaneStore::new(&mut data)
+                .get_metadata_shard(&shard.file_system_id, &shard.shard_id)
+                .unwrap(),
             Some(shard)
         );
     }
 
     #[test]
     fn metadata_shard_primary_transfer_rejects_epoch_exhaustion() {
-        let owner = node("node_transfer_exhausted_owner");
-        let replica = node("node_transfer_exhausted_replica");
-        let file_system_id = file_system_id();
-        let shard = DfsMetadataShardConfig {
-            file_system_id: file_system_id.clone(),
-            shard_id: "root".to_string(),
-            primary_node_id: owner,
-            replica_node_ids: vec![replica.clone()],
-            epoch: u64::MAX,
-            assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
-            default_policy: DfsObjectPolicy::ReplicatedEventual,
-        };
-        let mut kv = InProcessKvStore::new();
-        DfsControlPlaneStore::new(&mut kv)
-            .put_metadata_shard(&shard)
-            .expect("put shard");
-
-        assert!(matches!(
-            DfsControlPlaneStore::new(&mut kv).transfer_metadata_shard_primary(
-                &file_system_id,
-                "root",
-                u64::MAX,
-                replica,
-            ),
-            Err(KvError::Serialization { detail }) if detail.contains("epoch is exhausted")
-        ));
+        let name = "native-cp-transfer-negative-exhaustion";
+        let nodes = crate::test_runtime::DfsTestRuntime::ordered_node_ids(name, 2);
+        let (mut data, mut shard) = native_control_plane_fixture_data(name, nodes);
+        let promoted = shard.replica_node_ids[0].clone();
+        // Negative schema input on the captured row; no live assignment is
+        // published at the impossible exhausted test epoch.
+        shard.epoch = u64::MAX;
+        data.put_serde(
+            metadata_shard_key(&shard.file_system_id, &shard.shard_id),
+            &shard,
+            None,
+        )
+        .unwrap();
+        assert!(
+            matches!(DfsControlPlaneStore::new(&mut data).transfer_metadata_shard_primary(
+            &shard.file_system_id, &shard.shard_id, u64::MAX, promoted),
+            Err(KvError::Serialization { detail }) if detail.contains("epoch is exhausted"))
+        );
     }
 
     #[tokio::test]
     async fn async_metadata_shard_primary_transfer_requires_dfs_handoff() {
-        let owner = node("node_transfer_async_owner");
-        let replica = node("node_transfer_async_replica");
-        let file_system_id = file_system_id();
-        let shard = DfsMetadataShardConfig {
-            file_system_id: file_system_id.clone(),
-            shard_id: "root".to_string(),
-            primary_node_id: owner.clone(),
-            replica_node_ids: vec![replica.clone()],
-            epoch: 12,
-            assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
-            default_policy: DfsObjectPolicy::ReplicatedEventual,
-        };
-        let mut kv = InProcessKvStore::new();
-        DfsControlPlaneStore::new(&mut kv)
-            .put_metadata_shard(&shard)
-            .expect("put shard");
-
-        assert!(matches!(
-            DfsControlPlaneAsyncStore::new(&mut kv)
-                .transfer_metadata_shard_primary(
-                    &file_system_id,
-                    "root",
-                    shard.epoch,
-                    replica,
-                )
-                .await,
-            Err(KvError::Serialization { detail })
-                if detail.contains("current operation-bound DFS prefix fence")
-        ));
+        let name = "native-cp-async-transfer-negative";
+        let nodes = crate::test_runtime::DfsTestRuntime::ordered_node_ids(name, 2);
+        let (mut data, shard) = native_control_plane_fixture_data(name, nodes);
+        assert!(
+            matches!(DfsControlPlaneAsyncStore::new(&mut data).transfer_metadata_shard_primary(
+            &shard.file_system_id, &shard.shard_id, shard.epoch, shard.replica_node_ids[0].clone()).await,
+            Err(KvError::Serialization { detail }) if detail.contains("current operation-bound DFS prefix fence"))
+        );
         assert_eq!(
-            DfsControlPlaneAsyncStore::new(&mut kv)
-                .get_metadata_shard(&file_system_id, "root")
+            DfsControlPlaneAsyncStore::new(&mut data)
+                .get_metadata_shard(&shard.file_system_id, &shard.shard_id)
                 .await
-                .expect("read unchanged async shard"),
+                .unwrap(),
             Some(shard)
         );
     }
 
     #[test]
     fn metadata_shard_compare_and_put_rejects_stale_expected_value() {
-        let owner = node("node_shard_cas_owner");
-        let replacement = node("node_shard_cas_replacement");
-        let file_system_id = file_system_id();
-        let initial = DfsMetadataShardConfig {
-            file_system_id: file_system_id.clone(),
-            shard_id: "root".to_string(),
-            primary_node_id: owner.clone(),
-            replica_node_ids: vec![replacement.clone()],
-            epoch: 1,
-            assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
-            default_policy: DfsObjectPolicy::ReplicatedEventual,
-        };
-        let desired = DfsMetadataShardConfig {
-            primary_node_id: replacement.clone(),
-            epoch: 2,
-            ..initial.clone()
-        };
-        let mut kv = InProcessKvStore::new();
+        let (mut data, before, after) =
+            native_control_plane_handoff_fixture_data("native-cp-stale-cas-data");
         assert!(
-            DfsControlPlaneStore::new(&mut kv)
-                .compare_and_put_metadata_shard(None, &initial)
-                .expect("create missing shard")
-        );
-        // Install the concurrent successor directly as fixture state. The
-        // public KV-only primary-transfer surface deliberately cannot create
-        // this transition without a proof-bearing DFS handoff.
-        DfsControlPlaneStore::new(&mut kv)
-            .put_metadata_shard(&desired)
-            .expect("install concurrent successor fixture");
-
-        assert!(
-            !DfsControlPlaneStore::new(&mut kv)
-                .compare_and_put_metadata_shard(Some(&initial), &desired)
-                .expect("stale compare")
+            !DfsControlPlaneStore::new(&mut data)
+                .compare_and_put_metadata_shard(Some(&before), &after)
+                .unwrap()
         );
         assert_eq!(
-            DfsControlPlaneStore::new(&mut kv)
-                .get_metadata_shard(&file_system_id, "root")
-                .expect("read current shard")
-                .expect("shard")
-                .primary_node_id,
-            replacement
+            DfsControlPlaneStore::new(&mut data)
+                .get_metadata_shard(&after.file_system_id, &after.shard_id)
+                .unwrap(),
+            Some(after)
         );
     }
 
     #[test]
     fn metadata_shard_compare_and_put_parks_direct_primary_change() {
-        let owner = node("node_shard_direct_primary_owner");
-        let replacement = node("node_shard_direct_primary_replacement");
-        let file_system_id = file_system_id();
-        let current = DfsMetadataShardConfig {
-            file_system_id: file_system_id.clone(),
-            shard_id: "root".to_string(),
-            primary_node_id: owner.clone(),
-            replica_node_ids: vec![replacement.clone()],
-            epoch: 40,
-            assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
-            default_policy: DfsObjectPolicy::ReplicatedEventual,
-        };
-        let desired = DfsMetadataShardConfig {
-            primary_node_id: replacement,
-            replica_node_ids: vec![owner],
-            epoch: 41,
+        let name = "native-cp-unproven-role-change-negative";
+        let nodes = crate::test_runtime::DfsTestRuntime::ordered_node_ids(name, 2);
+        let (mut data, current) = native_control_plane_fixture_data(name, nodes);
+        let changed = DfsMetadataShardConfig {
+            primary_node_id: current.replica_node_ids[0].clone(),
+            replica_node_ids: vec![current.primary_node_id.clone()],
+            epoch: current.epoch + 1,
             ..current.clone()
         };
-        let mut kv = InProcessKvStore::new();
-        DfsControlPlaneStore::new(&mut kv)
-            .put_metadata_shard(&current)
-            .expect("put current shard");
-
         assert!(
-            !DfsControlPlaneStore::new(&mut kv)
-                .compare_and_put_metadata_shard(Some(&current), &desired)
-                .expect("bare primary-role activation must fail closed")
+            !DfsControlPlaneStore::new(&mut data)
+                .compare_and_put_metadata_shard(Some(&current), &changed)
+                .unwrap()
         );
         assert_eq!(
-            DfsControlPlaneStore::new(&mut kv)
-                .get_metadata_shard(&file_system_id, "root")
-                .expect("read unchanged shard"),
+            DfsControlPlaneStore::new(&mut data)
+                .get_metadata_shard(&current.file_system_id, &current.shard_id)
+                .unwrap(),
             Some(current)
         );
     }
 
     #[test]
     fn primary_handoff_request_is_idempotent_and_does_not_activate_without_proof() {
-        let current = DfsMetadataShardConfig {
-            file_system_id: file_system_id(),
-            shard_id: "root".into(),
-            primary_node_id: node("request-primary"),
-            replica_node_ids: vec![node("request-replica-a"), node("request-replica-b")],
-            epoch: 9,
-            assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
-            default_policy: DfsObjectPolicy::ReplicatedEventual,
-        };
-        let mut kv = InProcessKvStore::new();
-        let mut store = DfsControlPlaneStore::new(&mut kv);
-        store.put_metadata_shard(&current).unwrap();
+        let (runtime, mut source, current) = crate::test_support::current_native_metadata_service(
+            "native-cp-idempotent-role-request",
+            3,
+            "/",
+        )
+        .unwrap();
+        // SAME normal source serialization gate: pause background freeze while
+        // observing the request producer. This guard grants no publication.
+        let gate = source
+            .metadata_shard_fence_guard(&current.file_system_id, &current.shard_id)
+            .unwrap();
+        let control = source.control_plane.as_mut().unwrap();
+        let mut store = DfsControlPlaneStore::new(control.as_mut());
+        let prior_proof = store
+            .get_metadata_shard_membership_handoff_proof(&current.file_system_id, &current.shard_id)
+            .unwrap();
         assert!(
             store
-                .request_metadata_shard_primary_handoff(&current, &node("outsider"))
+                .request_metadata_shard_primary_handoff(&current, &node("native-cp-outsider"))
                 .is_err()
         );
         let first = store
@@ -10505,19 +10047,29 @@ mod tests {
             .unwrap();
         assert_eq!(first, retry);
         assert_eq!(
-            first.desired_shard.replica_node_ids,
-            vec![
-                current.replica_node_ids[1].clone(),
-                current.primary_node_id.clone()
-            ]
+            first.desired_shard,
+            metadata_shard_primary_handoff_target(&current, &current.replica_node_ids[0],).unwrap()
         );
-        assert_eq!(first.desired_shard.epoch, 10);
+        assert_eq!(first.desired_shard.epoch, current.epoch + 1);
         assert!(first.retiring_primary_fence.is_none());
         assert_eq!(
             store
                 .get_metadata_shard(&current.file_system_id, &current.shard_id)
                 .unwrap(),
             Some(current.clone())
+        );
+        let observed_proof = store
+            .get_metadata_shard_membership_handoff_proof(&current.file_system_id, &current.shard_id)
+            .unwrap();
+        assert_eq!(
+            observed_proof, prior_proof,
+            "the new unfenced request preserves the complete earlier native proof"
+        );
+        assert!(
+            observed_proof
+                .as_ref()
+                .is_none_or(|proof| proof.handoff_id != first.handoff_id),
+            "the new request has no exact proof or activation at this held source cut"
         );
         assert!(
             store
@@ -10546,192 +10098,453 @@ mod tests {
                 .unwrap(),
             Some(current)
         );
+        drop(gate);
+        drop(source);
+        runtime.close().unwrap();
     }
 
     #[test]
     fn metadata_shard_primary_role_handoff_requires_exact_existing_member_rotation() {
-        let owner = node("node_primary_role_owner");
-        let promoted = node("node_primary_role_promoted");
-        let other_replica = node("node_primary_role_other_replica");
-        let outsider = node("node_primary_role_outsider");
-        let file_system_id = file_system_id();
-        let current = DfsMetadataShardConfig {
-            file_system_id: file_system_id.clone(),
-            shard_id: "root".to_string(),
-            primary_node_id: owner.clone(),
-            replica_node_ids: vec![promoted.clone(), other_replica.clone()],
-            epoch: 44,
-            assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
-            default_policy: DfsObjectPolicy::ReplicatedEventual,
-        };
-        let desired = DfsMetadataShardConfig {
-            primary_node_id: promoted.clone(),
-            replica_node_ids: vec![other_replica.clone(), owner.clone()],
-            epoch: current.epoch + 1,
-            ..current.clone()
-        };
-        let mut kv = InProcessKvStore::new();
-        DfsControlPlaneStore::new(&mut kv)
-            .put_metadata_shard(&current)
-            .expect("put current shard");
-
+        let (runtime, mut source, current) = crate::test_support::current_native_metadata_service(
+            "native-cp-exact-role-rotation",
+            3,
+            "/",
+        )
+        .unwrap();
+        let desired =
+            metadata_shard_primary_handoff_target(&current, &current.replica_node_ids[0]).unwrap();
+        let mut wrong_order = desired.clone();
+        wrong_order.replica_node_ids.reverse();
+        let gate = source
+            .metadata_shard_fence_guard(&current.file_system_id, &current.shard_id)
+            .unwrap();
+        let control = source.control_plane.as_mut().unwrap();
+        let mut store = DfsControlPlaneStore::new(control.as_mut());
         for invalid in [
             DfsMetadataShardConfig {
-                primary_node_id: outsider,
+                primary_node_id: node("native-cp-role-outsider"),
                 ..desired.clone()
             },
             DfsMetadataShardConfig {
-                replica_node_ids: vec![owner.clone()],
+                replica_node_ids: vec![current.primary_node_id.clone()],
                 ..desired.clone()
             },
-            DfsMetadataShardConfig {
-                replica_node_ids: vec![owner.clone(), other_replica],
-                ..desired.clone()
-            },
+            wrong_order,
         ] {
             assert!(matches!(
-                DfsControlPlaneStore::new(&mut kv)
-                    .begin_metadata_shard_membership_handoff(&current, &invalid),
+                store.begin_metadata_shard_membership_handoff(&current, &invalid),
                 Err(KvError::Serialization { .. })
             ));
         }
-
-        let handoff = DfsControlPlaneStore::new(&mut kv)
+        let handoff = store
             .begin_metadata_shard_membership_handoff(&current, &desired)
-            .expect("begin exact role-only handoff")
-            .expect("current shard still active");
+            .unwrap()
+            .unwrap();
         assert_eq!(handoff.retiring_shard, current);
         assert_eq!(handoff.desired_shard, desired);
         assert_eq!(
             metadata_shard_configured_node_ids(&handoff.retiring_shard),
             metadata_shard_configured_node_ids(&handoff.desired_shard)
         );
+        assert_eq!(
+            store
+                .get_metadata_shard(&current.file_system_id, &current.shard_id)
+                .unwrap(),
+            Some(current)
+        );
+        drop(gate);
+        drop(source);
+        runtime.close().unwrap();
     }
 
     #[test]
     fn metadata_shard_primary_handoff_joint_quorum_tolerates_one_offline_replica() {
-        let owner = node("node_primary_joint_owner");
-        let promoted = node("node_primary_joint_promoted");
-        let retained = node("node_primary_joint_retained");
-        let offline = node("node_primary_joint_offline");
-        let file_system_id = file_system_id();
-        let current = DfsMetadataShardConfig {
-            file_system_id: file_system_id.clone(),
-            shard_id: "root".to_string(),
-            primary_node_id: owner.clone(),
-            replica_node_ids: vec![promoted.clone(), retained.clone(), offline.clone()],
-            epoch: 46,
-            assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
-            default_policy: DfsObjectPolicy::ReplicatedEventual,
-        };
-        let desired = DfsMetadataShardConfig {
-            primary_node_id: promoted.clone(),
-            replica_node_ids: vec![retained.clone(), offline.clone(), owner.clone()],
-            epoch: current.epoch + 1,
-            ..current.clone()
-        };
-        let mut kv = InProcessKvStore::new();
-        DfsControlPlaneStore::new(&mut kv)
-            .put_metadata_shard(&current)
-            .expect("put current shard");
-        let handoff = DfsControlPlaneStore::new(&mut kv)
-            .begin_metadata_shard_membership_handoff(&current, &desired)
-            .expect("begin primary handoff")
-            .expect("current shard remains exact");
-        let retiring_fence = DfsMetadataShardMembershipHandoffFence {
-            handoff_id: handoff.handoff_id.clone(),
-            primary_node_id: owner.clone(),
-            journal_sequence: 12,
-            state_fingerprint: "blake3:primary-joint-12".to_string(),
-        };
-        let handoff = DfsControlPlaneStore::new(&mut kv)
-            .acknowledge_metadata_shard_membership_handoff_fence(&handoff, &retiring_fence)
-            .expect("acknowledge retiring fence")
-            .expect("handoff remains pending");
-
-        let mut missing_promoted = membership_handoff_proof(&handoff, 12);
-        missing_promoted.acknowledged_node_ids =
-            vec![owner.clone(), retained.clone(), offline.clone()];
-        assert!(matches!(
-            DfsControlPlaneStore::new(&mut kv).complete_metadata_shard_membership_handoff(
-                &current,
-                &desired,
-                &missing_promoted,
-            ),
-            Err(KvError::Serialization { detail }) if detail.contains("both primaries")
-        ));
-
-        let mut proof = membership_handoff_proof(&handoff, 12);
-        proof.acknowledged_node_ids = vec![owner.clone(), promoted.clone(), retained.clone()];
+        let (mut runtime, mut source, current) =
+            crate::test_support::current_native_metadata_service(
+                "native-cp-offline-joint-handoff",
+                4,
+                "/",
+            )
+            .unwrap();
+        assert_eq!(metadata_shard_configured_node_ids(&current).len(), 4);
+        assert_eq!(current.replica_node_ids.len(), 3);
+        source
+            .posix_mkdir("/native-cp-before-offline-joint")
+            .unwrap();
+        let before = source
+            .posix_stat("/native-cp-before-offline-joint")
+            .unwrap();
+        let promoted = current.replica_node_ids[0].clone();
+        let offline = current.replica_node_ids.last().unwrap().clone();
+        assert_ne!(offline, promoted);
+        assert_ne!(offline, current.primary_node_id);
+        runtime.stop_node(&offline).unwrap();
+        let desired = metadata_shard_primary_handoff_target(&current, &promoted).unwrap();
+        let handoff_key =
+            metadata_shard_membership_handoff_key(&current.file_system_id, &current.shard_id);
+        let proof_key =
+            metadata_shard_membership_handoff_proof_key(&current.file_system_id, &current.shard_id);
+        let floor_key =
+            metadata_shard_operation_floor_key(&current.file_system_id, &current.shard_id);
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&captured);
+        let capture = runtime
+            .native_kv_request_hook(&current.primary_node_id, move |request| {
+                let proof = request.txn.success.iter().find_map(|op| match op {
+                    KvOp::Put { key, value, .. } if key == &proof_key => Some(value),
+                    _ => None,
+                });
+                let pending = request
+                    .txn
+                    .compares
+                    .iter()
+                    .find_map(|compare| match compare {
+                        KvCompare::ValueEquals { key, value } if key == &handoff_key => Some(value),
+                        _ => None,
+                    });
+                if let (Some(proof), Some(pending)) = (proof, pending) {
+                    let proof: DfsMetadataShardMembershipHandoffProof =
+                        sinomo_core::object::serde_ext::from_bytes(proof)
+                            .expect("actual normal activation proof request");
+                    let pending: DfsMetadataShardMembershipHandoff =
+                        sinomo_core::object::serde_ext::from_bytes(pending)
+                            .expect("same actual transaction's fenced pending compare");
+                    let floor = request
+                        .txn
+                        .compares
+                        .iter()
+                        .find_map(|compare| match compare {
+                            KvCompare::ValueEquals { key, value } if key == &floor_key => Some(
+                                sinomo_core::object::serde_ext::from_bytes::<
+                                    DfsMetadataShardOperationFloor,
+                                >(value)
+                                .expect("same actual transaction's floor compare"),
+                            ),
+                            _ => None,
+                        });
+                    let mut seen = seen.lock().unwrap();
+                    assert!(seen.len() < 32, "bounded actual handoff capture");
+                    seen.push((pending, proof, floor));
+                }
+                Ok(())
+            })
+            .unwrap();
+        let gate = source
+            .metadata_shard_fence_guard(&current.file_system_id, &current.shard_id)
+            .unwrap();
+        let requested = DfsControlPlaneStore::new(source.control_plane.as_mut().unwrap().as_mut())
+            .request_metadata_shard_primary_handoff(&current, &promoted)
+            .unwrap()
+            .unwrap();
+        assert_eq!(requested.desired_shard, desired);
+        drop(gate);
+        let configurations = runtime.metadata_shards().unwrap();
+        source
+            .reconcile_pending_metadata_shard_membership_handoffs(
+                &configurations,
+                std::time::Duration::from_secs(5),
+            )
+            .unwrap();
+        let store = DfsControlPlaneStore::new(source.control_plane.as_mut().unwrap().as_mut());
+        let active = store
+            .get_metadata_shard(&current.file_system_id, &current.shard_id)
+            .unwrap()
+            .unwrap();
+        let proof = store
+            .get_metadata_shard_membership_handoff_proof(&current.file_system_id, &current.shard_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(active, desired);
+        assert_eq!(proof.retiring_shard, current);
+        assert_eq!(proof.desired_shard, desired);
+        assert!(!proof.acknowledged_node_ids.contains(&offline));
+        assert_eq!(proof.acknowledged_node_ids.len(), 3);
         assert!(
-            DfsControlPlaneStore::new(&mut kv)
-                .complete_metadata_shard_membership_handoff(&current, &desired, &proof)
-                .expect("joint quorum activates without the offline replica")
+            proof
+                .acknowledged_node_ids
+                .contains(&current.primary_node_id)
         );
+        assert!(proof.acknowledged_node_ids.contains(&promoted));
+        assert!(
+            store
+                .get_metadata_shard_membership_handoff(&current.file_system_id, &current.shard_id)
+                .unwrap()
+                .is_none()
+        );
+        // Negative-only validation from the SAME successful producer request.
+        // This copied proof can never activate an assignment or create an ACK.
+        let (pending, original, floor) = captured
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(_, actual, _)| actual == &proof)
+            .unwrap()
+            .clone();
+        assert_eq!(original, proof);
+        let mut missing_promoted = original;
+        missing_promoted
+            .acknowledged_node_ids
+            .retain(|node| node != &promoted);
+        assert!(matches!(normalize_metadata_shard_membership_handoff_proof(
+            &pending, &missing_promoted, floor.as_ref(),
+        ), Err(KvError::Serialization { detail }) if detail.contains("both primaries")));
+        let mut reader = runtime.client(&promoted).unwrap();
+        let after = reader
+            .posix_stat("/native-cp-before-offline-joint")
+            .unwrap();
         assert_eq!(
-            DfsControlPlaneStore::new(&mut kv)
-                .get_metadata_shard(&file_system_id, "root")
-                .expect("active shard"),
-            Some(desired)
+            (after.object_id, after.version),
+            (before.object_id, before.version)
         );
+        drop(reader);
+        drop(capture);
+        drop(source);
+        runtime.close().unwrap();
     }
 
-    #[tokio::test]
-    async fn async_metadata_shard_primary_role_handoff_accepts_exact_rotation() {
-        let owner = node("node_primary_role_async_owner");
-        let promoted = node("node_primary_role_async_promoted");
-        let file_system_id = file_system_id();
-        let current = DfsMetadataShardConfig {
-            file_system_id,
-            shard_id: "root".to_string(),
-            primary_node_id: owner.clone(),
-            replica_node_ids: vec![promoted.clone()],
-            epoch: 45,
-            assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
-            default_policy: DfsObjectPolicy::ReplicatedEventual,
-        };
-        let desired = DfsMetadataShardConfig {
-            primary_node_id: promoted,
-            replica_node_ids: vec![owner],
-            epoch: current.epoch + 1,
-            ..current.clone()
-        };
-        let mut kv = InProcessKvStore::new();
-        DfsControlPlaneAsyncStore::new(&mut kv)
-            .put_metadata_shard(&current)
-            .await
-            .expect("put current shard");
-
-        let handoff = DfsControlPlaneAsyncStore::new(&mut kv)
+    #[test]
+    fn async_metadata_shard_primary_role_handoff_accepts_exact_rotation() {
+        let (runtime, mut source, current) = crate::test_support::current_native_metadata_service(
+            "native-cp-async-role-rotation",
+            2,
+            "/",
+        )
+        .unwrap();
+        let desired =
+            metadata_shard_primary_handoff_target(&current, &current.replica_node_ids[0]).unwrap();
+        let gate = source
+            .metadata_shard_fence_guard(&current.file_system_id, &current.shard_id)
+            .unwrap();
+        let mut control = source.control_plane.take().unwrap();
+        // Drive the actual native async CP API on the existing shared executor.
+        let handoff = runtime.runtime_handle().block_on(async {
+            DfsControlPlaneAsyncStore::new(
+                control.async_client().expect("native async CP capability"),
+            )
             .request_metadata_shard_primary_handoff(&current, &desired.primary_node_id)
             .await
-            .expect("begin exact async role-only handoff")
-            .expect("current shard still active");
+            .unwrap()
+            .unwrap()
+        });
         assert_eq!(handoff.retiring_shard, current);
         assert_eq!(handoff.desired_shard, desired);
+        assert_eq!(
+            DfsControlPlaneStore::new(control.as_mut())
+                .get_metadata_shard(&current.file_system_id, &current.shard_id,)
+                .unwrap(),
+            Some(current)
+        );
+        drop(gate);
+        drop(control);
+        drop(source);
+        runtime.close().unwrap();
+    }
+
+    /// Immutable schema/comparison DATA captured from a completed ordinary
+    /// native owner. This copied store has no live native transaction proof,
+    /// publication capability or peer ACK and cannot certify V7 publication.
+    fn native_control_plane_fixture_data(
+        name: &str,
+        nodes: Vec<NodeId>,
+    ) -> (InProcessKvStore, DfsMetadataShardConfig) {
+        assert!(!nodes.is_empty());
+        let name = name.to_string();
+        // Some callers run on a current-thread Tokio test executor. Native Main
+        // startup uses its existing shared multi-thread executor independently.
+        std::thread::spawn(move || {
+            let mut runtime =
+                crate::test_runtime::DfsTestRuntime::new(&name, nodes[0].clone()).unwrap();
+            for node in &nodes[1..] {
+                runtime.define_node(node.clone()).unwrap();
+            }
+            runtime.start_nodes().unwrap();
+            let shard = runtime.root_shard().unwrap();
+            let source = runtime.shared_control_plane().unwrap();
+            let mut keys = nodes
+                .iter()
+                .flat_map(|node| {
+                    [
+                        cluster_member_key(node),
+                        cluster_capability_policy_key(node),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            keys.push(metadata_shard_key(&shard.file_system_id, &shard.shard_id));
+            let entries = source
+                .with_client(|client| client.get_authoritative_consistent(&keys))
+                .unwrap();
+            assert_eq!(entries.len(), keys.len());
+            let mut data = InProcessKvStore::new();
+            for (key, entry) in keys.into_iter().zip(entries) {
+                if let Some(entry) = entry {
+                    assert_eq!(entry.key, key);
+                    data.put(entry.key, entry.value, None).unwrap();
+                }
+            }
+            for node in &nodes {
+                let member = data
+                    .get(&cluster_member_key(node))
+                    .unwrap()
+                    .decode::<ClusterMemberRecord>()
+                    .unwrap();
+                assert_eq!(member.node_id, *node);
+                assert!(member.state.is_authorized());
+                // Assert produced capabilities verbatim; never add a healthy
+                // capability to satisfy the gate under test.
+                assert!(
+                    member
+                        .capabilities
+                        .iter()
+                        .any(|capability| capability.as_str()
+                            == DFS_METADATA_PREPARED_OPERATION_V7_CAPABILITY)
+                );
+            }
+            assert_eq!(
+                data.get(&metadata_shard_key(&shard.file_system_id, &shard.shard_id))
+                    .unwrap()
+                    .decode::<DfsMetadataShardConfig>()
+                    .unwrap(),
+                shard
+            );
+            drop(source);
+            runtime.close().unwrap();
+            (data, shard)
+        })
+        .join()
+        .expect("actual native control-plane DATA producer")
+    }
+
+    fn copy_native_member_fixture_data(kv: &mut InProcessKvStore, nodes: Vec<NodeId>) {
+        let name = format!("native-cp-member-data-{}", nodes[0]);
+        let (captured, _) = native_control_plane_fixture_data(&name, nodes.clone());
+        for node in nodes {
+            for key in [
+                cluster_member_key(&node),
+                cluster_capability_policy_key(&node),
+            ] {
+                if let Some(entry) = captured.get(&key) {
+                    kv.put(entry.key.clone(), entry.value.clone(), None)
+                        .unwrap();
+                }
+            }
+        }
+    }
+
+    fn native_control_plane_handoff_fixture_data(
+        name: &str,
+    ) -> (
+        InProcessKvStore,
+        DfsMetadataShardConfig,
+        DfsMetadataShardConfig,
+    ) {
+        let name = name.to_string();
+        std::thread::spawn(move || {
+            let (runtime, nodes) =
+                crate::test_runtime::DfsTestRuntime::start_cluster(&name, 2).unwrap();
+            let before = runtime.root_shard().unwrap();
+            let promoted = nodes
+                .iter()
+                .find(|node| **node != before.primary_node_id)
+                .unwrap()
+                .clone();
+            let after = runtime
+                .reassign_metadata_shard(
+                    &before.file_system_id,
+                    &before.shard_id,
+                    promoted,
+                    vec![before.primary_node_id.clone()],
+                )
+                .unwrap();
+            let source = runtime.shared_control_plane().unwrap();
+            let key = metadata_shard_key(&after.file_system_id, &after.shard_id);
+            let entry = source
+                .with_client(|client| client.get_authoritative_consistent(&[key.clone()]))
+                .unwrap()
+                .pop()
+                .unwrap()
+                .unwrap();
+            assert_eq!(entry.decode::<DfsMetadataShardConfig>().unwrap(), after);
+            assert_ne!(before.primary_node_id, after.primary_node_id);
+            let mut data = InProcessKvStore::new();
+            data.put(entry.key, entry.value, None).unwrap();
+            drop(source);
+            runtime.close().unwrap();
+            (data, before, after)
+        })
+        .join()
+        .expect("actual current handoff source DATA")
+    }
+
+    fn native_placement_activity_fixture_data(
+        name: &str,
+    ) -> (InProcessKvStore, DfsPlacementReconciliationJob) {
+        let name = name.to_string();
+        std::thread::spawn(move || {
+            let (runtime, nodes) =
+                crate::test_runtime::DfsTestRuntime::start_cluster(&name, 1).unwrap();
+            let mut policy =
+                crate::DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedConfirmed, 1, 1).unwrap();
+            policy.required_node_ids = nodes.clone();
+            let produced = runtime
+                .apply_placement_policy(
+                    &nodes[0],
+                    "/services/native-activity-data",
+                    crate::DfsPlacementScope::Subtree,
+                    policy,
+                )
+                .unwrap();
+            let source = runtime.shared_control_plane().unwrap();
+            let keys = [
+                file_system_config_key(&produced.file_system_id),
+                metadata_shard_key(&produced.file_system_id, "root"),
+                placement_reconciliation_key(&produced.file_system_id, &produced.job_id),
+                placement_reconciliation_queue_key(&produced.file_system_id),
+                placement_reconciliation_activity_index_key(&produced.file_system_id),
+                placement_reconciliation_activity_record_key(
+                    &produced.file_system_id,
+                    &produced.job_id,
+                ),
+            ];
+            let entries = source
+                .with_client(|client| client.get_authoritative_consistent(&keys))
+                .unwrap();
+            assert_eq!(entries.len(), keys.len());
+            let mut data = InProcessKvStore::new();
+            for (key, entry) in keys.into_iter().zip(entries) {
+                if let Some(entry) = entry {
+                    assert_eq!(entry.key, key);
+                    data.put(entry.key, entry.value, None).unwrap();
+                }
+            }
+            let actual = data
+                .get(&placement_reconciliation_key(
+                    &produced.file_system_id,
+                    &produced.job_id,
+                ))
+                .unwrap()
+                .decode::<DfsPlacementReconciliationJob>()
+                .unwrap();
+            assert_eq!(actual.job_id, produced.job_id);
+            assert!(
+                data.get(&placement_reconciliation_activity_record_key(
+                    &actual.file_system_id,
+                    &actual.job_id
+                ))
+                .is_some()
+            );
+            drop(source);
+            runtime.close().unwrap();
+            (data, actual)
+        })
+        .join()
+        .expect("actual normal placement Apply activity DATA")
     }
 
     fn exact_authority_test_fixture(
         test_name: &str,
     ) -> (ExactAuthorityOnlyKv, DfsMetadataShardConfig) {
-        let owner = node(&format!("{test_name}-owner"));
-        let shard = DfsMetadataShardConfig {
-            file_system_id: file_system_id(),
-            shard_id: "root".to_string(),
-            primary_node_id: owner,
-            replica_node_ids: Vec::new(),
-            epoch: 19,
-            assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
-            default_policy: DfsObjectPolicy::ReplicatedEventual,
-        };
-        let mut inner = InProcessKvStore::new();
-        DfsControlPlaneStore::new(&mut inner)
-            .put_metadata_shard(&shard)
-            .expect("put exact-authority shard");
+        let nodes = crate::test_runtime::DfsTestRuntime::ordered_node_ids(test_name, 1);
+        let (inner, shard) = native_control_plane_fixture_data(test_name, nodes);
         (ExactAuthorityOnlyKv::new(inner), shard)
     }
 
@@ -10845,9 +10658,14 @@ mod tests {
             epoch: stale_shard.epoch.saturating_add(1),
             ..stale_shard.clone()
         };
-        DfsControlPlaneStore::new(&mut stale_client.inner)
-            .put_metadata_shard(&successor)
-            .expect("install successor shard");
+        stale_client
+            .inner
+            .put_serde(
+                metadata_shard_key(&stale_shard.file_system_id, &stale_shard.shard_id),
+                &successor,
+                None,
+            )
+            .expect("negatively alter captured assignment DATA");
         assert!(
             !DfsControlPlaneStore::new(&mut stale_client)
                 .metadata_shard_authority_is_current(&stale_shard)
@@ -10979,469 +10797,1041 @@ mod tests {
 
     #[test]
     fn metadata_shard_authority_check_rejects_stale_assignment_without_writing_kv() {
-        let owner = node("node_authority_stale_owner");
-        let replacement = node("node_authority_stale_replacement");
-        let file_system_id = file_system_id();
-        let shard = DfsMetadataShardConfig {
-            file_system_id: file_system_id.clone(),
-            shard_id: "root".to_string(),
-            primary_node_id: owner,
-            replica_node_ids: vec![replacement.clone()],
-            epoch: 4,
-            assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
-            default_policy: DfsObjectPolicy::ReplicatedEventual,
-        };
-        let mut kv = InProcessKvStore::new();
-        let mut control = DfsControlPlaneStore::new(&mut kv);
-        control.put_metadata_shard(&shard).expect("put shard");
-        let transferred = DfsMetadataShardConfig {
-            primary_node_id: replacement,
-            replica_node_ids: vec![shard.primary_node_id.clone()],
-            epoch: shard.epoch + 1,
-            ..shard.clone()
-        };
-        DfsControlPlaneStore::new(&mut kv)
-            .put_metadata_shard(&transferred)
-            .expect("install successor fixture");
-
-        let revision_before = kv.revision();
+        let (mut data, before, _after) =
+            native_control_plane_handoff_fixture_data("native-cp-stale-read-data");
+        let revision = data.revision();
         assert!(
-            !DfsControlPlaneStore::new(&mut kv)
-                .metadata_shard_authority_is_current(&shard)
-                .expect("stale authority check")
+            !DfsControlPlaneStore::new(&mut data)
+                .metadata_shard_authority_is_current(&before)
+                .unwrap()
         );
-        assert_eq!(kv.revision(), revision_before);
+        assert_eq!(data.revision(), revision);
+    }
+
+    // Only captured older observations or negative read failures are supplied
+    // here. All compares and native certificates come from the actual mounted
+    // control-plane client, never a private in-process quorum substitute.
+    #[derive(Debug)]
+    struct NativeFloorObservationKv {
+        inner: Box<dyn DfsControlPlaneKvClient>,
+        stale_entries: Option<BTreeMap<String, Option<KvEntry>>>,
+        remaining_read_failures: AtomicUsize,
+        refresh_calls: usize,
+        compare_misses: usize,
+    }
+
+    impl DfsControlPlaneKvClient for NativeFloorObservationKv {
+        fn refresh_latest(&mut self) -> Result<(), KvError> {
+            self.refresh_calls += 1;
+            self.inner.refresh_latest()?;
+            self.stale_entries = None;
+            Ok(())
+        }
+        fn get(&self, key: &str) -> Result<Option<KvEntry>, KvError> {
+            if self
+                .remaining_read_failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    (remaining > 0).then(|| remaining - 1)
+                })
+                .is_ok()
+            {
+                return Err(KvError::Io {
+                    path: "test-cluster-authoritative-view".into(),
+                    detail: "resident Raft view changed after ReadIndex quorum; retry the read"
+                        .into(),
+                });
+            }
+            if let Some(entry) = self
+                .stale_entries
+                .as_ref()
+                .and_then(|entries| entries.get(key))
+            {
+                return Ok(entry.clone());
+            }
+            self.inner.get(key)
+        }
+        fn range_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>, KvError> {
+            self.inner.range_prefix(prefix)
+        }
+        fn put(&mut self, key: String, value: Vec<u8>) -> Result<KvRevision, KvError> {
+            self.inner.put(key, value)
+        }
+        fn txn(&mut self, txn: KvTxn) -> Result<KvTxnResponse, KvError> {
+            self.inner.txn(txn)
+        }
+        fn txn_with_native_authority(
+            &mut self,
+            txn: KvTxn,
+        ) -> Result<(KvTxnResponse, Option<DfsNativeTxnCommit>), KvError> {
+            let result = self.inner.txn_with_native_authority(txn)?;
+            self.compare_misses += usize::from(!result.0.succeeded);
+            Ok(result)
+        }
+    }
+
+    struct NativeFloorFixture {
+        runtime: crate::test_support::DfsTestRuntime,
+        service: crate::NetworkedDfsService<crate::DfsNodeTransport>,
+        shard: DfsMetadataShardConfig,
+        control: NativeFloorObservationKv,
+        observed_create_command: Arc<Mutex<Option<crate::DfsMessageCommand>>>,
+    }
+    impl NativeFloorFixture {
+        fn new(name: &str) -> Self {
+            Self::with_node_count(name, 3)
+        }
+        fn with_node_count(name: &str, node_count: usize) -> Self {
+            let (runtime, _) = crate::test_support::DfsTestRuntime::start_cluster(name, node_count)
+                .expect("start actual native floor owners");
+            let shard = runtime.root_shard().expect("actual root assignment");
+            for path in [
+                "/native-floor-a.bin",
+                "/native-floor-b.bin",
+                "/native-floor-c.bin",
+            ] {
+                let mut policy =
+                    crate::DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedConfirmed, 1, 1)
+                        .unwrap();
+                policy.required_node_ids = vec![shard.primary_node_id.clone()];
+                runtime
+                    .apply_placement_policy(
+                        &shard.primary_node_id,
+                        path,
+                        DfsPlacementScope::SelfOnly,
+                        policy,
+                    )
+                    .expect("normal W1 placement Apply before writer open");
+            }
+            let service = runtime.client(&shard.primary_node_id).unwrap();
+            // This actual peer's CP remains healthy while the source owner's
+            // floor read is denied. It supplies the same genuine Raft producer.
+            let mut peer = runtime.client(&shard.replica_node_ids[0]).unwrap();
+            let inner = peer
+                .control_plane
+                .take()
+                .expect("actual peer control plane");
+            drop(peer);
+            let unavailable = shard.replica_node_ids.last().unwrap().clone();
+            for route in [
+                crate::DFS_METADATA_JOURNAL_BATCH_ROUTE,
+                crate::DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE,
+            ] {
+                runtime.install_fault(crate::test_support::DfsTestFaultRule {
+                    source: Some(shard.primary_node_id.clone()),
+                    target: Some(unavailable.clone()),
+                    route: Some(route.into()),
+                    call_id: None,
+                    origin: None,
+                    remaining_hits: 32,
+                    action: crate::test_support::DfsTestFaultAction::BudgetExhausted,
+                });
+            }
+            Self {
+                runtime,
+                service,
+                shard,
+                control: NativeFloorObservationKv {
+                    inner,
+                    stale_entries: None,
+                    remaining_read_failures: AtomicUsize::new(0),
+                    refresh_calls: 0,
+                    compare_misses: 0,
+                },
+                observed_create_command: Arc::new(Mutex::new(None)),
+            }
+        }
+        fn floor_key(&self) -> String {
+            metadata_shard_operation_floor_key(&self.shard.file_system_id, &self.shard.shard_id)
+        }
+        fn floor(&mut self) -> DfsMetadataShardOperationFloor {
+            let key = self.floor_key();
+            let entries = self
+                .control
+                .inner
+                .get_authoritative_consistent(&[key])
+                .unwrap();
+            let [Some(entry)] = entries.as_slice() else {
+                panic!("actual authoritative floor baseline must contain its exact native permit");
+            };
+            entry.decode().unwrap()
+        }
+        fn capture_observations(&mut self) -> BTreeMap<String, Option<KvEntry>> {
+            let keys = vec![
+                metadata_shard_key(&self.shard.file_system_id, &self.shard.shard_id),
+                self.floor_key(),
+                metadata_shard_membership_handoff_key(
+                    &self.shard.file_system_id,
+                    &self.shard.shard_id,
+                ),
+            ];
+            let entries = self
+                .control
+                .inner
+                .get_authoritative_consistent(&keys)
+                .unwrap();
+            keys.into_iter().zip(entries).collect()
+        }
+        fn capture_create_on_main(
+            &self,
+            path: &str,
+            operation_id: &str,
+            captured: Arc<Mutex<Option<crate::DfsPreparedOperationPayload>>>,
+            before_prepare: Option<Box<dyn FnOnce() + Send>>,
+        ) -> crate::runtime_host::DaemonDfsPreDispatchTestHookGuard {
+            let expected_path = path.to_string();
+            let expected_operation = operation_id.to_string();
+            let expected_shard = self.shard.clone();
+            let executions = std::sync::atomic::AtomicUsize::new(0);
+            let before_prepare = Mutex::new(before_prepare);
+            let observed_command = Arc::clone(&self.observed_create_command);
+            let hook: Arc<crate::runtime_host::DaemonDfsPreDispatchTestHook> =
+                Arc::new(move |point, command, _| {
+                    if !matches!(
+                        point,
+                        crate::runtime_host::DaemonDfsPreDispatchTestPoint::BeforeExecute { .. }
+                    ) {
+                        return Ok(());
+                    }
+                    let Some(command) = command else {
+                        return Ok(());
+                    };
+                    let crate::DfsNetworkMessage::ExclusiveCreateRequest(write) =
+                        &command.routed_message.message
+                    else {
+                        return Ok(());
+                    };
+                    if write.request_id != expected_operation {
+                        return Ok(());
+                    }
+                    assert_eq!(executions.fetch_add(1, Ordering::SeqCst), 0);
+                    // One actual normal command, correlated before any mutation.
+                    observed_command.lock().unwrap().replace(command.clone());
+                    assert_eq!(
+                        command.routed_message.source_node_id,
+                        expected_shard.primary_node_id
+                    );
+                    assert_eq!(
+                        command.routed_message.target_node_id,
+                        expected_shard.primary_node_id
+                    );
+                    assert_eq!(
+                        write.request.requesting_node_id,
+                        expected_shard.primary_node_id
+                    );
+                    assert_eq!(write.request.file_system_id, expected_shard.file_system_id);
+                    assert_eq!(write.authority_shard.as_ref(), Some(&expected_shard));
+                    assert_eq!(write.object_metadata.as_ref().unwrap().path, expected_path);
+                    let object_id = write.request.object_id.clone();
+                    let target_version = write.request.target_version.clone();
+                    let operation_id = expected_operation.clone();
+                    let path = expected_path.clone();
+                    let capture = Arc::clone(&captured);
+                    let trigger = before_prepare.lock().unwrap().take();
+                    crate::service_commit::BEFORE_CREATE_PREPARE.with(|hook| {
+                        assert!(hook.borrow().is_none());
+                        *hook.borrow_mut() = Some(Box::new(move |payload| {
+                            let intent = payload.prepared_intent.as_ref().unwrap();
+                            assert_eq!(intent.operation_id.as_deref(), Some(operation_id.as_str()));
+                            assert_eq!(intent.object_id, object_id);
+                            assert_eq!(intent.target_version, target_version);
+                            assert!(payload.transaction.objects.iter().any(
+                                |object| object.object_id == object_id
+                                    && object.version == target_version
+                                    && object.path == path
+                            ));
+                            let mut captured = capture.lock().unwrap();
+                            assert!(captured.is_none());
+                            *captured = Some(payload.clone());
+                            if let Some(trigger) = trigger {
+                                trigger();
+                            }
+                        }));
+                    });
+                    Ok(())
+                });
+            crate::runtime_host::install_daemon_dfs_pre_dispatch_test_hook(
+                self.runtime.data_dir(&self.shard.primary_node_id),
+                hook,
+            )
+        }
+        fn write(&mut self, path: &str) -> crate::DfsPreparedOperationRecord {
+            let captured = Arc::new(Mutex::new(None));
+            let operation_id = format!("cf_{}", sinomo_core::Id::generate());
+            let capture =
+                self.capture_create_on_main(path, &operation_id, Arc::clone(&captured), None);
+            let created = self
+                .service
+                .posix_create_file_with_contents_and_attrs_and_operation_id(
+                    path,
+                    &[],
+                    crate::DfsWriteOptions::replicated_eventual(vec![
+                        self.shard.primary_node_id.clone(),
+                    ]),
+                    crate::DfsPosixCreateAttrs::new(0o640, 6101, 6102),
+                    &operation_id,
+                );
+            drop(capture);
+            created.expect("actual native degraded root create");
+            let payload = captured
+                .lock()
+                .unwrap()
+                .take()
+                .expect("actual normal create payload");
+            let record = self.record_for_payload(path, &payload);
+            assert_eq!(record.status, crate::DfsPreparedOperationStatus::Committed);
+            assert!(
+                self.service
+                    .metadata_backend()
+                    .unwrap()
+                    .committed_prepared_operation(&record.digest)
+                    .unwrap()
+                    .is_some(),
+                "actual producer must retain its exact terminal commit witness"
+            );
+            // A later normal prepared operation can advance the floor before
+            // this create returns. Verify its actual immutable body and commit,
+            // while retaining the captured create identity for restart checks.
+            let (floor, latest) = self.floor_record();
+            assert!(latest.digest.prepare_sequence >= record.digest.prepare_sequence);
+            assert_eq!(floor.authority_epoch, record.digest.owner_epoch);
+            record
+        }
+        fn floor_record(
+            &mut self,
+        ) -> (
+            DfsMetadataShardOperationFloor,
+            crate::DfsPreparedOperationRecord,
+        ) {
+            let floor = self.floor();
+            assert!(floor.prepared_sequence > 0);
+            assert!(!floor.permit_id.is_empty());
+            let shard_id = crate::DfsMetadataShardId::new(self.shard.shard_id.clone());
+            let backend = self.service.metadata_backend().unwrap();
+            let batch = backend
+                .journal_batch_for_shard_since_limited(
+                    &shard_id,
+                    floor.prepared_sequence - 1,
+                    1,
+                    crate::DfsMetadataJournalReplicationOptions::default().batch_byte_limit,
+                )
+                .unwrap()
+                .expect("actual floor-bound native prepare frame");
+            assert_eq!(batch.shard_id, shard_id);
+            let [entry] = batch.entries.as_slice() else {
+                panic!("floor lookup must select its one exact native journal slot");
+            };
+            assert_eq!(entry.sequence, floor.prepared_sequence);
+            let crate::DfsMetadataMutation::PrepareOperationV7 {
+                file_system_id,
+                operation_id,
+                record: original,
+            } = &entry.mutation
+            else {
+                panic!("actual operation floor must bind a native prepare body");
+            };
+            original.validate().unwrap();
+            assert_eq!(operation_id, &original.digest.operation_id);
+            assert_eq!(file_system_id, &self.shard.file_system_id);
+            assert_eq!(original.digest.file_system_id, self.shard.file_system_id);
+            assert_eq!(original.digest.shard_id, shard_id);
+            assert_eq!(original.digest.owner_epoch, self.shard.epoch);
+            assert_eq!(original.digest.owner_epoch, floor.authority_epoch);
+            assert_eq!(original.digest.payload_digest, floor.operation_digest);
+            assert_eq!(original.digest.prepare_sequence, floor.prepared_sequence);
+            let record = backend
+                .prepared_operation_record(&original.digest.operation_id)
+                .unwrap()
+                .expect("actual retained floor-bound operation");
+            record.validate().unwrap();
+            assert_eq!(record.digest, original.digest);
+            assert_eq!(record.payload, original.payload);
+            assert_eq!(record.status, crate::DfsPreparedOperationStatus::Committed);
+            assert!(
+                backend
+                    .committed_prepared_operation(&record.digest)
+                    .unwrap()
+                    .is_some()
+            );
+            (floor, record)
+        }
+        fn record_for_payload(
+            &self,
+            path: &str,
+            captured: &crate::DfsPreparedOperationPayload,
+        ) -> crate::DfsPreparedOperationRecord {
+            captured.validate().unwrap();
+            assert_eq!(captured.file_system_id, self.shard.file_system_id);
+            assert_eq!(captured.shard_id.0, self.shard.shard_id);
+            assert_eq!(captured.owner_epoch, self.shard.epoch);
+            assert!(
+                captured
+                    .transaction
+                    .objects
+                    .iter()
+                    .any(|object| object.path == path)
+            );
+            // The normal listing intentionally contains only pending prepares.
+            // Select this producer's exact immutable identity, including its
+            // committed row, without inventing a record from an observed head.
+            let record = self
+                .service
+                .metadata_backend()
+                .unwrap()
+                .prepared_operation_record(&captured.operation_id)
+                .unwrap()
+                .expect("actual operation-bound prepared body");
+            record.validate().unwrap();
+            assert_eq!(
+                record.digest.payload_digest,
+                captured.canonical_digest().unwrap()
+            );
+            let mut normalized = captured.clone();
+            normalized.normalize();
+            assert_eq!(record.payload.as_ref(), &normalized);
+            record
+        }
+        fn prepare_without_floor(
+            &mut self,
+            path: &str,
+        ) -> (
+            crate::DfsPreparedOperationRecord,
+            crate::test_support::DfsTestNativeConfigurationFault,
+        ) {
+            let fault = self
+                .runtime
+                .metadata_operation_floor_fault(&self.shard.primary_node_id)
+                .unwrap();
+            let trigger = fault.operation_floor_denial_trigger(self.floor_key());
+            let captured = Arc::new(Mutex::new(None));
+            let operation_id = format!("cf_{}", sinomo_core::Id::generate());
+            let capture = self.capture_create_on_main(
+                path,
+                &operation_id,
+                Arc::clone(&captured),
+                Some(Box::new(trigger)),
+            );
+            let created = self
+                .service
+                .posix_create_file_with_contents_and_attrs_and_operation_id(
+                    path,
+                    &[],
+                    crate::DfsWriteOptions::replicated_eventual(vec![
+                        self.shard.primary_node_id.clone(),
+                    ]),
+                    crate::DfsPosixCreateAttrs::new(0o640, 6101, 6102),
+                    &operation_id,
+                );
+            drop(capture);
+            let error = created.unwrap_err();
+            assert!(error.to_string().contains("retry the read"), "{error}");
+            assert!(fault.denied_operation_floor_reads() > 1);
+            let payload = captured
+                .lock()
+                .unwrap()
+                .take()
+                .expect("actual denied-create payload");
+            let record = self.record_for_payload(path, &payload);
+            assert_eq!(record.status, crate::DfsPreparedOperationStatus::Prepared);
+            let pending = self
+                .service
+                .metadata_backend()
+                .unwrap()
+                .list_prepared_operations()
+                .unwrap();
+            assert!(
+                pending
+                    .iter()
+                    .all(
+                        |candidate| !candidate.metadata_effects.iter().any(|effect| matches!(
+                            effect,
+                            crate::DfsPreparedMetadataEffect::ResolvePreparedOperation {
+                                digest,
+                                status: crate::DfsPreparedOperationStatus::Aborted,
+                            } if digest == &record.digest
+                        ))
+                    ),
+                "an authority-read failure must not prepare an automatic abort of the sealed write"
+            );
+            assert!(
+                self.service
+                    .metadata_backend()
+                    .unwrap()
+                    .get_object_by_path(&self.shard.file_system_id, path)
+                    .unwrap()
+                    .is_none()
+            );
+            (record, fault)
+        }
+        fn certify(
+            &mut self,
+            record: &crate::DfsPreparedOperationRecord,
+        ) -> DfsMetadataOperationPermit {
+            assert_eq!(record.digest.shard_id.0, self.shard.shard_id);
+            assert_eq!(record.digest.owner_epoch, self.shard.epoch);
+            let permit = DfsControlPlaneStore::new(&mut self.control)
+                .certify_metadata_shard_operation_with_native_authority(
+                    &self.shard,
+                    &record.digest.payload_digest,
+                    record.digest.prepare_sequence,
+                )
+                .unwrap()
+                .expect("native exact operation permit");
+            assert!(
+                permit.native_commit.is_some(),
+                "the current producer must return actual native authority"
+            );
+            permit
+        }
+        fn recover_and_close(mut self, path: &str, record: &crate::DfsPreparedOperationRecord) {
+            let expected = record
+                .transaction
+                .objects
+                .iter()
+                .find(|object| object.path == path)
+                .unwrap();
+            drop(self.control);
+            drop(self.service);
+            self.runtime.clear_faults();
+            self.runtime.stop_node(&self.shard.primary_node_id).unwrap();
+            self.runtime
+                .reopen_node(self.shard.primary_node_id.clone())
+                .unwrap();
+            let outcome = self
+                .runtime
+                .maintenance_tick(
+                    &self.shard.primary_node_id,
+                    std::time::Duration::from_secs(5),
+                )
+                .unwrap()
+                .outcome
+                .unwrap();
+            assert!(
+                matches!(outcome, crate::DfsMaintenanceTickOutcome::Completed { .. }),
+                "the actual Main recovery invocation remains deferred: {outcome:?}"
+            );
+            let mut recovered = self.runtime.client(&self.shard.primary_node_id).unwrap();
+            let actual = recovered
+                .metadata_backend()
+                .unwrap()
+                .prepared_operation_record(&record.digest.operation_id)
+                .unwrap()
+                .expect("normal Main restart must retain this exact prepared operation");
+            actual.validate().unwrap();
+            assert_eq!(actual.digest, record.digest);
+            assert_eq!(actual.payload, record.payload);
+            assert_eq!(actual.status, crate::DfsPreparedOperationStatus::Committed);
+            assert!(
+                recovered
+                    .metadata_backend()
+                    .unwrap()
+                    .committed_prepared_operation(&record.digest)
+                    .unwrap()
+                    .is_some()
+            );
+            let stat = recovered.posix_stat(path).unwrap();
+            assert_eq!(stat.object_id, expected.object_id);
+            assert_eq!(stat.version, expected.version);
+            assert_eq!(recovered.posix_read_file(path).unwrap(), Vec::<u8>::new());
+            drop(recovered);
+            self.runtime.close().unwrap();
+        }
+    }
+
+    #[derive(Debug)]
+    struct NativeParticipantReadSetObservation {
+        inner: Box<dyn DfsControlPlaneKvClient>,
+        scalar_reads: AtomicUsize,
+        consistent_reads: AtomicUsize,
+        negative_response: AtomicUsize,
+    }
+    impl DfsControlPlaneKvClient for NativeParticipantReadSetObservation {
+        fn get(&self, key: &str) -> Result<Option<KvEntry>, KvError> {
+            self.scalar_reads.fetch_add(1, Ordering::SeqCst);
+            self.inner.get(key)
+        }
+        fn get_consistent(&self, keys: &[String]) -> Result<Vec<Option<KvEntry>>, KvError> {
+            self.consistent_reads.fetch_add(1, Ordering::SeqCst);
+            let mut actual = self.inner.get_consistent(keys)?;
+            // Negative response DATA only, after the real native reader returns.
+            match self.negative_response.load(Ordering::SeqCst) {
+                1 => {
+                    actual.pop();
+                }
+                2 => {
+                    actual[0].as_mut().unwrap().key = "/unrelated-participant".into();
+                }
+                _ => {}
+            }
+            Ok(actual)
+        }
+        fn range_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>, KvError> {
+            self.inner.range_prefix(prefix)
+        }
+        fn put(&mut self, key: String, value: Vec<u8>) -> Result<KvRevision, KvError> {
+            self.inner.put(key, value)
+        }
+        fn txn(&mut self, txn: KvTxn) -> Result<KvTxnResponse, KvError> {
+            self.inner.txn(txn)
+        }
+        fn txn_with_native_authority(
+            &mut self,
+            txn: KvTxn,
+        ) -> Result<(KvTxnResponse, Option<DfsNativeTxnCommit>), KvError> {
+            self.inner.txn_with_native_authority(txn)
+        }
+    }
+
+    #[test]
+    fn metadata_participant_admission_uses_one_actual_native_read_set_and_rejects_bad_scope() {
+        let fixture = NativeFloorFixture::new("native-member-policy-read-set");
+        let shard = fixture.shard.clone();
+        let observer = NativeParticipantReadSetObservation {
+            inner: fixture.control.inner,
+            scalar_reads: AtomicUsize::new(0),
+            consistent_reads: AtomicUsize::new(0),
+            negative_response: AtomicUsize::new(0),
+        };
+        let compares = metadata_prepared_operation_admission_compares(&observer, &shard).unwrap();
+        assert_eq!(
+            compares.len(),
+            2 * metadata_shard_configured_node_ids(&shard).len()
+        );
+        assert_eq!(observer.scalar_reads.load(Ordering::SeqCst), 0);
+        assert_eq!(observer.consistent_reads.load(Ordering::SeqCst), 1);
+        observer.negative_response.store(1, Ordering::SeqCst);
+        assert!(matches!(
+            metadata_prepared_operation_admission_compares(&observer, &shard),
+            Err(KvError::Serialization { detail }) if detail.contains("exact key count")
+        ));
+        observer.negative_response.store(2, Ordering::SeqCst);
+        assert!(matches!(
+            metadata_prepared_operation_admission_compares(&observer, &shard),
+            Err(KvError::Serialization { detail }) if detail.contains("exact key scope")
+        ));
+        assert_eq!(observer.scalar_reads.load(Ordering::SeqCst), 0);
+        assert_eq!(observer.consistent_reads.load(Ordering::SeqCst), 3);
+        drop(observer);
+        drop(fixture.service);
+        fixture.runtime.clear_faults();
+        fixture.runtime.close().unwrap();
+    }
+
+    #[test]
+    fn metadata_operation_floor_foreign_target_collision_preserves_the_actual_prepare() {
+        let mut fixture = NativeFloorFixture::new("native-floor-foreign-target-collision");
+        let (original, fault) = fixture.prepare_without_floor("/native-floor-b.bin");
+        let mut command = fixture
+            .observed_create_command
+            .lock()
+            .unwrap()
+            .take()
+            .expect("exact normal Main command was observed");
+        let foreign = fixture.shard.replica_node_ids[0].clone();
+        let collision_id = format!("foreign_{}", sinomo_core::Id::generate());
+        let crate::DfsNetworkMessage::ExclusiveCreateRequest(mut write) =
+            command.routed_message.message
+        else {
+            panic!("actual exclusive create command");
+        };
+        write.request_id = collision_id.clone();
+        write.request.requesting_node_id = foreign.clone();
+        write.requester_blob_pre_staged = false;
+        write.exclusive_create = false;
+        command.routed_message.source_node_id = foreign.clone();
+        command.routed_message.message = crate::DfsNetworkMessage::DistributedWriteRequest(write);
+        let shard_id = crate::DfsMetadataShardId::new(fixture.shard.shard_id.clone());
+        let journal = crate::LocalSobjMetadataBackend::open_for_inspection(
+            shard_id.clone(),
+            crate::default_dfs_metadata_shards_root(
+                fixture.runtime.data_dir(&fixture.shard.primary_node_id),
+            )
+            .join(crate::metadata_keys::key_segment(&shard_id.0)),
+        )
+        .unwrap();
+        let limit = crate::DfsMetadataJournalReplicationOptions::default().batch_entry_limit;
+        let before = journal.journal_since_limited(0, limit).unwrap();
+        assert!(
+            before.len() < limit,
+            "complete bounded journal before collision"
+        );
+        let response = fixture
+            .runtime
+            .rpc_request(
+                &foreign,
+                &fixture.shard.primary_node_id,
+                crate::dfs_message_rpc_request(&command).unwrap(),
+                sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+            )
+            .expect("foreign collision must return its normal rejection");
+        let response = crate::decode_dfs_message_rpc_response(&response).unwrap();
+        assert!(response.outbound_messages.iter().any(|routed| matches!(
+            &routed.message,
+            crate::DfsNetworkMessage::DistributedWriteResponse(reply)
+                if reply.request_id == collision_id && matches!(
+                    &reply.result, crate::DfsDistributedWriteResult::Rejected { reason, .. }
+                        if reason.contains(&original.prepared_intent.as_ref().unwrap().intent_id)
+                )
+        )), "original pending claim must reject the unrelated target collision");
+        let retained = fixture
+            .service
+            .metadata_backend()
+            .unwrap()
+            .prepared_operation_record(&original.digest.operation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained, original);
+        let after = journal.journal_since_limited(0, limit).unwrap();
+        assert!(
+            after.len() < limit,
+            "complete bounded journal after collision"
+        );
+        assert_eq!(
+            after, before,
+            "foreign request cannot author abort or other native frames"
+        );
+        drop(fault);
+        drop(fixture.service);
+        drop(fixture.control);
+        fixture.runtime.clear_faults();
+        fixture.runtime.close().unwrap();
     }
 
     #[test]
     fn metadata_operation_floor_refreshes_after_stale_observed_cas() {
-        let owner = node("node_operation_floor_refresh_owner");
-        let replica = node("node_operation_floor_refresh_replica");
-        let file_system_id = file_system_id();
-        let shard = DfsMetadataShardConfig {
-            file_system_id: file_system_id.clone(),
-            shard_id: "root".to_string(),
-            primary_node_id: owner,
-            replica_node_ids: vec![replica],
-            epoch: 73,
-            assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
-            default_policy: DfsObjectPolicy::ReplicatedEventual,
-        };
-        let floor_key = metadata_shard_operation_floor_key(&file_system_id, &shard.shard_id);
-        let stale_floor = DfsMetadataShardOperationFloor {
-            operation_digest: "blake3:stale-observed-floor".to_string(),
-            prepared_sequence: 20268,
-            authority_epoch: 71,
-            permit_id: "stale-observed-permit".to_string(),
-        };
-        let authoritative_floor = DfsMetadataShardOperationFloor {
-            operation_digest: "blake3:authoritative-predecessor-floor".to_string(),
-            prepared_sequence: 20274,
-            authority_epoch: shard.epoch,
-            permit_id: "authoritative-predecessor-permit".to_string(),
-        };
-
-        let mut observed = InProcessKvStore::new();
-        DfsControlPlaneStore::new(&mut observed)
-            .put_metadata_shard(&shard)
-            .expect("put observed shard");
-        observed
-            .put_serde(floor_key.clone(), &stale_floor, None)
-            .expect("put stale observed floor");
-        let mut authoritative = InProcessKvStore::restore(
-            observed
-                .try_snapshot()
-                .expect("snapshot stale observed state"),
-        )
-        .expect("restore authoritative state");
-        authoritative
-            .put_serde(floor_key.clone(), &authoritative_floor, None)
-            .expect("advance authoritative floor");
-
-        let mut client = StaleObservedAuthoritativeTxnKv {
-            observed,
-            authoritative,
-        };
-        let requested_digest = "blake3:requested-after-refresh";
-        let requested_sequence = authoritative_floor.prepared_sequence + 1;
-        let permit_id = DfsControlPlaneStore::new(&mut client)
-            .certify_metadata_shard_operation(&shard, requested_digest, requested_sequence)
-            .expect("certify after refreshing stale floor")
-            .expect("operation permit");
-        let committed = client
-            .authoritative
-            .get(&floor_key)
-            .expect("committed operation floor")
-            .decode::<DfsMetadataShardOperationFloor>()
-            .expect("decode committed operation floor");
-        assert_eq!(committed.operation_digest, requested_digest);
-        assert_eq!(committed.prepared_sequence, requested_sequence);
-        assert_eq!(committed.authority_epoch, shard.epoch);
-        assert_eq!(committed.permit_id, permit_id);
+        let mut fixture = NativeFloorFixture::new("native-floor-stale-cas");
+        fixture.write("/native-floor-a.bin");
+        let stale = fixture.capture_observations();
+        fixture.write("/native-floor-b.bin");
+        let predecessor = fixture.floor();
+        let (requested, fault) = fixture.prepare_without_floor("/native-floor-c.bin");
+        assert!(requested.digest.prepare_sequence > predecessor.prepared_sequence);
+        fixture.control.stale_entries = Some(stale);
+        let permit = fixture.certify(&requested);
+        assert_eq!(fixture.control.compare_misses, 1);
+        assert_eq!(fixture.control.refresh_calls, 1);
+        let committed = fixture.floor();
+        assert_eq!(committed.operation_digest, requested.digest.payload_digest);
+        assert_eq!(
+            committed.prepared_sequence,
+            requested.digest.prepare_sequence
+        );
+        assert_eq!(committed.authority_epoch, fixture.shard.epoch);
+        assert_eq!(committed.permit_id, permit.permit_id);
+        drop(fault);
+        fixture.recover_and_close("/native-floor-c.bin", &requested);
     }
 
     #[test]
     fn metadata_operation_floor_retries_readindex_generation_race() {
-        let owner = node("node_operation_floor_readindex_retry_owner");
-        let replica = node("node_operation_floor_readindex_retry_replica");
-        let file_system_id = file_system_id();
-        let shard = DfsMetadataShardConfig {
-            file_system_id: file_system_id.clone(),
-            shard_id: "root".to_string(),
-            primary_node_id: owner,
-            replica_node_ids: vec![replica],
-            epoch: 74,
-            assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
-            default_policy: DfsObjectPolicy::ReplicatedEventual,
-        };
-        let mut inner = InProcessKvStore::new();
-        DfsControlPlaneStore::new(&mut inner)
-            .put_metadata_shard(&shard)
-            .expect("put metadata shard");
-        let mut client = RetryAuthoritativeViewKv {
-            inner,
-            remaining_retryable_get_failures: AtomicUsize::new(1),
-            refresh_calls: AtomicUsize::new(0),
-        };
-
-        let digest = "blake3:readindex-generation-retry";
-        let sequence = 20452;
-        let permit_id = DfsControlPlaneStore::new(&mut client)
-            .certify_metadata_shard_operation(&shard, digest, sequence)
-            .expect("retry transient authoritative view")
-            .expect("operation permit");
-
-        assert_eq!(client.refresh_calls.load(Ordering::SeqCst), 1);
+        let mut fixture = NativeFloorFixture::new("native-floor-readindex-race");
+        fixture.write("/native-floor-a.bin");
+        let (requested, fault) = fixture.prepare_without_floor("/native-floor-b.bin");
+        fixture
+            .control
+            .remaining_read_failures
+            .store(1, Ordering::SeqCst);
+        let permit = fixture.certify(&requested);
+        assert_eq!(fixture.control.refresh_calls, 1);
         assert_eq!(
-            client
-                .remaining_retryable_get_failures
+            fixture
+                .control
+                .remaining_read_failures
                 .load(Ordering::SeqCst),
             0
         );
-        let floor = client
-            .inner
-            .get(&metadata_shard_operation_floor_key(
-                &file_system_id,
-                &shard.shard_id,
-            ))
-            .expect("operation floor")
-            .decode::<DfsMetadataShardOperationFloor>()
-            .expect("decode operation floor");
-        assert_eq!(floor.operation_digest, digest);
-        assert_eq!(floor.prepared_sequence, sequence);
-        assert_eq!(floor.authority_epoch, shard.epoch);
-        assert_eq!(floor.permit_id, permit_id);
-
-        assert!(!metadata_operation_authority_view_error_is_retryable(
-            &KvError::Io {
-                path: "test-disk".to_string(),
-                detail: "permission denied".to_string(),
-            }
-        ));
-        assert!(!metadata_operation_authority_view_error_is_retryable(
-            &KvError::Io {
-                path: "test-disk".to_string(),
-                detail: "permission denied; retry the read".to_string(),
-            }
-        ));
+        let floor = fixture.floor();
+        assert_eq!(floor.operation_digest, requested.digest.payload_digest);
+        assert_eq!(floor.prepared_sequence, requested.digest.prepare_sequence);
+        assert_eq!(floor.authority_epoch, fixture.shard.epoch);
+        assert_eq!(floor.permit_id, permit.permit_id);
+        for detail in ["permission denied", "permission denied; retry the read"] {
+            assert!(!metadata_operation_authority_view_error_is_retryable(
+                &KvError::Io {
+                    path: "test-disk".into(),
+                    detail: detail.into(),
+                }
+            ));
+        }
+        drop(fault);
+        fixture.recover_and_close("/native-floor-b.bin", &requested);
     }
 
     #[test]
     fn metadata_operation_floor_exact_replay_reuses_authoritative_permit() {
-        let owner = node("node_operation_floor_replay_owner");
-        let replica = node("node_operation_floor_replay_replica");
-        let file_system_id = file_system_id();
-        let shard = DfsMetadataShardConfig {
-            file_system_id: file_system_id.clone(),
-            shard_id: "root".to_string(),
-            primary_node_id: owner,
-            replica_node_ids: vec![replica],
-            epoch: 73,
-            assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
-            default_policy: DfsObjectPolicy::ReplicatedEventual,
-        };
-        let floor_key = metadata_shard_operation_floor_key(&file_system_id, &shard.shard_id);
-        let stale_floor = DfsMetadataShardOperationFloor {
-            operation_digest: "blake3:stale-replay-floor".to_string(),
-            prepared_sequence: 20268,
-            authority_epoch: 71,
-            permit_id: "stale-replay-permit".to_string(),
-        };
-        let exact_floor = DfsMetadataShardOperationFloor {
-            operation_digest: "blake3:exact-replayed-operation".to_string(),
-            prepared_sequence: 20274,
-            authority_epoch: shard.epoch,
-            permit_id: "existing-authoritative-permit".to_string(),
-        };
-
-        let mut observed = InProcessKvStore::new();
-        DfsControlPlaneStore::new(&mut observed)
-            .put_metadata_shard(&shard)
-            .expect("put observed shard");
-        observed
-            .put_serde(floor_key.clone(), &stale_floor, None)
-            .expect("put stale observed floor");
-        let mut authoritative = InProcessKvStore::restore(
-            observed
-                .try_snapshot()
-                .expect("snapshot stale observed state"),
-        )
-        .expect("restore authoritative state");
-        authoritative
-            .put_serde(floor_key.clone(), &exact_floor, None)
-            .expect("install exact authoritative floor");
-        let barrier_key = metadata_shard_authority_barrier_key(&file_system_id, &shard.shard_id);
-
-        let mut client = StaleObservedAuthoritativeTxnKv {
-            observed,
-            authoritative,
-        };
-        let permit_id = DfsControlPlaneStore::new(&mut client)
-            .certify_metadata_shard_operation(
-                &shard,
-                &exact_floor.operation_digest,
-                exact_floor.prepared_sequence,
-            )
-            .expect("certify exact replay after refreshing stale floor")
-            .expect("existing operation permit");
-        assert_eq!(permit_id, exact_floor.permit_id);
+        let mut fixture = NativeFloorFixture::new("native-floor-exact-replay");
+        fixture.write("/native-floor-a.bin");
+        let stale = fixture.capture_observations();
+        let created = fixture.write("/native-floor-b.bin");
+        let (exact, replayed) = fixture.floor_record();
+        fixture.control.stale_entries = Some(stale);
+        let permit = fixture.certify(&replayed);
+        assert_eq!(permit.permit_id, exact.permit_id);
+        assert_eq!(fixture.control.compare_misses, 1);
+        assert_eq!(fixture.control.refresh_calls, 1);
         assert!(
-            client.authoritative.get(&barrier_key).is_some(),
-            "exact replay must be revalidated through an authoritative barrier"
+            fixture
+                .control
+                .inner
+                .get(&metadata_shard_authority_barrier_key(
+                    &fixture.shard.file_system_id,
+                    &fixture.shard.shard_id,
+                ))
+                .unwrap()
+                .is_some()
         );
-        assert_eq!(
-            client
-                .authoritative
-                .get(&floor_key)
-                .expect("exact operation floor")
-                .decode::<DfsMetadataShardOperationFloor>()
-                .expect("decode exact operation floor"),
-            exact_floor
-        );
+        assert_eq!(fixture.floor(), exact);
+        fixture.recover_and_close("/native-floor-b.bin", &created);
     }
 
     #[test]
     fn metadata_operation_floor_stale_exact_replay_cannot_bypass_authoritative_handoff() {
-        let owner = node("node_operation_floor_handoff_owner");
-        let replica = node("node_operation_floor_handoff_replica");
-        let replacement = node("node_operation_floor_handoff_replacement");
-        let file_system_id = file_system_id();
-        let shard = DfsMetadataShardConfig {
-            file_system_id: file_system_id.clone(),
-            shard_id: "root".to_string(),
-            primary_node_id: owner,
-            replica_node_ids: vec![replica],
-            epoch: 73,
-            assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
-            default_policy: DfsObjectPolicy::ReplicatedEventual,
-        };
-        let desired = DfsMetadataShardConfig {
-            replica_node_ids: vec![replacement],
-            epoch: shard.epoch + 1,
-            ..shard.clone()
-        };
-        let floor_key = metadata_shard_operation_floor_key(&file_system_id, &shard.shard_id);
-        let handoff_key = metadata_shard_membership_handoff_key(&file_system_id, &shard.shard_id);
-        let barrier_key = metadata_shard_authority_barrier_key(&file_system_id, &shard.shard_id);
-        let exact_floor = DfsMetadataShardOperationFloor {
-            operation_digest: "blake3:exact-before-authoritative-handoff".to_string(),
-            prepared_sequence: 20274,
-            authority_epoch: shard.epoch,
-            permit_id: "permit-before-authoritative-handoff".to_string(),
-        };
-
-        let mut observed = InProcessKvStore::new();
-        DfsControlPlaneStore::new(&mut observed)
-            .put_metadata_shard(&shard)
-            .expect("put observed shard");
-        observed
-            .put_serde(floor_key.clone(), &exact_floor, None)
-            .expect("put observed exact floor");
-        let mut authoritative = InProcessKvStore::restore(
-            observed
-                .try_snapshot()
-                .expect("snapshot stale observed state"),
-        )
-        .expect("restore authoritative state");
-        authoritative
-            .put_serde(
-                handoff_key,
-                &DfsMetadataShardMembershipHandoff {
-                    handoff_id: "authoritative-handoff".to_string(),
-                    retiring_shard: shard.clone(),
-                    desired_shard: desired,
-                    required_prepared_sequence: exact_floor.prepared_sequence,
-                    required_head_watermark: None,
-                    retiring_primary_fence: None,
-                },
-                None,
-            )
-            .expect("install authoritative handoff");
-
-        let mut client = StaleObservedAuthoritativeTxnKv {
-            observed,
-            authoritative,
-        };
+        let mut fixture = NativeFloorFixture::new("native-floor-pending-handoff");
+        fixture.write("/native-floor-a.bin");
+        let (exact, replayed) = fixture.floor_record();
+        let stale = fixture.capture_observations();
+        // The already denied real replica is also the promoted target. Its
+        // mandatory acknowledgement cannot be replaced by another member.
+        let promoted = fixture.shard.replica_node_ids.last().unwrap().clone();
+        let handoff = DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+            .request_metadata_shard_primary_handoff(&fixture.shard, &promoted)
+            .unwrap()
+            .expect("actual normal pending role handoff");
+        assert_eq!(handoff.retiring_shard, fixture.shard);
+        fixture.control.stale_entries = Some(stale);
         assert!(
-            DfsControlPlaneStore::new(&mut client)
-                .certify_metadata_shard_operation(
-                    &shard,
-                    &exact_floor.operation_digest,
-                    exact_floor.prepared_sequence,
+            DfsControlPlaneStore::new(&mut fixture.control)
+                .certify_metadata_shard_operation_with_native_authority(
+                    &fixture.shard,
+                    &replayed.digest.payload_digest,
+                    replayed.digest.prepare_sequence,
                 )
-                .expect("reject stale exact replay against authoritative handoff")
+                .unwrap()
                 .is_none()
         );
-        assert!(client.authoritative.get(&barrier_key).is_none());
-        assert_eq!(
-            client
-                .authoritative
-                .get(&floor_key)
-                .expect("operation floor remains")
-                .decode::<DfsMetadataShardOperationFloor>()
-                .expect("decode operation floor"),
-            exact_floor
-        );
+        assert_eq!(fixture.control.compare_misses, 1);
+        assert_eq!(fixture.control.refresh_calls, 1);
+        assert_eq!(fixture.floor(), exact);
+        drop(fixture.control);
+        drop(fixture.service);
+        fixture.runtime.clear_faults();
+        fixture.runtime.close().unwrap();
     }
 
     #[test]
     fn degraded_operation_floor_is_carried_into_membership_handoff() {
-        let owner = node("node_operation_floor_owner");
-        let retained = node("node_operation_floor_retained");
-        let added = node("node_operation_floor_added");
-        let file_system_id = file_system_id();
-        let current = DfsMetadataShardConfig {
-            file_system_id,
-            shard_id: "root".to_string(),
-            primary_node_id: owner.clone(),
-            replica_node_ids: vec![retained.clone()],
-            epoch: 9,
-            assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
-            default_policy: DfsObjectPolicy::ReplicatedEventual,
-        };
-        let desired = DfsMetadataShardConfig {
-            replica_node_ids: vec![retained, added],
-            epoch: current.epoch + 1,
-            ..current.clone()
-        };
-        let mut kv = InProcessKvStore::new();
-        DfsControlPlaneStore::new(&mut kv)
-            .put_metadata_shard(&current)
-            .expect("put current shard");
-
-        let permit = DfsControlPlaneStore::new(&mut kv)
-            .certify_metadata_shard_operation(&current, "blake3:prepared-6", 6)
-            .expect("certify degraded operation")
-            .expect("operation permit");
-        assert!(!permit.is_empty());
+        let mut fixture =
+            NativeFloorFixture::with_node_count("native-floor-membership-expansion", 4);
+        assert_eq!(metadata_shard_configured_node_ids(&fixture.shard).len(), 4);
+        assert_eq!(fixture.shard.replica_node_ids.len(), 3);
+        fixture.runtime.clear_faults();
+        let added = fixture.shard.replica_node_ids.last().unwrap().clone();
+        let retained = fixture.shard.replica_node_ids[..2].to_vec();
+        // Make the three-member source through a real completed native handoff;
+        // the fourth mounted member remains a genuine expansion target.
+        fixture.shard = fixture
+            .runtime
+            .reassign_metadata_shard(
+                &fixture.shard.file_system_id,
+                &fixture.shard.shard_id,
+                fixture.shard.primary_node_id.clone(),
+                retained,
+            )
+            .unwrap();
+        assert_eq!(metadata_shard_configured_node_ids(&fixture.shard).len(), 3);
+        assert_eq!(fixture.shard.replica_node_ids.len(), 2);
+        assert!(!metadata_shard_configured_node_ids(&fixture.shard).contains(&added));
+        fixture.service = fixture
+            .runtime
+            .client(&fixture.shard.primary_node_id)
+            .unwrap();
+        let unavailable = fixture.shard.replica_node_ids.last().unwrap().clone();
+        for route in [
+            crate::DFS_METADATA_JOURNAL_BATCH_ROUTE,
+            crate::DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE,
+        ] {
+            fixture
+                .runtime
+                .install_fault(crate::test_support::DfsTestFaultRule {
+                    source: Some(fixture.shard.primary_node_id.clone()),
+                    target: Some(unavailable.clone()),
+                    route: Some(route.into()),
+                    call_id: None,
+                    origin: None,
+                    remaining_hits: 32,
+                    action: crate::test_support::DfsTestFaultAction::BudgetExhausted,
+                });
+        }
+        fixture.write("/native-floor-a.bin");
+        let (floor, record) = fixture.floor_record();
+        let mut wrong_digest = record.digest.payload_digest.clone();
+        wrong_digest.push_str("-negative");
         assert!(
-            DfsControlPlaneStore::new(&mut kv)
-                .certify_metadata_shard_operation(&current, "blake3:different-6", 6)
-                .expect("reject same-sequence alternate operation")
-                .is_none()
+            DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+                .certify_metadata_shard_operation_with_native_authority(
+                    &fixture.shard,
+                    &wrong_digest,
+                    record.digest.prepare_sequence,
+                )
+                .unwrap()
+                .is_none(),
+            "same-sequence negative digest cannot replace the genuine floor"
         );
-
-        let handoff = DfsControlPlaneStore::new(&mut kv)
-            .begin_metadata_shard_membership_handoff(&current, &desired)
-            .expect("begin membership handoff")
-            .expect("exact current assignment");
-        assert_eq!(handoff.required_prepared_sequence, 6);
+        let mut desired = fixture.shard.clone();
+        desired.replica_node_ids.push(added);
+        desired.replica_node_ids.sort();
+        desired.epoch += 1;
+        let gate = fixture
+            .service
+            .metadata_shard_fence_guard(&fixture.shard.file_system_id, &fixture.shard.shard_id)
+            .unwrap();
+        let handoff = DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+            .begin_metadata_shard_membership_handoff(&fixture.shard, &desired)
+            .unwrap()
+            .unwrap();
+        assert_eq!(handoff.required_prepared_sequence, floor.prepared_sequence);
         assert!(
-            DfsControlPlaneStore::new(&mut kv)
-                .certify_metadata_shard_operation(&current, "blake3:after-handoff", 7)
-                .expect("pending handoff rejects new degraded permit")
-                .is_none()
+            DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+                .certify_metadata_shard_operation_with_native_authority(
+                    &fixture.shard,
+                    &record.digest.payload_digest,
+                    record.digest.prepare_sequence,
+                )
+                .unwrap()
+                .is_none(),
+            "actual pending handoff fences even an exact floor replay"
         );
-
+        let shard_id = crate::DfsMetadataShardId::new(fixture.shard.shard_id.clone());
+        let backend = fixture.service.metadata_backend().unwrap();
+        let sequence = backend
+            .metadata_shard_statuses()
+            .unwrap()
+            .into_iter()
+            .find(|status| status.shard_id == shard_id)
+            .unwrap()
+            .journal_last_sequence;
+        let fingerprint =
+            crate::service_sync::metadata_shard_state_fingerprint_at(backend, &shard_id, sequence)
+                .unwrap();
+        // A negative below-floor candidate uses the actual source fingerprint;
+        // it cannot establish a fence or healthy acknowledgement.
         let stale_fence = DfsMetadataShardMembershipHandoffFence {
             handoff_id: handoff.handoff_id.clone(),
-            primary_node_id: owner.clone(),
-            journal_sequence: 5,
-            state_fingerprint: "blake3:state-5".to_string(),
-        };
-        assert!(matches!(
-            DfsControlPlaneStore::new(&mut kv)
-                .acknowledge_metadata_shard_membership_handoff_fence(&handoff, &stale_fence),
-            Err(KvError::Serialization { detail }) if detail.contains("below required prepared floor")
-        ));
-
-        let current_fence = DfsMetadataShardMembershipHandoffFence {
-            journal_sequence: 6,
-            state_fingerprint: "blake3:state-6".to_string(),
-            ..stale_fence
+            primary_node_id: fixture.shard.primary_node_id.clone(),
+            journal_sequence: floor.prepared_sequence - 1,
+            state_fingerprint: fingerprint,
         };
         assert!(
-            DfsControlPlaneStore::new(&mut kv)
-                .acknowledge_metadata_shard_membership_handoff_fence(&handoff, &current_fence)
-                .expect("acknowledge current operation floor")
-                .is_some()
+            matches!(DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+            .acknowledge_metadata_shard_membership_handoff_fence(&handoff, &stale_fence),
+            Err(KvError::Serialization { detail }) if detail.contains("below required prepared floor"))
         );
+        drop(gate);
+        fixture.runtime.clear_faults();
+        let active = fixture
+            .runtime
+            .reassign_metadata_shard(
+                &desired.file_system_id,
+                &desired.shard_id,
+                desired.primary_node_id.clone(),
+                desired.replica_node_ids.clone(),
+            )
+            .unwrap();
+        assert_eq!(active, desired);
+        let proof = DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+            .get_metadata_shard_membership_handoff_proof(&active.file_system_id, &active.shard_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(proof.retiring_shard, fixture.shard);
+        assert_eq!(proof.desired_shard, active);
+        assert!(proof.journal_sequence >= floor.prepared_sequence);
+        assert!(metadata_shard_membership_handoff_acknowledgements_are_safe(
+            &proof.retiring_shard,
+            &proof.desired_shard,
+            &proof.acknowledged_node_ids.iter().cloned().collect(),
+        ));
+        drop(fixture.control);
+        drop(fixture.service);
+        fixture.runtime.close().unwrap();
     }
 
     #[test]
     fn degraded_head_watermark_is_exact_and_monotonic() {
-        let owner = node("node_head_watermark_owner");
-        let replica = node("node_head_watermark_replica");
-        let file_system_id = file_system_id();
-        let shard = DfsMetadataShardConfig {
-            file_system_id: file_system_id.clone(),
-            shard_id: "root".to_string(),
-            primary_node_id: owner.clone(),
-            replica_node_ids: vec![replica.clone()],
-            epoch: 4,
-            assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
-            default_policy: DfsObjectPolicy::ReplicatedEventual,
-        };
-        let mut kv = InProcessKvStore::new();
-        DfsControlPlaneStore::new(&mut kv)
-            .put_metadata_shard(&shard)
-            .expect("put shard");
-        let high = DfsMetadataShardHeadWatermark {
-            file_system_id: file_system_id.clone(),
-            shard_id: shard.shard_id.clone(),
-            primary_node_id: owner.clone(),
-            epoch: shard.epoch,
-            journal_sequence: 8,
-            state_fingerprint: "blake3:state-8".to_string(),
-            acknowledged_node_ids: vec![owner.clone(), replica.clone()],
-        };
-        assert!(
-            DfsControlPlaneStore::new(&mut kv)
-                .publish_metadata_shard_head_watermark(&shard, &high)
-                .expect("publish high watermark")
-        );
-        let low = DfsMetadataShardHeadWatermark {
-            journal_sequence: 7,
-            state_fingerprint: "blake3:state-7".to_string(),
-            ..high.clone()
-        };
-        assert!(
-            DfsControlPlaneStore::new(&mut kv)
-                .publish_metadata_shard_head_watermark(&shard, &low)
-                .expect("lower candidate is a fenced no-regression write")
-        );
-        let stored = DfsControlPlaneStore::new(&mut kv)
-            .get_metadata_shard_head_watermark(&file_system_id, "root")
-            .expect("read watermark")
-            .expect("stored watermark");
-        assert_eq!(stored.journal_sequence, high.journal_sequence);
-        assert_eq!(stored.state_fingerprint, high.state_fingerprint);
+        let mut fixture = NativeFloorFixture::new("native-cp-sync-watermark");
+        let unavailable = fixture.shard.replica_node_ids.last().unwrap().clone();
+        fixture.runtime.stop_node(&unavailable).unwrap();
+        let first = fixture.write("/native-floor-a.bin");
+        let first_object = first
+            .transaction
+            .objects
+            .iter()
+            .find(|object| object.path == "/native-floor-a.bin")
+            .unwrap();
+        let first_target = fixture
+            .service
+            .capture_metadata_quorum_sync_target(first_object)
+            .unwrap();
+        let first_certificate = fixture
+            .service
+            .sync_metadata_shard_to_quorum(&first_target, std::time::Duration::from_secs(5))
+            .unwrap();
+        let low = DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+            .get_metadata_shard_head_watermark(
+                &fixture.shard.file_system_id,
+                &fixture.shard.shard_id,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(low.journal_sequence, first_target.journal_sequence);
+        assert_eq!(low.state_fingerprint, first_target.state_fingerprint);
         assert_eq!(
-            stored
-                .acknowledged_node_ids
-                .into_iter()
-                .collect::<BTreeSet<_>>(),
-            high.acknowledged_node_ids
-                .into_iter()
-                .collect::<BTreeSet<_>>()
+            low.acknowledged_node_ids,
+            first_certificate.acknowledged_node_ids
         );
+        let second = fixture.write("/native-floor-b.bin");
+        let second_object = second
+            .transaction
+            .objects
+            .iter()
+            .find(|object| object.path == "/native-floor-b.bin")
+            .unwrap();
+        let second_target = fixture
+            .service
+            .capture_metadata_quorum_sync_target(second_object)
+            .unwrap();
+        let second_certificate = fixture
+            .service
+            .sync_metadata_shard_to_quorum(&second_target, std::time::Duration::from_secs(5))
+            .unwrap();
+        let high = DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+            .get_metadata_shard_head_watermark(
+                &fixture.shard.file_system_id,
+                &fixture.shard.shard_id,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(high.journal_sequence > low.journal_sequence);
+        assert_eq!(high.journal_sequence, second_target.journal_sequence);
+        assert_eq!(high.state_fingerprint, second_target.state_fingerprint);
+        assert_eq!(
+            high.acknowledged_node_ids,
+            second_certificate.acknowledged_node_ids
+        );
+        assert!(
+            DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+                .publish_metadata_shard_head_watermark(&fixture.shard, &low)
+                .unwrap()
+        );
+        assert_eq!(
+            DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+                .get_metadata_shard_head_watermark(
+                    &fixture.shard.file_system_id,
+                    &fixture.shard.shard_id
+                )
+                .unwrap(),
+            Some(high)
+        );
+        fixture.runtime.reopen_node(unavailable).unwrap();
+        fixture.recover_and_close("/native-floor-b.bin", &second);
     }
 
     #[test]
@@ -11449,6 +11839,15 @@ mod tests {
         let node_owner = node("node_shard_select_owner");
         let node_replica = node("node_shard_select_replica");
         let mut kv = InProcessKvStore::new();
+        // These names are structural assignment DATA; admitted member bytes
+        // come unchanged from their actual ordinary native source owner.
+        copy_native_member_fixture_data(
+            &mut kv,
+            vec![
+                node("node_shard_select_owner"),
+                node("node_shard_select_replica"),
+            ],
+        );
         let file_system_id = file_system_id();
         let mut control = DfsControlPlaneStore::new(&mut kv);
         for shard in [
@@ -11459,7 +11858,6 @@ mod tests {
                 replica_node_ids: vec![node_replica.clone()],
                 epoch: 1,
                 assignment: DfsMetadataShardAssignment::Root,
-                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             },
             DfsMetadataShardConfig {
@@ -11471,7 +11869,6 @@ mod tests {
                 assignment: DfsMetadataShardAssignment::PathPrefix {
                     prefix: "/services".to_string(),
                 },
-                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             },
             DfsMetadataShardConfig {
@@ -11483,7 +11880,6 @@ mod tests {
                 assignment: DfsMetadataShardAssignment::PathPrefix {
                     prefix: "/services/sandbox".to_string(),
                 },
-                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             },
         ] {
@@ -11519,6 +11915,16 @@ mod tests {
         let node_services = node("node_shard_partial_services");
         let node_users = node("node_shard_partial_users");
         let mut kv = InProcessKvStore::new();
+        // These names are structural assignment DATA; admitted member bytes
+        // come unchanged from their actual ordinary native source owner.
+        copy_native_member_fixture_data(
+            &mut kv,
+            vec![
+                node("node_shard_partial_root"),
+                node("node_shard_partial_services"),
+                node("node_shard_partial_users"),
+            ],
+        );
         let file_system_id = sifs_file_system_id();
         let mut control = DfsControlPlaneStore::new(&mut kv);
         let root_shard = DfsMetadataShardConfig {
@@ -11528,7 +11934,6 @@ mod tests {
             replica_node_ids: Vec::new(),
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         control
@@ -11551,7 +11956,6 @@ mod tests {
             assignment: DfsMetadataShardAssignment::PathPrefix {
                 prefix: SIFS_USERS_PATH.to_string(),
             },
-            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         control
@@ -11591,7 +11995,6 @@ mod tests {
             assignment: DfsMetadataShardAssignment::PathPrefix {
                 prefix: SIFS_SERVICES_PATH.to_string(),
             },
-            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         control
@@ -11611,6 +12014,15 @@ mod tests {
         let node_owner = node("node_shard_hash_owner");
         let node_replica = node("node_shard_hash_replica");
         let mut kv = InProcessKvStore::new();
+        // These names are structural assignment DATA; admitted member bytes
+        // come unchanged from their actual ordinary native source owner.
+        copy_native_member_fixture_data(
+            &mut kv,
+            vec![
+                node("node_shard_hash_owner"),
+                node("node_shard_hash_replica"),
+            ],
+        );
         let file_system_id = file_system_id();
         let selected_path = "/users/alice/project";
         let hash = metadata_name_hash(selected_path);
@@ -11628,7 +12040,6 @@ mod tests {
                 replica_node_ids: vec![node_replica.clone()],
                 epoch: 1,
                 assignment: DfsMetadataShardAssignment::Root,
-                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             },
             DfsMetadataShardConfig {
@@ -11641,7 +12052,6 @@ mod tests {
                     start_inclusive,
                     end_exclusive,
                 },
-                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             },
         ] {
@@ -11661,6 +12071,9 @@ mod tests {
     fn metadata_shard_selection_prefers_narrower_hash_range() {
         let node_owner = node("node_shard_hash_width_owner");
         let mut kv = InProcessKvStore::new();
+        // These names are structural assignment DATA; admitted member bytes
+        // come unchanged from their actual ordinary native source owner.
+        copy_native_member_fixture_data(&mut kv, vec![node("node_shard_hash_width_owner")]);
         let file_system_id = file_system_id();
         let selected_path = "/users/bob/project";
         let hash = metadata_name_hash(selected_path);
@@ -11676,7 +12089,6 @@ mod tests {
                     start_inclusive: hash.wrapping_sub(100),
                     end_exclusive: hash.wrapping_add(101),
                 },
-                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             },
             DfsMetadataShardConfig {
@@ -11689,7 +12101,6 @@ mod tests {
                     start_inclusive: hash,
                     end_exclusive: hash.wrapping_add(1),
                 },
-                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             },
         ] {
@@ -11719,7 +12130,6 @@ mod tests {
                 replica_node_ids: Vec::new(),
                 epoch: 1,
                 assignment: DfsMetadataShardAssignment::Root,
-                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             },
             DfsMetadataShardConfig {
@@ -11731,7 +12141,6 @@ mod tests {
                 assignment: DfsMetadataShardAssignment::PathPrefix {
                     prefix: "/services".to_string(),
                 },
-                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             },
             DfsMetadataShardConfig {
@@ -11743,7 +12152,6 @@ mod tests {
                 assignment: DfsMetadataShardAssignment::PathPrefix {
                     prefix: "/services/deep".to_string(),
                 },
-                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             },
             DfsMetadataShardConfig {
@@ -11756,7 +12164,6 @@ mod tests {
                     start_inclusive: selected_hash.wrapping_sub(100),
                     end_exclusive: selected_hash.wrapping_add(101),
                 },
-                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             },
             DfsMetadataShardConfig {
@@ -11769,7 +12176,6 @@ mod tests {
                     start_inclusive: selected_hash,
                     end_exclusive: selected_hash.wrapping_add(1),
                 },
-                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             },
         ];
@@ -11801,6 +12207,9 @@ mod tests {
     fn metadata_shard_selection_rejects_nul_paths() {
         let node_owner = node("node_shard_invalid_owner");
         let mut kv = InProcessKvStore::new();
+        // These names are structural assignment DATA; admitted member bytes
+        // come unchanged from their actual ordinary native source owner.
+        copy_native_member_fixture_data(&mut kv, vec![node("node_shard_invalid_owner")]);
         let file_system_id = file_system_id();
         let shard = DfsMetadataShardConfig {
             file_system_id: file_system_id.clone(),
@@ -11809,7 +12218,6 @@ mod tests {
             replica_node_ids: Vec::new(),
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         let mut control = DfsControlPlaneStore::new(&mut kv);
@@ -11821,4 +12229,155 @@ mod tests {
         ));
     }
     mod placement_update_retry;
+}
+
+impl DfsMetadataOperationPermit {
+    pub(crate) fn matches_native_preparation(
+        &self,
+        expected: &crate::DfsMetadataShardConfig,
+        digest: &crate::DfsPreparedOperationDigest,
+    ) -> bool {
+        let permit = self;
+        use sinomo_core::kv::{KvAuthorityBasis, KvCompare, KvOp};
+        if permit.file_system_id != digest.file_system_id
+            || permit.shard_id != digest.shard_id.0
+            || permit.owner_epoch != digest.owner_epoch
+            || permit.operation_digest != digest.payload_digest
+            || permit.prepare_sequence != digest.prepare_sequence
+            || permit.permit_id.is_empty()
+        {
+            return false;
+        }
+        let Some(native) = permit.native_commit.as_ref() else {
+            return false;
+        };
+        let Some(response) = native.result.txn_response.as_ref() else {
+            return false;
+        };
+        let proof = &native.result.authority;
+        let fresh_quorum = matches!(proof.basis, KvAuthorityBasis::CurrentTermQuorum { voter_acks, required_quorum }
+        if required_quorum > 0 && voter_acks >= required_quorum);
+        let request_digest = native.request.clone().into_command_request().digest();
+        if !fresh_quorum
+            || !response.succeeded
+            || proof.term == 0
+            || proof.commit_index == 0
+            || response.revision != proof.revision
+            || native.request.request_id != native.result.request_id
+            || request_digest.ok()
+                != Some(
+                    native
+                        .result
+                        .submitted_command_digest
+                        .unwrap_or(native.result.command_digest),
+                )
+        {
+            return false;
+        }
+        let txn = &native.request.txn;
+        let shard_key = crate::metadata_shard_key(&expected.file_system_id, &expected.shard_id);
+        let floor_key = crate::control_plane::metadata_shard_operation_floor_key(
+            &expected.file_system_id,
+            &expected.shard_id,
+        );
+        let handoff_key = crate::metadata_shard_membership_handoff_key(
+            &expected.file_system_id,
+            &expected.shard_id,
+        );
+        let barrier_key = crate::metadata_shard_authority_barrier_key(
+            &expected.file_system_id,
+            &expected.shard_id,
+        );
+        let config_matches = txn.compares.iter().any(|compare| matches!(compare, KvCompare::ValueEquals { key, value }
+        if key == &shard_key && sinomo_core::kv::decode_kv_value::<crate::DfsMetadataShardConfig>(value).ok().as_ref() == Some(expected)));
+        let handoff_missing = txn
+            .compares
+            .iter()
+            .any(|compare| matches!(compare, KvCompare::Missing { key } if key == &handoff_key));
+        let floor_matches = |value: &[u8]| {
+            sinomo_core::kv::decode_kv_value::<crate::control_plane::DfsMetadataShardOperationFloor>(
+            value,
+        )
+        .ok()
+        .is_some_and(|floor| {
+            floor.authority_epoch == permit.owner_epoch
+                && floor.prepared_sequence == permit.prepare_sequence
+                && floor.operation_digest == permit.operation_digest
+                && floor.permit_id == permit.permit_id
+        })
+        };
+        let effect_matches = match txn.success.as_slice() {
+        [KvOp::Put { key, value, lease_id: None }] if key == &floor_key => floor_matches(value),
+        [KvOp::Put { key, value, lease_id: None }] if key == &barrier_key && !value.is_empty() =>
+            txn.compares.iter().any(|compare| matches!(compare, KvCompare::ValueEquals { key, value } if key == &floor_key && floor_matches(value))),
+        _ => false,
+    };
+        config_matches && handoff_missing && effect_matches && txn.failure.is_empty()
+    }
+}
+
+/// Observation-only decoding of the SAME retained current control-row bytes.
+/// No private floor type or authority constructor crosses this module.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn decode_native_control_observation(
+    entry: &KvEntry,
+) -> Result<Option<(&'static str, serde_json::Value)>, KvError> {
+    decode_native_control_value_observation(&entry.key, &entry.value)
+}
+
+/// The same current decoder at explicit observation export. Request values
+/// have no durable Entry revisions; preserve their actual key and bytes only.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn decode_native_control_value_observation(
+    key: &str,
+    bytes: &[u8],
+) -> Result<Option<(&'static str, serde_json::Value)>, KvError> {
+    let parts = key.split('/').collect::<Vec<_>>();
+    if parts.len() != 6
+        || parts[0] != ""
+        || parts[1] != "dfs"
+        || parts[2] != "filesystems"
+        || parts[3].is_empty()
+        || parts[5].is_empty()
+    {
+        return Ok(None);
+    }
+    fn value<T: Serialize>(value: &T) -> Result<serde_json::Value, KvError> {
+        serde_json::to_value(value).map_err(|error| KvError::Serialization {
+            detail: error.to_string(),
+        })
+    }
+    Ok(match parts[4] {
+        "metadata-shards" => Some((
+            "DfsMetadataShardConfig",
+            value(&sinomo_core::kv::decode_kv_value::<DfsMetadataShardConfig>(
+                bytes,
+            )?)?,
+        )),
+        "metadata-membership-handoffs" => Some((
+            "DfsMetadataShardMembershipHandoff",
+            value(&sinomo_core::kv::decode_kv_value::<
+                DfsMetadataShardMembershipHandoff,
+            >(bytes)?)?,
+        )),
+        "metadata-membership-handoff-proofs" => Some((
+            "DfsMetadataShardMembershipHandoffProof",
+            value(&sinomo_core::kv::decode_kv_value::<
+                DfsMetadataShardMembershipHandoffProof,
+            >(bytes)?)?,
+        )),
+        "metadata-operation-floors" => Some((
+            "DfsMetadataShardOperationFloor",
+            value(&sinomo_core::kv::decode_kv_value::<
+                DfsMetadataShardOperationFloor,
+            >(bytes)?)?,
+        )),
+        "metadata-head-watermarks" => Some((
+            "DfsMetadataShardHeadWatermark",
+            value(&sinomo_core::kv::decode_kv_value::<
+                DfsMetadataShardHeadWatermark,
+            >(bytes)?)?,
+        )),
+        _ => None,
+    })
 }

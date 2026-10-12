@@ -96,7 +96,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             );
         }
         let result = match storage_result {
-            Ok(()) => {
+            Ok(_manifest) => {
                 let local_node_id = self.node_id.clone();
                 self.put_replica_receipt_if_authoritative(
                     &command.file_system_id,
@@ -242,7 +242,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &self,
         command: &DfsStageBlobCommand,
         blob: Option<ContentStoreQuarantinedBlob>,
-    ) -> Result<(), DfsError> {
+    ) -> Result<ContentManifest, DfsError> {
         match blob {
             Some(blob) => {
                 if blob.content_hash != command.content_hash {
@@ -251,19 +251,26 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         actual: blob.content_hash.clone(),
                     });
                 }
-                self.content.bind_quarantined_blob(
+                Ok(self.content.bind_quarantined_blob(
                     command.object_id.as_str(),
                     command.version.as_str(),
                     blob,
-                )?;
-                Ok(())
+                )?)
             }
-            None => self.store_command_bytes(
-                &command.object_id,
-                &command.version,
-                &command.content_hash,
-                &command.bytes,
-            ),
+            None => self
+                .content
+                .put_object_version_with_expected_hash(
+                    command.object_id.as_str(),
+                    command.version.as_str(),
+                    &command.content_hash,
+                    &command.bytes,
+                )
+                .map_err(|error| match error {
+                    ContentStoreError::BlobHashMismatch { expected, actual } => {
+                        DfsError::ContentHashMismatch { expected, actual }
+                    }
+                    error => error.into(),
+                }),
         }
     }
 
@@ -332,7 +339,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         requester_node_id: NodeId,
         command: DfsStageBlobCommand,
-        storage_result: Result<(), DfsError>,
+        storage_result: Result<ContentManifest, DfsError>,
     ) -> Result<NetworkedDfsServiceEvent, DfsError> {
         self.finish_stage_blob_result(requester_node_id, command, storage_result, true)
     }
@@ -341,12 +348,33 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         requester_node_id: NodeId,
         command: DfsStageBlobCommand,
-        storage_result: Result<(), DfsError>,
+        storage_result: Result<ContentManifest, DfsError>,
         record_current_stage: bool,
     ) -> Result<NetworkedDfsServiceEvent, DfsError> {
         let mut timing = StageBlobPhaseTrace::new(&command, "finish");
+        #[cfg(any(test, feature = "test-support"))]
+        let native_shard = command
+            .authority_shard
+            .as_ref()
+            .map(|scope| DfsMetadataShardId::new(scope.shard_id.clone()));
+        #[cfg(any(test, feature = "test-support"))]
+        let mut native_trace = native_shard.as_ref().and_then(|shard| {
+            self.native_publication_owner_for_observation()
+                .and_then(|(root, owner)| {
+                    crate::native_shard_trace::boundary_interest(&root, Some(&owner), shard)
+                })
+        });
         let result = match storage_result {
-            Ok(()) => {
+            Ok(_manifest) => {
+                #[cfg(any(test, feature = "test-support"))]
+                if let Some(shard) = native_shard.as_ref() {
+                    self.observe_native_content_persistence(
+                        shard,
+                        &command.file_system_id,
+                        &_manifest,
+                        crate::native_shard_trace::NativeContentPersistenceKindV1::ManifestBound,
+                    );
+                }
                 let local_node_id = self.node_id.clone();
                 let receipt = self.put_replica_receipt_if_authoritative(
                     &command.file_system_id,
@@ -380,6 +408,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // The response consumes part of the command, so trace its remaining
         // identities directly. Disabled tracing performs no clock read.
         let response_started = dfs_perf_trace_enabled().then(Instant::now);
+        #[cfg(any(test, feature = "test-support"))]
+        let native_return = (native_trace.is_some()
+            && matches!(&result, DfsBlobTransferResult::Durable { .. }))
+        .then(
+            || crate::native_shard_trace::NativeBoundaryFactsV1::ContentStageDurableReturn {
+                authenticated_requester_node_id: requester_node_id.clone(),
+                command: (&command).into(),
+                response: DfsStageBlobResponse {
+                    request_id: command.request_id.clone(),
+                    intent_id: command.intent_id.clone(),
+                    file_system_id: command.file_system_id.clone(),
+                    object_id: command.object_id.clone(),
+                    version: command.version.clone(),
+                    replica_node_id: self.node_id.clone(),
+                    result: result.clone(),
+                },
+            },
+        );
         let response = self.send_stage_blob_response(
             &requester_node_id,
             command.request_id.clone(),
@@ -402,6 +448,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             ));
         }
         response?;
+        #[cfg(any(test, feature = "test-support"))]
+        if let (Some(trace), Some(fact)) = (native_trace.as_mut(), native_return) {
+            trace.observe(fact, None, None);
+        }
         Ok(self.stage_blob_result_event(
             command.intent_id,
             command.object_id,
@@ -805,9 +855,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     .is_some_and(|intent| {
                         matches!(
                             intent.state,
-                            DfsWriteIntentState::Aborted
-                                | DfsWriteIntentState::Rejected
-                                | DfsWriteIntentState::Conflict
+                            DfsWriteIntentState::Aborted | DfsWriteIntentState::Rejected
                         )
                     })
                 {
@@ -833,6 +881,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         reason: error.to_string(),
                     }));
                 }
+                self.record_replica_transfer_completed(
+                    &response.intent_id,
+                    &response.replica_node_id,
+                    &response.request_id,
+                    true,
+                )?;
                 let event =
                     self.with_placement_intent_authority(&response.intent_id, |service| {
                         service.put_metadata_receipt(
@@ -852,6 +906,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             &response.intent_id,
                             response.replica_node_id.clone(),
                         )?;
+                        #[cfg(any(test, feature = "test-support"))]
+                        service.observe_native_coordinator_receipt(
+                            None,
+                            &updated_intent,
+                            &response.replica_node_id,
+                        );
                         let event = NetworkedDfsServiceEvent::BlobStaged {
                             intent_id: response.intent_id.clone(),
                             object_id: response.object_id.clone(),
@@ -894,8 +954,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 })))
             }
             DfsBlobTransferResult::Rejected { ref reason } => {
-                match self.ensure_stage_response_request_matches_pending(&response) {
+                let pending_hash = self
+                    .writes
+                    .pending_writes
+                    .get(&response.intent_id)
+                    .map(|pending| pending.content_hash.clone());
+                let correlation = pending_hash
+                    .as_deref()
+                    .ok_or_else(|| DfsError::Distributed {
+                        message: "missing exact pending stage for rejected response".into(),
+                    })
+                    .and_then(|hash| self.ensure_stage_response_matches_pending(&response, hash));
+                match correlation {
                     Ok(()) => {
+                        self.record_replica_transfer_completed(
+                            &response.intent_id,
+                            &response.replica_node_id,
+                            &response.request_id,
+                            true,
+                        )?;
                         self.record_stage_patch_fallback(
                             &response.intent_id,
                             &response.replica_node_id,
@@ -931,51 +1008,37 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &self,
         response: &DfsStageBlobResponse,
     ) -> Result<(), DfsError> {
-        let Some(pending) = self.writes.pending_writes.get(&response.intent_id) else {
-            return Err(DfsError::Distributed {
-                message: format!(
-                    "missing pending write for stage response: {}",
-                    response.intent_id
-                ),
+        let exact_pending = self
+            .writes
+            .pending_writes
+            .get(&response.intent_id)
+            .is_some_and(|pending| {
+                pending
+                    .stage_inflight_request_ids
+                    .get(&response.replica_node_id)
+                    == Some(&response.request_id)
             });
-        };
-        let expected_request_id = pending
-            .stage_inflight_request_ids
-            .get(&response.replica_node_id);
-        if let Some(expected_request_id) = expected_request_id {
-            if expected_request_id != &response.request_id {
-                return Err(DfsError::Distributed {
-                    message: format!(
-                        "unexpected DFS stage response request id for intent {} from {}: expected {}, actual {}",
-                        response.intent_id,
-                        response.replica_node_id,
-                        expected_request_id,
-                        response.request_id
-                    ),
-                });
-            }
+        let queue = self
+            .repair_attempt_records
+            .get(&(response.intent_id.clone(), response.replica_node_id.clone()));
+        let requires_queue = queue.is_some();
+        if exact_pending
+            && (!requires_queue
+                || self.replica_queue_matches_current_transfer(
+                    &response.intent_id,
+                    &response.replica_node_id,
+                    &response.request_id,
+                    true,
+                ))
+        {
             return Ok(());
         }
-        if pending
-            .stage_retries
-            .contains_key(&response.replica_node_id)
-        {
-            return Err(DfsError::Distributed {
-                message: format!(
-                    "expired or superseded DFS stage response for intent {} from {}: {}",
-                    response.intent_id, response.replica_node_id, response.request_id
-                ),
-            });
-        }
-        if !pending.stage_inflight_request_ids.is_empty() {
-            return Err(DfsError::Distributed {
-                message: format!(
-                    "unexpected DFS stage response source for intent {}: {}",
-                    response.intent_id, response.replica_node_id
-                ),
-            });
-        }
-        Ok(())
+        Err(DfsError::Distributed {
+            message: format!(
+                "DFS stage response has no exact current same-kind request: intent {}, replica {}, request {}",
+                response.intent_id, response.replica_node_id, response.request_id
+            ),
+        })
     }
 
     pub(crate) fn ensure_stage_response_matches_pending(

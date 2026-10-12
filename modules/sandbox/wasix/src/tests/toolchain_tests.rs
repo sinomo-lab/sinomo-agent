@@ -824,14 +824,12 @@ fn rich_toolchain_targets_track_implemented_and_planned_packages() {
 
 #[test]
 fn busybox_toolchain_spec_registers_core_applets_in_sifs() {
-    let runtime_root = unique_test_dir("sinomo-sandbox-busybox-sifs");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_busybox_sifs").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(runtime_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "busybox_toolchain_spec_registers_core_applets_in_sifs",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let mut store = SifsSandboxToolchainStore::new(dfs);
     let spec = SandboxBusyBoxToolchainSpec::new(
         "busybox-wasi-test",
@@ -853,19 +851,19 @@ fn busybox_toolchain_spec_registers_core_applets_in_sifs() {
             b"busybox module"
         );
     }
-    fs::remove_dir_all(runtime_root).ok();
+
+    drop(store);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
 fn sifs_sandbox_toolchain_store_persists_manifest_and_verifies_modules() {
-    let runtime_root = unique_test_dir("sinomo-sandbox-sifs-toolchain-store");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_toolchain").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(runtime_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_sandbox_toolchain_store_persists_manifest_and_verifies_modules",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let mut store = SifsSandboxToolchainStore::new(dfs);
     let toolchain_id =
         SandboxToolchainId::from_legacy_named("toolchain_busybox").expect("toolchain");
@@ -912,7 +910,9 @@ fn sifs_sandbox_toolchain_store_persists_manifest_and_verifies_modules() {
             .expect("manifest exists")
             .is_empty()
     );
-    fs::remove_dir_all(runtime_root).ok();
+
+    drop(dfs);
+    native.close().expect("normal native DFS shutdown");
 }
 
 #[test]
@@ -1000,14 +1000,12 @@ fn sifs_sandbox_toolchain_store_can_replicate_to_candidate_node() {
 
 #[test]
 fn sifs_sandbox_toolchain_store_rejects_tampered_module() {
-    let runtime_root = unique_test_dir("sinomo-sandbox-sifs-toolchain-tamper");
-    let network = InProcessNetwork::new();
     let node_id = NodeId::from_legacy_named("node_sifs_toolchain_tamper").expect("node");
-    let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
-        LocalContentStore::new(runtime_root.join("content")).expect("content"),
-    );
-    dfs.bootstrap_distributed_sifs().expect("bootstrap");
+    let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+        "sifs_sandbox_toolchain_store_rejects_tampered_module",
+        node_id.clone(),
+    )
+    .expect("normal native DFS startup");
     let mut store = SifsSandboxToolchainStore::new(dfs);
     let toolchain_id =
         SandboxToolchainId::from_legacy_named("toolchain_busybox").expect("toolchain");
@@ -1043,5 +1041,7 @@ fn sifs_sandbox_toolchain_store_rejects_tampered_module() {
             .expect_err("hash mismatch"),
         SandboxToolchainError::InvalidManifest { .. }
     ));
-    fs::remove_dir_all(runtime_root).ok();
+
+    drop(store);
+    native.close().expect("normal native DFS shutdown");
 }

@@ -14,48 +14,6 @@ const COMPACTION_BYTES: usize = 1024 * 1024;
 const COMPACTION_JOB: &str = "compaction.sobj";
 const COMPACTION_PLAN: &str = "compaction-plan.sobj";
 
-#[derive(Clone, Debug, Default)]
-pub(super) struct LegacyCleanupState {
-    source: Option<(u64, u64)>,
-    after: Option<CanonicalKey>,
-    complete: bool,
-}
-
-fn next_legacy_cleanup_key(
-    view: &InlineBindingView,
-    after: Option<&CanonicalKey>,
-) -> Option<CanonicalKey> {
-    use std::ops::Bound::{Excluded, Unbounded};
-    if after.is_none() || matches!(after, Some(CanonicalKey::Blob(_))) {
-        let live = match after {
-            Some(CanonicalKey::Blob(hash)) => view
-                .blobs
-                .range::<str, _>((Excluded(hash.as_str()), Unbounded))
-                .next()
-                .map(|(hash, _)| hash),
-            _ => view.blobs.first_key_value().map(|(hash, _)| hash),
-        };
-        let deleted = match after {
-            Some(CanonicalKey::Blob(hash)) => view
-                .deleted_blobs
-                .range::<str, _>((Excluded(hash.as_str()), Unbounded))
-                .next(),
-            _ => view.deleted_blobs.first(),
-        };
-        if let Some(hash) = match (live, deleted) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        } {
-            return Some(CanonicalKey::Blob(hash.clone()));
-        }
-    }
-    let version = match after {
-        Some(CanonicalKey::Version(key)) => view.versions.range((Excluded(key), Unbounded)).next(),
-        _ => view.versions.first_key_value(),
-    };
-    version.map(|(key, _)| CanonicalKey::Version(key.clone()))
-}
-
 #[derive(Clone, Serialize, Deserialize)]
 struct CompactionSource {
     catalog: InlineCatalog,
@@ -236,11 +194,6 @@ fn canonical_next<'a>(
                     version: key.1.clone(),
                     content_hash: content_hash.clone(),
                 },
-                InlineVersionState::Legacy { content_hash } => InlineOperation::LegacyManifest {
-                    object_id: key.0.clone(),
-                    version: key.1.clone(),
-                    content_hash: content_hash.clone(),
-                },
             };
             return Some((CanonicalKey::Version(key.clone()), operation, None));
         }
@@ -313,7 +266,7 @@ fn cursor_ordinal(cursor: &[u8]) -> Result<u64> {
     ))
 }
 fn read_payload(blob: &InlineBlobEntry) -> Result<Vec<u8>> {
-    if blob.size_bytes > PACKED_BLOB_SMALL_LIMIT_BYTES {
+    if blob.size_bytes > INLINE_BLOB_SMALL_LIMIT_BYTES {
         return Err(inline_error("compaction payload exceeds inline bound"));
     }
     let mut file = fs::File::open(&blob.path).map_err(|source| ContentStoreError::Io {
@@ -386,7 +339,6 @@ impl CompactionDriver<'_> {
             format_version: INLINE_FORMAT_VERSION,
             store_incarnation: self.plan.source.catalog.store_incarnation.clone(),
             generation: self.plan.target,
-            legacy_files_are_authoritative: true,
             segments,
         })
     }
@@ -832,26 +784,7 @@ impl LocalContentStore {
         let job_store = MigrationJobStore::new(job_path(root));
         let job = job_store.read().map_err(inline_error)?;
         let mut plan = read_plan(root)?;
-        let (shadowed, reclaimed, cleanup_steps) = {
-            let InlineResidentState {
-                view,
-                legacy_cleanup,
-                ..
-            } = &mut *state;
-            self.reclaim_shadowed_inline_legacy(
-                view,
-                legacy_cleanup,
-                current.catalog.generation,
-                dry_run,
-                allow_work,
-            )?
-        };
-        let mut report = InlineCompactionReport {
-            pending: shadowed,
-            reclaimed_bytes: reclaimed,
-            advanced_steps: cleanup_steps,
-            ..InlineCompactionReport::default()
-        };
+        let mut report = InlineCompactionReport::default();
         let terminal = job.as_ref().is_some_and(|job| {
             matches!(
                 job.phase,
@@ -1006,116 +939,6 @@ impl LocalContentStore {
     }
 }
 
-impl LocalContentStore {
-    /// An adopted live hash or tombstone shadows all legacy copies. Remove the
-    /// old physical representation only after its exact log state is certified
-    /// and after lazy legacy readers drain. No canonical-root decision is made
-    /// here: this only reclaims representations already superseded durably.
-    fn reclaim_shadowed_inline_legacy(
-        &self,
-        view: &InlineBindingView,
-        progress: &mut LegacyCleanupState,
-        generation: u64,
-        dry_run: bool,
-        allow_work: bool,
-    ) -> Result<(u64, u64, u64)> {
-        if progress.source != Some((generation, view.sequence)) {
-            *progress = LegacyCleanupState {
-                source: Some((generation, view.sequence)),
-                ..LegacyCleanupState::default()
-            };
-        }
-        if progress.complete {
-            return Ok((0, 0, 0));
-        }
-        let mut after = progress.after.clone();
-        let mut blob_hashes = Vec::new();
-        let mut manifests = Vec::new();
-        let mut probes = 0u64;
-        for _ in 0..COMPACTION_RECORDS {
-            let Some(key) = next_legacy_cleanup_key(view, after.as_ref()) else {
-                break;
-            };
-            match &key {
-                CanonicalKey::Blob(hash) => {
-                    if file_len_if_exists(&self.blob_path(hash)?)?.is_some()
-                        || self.packed_blob_location_and_read_lock(hash)?.is_some()
-                    {
-                        blob_hashes.push(hash.clone());
-                    }
-                }
-                CanonicalKey::Version((object, version)) => {
-                    let entry = &view.versions[&(object.clone(), version.clone())];
-                    if !matches!(entry, InlineVersionState::Legacy { .. })
-                        && file_len_if_exists(&self.manifest_path(object, version))?.is_some()
-                    {
-                        manifests.push((
-                            object.clone(),
-                            version.clone(),
-                            version_hash(entry).to_owned(),
-                        ));
-                    }
-                }
-                _ => return Err(inline_error("invalid legacy reclamation cursor")),
-            }
-            probes += 1;
-            after = Some(key);
-        }
-        let more = next_legacy_cleanup_key(view, after.as_ref()).is_some();
-        let candidates = blob_hashes.len() as u64 + manifests.len() as u64;
-        if dry_run || !allow_work {
-            return Ok((u64::from(more || candidates != 0), 0, 0));
-        }
-        let Some(_readers) = self.try_lock_legacy_reclamation()? else {
-            return Ok((u64::from(more || candidates != 0), 0, 0));
-        };
-        let mut physical_bytes = 0u64;
-        let mut directories = BTreeSet::new();
-        for hash in &blob_hashes {
-            let path = self.blob_path(hash)?;
-            let size = file_len_if_exists(&path)?.unwrap_or(0);
-            if remove_file_if_exists_without_sync(&path)? {
-                physical_bytes = physical_bytes.saturating_add(size);
-                if let Some(parent) = path.parent() {
-                    directories.insert(parent.to_owned());
-                }
-            }
-        }
-        let removed = self.remove_packed_blob_index_entries_deferred_checkpoint(&blob_hashes)?;
-        self.checkpoint_packed_blob_index_lanes_after_gc(&removed.modified_lanes)?;
-        for (object, version, hash) in manifests {
-            let path = self.manifest_path(&object, &version);
-            let size = file_len_if_exists(&path)?.unwrap_or(0);
-            if remove_file_if_exists_without_sync(&path)? {
-                physical_bytes = physical_bytes.saturating_add(size);
-                if let Some(parent) = path.parent() {
-                    directories.insert(parent.to_owned());
-                }
-            }
-            let index_path = self.content_manifest_index_path(&object, &hash)?;
-            if let Ok(bytes) = read_file(&index_path)
-                && let Ok(manifest) = decode_manifest(&bytes)
-                && manifest.version == version
-                && remove_file_if_exists_without_sync(&index_path)?
-                && let Some(parent) = index_path.parent()
-            {
-                directories.insert(parent.to_owned());
-            }
-            self.evict_stream_manifest(&path);
-        }
-        for directory in directories {
-            sync_dir(&directory)?;
-        }
-        progress.after = after;
-        progress.complete = !more;
-        Ok((
-            u64::from(more || candidates != 0),
-            physical_bytes,
-            u64::from(probes != 0),
-        ))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::tests::active_store;
@@ -1235,7 +1058,7 @@ mod tests {
     #[test]
     fn expected_hash_inline_binding_survives_compaction_and_root_reopen() {
         let (_root, _owner, store) = active_store("dfs-inline-expected-hash-compaction");
-        let bytes = vec![53; PACKED_BLOB_SMALL_LIMIT_BYTES as usize];
+        let bytes = vec![53; INLINE_BLOB_SMALL_LIMIT_BYTES as usize];
         let hash = content_hash(&bytes);
         let manifest = store
             .put_object_version_with_expected_hash("object", "v1", &hash, &bytes)
@@ -1459,7 +1282,7 @@ mod tests {
         );
     }
     #[test]
-    fn inline_compaction_keeps_deleted_legacy_and_released_categories_across_batch_boundary() {
+    fn inline_compaction_keeps_deleted_external_and_released_categories_across_batch_boundary() {
         let (_root, _owner, store) = active_store("dfs-inline-compaction-mixed-states");
         let mut retired = Vec::new();
         for index in 0..35 {
@@ -1495,7 +1318,7 @@ mod tests {
                 .inline_remove_blob_unlocked(&manifest.content_hash)
                 .unwrap();
         }
-        let large = vec![37u8; PACKED_BLOB_SMALL_LIMIT_BYTES as usize + 1];
+        let large = vec![37u8; INLINE_BLOB_SMALL_LIMIT_BYTES as usize + 1];
         let legacy = store.put_object_version("legacy", "v1", &large).unwrap();
         {
             let _owner = store.content_mutation_guard().unwrap();
@@ -1506,7 +1329,7 @@ mod tests {
         store.put_object_version("legacy", "v1", &large).unwrap();
         assert!(matches!(
             store.inline_version_state("legacy", "v1").unwrap(),
-            Some(InlineVersionState::Legacy { .. })
+            Some(InlineVersionState::Live(_))
         ));
         force_plan(&store);
         drive_to_publishing(&store);

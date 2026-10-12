@@ -7,7 +7,7 @@ use sinomo_core::node::NodeId;
 
 use crate::service_state::DfsMetadataBackendOwner;
 use crate::{
-    AsyncDfsMessageTransport, DfsCancellationFlag, DfsCommittedWorkTracker, DfsConflictStatus,
+    AsyncDfsMessageTransport, DfsCancellationFlag, DfsCommittedWorkTracker,
     DfsControlPlaneKvClient, DfsError, DfsFileSystem, DfsMessageCommittedWork, DfsMessageTransport,
     DfsMetadataBackend, DfsMetadataStore, DfsNetworkMessage, DfsObjectId, DfsOperationalMetrics,
     DfsRoutedCall, DfsRoutedMessage, DfsTransportIdentity, DistributedEventualCoordinator,
@@ -69,6 +69,13 @@ impl<T: DfsTransportIdentity> NetworkedDfsService<T> {
             stable_namespace_reconciliation_results: BTreeMap::new(),
             stable_namespace_reconciliation_targets: BTreeMap::new(),
             namespace_execution: Default::default(),
+            remote_namespace_phase: None,
+            pending_namespace_request_recovery: None,
+            completed_remote_namespace_phases: BTreeMap::new(),
+            prepared_remote_sources: BTreeMap::new(),
+            publication_execution: Default::default(),
+            publication_provider: Default::default(),
+            source_adoption: Default::default(),
             pending_namespace_request_recovery_cursor: None,
             write_intent_maintenance_scan: std::sync::Arc::new(Default::default()),
             routed_namespace_settle_depth: 0,
@@ -98,7 +105,10 @@ where
         let routed_message = self.next_dfs_routed_message(target_node_id, message);
         match self
             .transport
-            .send_routed_call_async(target_node_id, DfsRoutedCall::value(routed_message))
+            .send_routed_call_async(
+                target_node_id,
+                crate::message_transport::native_snapshot_routed_call(routed_message)?,
+            )
             .await
         {
             Ok(()) => Ok(true),
@@ -530,6 +540,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             && self.replication.is_quiescent()
             && self.pending_routed_namespace_ops.is_empty()
             && self.namespace_execution.is_quiescent()
+            && self.pending_namespace_request_recovery.is_none()
             && self.routed_namespace_settle_depth == 0
             && committed_work_has_durable_owner
     }
@@ -645,17 +656,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn operational_metrics(&self) -> Result<DfsOperationalMetrics, DfsError> {
-        let open_conflict_count = self
-            .metadata
-            .conflicts
-            .values()
-            .map(|conflicts| {
-                conflicts
-                    .values()
-                    .filter(|conflict| conflict.status == DfsConflictStatus::Open)
-                    .count()
-            })
-            .sum();
         let stage_retry_count = self
             .writes
             .pending_writes
@@ -698,7 +698,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             node_id: self.node_id.clone(),
             file_system_count: self.metadata.filesystems.len(),
             object_count: self.metadata.objects.len(),
-            open_conflict_count,
             coordinator_intent_count: self.coordinator.intent_count(),
             coordinator_receipt_count: self.coordinator.receipt_count(),
             coordinator_committed_version_count: self.coordinator.committed_version_count(),
@@ -732,40 +731,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 #[cfg(test)]
 mod projection_release_tests {
     use std::collections::BTreeSet;
-    use std::path::PathBuf;
-    use std::time::{Instant, SystemTime, UNIX_EPOCH};
-
-    use sinomo_core::DfsObjectPolicy;
-    use sinomo_core::network::{InProcessNetwork, InProcessTransport};
+    use std::time::{Duration, Instant};
     use time::OffsetDateTime;
 
     use super::*;
     use crate::transfer::PendingNetworkedWrite;
-    use crate::{
-        DfsMetadataShardAssignment, DfsMetadataShardConfig, DfsMetadataShardId, DfsObjectId,
-        DfsVersion, LocalShardedMetadataBackend, directory_object, sifs_file_system_id,
-    };
-
-    fn temporary_root(name: &str) -> PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time")
-            .as_nanos();
-        std::env::temp_dir().join(format!("sinomo-dfs-{name}-{}-{unique}", std::process::id()))
-    }
-
-    fn service_at(root: &std::path::Path, node: NodeId) -> NetworkedDfsService<InProcessTransport> {
-        NetworkedDfsService::new(
-            InProcessNetwork::new().add_node(node),
-            LocalContentStore::new(root.join("content")).expect("content store"),
-        )
-    }
+    use crate::{DfsMetadataShardId, DfsObjectId, DfsVersion};
 
     #[test]
     fn projection_release_quiescence_fails_closed_for_live_operation_state() {
-        let root = temporary_root("projection-release-quiescence");
-        let node = NodeId::from_legacy_named("node_projection_release_quiescence").expect("node");
-        let mut service = service_at(&root, node);
+        let (runtime, mut service, _) = crate::test_support::current_native_metadata_service(
+            "native-projection-release-quiescence",
+            1,
+            "/services",
+        )
+        .expect("actual current runtime");
         assert!(service.can_release_hydrated_metadata_projection());
 
         service.writes.pending_writes.insert(
@@ -817,14 +797,24 @@ mod projection_release_tests {
             Some("bounded-recovery-progress")
         );
 
-        std::fs::remove_dir_all(root).ok();
+        drop(rebuilt);
+        runtime.close().expect("native owner drain");
     }
 
     #[test]
     fn frozen_shard_gate_does_not_collect_or_persist_content_stats() {
-        let root = temporary_root("frozen-shard-gate-read-only");
-        let node = NodeId::from_legacy_named("node_frozen_shard_gate_read_only").expect("node");
-        let service = service_at(&root, node);
+        let (runtime, service, config) = crate::test_support::current_native_metadata_service(
+            "native-frozen-shard-gate-read-only",
+            1,
+            "/services",
+        )
+        .expect("actual current runtime");
+        let content_root = runtime
+            .data_dir(&config.primary_node_id)
+            .dfs_dir()
+            .join("content");
+        let before =
+            ["stats.sobj", "stats.lock"].map(|name| std::fs::read(content_root.join(name)).ok());
 
         assert_eq!(
             service
@@ -832,55 +822,74 @@ mod projection_release_tests {
                 .expect("read frozen shard gate"),
             0
         );
-        assert!(
-            !root.join("content").join("stats.sobj").exists(),
-            "the maintenance safety gate must not collect content metrics"
+        assert_eq!(
+            ["stats.sobj", "stats.lock"].map(|name| std::fs::read(content_root.join(name)).ok()),
+            before,
+            "the normal safety gate must leave current content counters unchanged",
         );
-        assert!(
-            !root.join("content").join("stats.lock").exists(),
-            "the maintenance safety gate must not create the stats lock"
-        );
-
-        let _ = std::fs::remove_dir_all(root);
+        drop(service);
+        runtime.close().expect("native owner drain");
     }
 
     #[test]
     fn quiescent_exact_lane_releases_only_the_rebuildable_projection() {
-        let root = temporary_root("projection-release-exact-lane");
-        let node = NodeId::from_legacy_named("node_projection_release_exact").expect("node");
-        let file_system_id = sifs_file_system_id();
-        let shard_id = DfsMetadataShardId::new("root");
-        let resident = LocalShardedMetadataBackend::new(
-            root.join("metadata"),
-            vec![DfsMetadataShardConfig {
-                file_system_id: file_system_id.clone(),
-                shard_id: shard_id.0.clone(),
-                primary_node_id: node.clone(),
-                replica_node_ids: Vec::new(),
-                epoch: 1,
-                assignment: DfsMetadataShardAssignment::Root,
-                namespace_prepare_codec: Default::default(),
-                default_policy: DfsObjectPolicy::ReplicatedEventual,
-            }],
+        let (runtime, mut service, config) = crate::test_support::current_native_metadata_service(
+            "native-projection-release-exact-lane",
+            1,
+            "/services",
         )
-        .expect("resident backend")
-        .into_resident();
-        let mut service = service_at(&root, node)
+        .expect("actual current runtime");
+        let node = config.primary_node_id.clone();
+        let file_system_id = config.file_system_id.clone();
+        let shard_id = DfsMetadataShardId::new(config.shard_id.clone());
+        let stat = service
+            .posix_mkdir("/services/projection-release")
+            .expect("normal guarded directory");
+        let object = service
+            .metadata_backend()
+            .unwrap()
+            .get_object(&stat.object_id)
+            .unwrap()
+            .unwrap();
+        runtime
+            .maintenance_tick(&node, Duration::from_secs(5))
+            .expect("normal served owner")
+            .outcome
+            .expect("normal maintenance result");
+        let data_dir = runtime.data_dir(&node);
+        let paths = sinomo_core::network::ClusterPaths::new(data_dir);
+        let peer = crate::runtime_host::read_daemon_dfs_message_peer_snapshot(&paths)
+            .expect("actual registered host projection")
+            .expect("mounted host");
+        let resident = crate::runtime_host::daemon_dfs_cached_resident_metadata_shard_handle(
+            data_dir,
+            &peer,
+            &file_system_id,
+            &shard_id,
+            &paths,
+            &runtime.runtime_handle(),
+        )
+        .expect("already-published current physical shard");
+        let native_head = resident
+            .with_backend(|backend| Ok(backend.journal_last_sequence()))
+            .expect("actual retained journal head");
+        service = service
             .with_resident_metadata_shard_backend_lazy(
-                resident
-                    .scope_shard(&file_system_id, &shard_id)
-                    .expect("exact scope")
-                    .checkout()
-                    .expect("exact checkout"),
+                resident.checkout().expect("actual existing shard lease"),
             )
-            .expect("exact service");
-        let object = directory_object("/services/projection-release", service.node_id().clone());
-        service.metadata.add_object(object.clone()).expect("object");
+            .expect("same native service with exact backend");
+        service
+            .metadata
+            .add_object(object.clone())
+            .expect("current cached object");
         let replica =
             NodeId::from_legacy_named("node_projection_release_replica").expect("replica");
         service.repair_attempt_records.insert(
             ("durable-repair".to_string(), replica.clone()),
             crate::DfsRepairAttemptRecord {
+                transfer_delivery_state: None,
+                completed_transfer_request_id: None,
+                transfer_kind: None,
                 intent_id: "durable-repair".to_string(),
                 object_id: object.object_id.clone(),
                 version: object.version.clone(),
@@ -949,7 +958,7 @@ mod projection_release_tests {
                 .replication
                 .local_metadata_journal_cursors
                 .get(&shard_id),
-            Some(&0)
+            Some(&native_head)
         );
         assert!(
             service
@@ -980,6 +989,8 @@ mod projection_release_tests {
         assert_eq!(service.next_request_id, 73);
         assert!(service.metadata_backend().is_some());
 
-        std::fs::remove_dir_all(root).ok();
+        drop(service);
+        drop(resident);
+        runtime.close().expect("native owner drain");
     }
 }

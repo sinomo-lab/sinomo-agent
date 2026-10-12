@@ -2,7 +2,7 @@
 
 use super::*;
 
-const LEGACY_READERS_LOCK: &str = "legacy-readers.lock";
+const FILE_READERS_LOCK: &str = "file-readers-v2.lock";
 
 #[derive(Clone, Debug)]
 enum CapturedBlobLocator {
@@ -25,36 +25,36 @@ impl CapturedBlobLocator {
 }
 
 #[derive(Debug)]
-struct LegacyReaderLease(fs::File);
+struct FileReaderLease(fs::File);
 
-impl Drop for LegacyReaderLease {
+impl Drop for FileReaderLease {
     fn drop(&mut self) {
         let _ = FileExt::unlock(&self.0);
     }
 }
 
-/// An exclusive legacy-reclamation window. Try acquisition never waits for a
+/// An exclusive file-reclamation window. Try acquisition never waits for a
 /// live reader. Retaining the owner guard enforces owner -> reclamation -> lane
 /// ordering even when a destructive caller did not already enter the owner.
-pub(in crate::content_store) struct LegacyReclamationGuard {
+pub(in crate::content_store) struct FileReclamationGuard {
     file: fs::File,
     _owner: ContentMutationGuard,
 }
 
-impl Drop for LegacyReclamationGuard {
+impl Drop for FileReclamationGuard {
     fn drop(&mut self) {
         let _ = FileExt::unlock(&self.file);
     }
 }
 
 /// One locator per distinct hash, one descriptor per inline generation, and at
-/// most one legacy reclamation descriptor. Payload descriptors are opened only
+/// most one file reclamation descriptor. Payload descriptors are opened only
 /// for the current extent. No common owner guard survives snapshot construction.
 #[derive(Debug)]
 pub(in crate::content_store) struct ContentReadSnapshot {
     locators: BTreeMap<String, CapturedBlobLocator>,
     _generations: Vec<InlineReaderLease>,
-    _legacy: Option<LegacyReaderLease>,
+    _files: Option<FileReaderLease>,
     _store: InlineStoreLease,
     #[cfg(test)]
     blob_stream_open_count: Arc<AtomicU64>,
@@ -169,14 +169,14 @@ fn pin_file_shared(path: &Path) -> Result<fs::File> {
 }
 
 /// Called only by writable construction/activation. Read-only snapshots never
-/// create this path; an older inspection-only root without it fails closed.
-pub(in crate::content_store) fn initialize_legacy_reclamation_lock(root: &Path) -> Result<()> {
+/// create this path; an inspection-only root without it fails closed.
+pub(in crate::content_store) fn initialize_file_reclamation_lock(root: &Path) -> Result<()> {
     let root =
         root_identity::canonical_existing_root(root).map_err(|source| ContentStoreError::Io {
             path: root.to_owned(),
             source,
         })?;
-    let path = root.join(LEGACY_READERS_LOCK);
+    let path = root.join(FILE_READERS_LOCK);
     let file = match fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -206,19 +206,17 @@ pub(in crate::content_store) fn initialize_legacy_reclamation_lock(root: &Path) 
         .map_err(|source| ContentStoreError::Io { path, source })?
         .is_file()
     {
-        return Err(inline_error(
-            "legacy reclamation lock is not a regular file",
-        ));
+        return Err(inline_error("file reclamation lock is not a regular file"));
     }
     Ok(())
 }
 
 impl LocalContentStore {
-    pub(in crate::content_store) fn try_lock_legacy_reclamation(
+    pub(in crate::content_store) fn try_lock_file_reclamation(
         &self,
-    ) -> Result<Option<LegacyReclamationGuard>> {
+    ) -> Result<Option<FileReclamationGuard>> {
         let owner = self.content_mutation_guard()?;
-        let path = self.inline_store.owner.root.join(LEGACY_READERS_LOCK);
+        let path = self.inline_store.owner.root.join(FILE_READERS_LOCK);
         let file = fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -228,7 +226,7 @@ impl LocalContentStore {
                 source,
             })?;
         match FileExt::try_lock_exclusive(&file) {
-            Ok(()) => Ok(Some(LegacyReclamationGuard {
+            Ok(()) => Ok(Some(FileReclamationGuard {
                 file,
                 _owner: owner,
             })),
@@ -297,15 +295,15 @@ impl LocalContentStore {
                 )?,
             });
         }
-        let has_legacy = hashes.iter().any(|hash| {
+        let has_files = hashes.iter().any(|hash| {
             hash.as_str() != intrinsic_empty_content_hash() && !inline.contains_key(hash)
         });
-        // Pin before resolving any loose path or packed index. In an active
-        // store the common owner also prevents catalog/locator changes during
-        // capture; in a legacy store the reclamation pin protects the lookup.
-        let legacy_pin = if has_legacy {
-            Some(LegacyReaderLease(pin_file_shared(
-                &root.join(LEGACY_READERS_LOCK),
+        // Pin before resolving current loose blob paths. The common owner
+        // prevents catalog/locator changes during capture; the file pin
+        // protects lazy reads after the owner guard is released.
+        let file_pin = if has_files {
+            Some(FileReaderLease(pin_file_shared(
+                &root.join(FILE_READERS_LOCK),
             )?))
         } else {
             None
@@ -349,36 +347,6 @@ impl LocalContentStore {
                             inline: false,
                         }
                     }
-                    Err(source) if source.kind() == io::ErrorKind::NotFound => {
-                        let Some((location, _lane)) =
-                            self.packed_blob_location_and_read_lock(&hash)?
-                        else {
-                            return Err(ContentStoreError::Io {
-                                path,
-                                source: io::Error::new(
-                                    io::ErrorKind::NotFound,
-                                    "blob not found while capturing extent",
-                                ),
-                            });
-                        };
-                        let candidate = self.packed_blob_location_path(&location);
-                        let path =
-                            root.join(candidate.strip_prefix(&self.root).map_err(|_| {
-                                inline_error("packed locator escaped content root")
-                            })?);
-                        let metadata =
-                            fs::metadata(&path).map_err(|source| ContentStoreError::Io {
-                                path: path.clone(),
-                                source,
-                            })?;
-                        validate_locator(&path, location.offset, location.size_bytes, &metadata)?;
-                        CapturedBlobLocator::File {
-                            path,
-                            payload_offset: location.offset,
-                            size_bytes: location.size_bytes,
-                            inline: false,
-                        }
-                    }
                     Err(source) => return Err(ContentStoreError::Io { path, source }),
                 }
             };
@@ -387,7 +355,7 @@ impl LocalContentStore {
         Ok(Arc::new(ContentReadSnapshot {
             locators,
             _generations: generation_pins,
-            _legacy: legacy_pin,
+            _files: file_pin,
             _store: self.inline_store.clone(),
             #[cfg(test)]
             blob_stream_open_count: Arc::clone(&self.blob_stream_open_count),
@@ -401,31 +369,36 @@ mod tests {
     use crate::runtime_host::{DfsDataOwnerLock, DfsRuntimePaths};
     use sinomo_core::local::SinomoDataDir;
 
-    fn legacy_store(name: &str) -> (sinomo_testdir::TestDir, LocalContentStore) {
+    fn external_store(name: &str) -> (sinomo_testdir::TestDir, LocalContentStore) {
         let root = sinomo_testdir::TestDir::new(name);
-        let store = LocalContentStore::new(root.path()).expect("legacy store");
-        initialize_legacy_reclamation_lock(root.path()).expect("legacy reader lock");
+        let store = LocalContentStore::new(root.path()).expect("current file store");
+        initialize_file_reclamation_lock(root.path()).expect("file reader lock");
         (root, store)
     }
 
     fn inline_store(name: &str) -> (sinomo_testdir::TestDir, DfsDataOwnerLock, LocalContentStore) {
         let root = sinomo_testdir::TestDir::new(name);
         let data_dir = SinomoDataDir::new(root.path());
-        let mut owner =
+        let owner =
             DfsDataOwnerLock::acquire(&DfsRuntimePaths::new(&data_dir)).expect("main owner");
-        owner
-            .activate_content_bindings_before_routes()
-            .expect("cold activation");
         let store =
             LocalContentStore::new(data_dir.dfs_dir().join("content")).expect("active store");
         (root, owner, store)
     }
 
     #[test]
-    fn lazy_legacy_extent_stream_pins_reclamation_until_reader_drop() {
-        let (_root, store) = legacy_store("dfs-lazy-legacy-reader-pin");
+    fn lazy_files_extent_stream_pins_reclamation_until_reader_drop() {
+        let (_root, store) = external_store("dfs-lazy-file-reader-pin");
         store
-            .put_object_version("extent-object", "v1", b"0123456789abcdef")
+            .put_object_version(
+                "extent-object",
+                "v1",
+                &[
+                    b"0123456789abcdef".as_slice(),
+                    &vec![b'x'; INLINE_BLOB_SMALL_LIMIT_BYTES as usize],
+                ]
+                .concat(),
+            )
             .unwrap();
         let manifest = store
             .put_object_version_patch("extent-object", "v1", "v2", 6, b"WXYZ")
@@ -441,28 +414,45 @@ mod tests {
             "capturing locators must not eagerly open payload files"
         );
         assert!(
-            store.try_lock_legacy_reclamation().unwrap().is_none(),
-            "future unopened legacy extents need their shared reclamation pin"
+            store.try_lock_file_reclamation().unwrap().is_none(),
+            "future unopened file extents need their shared reclamation pin"
         );
         // The returned reader owns manifest/locator data rather than its name.
-        fs::remove_file(store.manifest_path("extent-object", "v2")).unwrap();
+        store
+            .inline_delete_version_unlocked("extent-object", "v2", &manifest.content_hash)
+            .unwrap();
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes).unwrap();
-        assert_eq!(bytes, b"012345WXYZabcdef");
+        assert_eq!(
+            bytes,
+            [
+                b"012345WXYZabcdef".as_slice(),
+                &vec![b'x'; INLINE_BLOB_SMALL_LIMIT_BYTES as usize]
+            ]
+            .concat()
+        );
         assert_eq!(
             store.blob_stream_open_count.load(Ordering::Relaxed) - before,
             manifest.extents.len() as u64
         );
-        assert!(store.try_lock_legacy_reclamation().unwrap().is_none());
+        assert!(store.try_lock_file_reclamation().unwrap().is_none());
         drop(reader);
-        assert!(store.try_lock_legacy_reclamation().unwrap().is_some());
+        assert!(store.try_lock_file_reclamation().unwrap().is_some());
     }
 
     #[test]
     fn lazy_range_stream_retains_only_captured_selected_sources() {
-        let (_root, store) = legacy_store("dfs-lazy-range-reader-pin");
+        let (_root, store) = external_store("dfs-lazy-range-reader-pin");
         store
-            .put_object_version("range-object", "v1", b"0123456789abcdef")
+            .put_object_version(
+                "range-object",
+                "v1",
+                &[
+                    b"0123456789abcdef".as_slice(),
+                    &vec![b'x'; INLINE_BLOB_SMALL_LIMIT_BYTES as usize],
+                ]
+                .concat(),
+            )
             .unwrap();
         store
             .put_object_version_patch("range-object", "v1", "v2", 6, b"WXYZ")
@@ -470,44 +460,63 @@ mod tests {
         let (_, mut reader) = store
             .open_object_version_range_stream("range-object", "v2", 5, 6)
             .unwrap();
-        fs::remove_file(store.manifest_path("range-object", "v2")).unwrap();
-        assert!(store.try_lock_legacy_reclamation().unwrap().is_none());
+        let manifest = store.read_manifest("range-object", "v2").unwrap();
+        store
+            .inline_delete_version_unlocked("range-object", "v2", &manifest.content_hash)
+            .unwrap();
+        assert!(store.try_lock_file_reclamation().unwrap().is_none());
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes).unwrap();
         assert_eq!(bytes, b"5WXYZa");
         drop(reader);
-        assert!(store.try_lock_legacy_reclamation().unwrap().is_some());
+        assert!(store.try_lock_file_reclamation().unwrap().is_some());
     }
 
     #[test]
-    fn captured_range_keeps_shared_legacy_pin_after_snapshot_handle_drops() {
-        let (_root, store) = legacy_store("dfs-captured-range-retains-snapshot");
+    fn captured_range_keeps_shared_files_pin_after_snapshot_handle_drops() {
+        let (_root, store) = external_store("dfs-captured-range-retains-snapshot");
         let manifest = store
-            .put_object_version("object", "v1", b"retained bytes")
+            .put_object_version(
+                "object",
+                "v1",
+                &[
+                    b"retained bytes".as_slice(),
+                    &vec![b'x'; INLINE_BLOB_SMALL_LIMIT_BYTES as usize],
+                ]
+                .concat(),
+            )
             .unwrap();
         let snapshot = store
             .capture_read_snapshot([manifest.content_hash.as_str()])
             .unwrap();
         let mut range = snapshot.open_range(&manifest.content_hash, 2, 6).unwrap();
         drop(snapshot);
-        assert!(store.try_lock_legacy_reclamation().unwrap().is_none());
+        assert!(store.try_lock_file_reclamation().unwrap().is_none());
         let mut bytes = Vec::new();
         range.read_to_end(&mut bytes).unwrap();
         assert_eq!(bytes, b"tained");
         drop(range);
-        assert!(store.try_lock_legacy_reclamation().unwrap().is_some());
+        assert!(store.try_lock_file_reclamation().unwrap().is_some());
     }
 
     #[test]
-    fn inspection_cannot_create_a_missing_legacy_reader_lock() {
-        let (root, store) = legacy_store("dfs-inspection-lazy-pin-missing");
+    fn inspection_cannot_create_a_missing_files_reader_lock() {
+        let (root, store) = external_store("dfs-inspection-lazy-pin-missing");
         store
-            .put_object_version("object", "v1", b"0123456789abcdef")
+            .put_object_version(
+                "object",
+                "v1",
+                &[
+                    b"0123456789abcdef".as_slice(),
+                    &vec![b'x'; INLINE_BLOB_SMALL_LIMIT_BYTES as usize],
+                ]
+                .concat(),
+            )
             .unwrap();
         store
             .put_object_version_patch("object", "v1", "v2", 6, b"WXYZ")
             .unwrap();
-        let lock = root.join(LEGACY_READERS_LOCK);
+        let lock = root.join(FILE_READERS_LOCK);
         fs::remove_file(&lock).unwrap();
         drop(store);
         let inspected = LocalContentStore::open_for_inspection(root.path());
@@ -535,7 +544,7 @@ mod tests {
             .unwrap();
         assert_eq!(snapshot.locators.len(), 2);
         assert_eq!(snapshot._generations.len(), 1);
-        assert!(snapshot._legacy.is_none());
+        assert!(snapshot._files.is_none());
         let extents = vec![
             ContentExtent {
                 logical_offset: 0,
@@ -598,11 +607,12 @@ mod tests {
         }
         assert!(store.inline_blob_entry(&b.content_hash).unwrap().is_none());
         assert!(store.open_blob_stream(&b.content_hash).is_err());
-        // An authoritative Drop must also shadow a surviving legacy copy.
+        // An authoritative Drop must also shadow a surviving loose copy.
         // Existing readers retain their captured locator; new readers cannot
         // resurrect the hash by falling through to this old representation.
-        let legacy_copy = store.blob_path(&b.content_hash).unwrap();
-        fs::write(&legacy_copy, b"second").unwrap();
+        let loose_copy = store.blob_path(&b.content_hash).unwrap();
+        fs::create_dir_all(loose_copy.parent().unwrap()).unwrap();
+        fs::write(&loose_copy, b"second").unwrap();
         assert!(matches!(
             store.capture_read_snapshot([b.content_hash.as_str()]),
             Err(ContentStoreError::Io { source, .. })

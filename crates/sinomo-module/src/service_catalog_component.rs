@@ -335,18 +335,22 @@ async fn run_service_catalog_publisher_with_timing(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    struct CountingHost(AtomicUsize);
+    #[derive(Default)]
+    struct CountingHost(AtomicUsize, AtomicBool);
 
     impl ServiceCatalogPublisherHost for CountingHost {
         fn publish<'a>(
             &'a self,
             _snapshot: Arc<ServiceRegistrySnapshot>,
-            _authoritative_recheck: bool,
+            authoritative_recheck: bool,
         ) -> ServiceCatalogPublishFuture<'a> {
             Box::pin(async move {
                 self.0.fetch_add(1, Ordering::SeqCst);
+                if !authoritative_recheck {
+                    self.1.store(true, Ordering::SeqCst);
+                }
                 Ok(())
             })
         }
@@ -393,7 +397,7 @@ mod tests {
 
     #[tokio::test]
     async fn registry_generation_change_triggers_publication() {
-        let host = Arc::new(CountingHost(AtomicUsize::new(0)));
+        let host = Arc::new(CountingHost::default());
         let registry = sinomo_core::service::ServiceRegistrySnapshotStore::default();
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let task = tokio::spawn(run_service_catalog_publisher(
@@ -427,7 +431,7 @@ mod tests {
 
     #[tokio::test]
     async fn stable_registry_parks_after_successful_publication() {
-        let host = Arc::new(CountingHost(AtomicUsize::new(0)));
+        let host = Arc::new(CountingHost::default());
         let registry = sinomo_core::service::ServiceRegistrySnapshotStore::default();
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let task = tokio::spawn(run_service_catalog_publisher(
@@ -488,7 +492,7 @@ mod tests {
 
     #[tokio::test]
     async fn stable_registry_is_reconciled_during_process_replacement_window() {
-        let host = Arc::new(CountingHost(AtomicUsize::new(0)));
+        let host = Arc::new(CountingHost::default());
         let registry = sinomo_core::service::ServiceRegistrySnapshotStore::default();
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let reconcile_interval = Duration::from_millis(5);
@@ -517,7 +521,16 @@ mod tests {
         .await
         .expect("stable startup registry was reconciled again");
 
-        tokio::time::sleep(reconcile_window + reconcile_interval).await;
+        // A delayed publisher can still owe the final startup publication after
+        // the test's timer wakes. Observe that real publication before checking
+        // that the unchanged registry stays parked.
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !host.1.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("publisher reached the end of the startup reconciliation window");
         let settled_count = host.0.load(Ordering::SeqCst);
         tokio::time::sleep(reconcile_interval.saturating_mul(3)).await;
         assert_eq!(

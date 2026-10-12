@@ -730,37 +730,13 @@ impl<T: DfsMessageTransport> DfsAttachmentService<'_, T> {
             self.posix_mkdir_all(&directory)?;
             self.posix_open_beneath_no_links_distributed("/", &directory)?;
         }
-        let deadline = self
-            .operation_deadline()
-            .unwrap_or_else(|| std::time::Instant::now() + std::time::Duration::from_secs(30));
-        let committed = loop {
-            match self.posix_write_internal_file_from_reader(
-                &path,
-                std::io::Cursor::new(bytes.as_slice()),
-                options.clone(),
-                base.map(|s| (&s.object_id, &s.version)),
-                &physical,
-            ) {
-                Ok(committed) => break committed,
-                Err(error) if sinomo_dfs::posix_error_is_retryable_write_serialization(&error) => {
-                    // Another admitted catalog writer has not settled yet.
-                    // This is a known rejection, not an ambiguous delivery.
-                    // Preserve this exact physical operation and expected
-                    // base while waiting; a changed base returns CAS conflict
-                    // to the outer catalog merge/revision check.
-                    self.check_operation_cancellation("attachment catalog serialization")?;
-                    let now = std::time::Instant::now();
-                    if now >= deadline {
-                        return Err(error);
-                    }
-                    std::thread::sleep(
-                        std::time::Duration::from_millis(10)
-                            .min(deadline.saturating_duration_since(now)),
-                    );
-                }
-                Err(error) => return Err(error),
-            }
-        };
+        let committed = self.posix_write_internal_file_from_reader(
+            &path,
+            std::io::Cursor::new(bytes.as_slice()),
+            options.clone(),
+            base.map(|s| (&s.object_id, &s.version)),
+            &physical,
+        )?;
         // The successful CAS supplies the immutable version we just encoded.
         // Keep it available to subsequent reads without downloading our own
         // newly committed catalog from another replica.

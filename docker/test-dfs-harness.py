@@ -24,10 +24,6 @@ idle_spec.loader.exec_module(idle_driver)
 stage_spec = importlib.util.spec_from_file_location("write_stage_profile", Path(__file__).with_name("profile-dfs-writes.py"))
 stage_driver = importlib.util.module_from_spec(stage_spec)
 stage_spec.loader.exec_module(stage_driver)
-migration_spec = importlib.util.spec_from_file_location(
-    "storage_migration", Path(__file__).with_name("test-storage-migrations.py"))
-migration_driver = importlib.util.module_from_spec(migration_spec)
-migration_spec.loader.exec_module(migration_driver)
 
 
 class HarnessTests(unittest.TestCase):
@@ -245,92 +241,6 @@ NODES=node1
             runner.exercise_core_only()
         runner.probe.assert_called_once_with("node6", "semantic-lost-reply", timeout_seconds=120)
         runner.set_filesystem_features.assert_not_called()
-
-    def test_storage_upgrade_requires_v6_on_all_three_lanes_and_all_six_nodes(self):
-        def shard_layout(codec):
-            return json.dumps({"diagnostics": {"shards": [
-                {"shard_id": lane, "namespace_prepare_codec": codec}
-                for lane in ["root", "services", "users"]]}}).encode()
-        runner = self.runner()
-        runner.probe = Mock(return_value=shard_layout("packed-v3"))
-        with patch.object(migration_driver.time, "monotonic", side_effect=[0, 2]):
-            with self.assertRaisesRegex(RuntimeError, "codec transition did not settle"):
-                migration_driver.wait_for_current_codec(runner, timeout=1)
-        self.assertEqual(runner.probe.call_count, 6)
-        runner.probe = Mock(return_value=shard_layout("packed-v6"))
-        migration_driver.wait_for_current_codec(runner, timeout=1)
-        self.assertEqual(runner.probe.call_count, 6)
-        self.assertEqual({call.args[0] for call in runner.probe.call_args_list},
-                         {f"node{i}" for i in range(1, 7)})
-
-    def test_storage_verifier_checks_inner_reader_floor_before_and_after_restart(self):
-        runner = self.runner()
-        runner.args = SimpleNamespace(project="owned-test-project")
-        runner.verify_processes = runner.wait_ready = runner.expect = runner.read = Mock()
-        runner.write = runner.restart = Mock()
-        runner.probe = Mock(return_value=b'{"status":"passed"}')
-        jobs = [{"identity": {"owner": "sinomo-dfs", "target_version": target, "migration": f"metadata-snapshot-v{target}"},
-                 "phase": "complete", "copied_records": 5, "verified_records": 5}
-                for target in [3, 6]]
-        runner.cli = Mock(return_value=json.dumps({"storage_migrations": jobs}).encode())
-        prefix = "/services/cluster-tests/storage-migration-fixture"
-        identity = {"object_id": "retained-object", "version": "retained-version"}
-        fixture = {"project": runner.args.project, "prefix": prefix,
-                   "current": prefix + "/current.txt", "current_bytes": "current",
-                   "current_identity": identity, "retained_identity": identity,
-                   "retained_bytes": "retained"}
-        runner.history = Mock(side_effect=lambda node, action, *args: {
-            "identity": identity} if action == "capture" else {"path": prefix + "/recovered.txt"})
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "fixture.json"
-            path.write_text(json.dumps(fixture))
-            with patch.object(migration_driver, "wait_for_current_codec"), \
-                 patch.object(migration_driver, "snapshot_headers", return_value=6) as headers:
-                result = migration_driver.verify(runner, path, lambda: "restore-operation")
-        headers.assert_called_once_with(runner, b"SMIGLOG1")
-        floor_calls = [call for call in runner.probe.call_args_list
-                       if call.args[1] == "metadata-snapshot-reader-floor"]
-        self.assertEqual(len(floor_calls), 12)
-        for call in floor_calls:
-            self.assertEqual(call.kwargs, {"require_floor6": "true"})
-        self.assertEqual([call.args[0] for call in floor_calls],
-                         [f"node{i}" for i in range(1, 7)] * 2)
-        self.assertEqual({job["identity"]["target_version"] for job in result["migration_jobs"]}, {3, 6})
-        self.assertEqual(len(result["physical_reader_floors"]), 6)
-        self.assertEqual(len(result["restarted_reader_floors"]), 6)
-
-    def test_physical_floor_only_reports_do_not_prove_local_migration_execution(self):
-        for jobs in [[], [{"identity": {"owner": "sinomo-dfs", "target_version": 3,
-                                       "migration": "metadata-snapshot-v3"},
-                          "phase": "complete", "copied_records": 1, "verified_records": 1}]]:
-            with self.assertRaisesRegex(AssertionError, "completed local floor-six migration"):
-                migration_driver.validate_migration_jobs(jobs)
-        migrated = {"identity": {"owner": "sinomo-dfs", "target_version": 6,
-                                 "migration": "metadata-snapshot-v6"},
-                    "phase": "complete", "copied_records": 1, "verified_records": 1}
-        migration_driver.validate_migration_jobs([migrated])
-
-    def test_migration_baseline_accepts_legacy_and_checked_v3_but_rejects_candidate_floor(self):
-        path = "/data/dfs/metadata/services/records/tables/snapshot.sobj"
-        for version in [1, 2, 3]:
-            legacy = b"SOBJ" + version.to_bytes(2, "little") + bytes(10)
-            report = migration_driver.validate_baseline_snapshot("node1", path, legacy, None)
-            self.assertEqual(report["document_version"], version)
-            self.assertEqual(report["raw_prefix_hex"], legacy.hex())
-        stream = b"SMIGLOG1" + (128).to_bytes(8, "little")
-        checked = {"format_version": 3, "generation": "a" * 64,
-                   "materialized_through_sequence": 12}
-        report = migration_driver.validate_baseline_snapshot("node6", path, stream, checked)
-        self.assertEqual(report["snapshot_format_version"], 3)
-        self.assertEqual(report["checked_stream_header"], checked)
-        with self.assertRaisesRegex(AssertionError, "checked inner header"):
-            migration_driver.validate_baseline_snapshot("node6", path, stream, None)
-        with self.assertRaisesRegex(AssertionError, "candidate reader floor"):
-            migration_driver.validate_baseline_snapshot("node6", path, stream,
-                {**checked, "format_version": 6})
-        with self.assertRaisesRegex(AssertionError, "candidate or unknown SOBJ version"):
-            migration_driver.validate_baseline_snapshot("node1", path,
-                b"SOBJ" + (6).to_bytes(2, "little") + bytes(10), None)
 
     def test_skipped_probe_is_not_acceptance(self):
         runner = self.runner()

@@ -1,141 +1,34 @@
 //! Owner-side metadata contribution fences across real routed namespace moves.
 use super::*;
 
-type Service = NetworkedDfsService<sinomo_core::network::InProcessTransport>;
+type Service = NetworkedDfsService<DfsNodeTransport>;
 
 struct ContributionCluster {
-    _root: sinomo_testdir::TestDir,
+    _runtime: crate::test_runtime::DfsTestRuntime,
     nodes: [NodeId; 3],
     services: Vec<Option<Service>>,
 }
 
 impl ContributionCluster {
     fn new(label: &str) -> Self {
-        let root = temp_root(label);
-        let nodes = ["users", "services", "requester"]
-            .map(|suffix| NodeId::from_legacy_named(format!("{label}-{suffix}")).unwrap());
-        let network = InProcessNetwork::new();
-        let genesis = networked_sifs_with_backend(&root.join("genesis"), nodes[0].clone());
-        let backend = genesis.metadata_backend().unwrap();
-        let file_system = backend
-            .get_file_system(&sifs_file_system_id())
-            .unwrap()
-            .unwrap();
-        let page = backend
-            .objects_for_file_system_page(&sifs_file_system_id(), None, 128)
-            .unwrap();
-        assert!(page.next_cursor.is_none());
-        assert!(
-            page.objects
-                .iter()
-                .all(|object| object.kind == DfsObjectKind::Directory)
-        );
-        let mut shards =
-            sifs_two_primary_shard_configs(&nodes[0], &nodes[1], 1, Vec::new(), Vec::new());
-        for shard in &mut shards {
-            shard.namespace_prepare_codec = DfsMetadataNamespacePrepareCodec::PackedV6;
+        let cluster = sifs_two_primary_cluster(label);
+        Self {
+            nodes: [
+                cluster.users_primary_node,
+                cluster.services_primary_node,
+                cluster.replica_node,
+            ],
+            services: vec![
+                Some(cluster.users_primary),
+                Some(cluster.services_primary),
+                Some(cluster.replica),
+            ],
+            _runtime: cluster._runtime,
         }
-        assert!(shards.iter().all(|shard| shard.replica_node_ids.is_empty()));
-        let mut kv = InProcessKvStore::new();
-        let cluster_id = sinomo_core::Id::from_legacy_named(label).unwrap();
-        for node_id in &nodes {
-            let mut member = sinomo_core::ClusterMemberRecord::local_non_voting(
-                cluster_id.clone(),
-                node_id.clone(),
-                "contribution authority fixture",
-                format!("{node_id}-key"),
-                OffsetDateTime::UNIX_EPOCH,
-            );
-            member.state = sinomo_core::ClusterMemberState::Active;
-            member.capabilities = sinomo_core::node::main_daemon_capabilities(&member.role);
-            member.allowed_capabilities = member.capabilities.clone();
-            kv.put_serde(
-                sinomo_core::node::cluster_member_key(node_id),
-                &member,
-                None,
-            )
-            .unwrap();
-            kv.put_serde(
-                sinomo_core::node::cluster_capability_policy_key(node_id),
-                &sinomo_core::node::ClusterCapabilityPolicyRecord::from(&member),
-                None,
-            )
-            .unwrap();
-        }
-        let control_plane = SharedDfsControlPlaneKvClient::new(kv);
-        control_plane.with_client(|kv| {
-            let mut control = DfsControlPlaneStore::new(kv);
-            control
-                .put_file_system_config(&DfsFileSystemConfig::from(&file_system))
-                .unwrap();
-            for shard in &shards {
-                control.put_metadata_shard(shard).unwrap();
-            }
-        });
-        let services = nodes
-            .iter()
-            .enumerate()
-            .map(|(index, node_id)| {
-                let node_root = root.join(format!("node-{index}"));
-                let mut backend =
-                    open_local_sharded_metadata_backend(node_root.join("metadata"), shards.clone())
-                        .unwrap();
-                backend.put_file_system(&file_system).unwrap();
-                // Seed only the bootstrap directories. Files, moves and
-                // contributions all use the normal service authority paths.
-                for directory in &page.objects {
-                    backend.put_object(directory).unwrap();
-                }
-                Some(
-                    NetworkedDfsService::new(
-                        network.add_node(node_id.clone()),
-                        LocalContentStore::new(node_root.join("content")).unwrap(),
-                    )
-                    .with_control_plane(control_plane.clone())
-                    .with_metadata_backend(backend)
-                    .unwrap(),
-                )
-            })
-            .collect();
-        let mut cluster = Self {
-            _root: root,
-            nodes,
-            services,
-        };
-        cluster.run(2, |requester| {
-            requester.bootstrap_distributed_sifs().unwrap()
-        });
-        cluster
     }
 
     fn run<R>(&mut self, active: usize, operation: impl FnOnce(&mut Service) -> R) -> R {
-        let mut service = self.services[active].take().unwrap();
-        let stop = Arc::new(AtomicBool::new(false));
-        let pumps = self
-            .services
-            .iter_mut()
-            .enumerate()
-            .filter_map(|(index, service)| {
-                service.take().map(|service| {
-                    let stop = stop.clone();
-                    (
-                        index,
-                        std::thread::spawn(move || pump_sifs_service_until_stop(service, stop)),
-                    )
-                })
-            })
-            .collect::<Vec<_>>();
-        let outcome =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| operation(&mut service)));
-        stop.store(true, Ordering::SeqCst);
-        self.services[active] = Some(service);
-        for (index, pump) in pumps {
-            self.services[index] = Some(pump.join().unwrap());
-        }
-        match outcome {
-            Ok(outcome) => outcome,
-            Err(error) => std::panic::resume_unwind(error),
-        }
+        operation(self.services[active].as_mut().unwrap())
     }
 
     fn write(&mut self, path: &str) -> crate::posix_model::DfsStat {
@@ -349,7 +242,7 @@ fn admitted_contribution_retry_rejects_disjoint_owner_without_original_outcome()
         let backend = owner.metadata_backend().unwrap();
         assert!(
             backend
-                .get_namespace_transaction(&transaction_id)
+                .prepared_operation_record(&transaction_id)
                 .unwrap()
                 .is_none()
         );
@@ -437,7 +330,7 @@ fn distributed_contribution_original_head_rejects_disjoint_move_aba_without_outc
         let backend = owner.metadata_backend().unwrap();
         assert!(
             backend
-                .get_namespace_transaction(&transaction_id)
+                .prepared_operation_record(&transaction_id)
                 .unwrap()
                 .is_none()
         );

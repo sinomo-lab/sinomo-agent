@@ -1,5 +1,6 @@
 /target
 /dist
+/data
 /crates/*/target/
 /modules/*/*/target/
 /fixtures/*/target/

@@ -77,7 +77,6 @@ pub type MountedSifsMutationArmRequestId = Id;
 #[serde(rename_all = "kebab-case")]
 pub enum MountedSifsMutationAdapter {
     Fuse,
-    #[serde(alias = "cloud-files")]
     ExternalProvider,
     Nfs,
 }
@@ -93,7 +92,7 @@ pub struct MountedSifsMutationOrigin {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
-#[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct MountedSifsMutationCapturedWork {
     pub committed_work: DfsCommittedWork,
     pub committed_repair_records: Vec<DfsRepairAttemptRecord>,
@@ -148,7 +147,7 @@ pub struct MountedSifsMutationRecoveryReceipt {
 /// direct mounted mutations. Bits are never cleared: every daemon generation
 /// can replay the snapshot once during startup without a lost-wake window.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
-#[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct MountedSifsMutationCommittedWorkLatch {
     pub schema_version: u16,
     pub generation: u64,
@@ -855,6 +854,10 @@ impl MountedSifsMutationOutboxStore {
         data_dir
             .ensure_root_layout()
             .map_err(|source| outbox_error(source.to_string()))?;
+        crate::storage_preparation::prepare_storage_root_before_open(
+            &data_dir.dfs_dir(),
+            &crate::DfsStoragePreparationScope::LocalState,
+        )?;
         let root = data_dir.dfs_dir().join(OUTBOX_DIRECTORY);
         let outbox_preexisting = root.exists();
         ensure_directory(&root).map_err(durable_error)?;

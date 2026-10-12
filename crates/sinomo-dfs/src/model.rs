@@ -5,8 +5,7 @@
 //! `metadata_backend`; transport envelopes live in `protocol` and `routes`.
 
 use crate::{
-    ContentStoreStats, DFS_POLICY_VIOLATION_EVENT_KIND, DfsConflictRecord, DfsConflictStatus,
-    DfsError, DfsFileSystemId, DfsObjectId,
+    ContentStoreStats, DFS_POLICY_VIOLATION_EVENT_KIND, DfsError, DfsFileSystemId, DfsObjectId,
 };
 use serde::{Deserialize, Serialize};
 use sinomo_core::events::EventId;
@@ -100,7 +99,6 @@ pub struct DfsMetadataStore {
     /// replacement), so the set is resolved to the first non-tombstone object at
     /// lookup time, matching the previous linear scan exactly.
     pub(crate) objects_by_path: BTreeMap<(DfsFileSystemId, String), BTreeSet<DfsObjectId>>,
-    pub(crate) conflicts: BTreeMap<DfsObjectId, BTreeMap<String, DfsConflictRecord>>,
 }
 
 impl DfsMetadataStore {
@@ -173,40 +171,6 @@ impl DfsMetadataStore {
             .iter()
             .filter_map(|object_id| self.objects.get(object_id))
             .find(|object| object.kind != DfsObjectKind::Tombstone)
-    }
-
-    pub fn add_conflict(&mut self, conflict: DfsConflictRecord) {
-        self.conflicts
-            .entry(conflict.object_id.clone())
-            .or_default()
-            .insert(conflict.conflict_id.clone(), conflict);
-    }
-
-    pub fn remove_conflict(
-        &mut self,
-        object_id: &DfsObjectId,
-        conflict_id: &str,
-    ) -> Option<DfsConflictRecord> {
-        let conflicts = self.conflicts.get_mut(object_id)?;
-        let removed = conflicts.remove(conflict_id);
-        if conflicts.is_empty() {
-            self.conflicts.remove(object_id);
-        }
-        removed
-    }
-
-    pub fn conflicts_for_object(&self, object_id: &DfsObjectId) -> Vec<DfsConflictRecord> {
-        self.conflicts
-            .get(object_id)
-            .map(|conflicts| conflicts.values().cloned().collect())
-            .unwrap_or_default()
-    }
-
-    pub fn open_conflicts_for_object(&self, object_id: &DfsObjectId) -> Vec<DfsConflictRecord> {
-        self.conflicts_for_object(object_id)
-            .into_iter()
-            .filter(|conflict| conflict.status == DfsConflictStatus::Open)
-            .collect()
     }
 
     pub fn route_read(
@@ -346,7 +310,7 @@ pub struct DfsOperationalMetrics {
     pub node_id: NodeId,
     pub file_system_count: usize,
     pub object_count: usize,
-    pub open_conflict_count: usize,
+
     pub coordinator_intent_count: usize,
     pub coordinator_receipt_count: usize,
     pub coordinator_committed_version_count: usize,

@@ -1,8 +1,8 @@
 //! Authoritative small-content bindings, layered on shared storage frames.
 //!
-//! Legacy files remain authoritative for identities not adopted by this log.
-//! A live entry or tombstone is an explicit ownership decision, never a missing
-//! cache entry. The mandatory reservation sentinel gates this interpretation.
+//! The published catalog owns every version and retention root. Small payloads
+//! are framed inline; large and extent payloads use current content-addressed
+//! files. The mandatory current marker rejects unsupported storage formats.
 
 mod activation;
 mod blob_stage;
@@ -10,11 +10,13 @@ mod compaction;
 mod completion;
 mod operations;
 pub(super) use operations::open_verified_inline_payload;
+#[cfg(feature = "storage-conversion")]
+pub use operations::{ContentStoreStagingRow, ContentStoreStagingWriter};
 mod read_snapshot;
 mod root_identity;
 #[cfg(test)]
 mod tests;
-pub(super) use read_snapshot::{ContentReadSnapshot, initialize_legacy_reclamation_lock};
+pub(super) use read_snapshot::{ContentReadSnapshot, initialize_file_reclamation_lock};
 
 use super::*;
 use sinomo_core::storage::checksummed_frame::{
@@ -24,9 +26,9 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Weak;
 
-pub(super) const INLINE_BINDING_LAYOUT: &str = "inline-bindings-v1";
+pub(super) const INLINE_BINDING_LAYOUT: &str = "inline-bindings-v2";
 pub(super) const INLINE_BINDING_DIR: &str = "inline-bindings";
-const INLINE_FORMAT_VERSION: u32 = 1;
+const INLINE_FORMAT_VERSION: u32 = 2;
 const INLINE_SEGMENT_MAX_BYTES: u64 = 4 * 1024 * 1024;
 const INLINE_FRAME_HEADER_LIMIT: u32 = 64 * 1024;
 const INLINE_OWNER_LOCK: &str = "content-owner.lock";
@@ -42,7 +44,6 @@ struct InlineCatalog {
     generation: u64,
     /// The original file representation is an authoritative mixed baseline.
     /// Control records shadow exact identities; missing log keys do not.
-    legacy_files_are_authoritative: bool,
     segments: Vec<InlineSegment>,
 }
 
@@ -105,12 +106,10 @@ enum InlineOperation {
         version: String,
         content_hash: String,
     },
-    /// A legacy representation was durably republished after a tombstone.
-    /// It resumes exact, checked file fallback without adopting its payload.
-    LegacyManifest {
-        object_id: String,
-        version: String,
-        content_hash: String,
+    ExternalBinding {
+        manifest: ContentManifest,
+        published_at_unix_nanos: u64,
+        reservation: Option<ContentStoreReservationRecord>,
     },
     RemoveBlob {
         content_hash: String,
@@ -127,7 +126,6 @@ pub(super) struct InlineVersionEntry {
 pub(super) enum InlineVersionState {
     Live(InlineVersionEntry),
     Deleted { content_hash: String },
-    Legacy { content_hash: String },
 }
 
 #[derive(Clone, Debug)]
@@ -173,6 +171,7 @@ impl InlineBlobEntry {
 #[derive(Clone, Debug, Default)]
 pub(super) struct InlineBindingView {
     pub(super) versions: BTreeMap<VersionKey, InlineVersionState>,
+    content_versions: BTreeMap<(String, String, u64), BTreeSet<String>>,
     pub(super) reservations: BTreeMap<ContentStoreReservationIdentity, InlineReservationState>,
     pub(super) blobs: BTreeMap<String, InlineBlobEntry>,
     pub(super) deleted_blobs: BTreeSet<String>,
@@ -180,36 +179,13 @@ pub(super) struct InlineBindingView {
 }
 
 impl InlineBindingView {
-    pub(super) fn validate_legacy_manifest(&self, manifest: &ContentManifest) -> Result<()> {
-        if let Some(InlineVersionState::Legacy { content_hash }) = self
-            .versions
-            .get(&(manifest.object_id.clone(), manifest.version.clone()))
-            && *content_hash != manifest.content_hash
-        {
-            return Err(inline_error(
-                "legacy manifest disagrees with its adopted exact identity",
-            ));
-        }
-        Ok(())
-    }
-
-    pub(super) fn owns_version(&self, object_id: &str, version: &str) -> bool {
-        matches!(
-            self.versions
-                .get(&(object_id.to_owned(), version.to_owned())),
-            Some(InlineVersionState::Live(_) | InlineVersionState::Deleted { .. })
-        )
-    }
-
     pub(super) fn live_manifest(&self, object_id: &str, version: &str) -> Option<&ContentManifest> {
         match self
             .versions
             .get(&(object_id.to_owned(), version.to_owned()))
         {
             Some(InlineVersionState::Live(entry)) => Some(&entry.manifest),
-            Some(InlineVersionState::Deleted { .. } | InlineVersionState::Legacy { .. }) | None => {
-                None
-            }
+            Some(InlineVersionState::Deleted { .. }) | None => None,
         }
     }
 }
@@ -225,7 +201,6 @@ struct InlineResidentState {
     certified_catalog: Option<InlineCatalog>,
     active_identity: Option<InlineFileIdentity>,
     certified_identity: Option<InlineFileIdentity>,
-    legacy_cleanup: compaction::LegacyCleanupState,
     retired_generation_cursor: u64,
 }
 
@@ -286,7 +261,7 @@ struct InlineStoreOwner {
 
 static INLINE_STORES: OnceLock<Mutex<BTreeMap<PathBuf, Weak<InlineStoreOwner>>>> = OnceLock::new();
 
-/// Retained by store handles and every reader, including legacy readers. Cold
+/// Retained by store handles and every reader. Cold
 /// activation must see only its own lease after exclusive daemon ownership.
 #[derive(Clone, Debug)]
 pub(super) struct InlineStoreLease {
@@ -349,7 +324,7 @@ thread_local! {
     static CONTENT_OWNER_LOCKS: RefCell<BTreeMap<PathBuf, (usize, Arc<fs::File>)>> = const { RefCell::new(BTreeMap::new()) };
 }
 
-/// Synchronous reentrancy is needed because legacy helpers call reservation and
+/// Synchronous reentrancy is needed because mutation methods call reservation and
 /// accounting helpers internally. The marker makes this guard !Send: a lock
 /// depth cannot migrate to another worker. All active-layout mutation entry
 /// points take this owner before the reservation flock or the stats lock.
@@ -366,7 +341,7 @@ impl ContentMutationGuard {
         }
     }
 
-    fn acquire(root: &Path, create: bool) -> Result<Self> {
+    pub(super) fn acquire(root: &Path, create: bool) -> Result<Self> {
         let canonical = root_identity::canonical_existing_root(root).map_err(|source| {
             ContentStoreError::Io {
                 path: root.to_owned(),
@@ -454,7 +429,7 @@ fn inline_error(detail: impl std::fmt::Display) -> ContentStoreError {
 }
 
 fn frame_limits() -> FrameLimits {
-    FrameLimits::new(INLINE_FRAME_HEADER_LIMIT, PACKED_BLOB_SMALL_LIMIT_BYTES)
+    FrameLimits::new(INLINE_FRAME_HEADER_LIMIT, INLINE_BLOB_SMALL_LIMIT_BYTES)
         .expect("fixed inline frame limits")
 }
 
@@ -488,7 +463,6 @@ fn read_catalog(root: &Path, incarnation: &str) -> Result<InlineCatalog> {
     }
     if catalog.format_version != INLINE_FORMAT_VERSION
         || catalog.store_incarnation != incarnation
-        || !catalog.legacy_files_are_authoritative
         || catalog.generation == 0
         || catalog.segments.is_empty()
         || catalog
@@ -623,19 +597,14 @@ fn validate_key(object_id: &str, version: &str) -> Result<()> {
 fn version_hash(state: &InlineVersionState) -> &str {
     match state {
         InlineVersionState::Live(entry) => &entry.manifest.content_hash,
-        InlineVersionState::Deleted { content_hash }
-        | InlineVersionState::Legacy { content_hash } => content_hash,
+        InlineVersionState::Deleted { content_hash } => content_hash,
     }
 }
 
 fn validate_tuple(view: &InlineBindingView, manifest: &ContentManifest) -> Result<()> {
     validate_key(&manifest.object_id, &manifest.version)?;
     hash_hex(&manifest.content_hash)?;
-    if !manifest.extents.is_empty() || manifest.size_bytes > PACKED_BLOB_SMALL_LIMIT_BYTES {
-        return Err(inline_error(
-            "inline binding must be a bounded whole-content manifest",
-        ));
-    }
+    validate_and_order_stream_manifest(manifest.clone())?;
     if let Some(prior) = view
         .versions
         .get(&(manifest.object_id.clone(), manifest.version.clone()))
@@ -666,11 +635,7 @@ fn validate_inline_reservation(
 ) -> Result<()> {
     validate_key(&record.identity.object_id, &record.identity.version)?;
     hash_hex(&record.identity.content_hash)?;
-    if record
-        .causal_stamp
-        .as_ref()
-        .is_none_or(|stamp| stamp.store_incarnation != incarnation)
-    {
+    if record.causal_stamp.store_incarnation != incarnation {
         return Err(inline_error(
             "inline reservation lacks exact store provenance",
         ));
@@ -694,7 +659,7 @@ fn validate_operation(
             hash_hex(content_hash)?;
             if content_hash != payload_hash
                 || *size_bytes != payload_bytes
-                || *size_bytes > PACKED_BLOB_SMALL_LIMIT_BYTES
+                || *size_bytes > INLINE_BLOB_SMALL_LIMIT_BYTES
             {
                 return Err(inline_error(
                     "inline payload does not match its declared hash/size",
@@ -709,7 +674,7 @@ fn validate_operation(
             validate_inline_reservation(reservation, incarnation)?;
             if reservation.identity.content_hash != payload_hash
                 || *size_bytes != payload_bytes
-                || *size_bytes > PACKED_BLOB_SMALL_LIMIT_BYTES
+                || *size_bytes > INLINE_BLOB_SMALL_LIMIT_BYTES
                 || *size_bytes == 0
             {
                 return Err(inline_error(
@@ -738,6 +703,11 @@ fn validate_operation(
             manifest,
             reservation,
             published_at_unix_nanos,
+        }
+        | InlineOperation::ExternalBinding {
+            manifest,
+            reservation,
+            published_at_unix_nanos,
         } => {
             validate_tuple(view, manifest)?;
             if let Some(InlineVersionState::Live(prior)) = view
@@ -751,7 +721,9 @@ fn validate_operation(
             }
             match operation {
                 InlineOperation::Bind { .. }
-                    if manifest.content_hash == payload_hash
+                    if manifest.extents.is_empty()
+                        && manifest.size_bytes <= INLINE_BLOB_SMALL_LIMIT_BYTES
+                        && manifest.content_hash == payload_hash
                         && manifest.size_bytes == payload_bytes => {}
                 InlineOperation::Link { .. }
                     if payload_bytes == 0
@@ -759,6 +731,7 @@ fn validate_operation(
                             .blobs
                             .get(&manifest.content_hash)
                             .is_some_and(|entry| entry.size_bytes == manifest.size_bytes) => {}
+                InlineOperation::ExternalBinding { .. } if payload_bytes == 0 => {}
                 _ => return Err(inline_error("binding payload/reference is not exact")),
             }
             if manifest.content_hash == intrinsic_empty_content_hash() {
@@ -780,14 +753,8 @@ fn validate_operation(
         }
         InlineOperation::RestoreVersion { manifest, .. } => {
             validate_tuple(view, manifest)?;
-            if payload_bytes != 0
-                || (manifest.content_hash != intrinsic_empty_content_hash()
-                    && view
-                        .blobs
-                        .get(&manifest.content_hash)
-                        .is_none_or(|blob| blob.size_bytes != manifest.size_bytes))
-            {
-                return Err(inline_error("compacted version has no exact payload"));
+            if payload_bytes != 0 {
+                return Err(inline_error("compacted manifest has payload"));
             }
         }
         InlineOperation::Reserve(record) => {
@@ -804,11 +771,6 @@ fn validate_operation(
             hash_hex(&identity.content_hash)?;
         }
         InlineOperation::DeleteVersion {
-            object_id,
-            version,
-            content_hash,
-        }
-        | InlineOperation::LegacyManifest {
             object_id,
             version,
             content_hash,
@@ -847,6 +809,33 @@ fn apply_operation(
     location: InlineBlobEntry,
     sequence: u64,
 ) {
+    let affected_version = match &operation {
+        InlineOperation::Bind { manifest, .. }
+        | InlineOperation::Link { manifest, .. }
+        | InlineOperation::ExternalBinding { manifest, .. }
+        | InlineOperation::RestoreVersion { manifest, .. } => {
+            Some((manifest.object_id.clone(), manifest.version.clone()))
+        }
+        InlineOperation::DeleteVersion {
+            object_id, version, ..
+        } => Some((object_id.clone(), version.clone())),
+        _ => None,
+    };
+    if let Some(key) = affected_version.as_ref()
+        && let Some(InlineVersionState::Live(prior)) = view.versions.get(key)
+    {
+        let index_key = (
+            prior.manifest.object_id.clone(),
+            prior.manifest.content_hash.clone(),
+            prior.manifest.size_bytes,
+        );
+        if let Some(versions) = view.content_versions.get_mut(&index_key) {
+            versions.remove(&prior.manifest.version);
+            if versions.is_empty() {
+                view.content_versions.remove(&index_key);
+            }
+        }
+    }
     match operation {
         InlineOperation::Blob { content_hash, .. } => {
             view.deleted_blobs.remove(&content_hash);
@@ -886,6 +875,11 @@ fn apply_operation(
             }
         }
         InlineOperation::Link {
+            manifest,
+            published_at_unix_nanos,
+            reservation,
+        }
+        | InlineOperation::ExternalBinding {
             manifest,
             published_at_unix_nanos,
             reservation,
@@ -937,20 +931,22 @@ fn apply_operation(
                 InlineVersionState::Deleted { content_hash },
             );
         }
-        InlineOperation::LegacyManifest {
-            object_id,
-            version,
-            content_hash,
-        } => {
-            view.versions.insert(
-                (object_id, version),
-                InlineVersionState::Legacy { content_hash },
-            );
-        }
         InlineOperation::RemoveBlob { content_hash } => {
             view.blobs.remove(&content_hash);
             view.deleted_blobs.insert(content_hash);
         }
+    }
+    if let Some(key) = affected_version
+        && let Some(InlineVersionState::Live(entry)) = view.versions.get(&key)
+    {
+        view.content_versions
+            .entry((
+                entry.manifest.object_id.clone(),
+                entry.manifest.content_hash.clone(),
+                entry.manifest.size_bytes,
+            ))
+            .or_default()
+            .insert(entry.manifest.version.clone());
     }
     view.sequence = sequence;
 }
@@ -1292,7 +1288,7 @@ fn append_operation(
 
 impl LocalContentStore {
     /// The cold activation path creates the owner lock before enabling the
-    /// mandatory layout gate. Observational legacy opens remain non-creating.
+    /// mandatory layout gate. Observational opens remain non-creating.
     pub(super) fn content_mutation_guard(&self) -> Result<ContentMutationGuard> {
         if let Some(error) = self.inline_store.identity_error.as_ref() {
             return Err(inline_error(format!(
@@ -1311,16 +1307,130 @@ impl LocalContentStore {
             Err(source) => return Err(ContentStoreError::Io { path, source }),
         };
         let sentinel = decode_content_reservation_batch_sentinel(&bytes)?;
-        if sentinel.format_version == 1
-            && sentinel.marker == CONTENT_RESERVATION_BATCH_SENTINEL_MARKER
-        {
-            return Ok(ContentMutationGuard::inactive());
-        }
         validate_content_reservation_batch_sentinel(&sentinel)?;
         if sentinel.content_binding_layout == INLINE_BINDING_LAYOUT {
             ContentMutationGuard::acquire(&self.inline_store.owner.root, false)
         } else {
             Ok(ContentMutationGuard::inactive())
         }
+    }
+}
+
+// Shared negative utility: mutate the header of one actual current live
+// manifest record under the same normal content writer; no legacy files.
+#[cfg(test)]
+impl LocalContentStore {
+    pub(crate) fn corrupt_current_manifest_for_test(
+        &self,
+        manifest: &ContentManifest,
+    ) -> Result<()> {
+        let _owner = self.content_mutation_guard()?;
+        let view = self
+            .inline_binding_view_verified()?
+            .ok_or_else(|| inline_error("current binding view is absent"))?;
+        if view.live_manifest(&manifest.object_id, &manifest.version) != Some(manifest) {
+            return Err(inline_error("negative fault lacks the exact live manifest"));
+        }
+        let sentinel = self
+            .inline_sentinel_unlocked()?
+            .ok_or_else(|| inline_error("current content writer identity is absent"))?;
+        let root = &self.inline_store.owner.root;
+        let catalog = read_catalog(root, &sentinel.store_incarnation)?;
+        let catalog_file = catalog_path(root);
+        let catalog_before = fs::read(&catalog_file).map_err(|source| ContentStoreError::Io {
+            path: catalog_file.clone(),
+            source,
+        })?;
+        let mut selected = None;
+        let mut next_sequence = 1;
+        for segment in &catalog.segments {
+            let path = segment_path(root, catalog.generation, segment.id);
+            let mut file = fs::File::open(&path).map_err(|source| ContentStoreError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            loop {
+                match read_frame(&mut file, &path, frame_limits()).map_err(inline_error)? {
+                    FrameRead::Complete(frame) => {
+                        let record: InlineRecord = sinomo_object_serde::from_bytes(frame.header())
+                            .map_err(|error| ContentStoreError::Serde(error.to_string()))?;
+                        if record.format_version != INLINE_FORMAT_VERSION
+                            || record.store_incarnation != catalog.store_incarnation
+                            || record.generation != catalog.generation
+                            || record.sequence != next_sequence
+                            || record.sequence > view.sequence
+                        {
+                            return Err(inline_error("negative fault names another current cut"));
+                        }
+                        next_sequence = record
+                            .sequence
+                            .checked_add(1)
+                            .ok_or_else(|| inline_error("current record sequence overflow"))?;
+                        let actual = match &record.operation {
+                            InlineOperation::Bind { manifest, .. }
+                            | InlineOperation::Link { manifest, .. }
+                            | InlineOperation::RestoreVersion { manifest, .. }
+                            | InlineOperation::ExternalBinding { manifest, .. } => Some(manifest),
+                            _ => None,
+                        };
+                        if actual == Some(manifest) {
+                            let header_start = frame
+                                .payload_offset()
+                                .checked_sub(frame.header().len() as u64)
+                                .ok_or_else(|| inline_error("manifest header offset underflow"))?;
+                            selected = Some((path.clone(), header_start, frame.header()[0]));
+                        }
+                    }
+                    FrameRead::CleanEof { .. } => break,
+                    _ => {
+                        return Err(inline_error(
+                            "negative fault requires complete current frames",
+                        ));
+                    }
+                }
+            }
+        }
+        let (path, offset, original) = selected
+            .ok_or_else(|| inline_error("exact live manifest has no current native frame"))?;
+        let mut expected = fs::read(&path).map_err(|source| ContentStoreError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        let index = usize::try_from(offset)
+            .map_err(|_| inline_error("manifest header offset exceeds address space"))?;
+        if expected.get(index).copied() != Some(original) {
+            return Err(inline_error(
+                "actual manifest header changed before negative fault",
+            ));
+        }
+        expected[index] ^= 0x40;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .map_err(|source| ContentStoreError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        file.seek(SeekFrom::Start(offset))
+            .and_then(|_| file.write_all(&[expected[index]]))
+            .and_then(|_| file.sync_data())
+            .map_err(|source| ContentStoreError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        let actual = fs::read(&path).map_err(|source| ContentStoreError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        let catalog_after = fs::read(&catalog_file).map_err(|source| ContentStoreError::Io {
+            path: catalog_file,
+            source,
+        })?;
+        if actual != expected || catalog_after != catalog_before {
+            return Err(inline_error(
+                "negative fault changed another current byte or catalog",
+            ));
+        }
+        Ok(())
     }
 }

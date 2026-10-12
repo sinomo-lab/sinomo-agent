@@ -8,14 +8,9 @@
 
 use crate::{
     AlignmentHint, DecodeOptions, ElementType, Error, LengthMode, MAGIC, Result, TypeId,
-    duplicate_key_error, ensure_decode_limit, enter_decode_nesting, try_box,
-    try_hashset_with_capacity, try_vec_with_capacity,
+    ensure_decode_limit, enter_decode_nesting, try_box, try_vec_with_capacity,
 };
-use serde::de::{
-    self, DeserializeOwned, DeserializeSeed, EnumAccess, MapAccess, SeqAccess, VariantAccess,
-    Visitor,
-};
-use std::collections::HashSet;
+use serde::de::DeserializeOwned;
 
 /// Decodes one SOBJ document from ownership-bearing, non-contiguous chunks.
 ///
@@ -80,9 +75,9 @@ fn decode_chunk_document<T: DeserializeOwned>(
             "serde deserialization from raw schema payload is not implemented".to_owned(),
         ));
     }
-    let value = T::deserialize(ChunkDeserializer {
+    let value = T::deserialize(crate::serde_ext::SobjDeserializer {
         reader: &mut reader,
-        shape: Shape::Element,
+        shape: crate::serde_ext::Shape::Element,
     })?;
     reader.skip_padding()?;
     reader.finish()?;
@@ -268,16 +263,6 @@ impl<'source> ChunkReader<'source> {
         self.read_vec(len, "streamed serde bytes")
     }
 
-    fn with_nesting<T>(&mut self, decode: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
-        let previous = enter_decode_nesting(
-            &mut self.nesting_depth,
-            self.options.limits.max_nesting_depth,
-        )?;
-        let result = decode(self);
-        self.nesting_depth = previous;
-        result
-    }
-
     fn skip_padding(&mut self) -> Result<()> {
         while self.peek_u8()? == Some(TypeId::Padding.byte()) {
             self.read_u8()?;
@@ -300,30 +285,38 @@ impl<'source> ChunkReader<'source> {
     }
 }
 
-enum Shape {
-    Element,
-    Typed(ElementType),
+impl<'de> crate::serde_ext::SobjInput<'de> for ChunkReader<'_> {
+    crate::serde_ext::forward_input_numbers!();
+    fn read_text(&mut self) -> Result<crate::serde_ext::SobjText<'de>> {
+        self.read_string().map(crate::serde_ext::SobjText::Owned)
+    }
+    fn read_blob(&mut self) -> Result<crate::serde_ext::SobjBytes<'de>> {
+        self.read_bytes().map(crate::serde_ext::SobjBytes::Owned)
+    }
+    fn read_element_type(&mut self) -> Result<ElementType> {
+        read_element_type_at_depth(self, 1)
+    }
+    fn skip_padding(&mut self) -> Result<()> {
+        ChunkReader::skip_padding(self)
+    }
+    fn enter_nesting(&mut self) -> Result<usize> {
+        enter_decode_nesting(
+            &mut self.nesting_depth,
+            self.options.limits.max_nesting_depth,
+        )
+    }
+    fn restore_nesting(&mut self, previous: usize) {
+        self.nesting_depth = previous;
+    }
+    fn borrowed_keys(&self) -> bool {
+        false
+    }
+    #[cfg(test)]
+    fn nesting_depth(&self) -> usize {
+        self.nesting_depth
+    }
 }
-
-fn element_type_type_id(element_type: &ElementType) -> Result<TypeId> {
-    Ok(match element_type {
-        ElementType::Builtin(type_id) => *type_id,
-        ElementType::Object => TypeId::Object,
-        ElementType::List(_) => TypeId::List,
-        ElementType::Array(_) => TypeId::Array,
-        ElementType::Optional(_) => TypeId::Optional,
-        ElementType::SchemaRef(_) | ElementType::Extension(_) => {
-            return Err(Error::Serde(
-                "schema and extension element types are not supported by serde decoding".to_owned(),
-            ));
-        }
-    })
-}
-
-fn read_element_type(reader: &mut ChunkReader<'_>) -> Result<ElementType> {
-    read_element_type_at_depth(reader, 1)
-}
-
+// Cursor-specific bounded type-descriptor reads stay non-generic.
 fn read_element_type_at_depth(reader: &mut ChunkReader<'_>, depth: usize) -> Result<ElementType> {
     let total_depth = reader
         .nesting_depth
@@ -354,384 +347,6 @@ fn read_element_type_at_depth(reader: &mut ChunkReader<'_>, depth: usize) -> Res
         )?)),
         0x80..=0xFF => ElementType::try_extension(byte, reader.read_bytes()?),
         other => Err(Error::InvalidTypeId(other)),
-    }
-}
-
-struct ChunkDeserializer<'r, 'source> {
-    reader: &'r mut ChunkReader<'source>,
-    shape: Shape,
-}
-
-impl ChunkDeserializer<'_, '_> {
-    fn type_id(reader: &mut ChunkReader<'_>, shape: &Shape) -> Result<TypeId> {
-        match shape {
-            Shape::Element => {
-                reader.skip_padding()?;
-                let byte = reader.read_u8()?;
-                let type_id = TypeId::from_byte(byte)?;
-                if type_id == TypeId::Padding {
-                    return Err(Error::InvalidTypeId(byte));
-                }
-                Ok(type_id)
-            }
-            Shape::Typed(element_type) => element_type_type_id(element_type),
-        }
-    }
-}
-
-struct TransientStrDeserializer<'a> {
-    value: &'a str,
-}
-
-impl<'de> de::Deserializer<'de> for TransientStrDeserializer<'_> {
-    type Error = Error;
-
-    fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
-        visitor.visit_str(self.value)
-    }
-
-    fn deserialize_str<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
-        visitor.visit_str(self.value)
-    }
-
-    fn deserialize_string<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
-        visitor.visit_string(self.value.to_owned())
-    }
-
-    fn deserialize_identifier<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
-        visitor.visit_str(self.value)
-    }
-
-    serde::forward_to_deserialize_any! {
-        bool i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 char bytes byte_buf
-        option unit unit_struct newtype_struct seq tuple tuple_struct map struct
-        enum ignored_any
-    }
-}
-
-fn deserialize_value<'de, V: Visitor<'de>>(
-    reader: &mut ChunkReader<'_>,
-    type_id: TypeId,
-    visitor: V,
-) -> Result<V::Value> {
-    match type_id {
-        TypeId::Boolean => match reader.read_u8()? {
-            0 => visitor.visit_bool(false),
-            1 => visitor.visit_bool(true),
-            other => Err(Error::InvalidBoolean(other)),
-        },
-        TypeId::Uint8 => visitor.visit_u8(reader.read_u8()?),
-        TypeId::Int8 => visitor.visit_i8(reader.read_u8()? as i8),
-        TypeId::Uint16 => visitor.visit_u16(reader.read_u16()?),
-        TypeId::Int16 => visitor.visit_i16(i16::from_le_bytes(reader.read_array()?)),
-        TypeId::Uint32 => visitor.visit_u32(reader.read_u32()?),
-        TypeId::Int32 => visitor.visit_i32(reader.read_i32()?),
-        TypeId::Uint64 => visitor.visit_u64(reader.read_u64()?),
-        TypeId::Int64 => visitor.visit_i64(reader.read_i64()?),
-        TypeId::Float => visitor.visit_f32(f32::from_le_bytes(reader.read_array()?)),
-        TypeId::Double => visitor.visit_f64(f64::from_le_bytes(reader.read_array()?)),
-        TypeId::String => visitor.visit_string(reader.read_string()?),
-        TypeId::Bytes => visitor.visit_byte_buf(reader.read_bytes()?),
-        TypeId::Object => reader.with_nesting(|reader| {
-            let remaining = reader.read_container_len()?;
-            visitor.visit_map(ChunkMapAccess {
-                reader,
-                remaining,
-                keys: try_hashset_with_capacity(remaining, "streamed serde object keys")?,
-            })
-        }),
-        TypeId::List => reader.with_nesting(|reader| {
-            let element_type = read_element_type(reader)?;
-            let remaining = reader.read_container_len()?;
-            visitor.visit_seq(ChunkSeqAccess {
-                reader,
-                element_type,
-                remaining,
-            })
-        }),
-        TypeId::Array => Err(Error::Serde(
-            "array values are not supported by serde decoding; use the dynamic Value API"
-                .to_owned(),
-        )),
-        TypeId::Optional => reader.with_nesting(|reader| {
-            let element_type = read_element_type(reader)?;
-            match reader.read_u8()? {
-                0 => visitor.visit_none(),
-                1 => visitor.visit_some(ChunkDeserializer {
-                    reader,
-                    shape: Shape::Typed(element_type),
-                }),
-                other => Err(Error::InvalidBoolean(other)),
-            }
-        }),
-        TypeId::Padding | TypeId::Document => Err(Error::UnsupportedTypeId(type_id.byte())),
-    }
-}
-
-impl<'de> de::Deserializer<'de> for ChunkDeserializer<'_, '_> {
-    type Error = Error;
-
-    fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
-        let Self { reader, shape } = self;
-        let type_id = Self::type_id(reader, &shape)?;
-        deserialize_value(reader, type_id, visitor)
-    }
-
-    fn deserialize_str<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
-        let Self { reader, shape } = self;
-        match Self::type_id(reader, &shape)? {
-            TypeId::String => visitor.visit_string(reader.read_string()?),
-            _ => Err(Error::Serde("expected string".to_owned())),
-        }
-    }
-
-    fn deserialize_string<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
-        self.deserialize_str(visitor)
-    }
-
-    fn deserialize_bytes<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
-        let Self { reader, shape } = self;
-        match Self::type_id(reader, &shape)? {
-            TypeId::Bytes => visitor.visit_byte_buf(reader.read_bytes()?),
-            _ => Err(Error::Serde("expected bytes".to_owned())),
-        }
-    }
-
-    fn deserialize_byte_buf<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
-        self.deserialize_bytes(visitor)
-    }
-
-    fn deserialize_unit<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
-        let Self { reader, shape } = self;
-        match Self::type_id(reader, &shape)? {
-            TypeId::Optional => reader.with_nesting(|reader| {
-                read_element_type(reader)?;
-                match reader.read_u8()? {
-                    0 => visitor.visit_unit(),
-                    other => Err(Error::InvalidBoolean(other)),
-                }
-            }),
-            TypeId::Object => reader.with_nesting(|reader| {
-                if reader.read_container_len()? != 0 {
-                    return Err(Error::Serde("expected unit".to_owned()));
-                }
-                visitor.visit_unit()
-            }),
-            _ => Err(Error::Serde("expected unit".to_owned())),
-        }
-    }
-
-    fn deserialize_unit_struct<V: Visitor<'de>>(
-        self,
-        _name: &'static str,
-        visitor: V,
-    ) -> Result<V::Value> {
-        self.deserialize_unit(visitor)
-    }
-
-    fn deserialize_newtype_struct<V: Visitor<'de>>(
-        self,
-        _name: &'static str,
-        visitor: V,
-    ) -> Result<V::Value> {
-        visitor.visit_newtype_struct(self)
-    }
-
-    fn deserialize_enum<V: Visitor<'de>>(
-        self,
-        _name: &'static str,
-        _variants: &'static [&'static str],
-        visitor: V,
-    ) -> Result<V::Value> {
-        let Self { reader, shape } = self;
-        match Self::type_id(reader, &shape)? {
-            TypeId::String => visitor.visit_enum(UnitEnumAccess {
-                variant: reader.read_string()?,
-            }),
-            TypeId::Object => reader.with_nesting(|reader| {
-                if reader.read_container_len()? != 1 {
-                    return Err(Error::Serde(
-                        "expected single-field object for enum variant".to_owned(),
-                    ));
-                }
-                visitor.visit_enum(ChunkEnumAccess {
-                    variant: reader.read_string()?,
-                    reader,
-                })
-            }),
-            _ => Err(Error::Serde("expected enum representation".to_owned())),
-        }
-    }
-
-    serde::forward_to_deserialize_any! {
-        bool i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 char
-        option seq tuple tuple_struct map struct identifier ignored_any
-    }
-}
-
-struct ChunkMapAccess<'r, 'source> {
-    reader: &'r mut ChunkReader<'source>,
-    remaining: usize,
-    keys: HashSet<String>,
-}
-
-impl<'de> MapAccess<'de> for ChunkMapAccess<'_, '_> {
-    type Error = Error;
-
-    fn next_key_seed<K: DeserializeSeed<'de>>(&mut self, seed: K) -> Result<Option<K::Value>> {
-        if self.remaining == 0 {
-            return Ok(None);
-        }
-        self.remaining -= 1;
-        let key = self.reader.read_string()?;
-        if self.keys.contains(&key) {
-            return duplicate_key_error(&key);
-        }
-        let value = seed.deserialize(TransientStrDeserializer { value: &key })?;
-        self.keys.insert(key);
-        Ok(Some(value))
-    }
-
-    fn next_value_seed<V: DeserializeSeed<'de>>(&mut self, seed: V) -> Result<V::Value> {
-        seed.deserialize(ChunkDeserializer {
-            reader: &mut *self.reader,
-            shape: Shape::Element,
-        })
-    }
-
-    fn size_hint(&self) -> Option<usize> {
-        Some(self.remaining)
-    }
-}
-
-struct ChunkSeqAccess<'r, 'source> {
-    reader: &'r mut ChunkReader<'source>,
-    element_type: ElementType,
-    remaining: usize,
-}
-
-impl<'de> SeqAccess<'de> for ChunkSeqAccess<'_, '_> {
-    type Error = Error;
-
-    fn next_element_seed<T: DeserializeSeed<'de>>(&mut self, seed: T) -> Result<Option<T::Value>> {
-        if self.remaining == 0 {
-            return Ok(None);
-        }
-        self.remaining -= 1;
-        seed.deserialize(ChunkDeserializer {
-            reader: &mut *self.reader,
-            shape: Shape::Typed(self.element_type.clone()),
-        })
-        .map(Some)
-    }
-
-    fn size_hint(&self) -> Option<usize> {
-        Some(self.remaining)
-    }
-}
-
-struct UnitEnumAccess {
-    variant: String,
-}
-
-struct UnitVariantAccess;
-
-impl<'de> EnumAccess<'de> for UnitEnumAccess {
-    type Error = Error;
-    type Variant = UnitVariantAccess;
-
-    fn variant_seed<V: DeserializeSeed<'de>>(self, seed: V) -> Result<(V::Value, Self::Variant)> {
-        let variant = seed.deserialize(TransientStrDeserializer {
-            value: &self.variant,
-        })?;
-        Ok((variant, UnitVariantAccess))
-    }
-}
-
-impl<'de> VariantAccess<'de> for UnitVariantAccess {
-    type Error = Error;
-
-    fn unit_variant(self) -> Result<()> {
-        Ok(())
-    }
-
-    fn newtype_variant_seed<T: DeserializeSeed<'de>>(self, _seed: T) -> Result<T::Value> {
-        Err(Error::Serde("expected unit enum variant".to_owned()))
-    }
-
-    fn tuple_variant<V: Visitor<'de>>(self, _len: usize, _visitor: V) -> Result<V::Value> {
-        Err(Error::Serde("expected unit enum variant".to_owned()))
-    }
-
-    fn struct_variant<V: Visitor<'de>>(
-        self,
-        _fields: &'static [&'static str],
-        _visitor: V,
-    ) -> Result<V::Value> {
-        Err(Error::Serde("expected unit enum variant".to_owned()))
-    }
-}
-
-struct ChunkEnumAccess<'r, 'source> {
-    reader: &'r mut ChunkReader<'source>,
-    variant: String,
-}
-
-impl<'de> EnumAccess<'de> for ChunkEnumAccess<'_, '_> {
-    type Error = Error;
-    type Variant = Self;
-
-    fn variant_seed<V: DeserializeSeed<'de>>(self, seed: V) -> Result<(V::Value, Self::Variant)> {
-        let variant = seed.deserialize(TransientStrDeserializer {
-            value: &self.variant,
-        })?;
-        Ok((variant, self))
-    }
-}
-
-impl<'de> VariantAccess<'de> for ChunkEnumAccess<'_, '_> {
-    type Error = Error;
-
-    fn unit_variant(self) -> Result<()> {
-        de::Deserializer::deserialize_any(
-            ChunkDeserializer {
-                reader: self.reader,
-                shape: Shape::Element,
-            },
-            de::IgnoredAny,
-        )
-        .map(|_| ())
-    }
-
-    fn newtype_variant_seed<T: DeserializeSeed<'de>>(self, seed: T) -> Result<T::Value> {
-        seed.deserialize(ChunkDeserializer {
-            reader: self.reader,
-            shape: Shape::Element,
-        })
-    }
-
-    fn tuple_variant<V: Visitor<'de>>(self, _len: usize, visitor: V) -> Result<V::Value> {
-        de::Deserializer::deserialize_any(
-            ChunkDeserializer {
-                reader: self.reader,
-                shape: Shape::Element,
-            },
-            visitor,
-        )
-    }
-
-    fn struct_variant<V: Visitor<'de>>(
-        self,
-        _fields: &'static [&'static str],
-        visitor: V,
-    ) -> Result<V::Value> {
-        de::Deserializer::deserialize_any(
-            ChunkDeserializer {
-                reader: self.reader,
-                shape: Shape::Element,
-            },
-            visitor,
-        )
     }
 }
 
@@ -904,15 +519,15 @@ mod tests {
                 ..Default::default()
             }),
         );
-        let error = reader
-            .with_nesting(|reader| {
-                assert_eq!(reader.nesting_depth, 1);
-                let inner = reader
-                    .with_nesting::<()>(|_| panic!("over-limit scope must not invoke its decoder"));
-                assert_eq!(reader.nesting_depth, 1);
-                inner
-            })
-            .expect_err("nested scope exceeds the limit");
+        let error = crate::serde_ext::with_input_nesting(&mut reader, |reader| {
+            assert_eq!(reader.nesting_depth(), 1);
+            let inner = crate::serde_ext::with_input_nesting::<()>(reader, |_| {
+                panic!("over-limit scope must not invoke its decoder")
+            });
+            assert_eq!(reader.nesting_depth(), 1);
+            inner
+        })
+        .expect_err("nested scope exceeds the limit");
         assert_eq!(
             error,
             Error::DecodeLimitExceeded {
@@ -923,14 +538,16 @@ mod tests {
         );
         assert_eq!(reader.nesting_depth, 0);
         assert_eq!(
-            reader.with_nesting(|reader| Ok(reader.nesting_depth)),
+            crate::serde_ext::with_input_nesting(&mut reader, |reader| Ok(reader.nesting_depth())),
             Ok(1)
         );
         assert_eq!(reader.nesting_depth, 0);
 
         reader.nesting_depth = usize::MAX;
         assert_eq!(
-            reader.with_nesting::<()>(|_| panic!("overflow must not invoke its decoder")),
+            crate::serde_ext::with_input_nesting::<()>(&mut reader, |_| panic!(
+                "overflow must not invoke its decoder"
+            )),
             Err(Error::SizeOverflow)
         );
         assert_eq!(reader.nesting_depth, usize::MAX);

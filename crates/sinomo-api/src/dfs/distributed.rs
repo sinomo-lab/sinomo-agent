@@ -199,7 +199,7 @@ pub enum DfsWriteIntentState {
     AwaitingReceipts,
     Committed,
     Rejected,
-    Conflict,
+
     Aborted,
 }
 

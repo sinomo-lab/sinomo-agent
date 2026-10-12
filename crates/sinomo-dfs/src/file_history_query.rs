@@ -10,20 +10,29 @@ pub const DFS_FILE_HISTORY_RANGE_LIMIT: u32 = 64 * 1024;
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum DfsMetadataSelection {
-    /// Exact object lookup for the legacy version-read surface. This does not
+    /// One current owner's durable direct-child page and exact local cursors.
+    DirectoryPage {
+        path: String,
+        after: Option<DfsDirectoryPageCursor>,
+        limit: usize,
+    },
+    /// Exact object lookup for the current version-read surface. This does not
     /// require retention to be enabled on the shard.
-    CurrentObject { object_id: DfsObjectId },
+    CurrentObject {
+        object_id: DfsObjectId,
+    },
     /// Canonical identity and live content-reference evidence in one snapshot.
-    ObjectLifecycle { object_id: DfsObjectId },
+    ObjectLifecycle {
+        object_id: DfsObjectId,
+    },
     VersionPin {
         identity: DfsFileVersionIdentity,
         pin_id: String,
     },
-    #[serde(rename = "restore-job", alias = "namespace-job")]
-    NamespaceJob { job_id: String },
-    #[serde(rename = "list", alias = "retained-revisions")]
+    NamespaceJob {
+        job_id: String,
+    },
     RetainedRevisions {
-        #[serde(default = "legacy_query_namespace")]
         namespace: Option<String>,
         path: Option<String>,
         object_id: Option<DfsObjectId>,
@@ -31,32 +40,15 @@ pub enum DfsMetadataSelection {
         limit: usize,
     },
     Version {
-        #[serde(default = "legacy_query_namespace")]
         namespace: Option<String>,
-        #[serde(default)]
         allow_current: bool,
         identity: DfsRevisionReference,
     },
     /// Metadata-only inspection of one anchored revision. Returning this row
     /// grants no permission to read its immutable content.
-    RevisionMetadata { identity: DfsRevisionReference },
-}
-
-impl DfsMetadataSelection {
-    pub(crate) fn supports_codec(&self, codec: DfsMetadataNamespacePrepareCodec) -> bool {
-        if matches!(self, Self::RevisionMetadata { .. }) {
-            return codec == DfsMetadataNamespacePrepareCodec::PackedV6;
-        }
-        matches!(
-            self,
-            Self::CurrentObject { .. }
-                | Self::ObjectLifecycle { .. }
-                | Self::Version {
-                    allow_current: true,
-                    ..
-                }
-        ) || codec.supports_file_history()
-    }
+    RevisionMetadata {
+        identity: DfsRevisionReference,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -70,6 +62,10 @@ pub struct DfsMetadataShardQuery {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum DfsMetadataQueryResult {
+    DirectoryPage {
+        entries: Vec<(DfsObjectMetadata, DfsDirectoryPageCursor)>,
+        after: Option<DfsDirectoryPageCursor>,
+    },
     CurrentObject {
         object: Option<Box<DfsObjectMetadata>>,
     },
@@ -83,12 +79,10 @@ pub enum DfsMetadataQueryResult {
         pin_id: String,
         present: bool,
     },
-    #[serde(rename = "restore-job", alias = "namespace-job")]
     NamespaceJob {
         job: Option<Box<DfsNamespaceJobRecord>>,
         receipt: Option<Box<DfsNamespaceJobReceipt>>,
     },
-    #[serde(rename = "list", alias = "retained-revisions")]
     RetainedRevisions {
         entries: Vec<DfsRetainedRevisionDescriptor>,
         after: Option<DfsObjectVersionScanCursor>,
@@ -120,6 +114,25 @@ pub(crate) fn query_backend_metadata<B: DfsMetadataBackend + ?Sized>(
     query: &DfsMetadataShardQuery,
 ) -> Result<DfsMetadataQueryResult, MetadataBackendError> {
     match &query.selection {
+        DfsMetadataSelection::DirectoryPage { path, after, limit } => {
+            let path = crate::posix_path::normalize_posix_path(path)
+                .map_err(|error| MetadataBackendError::Serde(error.to_string()))?;
+            if after
+                .as_ref()
+                .is_some_and(|cursor| cursor.shard_id.is_some())
+            {
+                return Err(MetadataBackendError::Serde(
+                    "owner directory query requires its exact local cursor".into(),
+                ));
+            }
+            let (entries, after) = backend.child_objects_for_directory_page_entries(
+                &query.file_system_id,
+                &path,
+                after.as_ref(),
+                *limit,
+            )?;
+            Ok(DfsMetadataQueryResult::DirectoryPage { entries, after })
+        }
         DfsMetadataSelection::ObjectLifecycle { object_id } => {
             let object = backend.get_object(object_id)?.filter(|object| {
                 object.file_system_id == query.file_system_id
@@ -293,9 +306,9 @@ pub(crate) fn query_backend_metadata<B: DfsMetadataBackend + ?Sized>(
                 .filter(|pin| pin.version == identity.version)
                 .collect::<Vec<_>>();
             let pinned = references.iter().any(|pin| {
-                namespace.as_deref().is_none_or(|owner| {
-                    pin.namespace.as_deref().unwrap_or("module.dfs.history") == owner
-                })
+                namespace
+                    .as_deref()
+                    .is_none_or(|owner| pin.namespace == owner)
             });
             let current = *allow_current
                 && current_object.version == identity.version
@@ -404,7 +417,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 replica_node_ids: Vec::new(),
                 epoch: 0,
                 assignment: DfsMetadataShardAssignment::Root,
-                namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV6,
                 default_policy: sinomo_core::DfsObjectPolicy::LocalOwned,
             }]);
         }
@@ -434,15 +446,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     shard.shard_id == query.shard_id.0
                         && shard.epoch == query.epoch
                         && shard.primary_node_id == self.node_id
-                        && query
-                            .selection
-                            .supports_codec(shard.namespace_prepare_codec)
                 })
             {
                 return Err(error(
                     "history query does not match the current shard authority",
                 ));
             }
+        }
+        if let DfsMetadataSelection::DirectoryPage { path, .. } = &query.selection {
+            self.ensure_path_not_in_cross_shard_flight(&query.file_system_id, path)?;
         }
         let backend = self
             .metadata_backend
@@ -453,6 +465,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         backend.end_consistent_read_snapshot();
         let result = result?;
         match &result {
+            DfsMetadataQueryResult::DirectoryPage { entries, .. } => {
+                for (object, _) in entries {
+                    self.ensure_object_not_in_cross_shard_flight(object)?;
+                }
+            }
             DfsMetadataQueryResult::CurrentObject {
                 object: Some(object),
             }
@@ -491,13 +508,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         shard: &DfsMetadataShardConfig,
         selection: DfsMetadataSelection,
     ) -> Result<DfsMetadataQueryResult, DfsError> {
-        if matches!(&selection, DfsMetadataSelection::RevisionMetadata { .. })
-            && !selection.supports_codec(shard.namespace_prepare_codec)
-        {
-            return Err(error(
-                "revision metadata inspection requires a packed-v6 authority",
-            ));
-        }
         let query = DfsMetadataShardQuery {
             file_system_id: shard.file_system_id.clone(),
             shard_id: DfsMetadataShardId::new(shard.shard_id.clone()),
@@ -507,17 +517,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let response = if self.control_plane.is_none() {
             self.serve_metadata_query(&query)?
         } else {
-            let outcome = self
-                .route_namespace_operation_to_metadata_primary_with_timeout_and_options(
-                    query.file_system_id.clone(),
-                    shard.primary_node_id.clone(),
-                    DfsNamespaceOperation::MetadataQuery {
-                        query: query.clone(),
-                    },
-                    Duration::from_secs(30),
-                    false,
-                    false,
-                )?;
+            let outcome = self.route_metadata_query(shard, &query)?;
             match (outcome.result, outcome.posix_coordination_result) {
                 (
                     DfsNamespaceResult::Applied,
@@ -538,23 +538,153 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(response.result)
     }
 
+    /// The read uses the existing namespace command, authenticated sender and
+    /// exact response fence. Its wait must not enter the mutation dispatcher.
+    fn route_metadata_query(
+        &mut self,
+        expected: &DfsMetadataShardConfig,
+        query: &DfsMetadataShardQuery,
+    ) -> Result<PendingRoutedNamespaceResult, DfsError> {
+        self.check_cancelled("metadata query")?;
+        let snapshot = self
+            .metadata_shard_config_snapshot(&query.file_system_id)?
+            .unwrap_or_default();
+        let current = snapshot
+            .iter()
+            .find(|shard| {
+                shard.file_system_id == query.file_system_id
+                    && shard.shard_id == query.shard_id.0
+                    && shard.epoch == query.epoch
+            })
+            .ok_or_else(|| error("history query names a stale or foreign shard authority"))?;
+        if current != expected {
+            return Err(error("history query authority changed before dispatch"));
+        }
+        let request_id = self.next_request_id();
+        let command = DfsNamespaceCommand {
+            request_id: request_id.clone(),
+            file_system_id: query.file_system_id.clone(),
+            requesting_node_id: self.node_id.clone(),
+            include_metadata_journal_batches: false,
+            metadata_journal_after_sequences: Vec::new(),
+            authority_shards: vec![current.clone()],
+            operation: DfsNamespaceOperation::MetadataQuery {
+                query: query.clone(),
+            },
+        };
+        // An actual local primary reads its resident generation. Mounted clients
+        // continue to delegate to that primary through their ordinary transport.
+        if current.primary_node_id == self.node_id
+            && !self.transport.delegates_local_namespace_authority()
+        {
+            let _planning = self.namespace_execution.begin_independent_planning();
+            let previous =
+                self.replace_namespace_operation_context(query.file_system_id.clone(), snapshot);
+            let result = self.serve_metadata_query(query);
+            self.restore_namespace_operation_context(previous);
+            let response = result?;
+            self.validate_routed_namespace_response_authority(
+                &expected.primary_node_id,
+                Some(expected),
+                &command.authority_shards,
+            )?;
+            return Ok(PendingRoutedNamespaceResult {
+                result: DfsNamespaceResult::Applied,
+                posix_coordination_result: Some(DfsPosixCoordinationResult::MetadataQuery(
+                    response,
+                )),
+                synced_path_object: None,
+                synced_path_objects: Vec::new(),
+                metadata_journal_has_more: false,
+            });
+        }
+        let requested = std::time::Instant::now() + Duration::from_secs(30);
+        let previous_deadline = self.transport.set_operation_deadline(Some(requested));
+        let deadline = previous_deadline.map_or(requested, |old| old.min(requested));
+        self.transport.set_operation_deadline(Some(deadline));
+        self.routed_namespace_settle_depth = self.routed_namespace_settle_depth.saturating_add(1);
+        self.pending_routed_namespace_ops.insert(
+            request_id.clone(),
+            crate::service_state::PendingRoutedNamespaceOp {
+                primary_node_id: expected.primary_node_id.clone(),
+                dispatch_authority_shard: Some(expected.clone()),
+                authority_shards: command.authority_shards.clone(),
+                replay_journal_batches: false,
+                apply_synced_path_object: false,
+                result: None,
+            },
+        );
+        let result = (|| {
+            if !self.send_dfs_message_if_routable(
+                &expected.primary_node_id,
+                DfsNetworkMessage::NamespaceRequest(command.clone()),
+            )? {
+                return Err(error("metadata query primary is not routable"));
+            }
+            let response = wait_for_metadata_query_response(
+                &mut self.transport,
+                self.cancellation.as_ref(),
+                &self.node_id,
+                &expected.primary_node_id,
+                &request_id,
+                deadline,
+            )?;
+            match &response.result {
+                DfsNamespaceResult::Applied => self.validate_routed_namespace_response_authority(
+                    &expected.primary_node_id,
+                    Some(expected),
+                    &command.authority_shards,
+                )?,
+                DfsNamespaceResult::Rejected {
+                    current_primary_node_id: Some(redirect),
+                    ..
+                } => self.validate_routed_namespace_authority_redirect(
+                    &expected.primary_node_id,
+                    Some(expected),
+                    &command.authority_shards,
+                    redirect,
+                )?,
+                DfsNamespaceResult::Rejected { .. } => {}
+            }
+            Ok(PendingRoutedNamespaceResult {
+                result: response.result,
+                posix_coordination_result: response.posix_coordination_result,
+                synced_path_object: None,
+                synced_path_objects: Vec::new(),
+                metadata_journal_has_more: false,
+            })
+        })();
+        self.pending_routed_namespace_ops.remove(&request_id);
+        self.routed_namespace_settle_depth = self.routed_namespace_settle_depth.saturating_sub(1);
+        self.transport.set_operation_deadline(previous_deadline);
+        result
+    }
+
     pub(crate) fn resolve_file_version_current_object(
         &mut self,
         identity: &DfsRevisionReference,
     ) -> Result<Option<DfsObjectMetadata>, DfsError> {
-        for shard in self.metadata_shard_authorities(&identity.file_system_id)? {
+        self.current_object_from_authority(&identity.file_system_id, &identity.object_id)
+    }
+
+    pub(crate) fn current_object_from_authority(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        object_id: &DfsObjectId,
+    ) -> Result<Option<DfsObjectMetadata>, DfsError> {
+        for shard in self.metadata_shard_authorities(file_system_id)? {
             let result = self.query_metadata_authority_impl(
                 &shard,
                 DfsMetadataSelection::CurrentObject {
-                    object_id: identity.object_id.clone(),
+                    object_id: object_id.clone(),
                 },
             )?;
             let DfsMetadataQueryResult::CurrentObject { object } = result else {
                 return Err(error("version authority returned the wrong query kind"));
             };
             if let Some(object) = object {
-                if object.file_system_id != identity.file_system_id
-                    || object.object_id != identity.object_id
+                if object.file_system_id != *file_system_id
+                    || object.object_id != *object_id
                     || object.tombstone_provenance.is_some()
                 {
                     return Err(error("version authority returned a different object"));
@@ -669,10 +799,6 @@ pub(crate) fn retained_revision_content_object(
     Ok(object)
 }
 
-fn legacy_query_namespace() -> Option<String> {
-    Some("module.dfs.history".into())
-}
-
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// Inspect one exact revision's declarative metadata at its authority.
     /// This projection is not a content-read or retention authorization.
@@ -765,9 +891,117 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 }
 
-// Decoder-facing aliases preserve source compatibility during the owner move.
-pub type DfsFileHistorySelection = DfsMetadataSelection;
-pub type DfsFileHistoryShardQuery = DfsMetadataShardQuery;
-pub type DfsFileHistoryShardResponse = DfsMetadataShardResponse;
-pub type DfsFileHistoryShardResult = DfsMetadataQueryResult;
-pub type DfsFileHistoryDescriptor = DfsRetainedRevisionDescriptor;
+/// Transport-only wait: no backend, service dispatcher, prepare or repair graph.
+fn wait_for_metadata_query_response(
+    transport: &mut dyn DfsMessageTransport,
+    cancellation: Option<&DfsCancellationFlag>,
+    local: &sinomo_core::node::NodeId,
+    primary: &sinomo_core::node::NodeId,
+    request_id: &str,
+    deadline: std::time::Instant,
+) -> Result<DfsNamespaceResponse, DfsError> {
+    loop {
+        if cancellation.is_some_and(DfsCancellationFlag::is_cancelled) {
+            return Err(DfsError::Cancelled {
+                operation: "metadata query",
+            });
+        }
+        if let Some(message) = transport
+            .take_namespace_response(request_id)
+            .map_err(DfsError::from_network)?
+        {
+            if message.target_node_id != *local || message.source_node_id != *primary {
+                continue; // Same existing rule: a foreign/late frame grants no outcome.
+            }
+            let DfsNetworkMessage::NamespaceResponse(response) = message.message else {
+                return Err(error("metadata query inbox returned a non-response"));
+            };
+            if response.request_id != request_id {
+                return Err(error("metadata query response identity changed"));
+            }
+            return Ok(response);
+        }
+        let remaining = deadline
+            .checked_duration_since(std::time::Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| error("metadata query timed out waiting for its authority"))?;
+        // Unrelated queued traffic retains custody and cannot cause a busy loop.
+        std::thread::sleep(remaining.min(Duration::from_millis(10)));
+    }
+}
+
+#[cfg(test)]
+mod metadata_query_graph_tests {
+    use super::*;
+
+    #[test]
+    fn current_native_metadata_query_is_read_only_and_rejects_stale_scope() {
+        let node =
+            crate::test_runtime::DfsTestRuntime::ordered_node_ids("metadata-query-read-only", 1)
+                .remove(0);
+        let mut runtime =
+            crate::test_runtime::DfsTestRuntime::new("metadata-query-read-only", node.clone())
+                .unwrap();
+        runtime.start_nodes().unwrap();
+        let mut service = runtime.client(&node).unwrap();
+        service
+            .posix_write_file(
+                "/services/query-proof",
+                b"current bytes",
+                crate::DfsWriteOptions::replicated_eventual(vec![node]),
+            )
+            .unwrap();
+        let object = service
+            .file_history_capture_object("/services/query-proof")
+            .unwrap();
+        let authorities = service
+            .metadata_shard_authorities(&object.file_system_id)
+            .unwrap();
+        let before = service
+            .metadata_backend()
+            .unwrap()
+            .metadata_shard_statuses()
+            .unwrap();
+        let mut found = false;
+        for shard in &authorities {
+            let result = service
+                .query_metadata_authority_impl(
+                    shard,
+                    DfsMetadataSelection::CurrentObject {
+                        object_id: object.object_id.clone(),
+                    },
+                )
+                .unwrap();
+            if let DfsMetadataQueryResult::CurrentObject { object: Some(row) } = result {
+                assert_eq!(*row, object);
+                found = true;
+            }
+        }
+        assert!(found);
+        let after = service
+            .metadata_backend()
+            .unwrap()
+            .metadata_shard_statuses()
+            .unwrap();
+        assert_eq!(
+            before, after,
+            "query must not prepare, commit or repair metadata"
+        );
+        let mut stale = authorities[0].clone();
+        stale.epoch += 1;
+        assert!(
+            service
+                .query_metadata_authority_impl(
+                    &stale,
+                    DfsMetadataSelection::CurrentObject {
+                        object_id: object.object_id.clone()
+                    }
+                )
+                .is_err()
+        );
+        assert!(service.pending_routed_namespace_ops.is_empty());
+        assert_eq!(service.routed_namespace_settle_depth, 0);
+        drop(service);
+        runtime.close().unwrap();
+    }
+}

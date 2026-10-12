@@ -15,7 +15,7 @@ pub(crate) fn content_copy_job_id(requester: &NodeId, operation_id: &str) -> Str
     format!("file-restore:{}", blake3::hash(key.as_bytes()).to_hex())
 }
 
-fn begin_request_id(requester: &NodeId, operation_id: &str) -> String {
+pub(crate) fn begin_request_id(requester: &NodeId, operation_id: &str) -> String {
     let key = content_copy_job_id(requester, operation_id);
     let order = crate::intent::stable_operation_order_token(operation_id)
         .unwrap_or_else(|| "opaque".into());
@@ -55,12 +55,7 @@ fn definitive_copy_rejection(source: &DfsPosixError) -> bool {
 }
 
 fn copy_source_namespace_matches(reference: &DfsContentReferenceRequest) -> bool {
-    match reference.wire_format {
-        DfsContentReferenceFormat::NamespacedV6 => reference.namespace == "sinomo.content-copy",
-        DfsContentReferenceFormat::Legacy => {
-            reference.namespace == crate::lifecycle::legacy_reference_namespace()
-        }
-    }
+    reference.namespace == "sinomo.content-copy"
 }
 
 pub fn validate_content_copy_job(job: &DfsNamespaceJobRecord) -> Result<(), MetadataBackendError> {
@@ -133,6 +128,32 @@ pub fn validate_content_copy_job(job: &DfsNamespaceJobRecord) -> Result<(), Meta
                 }))
     {
         return Err(invalid());
+    }
+    if let Some(release) = &state.source_release {
+        let Some(pin) = &state.source_reference else {
+            return Err(invalid());
+        };
+        let DfsContentReferenceOperation::Retain { reference_id } = &pin.operation else {
+            return Err(invalid());
+        };
+        let prefix = format!("restore-unpin:{}_", job.job_id);
+        if state.result.is_none()
+            || !state.source_reference_applied
+            || release.namespace != pin.namespace
+            || release.path != pin.path
+            || release.identity != pin.identity
+            || release.operation
+                != (DfsContentReferenceOperation::Release {
+                    reference_id: reference_id.clone(),
+                })
+            || !release.operation_id.starts_with(&prefix)
+            || crate::intent::stable_operation_order_token(&release.operation_id).is_none()
+        {
+            return Err(invalid());
+        }
+        release
+            .validate()
+            .map_err(|error| MetadataBackendError::Serde(error.to_string()))?;
     }
     if let Some(DfsContentCopyJobResult::Applied { response }) = &state.result
         && (!state.source_reference_applied
@@ -207,6 +228,10 @@ pub(crate) fn validate_content_copy_job_transition(
             .as_ref()
             .is_some_and(|pin| new.source_reference.as_ref() != Some(pin))
         || old
+            .source_release
+            .as_ref()
+            .is_some_and(|release| new.source_release.as_ref() != Some(release))
+        || old
             .content_hash
             .as_ref()
             .is_some_and(|hash| new.content_hash.as_ref() != Some(hash))
@@ -218,7 +243,8 @@ pub(crate) fn validate_content_copy_job_transition(
             .result
             .as_ref()
             .is_some_and(|result| new.result.as_ref() != Some(result))
-        || (old.cleanup_complete && !new.cleanup_complete)
+        || (old.cleanup_complete
+            && (!new.cleanup_complete || old.source_release != new.source_release))
         || next.processed_object_count < previous.processed_object_count
     {
         return Err(MetadataBackendError::Serde(
@@ -379,6 +405,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     planned,
                     source_reference: None,
                     source_reference_applied: false,
+                    source_release: None,
                     content_hash: None,
                     content_size_bytes: None,
                     result: None,
@@ -399,10 +426,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             admission.posix_coordination_result =
                 Some(DfsPosixCoordinationResult::NamespaceJob(job.clone()));
             admission.updated_at = OffsetDateTime::now_utc();
-            self.metadata_backend
-                .as_mut()
-                .expect("content copy backend")
-                .put_namespace_request_on_shard(&admission.authority_shard_id, &admission)?;
+            self.publish_namespace_request_record(&admission)?;
         }
         Ok(job)
     }
@@ -474,7 +498,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             created_at: now,
             updated_at: now,
         };
-        backend.put_namespace_request_on_shard(&shard, &record)?;
+        self.publish_namespace_request_record(&record)?;
         Ok(record)
     }
 
@@ -564,21 +588,53 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 break;
             }
             let mut state = content_copy_job_state(&job)?.clone();
+            #[cfg(any(test, feature = "test-support"))]
+            if let Some((root, _owner)) = self.native_publication_owner_for_observation()
+                && let Some(hook) = crate::runtime_host::daemon_dfs_pre_dispatch_test_hook(
+                    &sinomo_core::local::SinomoDataDir::new(root),
+                )
+            {
+                hook(
+                    crate::runtime_host::DaemonDfsPreDispatchTestPoint::BeforeContentCopyStep {
+                        job_id_digest: *blake3::hash(job.job_id.as_bytes()).as_bytes(),
+                        source_reference_selected: state.source_reference.is_some(),
+                        source_reference_applied: state.source_reference_applied,
+                    },
+                    None,
+                    None,
+                )?;
+            }
             if state.result.is_some() {
                 if let Some(pin) = &state.source_reference {
                     let DfsContentReferenceOperation::Retain { reference_id } = &pin.operation
                     else {
                         return Err(copy_error("content copy source reservation is not a pin"));
                     };
+                    if state.source_release.is_none() && self.content_reference_present(pin)? {
+                        // Author one fresh ordered cleanup identity, checkpoint
+                        // its complete immutable request, then use the ordinary
+                        // reference owner. Retries and restart reuse this same
+                        // request even after other opaque outcomes were evicted.
+                        state.source_release = Some(DfsContentReferenceRequest {
+                            operation: DfsContentReferenceOperation::Release {
+                                reference_id: reference_id.clone(),
+                            },
+                            operation_id: format!(
+                                "restore-unpin:{}_{}",
+                                job.job_id,
+                                sinomo_core::Id::generate()
+                            ),
+                            ..pin.clone()
+                        });
+                        self.save_content_copy_state(&mut job, state)?;
+                        continue;
+                    }
                     let release = (|| {
                         if self.content_reference_present(pin)? {
-                            self.retain_content_revision(DfsContentReferenceRequest {
-                                operation: DfsContentReferenceOperation::Release {
-                                    reference_id: reference_id.clone(),
-                                },
-                                operation_id: format!("restore-unpin:{}", job.job_id),
-                                ..pin.clone()
+                            let request = state.source_release.as_ref().ok_or_else(|| {
+                                copy_error("content copy cleanup has no checkpointed release")
                             })?;
+                            self.retain_content_revision(request.clone())?;
                         }
                         Ok::<_, DfsError>(())
                     })();
@@ -674,7 +730,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 state.content_hash = descriptor.version.content_hash;
                 state.content_size_bytes = descriptor.version.size_bytes;
                 state.source_reference = Some(DfsContentReferenceRequest {
-                    wire_format: DfsContentReferenceFormat::NamespacedV6,
                     namespace: "sinomo.content-copy".into(),
                     path: descriptor.current_object.path,
                     identity: state.request.source.clone(),
@@ -692,7 +747,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     return Err(copy_error("invalid content copy source pin"));
                 };
                 if !self.content_reference_present(pin)?
-                    && let Err(error) = self.retain_content_revision(pin.clone())
+                    && let Err(error) = self.retain_content_revision_classified(pin.clone())
                 {
                     // Selection on the destination authority does not
                     // reserve bytes on a different source authority. If
@@ -701,21 +756,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     // Unknown transport outcomes remain recoverable; only
                     // a definitive execution failure plus authoritative
                     // absence can close this job.
-                    if matches!(
-                        error,
-                        DfsError::Metadata { .. } | DfsError::MetadataRejection { .. }
-                    ) && !self.content_reference_present(pin)?
-                        && self
-                            .resolve_retained_revision(&state.request.source)?
-                            .is_none()
-                    {
-                        state.result = Some(DfsContentCopyJobResult::Rejected {
-                            reason: format!("content source reservation rejected: {error}"),
-                        });
-                        self.save_content_copy_state(&mut job, state)?;
-                        continue;
+                    match error {
+                        crate::service_file_history::DfsContentReferenceMutationError::Rejected { reason } => {
+                            if !self.content_reference_present(pin)?
+                                && self.resolve_retained_revision(&state.request.source)?.is_none()
+                            {
+                                state.result = Some(DfsContentCopyJobResult::Rejected {
+                                    reason: format!("content source reservation rejected: {reason}"),
+                                });
+                                self.save_content_copy_state(&mut job, state)?;
+                                continue;
+                            }
+                            return Err(copy_error(reason));
+                        }
+                        crate::service_file_history::DfsContentReferenceMutationError::Uncertain(error) => return Err(error),
                     }
-                    return Err(error);
                 }
                 state.source_reference_applied = true;
                 self.save_content_copy_state(&mut job, state)?;
@@ -797,20 +852,159 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sinomo_core::network::{InProcessNetwork, InProcessTransport};
-    use std::path::Path;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
-    fn service(root: &Path, node: &NodeId) -> NetworkedDfsService<InProcessTransport> {
-        let network = InProcessNetwork::new();
-        let mut service = NetworkedDfsService::new(
-            network.add_node(node.clone()),
-            LocalContentStore::new(root.join("content")).unwrap(),
-        )
-        .with_metadata_backend(open_root_local_metadata_backend(root.join("metadata")).unwrap())
-        .unwrap();
-        service.bootstrap_distributed_sifs().unwrap();
-        service
+    fn current_job(
+        runtime: &crate::test_runtime::DfsTestRuntime,
+        admitted: &DfsNamespaceJobRecord,
+    ) -> DfsNamespaceJobRecord {
+        let job = runtime
+            .metadata_primary_service(&admitted.root_path)
+            .unwrap()
+            .metadata_backend()
+            .unwrap()
+            .get_namespace_job(&admitted.job_id)
+            .unwrap()
+            .unwrap();
+        validate_content_copy_job(&job).unwrap();
+        assert_eq!(job.job_id, admitted.job_id);
+        assert_eq!(job.origin, admitted.origin);
+        assert_eq!(
+            content_copy_job_state(&job).unwrap().request,
+            content_copy_job_state(admitted).unwrap().request
+        );
+        job
+    }
+
+    fn hold_copy_step(
+        runtime: &crate::test_runtime::DfsTestRuntime,
+        node: &NodeId,
+        operation_id: &str,
+        source_reference_applied: bool,
+    ) -> (
+        crate::runtime_host::DaemonDfsPreDispatchTestHookGuard,
+        Arc<AtomicUsize>,
+    ) {
+        let job_id = content_copy_job_id(node, operation_id);
+        let expected = *blake3::hash(job_id.as_bytes()).as_bytes();
+        let stopped = Arc::new(AtomicUsize::new(0));
+        let captured = Arc::clone(&stopped);
+        let guard = crate::runtime_host::install_daemon_dfs_pre_dispatch_test_hook(
+            runtime.data_dir(node),
+            Arc::new(move |point, command, context| {
+                if matches!(point,
+                    crate::runtime_host::DaemonDfsPreDispatchTestPoint::BeforeContentCopyStep {
+                        job_id_digest,
+                        source_reference_selected: true,
+                        source_reference_applied: actual,
+                    } if job_id_digest == expected && actual == source_reference_applied
+                ) {
+                    assert!(command.is_none() && context.is_none());
+                    captured.fetch_add(1, Ordering::SeqCst);
+                    return Err(DfsError::Cancelled {
+                        operation: "content copy job",
+                    });
+                }
+                Ok(())
+            }),
+        );
+        (guard, stopped)
+    }
+
+    fn reach_held_step(
+        runtime: &crate::test_runtime::DfsTestRuntime,
+        service: &mut NetworkedDfsService<crate::DfsNodeTransport>,
+        admitted: &DfsNamespaceJobRecord,
+        max_steps: usize,
+        source_reference_applied: bool,
+    ) -> DfsNamespaceJobRecord {
+        match service.test_resume_content_copy_job(admitted, max_steps) {
+            Ok(job) => assert_eq!(job.job_id, admitted.job_id),
+            Err(DfsError::Metadata { message }) => assert_eq!(
+                message,
+                DfsPosixError::from(DfsError::Cancelled {
+                    operation: "content copy job"
+                })
+                .to_string()
+            ),
+            Err(error) => panic!("unexpected copy continuation failure: {error}"),
+        }
+        let job = current_job(runtime, admitted);
+        let state = content_copy_job_state(&job).unwrap();
+        assert_eq!(job.status, DfsNamespaceJobStatus::Running);
+        assert!(state.source_reference.is_some());
+        assert_eq!(state.source_reference_applied, source_reference_applied);
+        assert!(state.result.is_none() && !state.cleanup_complete);
+        job
+    }
+
+    fn reference_prepare(
+        runtime: &crate::test_runtime::DfsTestRuntime,
+        node: &NodeId,
+        request: &DfsContentReferenceRequest,
+    ) -> DfsPreparedOperationRecord {
+        let physical = runtime.metadata_primary_service(&request.path).unwrap();
+        let backend = physical.metadata_backend().unwrap();
+        let completed = backend
+            .get_namespace_request(node, &request.operation_id)
+            .unwrap()
+            .expect("actual authenticated completed reference request");
+        assert_eq!(completed.requester_node_id, *node);
+        assert_eq!(completed.request_id, request.operation_id);
+        assert_eq!(completed.file_system_id, request.identity.file_system_id);
+        assert_eq!(completed.status, DfsNamespaceRequestStatus::Completed);
+        assert_eq!(completed.result, Some(DfsNamespaceResult::Applied));
+        assert_eq!(
+            completed.operation,
+            DfsNamespaceOperation::ContentReference {
+                request: request.clone(),
+            }
+        );
+        let contribution = Some(
+            blake3::hash(&serde_json::to_vec(request).unwrap())
+                .to_hex()
+                .to_string(),
+        );
+        let snapshot = backend.export_table_snapshot().unwrap();
+        let mut records = snapshot
+            .tables
+            .prepared_operations_v7
+            .into_iter()
+            .filter(|record| {
+                record
+                    .payload
+                    .transaction
+                    .content_reference_identity
+                    .as_ref()
+                    == Some(&request.identity)
+                    && record.payload.transaction.contribution_digest == contribution
+            });
+        let record = records
+            .next()
+            .expect("actual reference contribution preparation");
+        assert!(records.next().is_none(), "ambiguous reference preparation");
+        record.validate().unwrap();
+        assert_eq!(record.status, DfsPreparedOperationStatus::Committed);
+        assert_eq!(record.digest.shard_id, completed.authority_shard_id);
+        if let Some(included) = &record.payload.completed_request {
+            assert_eq!(included, &completed);
+        }
+        record
+    }
+
+    fn service(
+        name: &str,
+        node: &NodeId,
+    ) -> (
+        crate::test_runtime::DfsTestRuntime,
+        NetworkedDfsService<crate::DfsNodeTransport>,
+    ) {
+        let mut runtime = crate::test_runtime::DfsTestRuntime::new(name, node.clone()).unwrap();
+        runtime.start_nodes().unwrap();
+        let service = runtime.client(node).unwrap();
+        (runtime, service)
     }
 
     fn options(node: &NodeId) -> DfsWriteOptions {
@@ -836,7 +1030,6 @@ mod tests {
         };
         service
             .retain_content_revision(DfsContentReferenceRequest {
-                wire_format: DfsContentReferenceFormat::NamespacedV6,
                 namespace: "org.example.retention".into(),
                 path: stat.path,
                 identity: identity.clone(),
@@ -852,9 +1045,9 @@ mod tests {
 
     #[test]
     fn content_copy_resumes_after_cancellation_with_non_history_source_reference() {
-        let root = sinomo_testdir::TestDir::new("core-content-copy-cancellation");
+        let fixture_name = "core-content-copy-cancellation";
         let node = NodeId::from_legacy_named("core-content-copy-cancellation").unwrap();
-        let mut service = service(&root, &node);
+        let (mut runtime, mut service) = service(fixture_name, &node);
         let source = granted_source(&mut service, &node);
         let request = DfsContentCopyRequest {
             source,
@@ -862,10 +1055,12 @@ mod tests {
             expected_destination: None,
             operation_id: "copy-source".into(),
         };
+        let (hold, stopped) = hold_copy_step(&runtime, &node, &request.operation_id, true);
         let job = service
-            .begin_content_copy_job("/users/copied", &request, &options(&node))
+            .test_begin_content_copy_job("/users/copied", &request, &options(&node))
             .unwrap();
-        let job = service.run_content_copy_job(job, 2).unwrap();
+        let admitted = job.clone();
+        let job = reach_held_step(&runtime, &mut service, &job, 2, true);
         let reference = content_copy_job_state(&job)
             .unwrap()
             .source_reference
@@ -877,24 +1072,40 @@ mod tests {
                 .source_reference_applied
         );
         assert!(service.content_reference_present(&reference).unwrap());
+        assert!(service.posix_stat("/users/copied").is_err());
+        // Exercise the ordinary owning-shard maintenance caller's cancellation
+        // handling against the real checkpointed job and reservation.
+        let stopped_before = stopped.load(Ordering::SeqCst);
+        let report = runtime
+            .metadata_primary_service("/users/copied")
+            .unwrap()
+            .posix_resume_namespace_jobs_bounded(1, 2)
+            .unwrap();
+        assert_eq!(report.resumed_job_count, 1);
+        assert_eq!(report.remaining_running_job_count, 1);
+        assert_eq!(report.failed_job_count, 0);
+        assert!(report.failures.is_empty());
+        assert!(stopped.load(Ordering::SeqCst) > stopped_before);
+        assert_eq!(current_job(&runtime, &job), job);
         let cancel = DfsCancellationFlag::new();
         service.set_cancellation(Some(cancel.clone()));
         cancel.cancel();
         assert!(matches!(
-            service.run_content_copy_job(job.clone(), 8),
+            service.test_resume_content_copy_job(&job, 8),
             Err(DfsError::Cancelled { .. })
         ));
         drop(service);
 
-        let mut service = self::service(&root, &node);
+        runtime.stop_node(&node).unwrap();
+        runtime.reopen_node(node.clone()).unwrap();
+        let mut service = runtime.client(&node).unwrap();
         assert!(service.content_reference_present(&reference).unwrap());
-        let job = service
-            .metadata_backend()
-            .unwrap()
-            .get_namespace_job(&job.job_id)
-            .unwrap()
-            .unwrap();
-        let complete = service.run_content_copy_job(job, 16).unwrap();
+        assert_eq!(
+            current_job(&runtime, &job).status,
+            DfsNamespaceJobStatus::Running
+        );
+        drop(hold);
+        let complete = service.test_resume_content_copy_job(&job, 16).unwrap();
         assert_eq!(complete.status, DfsNamespaceJobStatus::Completed);
         assert_eq!(
             service.posix_read_file("/users/copied").unwrap(),
@@ -902,19 +1113,19 @@ mod tests {
         );
         assert!(!service.content_reference_present(&reference).unwrap());
         let replay = service
-            .begin_content_copy_job("/users/copied", &request, &options(&node))
+            .test_begin_content_copy_job("/users/copied", &request, &options(&node))
             .unwrap();
-        assert_eq!(
-            content_copy_job_state(&replay).unwrap().result,
-            content_copy_job_state(&complete).unwrap().result
-        );
+        // Begin retains the immutable admission response; current job state
+        // belongs to the separately checkpointed continuation.
+        assert_eq!(replay, admitted);
+        assert_eq!(current_job(&runtime, &admitted), complete);
     }
 
     #[test]
     fn content_copy_preserves_a_destination_created_after_admission() {
-        let root = sinomo_testdir::TestDir::new("core-content-copy-destination-race");
+        let fixture_name = "core-content-copy-destination-race";
         let node = NodeId::from_legacy_named("core-content-copy-destination-race").unwrap();
-        let mut service = service(&root, &node);
+        let (runtime, mut service) = service(fixture_name, &node);
         let source = granted_source(&mut service, &node);
         let request = DfsContentCopyRequest {
             source,
@@ -922,19 +1133,24 @@ mod tests {
             expected_destination: None,
             operation_id: "copy-destination-race".into(),
         };
+        let (hold, _) = hold_copy_step(&runtime, &node, &request.operation_id, true);
         let job = service
-            .begin_content_copy_job("/users/copied", &request, &options(&node))
+            .test_begin_content_copy_job("/users/copied", &request, &options(&node))
             .unwrap();
-        let job = service.run_content_copy_job(job, 2).unwrap();
+        let job = reach_held_step(&runtime, &mut service, &job, 2, true);
         let reference = content_copy_job_state(&job)
             .unwrap()
             .source_reference
             .clone()
             .unwrap();
-        service
+        assert!(service.content_reference_present(&reference).unwrap());
+        assert!(service.posix_stat("/users/copied").is_err());
+        let concurrent = service
             .posix_write_file("/users/copied", b"concurrent destination", options(&node))
             .unwrap();
-        let complete = service.run_content_copy_job(job, 16).unwrap();
+        assert_eq!(current_job(&runtime, &job), job);
+        drop(hold);
+        let complete = service.test_resume_content_copy_job(&job, 16).unwrap();
         assert_eq!(complete.status, DfsNamespaceJobStatus::Failed);
         assert!(matches!(
             content_copy_job_state(&complete).unwrap().result,
@@ -944,12 +1160,16 @@ mod tests {
             service.posix_read_file("/users/copied").unwrap(),
             b"concurrent destination"
         );
+        let preserved = service.posix_stat("/users/copied").unwrap();
+        assert_eq!(preserved.object_id, concurrent.object_id);
+        assert_eq!(preserved.version, concurrent.version);
+        assert_eq!(preserved.content_hash, concurrent.content_hash);
+        assert_eq!(preserved.size_bytes, concurrent.size_bytes);
         assert!(!service.content_reference_present(&reference).unwrap());
     }
 
     fn authored_source_request(source: &DfsRevisionReference) -> DfsContentReferenceRequest {
         DfsContentReferenceRequest {
-            wire_format: DfsContentReferenceFormat::NamespacedV6,
             namespace: "org.example.retention".into(),
             path: "/users/source".into(),
             identity: source.clone(),
@@ -963,9 +1183,9 @@ mod tests {
 
     #[test]
     fn exact_noop_release_cannot_remove_a_later_reference_with_the_same_name() {
-        let root = sinomo_testdir::TestDir::new("core-reference-noop-release-replay");
+        let fixture_name = "core-reference-noop-release-replay";
         let node = NodeId::from_legacy_named("core-reference-noop-release-replay").unwrap();
-        let mut service = service(&root, &node);
+        let (runtime, mut service) = service(fixture_name, &node);
         let source = granted_source(&mut service, &node);
         let release = DfsContentReferenceRequest {
             operation: DfsContentReferenceOperation::Release {
@@ -974,13 +1194,17 @@ mod tests {
             operation_id: "release-before-later-consumer".into(),
             ..authored_source_request(&source)
         };
-        let before_object = service
+        let before_object = runtime
+            .metadata_primary_service("/users/source")
+            .unwrap()
             .metadata_backend()
             .unwrap()
             .get_object(&source.object_id)
             .unwrap()
             .unwrap();
-        let before_version = service
+        let before_version = runtime
+            .metadata_primary_service("/users/source")
+            .unwrap()
             .metadata_backend()
             .unwrap()
             .get_version(&source.object_id, &source.version)
@@ -988,7 +1212,9 @@ mod tests {
             .unwrap();
         service.retain_content_revision(release.clone()).unwrap();
         assert_eq!(
-            service
+            runtime
+                .metadata_primary_service("/users/source")
+                .unwrap()
                 .metadata_backend()
                 .unwrap()
                 .get_object(&source.object_id)
@@ -997,7 +1223,9 @@ mod tests {
             before_object
         );
         assert_eq!(
-            service
+            runtime
+                .metadata_primary_service("/users/source")
+                .unwrap()
                 .metadata_backend()
                 .unwrap()
                 .get_version(&source.object_id, &source.version)
@@ -1005,17 +1233,24 @@ mod tests {
                 .unwrap(),
             before_version
         );
-        let transaction = service
-            .metadata_backend()
-            .unwrap()
-            .get_namespace_transaction("file-history:release-before-later-consumer")
-            .unwrap()
-            .unwrap();
-        assert!(transaction.contribution_digest.is_some());
+        let full = reference_prepare(&runtime, &node, &release);
+        let transaction = full.payload.transaction.clone();
+        assert_eq!(
+            transaction.contribution_digest,
+            Some(
+                blake3::hash(&serde_json::to_vec(&release).unwrap())
+                    .to_hex()
+                    .to_string()
+            )
+        );
         assert_eq!(transaction.content_reference_identity, Some(source.clone()));
         assert!(transaction.versions.is_empty());
-        let mutation = transaction.file_version_pins.unwrap();
-        assert!(mutation.add.is_empty() && mutation.remove.is_empty());
+        assert!(
+            transaction
+                .file_version_pins
+                .as_ref()
+                .is_none_or(|mutation| { mutation.add.is_empty() && mutation.remove.is_empty() })
+        );
         let retain = DfsContentReferenceRequest {
             operation: DfsContentReferenceOperation::Retain {
                 reference_id: "later-consumer".into(),
@@ -1026,46 +1261,72 @@ mod tests {
         service.retain_content_revision(retain.clone()).unwrap();
         service.retain_content_revision(release.clone()).unwrap();
         assert!(service.content_reference_present(&retain).unwrap());
-        service
-            .metadata_backend_mut()
+        let completed = runtime
+            .metadata_primary_service("/users/source")
             .unwrap()
-            .gc_metadata_history(DfsMetadataHistoryGcOptions::delete_eligible(
+            .metadata_backend()
+            .unwrap()
+            .get_namespace_request(&node, &release.operation_id)
+            .unwrap()
+            .expect("actual independently completed authenticated no-op request");
+        assert_eq!(completed.requester_node_id, node);
+        assert_eq!(completed.request_id, release.operation_id);
+        assert_eq!(completed.file_system_id, source.file_system_id);
+        assert_eq!(completed.status, DfsNamespaceRequestStatus::Completed);
+        assert_eq!(completed.result, Some(DfsNamespaceResult::Applied));
+        assert_eq!(
+            completed.operation,
+            DfsNamespaceOperation::ContentReference {
+                request: release.clone()
+            }
+        );
+        runtime
+            .gc_metadata_history_on_current_primaries(DfsMetadataHistoryGcOptions::delete_eligible(
                 Duration::ZERO,
                 0,
             ))
             .unwrap();
-        let compact = service
+        let compact = runtime
+            .metadata_primary_service("/users/source")
+            .unwrap()
             .metadata_backend()
             .unwrap()
-            .get_namespace_transaction_receipt("file-history:release-before-later-consumer")
+            .get_namespace_request_receipt(&node, &release.operation_id)
             .unwrap()
-            .unwrap();
-        assert_eq!(compact.content_reference_identity, Some(source.clone()));
-        assert_eq!(
-            compact.contribution_digest,
-            Some(
-                blake3::hash(&serde_json::to_vec(&release).unwrap())
-                    .to_hex()
-                    .to_string()
-            )
-        );
+            .expect("actual compact authenticated no-op reference completion");
+        assert_eq!(compact.requester_node_id, completed.requester_node_id);
+        assert_eq!(compact.request_id, completed.request_id);
+        assert_eq!(compact.operation_id, completed.operation_id);
+        assert_eq!(compact.authority_shard_id, completed.authority_shard_id);
+        assert_eq!(compact.file_system_id, completed.file_system_id);
+        assert_eq!(compact.command_digest, completed.command_digest);
+        assert_eq!(compact.result, DfsNamespaceResult::Applied);
         service.retain_content_revision(release.clone()).unwrap();
         assert!(service.content_reference_present(&retain).unwrap());
         for _ in 0..4 {
-            service
-                .metadata_backend_mut()
-                .unwrap()
-                .gc_metadata_history(DfsMetadataHistoryGcOptions::delete_eligible(
-                    Duration::ZERO,
-                    0,
-                ))
+            runtime
+                .gc_metadata_history_on_current_primaries(
+                    DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 0),
+                )
                 .unwrap();
         }
         assert!(
-            service
+            runtime
+                .metadata_primary_service("/users/source")
+                .unwrap()
                 .metadata_backend()
                 .unwrap()
-                .get_namespace_transaction_receipt("file-history:release-before-later-consumer")
+                .prepared_operation_record(&full.digest.operation_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            runtime
+                .metadata_primary_service("/users/source")
+                .unwrap()
+                .metadata_backend()
+                .unwrap()
+                .get_namespace_request_receipt(&node, &release.operation_id)
                 .unwrap()
                 .is_none()
         );
@@ -1075,9 +1336,9 @@ mod tests {
 
     #[test]
     fn content_copy_rejects_a_selected_source_that_loses_its_last_grant_before_reservation() {
-        let root = sinomo_testdir::TestDir::new("core-content-copy-source-gc-race");
+        let fixture_name = "core-content-copy-source-gc-race";
         let node = NodeId::from_legacy_named("core-content-copy-source-gc-race").unwrap();
-        let mut service = service(&root, &node);
+        let (runtime, mut service) = service(fixture_name, &node);
         let source = granted_source(&mut service, &node);
         let request = DfsContentCopyRequest {
             source: source.clone(),
@@ -1085,10 +1346,11 @@ mod tests {
             expected_destination: None,
             operation_id: "copy-source-before-gc".into(),
         };
+        let (hold, _) = hold_copy_step(&runtime, &node, &request.operation_id, false);
         let job = service
-            .begin_content_copy_job("/users/copied", &request, &options(&node))
+            .test_begin_content_copy_job("/users/copied", &request, &options(&node))
             .unwrap();
-        let selected = service.run_content_copy_job(job, 1).unwrap();
+        let selected = reach_held_step(&runtime, &mut service, &job, 1, false);
         let private_reference = content_copy_job_state(&selected)
             .unwrap()
             .source_reference
@@ -1098,6 +1360,11 @@ mod tests {
             !content_copy_job_state(&selected)
                 .unwrap()
                 .source_reference_applied
+        );
+        assert!(
+            !service
+                .content_reference_present(&private_reference)
+                .unwrap()
         );
         service
             .retain_content_revision(DfsContentReferenceRequest {
@@ -1118,7 +1385,9 @@ mod tests {
         // The retained row still exists physically. Structural provenance by
         // itself must not reanimate a deleted, unrooted source.
         assert!(
-            service
+            runtime
+                .metadata_primary_service("/users/source")
+                .unwrap()
                 .metadata_backend()
                 .unwrap()
                 .get_version(&source.object_id, &source.version)
@@ -1142,7 +1411,9 @@ mod tests {
                 .unwrap()
                 .reclaimable
         );
-        let terminal = service.run_content_copy_job(selected, 8).unwrap();
+        assert_eq!(current_job(&runtime, &selected), selected);
+        drop(hold);
+        let terminal = service.test_resume_content_copy_job(&selected, 8).unwrap();
         assert_eq!(terminal.status, DfsNamespaceJobStatus::Failed);
         assert!(matches!(
             content_copy_job_state(&terminal).unwrap().result,
@@ -1155,20 +1426,18 @@ mod tests {
                 .unwrap()
         );
         assert!(service.posix_stat("/users/copied").is_err());
-        let replay = service
-            .begin_content_copy_job("/users/copied", &request, &options(&node))
-            .unwrap();
-        assert_eq!(
-            content_copy_job_state(&replay).unwrap().result,
-            content_copy_job_state(&terminal).unwrap().result
-        );
+        // Retry the existing job after its source grant is gone, rather than
+        // admitting another source-dependent Begin request.
+        let replay = service.test_resume_content_copy_job(&selected, 8).unwrap();
+        assert_eq!(replay, terminal);
+        assert_eq!(current_job(&runtime, &selected), terminal);
     }
 
     #[test]
     fn standalone_reference_replay_uses_full_and_compact_witnesses_before_source_lookup() {
-        let root = sinomo_testdir::TestDir::new("core-reference-replay-source-gc");
+        let fixture_name = "core-reference-replay-source-gc";
         let node = NodeId::from_legacy_named("core-reference-replay-source-gc").unwrap();
-        let mut service = service(&root, &node);
+        let (runtime, mut service) = service(fixture_name, &node);
         let stat = service
             .posix_write_file("/users/source", b"protected source", options(&node))
             .unwrap();
@@ -1180,7 +1449,9 @@ mod tests {
         // Compact the ordinary write witness before creating the reference
         // command. Its receipt can then expire during the later GC passes,
         // while the newly compacted reference outcome remains available.
-        let source_intent = service
+        let source_intent = runtime
+            .metadata_primary_service("/users/source")
+            .unwrap()
             .metadata_backend()
             .unwrap()
             .intents_for_object(&source.object_id)
@@ -1191,15 +1462,14 @@ mod tests {
             })
             .unwrap();
         for _ in 0..4 {
-            service
-                .metadata_backend_mut()
-                .unwrap()
-                .gc_metadata_history(DfsMetadataHistoryGcOptions::delete_eligible(
-                    Duration::ZERO,
-                    0,
-                ))
+            runtime
+                .gc_metadata_history_on_current_primaries(
+                    DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 0),
+                )
                 .unwrap();
-            if service
+            if runtime
+                .metadata_primary_service("/users/source")
+                .unwrap()
                 .metadata_backend()
                 .unwrap()
                 .get_intent_receipt(&source.object_id, &source_intent.intent_id)
@@ -1210,7 +1480,9 @@ mod tests {
             }
         }
         assert!(
-            service
+            runtime
+                .metadata_primary_service("/users/source")
+                .unwrap()
                 .metadata_backend()
                 .unwrap()
                 .get_intent_receipt(&source.object_id, &source_intent.intent_id)
@@ -1219,6 +1491,7 @@ mod tests {
         );
         let capture = authored_source_request(&source);
         service.retain_content_revision(capture.clone()).unwrap();
+        let full_capture = reference_prepare(&runtime, &node, &capture);
         service
             .posix_rename("/users/source", "/users/renamed")
             .unwrap();
@@ -1238,28 +1511,43 @@ mod tests {
         let future =
             crate::metadata_records::dfs_now_unix_nanos().saturating_add(172_800_000_000_000);
         for _ in 0..4 {
-            service
-                .metadata_backend_mut()
-                .unwrap()
-                .gc_metadata_history(
+            runtime
+                .gc_metadata_history_on_current_primaries(
                     DfsMetadataHistoryGcOptions::delete_eligible(Duration::from_secs(86_400), 0)
                         .with_now_unix_nanos(future),
                 )
                 .unwrap();
         }
-        let backend = service.metadata_backend().unwrap();
+        let physical = runtime.metadata_primary_service("/users/source").unwrap();
+        let backend = physical.metadata_backend().unwrap();
         assert!(
             backend
-                .get_namespace_transaction("file-history:capture-source")
+                .prepared_operation_record(&full_capture.digest.operation_id)
                 .unwrap()
                 .is_none()
         );
-        assert!(
-            backend
-                .get_namespace_transaction_receipt("file-history:capture-source")
-                .unwrap()
-                .is_some()
-        );
+        let compact = backend
+            .get_namespace_request_receipt(&node, &capture.operation_id)
+            .unwrap()
+            .expect("actual compact authenticated reference request witness");
+        let completed = full_capture.payload.completed_request.as_ref().unwrap();
+        assert_eq!(compact.requester_node_id, completed.requester_node_id);
+        assert_eq!(compact.request_id, completed.request_id);
+        assert_eq!(compact.operation_id, completed.operation_id);
+        assert_eq!(compact.authority_shard_id, completed.authority_shard_id);
+        assert_eq!(compact.file_system_id, completed.file_system_id);
+        assert_eq!(compact.command_digest, completed.command_digest);
+        assert_eq!(compact.result, DfsNamespaceResult::Applied);
+        let receipt = backend
+            .get_namespace_request_receipt(&node, &capture.operation_id)
+            .unwrap()
+            .unwrap();
+        let completed = full_capture.payload.completed_request.as_ref().unwrap();
+        assert_eq!(receipt.requester_node_id, completed.requester_node_id);
+        assert_eq!(receipt.request_id, completed.request_id);
+        assert_eq!(receipt.authority_shard_id, completed.authority_shard_id);
+        assert_eq!(receipt.command_digest, completed.command_digest);
+        assert_eq!(receipt.result, DfsNamespaceResult::Applied);
         assert!(
             backend
                 .get_version(&source.object_id, &source.version)
@@ -1275,150 +1563,5 @@ mod tests {
             metadata: None,
         };
         assert!(service.retain_content_revision(changed_payload).is_err());
-    }
-
-    #[test]
-    fn source_local_prepared_reference_protects_an_expired_grant_until_abort() {
-        let root = sinomo_testdir::TestDir::new("core-reference-prepared-source-root");
-        let node = NodeId::from_legacy_named("core-reference-prepared-source-root").unwrap();
-        let mut service = service(&root, &node);
-        let source = granted_source(&mut service, &node);
-        let now = crate::metadata_records::dfs_now_unix_nanos();
-        let mut version = service
-            .metadata_backend()
-            .unwrap()
-            .get_version(&source.object_id, &source.version)
-            .unwrap()
-            .unwrap();
-        let state = version.retention.get_mut("org.example.retention").unwrap();
-        state.order = 1;
-        state.grant.as_mut().unwrap().minimum = Some(DfsOrderedRetentionGrant {
-            order: 1,
-            granted_at_unix_nanos: now,
-            minimum: DfsRetentionMinimum {
-                keep_last: 0,
-                keep_for_seconds: 1,
-            },
-        });
-        service
-            .metadata_backend_mut()
-            .unwrap()
-            .put_version(&version)
-            .unwrap();
-        service
-            .retain_content_revision(DfsContentReferenceRequest {
-                operation: DfsContentReferenceOperation::Release {
-                    reference_id: "authored-source".into(),
-                },
-                operation_id: "release-before-source-prepare".into(),
-                ..authored_source_request(&source)
-            })
-            .unwrap();
-        service.posix_unlink("/users/source").unwrap();
-        let backend = service.metadata_backend_mut().unwrap();
-        let version = backend
-            .get_version(&source.object_id, &source.version)
-            .unwrap()
-            .unwrap();
-        let shard_status = backend.metadata_shard_statuses().unwrap()[0].clone();
-        let shard_id = shard_status.shard_id;
-        let owner_epoch = shard_status.epoch.unwrap_or(1).max(1);
-        let transaction = DfsNamespaceTransaction {
-            contribution_digest: Some("accepted-source-reference".into()),
-            content_reference_identity: None,
-            extension_expectations: vec![DfsRevisionMetadataExpectation {
-                object_id: source.object_id.clone(),
-                version: source.version.clone(),
-                expected: Some(Box::new(version.clone())),
-            }],
-            transaction_id: "prepared-source-reference-tx".into(),
-            file_system_id: source.file_system_id.clone(),
-            objects: Vec::new(),
-            versions: vec![version],
-            advisory_lock_states: Vec::new(),
-            file_version_pins: Some(DfsFileVersionPinMutation {
-                add: vec![DfsMetadataVersionPinRecord {
-                    file_system_id: source.file_system_id.clone(),
-                    object_id: source.object_id.clone(),
-                    version: source.version.clone(),
-                    namespace: Some("org.example.retention".into()),
-                    pin_id: content_reference_storage_id(
-                        "org.example.retention",
-                        "prepared-source",
-                    ),
-                    created_at: OffsetDateTime::now_utc(),
-                }],
-                remove: Vec::new(),
-            }),
-            created_at: OffsetDateTime::now_utc(),
-        };
-        let (expected_object_versions, expected_path_occupants, _) = backend
-            .namespace_prepare_expectations(&shard_id, &transaction)
-            .unwrap();
-        let mut prepare = DfsNamespacePrepareRecord {
-            operation_id: "prepared-source-reference".into(),
-            file_system_id: source.file_system_id.clone(),
-            shard_id,
-            owner_epoch,
-            operation_digest: String::new(),
-            expected_object_versions,
-            expected_path_occupants,
-            content_receipts: Vec::new(),
-            transaction,
-            completed_request: None,
-            completed_request_completion: None,
-            status: DfsNamespacePrepareStatus::Prepared,
-        };
-        prepare.operation_digest =
-            crate::service_replica::metadata_namespace_prepare_payload_digest(&prepare).unwrap();
-        backend.prepare_namespace_transaction(&prepare).unwrap();
-        assert_eq!(
-            backend
-                .prepared_content_reference_protection(&source.file_system_id, &source.object_id, 0)
-                .unwrap(),
-            (false, false)
-        );
-        std::thread::sleep(Duration::from_millis(1100));
-        assert!(
-            service
-                .resolve_retained_revision(&source)
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            !service
-                .object_lifecycle(&source.file_system_id, &source.object_id)
-                .unwrap()
-                .reclaimable
-        );
-        service
-            .metadata_backend_mut()
-            .unwrap()
-            .abort_prepared_namespace_transaction(
-                &prepare.operation_id,
-                &prepare.operation_digest,
-                prepare.owner_epoch,
-            )
-            .unwrap();
-        assert!(
-            service
-                .object_lifecycle(&source.file_system_id, &source.object_id)
-                .unwrap()
-                .reclaimable
-        );
-        // A new author cannot reuse the old decision timestamp to resurrect
-        // the expired grant after its accepted reservation was aborted.
-        let mut backdated = prepare;
-        backdated.operation_id = "fresh-backdated-source-reference".into();
-        backdated.transaction.transaction_id = "fresh-backdated-source-reference-tx".into();
-        backdated.operation_digest =
-            crate::service_replica::metadata_namespace_prepare_payload_digest(&backdated).unwrap();
-        assert!(
-            service
-                .metadata_backend_mut()
-                .unwrap()
-                .prepare_namespace_transaction(&backdated)
-                .is_err()
-        );
     }
 }

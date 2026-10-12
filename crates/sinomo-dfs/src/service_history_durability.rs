@@ -1,4 +1,5 @@
-//! Fresh durability for legacy content whose original grant was lost.
+//! Fresh capture grants for current visible heads. Historical grant conversion
+//! belongs to the migration component; retained rows never infer old policy.
 
 use crate::*;
 use sinomo_core::DfsObjectPolicy;
@@ -33,12 +34,31 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         object: &DfsObjectMetadata,
         version: &DfsObjectVersionRecord,
     ) -> Result<Box<DfsContentDurability>, DfsError> {
+        if !version.retention.is_empty() {
+            return Err(grant_error(
+                "retained version without complete durability requires storage conversion",
+            ));
+        }
+        if object.kind != DfsObjectKind::File
+            || version.file_system_id != object.file_system_id
+            || version.object_id != object.object_id
+            || version.version != object.version
+            || version.content_hash != object.content_hash
+            || version.size_bytes != object.content_size_bytes
+        {
+            return Err(grant_error(
+                "fresh capture durability requires the exact current visible file head",
+            ));
+        }
         let path = crate::metadata_keys::normalize_posix_path(&object.path);
         self.require_file_history_shard_support(&object.file_system_id, &path)?;
-        let shard = self.certified_local_metadata_owner_shard_for_object(object)?;
+        let scope = self.metadata_effect_scope_for_object(
+            object,
+            format!("history-grant:{}", sinomo_core::Id::generate()),
+        )?;
         let fs = self
             .refresh_file_history_configuration(&object.file_system_id)?
-            .ok_or_else(|| grant_error("legacy capture has no filesystem policy"))?;
+            .ok_or_else(|| grant_error("retained capture has no filesystem policy"))?;
         let candidates = self.placement_content_candidates()?;
         // This is the same fallback as an ordinary current-policy write: one
         // local candidate in standalone mode, otherwise up to two candidates.
@@ -84,10 +104,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let hash = version
             .content_hash
             .as_deref()
-            .ok_or_else(|| grant_error("legacy capture has no content hash"))?;
+            .ok_or_else(|| grant_error("retained capture has no content hash"))?;
         let size_bytes = version
             .size_bytes
-            .ok_or_else(|| grant_error("legacy capture has no content length"))?;
+            .ok_or_else(|| grant_error("retained capture has no content length"))?;
         let identity = DfsRevisionReference {
             file_system_id: version.file_system_id.clone(),
             object_id: version.object_id.clone(),
@@ -124,26 +144,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         if durable.len() < policy.min_commit_replicas {
             return Err(grant_error(format!(
-                "legacy capture current-policy durability requires {} receipts; established {}",
+                "retained capture current-policy durability requires {} receipts; established {}",
                 policy.min_commit_replicas,
                 durable.len(),
             )));
         }
-        // Recheck author authority after network I/O. The subsequent capture
-        // prepare carries these receipts through the normal metadata barrier.
-        let _guard = shard.as_ref().map(|shard| {
-            crate::service_replica::metadata_shard_publication_guard(
-                &shard.file_system_id,
-                &shard.shard_id,
-            )
-        });
-        if let Some(shard) = &shard
-            && !self.metadata_shard_assignment_still_exact(shard)?
-        {
-            return Err(grant_error(
-                "legacy capture metadata authority changed while copying content",
-            ));
-        }
+        // Seal the actual content receipts in one current prepared payload.
+        // Its captured owner epoch is revalidated by the publication guard.
+        let mut effects = Vec::new();
         for node in durable {
             self.ensure_metadata_receipt_accepts(&object.object_id, &version.version, &node, hash)?;
             let receipt = DfsReplicaReceiptRecord {
@@ -158,22 +166,43 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 content_hash: Some(hash.to_string()),
                 received_at: OffsetDateTime::now_utc(),
             };
-            self.metadata_backend
-                .as_mut()
-                .ok_or_else(|| grant_error("legacy capture requires durable metadata"))?
-                .put_receipt_for_object(Some(object), &receipt)?;
+            effects.push(crate::DfsPreparedMetadataEffect::PutReceipt { receipt });
         }
-        self.record_message_committed_work(DfsMessageCommittedWork {
-            publish_metadata: true,
-            ..Default::default()
-        });
+        let owner_epoch = scope.owner_epoch;
+        let _execution = self.acquire_prepared_execution(&scope)?;
+        let backend = self
+            .metadata_backend
+            .as_ref()
+            .ok_or_else(|| grant_error("current capture requires durable metadata"))?;
+        let current = backend
+            .get_object_on_shard(&scope.shard_id, &object.object_id)?
+            .ok_or_else(|| grant_error("current capture lost its visible head"))?;
+        if current != *object {
+            return Err(grant_error(
+                "current visible head changed while capture content was copied",
+            ));
+        }
+        let occupant = backend.get_object_by_path_on_shard(
+            &scope.shard_id,
+            &object.file_system_id,
+            &object.path,
+        )?;
+        self.publish_metadata_effects_on_shard(
+            scope,
+            vec![DfsNamespaceObjectVersionExpectation {
+                object_id: object.object_id.clone(),
+                expected_version: Some(object.version.clone()),
+            }],
+            vec![DfsNamespacePathOccupantExpectation {
+                path: object.path.clone(),
+                expected_object_id: occupant.map(|row| row.object_id),
+            }],
+            effects,
+        )?;
         Ok(Box::new(DfsContentDurability {
-            current_policy_granted_at_unix_nanos: Some(
-                crate::metadata_records::dfs_now_unix_nanos(),
-            ),
             source_version: version.version.clone(),
             coordinator_node_id: self.node_id.clone(),
-            owner_epoch: shard.map(|shard| shard.epoch).unwrap_or(0),
+            owner_epoch,
             desired_replica_node_ids: desired,
             policy,
         }))
@@ -277,42 +306,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             let object = backend
                 .get_object(object_id)?
-                .ok_or_else(|| grant_error("legacy rule capture lost its object"))?;
-            let recovered =
-                crate::content_durability::recover_from_backend(&version, backend.as_ref())?;
-            version.content_durability = Some(match recovered {
-                Some(plan) => plan,
-                None => self.establish_file_history_durability(&object, &version)?,
-            });
-            let shard = self.certified_local_metadata_owner_shard_for_object(&object)?;
-            let _guard = shard.as_ref().map(|shard| {
-                crate::service_replica::metadata_shard_publication_guard(
-                    &shard.file_system_id,
-                    &shard.shard_id,
-                )
-            });
-            if let Some(shard) = &shard
-                && !self.metadata_shard_assignment_still_exact(shard)?
-            {
+                .ok_or_else(|| grant_error("retained rule capture lost its object"))?;
+            if !version.retention.is_empty() || object.version != version.version {
                 return Err(grant_error(
-                    "legacy rule capture metadata authority changed",
+                    "historical or retained version has no complete durability; storage conversion is required",
                 ));
             }
-            self.metadata_backend
-                .as_mut()
-                .expect("durable history backend")
-                .apply_namespace_transaction(&DfsNamespaceTransaction {
-                    content_reference_identity: None,
-                    extension_expectations: Vec::new(),
-                    contribution_digest: None,
-                    transaction_id: format!("history-durability_{}", sinomo_core::Id::generate()),
-                    file_system_id: version.file_system_id.clone(),
-                    objects: Vec::new(),
-                    versions: vec![version],
-                    file_version_pins: None,
-                    advisory_lock_states: Vec::new(),
-                    created_at: OffsetDateTime::now_utc(),
-                })?;
+            version.content_durability =
+                Some(self.establish_file_history_durability(&object, &version)?);
+            self.publish_object_metadata_effects(
+                &object,
+                vec![crate::DfsPreparedMetadataEffect::PutVersion { version }],
+            )?;
         }
         Ok(())
     }

@@ -179,6 +179,11 @@ impl MigrationStreamWriter {
         })
     }
 
+    /// The actual already-computed framed stream identity; no read or sync.
+    pub fn cursor(&self) -> &StreamCursor {
+        &self.cursor
+    }
+
     pub fn append(&mut self, bytes: &[u8]) -> io::Result<()> {
         if self.finished || bytes.is_empty() || bytes.len() as u64 > MAX_RECORD_BYTES {
             return Err(invalid("invalid migration stream record"));

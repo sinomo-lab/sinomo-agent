@@ -40,7 +40,6 @@ struct Args {
     list_page_size: usize,
     metadata_batch_size: usize,
     namespace_job_steps: usize,
-    packed_small_threads: usize,
     network_timeout_secs: u64,
     keep: bool,
 }
@@ -55,7 +54,6 @@ enum Scenario {
     MetadataReplication,
     DirectoryJobs,
     Blob,
-    PackedSmall,
     NetworkBlob,
     NetworkWriteAt,
 }
@@ -96,11 +94,10 @@ impl Scenario {
             "metadata-replication" => Ok(Self::MetadataReplication),
             "directory-jobs" => Ok(Self::DirectoryJobs),
             "blob" => Ok(Self::Blob),
-            "packed-small" => Ok(Self::PackedSmall),
             "network-blob" => Ok(Self::NetworkBlob),
             "network-write-at" => Ok(Self::NetworkWriteAt),
             _ => Err(format!(
-                "unknown scenario `{value}`; use all, namespace, posix-create, posix-read, posix-write-at, metadata-replication, directory-jobs, blob, packed-small, network-blob, or network-write-at"
+                "unknown scenario `{value}`; use all, namespace, posix-create, posix-read, posix-write-at, metadata-replication, directory-jobs, blob, network-blob, or network-write-at"
             )
             .into()),
         }
@@ -116,7 +113,6 @@ impl Scenario {
             Self::MetadataReplication => "metadata-replication",
             Self::DirectoryJobs => "directory-jobs",
             Self::Blob => "blob",
-            Self::PackedSmall => "packed-small",
             Self::NetworkBlob => "network-blob",
             Self::NetworkWriteAt => "network-write-at",
         }
@@ -208,7 +204,6 @@ fn main() -> BenchResult<()> {
             run_metadata_replication(&args)?;
             run_directory_jobs(&args)?;
             run_blob(&args)?;
-            run_packed_small(&args)?;
             run_network_blob(&args)?;
             run_network_write_at(&args)?;
         }
@@ -219,7 +214,6 @@ fn main() -> BenchResult<()> {
         Scenario::MetadataReplication => run_metadata_replication(&args)?,
         Scenario::DirectoryJobs => run_directory_jobs(&args)?,
         Scenario::Blob => run_blob(&args)?,
-        Scenario::PackedSmall => run_packed_small(&args)?,
         Scenario::NetworkBlob => run_network_blob(&args)?,
         Scenario::NetworkWriteAt => run_network_write_at(&args)?,
     }
@@ -298,7 +292,6 @@ impl Args {
             "SINOMO_DFS_BENCH_NETWORK_TIMEOUT_SECS",
             defaults.network_timeout_secs,
         )?;
-        let mut packed_small_threads = env_usize("SINOMO_DFS_BENCH_PACKED_SMALL_THREADS", 8)?;
         let mut keep = false;
 
         while let Some(arg) = args.next() {
@@ -346,7 +339,6 @@ impl Args {
                 "--list-page-size" => list_page_size = parse_usize(&arg, args.next())?,
                 "--metadata-batch-size" => metadata_batch_size = parse_usize(&arg, args.next())?,
                 "--namespace-job-steps" => namespace_job_steps = parse_usize(&arg, args.next())?,
-                "--packed-small-threads" => packed_small_threads = parse_usize(&arg, args.next())?,
                 "--network-timeout-secs" => network_timeout_secs = parse_u64(&arg, args.next())?,
                 "--keep" => keep = true,
                 "--bench" => {}
@@ -369,9 +361,6 @@ impl Args {
         }
         if namespace_job_steps == 0 {
             return Err("--namespace-job-steps must be greater than zero".into());
-        }
-        if packed_small_threads == 0 {
-            return Err("--packed-small-threads must be greater than zero".into());
         }
         if network_timeout_secs == 0 {
             return Err("--network-timeout-secs must be greater than zero".into());
@@ -417,7 +406,6 @@ impl Args {
             list_page_size,
             metadata_batch_size,
             namespace_job_steps,
-            packed_small_threads,
             network_timeout_secs,
             keep,
         })
@@ -449,7 +437,6 @@ impl Args {
                 "list_page_size": self.list_page_size,
                 "metadata_batch_size": self.metadata_batch_size,
                 "namespace_job_steps": self.namespace_job_steps,
-                "packed_small_threads": self.packed_small_threads,
                 "network_timeout_secs": self.network_timeout_secs,
                 "keep": self.keep,
             }),
@@ -1303,168 +1290,6 @@ fn run_blob(args: &Args) -> BenchResult<()> {
             "bytes": range_stream_bytes,
             "requested_bytes": args.blob_range_bytes,
             "mib_per_second": mib_per_second(range_stream_bytes, range_stream_elapsed),
-        }),
-    );
-
-    Ok(())
-}
-
-fn run_packed_small(args: &Args) -> BenchResult<()> {
-    const PACKED_SMALL_MAX_BYTES: usize = 16 * 1024;
-    if args.files == 0 {
-        return Err("packed-small requires --files greater than zero".into());
-    }
-    if !(8..=PACKED_SMALL_MAX_BYTES).contains(&args.file_bytes) {
-        return Err(format!(
-            "packed-small requires --file-bytes between 8 and {PACKED_SMALL_MAX_BYTES}"
-        )
-        .into());
-    }
-
-    let root = args.scenario_root("packed-small");
-    remove_dir_all_if_exists(&root)?;
-    fs::create_dir_all(&root)?;
-    let store = LocalContentStore::new(&root)?;
-    let window_size = args.files.div_ceil(4);
-    let mut window_started = Instant::now();
-    let mut window_first_index = 0usize;
-    let mut windows = Vec::new();
-    let mut samples = Vec::<(String, Vec<u8>)>::new();
-
-    let write_started = Instant::now();
-    for index in 0..args.files {
-        let mut payload = vec![0x5a; args.file_bytes];
-        payload[..8].copy_from_slice(&(index as u64).to_le_bytes());
-        let manifest = store.put_object_version_blob_only(
-            &format!("packed-small-object-{index:08}"),
-            "version-packed-small-1",
-            &payload,
-        )?;
-        if index == 0 || index == args.files / 2 || index + 1 == args.files {
-            samples.push((manifest.content_hash, payload));
-        }
-        let window_complete =
-            (index + 1) % window_size == 0 || index.saturating_add(1) == args.files;
-        if window_complete {
-            let elapsed = window_started.elapsed();
-            let count = index.saturating_add(1).saturating_sub(window_first_index);
-            windows.push(json!({
-                "first_index": window_first_index,
-                "count": count,
-                "elapsed_ms": elapsed.as_secs_f64() * 1000.0,
-                "blobs_per_second": rate(count as u64, elapsed),
-            }));
-            window_first_index = index.saturating_add(1);
-            window_started = Instant::now();
-        }
-    }
-    let write_elapsed = write_started.elapsed();
-    let packed_root = root.join("blob-packs");
-    let packed_metrics = packed_storage_metrics(&packed_root)?;
-    emit(
-        "packed_small_unique_write",
-        write_elapsed,
-        json!({
-            "files": args.files,
-            "file_bytes": args.file_bytes,
-            "written_bytes": args.files.saturating_mul(args.file_bytes),
-            "blobs_per_second": rate(args.files as u64, write_elapsed),
-            "mib_per_second": mib_per_second(
-                args.files.saturating_mul(args.file_bytes) as u64,
-                write_elapsed,
-            ),
-            "windows": windows,
-            "lane_count": LocalContentStore::packed_blob_lane_count(),
-            "active_lanes": packed_metrics.active_lanes,
-            "index_snapshot_bytes": packed_metrics.index_snapshot_bytes,
-            "index_log_bytes": packed_metrics.index_log_bytes,
-            "segment_files": packed_metrics.segment_files,
-        }),
-    );
-
-    drop(store);
-    let reopen_started = Instant::now();
-    let reopened = LocalContentStore::new(&root)?;
-    let mut verified_bytes = 0u64;
-    for (hash, expected) in &samples {
-        let actual = reopened.read_blob(hash)?;
-        if actual.as_slice() != expected.as_slice() {
-            return Err(format!("packed-small reopen verification failed for {hash}").into());
-        }
-        verified_bytes = verified_bytes.saturating_add(actual.len() as u64);
-    }
-    let reopen_elapsed = reopen_started.elapsed();
-    emit(
-        "packed_small_reopen_lookup",
-        reopen_elapsed,
-        json!({
-            "files": args.files,
-            "sample_count": samples.len(),
-            "verified_bytes": verified_bytes,
-            "lane_count": LocalContentStore::packed_blob_lane_count(),
-            "active_lanes": packed_metrics.active_lanes,
-            "index_snapshot_bytes": packed_metrics.index_snapshot_bytes,
-            "index_log_bytes": packed_metrics.index_log_bytes,
-        }),
-    );
-    drop(reopened);
-
-    let parallel_root = root.join("parallel");
-    fs::create_dir_all(&parallel_root)?;
-    let parallel_store = LocalContentStore::new(&parallel_root)?;
-    let writer_threads = args.packed_small_threads.min(args.files);
-    let parallel_started = Instant::now();
-    let written = std::thread::scope(|scope| -> BenchResult<usize> {
-        let mut handles = Vec::with_capacity(writer_threads);
-        for thread_index in 0..writer_threads {
-            let writer = parallel_store.clone();
-            let file_bytes = args.file_bytes;
-            let files = args.files;
-            handles.push(scope.spawn(move || -> BenchResult<usize> {
-                let mut written = 0usize;
-                for index in (thread_index..files).step_by(writer_threads) {
-                    let mut payload = vec![0xa6; file_bytes];
-                    payload[..8].copy_from_slice(&(index as u64).to_le_bytes());
-                    writer.put_object_version_blob_only(
-                        &format!("packed-small-parallel-object-{index:08}"),
-                        "version-packed-small-parallel-1",
-                        &payload,
-                    )?;
-                    written = written.saturating_add(1);
-                }
-                Ok(written)
-            }));
-        }
-        let mut written = 0usize;
-        for handle in handles {
-            written = written.saturating_add(
-                handle
-                    .join()
-                    .map_err(|_| "packed-small writer thread panicked")??,
-            );
-        }
-        Ok(written)
-    })?;
-    let parallel_elapsed = parallel_started.elapsed();
-    let parallel_metrics = packed_storage_metrics(&parallel_root.join("blob-packs"))?;
-    emit(
-        "packed_small_parallel_unique_write",
-        parallel_elapsed,
-        json!({
-            "files": written,
-            "file_bytes": args.file_bytes,
-            "written_bytes": written.saturating_mul(args.file_bytes),
-            "writer_threads": writer_threads,
-            "lane_count": LocalContentStore::packed_blob_lane_count(),
-            "active_lanes": parallel_metrics.active_lanes,
-            "blobs_per_second": rate(written as u64, parallel_elapsed),
-            "mib_per_second": mib_per_second(
-                written.saturating_mul(args.file_bytes) as u64,
-                parallel_elapsed,
-            ),
-            "index_snapshot_bytes": parallel_metrics.index_snapshot_bytes,
-            "index_log_bytes": parallel_metrics.index_log_bytes,
-            "segment_files": parallel_metrics.segment_files,
         }),
     );
 
@@ -3035,66 +2860,6 @@ fn recursive_apparent_file_bytes(path: &Path) -> BenchResult<u64> {
     Ok(bytes)
 }
 
-#[derive(Debug, Default)]
-struct PackedStorageMetrics {
-    index_snapshot_bytes: u64,
-    index_log_bytes: u64,
-    segment_files: usize,
-    active_lanes: usize,
-}
-
-fn packed_storage_metrics(root: &Path) -> BenchResult<PackedStorageMetrics> {
-    fn visit(
-        path: &Path,
-        metrics: &mut PackedStorageMetrics,
-        active_lanes: &mut BTreeSet<PathBuf>,
-    ) -> BenchResult<()> {
-        let metadata = match fs::symlink_metadata(path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error.into()),
-        };
-        if metadata.file_type().is_dir() {
-            for entry in fs::read_dir(path)? {
-                visit(&entry?.path(), metrics, active_lanes)?;
-            }
-            return Ok(());
-        }
-        if !metadata.file_type().is_file() {
-            return Ok(());
-        }
-        match path.file_name().and_then(|name| name.to_str()) {
-            Some("index.sobj") => {
-                metrics.index_snapshot_bytes =
-                    metrics.index_snapshot_bytes.saturating_add(metadata.len());
-                if let Some(parent) = path.parent() {
-                    active_lanes.insert(parent.to_owned());
-                }
-            }
-            Some("index.slog") => {
-                metrics.index_log_bytes = metrics.index_log_bytes.saturating_add(metadata.len());
-                if let Some(parent) = path.parent() {
-                    active_lanes.insert(parent.to_owned());
-                }
-            }
-            Some(name) if name.ends_with(".pack") => {
-                metrics.segment_files = metrics.segment_files.saturating_add(1);
-                if let Some(lane_root) = path.parent().and_then(Path::parent) {
-                    active_lanes.insert(lane_root.to_owned());
-                }
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-
-    let mut metrics = PackedStorageMetrics::default();
-    let mut active_lanes = BTreeSet::new();
-    visit(root, &mut metrics, &mut active_lanes)?;
-    metrics.active_lanes = active_lanes.len();
-    Ok(metrics)
-}
-
 fn linux_peak_rss_bytes() -> Option<u64> {
     let status = fs::read_to_string("/proc/self/status").ok()?;
     let line = status.lines().find(|line| line.starts_with("VmHWM:"))?;
@@ -3237,7 +3002,7 @@ fn print_help() {
         "Usage: cargo bench -p sinomo-dfs --bench scale -- [OPTIONS]\n\
          \n\
          Options:\n\
-           --scenario all|namespace|posix-create|posix-read|posix-write-at|metadata-replication|directory-jobs|blob|packed-small|network-blob|network-write-at\n\
+           --scenario all|namespace|posix-create|posix-read|posix-write-at|metadata-replication|directory-jobs|blob|network-blob|network-write-at\n\
            --preset smoke|scale|production\n\
            --root PATH\n\
            --files COUNT\n\
@@ -3253,7 +3018,6 @@ fn print_help() {
            --list-page-size COUNT\n\
            --metadata-batch-size COUNT\n\
            --namespace-job-steps COUNT\n\
-           --packed-small-threads COUNT\n\
            --network-timeout-secs SECONDS\n\
            --keep\n\
          \n\
@@ -3269,7 +3033,6 @@ fn print_help() {
            SINOMO_DFS_BENCH_LIST_PAGE_SIZE,\n\
            SINOMO_DFS_BENCH_METADATA_BATCH_SIZE,\n\
            SINOMO_DFS_BENCH_NAMESPACE_JOB_STEPS,\n\
-           SINOMO_DFS_BENCH_PACKED_SMALL_THREADS,\n\
            SINOMO_DFS_BENCH_NETWORK_TIMEOUT_SECS\n\
          \n\
          Presets:\n\

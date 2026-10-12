@@ -336,56 +336,6 @@ where
 }
 
 #[cfg(test)]
-pub(super) fn daemon_dfs_actionable_conflict_count(
-    metadata: &dyn DfsMetadataBackend,
-    conflicts: &[DfsConflictRecord],
-) -> Result<usize, sinomo_dfs::MetadataBackendError> {
-    let mut actionable = 0usize;
-    for conflict in conflicts
-        .iter()
-        .filter(|conflict| conflict.status == DfsConflictStatus::Open)
-    {
-        let current = metadata.get_object(&conflict.object_id)?;
-        let requires_maintenance =
-            daemon_dfs_conflict_requires_maintenance(conflict, current.as_ref());
-        actionable = actionable.saturating_add(usize::from(requires_maintenance));
-    }
-    Ok(actionable)
-}
-
-#[cfg(test)]
-pub(super) fn daemon_dfs_conflict_requires_maintenance(
-    conflict: &DfsConflictRecord,
-    current: Option<&DfsObjectMetadata>,
-) -> bool {
-    match current {
-        // These are the exact cases that
-        // `reconcile_stale_conflicts_bounded` can advance: a deleted object
-        // supersedes the conflict, either branch becoming visible resolves
-        // it, and any version beyond the recorded base supersedes it. A
-        // conflict whose base remains visible is an intentional
-        // operator-facing conflict and must not select the short background
-        // cadence forever.
-        None => true,
-        Some(object)
-            if object.version == conflict.local_version
-                || object.version == conflict.remote_version =>
-        {
-            true
-        }
-        Some(object)
-            if conflict
-                .base_version
-                .as_ref()
-                .is_some_and(|base_version| object.version == *base_version) =>
-        {
-            false
-        }
-        Some(_) => true,
-    }
-}
-
-#[cfg(test)]
 pub(super) fn daemon_dfs_actionable_placement_reconciliation_count(
     jobs: &[DfsPlacementReconciliationJob],
     pending_repair_count: usize,
@@ -398,7 +348,6 @@ pub(super) fn daemon_dfs_pending_work_from_records(
     pending_write_count: usize,
     pending_repair_count: usize,
     pending_namespace_job_count: usize,
-    actionable_conflict_count: usize,
     actionable_placement_reconciliation_count: usize,
     write_intents: &[DfsWriteIntentRecord],
     receipt_records: &[DfsReplicaReceiptRecord],
@@ -608,7 +557,7 @@ pub(super) fn daemon_dfs_pending_work_from_records(
         next_time_based_maintenance_unix_nanos: next_stale_write_intent_deadline_unix_nanos,
         deferred_work_count,
         pending_namespace_job_count,
-        actionable_conflict_count,
+
         actionable_placement_reconciliation_count,
         metadata_replica_lag_count,
         pending_local_membership_handoff_count,
@@ -655,7 +604,6 @@ pub(super) fn daemon_dfs_orphan_gc_candidate_count(
             .saturating_add(report.eligible_orphan_count)
             .saturating_add(report.stale_orphan_observation_count)
             .saturating_add(report.retained_same_or_stale_catalog_orphan_count)
-            .saturating_add(report.eligible_packed_segment_count)
             .saturating_add(report.pending_inline_compaction_count),
     )
     .unwrap_or(usize::MAX)
@@ -942,7 +890,7 @@ pub(super) struct DaemonDfsMaintenanceMetadataObservation {
     pub(super) metadata_shard_statuses: Vec<DfsMetadataShardStatus>,
     pub(super) write_intents: Vec<DfsWriteIntentRecord>,
     pub(super) repair_views: Vec<DfsOperatorRepairView>,
-    pub(super) actionable_conflict_count: usize,
+
     pub(super) receipt_records: Vec<DfsReplicaReceiptRecord>,
     pub(super) lookups: DaemonDfsMetadataLookups,
 }
@@ -968,14 +916,6 @@ pub(super) fn daemon_dfs_maintenance_metadata_observation(
             } else {
                 Vec::new()
             };
-            let conflicts = if summary.open_conflict_count > 0 {
-                metadata.all_conflicts()?
-            } else {
-                Vec::new()
-            };
-            let actionable_conflict_count =
-                daemon_dfs_actionable_conflict_count(metadata, &conflicts)?;
-
             let mut receipt_records = Vec::new();
             let mut receipt_versions = BTreeSet::new();
             for intent in write_intents.iter().filter(|intent| {
@@ -1028,7 +968,7 @@ pub(super) fn daemon_dfs_maintenance_metadata_observation(
                 metadata_shard_statuses,
                 write_intents,
                 repair_views,
-                actionable_conflict_count,
+
                 receipt_records,
                 lookups,
             })

@@ -17,8 +17,7 @@ use crate::metadata_api::DfsMetadataBackend;
 use crate::metadata_error::Result;
 use crate::metadata_records::{
     DfsMetadataJournalBatch, DfsMetadataJournalEntry, DfsMetadataMutation, DfsMetadataShardId,
-    DfsMetadataSubscription, DfsNamespacePrepareRecord, DfsNamespacePrepareStatus,
-    DfsNamespaceTransaction,
+    DfsMetadataSubscription, DfsNamespaceTransaction,
 };
 use crate::model::{DfsObjectKind, DfsObjectMetadata, DfsTombstoneProvenance};
 use crate::namespace::{
@@ -244,7 +243,6 @@ struct RequestProvenance {
 }
 
 struct NamespaceChangeProjector<'a> {
-    retention_metadata_notifications: bool,
     backend: Option<&'a dyn DfsMetadataBackend>,
     cursor: &'a DfsNamespaceChangeCursor,
     root_path: &'a str,
@@ -383,9 +381,6 @@ fn project_namespace_change_batch(
 
     let root_path = crate::metadata_keys::normalize_posix_path(root_path);
     let projector = NamespaceChangeProjector {
-        retention_metadata_notifications: shard
-            .namespace_prepare_codec
-            .supports_retention_metadata_mutations(),
         backend,
         cursor,
         root_path: &root_path,
@@ -509,192 +504,80 @@ impl NamespaceChangeProjector<'_> {
         }
 
         match &entry.mutation {
-            DfsMetadataMutation::PutObject { path, object, .. } => {
-                let Some(object) = object else {
-                    return Ok(if path_is_relevant(path, self.root_path) {
-                        payload_rescan(entry, "put-object body is unavailable")
-                    } else {
-                        ProjectedEntry::Events(Vec::new())
-                    });
-                };
-                self.project_object(entry, 0, object, None, RequestProvenance::default())
+            DfsMetadataMutation::PrepareOperationV7 { .. } => {
+                Ok(ProjectedEntry::Events(Vec::new()))
             }
-            DfsMetadataMutation::FinalizeCrossShardSourceEviction { tombstone, .. } => {
-                self.project_object(entry, 0, tombstone, None, RequestProvenance::default())
-            }
-            DfsMetadataMutation::CommitVisibleVersion {
-                committed_object,
-                operation_id,
-                ..
-            } => {
-                let Some(object) = committed_object else {
-                    return Ok(payload_rescan(
-                        entry,
-                        "visible-version commit body is unavailable",
-                    ));
+            DfsMetadataMutation::CommitPreparedOperationV7 { digest, .. } => {
+                let Some(payload) = self.resolve_prepared_operation(digest, entry.sequence)? else {
+                    return Ok(payload_rescan(entry, "committed V7 body is unavailable"));
                 };
-                self.project_object(
-                    entry,
-                    0,
-                    object,
-                    None,
-                    RequestProvenance {
-                        operation_id: operation_id.clone(),
-                        ..RequestProvenance::default()
-                    },
-                )
-            }
-            DfsMetadataMutation::ApplyNamespaceTransaction {
-                transaction_id,
-                transaction,
-                operation_id,
-                ..
-            } => {
-                let transaction = match transaction {
-                    Some(transaction) => Cow::Borrowed(transaction),
-                    None => match self.backend {
-                        Some(backend) => match backend.get_namespace_transaction(transaction_id)? {
-                            Some(transaction) => Cow::Owned(transaction),
-                            None => {
-                                return Ok(payload_rescan(
-                                    entry,
-                                    format!(
-                                        "namespace transaction {transaction_id} is unavailable"
-                                    ),
-                                ));
-                            }
-                        },
-                        None => {
-                            return Ok(payload_rescan(
-                                entry,
-                                format!("namespace transaction {transaction_id} is not embedded"),
-                            ));
-                        }
-                    },
-                };
-                if transaction.transaction_id != *transaction_id
-                    || transaction.file_system_id != self.cursor.file_system_id
+                if digest.shard_id != self.cursor.shard_id
+                    || digest.file_system_id != self.cursor.file_system_id
+                    || digest.prepare_sequence >= entry.sequence
+                    || digest.validate_payload(&payload).is_err()
                 {
                     return Ok(payload_rescan(
                         entry,
-                        format!(
-                            "namespace transaction {transaction_id} identity does not match its journal reference"
-                        ),
+                        "V7 commit identity differs from its actual prepared body",
                     ));
                 }
-                self.project_transaction(
-                    entry,
-                    &transaction,
-                    RequestProvenance {
-                        operation_id: operation_id.clone(),
-                        ..RequestProvenance::default()
-                    },
-                )
-            }
-            DfsMetadataMutation::PutNamespacePrepare {
-                operation_id,
-                status,
-                ..
-            } => {
-                if *status != DfsNamespacePrepareStatus::Committed {
-                    return Ok(ProjectedEntry::Events(Vec::new()));
-                }
-                let prepare = match entry.mutation.namespace_prepare_payload_ref() {
-                    Ok(Some(payload)) => match payload.into_normalized_canonical() {
-                        Ok(prepare) => prepare,
-                        Err(error) => {
-                            return Ok(payload_rescan(
-                                entry,
-                                format!(
-                                    "namespace prepare {operation_id} could not be decoded: {error}"
-                                ),
-                            ));
-                        }
-                    },
-                    Ok(None) => match self.resolve_prepare(operation_id, entry.sequence)? {
-                        Some(prepare) => Cow::Owned(prepare),
-                        None => {
-                            return Ok(payload_rescan(
-                                entry,
-                                format!("namespace prepare {operation_id} is unavailable"),
-                            ));
-                        }
-                    },
-                    Err(error) => {
-                        return Ok(payload_rescan(
-                            entry,
-                            format!("namespace prepare {operation_id} payload is invalid: {error}"),
-                        ));
-                    }
+                let request = if payload.completed_request.is_none()
+                    && payload.completed_request_completion.is_none()
+                {
+                    payload
+                        .terminal_intent
+                        .as_ref()
+                        .and_then(|intent| intent.operation_id.clone())
+                        .map(|operation_id| RequestProvenance {
+                            operation_id: Some(operation_id),
+                            ..Default::default()
+                        })
+                        .unwrap_or_else(|| request_provenance(&payload))
+                } else {
+                    request_provenance(&payload)
                 };
-                self.project_committed_prepare(entry, operation_id, None, None, &prepare)
+                self.project_payload(entry, &payload, request)
             }
-            DfsMetadataMutation::CommitNamespacePrepare {
-                operation_id,
-                operation_digest,
-                owner_epoch,
-                ..
-            } => {
-                let Some(prepare) = self.resolve_prepare(operation_id, entry.sequence)? else {
-                    return Ok(payload_rescan(
-                        entry,
-                        format!("committed namespace prepare {operation_id} is unavailable"),
-                    ));
-                };
-                self.project_committed_prepare(
-                    entry,
-                    operation_id,
-                    Some(operation_digest),
-                    Some(*owner_epoch),
-                    &prepare,
-                )
-            }
-            _ => Ok(ProjectedEntry::Events(Vec::new())),
         }
     }
 
-    fn resolve_prepare(
+    fn resolve_prepared_operation(
         &self,
-        operation_id: &str,
+        digest: &crate::DfsPreparedOperationDigest,
         before_sequence: u64,
-    ) -> Result<Option<DfsNamespacePrepareRecord>> {
+    ) -> Result<Option<std::sync::Arc<crate::DfsPreparedOperationPayload>>> {
         let find = |entries: &[DfsMetadataJournalEntry]| {
-            entries
-                .iter()
-                .rev()
-                .position(|entry| {
-                    entry.shard_id == self.cursor.shard_id
-                        && entry.sequence < before_sequence
-                        && matches!(&entry.mutation, DfsMetadataMutation::PutNamespacePrepare {
-                        operation_id: id, ..
-                    } if id == operation_id)
-                })
-                .map(|reverse| entries.len() - 1 - reverse)
+            entries.iter().find_map(|entry| {
+                if entry.shard_id != digest.shard_id
+                    || entry.sequence != digest.prepare_sequence
+                    || entry.sequence >= before_sequence
+                {
+                    return None;
+                }
+                match &entry.mutation {
+                    DfsMetadataMutation::PrepareOperationV7 { record, .. }
+                        if &record.digest == digest =>
+                    {
+                        Some(std::sync::Arc::clone(&record.payload))
+                    }
+                    _ => None,
+                }
+            })
         };
-        let decode =
-            |entry: &DfsMetadataJournalEntry| -> Result<Option<DfsNamespacePrepareRecord>> {
-                entry
-                    .mutation
-                    .namespace_prepare_payload_ref()
-                    .map_err(|e| crate::MetadataBackendError::Serde(e.to_string()))?
-                    .map(|payload| payload.into_normalized_canonical().map(Cow::into_owned))
-                    .transpose()
-                    .map_err(|e| crate::MetadataBackendError::Serde(e.to_string()))
-            };
-        // A compact commit can outlive its live prepare table row. Prefer
-        // the historical body preceding it in this exact journal batch.
-        if let Some(index) = find(&self.batch.entries) {
-            return decode(&self.batch.entries[index]);
+        if let Some(payload) = find(&self.batch.entries) {
+            return Ok(Some(payload));
         }
         let Some(backend) = self.backend else {
             return Ok(None);
         };
-        if let Some(prepare) = backend.get_namespace_prepare(operation_id)? {
-            return Ok(Some(prepare));
+        if backend
+            .prepared_operation_digest(&digest.operation_id)?
+            .as_ref()
+            == Some(digest)
+            && let Some(payload) = backend.prepared_operation_payload(&digest.operation_id)?
+        {
+            return Ok(Some(payload));
         }
-        // Cover a poll boundary between prepare and commit without scanning
-        // retained history. Read one bounded exact-shard window per batch;
-        // older/compacted bodies still produce the normal rescan requirement.
         if self.prepare_lookback.borrow().is_none() {
             let prior = backend.journal_batch_for_shard_since_limited(
                 &self.cursor.shard_id,
@@ -703,42 +586,140 @@ impl NamespaceChangeProjector<'_> {
                 8 * 1024 * 1024,
             )?;
             *self.prepare_lookback.borrow_mut() =
-                Some(prior.map(|b| b.entries).unwrap_or_default());
+                Some(prior.map(|batch| batch.entries).unwrap_or_default());
         }
-        let prior = self.prepare_lookback.borrow();
-        let entries = prior.as_ref().expect("lookback initialized");
-        match find(entries) {
-            Some(index) => decode(&entries[index]),
-            None => Ok(None),
-        }
+        Ok(find(
+            self.prepare_lookback
+                .borrow()
+                .as_ref()
+                .expect("initialized lookback"),
+        ))
     }
 
-    fn project_committed_prepare(
+    fn project_payload(
         &self,
         entry: &DfsMetadataJournalEntry,
-        operation_id: &str,
-        operation_digest: Option<&String>,
-        owner_epoch: Option<u64>,
-        prepare: &DfsNamespacePrepareRecord,
+        payload: &crate::DfsPreparedOperationPayload,
+        request: RequestProvenance,
     ) -> Result<ProjectedEntry> {
-        if prepare.operation_id != operation_id
-            || prepare.file_system_id != self.cursor.file_system_id
-            || prepare.shard_id != self.cursor.shard_id
-            || !(prepare.status == DfsNamespacePrepareStatus::Committed
-                || (operation_digest.is_some()
-                    && owner_epoch.is_some()
-                    && prepare.status == DfsNamespacePrepareStatus::Prepared))
-            || operation_digest.is_some_and(|digest| digest != &prepare.operation_digest)
-            || owner_epoch.is_some_and(|epoch| epoch != prepare.owner_epoch)
-        {
-            return Ok(payload_rescan(
-                entry,
-                format!(
-                    "namespace prepare {operation_id} does not match its committed journal reference"
-                ),
-            ));
+        use crate::DfsPreparedMetadataEffect as Effect;
+        let mut transaction = payload.transaction.clone();
+        let mut revisions = std::collections::BTreeSet::new();
+        // The committed body is atomic. Project each affected path's final
+        // row, retaining the native transaction order needed for rename pairing.
+        for effect in &payload.metadata_effects {
+            match effect {
+                Effect::PutObject { object }
+                | Effect::FinalizeCrossShardSourceEviction {
+                    tombstone: object, ..
+                } => {
+                    if let Some(row) = transaction
+                        .objects
+                        .iter_mut()
+                        .find(|row| row.object_id == object.object_id)
+                    {
+                        *row = object.clone();
+                    } else {
+                        transaction.objects.push(object.clone());
+                    }
+                }
+                Effect::PutVersion { version } => {
+                    if let Some(row) = transaction.versions.iter_mut().find(|row| {
+                        row.object_id == version.object_id && row.version == version.version
+                    }) {
+                        *row = version.clone();
+                    } else {
+                        transaction.versions.push(version.clone());
+                    }
+                    revisions.insert((version.object_id.clone(), version.version.clone()));
+                }
+                Effect::ReconcileCrossShardPinTransfer { versions, .. } => {
+                    for version in versions {
+                        revisions.insert((version.object_id.clone(), version.version.clone()));
+                    }
+                }
+                Effect::PutVersionPin { pin } => {
+                    revisions.insert((pin.object_id.clone(), pin.version.clone()));
+                }
+                Effect::RemoveVersion { object_id, version }
+                | Effect::RemoveVersionPin {
+                    object_id, version, ..
+                } => {
+                    revisions.insert((object_id.clone(), version.clone()));
+                }
+                // These are hidden custody, scheduling or bookkeeping rows;
+                // they do not publish an alternative visible namespace state.
+                Effect::PutFileSystem { .. }
+                | Effect::RemoveCrossShardPinTransfer { .. }
+                | Effect::PutReceipt { .. }
+                | Effect::RemoveReceipt { .. }
+                | Effect::PutIntent { .. }
+                | Effect::RemoveRetainedRepairOwner { .. }
+                | Effect::PutIntentReceipt { .. }
+                | Effect::RemoveIntentReceipt { .. }
+                | Effect::MergeIntentReceiptRetention { .. }
+                | Effect::PutAdvisoryLockState { .. }
+                | Effect::PutNamespaceTransactionReceipt { .. }
+                | Effect::RemoveNamespaceTransactionReceipt { .. }
+                | Effect::PutNamespaceJob { .. }
+                | Effect::PutNamespaceJobReceipt { .. }
+                | Effect::RemoveNamespaceJobReceipt { .. }
+                | Effect::PutNamespaceRequest { .. }
+                | Effect::PutNamespaceRequestReceipt { .. }
+                | Effect::RemoveNamespaceRequestReceipt { .. }
+                | Effect::MergeContentReferenceOutcomeRetention { .. }
+                | Effect::RemovePreparedOperation { .. }
+                | Effect::ResolvePreparedOperation { .. } => {}
+            }
         }
-        self.project_transaction(entry, &prepare.transaction, request_provenance(prepare))
+        let mut events = match self.project_transaction(entry, &transaction, request.clone())? {
+            ProjectedEntry::Events(events) => events,
+            rescan @ ProjectedEntry::Rescan { .. } => return Ok(rescan),
+        };
+        let mut ordinal = transaction.objects.len() as u64;
+        for event in &events {
+            let provenance = match event {
+                DfsNamespaceChangeEvent::Upsert { provenance, .. }
+                | DfsNamespaceChangeEvent::Remove { provenance, .. }
+                | DfsNamespaceChangeEvent::Rename { provenance, .. }
+                | DfsNamespaceChangeEvent::RevisionMetadataChanged { provenance, .. } => provenance,
+                DfsNamespaceChangeEvent::RescanRequired { .. } => continue,
+            };
+            ordinal = ordinal.max(provenance.journal_ordinal.saturating_add(1));
+        }
+        for (object_id, version) in revisions {
+            if events.iter().any(|event| matches!(event,
+                DfsNamespaceChangeEvent::RevisionMetadataChanged { object_id: id, version: revision, .. }
+                if id == &object_id && revision == &version)) {
+                continue;
+            }
+            events.push(DfsNamespaceChangeEvent::RevisionMetadataChanged {
+                object_id,
+                version,
+                provenance: DfsNamespaceChangeProvenance {
+                    event_id: format!(
+                        "dfs-namespace-change:{}:{}:{}:{}:{ordinal}",
+                        self.cursor.file_system_id,
+                        entry.shard_id.0,
+                        self.cursor.authority_epoch,
+                        entry.sequence
+                    ),
+                    shard_id: entry.shard_id.clone(),
+                    authority_epoch: self.cursor.authority_epoch,
+                    journal_sequence: entry.sequence,
+                    journal_ordinal: ordinal,
+                    journal_created_at: entry.created_at,
+                    transaction_id: Some(transaction.transaction_id.clone()),
+                    operation_id: request.operation_id.clone(),
+                    requester_node_id: request.requester_node_id.clone(),
+                    request_id: request.request_id.clone(),
+                    created_by_event_id: None,
+                    last_modified_by_event_id: None,
+                },
+            });
+            ordinal = ordinal.saturating_add(1);
+        }
+        Ok(ProjectedEntry::Events(events))
     }
 
     fn project_transaction(
@@ -847,12 +828,6 @@ impl NamespaceChangeProjector<'_> {
         // stable. Sorting and deduplicating identities makes a pin plus a row
         // update one notification, including the final reference release.
         let mut revisions = std::collections::BTreeMap::new();
-        let v6_contribution = self.retention_metadata_notifications
-            || !transaction.extension_expectations.is_empty()
-            || transaction.contribution_digest.is_some();
-        if !v6_contribution {
-            return Vec::new();
-        }
         for version in &transaction.versions {
             let previous_data_changed =
                 transaction
@@ -1011,7 +986,7 @@ fn same_shard_rename_indices(transaction: &DfsNamespaceTransaction) -> Option<(u
     Some((0, moved_index))
 }
 
-fn request_provenance(prepare: &DfsNamespacePrepareRecord) -> RequestProvenance {
+fn request_provenance(prepare: &crate::DfsPreparedOperationPayload) -> RequestProvenance {
     if let Some(request) = prepare.completed_request.as_ref() {
         return RequestProvenance {
             // `request_id` is the caller-owned stable operation identity.
@@ -1031,9 +1006,11 @@ fn request_provenance(prepare: &DfsNamespacePrepareRecord) -> RequestProvenance 
     }
     RequestProvenance {
         operation_id: Some(
-            crate::metadata_records::namespace_prepare_journal_operation_id(&prepare.operation_id)
+            prepare
+                .journal_operation_id
+                .as_ref()
                 .unwrap_or(&prepare.operation_id)
-                .to_string(),
+                .clone(),
         ),
         ..RequestProvenance::default()
     }
@@ -1144,7 +1121,7 @@ mod tests {
     use sinomo_core::node::NodeId;
     use sinomo_core::object::{LengthMode, serde_ext as sinomo_object_serde};
 
-    use crate::control_plane::{DfsMetadataNamespacePrepareCodec, DfsMetadataShardAssignment};
+    use crate::control_plane::DfsMetadataShardAssignment;
     use crate::metadata_records::{DfsNamespaceRequestRecord, DfsNamespaceRequestStatus};
     use crate::protocol::{DfsNamespaceOperation, DfsNamespaceResult};
 
@@ -1164,7 +1141,7 @@ mod tests {
             replica_node_ids: Vec::new(),
             epoch,
             assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::Legacy,
+
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         }
     }
@@ -1195,34 +1172,67 @@ mod tests {
         }
     }
 
-    fn put_object_entry(
+    fn current_object_entries(
         shard_id: &str,
-        sequence: u64,
+        ordinal: u64,
         object: DfsObjectMetadata,
-    ) -> DfsMetadataJournalEntry {
-        DfsMetadataJournalEntry {
-            shard_id: DfsMetadataShardId::new(shard_id),
-            sequence,
-            created_at: OffsetDateTime::UNIX_EPOCH,
-            mutation: DfsMetadataMutation::PutObject {
+    ) -> Vec<DfsMetadataJournalEntry> {
+        let operation_id = format!("feed-object-{ordinal}");
+        let payload = crate::DfsPreparedOperationPayload::for_metadata_effects(
+            crate::DfsPreparedOperationScope {
                 file_system_id: object.file_system_id.clone(),
-                object_id: object.object_id.clone(),
-                path: object.path.clone(),
-                object: Some(object),
-                routing_change: None,
+                shard_id: DfsMetadataShardId::new(shard_id),
+                owner_epoch: 7,
+                operation_id: operation_id.clone(),
             },
-        }
+            Vec::new(),
+            Vec::new(),
+            vec![crate::DfsPreparedMetadataEffect::PutObject { object }],
+            OffsetDateTime::UNIX_EPOCH,
+        )
+        .unwrap();
+        let prepare_sequence = ordinal * 2 - 1;
+        let digest =
+            crate::DfsPreparedOperationDigest::at_sequence(&payload, prepare_sequence).unwrap();
+        let record = crate::DfsPreparedOperationRecord {
+            digest: digest.clone(),
+            payload: std::sync::Arc::new(payload),
+            status: crate::DfsPreparedOperationStatus::Prepared,
+            committed_entry: None,
+        };
+        vec![
+            DfsMetadataJournalEntry {
+                shard_id: digest.shard_id.clone(),
+                sequence: prepare_sequence,
+                created_at: OffsetDateTime::UNIX_EPOCH,
+                mutation: DfsMetadataMutation::PrepareOperationV7 {
+                    file_system_id: digest.file_system_id.clone(),
+                    operation_id: operation_id.clone(),
+                    record: Box::new(record),
+                },
+            },
+            DfsMetadataJournalEntry {
+                shard_id: digest.shard_id.clone(),
+                sequence: ordinal * 2,
+                created_at: OffsetDateTime::UNIX_EPOCH,
+                mutation: DfsMetadataMutation::CommitPreparedOperationV7 {
+                    file_system_id: digest.file_system_id.clone(),
+                    operation_id,
+                    digest,
+                },
+            },
+        ]
     }
 
     fn batch(
         shard_id: &str,
-        entries: Vec<DfsMetadataJournalEntry>,
-        next_after_sequence: u64,
+        entries: Vec<Vec<DfsMetadataJournalEntry>>,
+        through_ordinal: u64,
     ) -> DfsMetadataJournalBatch {
         DfsMetadataJournalBatch {
             shard_id: DfsMetadataShardId::new(shard_id),
-            entries,
-            next_after_sequence,
+            entries: entries.into_iter().flatten().collect(),
+            next_after_sequence: through_ordinal * 2,
         }
     }
 
@@ -1233,240 +1243,6 @@ mod tests {
         }
     }
 
-    fn metadata_transaction_entry(sequence: u64) -> DfsMetadataJournalEntry {
-        let source = object(
-            "semantic-feed-source",
-            "/outside-root/source",
-            DfsObjectKind::File,
-        );
-        let version = crate::DfsObjectVersionRecord {
-            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
-            file_system_id: source.file_system_id.clone(),
-            object_id: source.object_id.clone(),
-            version: source.version.clone(),
-            content_hash: source.content_hash.clone(),
-            size_bytes: source.content_size_bytes,
-            locations: source.current_locations.clone(),
-            created_by_event_id: None,
-            created_at: OffsetDateTime::UNIX_EPOCH,
-            visible: true,
-            retention: Default::default(),
-            module_metadata: std::collections::BTreeMap::from([(
-                "vendor.semantic".into(),
-                crate::DfsModuleMetadataValue {
-                    schema_version: 1,
-                    payload: serde_json::json!({"derived":true}),
-                },
-            )]),
-            content_durability: None,
-        };
-        let reference = crate::DfsMetadataVersionPinRecord {
-            namespace: Some("vendor.semantic".into()),
-            file_system_id: source.file_system_id.clone(),
-            object_id: source.object_id.clone(),
-            version: source.version.clone(),
-            pin_id: "ref/vendor.semantic/reader".into(),
-            created_at: OffsetDateTime::UNIX_EPOCH,
-        };
-        let transaction = DfsNamespaceTransaction {
-            content_reference_identity: None,
-            contribution_digest: None,
-            extension_expectations: Vec::new(),
-            transaction_id: "semantic-feed-transaction".into(),
-            file_system_id: source.file_system_id.clone(),
-            objects: Vec::new(),
-            versions: vec![version],
-            file_version_pins: Some(crate::DfsFileVersionPinMutation {
-                add: Vec::new(),
-                remove: vec![reference],
-            }),
-            advisory_lock_states: Vec::new(),
-            created_at: OffsetDateTime::UNIX_EPOCH,
-        };
-        DfsMetadataJournalEntry {
-            shard_id: DfsMetadataShardId::new("root"),
-            sequence,
-            created_at: OffsetDateTime::UNIX_EPOCH,
-            mutation: DfsMetadataMutation::ApplyNamespaceTransaction {
-                file_system_id: transaction.file_system_id.clone(),
-                transaction_id: transaction.transaction_id.clone(),
-                object_count: 0,
-                operation_id: Some("release-and-update-metadata".into()),
-                transaction: Some(transaction),
-            },
-        }
-    }
-
-    #[test]
-    fn committed_revision_and_reference_changes_have_one_durable_identity_event() {
-        let mut shard = shard_config("root", 7);
-        shard.namespace_prepare_codec = crate::DfsMetadataNamespacePrepareCodec::PackedV6;
-        let cursor = DfsNamespaceChangeCursor::from_shard_config(&shard, 0);
-        let journal = batch("root", vec![metadata_transaction_entry(1)], 1);
-        let projected = project_dfs_namespace_change_batch(&cursor, &shard, "/docs", &journal);
-        assert_eq!(projected.next_cursor.after_sequence, 1);
-        let [
-            DfsNamespaceChangeEvent::RevisionMetadataChanged {
-                object_id,
-                version,
-                provenance,
-            },
-        ] = projected.events.as_slice()
-        else {
-            panic!(
-                "one shard-scoped identity notification expected: {:?}",
-                projected.events
-            );
-        };
-        assert_eq!(object_id, &id("semantic-feed-source"));
-        assert_eq!(version, &id("semantic-feed-source-version"));
-        assert_eq!(provenance.journal_sequence, 1);
-        assert_eq!(provenance.journal_ordinal, 0);
-        assert_eq!(provenance.authority_epoch, 7);
-        assert_eq!(
-            provenance.operation_id.as_deref(),
-            Some("release-and-update-metadata")
-        );
-        assert_eq!(
-            provenance.transaction_id.as_deref(),
-            Some("semantic-feed-transaction")
-        );
-        let restarted: DfsNamespaceChangeCursor =
-            serde_json::from_slice(&serde_json::to_vec(&projected.next_cursor).unwrap()).unwrap();
-        assert!(
-            project_dfs_namespace_change_batch(&restarted, &shard, "/docs", &journal)
-                .events
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn empty_ordinary_v6_revisions_use_existing_namespace_events() {
-        let mut entry = metadata_transaction_entry(1);
-        let DfsMetadataMutation::ApplyNamespaceTransaction {
-            transaction: Some(transaction),
-            ..
-        } = &mut entry.mutation
-        else {
-            unreachable!()
-        };
-        transaction.versions[0].module_metadata.clear();
-        transaction.file_version_pins = None;
-        transaction.objects.push(object(
-            "semantic-feed-source",
-            "/docs/source",
-            DfsObjectKind::File,
-        ));
-        let mut shard = shard_config("root", 7);
-        shard.namespace_prepare_codec = crate::DfsMetadataNamespacePrepareCodec::PackedV6;
-        let cursor = DfsNamespaceChangeCursor::from_shard_config(&shard, 0);
-        let projected = project_dfs_namespace_change_batch(
-            &cursor,
-            &shard,
-            "/docs",
-            &batch("root", vec![entry], 1),
-        );
-        assert!(
-            matches!(
-                projected.events.as_slice(),
-                [DfsNamespaceChangeEvent::Upsert { .. }]
-            ),
-            "ordinary empty extension data does not enqueue a revision cleanup task"
-        );
-    }
-
-    #[test]
-    fn removal_of_the_final_opaque_metadata_value_remains_visible() {
-        let mut entry = metadata_transaction_entry(1);
-        let DfsMetadataMutation::ApplyNamespaceTransaction {
-            transaction: Some(transaction),
-            ..
-        } = &mut entry.mutation
-        else {
-            unreachable!()
-        };
-        let previous = transaction.versions[0].clone();
-        transaction.versions[0].module_metadata.clear();
-        transaction.file_version_pins = None;
-        transaction
-            .extension_expectations
-            .push(crate::DfsRevisionMetadataExpectation {
-                object_id: previous.object_id.clone(),
-                version: previous.version.clone(),
-                expected: Some(Box::new(previous)),
-            });
-        let mut shard = shard_config("root", 7);
-        shard.namespace_prepare_codec = crate::DfsMetadataNamespacePrepareCodec::PackedV6;
-        let cursor = DfsNamespaceChangeCursor::from_shard_config(&shard, 0);
-        let projected = project_dfs_namespace_change_batch(
-            &cursor,
-            &shard,
-            "/",
-            &batch("root", vec![entry], 1),
-        );
-        assert!(matches!(
-            projected.events.as_slice(),
-            [DfsNamespaceChangeEvent::RevisionMetadataChanged { .. }]
-        ));
-    }
-
-    #[test]
-    fn v6_release_of_a_legacy_reference_is_a_metadata_event() {
-        let mut entry = metadata_transaction_entry(1);
-        let DfsMetadataMutation::ApplyNamespaceTransaction {
-            transaction: Some(transaction),
-            ..
-        } = &mut entry.mutation
-        else {
-            unreachable!()
-        };
-        transaction.versions.clear();
-        let pin = &mut transaction.file_version_pins.as_mut().unwrap().remove[0];
-        pin.namespace = None;
-        pin.pin_id = "reader".into();
-        let mut shard = shard_config("root", 7);
-        let cursor = DfsNamespaceChangeCursor::from_shard_config(&shard, 0);
-        let journal = batch("root", vec![entry], 1);
-        let old = project_dfs_namespace_change_batch(&cursor, &shard, "/", &journal);
-        assert!(
-            old.events.is_empty(),
-            "old codec does not publish a new event schema"
-        );
-        shard.namespace_prepare_codec = crate::DfsMetadataNamespacePrepareCodec::PackedV6;
-        let upgraded = project_dfs_namespace_change_batch(&cursor, &shard, "/", &journal);
-        assert!(matches!(
-            upgraded.events.as_slice(),
-            [DfsNamespaceChangeEvent::RevisionMetadataChanged { .. }]
-        ));
-        assert_eq!(upgraded.next_cursor.after_sequence, 1);
-    }
-
-    #[test]
-    fn metadata_only_notifications_do_not_escape_a_gap_or_epoch_fence() {
-        let mut shard = shard_config("root", 7);
-        shard.namespace_prepare_codec = crate::DfsMetadataNamespacePrepareCodec::PackedV6;
-        let cursor = DfsNamespaceChangeCursor::from_shard_config(&shard, 0);
-        let journal = batch(
-            "root",
-            vec![metadata_transaction_entry(1), metadata_transaction_entry(3)],
-            3,
-        );
-        let gap = project_dfs_namespace_change_batch(&cursor, &shard, "/", &journal);
-        assert_eq!(
-            rescan_reason(&gap),
-            &DfsNamespaceRescanReason::JournalCompactionGap
-        );
-        assert_eq!(gap.next_cursor, cursor);
-        let mut changed = shard.clone();
-        changed.epoch += 1;
-        let epoch = project_dfs_namespace_change_batch(&cursor, &changed, "/", &journal);
-        assert_eq!(
-            rescan_reason(&epoch),
-            &DfsNamespaceRescanReason::AuthorityEpochChanged
-        );
-        assert_eq!(epoch.next_cursor, cursor);
-    }
-
     #[test]
     fn namespace_change_cursor_restart_replays_no_events_and_keeps_canonical_order() {
         let shard = shard_config("root", 7);
@@ -1474,8 +1250,8 @@ mod tests {
         let first_journal_batch = batch(
             "root",
             vec![
-                put_object_entry("root", 1, object("alpha", "/docs/a", DfsObjectKind::File)),
-                put_object_entry("root", 2, object("beta", "/docs/b", DfsObjectKind::File)),
+                current_object_entries("root", 1, object("alpha", "/docs/a", DfsObjectKind::File)),
+                current_object_entries("root", 2, object("beta", "/docs/b", DfsObjectKind::File)),
             ],
             2,
         );
@@ -1483,7 +1259,7 @@ mod tests {
         let first =
             project_dfs_namespace_change_batch(&cursor, &shard, "/docs", &first_journal_batch);
         assert!(!first.rescan_required());
-        assert_eq!(first.next_cursor.after_sequence, 2);
+        assert_eq!(first.next_cursor.after_sequence, 4);
         assert_eq!(first.events.len(), 2);
         let event_ids = first
             .events
@@ -1496,8 +1272,8 @@ mod tests {
         assert_eq!(
             event_ids,
             vec![
-                format!("dfs-namespace-change:{}:root:7:1:0", cursor.file_system_id),
-                format!("dfs-namespace-change:{}:root:7:2:0", cursor.file_system_id)
+                format!("dfs-namespace-change:{}:root:7:2:0", cursor.file_system_id),
+                format!("dfs-namespace-change:{}:root:7:4:0", cursor.file_system_id)
             ]
         );
 
@@ -1519,7 +1295,7 @@ mod tests {
             "/docs",
             &batch(
                 "root",
-                vec![put_object_entry(
+                vec![current_object_entries(
                     "root",
                     3,
                     object("gamma", "/docs/c", DfsObjectKind::File),
@@ -1528,188 +1304,7 @@ mod tests {
             ),
         );
         assert_eq!(next.events.len(), 1);
-        assert_eq!(next.next_cursor.after_sequence, 3);
-    }
-
-    #[test]
-    fn stable_create_and_visible_commit_keep_exact_operation_provenance_after_restart() {
-        let shard = shard_config("root", 7);
-        let cursor = DfsNamespaceChangeCursor::from_shard_config(&shard, 0);
-        let created = object("stable-feed-object", "/docs/stable", DfsObjectKind::File);
-        let transaction = DfsNamespaceTransaction {
-            content_reference_identity: None,
-            contribution_digest: None,
-            extension_expectations: Vec::new(),
-            file_version_pins: None,
-            transaction_id: "stable-feed-create-transaction".to_string(),
-            file_system_id: cursor.file_system_id.clone(),
-            objects: vec![created.clone()],
-            versions: Vec::new(),
-            advisory_lock_states: Vec::new(),
-            created_at: OffsetDateTime::UNIX_EPOCH,
-        };
-        let mut updated = created.clone();
-        updated.version = id("stable-feed-updated-version");
-        updated.content_hash = Some("blake3:stable-feed-updated".to_string());
-        let routed_operation_id = "cf_01k00000000000000000000002";
-        let routed_created = object(
-            "stable-routed-feed-object",
-            "/docs/stable-routed",
-            DfsObjectKind::Directory,
-        );
-        let routed_transaction = DfsNamespaceTransaction {
-            content_reference_identity: None,
-            contribution_digest: None,
-            extension_expectations: Vec::new(),
-            file_version_pins: None,
-            transaction_id: "stable-routed-feed-create-transaction".to_string(),
-            file_system_id: cursor.file_system_id.clone(),
-            objects: vec![routed_created],
-            versions: Vec::new(),
-            advisory_lock_states: Vec::new(),
-            created_at: OffsetDateTime::UNIX_EPOCH,
-        };
-        let routed_request = DfsNamespaceRequestRecord {
-            file_system_id: cursor.file_system_id.clone(),
-            requester_node_id: node("stable-routed-feed-requester"),
-            request_id: routed_operation_id.to_string(),
-            operation_id: "req-internal-requester-qualified-key".to_string(),
-            authority_shard_id: cursor.shard_id.clone(),
-            operation: DfsNamespaceOperation::Mkdir {
-                path: "/docs/stable-routed".to_string(),
-            },
-            command_digest: "blake3:stable-routed-feed-command".to_string(),
-            status: DfsNamespaceRequestStatus::Completed,
-            result: Some(DfsNamespaceResult::Applied),
-            posix_coordination_result: None,
-            recovery_attempts: 0,
-            last_recovery_error: None,
-            created_at: OffsetDateTime::UNIX_EPOCH,
-            updated_at: OffsetDateTime::UNIX_EPOCH,
-        };
-        let routed_prepare = DfsNamespacePrepareRecord {
-            operation_id: routed_request.operation_id.clone(),
-            file_system_id: cursor.file_system_id.clone(),
-            shard_id: cursor.shard_id.clone(),
-            owner_epoch: shard.epoch,
-            operation_digest: "blake3:stable-routed-feed-prepare".to_string(),
-            expected_object_versions: Vec::new(),
-            expected_path_occupants: Vec::new(),
-            content_receipts: Vec::new(),
-            transaction: routed_transaction,
-            completed_request: Some(routed_request),
-            completed_request_completion: None,
-            status: DfsNamespacePrepareStatus::Committed,
-        };
-        let coordinated_operation_id = "cf_01k00000000000000000000003";
-        let coordinated_transaction = DfsNamespaceTransaction {
-            content_reference_identity: None,
-            contribution_digest: None,
-            extension_expectations: Vec::new(),
-            file_version_pins: None,
-            transaction_id: "stable-coordinated-feed-transaction".to_string(),
-            file_system_id: cursor.file_system_id.clone(),
-            objects: vec![object(
-                "stable-coordinated-feed-object",
-                "/docs/stable-coordinated",
-                DfsObjectKind::File,
-            )],
-            versions: Vec::new(),
-            advisory_lock_states: Vec::new(),
-            created_at: OffsetDateTime::UNIX_EPOCH,
-        };
-        let coordinated_prepare = DfsNamespacePrepareRecord {
-            operation_id:
-                crate::metadata_records::namespace_prepare_operation_id_with_journal_provenance(
-                    coordinated_operation_id,
-                    &coordinated_transaction.transaction_id,
-                ),
-            file_system_id: cursor.file_system_id.clone(),
-            shard_id: cursor.shard_id.clone(),
-            owner_epoch: shard.epoch,
-            operation_digest: "blake3:stable-coordinated-feed-prepare".to_string(),
-            expected_object_versions: Vec::new(),
-            expected_path_occupants: Vec::new(),
-            content_receipts: Vec::new(),
-            transaction: coordinated_transaction,
-            completed_request: None,
-            completed_request_completion: None,
-            status: DfsNamespacePrepareStatus::Committed,
-        };
-        let entries = vec![
-            DfsMetadataJournalEntry {
-                shard_id: cursor.shard_id.clone(),
-                sequence: 1,
-                created_at: OffsetDateTime::UNIX_EPOCH,
-                mutation: DfsMetadataMutation::ApplyNamespaceTransaction {
-                    file_system_id: cursor.file_system_id.clone(),
-                    transaction_id: transaction.transaction_id.clone(),
-                    object_count: transaction.objects.len(),
-                    operation_id: Some("cf_01k00000000000000000000000".to_string()),
-                    transaction: Some(transaction),
-                },
-            },
-            DfsMetadataJournalEntry {
-                shard_id: cursor.shard_id.clone(),
-                sequence: 2,
-                created_at: OffsetDateTime::UNIX_EPOCH,
-                mutation: DfsMetadataMutation::CommitVisibleVersion {
-                    file_system_id: cursor.file_system_id.clone(),
-                    object_id: updated.object_id.clone(),
-                    previous_version: created.version,
-                    committed_version: updated.version.clone(),
-                    operation_id: Some("cf_01k00000000000000000000001".to_string()),
-                    committed_object: Some(updated),
-                    routing_change: None,
-                    visible_version: None,
-                    required_replica_node_ids: Vec::new(),
-                },
-            },
-            DfsMetadataJournalEntry {
-                shard_id: cursor.shard_id.clone(),
-                sequence: 3,
-                created_at: OffsetDateTime::UNIX_EPOCH,
-                mutation: DfsMetadataMutation::put_namespace_prepare(&routed_prepare),
-            },
-            DfsMetadataJournalEntry {
-                shard_id: cursor.shard_id.clone(),
-                sequence: 4,
-                created_at: OffsetDateTime::UNIX_EPOCH,
-                mutation: DfsMetadataMutation::put_namespace_prepare(&coordinated_prepare),
-            },
-        ];
-        let restarted_entries: Vec<DfsMetadataJournalEntry> =
-            serde_json::from_slice(&serde_json::to_vec(&entries).expect("persist journal entries"))
-                .expect("reopen journal entries");
-
-        let projected = project_dfs_namespace_change_batch(
-            &cursor,
-            &shard,
-            "/docs",
-            &batch("root", restarted_entries, 4),
-        );
-        let operation_ids = projected
-            .events
-            .iter()
-            .map(|event| match event {
-                DfsNamespaceChangeEvent::Upsert { provenance, .. }
-                | DfsNamespaceChangeEvent::Remove { provenance, .. }
-                | DfsNamespaceChangeEvent::Rename { provenance, .. }
-                | DfsNamespaceChangeEvent::RevisionMetadataChanged { provenance, .. } => {
-                    provenance.operation_id.as_deref()
-                }
-                DfsNamespaceChangeEvent::RescanRequired { .. } => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            operation_ids,
-            vec![
-                Some("cf_01k00000000000000000000000"),
-                Some("cf_01k00000000000000000000001"),
-                Some(routed_operation_id),
-                Some(coordinated_operation_id),
-            ]
-        );
+        assert_eq!(next.next_cursor.after_sequence, 6);
     }
 
     #[test]
@@ -1722,7 +1317,7 @@ mod tests {
             "/docs",
             &batch(
                 "root",
-                vec![put_object_entry(
+                vec![current_object_entries(
                     "root",
                     2,
                     object("gap-object", "/docs/gap", DfsObjectKind::File),
@@ -1742,7 +1337,7 @@ mod tests {
     #[test]
     fn namespace_change_cursor_epoch_or_shard_change_requires_rescan() {
         let shard = shard_config("root", 7);
-        let cursor = DfsNamespaceChangeCursor::from_shard_config(&shard, 4);
+        let cursor = DfsNamespaceChangeCursor::from_shard_config(&shard, 8);
 
         let mut newer_epoch = shard.clone();
         newer_epoch.epoch = 8;
@@ -1773,231 +1368,6 @@ mod tests {
     }
 
     #[test]
-    fn same_shard_rename_projects_one_canonical_event() {
-        let shard = shard_config("root", 7);
-        let cursor = DfsNamespaceChangeCursor::from_shard_config(&shard, 0);
-        let mut old_path = object("old-path-marker", "/docs/old", DfsObjectKind::Tombstone);
-        old_path.content_hash = None;
-        old_path.content_size_bytes = None;
-        let moved = object("moved-object", "/docs/new", DfsObjectKind::File);
-        let mut replaced = object("replaced-object", "/docs/new", DfsObjectKind::Tombstone);
-        replaced.content_hash = None;
-        replaced.content_size_bytes = None;
-        let transaction = DfsNamespaceTransaction {
-            content_reference_identity: None,
-            contribution_digest: None,
-            extension_expectations: Vec::new(),
-            file_version_pins: None,
-            transaction_id: namespace_transaction_id_for_versioned_path(
-                "rename",
-                &moved.object_id,
-                &moved.version,
-                &moved.path,
-            ),
-            file_system_id: cursor.file_system_id.clone(),
-            objects: vec![old_path, moved.clone(), replaced],
-            versions: Vec::new(),
-            advisory_lock_states: Vec::new(),
-            created_at: OffsetDateTime::UNIX_EPOCH,
-        };
-        let mut legacy = transaction.clone();
-        legacy.transaction_id =
-            namespace_transaction_id_for_path("rename", &moved.object_id, &moved.path);
-        assert_eq!(
-            same_shard_rename_indices(&legacy),
-            Some((0, 1)),
-            "old journal entries retain their semantic projection"
-        );
-        let journal_batch = batch(
-            "root",
-            vec![DfsMetadataJournalEntry {
-                shard_id: cursor.shard_id.clone(),
-                sequence: 1,
-                created_at: OffsetDateTime::UNIX_EPOCH,
-                mutation: DfsMetadataMutation::ApplyNamespaceTransaction {
-                    file_system_id: cursor.file_system_id.clone(),
-                    transaction_id: transaction.transaction_id.clone(),
-                    object_count: transaction.objects.len(),
-                    operation_id: None,
-                    transaction: Some(transaction),
-                },
-            }],
-            1,
-        );
-
-        let projected =
-            project_dfs_namespace_change_batch(&cursor, &shard, "/docs", &journal_batch);
-        assert_eq!(projected.events.len(), 1);
-        match &projected.events[0] {
-            DfsNamespaceChangeEvent::Rename {
-                from_path,
-                to_path,
-                object_id,
-                version,
-                ..
-            } => {
-                assert_eq!(from_path, "/docs/old");
-                assert_eq!(to_path, "/docs/new");
-                assert_eq!(object_id, &moved.object_id);
-                assert_eq!(version, &moved.version);
-            }
-            event => panic!("expected one rename event, got {event:?}"),
-        }
-        assert_eq!(projected.next_cursor.after_sequence, 1);
-    }
-
-    #[test]
-    fn compact_commit_projects_a_pruned_prepare_across_poll_boundary() {
-        let root = sinomo_testdir::TestDir::new("namespace-feed-pruned-prepare");
-        let shard = shard_config("root", 7);
-        let mut backend =
-            crate::LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.path())
-                .unwrap();
-        backend
-            .put_file_system(&crate::DfsFileSystem {
-                metadata_format: crate::DfsRevisionMetadataFormat::Legacy,
-                retention_policies: Default::default(),
-                module_metadata: Default::default(),
-                file_system_id: shard.file_system_id.clone(),
-                display_name: "namespace feed".into(),
-                owner_node_id: shard.primary_node_id.clone(),
-                subtree_policies: vec![],
-            })
-            .unwrap();
-        let original = object("deleted-feed-object", "/docs/deleted", DfsObjectKind::File);
-        backend.put_object(&original).unwrap();
-        let mut removed = original.clone();
-        removed.kind = DfsObjectKind::Tombstone;
-        removed.content_hash = None;
-        removed.content_size_bytes = None;
-        removed.current_locations.clear();
-        removed.version = id("deleted-feed-version");
-        let mut prepare = DfsNamespacePrepareRecord {
-            operation_id: "pruned-feed-prepare".into(),
-            file_system_id: shard.file_system_id.clone(),
-            shard_id: DfsMetadataShardId::new("root"),
-            owner_epoch: shard.epoch,
-            operation_digest: String::new(),
-            expected_object_versions: vec![crate::DfsNamespaceObjectVersionExpectation {
-                object_id: original.object_id.clone(),
-                expected_version: Some(original.version),
-            }],
-            expected_path_occupants: vec![crate::DfsNamespacePathOccupantExpectation {
-                path: original.path.clone(),
-                expected_object_id: Some(original.object_id.clone()),
-            }],
-            content_receipts: vec![],
-            transaction: DfsNamespaceTransaction {
-                content_reference_identity: None,
-                contribution_digest: None,
-                extension_expectations: Vec::new(),
-                transaction_id: "namespace_unlink_pruned_feed".into(),
-                file_system_id: shard.file_system_id.clone(),
-                objects: vec![removed],
-                versions: vec![],
-                advisory_lock_states: vec![],
-                file_version_pins: None,
-                created_at: OffsetDateTime::UNIX_EPOCH,
-            },
-            completed_request: None,
-            completed_request_completion: None,
-            status: DfsNamespacePrepareStatus::Prepared,
-        };
-        prepare.operation_digest =
-            crate::service_replica::metadata_namespace_prepare_payload_digest(&prepare).unwrap();
-        let prepared = backend.prepare_namespace_transaction(&prepare).unwrap();
-        let cursor = DfsNamespaceChangeCursor::from_shard_config(&shard, prepared.sequence);
-        backend
-            .commit_prepared_namespace_transaction(
-                &prepare.operation_id,
-                &prepare.operation_digest,
-                prepare.owner_epoch,
-            )
-            .unwrap();
-        assert!(
-            backend
-                .get_namespace_prepare(&prepare.operation_id)
-                .unwrap()
-                .is_none(),
-            "commit prunes the live prepare body"
-        );
-        let changes = poll_dfs_namespace_changes(&backend, &cursor, &shard, "/").unwrap();
-        assert!(!changes.rescan_required(), "{changes:?}");
-        assert!(changes.events.iter().any(|e| matches!(e, DfsNamespaceChangeEvent::Remove { object_id, .. } if object_id == &original.object_id)));
-
-        let entries = backend.journal_since(0).unwrap();
-        let mut journal = batch("root", entries, changes.next_cursor.after_sequence);
-        let from_start = DfsNamespaceChangeCursor::from_shard_config(&shard, 0);
-        assert!(
-            !project_dfs_namespace_change_batch(&from_start, &shard, "/", &journal)
-                .rescan_required()
-        );
-        for entry in &mut journal.entries {
-            if let DfsMetadataMutation::CommitNamespacePrepare {
-                operation_digest, ..
-            } = &mut entry.mutation
-            {
-                *operation_digest = "blake3:wrong-commit".into();
-            }
-        }
-        assert!(
-            project_dfs_namespace_change_batch(&from_start, &shard, "/", &journal)
-                .rescan_required(),
-            "a historical body cannot bypass the commit digest fence"
-        );
-    }
-
-    #[test]
-    fn prepared_namespace_state_is_not_exposed_as_a_change() {
-        let shard = shard_config("root", 7);
-        let cursor = DfsNamespaceChangeCursor::from_shard_config(&shard, 0);
-        let prepare = DfsNamespacePrepareRecord {
-            operation_id: "internal-prepare".to_string(),
-            file_system_id: cursor.file_system_id.clone(),
-            shard_id: cursor.shard_id.clone(),
-            owner_epoch: cursor.authority_epoch,
-            operation_digest: "blake3:internal-prepare".to_string(),
-            expected_object_versions: Vec::new(),
-            expected_path_occupants: Vec::new(),
-            content_receipts: Vec::new(),
-            transaction: DfsNamespaceTransaction {
-                content_reference_identity: None,
-                contribution_digest: None,
-                extension_expectations: Vec::new(),
-                file_version_pins: None,
-                transaction_id: "internal-transaction".to_string(),
-                file_system_id: cursor.file_system_id.clone(),
-                objects: vec![object(
-                    "hidden-object",
-                    "/docs/hidden-until-commit",
-                    DfsObjectKind::File,
-                )],
-                versions: Vec::new(),
-                advisory_lock_states: Vec::new(),
-                created_at: OffsetDateTime::UNIX_EPOCH,
-            },
-            completed_request: None,
-            completed_request_completion: None,
-            status: DfsNamespacePrepareStatus::Prepared,
-        };
-        let journal_batch = batch(
-            "root",
-            vec![DfsMetadataJournalEntry {
-                shard_id: cursor.shard_id.clone(),
-                sequence: 1,
-                created_at: OffsetDateTime::UNIX_EPOCH,
-                mutation: DfsMetadataMutation::put_namespace_prepare(&prepare),
-            }],
-            1,
-        );
-
-        let projected =
-            project_dfs_namespace_change_batch(&cursor, &shard, "/docs", &journal_batch);
-        assert!(projected.events.is_empty());
-        assert_eq!(projected.next_cursor.after_sequence, 1);
-    }
-
-    #[test]
     fn cross_shard_source_eviction_never_projects_a_false_remove() {
         let shard = shard_config("source", 7);
         let cursor = DfsNamespaceChangeCursor::from_shard_config(&shard, 0);
@@ -2018,7 +1388,11 @@ mod tests {
             &cursor,
             &shard,
             "/docs",
-            &batch("source", vec![put_object_entry("source", 1, eviction)], 1),
+            &batch(
+                "source",
+                vec![current_object_entries("source", 1, eviction)],
+                1,
+            ),
         );
 
         assert_eq!(

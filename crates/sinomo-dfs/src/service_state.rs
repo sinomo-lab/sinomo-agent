@@ -23,16 +23,15 @@ use crate::metadata_keys::normalize_posix_path as normalize_metadata_posix_path;
 use crate::posix_path::parent_posix_path;
 use crate::transfer::{PendingNetworkedRead, PendingNetworkedWrite};
 use crate::{
-    DfsBulkReadItemResponse, DfsConflictRecord, DfsConflictStatus, DfsControlPlaneKvClient,
-    DfsDistributedWriteCommand, DfsDistributedWriteResult, DfsError, DfsFileSystemConfig,
-    DfsFileSystemId, DfsMessageResponse, DfsMetadataBackend, DfsMetadataShardConfig,
-    DfsMetadataShardId, DfsMetadataStore, DfsNamespaceRequestRecord, DfsNamespaceResult,
-    DfsObjectId, DfsObjectMetadata, DfsOutboundAttachment, DfsPendingNamespaceRequestPageCursor,
-    DfsPosixCoordinationResult, DfsReadData, DfsReadRangeData, DfsReadResult,
-    DfsRepairAttemptRecord, DfsStableNamespaceOperationReconciliation,
-    DfsStableWriteOperationReconciliation, DfsVersion, DistributedEventualCoordinator,
-    DistributedRepairJob, LocalContentStore, ObjectVersionReader, ResidentLocalMetadataShardLease,
-    ResidentLocalShardedMetadataBackendLease,
+    DfsBulkReadItemResponse, DfsControlPlaneKvClient, DfsDistributedWriteCommand,
+    DfsDistributedWriteResult, DfsError, DfsFileSystemConfig, DfsFileSystemId, DfsMessageResponse,
+    DfsMetadataBackend, DfsMetadataShardConfig, DfsMetadataShardId, DfsMetadataStore,
+    DfsNamespaceRequestRecord, DfsNamespaceResult, DfsObjectId, DfsObjectMetadata,
+    DfsOutboundAttachment, DfsPendingNamespaceRequestPageCursor, DfsPosixCoordinationResult,
+    DfsReadData, DfsReadRangeData, DfsReadResult, DfsRepairAttemptRecord,
+    DfsStableNamespaceOperationReconciliation, DfsStableWriteOperationReconciliation, DfsVersion,
+    DistributedEventualCoordinator, DistributedRepairJob, LocalContentStore, ObjectVersionReader,
+    ResidentLocalMetadataShardLease, ResidentLocalShardedMetadataBackendLease,
 };
 
 pub(crate) const DFS_REMOTE_READ_RETRY_DELAY: Duration = Duration::from_secs(1);
@@ -40,10 +39,6 @@ pub(crate) const DFS_METADATA_HYDRATE_OBJECT_PAGE_SIZE: usize = 4096;
 pub(crate) const DFS_METADATA_OBJECT_VERSION_PAGE_SIZE: usize = 1024;
 pub(crate) const DFS_METADATA_OBJECT_INTENT_PAGE_SIZE: usize = 1024;
 pub(crate) const DFS_METADATA_OBJECT_RECEIPT_PAGE_SIZE: usize = 1024;
-#[cfg(not(test))]
-pub(crate) const DFS_CONFLICT_SCAN_PAGE_SIZE: usize = 1024;
-#[cfg(test)]
-pub(crate) const DFS_CONFLICT_SCAN_PAGE_SIZE: usize = 2;
 
 pub(crate) const DFS_DEFERRED_PARENT_TOUCH_DRAIN_LIMIT: usize = 8;
 
@@ -495,6 +490,15 @@ pub struct NetworkedDfsService<T> {
         BTreeMap<String, DfsStableNamespaceOperationReconciliation>,
     pub(crate) stable_namespace_reconciliation_targets: BTreeMap<String, NodeId>,
     pub(crate) namespace_execution: DfsNamespaceExecution,
+    pub(crate) remote_namespace_phase: Option<Box<crate::source_adoption::RemoteNamespacePhase>>,
+    /// SAME durable request retained across the existing host's remote-phase yield.
+    pub(crate) pending_namespace_request_recovery: Option<Box<crate::DfsNamespaceRequestRecord>>,
+    pub(crate) completed_remote_namespace_phases: BTreeMap<String, PendingRoutedNamespaceResult>,
+    pub(crate) prepared_remote_sources:
+        BTreeMap<String, crate::source_adoption::PreparedSourceAdoption>,
+    pub(crate) publication_execution: crate::publication_guard::DfsPublicationContextSlot,
+    pub(crate) publication_provider: crate::publication_guard::DfsPublicationProviderSlot,
+    pub(crate) source_adoption: crate::publication_guard::DfsSourceAdoptionContextSlot,
     /// In-memory round-robin cursor for bounded pending-request maintenance.
     /// Durable request status remains the recovery source of truth.
     pub(crate) pending_namespace_request_recovery_cursor:
@@ -534,14 +538,12 @@ pub struct DfsMessageProcessResult {
 /// delivery fails. The daemon consumes these coalesced bits before unwrapping
 /// an operation outcome, so every durable edge retains an owner.
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
-#[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct DfsCommittedWork {
     pub publish_metadata: bool,
     pub repair_maintenance: bool,
     pub namespace_maintenance: bool,
-    /// Durable namespace changes that semantic consumers can replay. The legacy
-    /// serialized key preserves outstanding mounted mutation receipts.
-    #[serde(rename = "attachment_cleanup", alias = "semantic_changes")]
+    /// Durable namespace changes that semantic consumers can replay.
     pub semantic_changes: bool,
     pub metadata_replica_progress: bool,
     /// A replica ACK advanced the durable journal beyond its rebuildable table
@@ -652,24 +654,6 @@ pub enum NetworkedDfsWriteOutcome {
         durable_receipts: usize,
         required_receipts: usize,
     },
-    Conflict {
-        conflict: DfsConflictRecord,
-    },
-}
-
-/// Lightweight conflict view returned by read paths when the authoritative
-/// version cannot be selected without explicit conflict resolution.
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct DfsConflictReadView {
-    pub conflict_id: String,
-    pub base_version: Option<DfsVersion>,
-    pub local_version: DfsVersion,
-    pub remote_version: DfsVersion,
-    pub detected_by_node_id: NodeId,
-    pub reason: String,
-    pub local_content_hash: Option<String>,
-    pub remote_content_hash: Option<String>,
-    pub status: DfsConflictStatus,
 }
 
 /// Result of a full-object networked read, including freshness information for
@@ -691,12 +675,6 @@ pub enum NetworkedDfsReadOutcome {
         version: DfsVersion,
         content_hash: Option<String>,
         current_locations: Vec<NodeId>,
-    },
-    Conflicted {
-        object_id: DfsObjectId,
-        visible_version: DfsVersion,
-        visible_content_hash: Option<String>,
-        conflicts: Vec<DfsConflictReadView>,
     },
     NotFound,
 }
@@ -721,12 +699,6 @@ pub enum NetworkedDfsRangeReadOutcome {
         content_hash: Option<String>,
         current_locations: Vec<NodeId>,
     },
-    Conflicted {
-        object_id: DfsObjectId,
-        visible_version: DfsVersion,
-        visible_content_hash: Option<String>,
-        conflicts: Vec<DfsConflictReadView>,
-    },
     NotFound,
 }
 
@@ -745,14 +717,12 @@ pub(crate) struct NetworkedDfsRangeReadStream {
 pub(crate) enum NetworkedDfsReadStreamOutcome {
     Found(NetworkedDfsReadStream),
     PendingReplication,
-    Conflicted { conflicts: Vec<DfsConflictReadView> },
     NotFound,
 }
 
 pub(crate) enum NetworkedDfsRangeReadStreamOutcome {
     Found(NetworkedDfsRangeReadStream),
     PendingReplication,
-    Conflicted { conflicts: Vec<DfsConflictReadView> },
     NotFound,
 }
 
@@ -760,6 +730,7 @@ pub(crate) enum NetworkedDfsRangeReadStreamOutcome {
 pub(crate) struct StageBlobSendOutcome {
     pub(crate) sent: bool,
     pub(crate) last_error: Option<String>,
+    pub(crate) delivery_state: Option<sinomo_core::network::NetworkDeliveryState>,
 }
 
 /// Freshness classification for read data returned by a networked DFS service.
@@ -797,9 +768,6 @@ pub enum DfsConfirmedTimeoutOutcome {
     Aborted {
         intent_id: String,
     },
-    Conflict {
-        conflict: DfsConflictRecord,
-    },
     Downgraded(NetworkedDfsWriteOutcome),
 }
 
@@ -810,52 +778,10 @@ pub struct DfsReconnectReconciliation {
     pub refreshed_receipts: usize,
     #[serde(default)]
     pub ignored_divergent_manifests: usize,
-    pub conflicts: Vec<DfsConflictRecord>,
     pub missing_current: bool,
 }
 
 /// Result of trying to transfer local-owned object authority to a new owner.
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub enum DfsOwnerHandoffOutcome {
-    Transferred {
-        file_system_id: DfsFileSystemId,
-        object_id: DfsObjectId,
-        previous_owner_node_id: NodeId,
-        new_owner_node_id: NodeId,
-        previous_epoch: u64,
-        new_epoch: u64,
-    },
-    Rejected {
-        reason: String,
-    },
-}
-
-/// Per-target result from sending metadata journal updates to configured shard
-/// replicas.
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub enum DfsMetadataReplicationOutcome {
-    Sent {
-        target_node_id: NodeId,
-        shard_id: DfsMetadataShardId,
-        entries: usize,
-        next_after_sequence: u64,
-    },
-    InFlight {
-        target_node_id: NodeId,
-        shard_id: DfsMetadataShardId,
-        next_after_sequence: u64,
-    },
-    NoChanges {
-        target_node_id: NodeId,
-        shard_id: DfsMetadataShardId,
-        after_sequence: u64,
-    },
-    Unroutable {
-        target_node_id: NodeId,
-        shard_id: DfsMetadataShardId,
-        after_sequence: u64,
-    },
-}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum PendingMetadataReplicationResponseKind {
@@ -870,8 +796,8 @@ pub(crate) struct PendingMetadataReplication {
     pub(crate) next_after_sequence: u64,
     pub(crate) expected_response_kind: PendingMetadataReplicationResponseKind,
     pub(crate) verify_prefix_only: bool,
-    /// Optional authority identity that a rolling-upgrade-safe response must
-    /// echo before an exact-prefix acknowledgement can count.
+    /// Exact authority identity required before a prepared-prefix
+    /// acknowledgement can count.
     pub(crate) required_authority_confirmation_id: Option<String>,
     pub(crate) created_at: Instant,
 }
@@ -883,6 +809,18 @@ pub(crate) struct PendingMetadataAuthorityProbe {
     pub(crate) expected_shard: DfsMetadataShardConfig,
     pub(crate) expected_next_after_sequence: u64,
 }
+
+#[derive(Clone, Debug)]
+pub(crate) struct OwnedRoutedPatchAttachment(
+    pub(crate) std::sync::Arc<crate::content_store::ContentStoreQuarantinedBlob>,
+);
+
+impl PartialEq for OwnedRoutedPatchAttachment {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl Eq for OwnedRoutedPatchAttachment {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PendingRoutedWrite {
@@ -902,6 +840,9 @@ pub(crate) struct PendingRoutedWrite {
     /// Shared byte attachment for a corroborated authority redirect. A wire
     /// head alone cannot replay an attachment-backed write.
     pub(crate) attachment_bytes: Option<bytes::Bytes>,
+    /// Actual immutable reader capture retained only for an unresolved patch.
+    /// It is content DATA, not a metadata version or publication receipt.
+    pub(crate) patch_attachment: Option<OwnedRoutedPatchAttachment>,
     pub(crate) authority_redirects_remaining: usize,
     pub(crate) remote_intent_id: Option<String>,
     pub(crate) durable_receipts: usize,
@@ -1064,9 +1005,6 @@ pub enum NetworkedDfsServiceEvent {
     },
     RepairRetryFailed {
         reason: String,
-    },
-    WriteConflictCreated {
-        conflict: DfsConflictRecord,
     },
     MetadataJournalBatchApplied {
         request_id: String,

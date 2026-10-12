@@ -334,21 +334,6 @@ pub struct DfsAdvisoryLockTransition {
     pub changed: bool,
 }
 
-/// Durable backend result for one atomic command application.
-///
-/// Callers that provide synchronous distributed semantics must replicate the
-/// returned `shard_id` through `durable_through_sequence` before acknowledging
-/// the command. `journal_entry` is absent only when an idempotent retry caused
-/// no state change; the sequence still identifies the already-durable head.
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct DfsAdvisoryLockApplyResult {
-    pub outcome: DfsAdvisoryLockOutcome,
-    pub shard_id: DfsMetadataShardId,
-    pub durable_through_sequence: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub journal_entry: Option<DfsMetadataJournalEntry>,
-}
-
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum DfsAdvisoryLockTransitionError {
     #[error("advisory-lock lease duration must be greater than zero")]

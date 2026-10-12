@@ -252,7 +252,182 @@ class OperationViewTests(unittest.TestCase):
         self.assertTrue(any('incomplete spans' in issue for issue in selected['issues']))
 
 
+class WritePercentileTests(unittest.TestCase):
+    def fixture(self):
+        policy = {'consistency': 'replicated-eventual', 'min_commit_replicas': 1, 'desired_replicas': 2}
+        diagnostics = {'node': 'a', 'iterations': 20, 'warmup_iterations': 2, 'benchmark_retries': 0,
+                       'correctness_passed': True, 'wait_for_commit': True, 'retain_fixture': True,
+                       'replication_scenario': 'w1-n2', 'requested_placement_policy': policy,
+                       'base': '/fixture', 'max_p95_us': 100000, 'timing_scope': 'public API through committed response',
+                       'samples': []}
+        spans = []
+        for index in range(22):
+            for operation in ('create', 'overwrite'):
+                ordinal = len(diagnostics['samples'])
+                elapsed = 900000 if index < 2 else (22 - index if operation == 'create' else index - 1)
+                diagnostics['samples'].append({'index': index, 'operation': operation, 'measured': index >= 2,
+                    'succeeded': True, 'error': None, 'elapsed_us': elapsed, 'path': f'/fixture/{index}',
+                    'placement_verified': True, 'placement_policy': policy, 'placement_source_path': '/fixture'})
+                server_id, browser_id = 2 * ordinal + 1, 2 * ordinal + 2
+                start = ordinal * 10000
+                # Observe reports the daemon process role; main/shadow affinity
+                # belongs to the selected endpoint, rather than this role tag.
+                row = {'node': 'a', 'process': ['a', 'daemon', 1, 'start'], 'rpc_request_id': f'rpc-{ordinal}',
+                       'start_ns': start, 'duration_ns': 200, 'io_direct': {}, 'io_inclusive': {},
+                       'outcome': 'unknown', 'peers': []}
+                spans.extend([{**row, 'span_id': server_id, 'stage': 'network.server', 'ancestors': []},
+                              {**row, 'span_id': browser_id, 'stage': 'dfs.browser.write',
+                               'start_ns': start + 10, 'duration_ns': 100, 'ancestors': [server_id]}])
+        source = {'spans': spans, 'coverage': [{'node': 'a', 'issues': [], 'censored_spans': [],
+                   'records': 176, 'spans_started': 88, 'spans_closed': 88, 'complete_spans': 88}],
+                  'issues': [], 'complete': True, 'stages': [], 'processes': [], 'capture_id': 'fixture',
+                  'manifest': {'workload_exit_code': 0}}
+        probe = {'case': {'id': 'cluster.dfs.write-latency'}, 'status': 'passed',
+                 'summary': 'writes passed', 'diagnostics': diagnostics}
+        return source, probe
+
+    def test_api_nearest_rank_excludes_warmup_and_keeps_operations_in_order(self):
+        source, probe = self.fixture()
+        # Reverse export order: correspondence uses local start order, not IDs,
+        # export order, stage duration, or the warmup's much larger API timers.
+        source['spans'].reverse()
+        create = report.write_operation_view(source, probe, 'create', 'a', expected_roots=44)
+        overwrite = report.write_operation_view(source, probe, 'overwrite', 'a')
+        self.assertTrue(create['complete'])
+        self.assertEqual(create['write_selection']['rank'], 19)
+        self.assertEqual(create['write_selection']['measured_sample_count'], 20)
+        self.assertEqual(create['write_selection']['raw_sample']['elapsed_us'], 19)
+        self.assertEqual(create['write_selection']['raw_sample']['index'], 3)
+        self.assertEqual(overwrite['write_selection']['raw_sample']['index'], 20)
+        self.assertEqual(create['selected_root_span_id'], 14)
+        self.assertEqual(create['write_selection']['server_rpc']['rpc_request_id'], 'rpc-6')
+        self.assertEqual(create['write_selection']['browser_root']['process'][1], 'daemon')
+        self.assertEqual({row['span_id'] for row in create['spans']}, {13, 14})
+        text = report.markdown(create)
+        self.assertIn('separate from the original matrix', text)
+        self.assertIn('API write timer ms | 0.019', text)
+        self.assertIn('"index": 3', text)
+
+    def test_ties_use_original_sample_ordinal_and_arbitrary_percentiles_use_api_samples(self):
+        source, probe = self.fixture()
+        for sample in probe['diagnostics']['samples']:
+            if sample['operation'] == 'create' and sample['measured']:
+                sample['elapsed_us'] = 19
+        selected = report.write_operation_view(source, probe, 'create', 'a')['write_selection']
+        self.assertEqual(selected['sample_ordinal'], 40)
+        self.assertEqual(len(selected['tie_sample_ordinals']), 20)
+        selected = report.write_operation_view(source, probe, 'overwrite', 'a', 50)['write_selection']
+        self.assertEqual((selected['rank'], selected['raw_sample']['elapsed_us']), (10, 10))
+
+    def test_threshold_failure_keeps_gate_verdict_separate_from_write_coverage(self):
+        source, probe = self.fixture()
+        probe['diagnostics']['max_p95_us'] = 19
+        probe.update(status='failed', summary='create p95=19us is not below 19us')
+        source['manifest']['workload_exit_code'] = 2
+        source.update(complete=False, issues=['Workload did not complete successfully'])
+        selected = report.write_operation_view(source, probe, 'create', 'a')
+        self.assertTrue(selected['complete'])
+        self.assertFalse(selected['capture_complete'])
+        self.assertEqual(selected['capture_issues'], source['issues'])
+        self.assertEqual(selected['write_selection']['probe_gate_status'], 'failed')
+        for code in (0, 1, -15):
+            source['manifest']['workload_exit_code'] = code
+            with self.subTest(exit_code=code), self.assertRaisesRegex(ValueError, 'workload exit'):
+                report.write_operation_view(source, probe, 'create', 'a')
+        source['manifest']['workload_exit_code'] = 2
+        probe['summary'] = 'fixture cleanup failed'
+        with self.assertRaisesRegex(ValueError, 'gate status'):
+            report.write_operation_view(source, probe, 'create', 'a')
+
+    def test_failed_or_reordered_probe_evidence_is_never_matched(self):
+        for change in ('case', 'correctness', 'commit', 'retry', 'caller', 'count', 'order', 'warmup',
+                       'duration', 'failed', 'policy', 'placement', 'path', 'pair', 'cleanup'):
+            source, probe = self.fixture()
+            diagnostics = probe['diagnostics']; samples = diagnostics['samples']
+            if change == 'case': probe['case']['id'] = 'another.probe'
+            if change == 'correctness': diagnostics['correctness_passed'] = False
+            if change == 'commit': diagnostics['wait_for_commit'] = False
+            if change == 'retry': diagnostics['benchmark_retries'] = 1
+            if change == 'caller': diagnostics['node'] = 'b'
+            if change == 'count': samples.pop()
+            if change == 'order': samples[0], samples[1] = samples[1], samples[0]
+            if change == 'warmup': samples[0]['measured'] = True
+            if change == 'duration': samples[0]['elapsed_us'] = True
+            if change == 'failed': samples[0]['succeeded'] = False
+            if change == 'policy': samples[0]['placement_policy'] = {}
+            if change == 'placement': samples[0]['placement_verified'] = False
+            if change == 'path': samples[0]['path'] = '/elsewhere'
+            if change == 'pair': samples[1]['path'] = '/fixture/different'
+            if change == 'cleanup': diagnostics['retain_fixture'] = False
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                report.write_operation_view(source, probe, 'create', 'a')
+
+    def test_ambiguous_incomplete_or_concurrent_browser_roots_are_never_matched(self):
+        for change in ('count', 'start', 'id', 'overlap', 'incarnation', 'role', 'duration',
+                       'error', 'rpc', 'envelope', 'censored', 'loss'):
+            source, probe = self.fixture()
+            roots = [row for row in source['spans'] if row['stage'] == 'dfs.browser.write']
+            if change == 'count': source['spans'].remove(roots[-1])
+            if change == 'start': roots[1]['start_ns'] = roots[0]['start_ns']
+            if change == 'id': roots[1]['span_id'] = roots[0]['span_id']
+            if change == 'overlap': roots[1]['start_ns'] = roots[0]['start_ns'] + 1
+            if change == 'incarnation': roots[-1]['process'] = ['a', 'daemon', 2, 'restart']
+            if change == 'role':
+                for row in source['spans']: row['process'][1] = 'shadow'
+            if change == 'duration': roots[-1]['duration_ns'] = 999999
+            if change == 'error': roots[0]['outcome'] = 'error'
+            if change == 'rpc': roots[1]['rpc_request_id'] = roots[0]['rpc_request_id']
+            if change == 'envelope': roots[0]['ancestors'] = []
+            if change == 'censored': source['coverage'][0]['censored_spans'] = [{'stage': 'dfs.browser.write'}]
+            if change == 'loss': source['coverage'][0]['issues'] = ['trace ring/response truncated']
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                report.write_operation_view(source, probe, 'create', 'a')
+        source, probe = self.fixture()
+        with self.assertRaisesRegex(ValueError, 'count'):
+            report.write_operation_view(source, probe, 'create', 'a', expected_roots=2)
+        for value in (0, 101, float('nan'), float('inf')):
+            with self.subTest(percentile=value), self.assertRaises(ValueError):
+                report.write_operation_view(source, probe, 'create', 'a', value)
+
+    def test_cli_requires_the_probe_from_this_capture_and_writes_selected_evidence(self):
+        source, probe = self.fixture()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); path = root / 'probe.json'
+            path.write_text(json.dumps(probe)); (root / 'workload.stdout').write_text(json.dumps(probe))
+            argv = ['report-performance.py', str(root), '--root-stage', 'dfs.browser.write', '--root-node', 'a',
+                    '--write-latency-probe', str(path), '--write-operation', 'create']
+            with mock.patch('sys.argv', argv), mock.patch.object(report, 'summarize', return_value=source):
+                self.assertEqual(report.main(), 0)
+            selected = json.loads((root / 'create.json').read_text())['write_selection']
+            self.assertEqual(selected['percentile'], 95)
+            self.assertEqual(len(selected['probe_sha256']), 64)
+            path.write_text(json.dumps({**probe, 'summary': 'unrelated probe'}))
+            with mock.patch('sys.argv', argv), mock.patch.object(report, 'summarize', return_value=source), \
+                 mock.patch('sys.stderr'):
+                with self.assertRaises(SystemExit) as raised: report.main()
+                self.assertEqual(raised.exception.code, 2)
+
+
 class CaptureCleanupTests(unittest.TestCase):
+    def test_streaming_duration_ceiling_is_explicit_and_buffered_ceiling_is_unchanged(self):
+        argv = ['capture-performance.py', '--nodes', 'a', '--output', '/unused', '--source-revision', 'source',
+                '--binary-sha256', 'hash', '--profile', 'test']
+        for buffered, duration, allowed in ((False, 300, True), (False, 301, False),
+                                           (True, 120, True), (True, 121, False), (False, 0, False)):
+            arguments = argv + (['--buffered'] if buffered else []) + ['--duration-seconds', str(duration), '--', 'true']
+            with self.subTest(buffered=buffered, duration=duration), mock.patch('sys.argv', arguments), \
+                 mock.patch.object(capture, 'run_capture', return_value=0) as run, mock.patch('sys.stderr'):
+                if allowed:
+                    self.assertEqual(capture.main(), 0)
+                    self.assertEqual(run.call_args.args[0].duration_seconds, duration)
+                else:
+                    with self.assertRaises(SystemExit) as raised: capture.main()
+                    self.assertEqual(raised.exception.code, 2)
+                    run.assert_not_called()
+        with mock.patch('sys.argv', argv + ['--', 'true']), mock.patch.object(capture, 'run_capture', return_value=0) as run:
+            self.assertEqual(capture.main(), 0)
+            self.assertEqual(run.call_args.args[0].duration_seconds, 60)
+
     def test_buffered_capture_stops_before_export_and_excludes_export_io(self):
         with tempfile.TemporaryDirectory() as tmp:
             args = argparse.Namespace(output=Path(tmp) / 'capture', nodes=['n'], client_command=['sinomo'], clients={},

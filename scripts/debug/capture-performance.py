@@ -327,7 +327,8 @@ def main():
     parser.add_argument("--profile", required=True)
     parser.add_argument("--poll-seconds", type=float, default=2)
     parser.add_argument("--rpc-timeout", type=float, default=20)
-    parser.add_argument("--duration-seconds", type=float, default=60)
+    parser.add_argument("--duration-seconds", type=float, default=60,
+                        help="workload ceiling in seconds (default: 60; streaming maximum: 300, buffered maximum: 120)")
     parser.add_argument("workload", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     if args.cpu_profile and not args.buffered:
@@ -348,8 +349,9 @@ def main():
         parser.error("node IDs must be unique safe directory names")
     if not 0 <= args.minimum_capacity <= 32768:
         parser.error("minimum-capacity must be 0..32768")
-    if not (0 < args.duration_seconds <= 120 and .1 <= args.poll_seconds <= 10 and 0 < args.rpc_timeout <= 60):
-        parser.error("duration 0..120s, poll .1..10s, RPC timeout 0..60s required")
+    duration_limit = 120 if args.buffered else 300
+    if not (0 < args.duration_seconds <= duration_limit and .1 <= args.poll_seconds <= 10 and 0 < args.rpc_timeout <= 60):
+        parser.error(f"duration 0..{duration_limit}s, poll .1..10s, RPC timeout 0..60s required")
     return run_capture(args)
 
 

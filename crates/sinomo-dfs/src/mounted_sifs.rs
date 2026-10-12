@@ -22,7 +22,7 @@ use crate::{
     DfsMessageTransport, DfsNamespaceChangeBatch, DfsNamespaceChangeCursor, DfsNodeAdvertisement,
     DfsNodeId, DfsNodeTransport, DfsObjectRpcSendOptions, DfsPeerTransport, DfsPeerTransportError,
     DfsPeerTransportFuture, DfsPosixError, DfsRepairAttemptRecord, NetworkedDfsService,
-    cluster_dfs_peer_node_ids, content_services_prefix, fallback_dfs_node_id,
+    cluster_dfs_peer_node_ids, content_services_prefix,
     open_cluster_dfs_service_with_peer_transports_for_nodes_lazy,
 };
 
@@ -314,7 +314,9 @@ fn mounted_sifs_cluster_context(
     let local_node_id = cluster_state
         .as_ref()
         .map(|state| state.local_node_id.clone())
-        .unwrap_or_else(fallback_dfs_node_id);
+        .ok_or_else(|| DfsError::Metadata {
+            message: "SIFS requires an initialized node".into(),
+        })?;
     let peer_node_ids = cluster_state
         .as_ref()
         .map(cluster_dfs_peer_node_ids)
@@ -354,6 +356,11 @@ fn open_mounted_sifs_service_from_context(
         control_plane,
     )?;
     service.set_cancellation(cancellation);
+    if cluster_state.is_some() {
+        // Clustered mounts are clients of the actual Main owner. Select that
+        // existing route before bootstrap can rebind or recover local state.
+        service.transport = service.transport.with_registered_main_namespace_dispatch();
+    }
     service
         .bootstrap_distributed_sifs()
         .map_err(|source| match source {
@@ -448,7 +455,9 @@ pub fn discover_mounted_sifs_content_replica_candidates(
 ) -> Result<Vec<DfsNodeId>, DfsError> {
     let cluster_paths = ClusterPaths::new(data_dir);
     if !cluster_paths.state.exists() {
-        return Ok(vec![fallback_dfs_node_id()]);
+        return Err(DfsError::Metadata {
+            message: "SIFS requires an initialized node".into(),
+        });
     }
     let _state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
         .map_err(DfsError::from_network)?;
@@ -507,67 +516,47 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    #[derive(Debug)]
-    struct MountedCaptureTransport {
-        local_node_id: NodeId,
-    }
-
-    impl crate::DfsTransportIdentity for MountedCaptureTransport {
-        fn local_node_id(&self) -> &NodeId {
-            &self.local_node_id
-        }
-    }
-
-    impl DfsMessageTransport for MountedCaptureTransport {
-        fn send_routed_call(
-            &mut self,
-            target_node_id: &NodeId,
-            _call: crate::DfsRoutedCall,
-        ) -> Result<(), NetworkError> {
-            Err(NetworkError::UnknownNode {
-                node_id: target_node_id.clone(),
-            })
-        }
-
-        fn drain_incoming_messages(
-            &mut self,
-        ) -> Result<Vec<crate::DfsRoutedMessage>, NetworkError> {
-            Ok(Vec::new())
-        }
-    }
-
     #[test]
     fn mounted_mutation_capture_returns_error_receipt_and_preserves_outer_tracker() {
-        let root = sinomo_testdir::TestDir::new("sinomo-mounted-mutation-capture");
-        let local_node =
-            NodeId::from_legacy_named("node_mounted_mutation_capture").expect("local node");
-        let content =
-            crate::LocalContentStore::new(root.path().join("content")).expect("content store");
-        let mut service = NetworkedDfsService::new(
-            MountedCaptureTransport {
-                local_node_id: local_node,
-            },
-            content,
-        );
+        let local_node = crate::test_runtime::DfsTestRuntime::ordered_node_ids(
+            "native-mounted-mutation-capture",
+            1,
+        )
+        .remove(0);
+        let mut runtime = crate::test_runtime::DfsTestRuntime::new(
+            "native-mounted-mutation-capture",
+            local_node.clone(),
+        )
+        .unwrap();
+        runtime.start_nodes().unwrap();
+        let mut service = runtime.client(&local_node).unwrap();
         let tracker = crate::DfsCommittedWorkTracker::new();
         service.set_committed_work_tracker(tracker.clone());
 
         let report = service.capture_mounted_mutation(|service| {
-            service.record_message_committed_work(DfsCommittedWork {
-                publish_metadata: true,
-                namespace_maintenance: true,
-                ..DfsCommittedWork::default()
-            });
+            service
+                .posix_mkdir("/services/actual-mounted-capture")
+                .expect("actual guarded namespace commit");
             Err::<(), _>("after-commit")
         });
 
         assert_eq!(report.outcome, Err("after-commit"));
         assert!(report.committed_work.publish_metadata);
-        assert!(report.committed_work.namespace_maintenance);
+        assert!(report.committed_work.semantic_changes);
         assert!(report.committed_repair_records.is_empty());
         let outer = tracker.take();
         assert!(outer.publish_metadata);
-        assert!(outer.namespace_maintenance);
+        assert_eq!(
+            outer, report.committed_work,
+            "all actual committed edges reach the outer tracker"
+        );
+        assert!(
+            service
+                .posix_stat("/services/actual-mounted-capture")
+                .is_ok()
+        );
+        drop(service);
+        runtime.close().unwrap();
     }
 
     #[derive(Debug)]
@@ -667,7 +656,6 @@ mod tests {
         routes: Mutex<Vec<String>>,
         options: Mutex<Vec<DfsObjectRpcSendOptions>>,
         authoritative_entry_calls: AtomicUsize,
-        exact_set_keys: Mutex<Vec<String>>,
     }
 
     impl ScriptedMountedKvTransport {
@@ -679,7 +667,6 @@ mod tests {
                 routes: Mutex::new(Vec::new()),
                 options: Mutex::new(Vec::new()),
                 authoritative_entry_calls: AtomicUsize::new(0),
-                exact_set_keys: Mutex::new(Vec::new()),
             }
         }
 
@@ -832,7 +819,6 @@ mod tests {
                             &request.body,
                         )
                         .expect("decode mounted exact-key-set read");
-                    *self.exact_set_keys.lock().expect("exact-set keys") = request.keys.clone();
                     if matches!(self.fault, MountedTxnResponseFault::UnknownExactSetRoute) {
                         return Err(DfsPeerTransportError::from_network(
                             sinomo_core::network::NetworkError::UnknownRoute {
@@ -867,34 +853,7 @@ mod tests {
                     )
                     .expect("encode mounted exact-key-set response")
                 }
-                sinomo_core::kv::CLUSTER_KV_AUTHORITATIVE_SNAPSHOT_ROUTE => {
-                    let _request =
-                        sinomo_core::kv::decode_cluster_kv_authoritative_snapshot_rpc_request_body(
-                            &request.body,
-                        )
-                        .expect("decode mounted authoritative snapshot read");
-                    let keys = self.exact_set_keys.lock().expect("exact-set keys").clone();
-                    let mut snapshot = empty_mounted_sifs_kv_snapshot(KvRevision(9));
-                    snapshot.entries = keys
-                        .iter()
-                        .map(|key| KvEntry {
-                            key: key.clone(),
-                            value: format!("authoritative:{key}").into_bytes(),
-                            create_revision: KvRevision(9),
-                            modify_revision: KvRevision(9),
-                            version: sinomo_core::kv::KvVersion(1),
-                            lease_id: None,
-                        })
-                        .collect();
-                    snapshot.canonicalize();
-                    sinomo_core::kv::cluster_kv_authoritative_snapshot_response_rpc_payload(
-                        &sinomo_core::kv::KvAuthoritativeRead {
-                            value: snapshot,
-                            authority: self.authority(KvRevision(9)),
-                        },
-                    )
-                    .expect("encode mounted authoritative snapshot response")
-                }
+
                 sinomo_core::kv::CLUSTER_KV_AUTHORITATIVE_RANGE_PREFIX_ROUTE => {
                     let request = sinomo_core::kv::decode_cluster_kv_authoritative_range_prefix_rpc_request_body(
                         &request.body,
@@ -1610,85 +1569,104 @@ mod tests {
 
     #[test]
     fn repeated_mounted_path_reads_reuse_the_metadata_shard_catalog_certificate() {
-        let root = sinomo_testdir::TestDir::new("sinomo-mounted-sifs-path-read-certificate");
-        let data_dir = SinomoDataDir::new(&root);
-        data_dir.ensure_root_layout().expect("data directory");
-        let cluster_paths = ClusterPaths::new(&data_dir);
-        let local_node = NodeId::from_legacy_named("node_mounted_sifs_path_read_certificate")
-            .expect("local node");
-        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
-            sinomo_core::node::ClusterId::from_legacy_named(
-                "cluster_mounted_sifs_path_read_certificate",
-            )
-            .expect("cluster id"),
-            "mounted SIFS ordinary path read certificate reuse",
-            local_node.clone(),
-            "local",
-            "public-key",
-            time::OffsetDateTime::now_utc(),
-        );
-        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("cluster state");
-
-        let unexpected_network_send: crate::DfsMessageSender =
-            Arc::new(|_target_node_id, _command, _options| {
-                Err(DfsPeerTransportError::new(
-                    "local ordinary read must not use the DFS network",
-                ))
-            });
-        let transport = DfsNodeTransport::with_message_sender_for_nodes(
-            local_node.clone(),
-            Vec::<NodeId>::new(),
-            sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
-            unexpected_network_send,
-        );
-        let content = crate::LocalContentStore::new(data_dir.dfs_dir().join("content"))
-            .expect("content store");
-        let mut service = NetworkedDfsService::new(transport, content);
-        service
-            .bootstrap_distributed_sifs()
-            .expect("bootstrap local SIFS before attaching clustered routing");
-        service
-            .posix_create_file(
-                "/ordinary-read.txt",
+        struct ObservedPeer {
+            inner: Arc<dyn DfsPeerTransport>,
+            ranges: AtomicUsize,
+        }
+        impl DfsPeerTransport for ObservedPeer {
+            fn response_delivery_owner(&self) -> Option<Arc<crate::DfsRoutedResponseDelivery>> {
+                self.inner.response_delivery_owner()
+            }
+            fn call_object_rpc(
+                &self,
+                target: &NodeId,
+                call: ObjectRpcCall,
+                options: DfsObjectRpcSendOptions,
+            ) -> Result<ObjectRpcResult, DfsPeerTransportError> {
+                if call.request.route
+                    == sinomo_core::kv::CLUSTER_KV_AUTHORITATIVE_RANGE_PREFIX_ROUTE
+                {
+                    self.ranges.fetch_add(1, Ordering::SeqCst);
+                }
+                // Same actual owned native transport/request/result, no
+                // manufactured floor, response or route-specific behavior.
+                self.inner.call_object_rpc(target, call, options)
+            }
+        }
+        let name = "native-mounted-path-catalog-certificate";
+        let (mut runtime, nodes) =
+            crate::test_support::DfsTestRuntime::start_cluster(name, 1).unwrap();
+        let local_node = nodes[0].clone();
+        let path = "/services/ordinary-read.txt";
+        let mut writer = runtime.client(&local_node).unwrap();
+        writer
+            .posix_write_file(
+                path,
                 b"ordinary-read",
-                crate::DfsWriteOptions {
-                    policy: crate::DfsReplicationPolicy::new(1, 1).expect("local policy"),
-                    replica_candidates: vec![local_node.clone()],
-                    wait_for_commit: true,
-                    foreground_replica_repair: true,
-                },
+                crate::DfsWriteOptions::replicated_eventual(vec![local_node.clone()]),
             )
-            .expect("seed ordinary read file");
-
-        let kv_transport = Arc::new(ScriptedMountedKvTransport::new(
-            local_node,
-            true,
-            MountedTxnResponseFault::None,
-        ));
-        let peer_transport: Arc<dyn DfsPeerTransport> = kv_transport.clone();
-        let mut control_plane = MountedSifsControlPlaneKvClient::new(
-            cluster_paths,
-            peer_transport,
-            Arc::new(empty_mounted_sifs_kv_snapshot(KvRevision(8))),
+            .unwrap();
+        drop(writer);
+        let data_dir = runtime.data_dir(&local_node).clone();
+        let (sync, asynchronous) = runtime.peer_transports(&local_node).unwrap();
+        let observed = Arc::new(ObservedPeer {
+            inner: sync,
+            ranges: AtomicUsize::new(0),
+        });
+        let control = MountedSifsControlPlaneKvClient::new_authoritative(
+            ClusterPaths::new(&data_dir),
+            observed.clone(),
         );
-        control_plane
-            .refresh_latest()
-            .expect("start mounted read authority generation");
-        let mut service = service.with_boxed_control_plane(Box::new(control_plane));
-
+        let mut opened = open_mounted_sifs_service_with_peer_transports(
+            data_dir,
+            observed.clone(),
+            asynchronous,
+            Some(Box::new(control.clone())),
+        )
+        .unwrap();
+        assert_eq!(
+            opened
+                .service
+                .posix_read_file_range_distributed(path, 0, 8)
+                .unwrap(),
+            b"ordinary"
+        );
+        let first = observed.ranges.load(Ordering::SeqCst);
+        assert!(
+            first > 0,
+            "the mount must establish real native prefix authority"
+        );
+        let prefix = format!(
+            "{}/",
+            crate::control_plane::metadata_shards_prefix(&crate::sifs_file_system_id())
+        );
+        assert!(
+            control
+                .snapshot
+                .lock()
+                .unwrap()
+                .validated_authoritative_prefixes
+                .contains(&prefix),
+            "the actual metadata-shard prefix must have a native read certificate"
+        );
         for _ in 0..8 {
             assert_eq!(
-                service
-                    .posix_read_file_range_distributed("/ordinary-read.txt", 0, 8)
+                opened
+                    .service
+                    .posix_read_file_range_distributed(path, 0, 8)
                     .expect("ordinary mounted path read"),
                 b"ordinary"
             );
         }
         assert_eq!(
-            kv_transport.routes(),
-            vec![sinomo_core::kv::CLUSTER_KV_AUTHORITATIVE_RANGE_PREFIX_ROUTE.to_string()],
-            "the ordinary path-read stack must reuse its metadata-shards prefix certificate instead of issuing one ReadIndex per read"
+            observed.ranges.load(Ordering::SeqCst),
+            first,
+            "warm ordinary reads reuse actual prefix certificates rather than issuing one ReadIndex per read"
         );
+        drop(opened);
+        drop(control);
+        drop(observed);
+        runtime.close().unwrap();
     }
 
     #[test]
@@ -1817,7 +1795,7 @@ mod tests {
             replica_node_ids: Vec::new(),
             epoch: 1,
             assignment: crate::DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
+
             default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
         };
         let mut current = expected.clone();
@@ -1873,7 +1851,7 @@ mod tests {
     }
 
     #[test]
-    fn mounted_exact_set_uses_one_snapshot_only_for_a_definite_legacy_route() {
+    fn mounted_exact_set_requires_the_current_route() {
         let root = sinomo_testdir::TestDir::new("sinomo-mounted-sifs-legacy-exact-set");
         let data_dir = SinomoDataDir::new(&root);
         data_dir.ensure_root_layout().expect("data directory");
@@ -1911,23 +1889,13 @@ mod tests {
         client
             .refresh_latest()
             .expect("begin mounted authority generation");
-        let values = client
+        client
             .get_consistent(&keys)
-            .expect("legacy daemon snapshot projection fallback");
-        assert_eq!(values.len(), keys.len());
-        for (key, value) in keys.iter().zip(&values) {
-            assert_eq!(
-                value.as_ref().map(|entry| entry.key.as_str()),
-                Some(key.as_str())
-            );
-        }
+            .expect_err("an incompatible daemon must be upgraded");
         assert_eq!(
             transport.routes(),
-            vec![
-                sinomo_core::kv::CLUSTER_KV_AUTHORITATIVE_ENTRIES_ROUTE.to_string(),
-                sinomo_core::kv::CLUSTER_KV_AUTHORITATIVE_SNAPSHOT_ROUTE.to_string(),
-            ],
-            "mixed-version fallback must project the complete key set from one authoritative snapshot"
+            vec![sinomo_core::kv::CLUSTER_KV_AUTHORITATIVE_ENTRIES_ROUTE.to_string()],
+            "missing current authority route must fail closed"
         );
 
         let transport = Arc::new(ScriptedMountedKvTransport::new(
@@ -1946,7 +1914,7 @@ mod tests {
             .expect("begin strict mounted authority generation");
         let error = client
             .get_consistent(&keys)
-            .expect_err("an ambiguous transport failure must not use compatibility fallback");
+            .expect_err("a transport failure must fail closed");
         assert!(
             error
                 .to_string()
@@ -1955,7 +1923,7 @@ mod tests {
         assert_eq!(
             transport.routes(),
             vec![sinomo_core::kv::CLUSTER_KV_AUTHORITATIVE_ENTRIES_ROUTE.to_string()],
-            "only a definite UnknownRoute may use the snapshot compatibility path"
+            "transport failure must not request a full snapshot"
         );
     }
 
@@ -2088,7 +2056,7 @@ mod tests {
     }
 
     #[test]
-    fn mounted_authority_absolute_deadline_bounds_dispatch_and_fallback() {
+    fn mounted_authority_absolute_deadline_bounds_dispatch() {
         let root = sinomo_testdir::TestDir::new("sinomo-mounted-sifs-authority-deadline");
         let data_dir = SinomoDataDir::new(&root);
         data_dir.ensure_root_layout().expect("data directory");
@@ -2111,7 +2079,7 @@ mod tests {
         let transport = Arc::new(ScriptedMountedKvTransport::new(
             local_node,
             true,
-            MountedTxnResponseFault::UnknownExactSetRoute,
+            MountedTxnResponseFault::None,
         ));
         let peer_transport: Arc<dyn DfsPeerTransport> = transport.clone();
         let mut client =
@@ -2132,25 +2100,18 @@ mod tests {
         let budget = Duration::from_secs(2);
         client
             .get_authoritative_consistent_before(&keys, Instant::now() + budget)
-            .expect("deadline-bounded exact read with mixed-version fallback");
+            .expect("deadline-bounded current exact read");
         assert_eq!(
             transport.routes(),
-            vec![
-                sinomo_core::kv::CLUSTER_KV_AUTHORITATIVE_ENTRIES_ROUTE.to_string(),
-                sinomo_core::kv::CLUSTER_KV_AUTHORITATIVE_SNAPSHOT_ROUTE.to_string(),
-            ]
+            vec![sinomo_core::kv::CLUSTER_KV_AUTHORITATIVE_ENTRIES_ROUTE.to_string(),]
         );
         let options = transport.options();
-        assert_eq!(options.len(), 2);
+        assert_eq!(options.len(), 1);
         assert!(options.iter().all(|options| {
             options
                 .overall_timeout
                 .is_some_and(|remaining| !remaining.is_zero() && remaining <= budget)
         }));
-        assert!(
-            options[1].overall_timeout <= options[0].overall_timeout,
-            "fallback must consume the original absolute deadline"
-        );
     }
 
     #[test]
@@ -3292,8 +3253,7 @@ impl MountedSifsControlPlaneKvClient {
         let state = sinomo_core::cluster::read_cluster_state_without_kv(&self.cluster_paths)
             .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
         // Compute the remaining budget immediately before transport dispatch;
-        // reading local cluster state and any preceding mixed-version attempt
-        // consumes the same absolute operation deadline.
+        // reading local cluster state consumes the same operation deadline.
         let options = match deadline {
             Some(deadline) => {
                 let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
@@ -3400,45 +3360,15 @@ impl MountedSifsControlPlaneKvClient {
             },
         )
         .map_err(|source| self.kv_error(source))?;
-        let response = match self.call_local_kv_rpc_raw(
-            call,
-            route,
-            sinomo_core::kv::CLUSTER_KV_AUTHORITATIVE_ENTRIES_MAX_PAYLOAD_BYTES
-                .saturating_add(1024 * 1024),
-            deadline,
-        ) {
-            Ok(response) => response,
-            Err(error) if error.is_unknown_route(route) => {
-                let payload = sinomo_core::kv::cluster_kv_authoritative_snapshot_rpc_payload()?;
-                let snapshot_route = payload.route;
-                let call = ObjectRpcCall::value(
-                    sinomo_core::network::ObjectRpcRequest::from_encoded_body(
-                        payload.route,
-                        payload.category,
-                        payload.body,
-                    ),
-                );
-                let response = self
-                    .call_local_kv_rpc_raw(
-                        call,
-                        snapshot_route,
-                        (sinomo_core::kv::MAX_CLUSTER_KV_RAFT_SNAPSHOT_BYTES as usize)
-                            .saturating_add(1024 * 1024),
-                        deadline,
-                    )
-                    .map_err(|source| self.kv_error(source))?;
-                let snapshot = sinomo_core::kv::decode_cluster_kv_authoritative_snapshot_rpc_body(
-                    &response.body,
-                )?;
-                self.ensure_authoritative_revision(
-                    snapshot.authority.revision,
-                    Some(minimum_revision),
-                    "mixed-version exact-key snapshot",
-                )?;
-                return sinomo_core::kv::project_cluster_kv_authoritative_entries(&snapshot, keys);
-            }
-            Err(error) => return Err(self.kv_error(error)),
-        };
+        let response = self
+            .call_local_kv_rpc_raw(
+                call,
+                route,
+                sinomo_core::kv::CLUSTER_KV_AUTHORITATIVE_ENTRIES_MAX_PAYLOAD_BYTES
+                    .saturating_add(1024 * 1024),
+                deadline,
+            )
+            .map_err(|error| self.kv_error(error))?;
         let read = sinomo_core::kv::decode_cluster_kv_authoritative_entries_rpc_body(
             &response.body,
             keys,
@@ -3870,7 +3800,7 @@ impl DfsControlPlaneKvClient for MountedSifsControlPlaneKvClient {
             return Err(mounted_sifs_authority_deadline_error());
         }
         // The exact deadline covers generation reset, every replan, the
-        // primary exact-set route, and its mixed-version snapshot fallback.
+        // primary exact-set route.
         self.begin_authoritative_refresh_generation()?;
         self.read_authoritative_entries_consistently_before(keys, deadline)
     }

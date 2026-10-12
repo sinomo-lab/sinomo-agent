@@ -62,6 +62,20 @@ impl PendingNetworkedWrite {
         }
     }
 
+    /// Called only immediately after successful NEW intent admission, before
+    /// any replica dispatch. Recovery constructors deliberately do not call it.
+    pub(crate) fn with_new_intent_transfer_targets(mut self, targets: &[NodeId]) -> Self {
+        for target in targets {
+            let stage = self.stage_retries.entry(target.clone()).or_default();
+            stage.transfer_delivery_state =
+                Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent);
+            let repair = self.repair_retries.entry(target.clone()).or_default();
+            repair.transfer_delivery_state =
+                Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent);
+        }
+        self
+    }
+
     pub(crate) fn with_foreground_replica_repair(
         mut self,
         foreground_replica_repair: bool,
@@ -98,6 +112,11 @@ pub(crate) struct RepairRetryState {
     pub(crate) attempts: u32,
     pub(crate) next_retry_tick: u64,
     pub(crate) inflight: bool,
+    pub(crate) transfer_delivery_state: Option<sinomo_core::network::NetworkDeliveryState>,
+    pub(crate) completed_transfer_request_id: Option<String>,
+    pub(crate) previous_transfer_delivery_state: Option<sinomo_core::network::NetworkDeliveryState>,
+    pub(crate) retrying_unresolved_transfer: bool,
+    pub(crate) unresolved_custody_without_request: bool,
 }
 
 pub(crate) fn repair_retry_delay_ticks(attempts: u32) -> u64 {

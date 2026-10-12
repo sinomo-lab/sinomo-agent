@@ -12,9 +12,6 @@ const STATUS_GAUGES: &[StatusGauge] = &[
     ("sinomo.dfs.pending_writes", |status| {
         status.pending_write_count
     }),
-    ("sinomo.dfs.open_conflicts", |status| {
-        status.open_conflict_count
-    }),
     ("sinomo.dfs.pending_repairs", |status| {
         status.pending_repair_count
     }),

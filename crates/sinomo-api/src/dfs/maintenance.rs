@@ -6,6 +6,7 @@ use serde::Serialize;
 use sinomo_core::node::NodeId;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct DfsRepairAttemptRecord {
     pub intent_id: String,
     pub object_id: DfsObjectId,
@@ -21,6 +22,31 @@ pub struct DfsRepairAttemptRecord {
     pub transfer_request_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    /// Actual unresolved delivery evidence. Explicit null is UNKNOWN; current
+    /// decoders never infer a fact from an absent historical field.
+    #[serde(deserialize_with = "required_transfer_fact")]
+    pub transfer_delivery_state: Option<sinomo_core::network::NetworkDeliveryState>,
+    /// Exact same-kind request whose terminal reply passed current correlation checks.
+    #[serde(deserialize_with = "required_transfer_fact")]
+    pub completed_transfer_request_id: Option<String>,
+    /// Actual operation kind. Null retains unknown imported custody.
+    #[serde(deserialize_with = "required_transfer_fact")]
+    pub transfer_kind: Option<DfsRepairTransferKind>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum DfsRepairTransferKind {
+    Stage,
+    Repair,
+}
+
+fn required_transfer_fact<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    <Option<T> as serde::Deserialize>::deserialize(deserializer)
 }
 
 /// Explicit operator request to reconstruct repair work from authoritative

@@ -12,9 +12,7 @@ pub const DAEMON_DFS_BROWSER_STAT_ROUTE: &str = "/daemon/dfs/browser/stat";
 /// servers must reject this route, rather than interpret a stat flag as absent.
 pub const DAEMON_DFS_BROWSER_NAMESPACE_LSTAT_ROUTE: &str = "/daemon/dfs/browser/namespace-lstat-v1";
 pub const DAEMON_DFS_BROWSER_LIST_ROUTE: &str = "/daemon/dfs/browser/list";
-pub const DAEMON_DFS_BROWSER_READ_FILE_ROUTE: &str = "/daemon/dfs/browser/read-file";
-/// Versioned current-file read using bulk bytes; the legacy route keeps its list encoding.
-pub const DAEMON_DFS_BROWSER_READ_FILE_BYTES_ROUTE: &str = "/daemon/dfs/browser/read-file-bytes-v1";
+pub const DAEMON_DFS_BROWSER_READ_FILE_ROUTE: &str = "/daemon/dfs/browser/read-file-v7";
 pub const DAEMON_DFS_BROWSER_READ_OBJECT_VERSION_ROUTE: &str =
     "/daemon/dfs/browser/read-object-version";
 pub const DAEMON_DFS_BROWSER_FILE_HISTORY_PIN_ROUTE: &str =
@@ -45,9 +43,6 @@ pub const DAEMON_DFS_BROWSER_TRANSFER_METADATA_PRIMARY_ROUTE: &str =
     "/daemon/dfs/browser/transfer-metadata-primary";
 pub const DAEMON_DFS_BROWSER_PLACEMENT_PREVIEW_ROUTE: &str =
     "/daemon/dfs/browser/placement-preview";
-/// Retained only to return an explicit rolling-upgrade error. Apply is disabled
-/// on this legacy route because its request cannot carry a preview token.
-pub const DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_ROUTE: &str = "/daemon/dfs/browser/placement-update";
 /// Fail-closed placement Apply route. A dedicated route prevents an older
 /// daemon from ignoring the preview precondition during a rolling upgrade.
 pub const DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_V2_ROUTE: &str =
@@ -71,7 +66,6 @@ pub const DAEMON_DFS_BROWSER_ROUTES: &[&str] = &[
     DAEMON_DFS_BROWSER_NAMESPACE_LSTAT_ROUTE,
     DAEMON_DFS_BROWSER_LIST_ROUTE,
     DAEMON_DFS_BROWSER_READ_FILE_ROUTE,
-    DAEMON_DFS_BROWSER_READ_FILE_BYTES_ROUTE,
     DAEMON_DFS_BROWSER_READ_OBJECT_VERSION_ROUTE,
     DAEMON_DFS_BROWSER_FILE_HISTORY_PIN_ROUTE,
     DAEMON_DFS_BROWSER_FILE_HISTORY_LIST_ROUTE,
@@ -92,7 +86,6 @@ pub const DAEMON_DFS_BROWSER_ROUTES: &[&str] = &[
     DAEMON_DFS_BROWSER_UNPIN_CONTENT_ROUTE,
     DAEMON_DFS_BROWSER_TRANSFER_METADATA_PRIMARY_ROUTE,
     DAEMON_DFS_BROWSER_PLACEMENT_PREVIEW_ROUTE,
-    DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_ROUTE,
     DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_V2_ROUTE,
     DAEMON_DFS_BROWSER_PLACEMENT_PROGRESS_ROUTE,
     DAEMON_DFS_BROWSER_PLACEMENT_ACTIVITY_ROUTE,
@@ -133,7 +126,6 @@ pub struct DaemonDfsBrowserHealthSummary {
     pub object_count: usize,
     pub version_count: usize,
     pub pending_write_count: usize,
-    pub open_conflict_count: usize,
     pub pending_repair_count: usize,
     pub pending_namespace_job_count: usize,
     pub failed_namespace_job_count: usize,
@@ -232,6 +224,7 @@ pub struct DaemonDfsBrowserStatRequest {
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct DaemonDfsBrowserStatResponse {
     pub file_system_id: String,
     pub object_id: String,
@@ -284,7 +277,6 @@ pub struct DaemonDfsBrowserObjectHealth {
     pub version_count: usize,
     pub receipt_count: usize,
     pub intent_count: usize,
-    pub open_conflict_count: usize,
     pub pending_repair_count: usize,
     pub missing_replica_nodes: Vec<String>,
 }
@@ -295,141 +287,15 @@ pub struct DaemonDfsBrowserReadFileRequest {
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
-pub struct DaemonDfsBrowserReadFileResponse {
-    /// Present only when the exact authoritative content version was read.
-    ///
-    /// Keeping the successful wire shape as `{ "bytes": [...] }` preserves
-    /// compatibility with older clients. Failure responses omit `bytes`, so an
-    /// older client fails decoding instead of mistaking unavailability for an
-    /// empty file.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        serialize_with = "serialize_present_read_file_bytes",
-        deserialize_with = "deserialize_present_read_file_bytes"
-    )]
-    pub bytes: Option<Vec<u8>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub failure: Option<DaemonDfsBrowserReadFileFailure>,
-}
-
-/// Typed current-file outcome for the explicit bulk-byte route. JSON remains
-/// `{ "bytes": [...] }`; SOBJ uses its bulk byte type rather than list<u8>.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
-pub struct DaemonDfsBrowserReadFileBytesResponse {
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        serialize_with = "serialize_present_bulk_read_bytes",
-        deserialize_with = "deserialize_present_bulk_read_bytes"
-    )]
-    pub bytes: Option<Vec<u8>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub failure: Option<DaemonDfsBrowserReadFileFailure>,
-}
-
-impl From<DaemonDfsBrowserReadFileResponse> for DaemonDfsBrowserReadFileBytesResponse {
-    fn from(value: DaemonDfsBrowserReadFileResponse) -> Self {
-        Self {
-            bytes: value.bytes,
-            failure: value.failure,
-        }
-    }
-}
-
-impl DaemonDfsBrowserReadFileBytesResponse {
-    pub fn found(bytes: Vec<u8>) -> Self {
-        DaemonDfsBrowserReadFileResponse::found(bytes).into()
-    }
-    pub fn not_found(path: impl Into<String>) -> Self {
-        DaemonDfsBrowserReadFileResponse::not_found(path).into()
-    }
-    pub fn into_result(self) -> Result<Vec<u8>, DaemonDfsBrowserReadFileFailure> {
-        DaemonDfsBrowserReadFileResponse {
-            bytes: self.bytes,
-            failure: self.failure,
-        }
-        .into_result()
-    }
-}
-
-fn serialize_present_bulk_read_bytes<S>(
-    bytes: &Option<Vec<u8>>,
-    serializer: S,
-) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    let bytes = bytes.as_ref().ok_or_else(|| {
-        <S::Error as serde::ser::Error>::custom(
-            "bulk-read bytes serializer called for an absent field",
-        )
-    })?;
-    serializer.serialize_bytes(bytes)
-}
-
-fn deserialize_present_bulk_read_bytes<'de, D>(deserializer: D) -> Result<Option<Vec<u8>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    struct BulkBytes;
-    impl<'de> serde::de::Visitor<'de> for BulkBytes {
-        type Value = Vec<u8>;
-        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str("bytes or a byte sequence")
-        }
-        fn visit_bytes<E: serde::de::Error>(self, bytes: &[u8]) -> Result<Vec<u8>, E> {
-            let mut value = Vec::new();
-            value.try_reserve_exact(bytes.len()).map_err(E::custom)?;
-            value.extend_from_slice(bytes);
-            Ok(value)
-        }
-        fn visit_borrowed_bytes<E: serde::de::Error>(self, bytes: &'de [u8]) -> Result<Vec<u8>, E> {
-            self.visit_bytes(bytes)
-        }
-        fn visit_byte_buf<E: serde::de::Error>(self, bytes: Vec<u8>) -> Result<Vec<u8>, E> {
-            Ok(bytes)
-        }
-        fn visit_seq<A: serde::de::SeqAccess<'de>>(
-            self,
-            mut sequence: A,
-        ) -> Result<Vec<u8>, A::Error> {
-            let mut bytes = Vec::new();
-            if let Some(size) = sequence.size_hint() {
-                bytes
-                    .try_reserve_exact(size)
-                    .map_err(serde::de::Error::custom)?;
-            }
-            while let Some(byte) = sequence.next_element::<u8>()? {
-                bytes.try_reserve(1).map_err(serde::de::Error::custom)?;
-                bytes.push(byte);
-            }
-            Ok(bytes)
-        }
-    }
-    deserializer.deserialize_any(BulkBytes).map(Some)
-}
-
-fn serialize_present_read_file_bytes<S>(
-    bytes: &Option<Vec<u8>>,
-    serializer: S,
-) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    let bytes = bytes.as_ref().ok_or_else(|| {
-        <S::Error as serde::ser::Error>::custom(
-            "read-file bytes serializer called for an absent field",
-        )
-    })?;
-    serde::Serialize::serialize(bytes, serializer)
-}
-
-fn deserialize_present_read_file_bytes<'de, D>(deserializer: D) -> Result<Option<Vec<u8>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    serde::Deserialize::deserialize(deserializer).map(Some)
+#[serde(tag = "status", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum DaemonDfsBrowserReadFileResponse {
+    Found {
+        #[serde(with = "serde_bytes")]
+        bytes: Vec<u8>,
+    },
+    Failed {
+        failure: DaemonDfsBrowserReadFileFailure,
+    },
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq, thiserror::Error)]
@@ -445,79 +311,14 @@ pub enum DaemonDfsBrowserReadFileFailure {
     InvalidResponse { detail: String },
 }
 
-/// Typed operational result for the existing DFS browser stat route.
-///
-/// The untagged successful variant serializes exactly as the legacy
-/// [`DaemonDfsBrowserStatResponse`]. A failure omits every legacy success
-/// field, so an older client fails decoding rather than inferring absence from
-/// an opaque service error.
-#[derive(Clone, Debug, serde::Serialize, Eq, PartialEq)]
-#[serde(untagged)]
+/// Typed metadata lookup result.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+#[serde(tag = "status", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum DaemonDfsBrowserStatOutcomeResponse {
     Found(DaemonDfsBrowserStatResponse),
     Failed {
         failure: DaemonDfsBrowserReadFileFailure,
     },
-}
-
-#[derive(serde::Deserialize)]
-struct DaemonDfsBrowserStatFailureResponse {
-    failure: DaemonDfsBrowserReadFileFailure,
-}
-
-impl<'de> serde::Deserialize<'de> for DaemonDfsBrowserStatOutcomeResponse {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value = <serde_json::Value as serde::Deserialize>::deserialize(deserializer)?;
-        let object = value.as_object().ok_or_else(|| {
-            <D::Error as serde::de::Error>::custom("daemon SIFS stat response must be an object")
-        })?;
-        let has_failure = object.contains_key("failure");
-        let has_success = [
-            "file_system_id",
-            "object_id",
-            "path",
-            "kind",
-            "version",
-            "content_hash",
-            "size_bytes",
-            "link_count",
-            "mode",
-            "uid",
-            "gid",
-            "accessed_at_unix_nanos",
-            "modified_at_unix_nanos",
-            "created_at_unix_nanos",
-            "changed_at_unix_nanos",
-            "policy",
-            "current_locations",
-            "local_pins",
-            "health",
-            "metadata_shard",
-            "placement",
-        ]
-        .iter()
-        .any(|field| object.contains_key(*field));
-
-        match (has_success, has_failure) {
-            (true, false) => serde_json::from_value::<DaemonDfsBrowserStatResponse>(value)
-                .map(Self::Found)
-                .map_err(serde::de::Error::custom),
-            (false, true) => serde_json::from_value::<DaemonDfsBrowserStatFailureResponse>(value)
-                .map(|response| Self::Failed {
-                    failure: response.failure,
-                })
-                .map_err(serde::de::Error::custom),
-            (true, true) => Err(<D::Error as serde::de::Error>::custom(
-                "daemon SIFS stat response contains both success fields and a failure",
-            )),
-            (false, false) => Err(<D::Error as serde::de::Error>::custom(
-                "daemon SIFS stat response contains neither success fields nor a failure",
-            )),
-        }
-    }
 }
 
 impl DaemonDfsBrowserStatOutcomeResponse {
@@ -543,39 +344,25 @@ impl DaemonDfsBrowserStatOutcomeResponse {
 
 impl DaemonDfsBrowserReadFileResponse {
     pub fn found(bytes: Vec<u8>) -> Self {
-        Self {
-            bytes: Some(bytes),
-            failure: None,
-        }
+        Self::Found { bytes }
     }
-
     pub fn not_found(path: impl Into<String>) -> Self {
-        Self {
-            bytes: None,
-            failure: Some(DaemonDfsBrowserReadFileFailure::NotFound { path: path.into() }),
+        Self::Failed {
+            failure: DaemonDfsBrowserReadFileFailure::NotFound { path: path.into() },
         }
     }
-
     pub fn content_unavailable(path: impl Into<String>, detail: impl Into<String>) -> Self {
-        Self {
-            bytes: None,
-            failure: Some(DaemonDfsBrowserReadFileFailure::ContentUnavailable {
+        Self::Failed {
+            failure: DaemonDfsBrowserReadFileFailure::ContentUnavailable {
                 path: path.into(),
                 detail: detail.into(),
-            }),
+            },
         }
     }
-
     pub fn into_result(self) -> Result<Vec<u8>, DaemonDfsBrowserReadFileFailure> {
-        match (self.bytes, self.failure) {
-            (Some(bytes), None) => Ok(bytes),
-            (None, Some(failure)) => Err(failure),
-            (Some(_), Some(_)) => Err(DaemonDfsBrowserReadFileFailure::InvalidResponse {
-                detail: "response contains both bytes and a failure".to_string(),
-            }),
-            (None, None) => Err(DaemonDfsBrowserReadFileFailure::InvalidResponse {
-                detail: "response contains neither bytes nor a failure".to_string(),
-            }),
+        match self {
+            Self::Found { bytes } => Ok(bytes),
+            Self::Failed { failure } => Err(failure),
         }
     }
 }
@@ -601,91 +388,39 @@ pub struct DaemonDfsBrowserReadFilePrefixRequest {
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
-pub struct DaemonDfsBrowserReadFilePrefixResponse {
-    /// Successful responses preserve the legacy `{ bytes, truncated }` wire
-    /// shape. Typed failures omit both legacy success fields, forcing older
-    /// clients to fail decoding rather than treating unavailable content as
-    /// an empty prefix.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        serialize_with = "serialize_present_read_file_bytes",
-        deserialize_with = "deserialize_present_read_file_bytes"
-    )]
-    pub bytes: Option<Vec<u8>>,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        serialize_with = "serialize_present_prefix_truncated",
-        deserialize_with = "deserialize_present_prefix_truncated"
-    )]
-    pub truncated: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub failure: Option<DaemonDfsBrowserReadFileFailure>,
-}
-
-fn serialize_present_prefix_truncated<S>(
-    truncated: &Option<bool>,
-    serializer: S,
-) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    let truncated = truncated.ok_or_else(|| {
-        <S::Error as serde::ser::Error>::custom(
-            "prefix-read truncated serializer called for an absent field",
-        )
-    })?;
-    serde::Serialize::serialize(&truncated, serializer)
-}
-
-fn deserialize_present_prefix_truncated<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    serde::Deserialize::deserialize(deserializer).map(Some)
+#[serde(tag = "status", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum DaemonDfsBrowserReadFilePrefixResponse {
+    Found {
+        #[serde(with = "serde_bytes")]
+        bytes: Vec<u8>,
+        truncated: bool,
+    },
+    Failed {
+        failure: DaemonDfsBrowserReadFileFailure,
+    },
 }
 
 impl DaemonDfsBrowserReadFilePrefixResponse {
     pub fn found(bytes: Vec<u8>, truncated: bool) -> Self {
-        Self {
-            bytes: Some(bytes),
-            truncated: Some(truncated),
-            failure: None,
-        }
+        Self::Found { bytes, truncated }
     }
-
     pub fn not_found(path: impl Into<String>) -> Self {
-        Self {
-            bytes: None,
-            truncated: None,
-            failure: Some(DaemonDfsBrowserReadFileFailure::NotFound { path: path.into() }),
+        Self::Failed {
+            failure: DaemonDfsBrowserReadFileFailure::NotFound { path: path.into() },
         }
     }
-
     pub fn content_unavailable(path: impl Into<String>, detail: impl Into<String>) -> Self {
-        Self {
-            bytes: None,
-            truncated: None,
-            failure: Some(DaemonDfsBrowserReadFileFailure::ContentUnavailable {
+        Self::Failed {
+            failure: DaemonDfsBrowserReadFileFailure::ContentUnavailable {
                 path: path.into(),
                 detail: detail.into(),
-            }),
+            },
         }
     }
-
     pub fn into_result(self) -> Result<(Vec<u8>, bool), DaemonDfsBrowserReadFileFailure> {
-        match (self.bytes, self.truncated, self.failure) {
-            (Some(bytes), Some(truncated), None) => Ok((bytes, truncated)),
-            (None, None, Some(failure)) => Err(failure),
-            (bytes, truncated, failure) => Err(DaemonDfsBrowserReadFileFailure::InvalidResponse {
-                detail: format!(
-                    "inconsistent prefix-read response (bytes={}, truncated={}, typed_failure={})",
-                    bytes.is_some(),
-                    truncated.is_some(),
-                    failure.is_some()
-                ),
-            }),
+        match self {
+            Self::Found { bytes, truncated } => Ok((bytes, truncated)),
+            Self::Failed { failure } => Err(failure),
         }
     }
 }
@@ -701,83 +436,47 @@ pub struct DaemonDfsBrowserReadFilesResponse {
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct DaemonDfsBrowserFileRead {
     pub path: String,
-    #[serde(default)]
-    pub bytes: Option<Vec<u8>>,
-    /// Legacy daemons reported every per-item failure as an untyped string.
-    /// Current readers retain this field only for rolling compatibility and
-    /// never infer namespace absence from it.
-    #[serde(default)]
-    pub error: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub failure: Option<DaemonDfsBrowserReadFileFailure>,
+    pub outcome: DaemonDfsBrowserReadFileResponse,
 }
 
 impl DaemonDfsBrowserFileRead {
     pub fn found(path: impl Into<String>, bytes: Vec<u8>) -> Self {
         Self {
             path: path.into(),
-            bytes: Some(bytes),
-            error: None,
-            failure: None,
+            outcome: DaemonDfsBrowserReadFileResponse::found(bytes),
         }
     }
-
     pub fn not_found(path: impl Into<String>) -> Self {
         let path = path.into();
         Self {
             path: path.clone(),
-            bytes: None,
-            error: None,
-            failure: Some(DaemonDfsBrowserReadFileFailure::NotFound { path }),
+            outcome: DaemonDfsBrowserReadFileResponse::not_found(path),
         }
     }
-
     pub fn content_unavailable(path: impl Into<String>, detail: impl Into<String>) -> Self {
         let path = path.into();
         Self {
             path: path.clone(),
-            bytes: None,
-            error: None,
-            failure: Some(DaemonDfsBrowserReadFileFailure::ContentUnavailable {
-                path,
-                detail: detail.into(),
-            }),
+            outcome: DaemonDfsBrowserReadFileResponse::content_unavailable(path, detail),
         }
     }
-
     pub fn read_failed(path: impl Into<String>, detail: impl Into<String>) -> Self {
         let path = path.into();
         Self {
             path: path.clone(),
-            bytes: None,
-            error: None,
-            failure: Some(DaemonDfsBrowserReadFileFailure::ReadFailed {
-                path,
-                detail: detail.into(),
-            }),
+            outcome: DaemonDfsBrowserReadFileResponse::Failed {
+                failure: DaemonDfsBrowserReadFileFailure::ReadFailed {
+                    path,
+                    detail: detail.into(),
+                },
+            },
         }
     }
-
     pub fn into_result(self) -> Result<Vec<u8>, DaemonDfsBrowserReadFileFailure> {
-        match (self.bytes, self.error, self.failure) {
-            (Some(bytes), None, None) => Ok(bytes),
-            (None, None, Some(failure)) => Err(failure),
-            (None, Some(error), None) => Err(DaemonDfsBrowserReadFileFailure::InvalidResponse {
-                detail: format!(
-                    "legacy daemon returned an unclassified per-file read failure: {error}"
-                ),
-            }),
-            (bytes, error, failure) => Err(DaemonDfsBrowserReadFileFailure::InvalidResponse {
-                detail: format!(
-                    "inconsistent per-file read response (bytes={}, legacy_error={}, typed_failure={})",
-                    bytes.is_some(),
-                    error.is_some(),
-                    failure.is_some()
-                ),
-            }),
-        }
+        self.outcome.into_result()
     }
 }
 
@@ -947,17 +646,6 @@ pub struct DaemonDfsBrowserPlacementPreviewResponse {
     pub preview: crate::dfs::DfsPlacementPreview,
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
-pub struct DaemonDfsBrowserPlacementUpdateRequest {
-    pub path: String,
-    /// `None` removes the override for exactly `(path, scope)`, restoring
-    /// inheritance from the nearest matching ancestor.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub policy: Option<crate::dfs::DfsPlacementPolicy>,
-    #[serde(default)]
-    pub scope: crate::dfs::DfsPlacementScope,
-}
-
 /// Apply only the exact placement plan returned by the immediately preceding
 /// preview. The token is intentionally required and lives on a versioned route
 /// so missing support can never degrade to an unconditional update.
@@ -1096,168 +784,33 @@ mod versioned_bulk_read_wire_tests {
     use super::*;
 
     #[test]
-    fn legacy_read_file_encoding_remains_a_byte_list() {
-        #[derive(serde::Serialize)]
-        struct LegacyBytes {
-            bytes: Vec<u8>,
-        }
-        for bytes in [Vec::new(), vec![0, 1, 127, 255]] {
-            let old = DaemonDfsBrowserReadFileResponse::found(bytes.clone());
-            let response = sinomo_core::network::ObjectRpcResponse::encode_body(
-                DAEMON_DFS_BROWSER_READ_FILE_ROUTE,
-                &old,
-            )
-            .unwrap();
-            let legacy = sinomo_core::network::ObjectRpcResponse::encode_body(
-                DAEMON_DFS_BROWSER_READ_FILE_ROUTE,
-                &LegacyBytes {
-                    bytes: bytes.clone(),
-                },
-            )
-            .unwrap();
-            assert_eq!(response.body, legacy.body);
-            assert_eq!(
-                serde_json::to_value(&old).unwrap(),
-                serde_json::json!({"bytes": bytes})
-            );
-            let decoded: DaemonDfsBrowserReadFileResponse = response.decode_body().unwrap();
-            assert_eq!(decoded, old);
-        }
-    }
-
-    #[test]
-    fn versioned_bulk_read_round_trips_native_chunks_json_and_legacy_lists() {
-        assert_ne!(
-            DAEMON_DFS_BROWSER_READ_FILE_BYTES_ROUTE,
-            DAEMON_DFS_BROWSER_READ_FILE_ROUTE
-        );
-        assert!(DAEMON_DFS_BROWSER_ROUTES.contains(&DAEMON_DFS_BROWSER_READ_FILE_BYTES_ROUTE));
-        for bytes in [
-            Vec::new(),
-            (0..196608usize).map(|index| index as u8).collect(),
-        ] {
-            let new = DaemonDfsBrowserReadFileBytesResponse::found(bytes.clone());
-            let encoded = sinomo_core::network::ObjectRpcResponse::encode_body(
-                DAEMON_DFS_BROWSER_READ_FILE_BYTES_ROUTE,
-                &new,
-            )
-            .unwrap();
-            let decoded: DaemonDfsBrowserReadFileBytesResponse = encoded.decode_body().unwrap();
-            assert_eq!(decoded, new);
-            let chunks = encoded
-                .body
-                .chunks(17)
-                .map(Ok::<_, sinomo_core::object::Error>);
-            let decoded: DaemonDfsBrowserReadFileBytesResponse =
-                sinomo_core::object::serde_ext::from_chunk_iter_with_options(
-                    chunks,
-                    encoded.body.len(),
-                    sinomo_core::object::DecodeOptions::default(),
-                )
-                .unwrap();
-            assert_eq!(decoded.into_result().unwrap(), bytes);
-            let old = DaemonDfsBrowserReadFileResponse::found(bytes.clone());
-            let legacy = sinomo_core::network::ObjectRpcResponse::encode_body(
-                DAEMON_DFS_BROWSER_READ_FILE_BYTES_ROUTE,
-                &old,
-            )
-            .unwrap();
-            let decoded: DaemonDfsBrowserReadFileBytesResponse = legacy.decode_body().unwrap();
-            assert_eq!(decoded.into_result().unwrap(), bytes);
-            let json = serde_json::to_value(&new).unwrap();
-            assert_eq!(json, serde_json::to_value(&old).unwrap());
-            assert_eq!(
-                serde_json::from_value::<DaemonDfsBrowserReadFileBytesResponse>(json).unwrap(),
-                new
-            );
-        }
-        let absent = DaemonDfsBrowserReadFileBytesResponse::not_found("/services/missing");
+    fn current_read_codec_preserves_bulk_bytes_and_typed_absence() {
+        let payload = vec![23; 1024 * 1024];
+        let current = DaemonDfsBrowserReadFileResponse::found(payload.clone());
         let encoded = sinomo_core::network::ObjectRpcResponse::encode_body(
-            DAEMON_DFS_BROWSER_READ_FILE_BYTES_ROUTE,
-            &absent,
+            DAEMON_DFS_BROWSER_READ_FILE_ROUTE,
+            &current,
         )
         .unwrap();
-        let decoded: DaemonDfsBrowserReadFileBytesResponse = encoded.decode_body().unwrap();
-        assert_eq!(decoded, absent);
-        let json = serde_json::to_value(&absent).unwrap();
+        assert!(encoded.body.len() < payload.len() + 256);
         assert_eq!(
-            serde_json::from_value::<DaemonDfsBrowserReadFileBytesResponse>(json).unwrap(),
-            absent
+            encoded
+                .decode_body::<DaemonDfsBrowserReadFileResponse>()
+                .unwrap()
+                .into_result()
+                .unwrap(),
+            payload
         );
+        let absent = DaemonDfsBrowserReadFileResponse::not_found("/missing");
         assert!(matches!(
             absent.into_result(),
             Err(DaemonDfsBrowserReadFileFailure::NotFound { .. })
         ));
-        assert!(matches!(
-            DaemonDfsBrowserReadFileBytesResponse {
-                bytes: Some(vec![1]),
-                failure: Some(DaemonDfsBrowserReadFileFailure::NotFound {
-                    path: "/missing".into()
-                }),
-            }
-            .into_result(),
-            Err(DaemonDfsBrowserReadFileFailure::InvalidResponse { .. })
-        ));
         assert!(
-            serde_json::from_str::<DaemonDfsBrowserReadFileBytesResponse>(r#"{"bytes":[256]}"#)
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn versioned_bulk_read_planning_uses_a_constant_number_of_appends() {
-        #[derive(Default)]
-        struct PlanningOutput {
-            length: usize,
-            appends: usize,
-            largest: usize,
-        }
-        impl sinomo_core::object::serde_ext::SobjOutput for PlanningOutput {
-            fn len(&self) -> usize {
-                self.length
-            }
-            fn append(&mut self, bytes: &[u8], _: &'static str) -> sinomo_core::object::Result<()> {
-                self.length += bytes.len();
-                self.appends += 1;
-                self.largest = self.largest.max(bytes.len());
-                Ok(())
-            }
-            fn patch(&mut self, offset: usize, bytes: &[u8]) -> sinomo_core::object::Result<()> {
-                assert!(offset + bytes.len() <= self.length);
-                Ok(())
-            }
-            fn truncate(&mut self, len: usize) {
-                self.length = len;
-            }
-        }
-        let plan = |value: &DaemonDfsBrowserReadFileBytesResponse| {
-            let mut output = PlanningOutput::default();
-            sinomo_core::object::serde_ext::append_bytes_to_output(
-                &mut output,
-                value,
-                1,
-                sinomo_core::object::LengthMode::U64,
+            serde_json::from_value::<DaemonDfsBrowserReadFileResponse>(
+                serde_json::json!({"bytes": []})
             )
-            .unwrap();
-            output
-        };
-        let small = plan(&DaemonDfsBrowserReadFileBytesResponse::found(vec![7; 1024]));
-        let large = plan(&DaemonDfsBrowserReadFileBytesResponse::found(vec![
-            7;
-            262144
-        ]));
-        assert_eq!(small.appends, large.appends);
-        assert_eq!(small.largest, 1024);
-        assert_eq!(large.largest, 262144);
-        assert_eq!(large.length - small.length, 262144 - 1024);
-        let mut legacy = PlanningOutput::default();
-        sinomo_core::object::serde_ext::append_bytes_to_output(
-            &mut legacy,
-            &DaemonDfsBrowserReadFileResponse::found(vec![7; 1024]),
-            1,
-            sinomo_core::object::LengthMode::U64,
-        )
-        .unwrap();
-        assert!(legacy.appends >= 1024);
+            .is_err()
+        );
     }
 }

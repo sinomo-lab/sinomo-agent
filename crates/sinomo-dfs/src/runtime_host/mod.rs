@@ -82,6 +82,13 @@ pub enum DfsRuntimeError {
     Io { path: String, detail: String },
     #[error("invalid DFS runtime operation: {detail}")]
     Parse { detail: String },
+    #[error(
+        "metadata storage preparation at {root:?} remains pending after {processed_records} records"
+    )]
+    StoragePreparationPending {
+        root: PathBuf,
+        processed_records: usize,
+    },
     #[error("DFS runtime network error at {address}: {detail}")]
     Network { address: String, detail: String },
     #[error("DFS data root is already owned at {lock_file}: {detail}")]
@@ -140,8 +147,17 @@ impl From<sinomo_core::kv::KvError> for DfsRuntimeError {
 
 impl From<crate::DfsError> for DfsRuntimeError {
     fn from(error: crate::DfsError) -> Self {
-        Self::Parse {
-            detail: error.to_string(),
+        match error {
+            crate::DfsError::StoragePreparationPending {
+                root,
+                processed_records,
+            } => Self::StoragePreparationPending {
+                root,
+                processed_records,
+            },
+            error => Self::Parse {
+                detail: error.to_string(),
+            },
         }
     }
 }
@@ -165,6 +181,13 @@ impl From<crate::DfsPosixError> for DfsRuntimeError {
 impl From<crate::MetadataBackendError> for DfsRuntimeError {
     fn from(error: crate::MetadataBackendError) -> Self {
         match error {
+            crate::MetadataBackendError::StoragePreparationPending {
+                root,
+                processed_records,
+            } => Self::StoragePreparationPending {
+                root,
+                processed_records,
+            },
             crate::MetadataBackendError::Io { path, source } => Self::Io {
                 path: path.display().to_string(),
                 detail: source.to_string(),
@@ -179,6 +202,13 @@ impl From<crate::MetadataBackendError> for DfsRuntimeError {
 impl From<crate::ContentStoreError> for DfsRuntimeError {
     fn from(error: crate::ContentStoreError) -> Self {
         match error {
+            crate::ContentStoreError::StoragePreparationPending {
+                root,
+                processed_records,
+            } => Self::StoragePreparationPending {
+                root,
+                processed_records,
+            },
             crate::ContentStoreError::Io { path, source } => Self::Io {
                 path: path.display().to_string(),
                 detail: source.to_string(),
@@ -193,24 +223,42 @@ impl From<crate::ContentStoreError> for DfsRuntimeError {
 #[derive(Debug)]
 pub struct DfsDataOwnerLock {
     file: File,
-    cold_content_root: Option<PathBuf>,
+    physical_data_root: PathBuf,
 }
 
-/// Borrowing the unique, still-unpublished owner prevents concurrent route/task
-/// ownership while the content format is activated. Only this module can mint
-/// the permit after acquiring the real main data-owner flock.
-pub(crate) struct DfsColdContentActivation<'a> {
-    content_root: PathBuf,
-    owner: &'a mut DfsDataOwnerLock,
-}
-
-impl DfsColdContentActivation<'_> {
-    pub(crate) fn content_root(&self) -> &Path {
-        &self.content_root
+/// Read-only platform identity DATA for one actually held file handle.
+/// This acquires no owner, opens no path, and grants no storage permission.
+pub fn storage_file_identity(file: &File) -> std::io::Result<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = file.metadata()?;
+        Ok((metadata.dev(), metadata.ino()))
+    }
+    #[cfg(windows)]
+    {
+        // Use the same stable held-handle identity as native journal storage.
+        // An unavailable identity stays fail-closed, never a path fallback.
+        let (volume, index) = crate::metadata_io::windows_file_identity(file)
+            .ok_or_else(|| std::io::Error::other("storage volume/file identity is unavailable"))?;
+        Ok((u64::from(volume), index))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = file;
+        Err(std::io::Error::other(
+            "storage file identity is unavailable on this platform",
+        ))
     }
 }
 
 impl DfsDataOwnerLock {
+    /// Identity of the actual retained OS owner lock, used by source-owner
+    /// capabilities. It grants no filesystem or cluster authorization.
+    pub fn storage_owner_file_identity(&self) -> std::io::Result<(u64, u64)> {
+        storage_file_identity(&self.file)
+    }
+
     pub fn acquire(paths: &DfsRuntimePaths) -> Result<Self, DfsRuntimeError> {
         std::fs::create_dir_all(&paths.root).map_err(|source| DfsRuntimeError::Io {
             path: paths.root.display().to_string(),
@@ -243,31 +291,53 @@ impl DfsDataOwnerLock {
                 path: path.display().to_string(),
                 detail: source.to_string(),
             })?;
-        let cold_content_root = if paths.host_role == ComponentHostRole::Shadow {
-            None
-        } else {
-            Some(paths.data_dir()?.dfs_dir().join("content"))
-        };
+        let physical_runtime_root =
+            paths
+                .root
+                .canonicalize()
+                .map_err(|source| DfsRuntimeError::Io {
+                    path: paths.root.display().to_string(),
+                    detail: source.to_string(),
+                })?;
+        let physical_lock =
+            physical_runtime_root.join(path.file_name().ok_or_else(|| DfsRuntimeError::Parse {
+                detail: "DFS owner lock has no filename".into(),
+            })?);
+        let held_identity = storage_file_identity(&file).map_err(|source| DfsRuntimeError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        // Probe the separately opened physical name against the SAME retained
+        // OS-locked handle; replacement/alias mismatches cannot change owner.
+        let named_file = File::open(&physical_lock).map_err(|source| DfsRuntimeError::Io {
+            path: physical_lock.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        let named_identity =
+            storage_file_identity(&named_file).map_err(|source| DfsRuntimeError::Io {
+                path: physical_lock.display().to_string(),
+                detail: source.to_string(),
+            })?;
+        if held_identity != named_identity {
+            return Err(DfsRuntimeError::Parse {
+                detail: "DFS owner physical path differs from its actual held lock".into(),
+            });
+        }
+        drop(named_file);
+        let physical_data_root = physical_runtime_root
+            .parent()
+            .ok_or_else(|| DfsRuntimeError::Parse {
+                detail: "DFS owner runtime root has no physical data-directory parent".into(),
+            })?
+            .to_path_buf();
         Ok(Self {
             file,
-            cold_content_root,
+            physical_data_root,
         })
     }
 
-    pub(crate) fn activate_content_bindings_before_routes(
-        &mut self,
-    ) -> Result<(), DfsRuntimeError> {
-        let root = self.cold_content_root.clone().ok_or_else(|| DfsRuntimeError::Parse {
-            detail: "cold content activation requires an unused exclusive main data-owner capability".into(),
-        })?;
-        let mut content = LocalContentStore::new(&root)?;
-        let mut permit = DfsColdContentActivation {
-            content_root: root,
-            owner: self,
-        };
-        content.activate_inline_bindings(&mut permit)?;
-        permit.owner.cold_content_root = None;
-        Ok(())
+    pub(crate) fn owns_backend_root(&self, canonical_backend_root: &Path) -> bool {
+        canonical_backend_root.starts_with(&self.physical_data_root)
     }
 }
 
@@ -282,6 +352,7 @@ pub struct DfsRuntimeHost {
     pub object_rpc: Arc<dyn ComponentObjectRpcTransport>,
     pub activity: Option<Arc<dyn ComponentActivityObserver>>,
     pub(crate) response_delivery: Arc<crate::DfsRoutedResponseDelivery>,
+    maintenance_notify: Arc<tokio::sync::Notify>,
     event_client: Option<ComponentEventClient>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     shutting_down: AtomicBool,
@@ -298,6 +369,7 @@ impl DfsRuntimeHost {
             object_rpc,
             activity,
             response_delivery: Arc::new(crate::DfsRoutedResponseDelivery::new()),
+            maintenance_notify: Arc::new(tokio::sync::Notify::new()),
             event_client: None,
             tasks: Mutex::new(Vec::new()),
             shutting_down: AtomicBool::new(false),
@@ -310,24 +382,21 @@ impl DfsRuntimeHost {
     }
 
     pub(crate) fn own_task(&self, task: tokio::task::JoinHandle<()>) {
+        let mut tasks = self.tasks.lock().unwrap_or_else(|error| error.into_inner());
         if self.shutting_down.load(Ordering::Acquire) {
+            // Abort does not stop an already-running blocking task. Retain its
+            // handle so the same lifecycle drain can join its actual owner.
             task.abort();
-            return;
         }
-        match self.tasks.lock() {
-            Ok(mut tasks) if !self.shutting_down.load(Ordering::Acquire) => {
-                tasks.retain(|task| !task.is_finished());
-                tasks.push(task);
-            }
-            _ => task.abort(),
-        }
+        tasks.retain(|task| !task.is_finished());
+        tasks.push(task);
     }
 
     pub(crate) fn shutdown(&self) {
         self.shutting_down.store(true, Ordering::Release);
         self.response_delivery.shutdown();
-        if let Ok(mut tasks) = self.tasks.lock() {
-            for task in tasks.drain(..) {
+        if let Ok(tasks) = self.tasks.lock() {
+            for task in tasks.iter() {
                 task.abort();
             }
         }
@@ -361,8 +430,12 @@ pub fn unregister_dfs_runtime_host(data_dir: &SinomoDataDir) {
     }
 }
 
-fn dfs_runtime_host(data_dir: &SinomoDataDir) -> Result<Arc<DfsRuntimeHost>, DfsRuntimeError> {
-    let registered = DFS_RUNTIME_HOSTS
+// Source reconciliation retains only the actual registered normal task owner;
+// it must never select the standalone/test fallback host on a missing registry.
+pub(crate) fn registered_dfs_runtime_host(
+    data_dir: &SinomoDataDir,
+) -> Result<Option<Arc<DfsRuntimeHost>>, DfsRuntimeError> {
+    Ok(DFS_RUNTIME_HOSTS
         .get_or_init(|| Mutex::new(BTreeMap::new()))
         .lock()
         .map_err(|_| DfsRuntimeError::Network {
@@ -370,7 +443,19 @@ fn dfs_runtime_host(data_dir: &SinomoDataDir) -> Result<Arc<DfsRuntimeHost>, Dfs
             detail: "runtime host registry is poisoned".to_string(),
         })?
         .get(&data_dir.root())
-        .and_then(Weak::upgrade);
+        .and_then(Weak::upgrade))
+}
+
+/// Inspect the actual component host, without constructing a local facade.
+/// Absence carries no storage or publication permission.
+pub fn registered_component_cluster(
+    context: &sinomo_module::ComponentContext,
+) -> Result<Option<Arc<dyn sinomo_core::service::ClusterAccess>>, DfsRuntimeError> {
+    Ok(registered_dfs_runtime_host(context.data_dir())?.map(|host| Arc::clone(&host.cluster)))
+}
+
+fn dfs_runtime_host(data_dir: &SinomoDataDir) -> Result<Arc<DfsRuntimeHost>, DfsRuntimeError> {
+    let registered = registered_dfs_runtime_host(data_dir)?;
     if let Some(host) = registered {
         return Ok(host);
     }
@@ -390,17 +475,22 @@ fn dfs_runtime_host(data_dir: &SinomoDataDir) -> Result<Arc<DfsRuntimeHost>, Dfs
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 struct TestDfsClusterAccess {
-    data_dir: SinomoDataDir,
+    local_data_dir: SinomoDataDir,
+    authority_data_dir: SinomoDataDir,
+    peers: Option<Arc<DfsTestClusterPeerBridge>>,
     full_commit_calls: AtomicUsize,
     compact_commit_calls: AtomicUsize,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl TestDfsClusterAccess {
     fn cluster_paths(&self) -> ClusterPaths {
-        ClusterPaths::new(&self.data_dir)
+        ClusterPaths::new(&self.authority_data_dir)
+    }
+    fn local_cluster_paths(&self) -> ClusterPaths {
+        ClusterPaths::new(&self.local_data_dir)
     }
 
     fn state(
@@ -409,33 +499,132 @@ impl TestDfsClusterAccess {
         sinomo_core::cluster::read_cluster_state_without_kv(&self.cluster_paths())
             .map_err(sinomo_core::service::ServiceError::Network)
     }
+}
 
-    fn snapshot(&self) -> Result<KvSnapshot, sinomo_core::service::ServiceError> {
-        let paths = self.cluster_paths();
-        match sinomo_core::cluster::read_cluster_kv_current_snapshot(&paths) {
-            Ok(snapshot) => Ok(snapshot),
-            Err(sinomo_core::network::NetworkError::ClusterOrphan) => {
-                Err(sinomo_core::service::ServiceError::NotClustered(
-                    "DFS test cluster access".to_string(),
-                ))
-            }
-            Err(_) => Ok(KvSnapshot {
-                revision: KvRevision::default(),
-                compacted_revision: KvRevision::default(),
-                entries: Vec::new(),
-                leases: Vec::new(),
-                events: Vec::new(),
-                committed_requests: Vec::new(),
-                expired_requests: Vec::new(),
-            }),
+#[cfg(any(test, feature = "test-support"))]
+struct TestDfsClusterQuorumHost {
+    peers: Option<Arc<DfsTestClusterPeerBridge>>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Default)]
+pub(crate) struct DfsTestClusterPeerBridge {
+    peers: Mutex<BTreeMap<NodeId, (SinomoDataDir, Arc<std::sync::atomic::AtomicBool>)>>,
+    fanout: Arc<tokio::sync::Mutex<()>>,
+    tasks: Mutex<Vec<tokio::task::JoinHandle<Result<(), sinomo_core::network::NetworkError>>>>,
+    native_effects:
+        Mutex<Vec<tokio::task::JoinHandle<Result<(), sinomo_core::network::NetworkError>>>>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl DfsTestClusterPeerBridge {
+    pub(crate) fn register(
+        &self,
+        node: NodeId,
+        data: SinomoDataDir,
+        available: Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        self.peers
+            .lock()
+            .expect("native fixture peer registry")
+            .insert(node, (data, available));
+    }
+
+    fn paths(&self, node: &NodeId) -> Result<ClusterPaths, sinomo_core::network::NetworkError> {
+        let peers = self.peers.lock().expect("native fixture peer registry");
+        let (data, available) =
+            peers
+                .get(node)
+                .ok_or_else(|| sinomo_core::network::NetworkError::UnknownNode {
+                    node_id: node.clone(),
+                })?;
+        if !available.load(Ordering::Acquire) {
+            return Err(sinomo_core::network::NetworkError::UnknownNode {
+                node_id: node.clone(),
+            });
         }
+        Ok(ClusterPaths::new(data))
+    }
+
+    pub(crate) async fn join(self: &Arc<Self>, timeout: Duration) -> Result<(), String> {
+        type Handles = Vec<tokio::task::JoinHandle<Result<(), sinomo_core::network::NetworkError>>>;
+        struct Owned<'a> {
+            pool: &'a Mutex<Handles>,
+            handles: Handles,
+        }
+        impl Drop for Owned<'_> {
+            fn drop(&mut self) {
+                self.pool
+                    .lock()
+                    .expect("owned fixture KV tasks")
+                    .append(&mut self.handles);
+            }
+        }
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            for pool in [&self.tasks, &self.native_effects] {
+                let mut owned = Owned {
+                    pool,
+                    handles: std::mem::take(&mut *pool.lock().expect("owned fixture KV tasks")),
+                };
+                while let Some(handle) = owned.handles.last_mut() {
+                    let result = tokio::time::timeout_at(deadline, handle)
+                        .await
+                        .map_err(|_| {
+                            "native fixture KV work did not drain before lifecycle deadline"
+                                .to_string()
+                        })?;
+                    owned.handles.pop();
+                    result
+                        .map_err(|error| error.to_string())?
+                        .map_err(|error| error.to_string())?;
+                }
+            }
+            if self
+                .tasks
+                .lock()
+                .expect("owned fixture fanout tasks")
+                .is_empty()
+                && self
+                    .native_effects
+                    .lock()
+                    .expect("owned fixture native effects")
+                    .is_empty()
+            {
+                return Ok(());
+            }
+        }
+    }
+
+    pub(crate) fn retain_after_failed_shutdown(self: &Arc<Self>) {
+        // Producers may be cancelled. Already admitted native effects retain
+        // their futures/handles and their case files until they finish.
+        for task in self
+            .tasks
+            .lock()
+            .expect("owned fixture fanout tasks")
+            .drain(..)
+        {
+            task.abort();
+        }
+        for (_, available) in self
+            .peers
+            .lock()
+            .expect("native fixture peer registry")
+            .values()
+        {
+            available.store(false, Ordering::Release);
+        }
+        static RETAINED: OnceLock<Mutex<Vec<Arc<DfsTestClusterPeerBridge>>>> = OnceLock::new();
+        RETAINED
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .expect("retained failed native fixture work")
+            .push(Arc::clone(self));
     }
 }
 
-#[cfg(test)]
-struct TestDfsClusterQuorumHost;
-
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn test_dfs_cluster_transport_unavailable<'a, T: 'a>(
     operation: &'static str,
 ) -> sinomo_core::network::ClusterMembershipRpcFuture<'a, T> {
@@ -446,47 +635,220 @@ fn test_dfs_cluster_transport_unavailable<'a, T: 'a>(
     })
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl sinomo_core::network::ClusterObjectRpcAsyncHost for TestDfsClusterQuorumHost {}
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl sinomo_core::cluster::ClusterKvQuorumAsyncHost for TestDfsClusterQuorumHost {
     fn last_local_kv_replication_index_async<'a>(
         &'a mut self,
-        _paths: &'a ClusterPaths,
-        _state: &'a sinomo_core::ClusterBootstrapState,
+        paths: &'a ClusterPaths,
+        state: &'a sinomo_core::ClusterBootstrapState,
     ) -> sinomo_core::network::ClusterMembershipRpcFuture<'a, u64> {
-        test_dfs_cluster_transport_unavailable("a remote replication-index read")
+        Box::pin(async move {
+            paths
+                .kv_paths()
+                .locked_last_raft_log_index_async(&state.local_node_id)
+                .await
+                .map_err(sinomo_core::network::NetworkError::directory)
+        })
     }
 
     fn build_kv_replication_request_async<'a>(
         &'a mut self,
-        _paths: &'a ClusterPaths,
-        _state: &'a sinomo_core::ClusterBootstrapState,
-        _next_index: u64,
+        paths: &'a ClusterPaths,
+        state: &'a sinomo_core::ClusterBootstrapState,
+        next_index: u64,
     ) -> sinomo_core::network::ClusterMembershipRpcFuture<
         'a,
         sinomo_core::kv::ClusterRaftAppendRequest,
     > {
-        test_dfs_cluster_transport_unavailable("a remote replication request")
+        Box::pin(async move {
+            paths
+                .kv_paths()
+                .locked_build_raft_append_request_from_next_index_async(state, next_index)
+                .await
+                .map_err(sinomo_core::network::NetworkError::directory)
+        })
     }
 
     fn send_cluster_kv_replication_to_node_async<'a>(
         &'a mut self,
         _paths: &'a ClusterPaths,
-        _state: &'a sinomo_core::ClusterBootstrapState,
-        _target_node_id: &'a NodeId,
-        _request: &'a sinomo_core::kv::ClusterRaftAppendRequest,
-        _timeout: Duration,
+        state: &'a sinomo_core::ClusterBootstrapState,
+        target: &'a NodeId,
+        request: &'a sinomo_core::kv::ClusterRaftAppendRequest,
+        timeout: Duration,
     ) -> sinomo_core::network::ClusterMembershipRpcFuture<
         'a,
         sinomo_core::kv::ClusterRaftAppendResponse,
     > {
-        test_dfs_cluster_transport_unavailable("remote KV replication")
+        Box::pin(async move {
+            let peers = self.peers.as_ref().ok_or_else(|| {
+                sinomo_core::network::NetworkError::UnknownNode {
+                    node_id: target.clone(),
+                }
+            })?;
+            let paths = peers.paths(target)?;
+            let source = state
+                .members
+                .iter()
+                .find(|member| member.node_id == state.local_node_id)
+                .ok_or_else(|| sinomo_core::network::NetworkError::UnknownNode {
+                    node_id: state.local_node_id.clone(),
+                })?;
+            let authenticated = sinomo_core::cluster::ClusterAuthenticatedPeer {
+                node_id: source.node_id.to_string(),
+                public_key: source.node_public_key.clone(),
+            };
+            let deadline = tokio::time::Instant::now() + timeout;
+            let request = request.clone();
+            let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+            // The caller's bounded wait never drops admitted native work.
+            // Case lifecycle owns and joins this receiver task independently.
+            let task = tokio::spawn(async move {
+                let response = sinomo_core::cluster::handle_cluster_raft_append_request_async(
+                    &tokio::runtime::Handle::current(),
+                    &paths,
+                    request,
+                    &authenticated,
+                )
+                .await;
+                let _ = response_tx.send(response);
+                Ok(())
+            });
+            peers
+                .native_effects
+                .lock()
+                .expect("owned fixture native append tasks")
+                .push(task);
+            tokio::time::timeout_at(deadline, response_rx)
+                .await
+                .map_err(|_| {
+                    sinomo_core::network::NetworkError::timeout(
+                        "native fixture learner append",
+                        sinomo_core::network::NetworkTimeoutPhase::Overall,
+                        timeout,
+                        sinomo_core::network::NetworkDeliveryState::PossiblyApplied,
+                    )
+                })?
+                .map_err(|error| {
+                    sinomo_core::network::NetworkError::delivery_failed(
+                        "native fixture learner append receiver",
+                        sinomo_core::network::NetworkDeliveryState::PossiblyApplied,
+                        error.to_string(),
+                    )
+                })?
+        })
+    }
+
+    fn fan_out_committed_cluster_kv_command_async<'a>(
+        &'a mut self,
+        paths: ClusterPaths,
+        state: sinomo_core::ClusterBootstrapState,
+        events: Arc<Vec<sinomo_core::kv::KvEvent>>,
+        _targets: Vec<NodeId>,
+    ) -> sinomo_core::network::ClusterMembershipRpcFuture<'a, ()> {
+        Box::pin(async move {
+            let Some(peers) = self.peers.as_ref().cloned() else {
+                return Ok(());
+            };
+            let worker = Arc::clone(&peers);
+            let task = tokio::spawn(async move {
+                let _wave = worker.fanout.lock().await;
+                let mut host = TestDfsClusterQuorumHost {
+                    peers: Some(Arc::clone(&worker)),
+                };
+                sinomo_core::cluster::fan_out_committed_cluster_raft_command_async_with_host(
+                    &tokio::runtime::Handle::current(),
+                    &paths,
+                    &state,
+                    &events,
+                    sinomo_core::cluster::ClusterControlPlaneTimeouts::default_daemon_transport()
+                        .committed_fanout_options(),
+                    &mut host,
+                )
+                .await
+                .map(|_| ())
+            });
+            peers
+                .tasks
+                .lock()
+                .expect("owned fixture fanout tasks")
+                .push(task);
+            Ok(())
+        })
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
+impl sinomo_core::cluster::ClusterKvCommittedFanoutAsyncHost for TestDfsClusterQuorumHost {
+    fn replicate_cluster_kv_to_node_async<'a>(
+        &'a mut self,
+        paths: &'a ClusterPaths,
+        state: &'a sinomo_core::ClusterBootstrapState,
+        target: &'a NodeId,
+        events: &'a [sinomo_core::kv::KvEvent],
+        timeout: Duration,
+    ) -> sinomo_core::network::ClusterMembershipRpcFuture<
+        'a,
+        sinomo_core::kv::ClusterKvRaftAppendReplicationOutcome,
+    > {
+        Box::pin(async move {
+            sinomo_core::cluster::replicate_cluster_kv_to_node_async_with_host(
+                paths,
+                state,
+                target,
+                events,
+                sinomo_core::cluster::ClusterControlPlaneTimeouts::default_daemon_transport(),
+                timeout,
+                self,
+            )
+            .await
+        })
+    }
+
+    fn send_cluster_kv_watch_events_to_node_async<'a>(
+        &'a mut self,
+        _state: &'a sinomo_core::ClusterBootstrapState,
+        target: &'a NodeId,
+        request: &'a sinomo_core::kv::ClusterKvWatchEventsRequest,
+        timeout: Duration,
+    ) -> sinomo_core::network::ClusterMembershipRpcFuture<
+        'a,
+        sinomo_core::kv::ClusterKvWatchEventsResponse,
+    > {
+        Box::pin(async move {
+            let peers = self.peers.as_ref().ok_or_else(|| {
+                sinomo_core::network::NetworkError::UnknownNode {
+                    node_id: target.clone(),
+                }
+            })?;
+            let paths = peers.paths(target)?;
+            let started = Instant::now();
+            let result = tokio::task::block_in_place(|| {
+                let state = sinomo_core::cluster::read_cluster_state(&paths)?;
+                sinomo_core::kv::handle_cluster_kv_watch_events(
+                    &paths.kv_paths(),
+                    &state,
+                    request.clone(),
+                )
+                .map_err(sinomo_core::network::NetworkError::directory)
+            });
+            if started.elapsed() >= timeout {
+                return Err(sinomo_core::network::NetworkError::timeout(
+                    "native fixture watch-event delivery",
+                    sinomo_core::network::NetworkTimeoutPhase::Overall,
+                    timeout,
+                    sinomo_core::network::NetworkDeliveryState::PossiblyApplied,
+                ));
+            }
+            result
+        })
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
 impl sinomo_core::cluster::ClusterStateAuthorityReachabilityAsyncHost for TestDfsClusterQuorumHost {
     fn probe_cluster_state_authority_node_async<'a>(
         &'a mut self,
@@ -504,7 +866,7 @@ impl sinomo_core::cluster::ClusterStateAuthorityReachabilityAsyncHost for TestDf
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl sinomo_core::cluster::ClusterKvTxnQuorumAsyncHost for TestDfsClusterQuorumHost {
     fn request_kv_state_authority_vote_async<'a>(
         &'a mut self,
@@ -520,41 +882,33 @@ impl sinomo_core::cluster::ClusterKvTxnQuorumAsyncHost for TestDfsClusterQuorumH
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl sinomo_core::service::ClusterAccess for TestDfsClusterAccess {
     fn kv_get_local(
         &self,
         key: &str,
     ) -> Result<sinomo_core::kv::KvLocalRead<Option<KvEntry>>, sinomo_core::service::ServiceError>
     {
-        let snapshot = self.snapshot()?;
-        let state = self.state()?;
-        Ok(sinomo_core::kv::KvLocalRead {
-            value: snapshot.get(key).cloned(),
-            revision: snapshot.revision,
-            observed_term: 1,
-            applied_index: snapshot.revision.0,
-            known_leader: Some(state.local_node_id),
-        })
+        let paths = self.local_cluster_paths();
+        let state = sinomo_core::cluster::read_cluster_state_without_kv(&paths)
+            .map_err(sinomo_core::service::ServiceError::Network)?;
+        sinomo_core::kv::read_cluster_kv_local_entry(&paths.kv_paths(), &state.local_node_id, key)
+            .map_err(sinomo_core::service::ServiceError::from)
     }
-
     fn kv_range_prefix_local(
         &self,
         prefix: &str,
     ) -> Result<sinomo_core::kv::KvLocalRead<Vec<KvEntry>>, sinomo_core::service::ServiceError>
     {
-        let snapshot = self.snapshot()?;
-        let state = self.state()?;
-        let value = snapshot
-            .range_prefix_limited(prefix, sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES)
-            .map_err(sinomo_core::service::ServiceError::Kv)?;
-        Ok(sinomo_core::kv::KvLocalRead {
-            value,
-            revision: snapshot.revision,
-            observed_term: 1,
-            applied_index: snapshot.revision.0,
-            known_leader: Some(state.local_node_id),
-        })
+        let paths = self.local_cluster_paths();
+        let state = sinomo_core::cluster::read_cluster_state_without_kv(&paths)
+            .map_err(sinomo_core::service::ServiceError::Network)?;
+        sinomo_core::kv::read_cluster_kv_local_prefix(
+            &paths.kv_paths(),
+            &state.local_node_id,
+            prefix,
+        )
+        .map_err(sinomo_core::service::ServiceError::from)
     }
 
     fn kv_get_authoritative_async<'a>(
@@ -572,17 +926,21 @@ impl sinomo_core::service::ClusterAccess for TestDfsClusterAccess {
         >,
     > {
         Box::pin(async move {
+            let options =
+                sinomo_core::cluster::ClusterControlPlaneTimeouts::default_daemon_transport()
+                    .kv_txn_quorum_options(true);
             let paths = self.cluster_paths();
             let mut state = self.state()?;
             let runtime = tokio::runtime::Handle::current();
-            let mut host = TestDfsClusterQuorumHost;
+            let mut host = TestDfsClusterQuorumHost {
+                peers: self.peers.clone(),
+            };
             sinomo_core::cluster::read_cluster_kv_authoritative_entry_async_with_host(
                 &runtime,
                 &paths,
                 &mut state,
                 key.to_string(),
-                sinomo_core::cluster::ClusterControlPlaneTimeouts::default_daemon_transport()
-                    .kv_txn_quorum_options(true),
+                options,
                 &mut host,
             )
             .await
@@ -605,18 +963,17 @@ impl sinomo_core::service::ClusterAccess for TestDfsClusterAccess {
         >,
     > {
         Box::pin(async move {
+            let options =
+                sinomo_core::cluster::ClusterControlPlaneTimeouts::default_daemon_transport()
+                    .kv_txn_quorum_options(true);
             let paths = self.cluster_paths();
             let mut state = self.state()?;
             let runtime = tokio::runtime::Handle::current();
-            let mut host = TestDfsClusterQuorumHost;
+            let mut host = TestDfsClusterQuorumHost {
+                peers: self.peers.clone(),
+            };
             sinomo_core::cluster::read_cluster_kv_authoritative_entries_async_with_host(
-                &runtime,
-                &paths,
-                &mut state,
-                keys,
-                sinomo_core::cluster::ClusterControlPlaneTimeouts::default_daemon_transport()
-                    .kv_txn_quorum_options(true),
-                &mut host,
+                &runtime, &paths, &mut state, keys, options, &mut host,
             )
             .await
             .map_err(sinomo_core::service::ServiceError::Network)
@@ -638,18 +995,49 @@ impl sinomo_core::service::ClusterAccess for TestDfsClusterAccess {
         >,
     > {
         Box::pin(async move {
+            let options =
+                sinomo_core::cluster::ClusterControlPlaneTimeouts::default_daemon_transport()
+                    .kv_txn_quorum_options(true);
             let paths = self.cluster_paths();
             let mut state = self.state()?;
             let runtime = tokio::runtime::Handle::current();
-            let mut host = TestDfsClusterQuorumHost;
+            let mut host = TestDfsClusterQuorumHost {
+                peers: self.peers.clone(),
+            };
             sinomo_core::cluster::read_cluster_kv_authoritative_range_prefix_async_with_host(
-                &runtime,
-                &paths,
-                &mut state,
-                prefix,
+                &runtime, &paths, &mut state, prefix, options, &mut host,
+            )
+            .await
+            .map_err(sinomo_core::service::ServiceError::Network)
+        })
+    }
+
+    fn kv_request_outcome_authoritative_async<'a>(
+        &'a self,
+        request_id: sinomo_core::kv::KvRequestId,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        sinomo_core::kv::ClusterKvRequestOutcomeRead,
+                        sinomo_core::service::ServiceError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let options =
                 sinomo_core::cluster::ClusterControlPlaneTimeouts::default_daemon_transport()
-                    .kv_txn_quorum_options(true),
-                &mut host,
+                    .kv_txn_quorum_options(true);
+            let paths = self.cluster_paths();
+            let mut state = self.state()?;
+            let runtime = tokio::runtime::Handle::current();
+            let mut host = TestDfsClusterQuorumHost {
+                peers: self.peers.clone(),
+            };
+            sinomo_core::cluster::read_cluster_kv_request_outcome_async_with_host(
+                &runtime, &paths, &mut state, request_id, true, options, &mut host,
             )
             .await
             .map_err(sinomo_core::service::ServiceError::Network)
@@ -672,16 +1060,17 @@ impl sinomo_core::service::ClusterAccess for TestDfsClusterAccess {
     > {
         self.full_commit_calls.fetch_add(1, Ordering::SeqCst);
         Box::pin(async move {
+            crate::test_runtime::observe_native_kv_request(&self.local_data_dir.root(), &request)?;
+            let options =
+                sinomo_core::cluster::ClusterControlPlaneTimeouts::default_daemon_transport()
+                    .kv_txn_quorum_options(true);
             let paths = self.cluster_paths();
             let runtime = tokio::runtime::Handle::current();
-            let mut host = TestDfsClusterQuorumHost;
+            let mut host = TestDfsClusterQuorumHost {
+                peers: self.peers.clone(),
+            };
             sinomo_core::cluster::handle_cluster_kv_txn_request_async_with_host(
-                &runtime,
-                &paths,
-                request,
-                sinomo_core::cluster::ClusterControlPlaneTimeouts::default_daemon_transport()
-                    .kv_txn_quorum_options(true),
-                &mut host,
+                &runtime, &paths, request, options, &mut host,
             )
             .await
             .map_err(sinomo_core::service::ServiceError::Network)
@@ -703,16 +1092,17 @@ impl sinomo_core::service::ClusterAccess for TestDfsClusterAccess {
     > {
         self.compact_commit_calls.fetch_add(1, Ordering::SeqCst);
         Box::pin(async move {
+            crate::test_runtime::observe_native_kv_request(&self.local_data_dir.root(), &request)?;
+            let options =
+                sinomo_core::cluster::ClusterControlPlaneTimeouts::default_daemon_transport()
+                    .kv_txn_quorum_options(true);
             let paths = self.cluster_paths();
             let runtime = tokio::runtime::Handle::current();
-            let mut host = TestDfsClusterQuorumHost;
+            let mut host = TestDfsClusterQuorumHost {
+                peers: self.peers.clone(),
+            };
             sinomo_core::cluster::handle_cluster_kv_txn_request_compact_async_with_host(
-                &runtime,
-                &paths,
-                request,
-                sinomo_core::cluster::ClusterControlPlaneTimeouts::default_daemon_transport()
-                    .kv_txn_quorum_options(true),
-                &mut host,
+                &runtime, &paths, request, options, &mut host,
             )
             .await
             .map_err(sinomo_core::service::ServiceError::Network)
@@ -757,6 +1147,111 @@ impl ComponentObjectRpcTransport for TestDfsObjectRpcTransport {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn test_cluster_access_with_peers_for_runtime(
+    data_dir: &SinomoDataDir,
+    peers: Option<Arc<DfsTestClusterPeerBridge>>,
+) -> Arc<dyn sinomo_core::service::ClusterAccess> {
+    test_cluster_access_for_node_on_voter(data_dir, data_dir, peers)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn test_cluster_access_for_node_on_voter(
+    local_data_dir: &SinomoDataDir,
+    authority_data_dir: &SinomoDataDir,
+    peers: Option<Arc<DfsTestClusterPeerBridge>>,
+) -> Arc<dyn sinomo_core::service::ClusterAccess> {
+    Arc::new(TestDfsClusterAccess {
+        local_data_dir: local_data_dir.clone(),
+        authority_data_dir: authority_data_dir.clone(),
+        peers,
+        full_commit_calls: AtomicUsize::new(0),
+        compact_commit_calls: AtomicUsize::new(0),
+    })
+}
+
+struct DfsRuntimeTaskJoinOwner {
+    host: Arc<DfsRuntimeHost>,
+    remaining: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for DfsRuntimeTaskJoinOwner {
+    fn drop(&mut self) {
+        if self.remaining.is_empty() {
+            return;
+        }
+        // Cancellation and every early return restore ownership. Even if the
+        // registry was poisoned, do not detach its unfinished task handles.
+        let mut tasks = match self.host.tasks.lock() {
+            Ok(tasks) => tasks,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        tasks.append(&mut self.remaining);
+    }
+}
+
+impl DfsRuntimeHost {
+    /// Retain and join the same started tasks before exposing component storage.
+    /// The component caller supplies its original absolute close deadline.
+    pub(crate) async fn shutdown_and_wait(
+        self: &Arc<Self>,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), String> {
+        self.shutdown();
+        let remaining = std::mem::take(
+            &mut *self
+                .tasks
+                .lock()
+                .map_err(|_| "DFS runtime task registry poisoned")?,
+        );
+        let mut owner = DfsRuntimeTaskJoinOwner {
+            host: Arc::clone(self),
+            remaining,
+        };
+        for task in &owner.remaining {
+            task.abort();
+        }
+        loop {
+            while let Some(task) = owner.remaining.last_mut() {
+                match tokio::time::timeout_at(deadline, task).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) if error.is_cancelled() => {}
+                    Ok(Err(error)) => {
+                        owner.remaining.pop();
+                        return Err(format!("DFS runtime task failed: {error}"));
+                    }
+                    Err(_) => return Err("DFS runtime task did not stop".into()),
+                }
+                owner.remaining.pop();
+            }
+            // A stopped task may have registered its already-started blocking
+            // child while this wave was being joined. Producers are stopped before
+            // this drain, so join every retained wave under the original deadline.
+            owner.remaining =
+                std::mem::take(&mut *self.tasks.lock().unwrap_or_else(|error| error.into_inner()));
+            if owner.remaining.is_empty() {
+                break;
+            }
+            for task in &owner.remaining {
+                task.abort();
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) async fn join_registered_runtime_for_test(
+    data_dir: &SinomoDataDir,
+    timeout: Duration,
+) -> Result<(), String> {
+    let host = registered_dfs_runtime_host(data_dir)
+        .map_err(|error| error.to_string())?
+        .ok_or("missing live embedded DFS host")?;
+    host.shutdown_and_wait(tokio::time::Instant::now() + timeout)
+        .await
+}
+
 #[cfg(test)]
 fn test_dfs_runtime_host(data_dir: &SinomoDataDir) -> Arc<DfsRuntimeHost> {
     static HOSTS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<DfsRuntimeHost>>>> = OnceLock::new();
@@ -769,7 +1264,9 @@ fn test_dfs_runtime_host(data_dir: &SinomoDataDir) -> Arc<DfsRuntimeHost> {
     Arc::clone(hosts.entry(root).or_insert_with(|| {
         Arc::new(DfsRuntimeHost::new(
             Arc::new(TestDfsClusterAccess {
-                data_dir: data_dir.clone(),
+                local_data_dir: data_dir.clone(),
+                authority_data_dir: data_dir.clone(),
+                peers: None,
                 full_commit_calls: AtomicUsize::new(0),
                 compact_commit_calls: AtomicUsize::new(0),
             }),
@@ -816,7 +1313,21 @@ fn block_on_dfs_cluster_future<T>(
 where
     T: Send,
 {
-    let future = Box::pin(future);
+    // This wrapper only boxes the caller's borrowed future. The normal Tokio
+    // bridge below specializes on its result type, not each concrete future.
+    block_on_dfs_cluster_erased(runtime, Box::pin(future))
+}
+
+fn block_on_dfs_cluster_erased<T: Send>(
+    runtime: &tokio::runtime::Handle,
+    future: std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<T, sinomo_core::service::ServiceError>>
+                + Send
+                + '_,
+        >,
+    >,
+) -> Result<T, KvError> {
     if let Ok(current) = tokio::runtime::Handle::try_current() {
         if matches!(
             current.runtime_flavor(),
@@ -979,30 +1490,218 @@ pub fn open_dfs_runtime_content_store(
     LocalContentStore::new(data_dir.dfs_dir().join("content")).map_err(Into::into)
 }
 
+/// sinomo:kv-configuration: Discover configured membership and capability offers through the active native owner's bounded configuration client.
+pub(crate) fn registered_dfs_runtime_peer_node_ids(
+    control_plane: &dyn crate::DfsControlPlaneKvClient,
+    state: &sinomo_core::ClusterBootstrapState,
+) -> Result<Vec<NodeId>, DfsRuntimeError> {
+    let members = control_plane
+        .range_prefix("/cluster/members/")?
+        .into_iter()
+        .map(|entry| entry.decode::<sinomo_core::ClusterMemberRecord>())
+        .collect::<Result<Vec<_>, _>>()?;
+    let services = control_plane.range_prefix(sinomo_core::service::CLUSTER_SERVICES_KV_PREFIX)?;
+    let mut peers = crate::cluster_service::dfs_provider_node_ids_from_current_entries(
+        state, &members, &services,
+    )?;
+    if !peers.contains(&state.local_node_id) {
+        peers.push(state.local_node_id.clone());
+        peers.sort();
+    }
+    Ok(peers)
+}
+
 pub fn open_dfs_runtime_service_with_content(
     data_dir: &SinomoDataDir,
     runtime: Option<&tokio::runtime::Handle>,
     content: LocalContentStore,
 ) -> Result<NetworkedDfsService<DfsNodeTransport>, DfsRuntimeError> {
+    open_dfs_runtime_service_for_effect(data_dir, runtime, content, None)
+}
+
+/// Open only the exact current owning physical shard for a bounded effect.
+/// Uses the same native owner/projection/provider as an ordinary client shell.
+pub fn open_dfs_runtime_service_on_shard(
+    data_dir: &SinomoDataDir,
+    runtime: Option<&tokio::runtime::Handle>,
+    expected: &crate::DfsMetadataShardConfig,
+) -> Result<NetworkedDfsService<DfsNodeTransport>, DfsRuntimeError> {
+    let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
+    open_dfs_runtime_service_for_effect(data_dir, runtime, content, Some(expected))
+}
+
+fn open_dfs_runtime_service_for_effect(
+    data_dir: &SinomoDataDir,
+    runtime: Option<&tokio::runtime::Handle>,
+    content: LocalContentStore,
+    effect: Option<&crate::DfsMetadataShardConfig>,
+) -> Result<NetworkedDfsService<DfsNodeTransport>, DfsRuntimeError> {
     let cluster_paths = ClusterPaths::new(data_dir);
     let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)?;
-    let peer_node_ids = discovered_cluster_dfs_peer_node_ids(&cluster_paths, &state)?;
-    let transport = match runtime {
-        Some(runtime) => daemon_dfs_node_transport_on_runtime(
+    let provider_runtime = runtime
+        .cloned()
+        .or_else(|| tokio::runtime::Handle::try_current().ok())
+        .ok_or_else(|| DfsRuntimeError::Parse {
+            detail: "native DFS service requires its actual runtime".into(),
+        })?;
+    let paths = DfsRuntimePaths::new(data_dir);
+    let owner = require_daemon_dfs_data_owner_lock(&paths)?;
+    let host = registered_dfs_runtime_host(data_dir)?.ok_or_else(|| DfsRuntimeError::Parse {
+        detail: "native DFS service has no actual registered runtime host".into(),
+    })?;
+    let authority = message_host::daemon_dfs_metadata_authority_generation_for_identity(
+        &cluster_paths,
+        &state.cluster_id,
+        &state.local_node_id,
+        Some(&provider_runtime),
+    )
+    .map_err(|error| DfsRuntimeError::Parse {
+        detail: error.to_string(),
+    })?;
+    // Join configuration before any service/backend mutation or effect admission.
+    block_on_dfs_cluster_future(&provider_runtime, async {
+        authority
+            .ensure_write_configuration_ready_async()
+            .await
+            .map_err(|error| sinomo_core::service::ServiceError::Service(error.to_string()))
+    })
+    .map_err(|error| DfsRuntimeError::Parse {
+        detail: error.to_string(),
+    })?;
+    let control_plane =
+        daemon_dfs_control_plane_client_on_runtime(&cluster_paths, Some(&provider_runtime))
+            .ok_or_else(|| DfsRuntimeError::Parse {
+                detail: "native DFS service has no actual registered control-plane client".into(),
+            })?;
+    // Use the existing owner client's native configuration projection. Opening
+    // another KV-path reader here competes with the live Raft owner and cannot
+    // substitute for that component's retained configuration.
+    let peer_node_ids = registered_dfs_runtime_peer_node_ids(control_plane.as_ref(), &state)?;
+    let shards = authority
+        .cached_metadata_shards(
+            &effect
+                .map(|scope| scope.file_system_id.clone())
+                .unwrap_or_else(crate::sifs_file_system_id),
+            authority.projection_generation(),
+        )?
+        .filter(|shards| !shards.is_empty())
+        .ok_or_else(|| DfsRuntimeError::Parse {
+            detail: "native DFS service has no current certified metadata topology".into(),
+        })?;
+    // Only a fresh ordinary shell needs local bindings here. This precedes
+    // request-local writes/reads; rebuilding an active producer would lose custody.
+    let cold_local_shards = if effect.is_none() {
+        shards
+            .iter()
+            .filter(|shard| shard.primary_node_id == state.local_node_id)
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    // The client view owns no resident ingress checkout across a remote RPC.
+    // Each effect still acquires its normal admission and physical writer;
+    // replicas keep their actual per-shard resident ingress sessions available.
+    let metadata: Box<dyn crate::DfsMetadataBackend> = if let Some(expected) = effect {
+        if expected.primary_node_id != state.local_node_id || !shards.contains(expected) {
+            return Err(DfsRuntimeError::Parse {
+                detail: "effect opener has no exact current locally owned shard".into(),
+            });
+        }
+        let root = crate::default_dfs_metadata_shards_root(data_dir)
+            .join(crate::metadata_keys::key_segment(&expected.shard_id));
+        Box::new(
+            crate::LocalSobjMetadataBackend::new(
+                crate::DfsMetadataShardId::new(expected.shard_id.clone()),
+                root,
+            )
+            .map_err(|error| DfsRuntimeError::Parse {
+                detail: error.to_string(),
+            })?,
+        )
+    } else {
+        Box::new(
+            crate::open_local_sharded_metadata_backend_for_replica_repair(
+                crate::default_dfs_metadata_shards_root(data_dir),
+                shards,
+                &state.local_node_id,
+            )
+            .map_err(|error| DfsRuntimeError::Parse {
+                detail: error.to_string(),
+            })?,
+        )
+    };
+    let publication_provider = crate::DfsPublicationExecutionProvider::from_runtime(
+        data_dir.root(),
+        owner,
+        daemon_dfs_mutation_scheduler(data_dir)?,
+        authority,
+        provider_runtime.clone(),
+    );
+    let transport = if effect.is_none() {
+        data_plane::daemon_dfs_client_node_transport(
+            state.local_node_id.clone(),
+            peer_node_ids,
+            host,
+        )
+    } else {
+        // Exact Core effects already own their admitted shard. Delegating a
+        // nested same-node namespace call here could reenter GLOBAL ownership.
+        daemon_dfs_node_transport_on_runtime(
             state.local_node_id.clone(),
             peer_node_ids,
             data_dir,
-            runtime,
-        ),
-        None => daemon_dfs_node_transport(state.local_node_id.clone(), peer_node_ids),
+            &provider_runtime,
+        )
     };
     let service = NetworkedDfsService::new(transport, content);
-    let service = with_daemon_owned_dfs_control_plane_on_runtime(service, &cluster_paths, runtime);
-    let metadata = open_daemon_dfs_metadata_backend(data_dir, &cluster_paths)?;
+    service
+        .publication_provider
+        .retain_runtime_provider(publication_provider);
+    let service = service.with_boxed_control_plane(control_plane);
     let mut service = service
         .with_boxed_metadata_backend_lazy(metadata)
         .map_err(DfsRuntimeError::from)?;
-    service.bootstrap_distributed_sifs()?;
+    if let Some(expected) = effect {
+        // A fresh physical shard instance does not inherit another lane's
+        // completed membership-handoff binding. Reuse normal mutation admission's
+        // exact active-assignment, completion-proof and durable-prefix checks
+        // before this bounded effect can acquire its authoritative writer.
+        service.rebind_completed_local_metadata_shard_membership_handoff_if_frozen(expected)?;
+    } else {
+        let mut rebound = false;
+        for expected in cold_local_shards {
+            let shard_id = crate::DfsMetadataShardId::new(expected.shard_id.clone());
+            if !service
+                .metadata_backend
+                .as_deref()
+                .expect("cold backend installed")
+                .metadata_shard_instance_writes_frozen(&shard_id)?
+            {
+                continue;
+            }
+            // Recovery can append. Keep the actual effect admission and native
+            // data owner until this exact shard's physical rebind finishes.
+            let _execution =
+                service.acquire_prepared_execution(&crate::DfsPreparedOperationScope {
+                    file_system_id: expected.file_system_id.clone(),
+                    shard_id,
+                    owner_epoch: expected.epoch,
+                    operation_id: format!(
+                        "cold-open-rebind:{}:{}",
+                        expected.shard_id, expected.epoch
+                    ),
+                })?;
+            rebound |=
+                service.rebind_completed_local_metadata_shard_instance_if_frozen(&expected)?;
+        }
+        if rebound {
+            // This newly opened shell stays lazy. Refresh only its read-only
+            // filesystem catalog after all exact-shard admissions are released.
+            service.hydrate_file_systems_from_metadata_backend()?;
+        }
+        service.bootstrap_distributed_sifs()?;
+    }
     Ok(service)
 }
 
@@ -1041,7 +1740,7 @@ fn sinomo_sandbox_replica_candidates(
 #[cfg(test)]
 use sinomo_core::ClusterNodeAvailability;
 use sinomo_core::kv::{KvEntry, KvError, KvOp, KvRevision, KvTxn, KvTxnResponse};
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use sinomo_core::kv::{KvSnapshot, KvVersion};
 use sinomo_core::local::SinomoDataDir;
 #[cfg(test)]
@@ -1056,7 +1755,7 @@ use sinomo_dfs::LocalDfsRepairQueueStore;
 #[cfg(test)]
 use sinomo_dfs::{
     ContentStoreError, ContentStoreGcOptions, ContentStoreVersionGcOptions,
-    DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsConflictRecord, DfsConflictStatus,
+    DaemonDfsInspectionRequest, DaemonDfsInspectionResponse,
     DfsContentRootCatalogCollectionValidation, DfsContentRootCatalogIncompleteReason,
     DfsMaintenanceRunOptions, DfsMessageResponse, DfsMetadataJournalBatchCommand,
     DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult, DfsMetadataJournalBatchSender,
@@ -1084,8 +1783,7 @@ use sinomo_dfs::{
     DfsCommittedEffects as DaemonDfsMessageCommittedEdges, DfsCommittedWorkTracker,
     DfsCrossShardNamespaceLockRegistry, DfsDataPlaneHost, DfsDataPlaneHostError,
     DfsDataPlaneHostFuture, DfsDataPlaneResponse, DfsDefaultClusterBootstrapOptions,
-    DfsDefaultClusterSmokeOptions, DfsFileSystemId, DfsInboundAttachment,
-    DfsMaintenanceExecutionExclusions,
+    DfsFileSystemId, DfsInboundAttachment, DfsMaintenanceExecutionExclusions,
     DfsMaintenanceForegroundPreemption as DaemonDfsMaintenanceForegroundPreemption,
     DfsMaintenanceTickOptions, DfsMaintenanceTickReport, DfsMessageCommand,
     DfsMessageCommittedWork, DfsMessageExecutionScope, DfsMessageProcessResult, DfsMetadataBackend,
@@ -1095,8 +1793,8 @@ use sinomo_dfs::{
     DfsMetadataShardMembershipHandoff, DfsMutationAdmission as DaemonDfsMutationAdmission,
     DfsMutationLaneKey as DaemonDfsMutationLaneKey,
     DfsMutationScheduler as DaemonDfsMutationScheduler, DfsMutationSchedulerRegistry,
-    DfsNodeDetachedSendWorker, DfsNodeServedMessageTransport, DfsNodeTransport,
-    DfsObjectRpcSendOptions, DfsPeerTransport, DfsPeerTransportError, DfsRepairAttemptRecord,
+    DfsNodeDetachedSendWorker, DfsNodeTransport, DfsObjectRpcSendOptions, DfsPeerTransport,
+    DfsPeerTransportError, DfsRepairAttemptRecord,
     DfsResidentMetadataScope as DaemonDfsResidentMetadataScope,
     DfsRuntimeMessageResult as DaemonDfsMessageCommandProcessResult,
     DfsRuntimeMessageServiceLane as DaemonDfsMessageServiceLane, NetworkedDfsService,
@@ -1139,7 +1837,7 @@ use sinomo_dfs::{
 use std::collections::VecDeque;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use std::sync::atomic::AtomicUsize;
 use std::sync::{
     Arc, Mutex, OnceLock, Weak,
@@ -1223,7 +1921,6 @@ const DAEMON_DEFAULT_DFS_RECONCILIATION_FOREGROUND_QUIET_PERIOD: Duration =
 // range the materialized cluster KV snapshot. The retained cluster-state Arc
 // still invalidates membership changes immediately; service-only changes are
 // observed within this bounded lease.
-const DAEMON_DFS_PEER_DISCOVERY_VALIDATION_LEASE: Duration = Duration::from_millis(250);
 const SINOMO_DFS_ZONE_ENV: &str = "SINOMO_DFS_ZONE";
 const DAEMON_DEFAULT_DFS_RECONCILIATION_RETRY_INITIAL: Duration = Duration::from_secs(1);
 const DAEMON_DEFAULT_DFS_RECONCILIATION_RETRY_MAX: Duration = Duration::from_secs(60);
@@ -1446,7 +2143,42 @@ impl DaemonDfsReplicaMaterializationLane {
             "replica-materialization:{}",
             self.data_dir.root().display()
         ));
-        DfsMetadataBackend::materialize_pending_replica_journal(&mut *shard)
+        #[cfg(any(test, feature = "test-support"))]
+        let mut native_boundary = crate::native_shard_trace::current_boundary_interest();
+        #[cfg(any(test, feature = "test-support"))]
+        let native_before = native_boundary.as_ref().and_then(|_| {
+            DfsMetadataBackend::native_held_snapshot_for_scope(
+                &*shard,
+                &self.lane.file_system_id,
+                &self.lane.shard_id,
+            )
+        });
+        let result = DfsMetadataBackend::materialize_pending_replica_journal(&mut *shard);
+        #[cfg(any(test, feature = "test-support"))]
+        if let (Some(trace), Ok(materialized)) = (native_boundary.as_mut(), &result) {
+            trace.observe(
+                crate::native_shard_trace::NativeBoundaryFactsV1::ReplicaMaterializationCompleted {
+                    file_system_id: self.lane.file_system_id.clone(),
+                    shard_id: self.lane.shard_id.clone(),
+                    actual_materialized_entries: *materialized,
+                },
+                native_before,
+                DfsMetadataBackend::native_held_snapshot_for_scope(
+                    &*shard,
+                    &self.lane.file_system_id,
+                    &self.lane.shard_id,
+                ),
+            );
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        if result.is_err() {
+            if let Some(trace) = native_boundary.as_ref() {
+                trace.uncertain();
+            }
+        }
+        // The ordinary resident checkout ends before formatting copied facts.
+        drop(shard);
+        result
     }
 }
 
@@ -1518,7 +2250,6 @@ static DAEMON_DFS_METADATA_PUBLISH_DISCOVERY_SCHEDULERS: OnceLock<
 static DAEMON_DFS_METADATA_AUTHORITY_GENERATIONS: OnceLock<
     sinomo_dfs::DfsMetadataAuthorityRuntimeRegistry<DaemonDfsMetadataAuthorityGenerationKey>,
 > = OnceLock::new();
-static DAEMON_DFS_MAINTENANCE_NOTIFY: OnceLock<Arc<tokio::sync::Notify>> = OnceLock::new();
 static DAEMON_DFS_REPAIR_QUEUE_NONEMPTY: OnceLock<Mutex<BTreeMap<PathBuf, bool>>> = OnceLock::new();
 static DAEMON_DFS_MAINTENANCE_RECONCILIATION_REQUESTS: OnceLock<
     Mutex<BTreeMap<PathBuf, maintenance_host::DaemonDfsReconciliationRequest>>,
@@ -1556,6 +2287,28 @@ pub(crate) fn register_daemon_dfs_data_owner_lock(
     Ok(())
 }
 
+/// Observe the registered weak owner without acquiring or retaining its lease.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn trace_dfs_data_owner_references(paths: &DfsRuntimePaths, checkpoint: &str) {
+    if !tracing::enabled!(target: "sinomo.dfs.reconciliation", tracing::Level::TRACE) {
+        return;
+    }
+    let (registry_state, strong_count) = match DAEMON_DFS_DATA_OWNER_LOCKS.get() {
+        None => ("uninitialized", None),
+        Some(registry) => match registry.lock() {
+            Err(_) => ("poisoned", None),
+            Ok(owners) => match owners.get(&paths.root) {
+                None => ("missing", None),
+                Some(owner) => ("present", Some(owner.strong_count())),
+            },
+        },
+    };
+    tracing::trace!(target: "sinomo.dfs.reconciliation",
+        phase = "data-owner-reference-count", checkpoint,
+        data_root = %paths.root.display(), registry_state,
+        strong_count = ?strong_count);
+}
+
 fn daemon_dfs_data_owner_lock(
     paths: &DaemonPaths,
 ) -> Result<Option<Arc<DaemonDataOwnerLock>>, DaemonError> {
@@ -1570,7 +2323,66 @@ fn daemon_dfs_data_owner_lock(
         .and_then(Weak::upgrade))
 }
 
-fn require_daemon_dfs_data_owner_lock(
+/// Cache serialization follows the physical root pinned by the actual held
+/// OS owner. Resolving an already-registered lexical/physical alias here uses
+/// only that existing weak owner registry, never a fresh filesystem probe or
+/// an inferred publication capability. Ownerless DATA slots keep their input
+/// key; ordinary runtime access still requires its existing native owner.
+pub(crate) fn dfs_runtime_message_cache_root(
+    data_root: &Path,
+    nonblocking: bool,
+) -> Result<PathBuf, DfsRuntimeError> {
+    let Some(owners) = DAEMON_DFS_DATA_OWNER_LOCKS.get() else {
+        return Ok(data_root.to_path_buf());
+    };
+    let owners = if nonblocking {
+        match owners.try_lock() {
+            Ok(owners) => owners,
+            Err(std::sync::TryLockError::WouldBlock) => return Err(DfsRuntimeError::Network {
+                address: "DFS message cache root identity".into(),
+                detail: "bounded DFS status unavailable while the resident generation cache is being updated".into(),
+            }),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(DfsRuntimeError::Parse {
+                detail: "DFS data-owner lock registry is poisoned".into(),
+            }),
+        }
+    } else {
+        owners.lock().map_err(|_| DfsRuntimeError::Parse {
+            detail: "DFS data-owner lock registry is poisoned".into(),
+        })?
+    };
+    let logical_owner = owners
+        .get(&data_root.join("daemon"))
+        .and_then(Weak::upgrade);
+    let owner = logical_owner.or_else(|| {
+        owners
+            .values()
+            .filter_map(Weak::upgrade)
+            .find(|owner| owner.physical_data_root == data_root)
+    });
+    Ok(owner
+        .map(|owner| owner.physical_data_root.clone())
+        .unwrap_or_else(|| data_root.to_path_buf()))
+}
+
+/// Return the actual retained OS owner for a backend in this runtime. The
+/// pathname is an ownership index; only an upgraded live flock is returned.
+pub(crate) fn publication_runtime_owner(
+    backend_root: &Path,
+) -> Result<Option<Arc<DfsDataOwnerLock>>, DfsRuntimeError> {
+    let Some(owners) = DAEMON_DFS_DATA_OWNER_LOCKS.get() else {
+        return Ok(None);
+    };
+    let owners = owners.lock().map_err(|_| DfsRuntimeError::Parse {
+        detail: "DFS data-owner lock registry is poisoned".into(),
+    })?;
+    Ok(owners
+        .iter()
+        .filter_map(|(_, owner)| owner.upgrade())
+        .find(|owner| owner.owns_backend_root(backend_root)))
+}
+
+pub(crate) fn require_daemon_dfs_data_owner_lock(
     paths: &DaemonPaths,
 ) -> Result<Arc<DaemonDataOwnerLock>, DaemonError> {
     daemon_dfs_data_owner_lock(paths)?.ok_or_else(|| DaemonError::Parse {
@@ -1718,15 +2530,22 @@ pub(crate) use control_plane::{
 };
 
 mod data_plane;
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) mod materialization_test;
+#[cfg(any(test, feature = "test-support"))]
+pub use materialization_test::{DfsTestMaterializationCapture, DfsTestMaterializationPause};
+#[cfg(feature = "storage-conversion")]
+mod storage_import;
 use data_plane::with_daemon_dfs_control_plane_seeded_on_runtime;
 #[cfg(test)]
 use data_plane::*;
 pub(crate) use data_plane::{
     DaemonDfsDataPlaneHost, daemon_dfs_control_plane_client_on_runtime, daemon_dfs_node_transport,
     daemon_dfs_node_transport_on_runtime, daemon_dfs_peer_transports_on_runtime,
-    open_daemon_dfs_metadata_backend, with_daemon_dfs_control_plane_on_runtime,
-    with_daemon_owned_dfs_control_plane_on_runtime,
+    with_daemon_dfs_control_plane_on_runtime,
 };
+#[cfg(feature = "storage-conversion")]
+pub use storage_import::DfsStorageImportContentReceiver;
 
 #[cfg(test)]
 mod test_support;
@@ -1746,7 +2565,7 @@ pub(crate) use maintenance_host::{
     daemon_dfs_maintenance_notify, daemon_dfs_maintenance_reconciliation_generation,
     daemon_dfs_pending_reactive_maintenance_work_on_runtime, daemon_dfs_repair_queue_work_is_known,
     handle_daemon_dfs_mounted_mutation_handoff_on_runtime, notify_daemon_dfs_maintenance_work,
-    request_daemon_dfs_maintenance_reconciliation,
+    notify_daemon_dfs_maintenance_work_for_paths, request_daemon_dfs_maintenance_reconciliation,
     request_daemon_dfs_maintenance_reconciliation_with_namespace_jobs,
     schedule_daemon_dfs_startup_repair_reconciliation,
 };
@@ -1813,3 +2632,140 @@ fn daemon_data_dir(paths: &DaemonPaths) -> Result<&std::path::Path, DaemonError>
 
 #[cfg(test)]
 mod tests;
+
+/// Retain the actual component-owned OS lease for a storage preparation service.
+/// The registry contains live ownership handles; absence never grants permission.
+pub fn retain_component_data_owner(
+    context: &sinomo_module::ComponentContext,
+) -> Result<Arc<DfsDataOwnerLock>, DfsRuntimeError> {
+    let paths = DfsRuntimePaths::for_host_role(context.data_dir(), context.host_role());
+    require_daemon_dfs_data_owner_lock(&paths)
+}
+
+/// Borrow the existing native host control client for storage-import process
+/// custody. No metadata service/backend or configuration readiness is opened.
+#[cfg(feature = "storage-conversion")]
+pub fn owned_storage_import_control_plane_client(
+    context: &sinomo_module::ComponentContext,
+    owner: &Arc<DfsDataOwnerLock>,
+) -> Result<Box<dyn crate::DfsControlPlaneKvClient>, DfsRuntimeError> {
+    if !matches!(
+        context.host_role(),
+        ComponentHostRole::Main | ComponentHostRole::Embedded
+    ) {
+        return Err(DfsRuntimeError::Parse {
+            detail: "storage import has no native effect host".into(),
+        });
+    }
+    let host =
+        registered_dfs_runtime_host(context.data_dir())?.ok_or_else(|| DfsRuntimeError::Parse {
+            detail: "storage import normal host is not registered yet".into(),
+        })?;
+    if host.shutting_down.load(Ordering::Acquire) {
+        return Err(DfsRuntimeError::Parse {
+            detail: "storage import native host is stopping".into(),
+        });
+    }
+    let actual = retain_component_data_owner(context)?;
+    if !Arc::ptr_eq(&actual, owner) {
+        return Err(DfsRuntimeError::Parse {
+            detail: "storage import lost its exact current data owner".into(),
+        });
+    }
+    let runtime = context.runtime().ok_or_else(|| DfsRuntimeError::Parse {
+        detail: "storage import normal host runtime is absent".into(),
+    })?;
+    daemon_dfs_control_plane_client_on_runtime(
+        &ClusterPaths::new(context.data_dir()),
+        Some(runtime),
+    )
+    .ok_or_else(|| DfsRuntimeError::Parse {
+        detail: "storage import has no native cluster client".into(),
+    })
+}
+
+pub use maintenance_host::{queue_namespace_reconciliation_work, wake_namespace_reconciliation};
+
+#[cfg(test)]
+mod native_request_outcome_test;
+
+#[cfg(test)]
+mod storage_preparation_error_tests {
+    use super::DfsRuntimeError;
+
+    #[test]
+    fn metadata_preparation_pending_preserves_the_exact_typed_provider_result() {
+        let root = std::path::PathBuf::from("actual-owner/dfs/metadata/root");
+        let original = crate::MetadataBackendError::StoragePreparationPending {
+            root: root.clone(),
+            processed_records: 17,
+        };
+        let detail = original.to_string();
+        let error = DfsRuntimeError::from(crate::DfsError::from(original));
+        assert!(matches!(error, DfsRuntimeError::StoragePreparationPending {
+            root: actual, processed_records: 17,
+        } if actual == root));
+        assert!(
+            matches!(DfsRuntimeError::from(crate::MetadataBackendError::StoragePreparationPending {
+            root: root.clone(), processed_records: 0,
+        }), DfsRuntimeError::StoragePreparationPending { root: actual, processed_records: 0 } if actual == root)
+        );
+        assert!(
+            matches!(
+                DfsRuntimeError::from(crate::DfsError::Metadata { message: detail }),
+                DfsRuntimeError::Parse { .. }
+            ),
+            "diagnostic text cannot select the Pending lifecycle path"
+        );
+        assert!(
+            matches!(
+                DfsRuntimeError::from(crate::MetadataBackendError::Io {
+                    path: root,
+                    source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+                }),
+                DfsRuntimeError::Io { .. }
+            ),
+            "permanent physical-owner errors must remain errors"
+        );
+    }
+}
+
+#[cfg(test)]
+mod content_preparation_error_tests {
+    use super::DfsRuntimeError;
+    #[test]
+    fn content_preparation_pending_retains_its_typed_root_and_count() {
+        let root = std::path::PathBuf::from("actual-owner/dfs/content");
+        let original = crate::ContentStoreError::StoragePreparationPending {
+            root: root.clone(),
+            processed_records: 256,
+        };
+        let detail = original.to_string();
+        assert!(
+            matches!(DfsRuntimeError::from(crate::DfsError::from(original)),
+            DfsRuntimeError::StoragePreparationPending { root: actual, processed_records: 256 } if actual == root)
+        );
+        assert!(
+            matches!(DfsRuntimeError::from(crate::ContentStoreError::StoragePreparationPending {
+            root: root.clone(), processed_records: 0,
+        }), DfsRuntimeError::StoragePreparationPending { root: actual, processed_records: 0 } if actual == root)
+        );
+        assert!(
+            matches!(
+                DfsRuntimeError::from(crate::DfsError::ContentStore { message: detail }),
+                DfsRuntimeError::Parse { .. }
+            ),
+            "text cannot defer host preparation"
+        );
+        assert!(
+            matches!(
+                DfsRuntimeError::from(crate::ContentStoreError::Io {
+                    path: root,
+                    source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+                }),
+                DfsRuntimeError::Io { .. }
+            ),
+            "permanent content IO still aborts preparation"
+        );
+    }
+}

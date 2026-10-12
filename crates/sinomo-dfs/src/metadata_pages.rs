@@ -10,16 +10,14 @@ use std::ops::Bound::{Excluded, Included, Unbounded};
 use crate::metadata_error::Result;
 use crate::metadata_hardlink::hardlink_object_from_path_record;
 use crate::metadata_keys::{
-    conflict_page_cursor, conflict_scan_cursor, directory_inode_id,
-    directory_page_cursor_with_dentry, directory_page_key, id_lower_bound, normalize_path,
-    normalize_posix_path, object_page_cursor, object_version_page_cursor,
+    directory_inode_id, directory_page_cursor_with_dentry, directory_page_key, id_lower_bound,
+    normalize_path, normalize_posix_path, object_page_cursor, object_version_page_cursor,
     object_version_scan_cursor, replica_receipt_page_cursor, replica_receipt_scan_cursor,
     version_pin_page_cursor, write_intent_page_cursor, write_intent_scan_cursor,
     write_intent_scan_cursor_key,
 };
 use crate::metadata_records::{
-    DfsConflictPage, DfsConflictPageCursor, DfsConflictRecord, DfsConflictScanCursor,
-    DfsConflictScanPage, DfsDirFragmentId, DfsDirectoryPageCursor, DfsMetadataVersionPinPage,
+    DfsDirFragmentId, DfsDirectoryPageCursor, DfsMetadataVersionPinPage,
     DfsMetadataVersionPinPageCursor, DfsNamespaceJobPage, DfsNamespaceJobPageCursor, DfsObjectPage,
     DfsObjectPageCursor, DfsObjectVersionPage, DfsObjectVersionPageCursor,
     DfsObjectVersionScanCursor, DfsObjectVersionScanPage, DfsPendingNamespaceRequestPage,
@@ -28,7 +26,7 @@ use crate::metadata_records::{
     DfsWriteIntentPageCursor, DfsWriteIntentScanCursor, DfsWriteIntentScanPage,
 };
 use crate::metadata_tables::DfsMetadataTables;
-use crate::metadata_visible_commit::object_by_path_from_tables;
+
 use crate::posix_path::posix_path_is_at_or_under_prefix;
 use crate::{DfsFileSystemId, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsVersion};
 
@@ -624,20 +622,6 @@ pub(crate) fn pending_namespace_requests_page_from_tables(
     }
 }
 
-pub(crate) fn conflicts_for_object_from_tables(
-    tables: &DfsMetadataTables,
-    object_id: &DfsObjectId,
-) -> Vec<DfsConflictRecord> {
-    tables
-        .conflicts
-        .range((Included((object_id.clone(), String::new())), Unbounded))
-        .take_while(|((record_object_id, _), _)| record_object_id == object_id)
-        .map(|(_, conflict)| conflict)
-        .filter(|conflict| conflict.object_id == *object_id)
-        .cloned()
-        .collect()
-}
-
 pub(crate) fn versions_for_object_page_from_tables(
     tables: &DfsMetadataTables,
     object_id: &DfsObjectId,
@@ -1130,79 +1114,6 @@ pub(crate) fn write_intents_page_from_tables(
     }
 }
 
-pub(crate) fn conflicts_for_object_page_from_tables(
-    tables: &DfsMetadataTables,
-    object_id: &DfsObjectId,
-    after: Option<&DfsConflictPageCursor>,
-    max_entries: usize,
-) -> DfsConflictPage {
-    if max_entries == 0 {
-        return DfsConflictPage {
-            conflicts: Vec::new(),
-            next_cursor: None,
-        };
-    }
-    let start = match after {
-        Some(after) => Excluded((object_id.clone(), after.conflict_id.clone())),
-        None => Included((object_id.clone(), String::new())),
-    };
-    let mut entries = Vec::new();
-    for ((record_object_id, _), conflict) in tables
-        .conflicts
-        .range((start, Unbounded))
-        .take_while(|((record_object_id, _), _)| record_object_id == object_id)
-    {
-        if record_object_id != object_id || conflict.object_id != *object_id {
-            continue;
-        }
-        let cursor = conflict_page_cursor(conflict);
-        entries.push((conflict.clone(), cursor));
-        if entries.len() > max_entries {
-            break;
-        }
-    }
-    let (conflicts, next_cursor) = finish_cursor_page(entries, max_entries);
-    DfsConflictPage {
-        conflicts,
-        next_cursor,
-    }
-}
-
-pub(crate) fn conflict_records_page_from_tables(
-    tables: &DfsMetadataTables,
-    after: Option<&DfsConflictScanCursor>,
-    max_entries: usize,
-) -> DfsConflictScanPage {
-    if max_entries == 0 {
-        return DfsConflictScanPage {
-            conflicts: Vec::new(),
-            next_cursor: None,
-        };
-    }
-    let start = match after {
-        Some(after) => Excluded((after.object_id.clone(), after.conflict_id.clone())),
-        None => Included((id_lower_bound(), String::new())),
-    };
-    let mut entries = Vec::new();
-    for ((record_object_id, record_conflict_id), conflict) in
-        tables.conflicts.range((start, Unbounded))
-    {
-        if record_object_id != &conflict.object_id || record_conflict_id != &conflict.conflict_id {
-            continue;
-        }
-        let cursor = conflict_scan_cursor(conflict);
-        entries.push((conflict.clone(), cursor));
-        if entries.len() > max_entries {
-            break;
-        }
-    }
-    let (conflicts, next_cursor) = finish_cursor_page(entries, max_entries);
-    DfsConflictScanPage {
-        conflicts,
-        next_cursor,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1232,7 +1143,6 @@ mod tests {
 
     fn version_record(object_id: DfsObjectId, version: DfsVersion) -> DfsObjectVersionRecord {
         DfsObjectVersionRecord {
-            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
             content_durability: None,
             retention: Default::default(),
             module_metadata: Default::default(),
@@ -1493,12 +1403,10 @@ mod tests {
     }
 
     #[test]
-    fn retained_revision_path_index_rebuilds_from_both_snapshot_formats_and_reconcile() {
-        use crate::metadata_records::{DfsCrossShardPinTransferRecord, DfsMetadataTableSnapshot};
+    fn retained_revision_path_index_rebuilds_from_current_snapshot_and_reconcile() {
+        use crate::metadata_records::DfsCrossShardPinTransferRecord;
         use crate::metadata_table_store::{
-            LEGACY_METADATA_TABLE_SNAPSHOT_FORMAT_VERSION, METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
-            metadata_table_snapshot_ops, metadata_tables_from_table_snapshot,
-            metadata_tables_snapshot,
+            metadata_tables_from_snapshot, metadata_tables_snapshot,
         };
         let mut tables = DfsMetadataTables::default();
         let object = retained_object("snapshot-family", "/current/file");
@@ -1542,30 +1450,11 @@ mod tests {
             versions: vec![record.clone()],
             transfer,
         });
-        for format_version in [
-            LEGACY_METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
-            METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
-        ] {
-            let snapshot = DfsMetadataTableSnapshot {
-                format_version,
-                materialized_through_sequence: Some(7),
-                tables: (format_version == METADATA_TABLE_SNAPSHOT_FORMAT_VERSION)
-                    .then(|| Box::new(metadata_tables_snapshot(&tables))),
-                ops: if format_version == LEGACY_METADATA_TABLE_SNAPSHOT_FORMAT_VERSION {
-                    metadata_table_snapshot_ops(&tables)
-                } else {
-                    Vec::new()
-                },
-                semantic_state_fingerprint: None,
-                prefix_proof: None,
-            };
+        {
+            let snapshot = metadata_tables_snapshot(&tables);
             let encoded = serde_json::to_value(&snapshot).unwrap();
             assert!(!encoded.to_string().contains("retained_revision_index"));
-            let rebuilt = metadata_tables_from_table_snapshot(
-                serde_json::from_value(encoded).unwrap(),
-                "index compatibility",
-            )
-            .unwrap();
+            let rebuilt = metadata_tables_from_snapshot(snapshot).unwrap();
             for path in ["/captured", "/current"] {
                 assert_eq!(
                     retained_path_page(&rebuilt, path, None, 1).versions,
@@ -1831,22 +1720,28 @@ mod tests {
         ] {
             tables.apply(DfsMetadataTableOp::PutVersionPin {
                 pin: DfsMetadataVersionPinRecord {
-                    namespace: None,
+                    namespace: "module.dfs.history".into(),
                     file_system_id: file_system_id(),
                     object_id: object_id.clone(),
                     version: ver(version_name),
-                    pin_id: pin_id.to_string(),
+                    pin_id: crate::content_reference_storage_id(
+                        "module.dfs.history",
+                        &(pin_id.to_string()),
+                    ),
                     created_at: OffsetDateTime::UNIX_EPOCH,
                 },
             });
         }
         tables.apply(DfsMetadataTableOp::PutVersionPin {
             pin: DfsMetadataVersionPinRecord {
-                namespace: None,
+                namespace: "module.dfs.history".into(),
                 file_system_id: file_system_id(),
                 object_id: other_id,
                 version: ver("version_pin_page_1"),
-                pin_id: "consumer-a".to_string(),
+                pin_id: crate::content_reference_storage_id(
+                    "module.dfs.history",
+                    &("consumer-a".to_string()),
+                ),
                 created_at: OffsetDateTime::UNIX_EPOCH,
             },
         });
@@ -1869,9 +1764,18 @@ mod tests {
             .map(|pin| (pin.version, pin.pin_id))
             .collect::<Vec<_>>();
         let mut expected = vec![
-            (ver("version_pin_page_1"), "consumer-a".to_string()),
-            (ver("version_pin_page_1"), "consumer-b".to_string()),
-            (ver("version_pin_page_2"), "consumer-a".to_string()),
+            (
+                ver("version_pin_page_1"),
+                "ref/module.dfs.history/consumer-a".to_string(),
+            ),
+            (
+                ver("version_pin_page_1"),
+                "ref/module.dfs.history/consumer-b".to_string(),
+            ),
+            (
+                ver("version_pin_page_2"),
+                "ref/module.dfs.history/consumer-a".to_string(),
+            ),
         ];
         expected.sort();
         assert_eq!(observed, expected);
@@ -1924,4 +1828,30 @@ mod tests {
             vec!["intent_c"]
         );
     }
+}
+
+pub(crate) fn object_by_path_from_tables(
+    tables: &DfsMetadataTables,
+    file_system_id: &DfsFileSystemId,
+    path: &str,
+) -> Option<DfsObjectMetadata> {
+    let normalized_path = normalize_path(path);
+    let Some(path_record) = tables
+        .paths
+        .get(&(file_system_id.clone(), normalized_path.clone()))
+    else {
+        return tables.compacted_tombstone_by_path(file_system_id, &normalized_path);
+    };
+    if path_record.file_system_id != *file_system_id
+        || normalize_path(&path_record.path) != normalized_path
+    {
+        return None;
+    }
+    if let Some(object) = tables.objects.get(&path_record.object_id).cloned()
+        && object.file_system_id == *file_system_id
+        && normalize_path(&object.path) == normalized_path
+    {
+        return Some(object);
+    }
+    tables.compacted_tombstone_by_path(file_system_id, &normalized_path)
 }

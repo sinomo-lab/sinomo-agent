@@ -23,73 +23,24 @@ use crate::metadata_keys::{
     dentry_key, id_lower_bound, intent_key, normalize_path, write_intent_scan_key,
     write_intent_target_key,
 };
-use crate::metadata_namespace_transaction::{
-    materialize_committed_namespace_transaction_table_state,
-    preapply_committed_namespace_transaction_table_state_with_rollback,
-};
 use crate::metadata_object_index::object_index_table_ops_with_previous;
 use crate::metadata_records::{
-    DfsConflictRecord, DfsConflictStatus, DfsCrossShardPinTransferRecord, DfsDirFragmentId,
-    DfsDirFragmentRecord, DfsInodeId, DfsInodeRecord, DfsMetadataPrefixProof, DfsMetadataSummary,
-    DfsMetadataTableOp, DfsMetadataVersionPinRecord, DfsNamespaceJobReceipt, DfsNamespaceJobRecord,
-    DfsNamespaceJobStatus, DfsNamespacePrepareReceipt, DfsNamespacePrepareRecord,
-    DfsNamespacePrepareStatus, DfsNamespaceReceiptOrderKey, DfsNamespaceReceiptRetentionState,
+    DfsCrossShardPinTransferRecord, DfsDirFragmentId, DfsDirFragmentRecord, DfsInodeId,
+    DfsInodeRecord, DfsMetadataPrefixProof, DfsMetadataSummary, DfsMetadataTableOp,
+    DfsMetadataVersionPinRecord, DfsNamespaceJobReceipt, DfsNamespaceJobRecord,
+    DfsNamespaceJobStatus, DfsNamespaceReceiptOrderKey, DfsNamespaceReceiptRetentionState,
     DfsNamespaceRequestCompletion, DfsNamespaceRequestReceipt, DfsNamespaceRequestRecord,
     DfsNamespaceRequestStatus, DfsNamespaceTransaction, DfsNamespaceTransactionReceipt,
-    DfsObjectVersionRecord, DfsPathRecord, DfsReplicaReceiptRecord, DfsVisibleVersionCommitRecord,
+    DfsObjectVersionRecord, DfsPathRecord, DfsPreparedOperationEviction,
+    DfsPreparedOperationRecord, DfsPreparedOperationStatus, DfsReplicaReceiptRecord,
     DfsWriteIntentReceipt, DfsWriteIntentReceiptRetentionState, DfsWriteIntentRecord,
     normalized_object_metadata,
 };
+
+mod prepared_operation;
 use crate::{
     DfsFileSystem, DfsFileSystemId, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsVersion,
 };
-
-#[cfg(test)]
-thread_local! {
-    static NAMESPACE_COMMIT_ROLLBACK_MATERIALIZATIONS: Cell<usize> = const { Cell::new(0) };
-    static NAMESPACE_COMMIT_DIRECT_MATERIALIZATIONS: Cell<usize> = const { Cell::new(0) };
-    static NAMESPACE_PREPARE_ROLLBACK_MATERIALIZATIONS: Cell<usize> = const { Cell::new(0) };
-    static NAMESPACE_PREPARE_POST_APPEND_MATERIALIZATIONS: Cell<usize> = const { Cell::new(0) };
-    static NAMESPACE_PREPARE_FOOTPRINT_CONSTRUCTIONS: Cell<usize> = const { Cell::new(0) };
-}
-
-#[cfg(test)]
-pub(crate) fn reset_namespace_commit_materialization_counters() {
-    NAMESPACE_COMMIT_ROLLBACK_MATERIALIZATIONS.set(0);
-    NAMESPACE_COMMIT_DIRECT_MATERIALIZATIONS.set(0);
-}
-
-#[cfg(test)]
-pub(crate) fn namespace_commit_materialization_counters() -> (usize, usize) {
-    (
-        NAMESPACE_COMMIT_ROLLBACK_MATERIALIZATIONS.get(),
-        NAMESPACE_COMMIT_DIRECT_MATERIALIZATIONS.get(),
-    )
-}
-
-#[cfg(test)]
-pub(crate) fn reset_namespace_prepare_materialization_counters() {
-    NAMESPACE_PREPARE_ROLLBACK_MATERIALIZATIONS.set(0);
-    NAMESPACE_PREPARE_POST_APPEND_MATERIALIZATIONS.set(0);
-}
-
-#[cfg(test)]
-pub(crate) fn namespace_prepare_materialization_counters() -> (usize, usize) {
-    (
-        NAMESPACE_PREPARE_ROLLBACK_MATERIALIZATIONS.get(),
-        NAMESPACE_PREPARE_POST_APPEND_MATERIALIZATIONS.get(),
-    )
-}
-
-#[cfg(test)]
-pub(crate) fn reset_namespace_prepare_footprint_constructions() {
-    NAMESPACE_PREPARE_FOOTPRINT_CONSTRUCTIONS.set(0);
-}
-
-#[cfg(test)]
-pub(crate) fn namespace_prepare_footprint_constructions() -> usize {
-    NAMESPACE_PREPARE_FOOTPRINT_CONSTRUCTIONS.get()
-}
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct DfsMetadataTables {
@@ -119,16 +70,15 @@ pub(crate) struct DfsMetadataTables {
     pub(crate) intent_receipt_retention: DfsWriteIntentReceiptRetentionState,
     pub(crate) intent_order: BTreeMap<(OffsetDateTime, String, DfsObjectId), (DfsObjectId, String)>,
     pub(crate) intent_targets: BTreeMap<(DfsObjectId, DfsVersion, String), (DfsObjectId, String)>,
-    pub(crate) conflicts: BTreeMap<(DfsObjectId, String), DfsConflictRecord>,
     pub(crate) advisory_lock_states: BTreeMap<DfsObjectId, DfsAdvisoryLockStateRecord>,
-    pub(crate) visible_commits: BTreeMap<(DfsObjectId, DfsVersion), DfsVisibleVersionCommitRecord>,
-    pub(crate) namespace_transactions: BTreeMap<String, DfsNamespaceTransaction>,
     pub(crate) namespace_transaction_receipts: BTreeMap<String, DfsNamespaceTransactionReceipt>,
     /// Derived object-local reference-outcome lookup; never serialized.
     content_reference_outcome_ids: BTreeMap<DfsObjectId, BTreeSet<String>>,
     content_reference_outcome_objects: BTreeMap<String, DfsObjectId>,
-    pub(crate) namespace_prepares: BTreeMap<String, DfsNamespacePrepareRecord>,
-    pub(crate) namespace_prepare_receipts: BTreeMap<String, DfsNamespacePrepareReceipt>,
+    /// Sole immutable prepared body and exact terminal outcome owner.
+    pub(crate) prepared_operations_v7:
+        BTreeMap<String, crate::metadata_records::DfsPreparedOperationRecord>,
+    pub(crate) prepared_operation_evictions: BTreeMap<String, DfsPreparedOperationEviction>,
     namespace_prepare_object_owners:
         BTreeMap<DfsFileSystemId, BTreeMap<DfsObjectId, BTreeSet<String>>>,
     namespace_prepare_path_owners: BTreeMap<DfsFileSystemId, BTreeMap<String, BTreeSet<String>>>,
@@ -392,7 +342,6 @@ struct DfsMetadataStatusIndex {
     expiring_repairs_by_file_system:
         BTreeMap<DfsFileSystemId, crate::repair_deadlines::RepairDeadlines>,
     pending_write_count: usize,
-    open_conflict_count: usize,
     pending_namespace_job_count: usize,
     failed_namespace_job_count: usize,
     cross_shard_namespace_lock_ref_counts: BTreeMap<(DfsFileSystemId, String), usize>,
@@ -412,7 +361,6 @@ struct DfsMetadataObjectStatusContribution {
 enum DfsMetadataStatusMutationEffect {
     None,
     Object(DfsObjectId),
-    Conflict(DfsObjectId, String),
     NamespaceJob(String),
 }
 
@@ -420,8 +368,7 @@ enum DfsMetadataStatusMutationEffect {
 pub(crate) struct DfsMetadataTableState {
     pub(crate) tables: DfsMetadataTables,
     pub(crate) table_log_offset: u64,
-    pub(crate) table_log_journal_reference_replay_cost_bytes: u64,
-    pub(crate) table_log_unpriced_namespace_prepare_references: u64,
+
     pub(crate) materialized_through_sequence: Option<u64>,
     pub(crate) snapshot_format_version: Option<u16>,
     pub(crate) snapshot_fingerprint: Option<MetadataTableSnapshotFingerprint>,
@@ -441,6 +388,10 @@ pub(crate) struct MetadataTableReadSnapshotCache {
     pub(crate) snapshot_fingerprint: Option<MetadataTableSnapshotFingerprint>,
     pub(crate) checkpoint_fingerprint: Option<MetadataTableSnapshotFingerprint>,
     pub(crate) table_log_offset: u64,
+
+    pub(crate) materialized_through_sequence: Option<u64>,
+    pub(crate) snapshot_format_version: Option<u16>,
+    pub(crate) prefix_proof: Option<DfsMetadataPrefixProof>,
     pub(crate) tables: Arc<DfsMetadataTables>,
 }
 
@@ -463,8 +414,7 @@ impl Deref for DfsMetadataTablesSnapshot<'_> {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct MetadataTableReplay {
     pub(crate) offset: u64,
-    pub(crate) journal_reference_replay_cost_bytes: u64,
-    pub(crate) unpriced_namespace_prepare_references: u64,
+
     pub(crate) materialized_through_sequence: Option<u64>,
     pub(crate) prefix_proof: Option<DfsMetadataPrefixProof>,
 }
@@ -501,20 +451,14 @@ pub(crate) struct DfsNamespacePrepareFootprint {
 
 impl DfsNamespacePrepareFootprint {
     pub(crate) fn from_validated_parts(
-        prepare: &DfsNamespacePrepareRecord,
+        prepare: &DfsPreparedOperationRecord,
         object_ids: BTreeSet<DfsObjectId>,
         normalized_paths: BTreeSet<String>,
     ) -> Self {
-        #[cfg(test)]
-        NAMESPACE_PREPARE_FOOTPRINT_CONSTRUCTIONS.set(
-            NAMESPACE_PREPARE_FOOTPRINT_CONSTRUCTIONS
-                .get()
-                .saturating_add(1),
-        );
         Self {
             file_system_id: prepare.file_system_id.clone(),
             operation_id: prepare.operation_id.clone(),
-            operation_digest: prepare.operation_digest.clone(),
+            operation_digest: prepare.digest.payload_digest.clone(),
             owner_epoch: prepare.owner_epoch,
             transaction_id: prepare.transaction.transaction_id.clone(),
             expected_object_count: prepare.expected_object_versions.len(),
@@ -535,26 +479,13 @@ impl DfsNamespacePrepareFootprint {
         &self.normalized_paths
     }
 
-    pub(crate) fn matches_prepare_identity(&self, prepare: &DfsNamespacePrepareRecord) -> bool {
-        self.file_system_id == prepare.file_system_id
-            && self.operation_id == prepare.operation_id
-            && self.operation_digest == prepare.operation_digest
-            && self.owner_epoch == prepare.owner_epoch
-            && self.transaction_id == prepare.transaction.transaction_id
-            && self.expected_object_count == prepare.expected_object_versions.len()
-            && self.expected_path_count == prepare.expected_path_occupants.len()
-            && self.transaction_object_count == prepare.transaction.objects.len()
-            && self.transaction_version_count == prepare.transaction.versions.len()
-            && self.content_receipt_count == prepare.content_receipts.len()
-    }
-
     fn into_parts(self) -> (BTreeSet<DfsObjectId>, BTreeSet<String>) {
         (self.object_ids, self.normalized_paths)
     }
 }
 
 pub(crate) fn namespace_prepare_footprint(
-    prepare: &DfsNamespacePrepareRecord,
+    prepare: &DfsPreparedOperationRecord,
 ) -> DfsNamespacePrepareFootprint {
     let mut object_ids = prepare
         .expected_object_versions
@@ -575,6 +506,12 @@ pub(crate) fn namespace_prepare_footprint(
             .iter()
             .map(|identity| identity.object_id.clone()),
     );
+    object_ids.extend(
+        prepare
+            .metadata_effects
+            .iter()
+            .flat_map(|effect| effect.affected_object_ids()),
+    );
     let mut paths = prepare
         .expected_path_occupants
         .iter()
@@ -588,22 +525,6 @@ pub(crate) fn namespace_prepare_footprint(
             .map(|object| normalize_path(&object.path)),
     );
     DfsNamespacePrepareFootprint::from_validated_parts(prepare, object_ids, paths)
-}
-
-fn namespace_transaction_order_key(
-    transaction: &DfsNamespaceTransaction,
-) -> DfsNamespaceReceiptOrderKey {
-    DfsNamespaceReceiptOrderKey {
-        created_at: transaction.created_at,
-        identity: transaction.transaction_id.clone(),
-    }
-}
-
-fn namespace_prepare_order_key(prepare: &DfsNamespacePrepareRecord) -> DfsNamespaceReceiptOrderKey {
-    DfsNamespaceReceiptOrderKey {
-        created_at: prepare.transaction.created_at,
-        identity: prepare.operation_id.clone(),
-    }
 }
 
 fn namespace_job_order_key(
@@ -651,18 +572,6 @@ pub(crate) fn namespace_transaction_receipt_eviction_delta(
     retention
 }
 
-pub(crate) fn namespace_prepare_receipt_eviction_delta(
-    receipt: &DfsNamespacePrepareReceipt,
-) -> DfsNamespaceReceiptRetentionState {
-    DfsNamespaceReceiptRetentionState {
-        prepare_floor: Some(DfsNamespaceReceiptOrderKey {
-            created_at: receipt.created_at,
-            identity: receipt.operation_id.clone(),
-        }),
-        ..DfsNamespaceReceiptRetentionState::default()
-    }
-}
-
 pub(crate) fn namespace_job_receipt_eviction_delta(
     receipt: &DfsNamespaceJobReceipt,
 ) -> DfsNamespaceReceiptRetentionState {
@@ -701,14 +610,9 @@ impl DfsMetadataTables {
             }
         }
         let identity = self
-            .namespace_transactions
+            .namespace_transaction_receipts
             .get(transaction_id)
-            .and_then(|transaction| transaction.content_reference_identity.as_ref())
-            .or_else(|| {
-                self.namespace_transaction_receipts
-                    .get(transaction_id)
-                    .and_then(|receipt| receipt.content_reference_identity.as_ref())
-            });
+            .and_then(|receipt| receipt.content_reference_identity.as_ref());
         if let Some(identity) = identity {
             let object_id = identity.object_id.clone();
             self.content_reference_outcome_objects
@@ -782,7 +686,6 @@ impl DfsMetadataTables {
             receipt_count: self.receipts.len(),
             intent_count: self.intents.len(),
             pending_write_count: self.status_index.pending_write_count,
-            open_conflict_count: self.status_index.open_conflict_count,
             pending_repair_count,
             pending_namespace_job_count: self.status_index.pending_namespace_job_count,
             failed_namespace_job_count: self.status_index.failed_namespace_job_count,
@@ -825,16 +728,7 @@ impl DfsMetadataTables {
             DfsMetadataTableOp::PutIntent { intent } => {
                 DfsMetadataStatusMutationEffect::Object(intent.object_id.clone())
             }
-            DfsMetadataTableOp::PutConflict { conflict } => {
-                DfsMetadataStatusMutationEffect::Conflict(
-                    conflict.object_id.clone(),
-                    conflict.conflict_id.clone(),
-                )
-            }
-            DfsMetadataTableOp::RemoveConflict {
-                object_id,
-                conflict_id,
-            } => DfsMetadataStatusMutationEffect::Conflict(object_id.clone(), conflict_id.clone()),
+
             DfsMetadataTableOp::PutNamespaceJob { job } => {
                 DfsMetadataStatusMutationEffect::NamespaceJob(job.job_id.clone())
             }
@@ -1059,12 +953,6 @@ impl DfsMetadataTables {
             .saturating_add(after.pending_write_count);
     }
 
-    fn conflict_is_open(&self, object_id: &DfsObjectId, conflict_id: &str) -> bool {
-        self.conflicts
-            .get(&(object_id.clone(), conflict_id.to_string()))
-            .is_some_and(|conflict| conflict.status == DfsConflictStatus::Open)
-    }
-
     fn namespace_job_status(
         &self,
         job_id: &str,
@@ -1165,270 +1053,117 @@ impl DfsMetadataTables {
     /// replay uses this checked entry point and rejects a missing or mismatched
     /// dependency instead of silently publishing partial metadata.
     pub(crate) fn apply_checked(&mut self, op: DfsMetadataTableOp) -> Result<()> {
+        let mut rollback = DfsMetadataTableRollback::default();
+        let result = self.apply_checked_with_rollback(op, &mut rollback);
+        if result.is_err() {
+            rollback.rollback(self);
+        }
+        result
+    }
+    pub(crate) fn validate_checked(&self, op: &DfsMetadataTableOp) -> Result<()> {
         match op {
-            DfsMetadataTableOp::PutNamespacePrepareJournalReference {
-                journal_sequence,
-                operation_id,
-                ..
-            } => Err(MetadataBackendError::Serde(format!(
-                "namespace prepare {operation_id} table reference at journal sequence {journal_sequence} was not resolved"
-            ))),
-            DfsMetadataTableOp::CommitNamespacePrepare {
-                operation_id,
-                operation_digest,
-                owner_epoch,
-                retained_at,
-            } => self.materialize_committed_namespace_prepare(
-                &operation_id,
-                &operation_digest,
-                owner_epoch,
-                retained_at,
-            ),
-            op => {
-                #[cfg(test)]
-                if matches!(&op, DfsMetadataTableOp::PutNamespacePrepare { .. }) {
-                    NAMESPACE_PREPARE_POST_APPEND_MATERIALIZATIONS.set(
-                        NAMESPACE_PREPARE_POST_APPEND_MATERIALIZATIONS
-                            .get()
-                            .saturating_add(1),
-                    );
+            DfsMetadataTableOp::PutPreparedOperationV7 { record } => record.validate(),
+            DfsMetadataTableOp::CommitPreparedOperationV7 {
+                digest,
+                committed_entry,
+            } => self.validate_prepared_operation_v7_commit(digest, committed_entry),
+            DfsMetadataTableOp::RemovePreparedOperation { digest } => {
+                let record = self
+                    .prepared_operations_v7
+                    .get(&digest.operation_id)
+                    .ok_or_else(|| {
+                        MetadataBackendError::Serde("eviction has no retained operation".into())
+                    })?;
+                if record.digest != *digest || record.status == DfsPreparedOperationStatus::Prepared
+                {
+                    return Err(MetadataBackendError::Serde(
+                        "cannot evict another or active operation".into(),
+                    ));
                 }
-                self.apply(op);
                 Ok(())
             }
+            DfsMetadataTableOp::ResolvePreparedOperation { digest, status } => {
+                let record = self
+                    .prepared_operations_v7
+                    .get(&digest.operation_id)
+                    .ok_or_else(|| {
+                        MetadataBackendError::Serde("resolution lacks current preparation".into())
+                    })?;
+                if record.digest != *digest
+                    || record.status != DfsPreparedOperationStatus::Prepared
+                    || !matches!(
+                        status,
+                        DfsPreparedOperationStatus::Aborted
+                            | DfsPreparedOperationStatus::Superseded
+                    )
+                {
+                    return Err(MetadataBackendError::Serde(
+                        "resolution preparation compare changed".into(),
+                    ));
+                }
+                Ok(())
+            }
+            _ => Ok(()),
         }
     }
-
-    /// Apply a prepare operation with the footprint produced by the same
-    /// successful shape-validation pass. The generic checked boundary above
-    /// remains self-contained for replay and untrusted callers; only the
-    /// foreground journal/materialization path uses this allocation-reuse
-    /// entry point.
-    pub(crate) fn apply_checked_with_namespace_prepare_footprint(
-        &mut self,
-        op: DfsMetadataTableOp,
-        footprint: DfsNamespacePrepareFootprint,
-    ) -> Result<()> {
-        let DfsMetadataTableOp::PutNamespacePrepare { prepare } = op else {
-            return Err(MetadataBackendError::Serde(
-                "validated namespace prepare footprint requires a prepare table operation"
-                    .to_string(),
-            ));
-        };
-        if !footprint.matches_prepare_identity(&prepare) {
-            return Err(MetadataBackendError::Serde(format!(
-                "validated namespace prepare footprint does not match prepare {}",
-                prepare.operation_id
-            )));
-        }
-        #[cfg(test)]
-        NAMESPACE_PREPARE_POST_APPEND_MATERIALIZATIONS.set(
-            NAMESPACE_PREPARE_POST_APPEND_MATERIALIZATIONS
-                .get()
-                .saturating_add(1),
-        );
-        self.namespace_prepare_receipts
-            .remove(&prepare.operation_id);
-        self.put_namespace_prepare_indexed_with_footprint(*prepare, footprint);
-        Ok(())
-    }
-
-    /// Validate any dependency referenced by a compact semantic operation
-    /// without cloning or mutating its full prepared body.
-    pub(crate) fn validate_checked(&self, op: &DfsMetadataTableOp) -> Result<()> {
-        if let DfsMetadataTableOp::PutNamespacePrepareJournalReference {
-            journal_sequence,
-            operation_id,
-            ..
-        } = op
-        {
-            return Err(MetadataBackendError::Serde(format!(
-                "namespace prepare {operation_id} table reference at journal sequence {journal_sequence} was not resolved"
-            )));
-        }
-        if let DfsMetadataTableOp::CommitNamespacePrepare {
-            operation_id,
-            operation_digest,
-            owner_epoch,
-            ..
-        } = op
-        {
-            self.validated_committed_namespace_prepare(
-                operation_id,
-                operation_digest,
-                *owner_epoch,
-            )?;
-        }
-        Ok(())
-    }
-
     pub(crate) fn apply_checked_with_rollback(
         &mut self,
         op: DfsMetadataTableOp,
         rollback: &mut DfsMetadataTableRollback,
     ) -> Result<()> {
-        if let DfsMetadataTableOp::PutNamespacePrepareJournalReference {
-            journal_sequence,
-            operation_id,
-            ..
-        } = &op
-        {
-            return Err(MetadataBackendError::Serde(format!(
-                "namespace prepare {operation_id} table reference at journal sequence {journal_sequence} was not resolved"
-            )));
+        match op {
+            DfsMetadataTableOp::PutPreparedOperationV7 { record } => {
+                self.apply_prepared_operation_v7_with_rollback(*record, rollback)
+            }
+            DfsMetadataTableOp::CommitPreparedOperationV7 {
+                digest,
+                committed_entry,
+            } => {
+                self.commit_prepared_operation_v7_with_rollback(&digest, &committed_entry, rollback)
+            }
+            DfsMetadataTableOp::RemovePreparedOperation { digest } => {
+                let op = DfsMetadataTableOp::RemovePreparedOperation {
+                    digest: digest.clone(),
+                };
+                self.validate_checked(&op)?;
+                rollback.record(self, &op);
+                let record = self
+                    .prepared_operations_v7
+                    .remove(&digest.operation_id)
+                    .expect("validated eviction");
+                self.unindex_namespace_prepare_footprint(&record);
+                self.unindex_namespace_prepare_request(&record);
+                self.prepared_operation_evictions.insert(
+                    digest.operation_id.clone(),
+                    DfsPreparedOperationEviction {
+                        digest: record.digest,
+                        status: record.status,
+                        committed_entry: record.committed_entry,
+                    },
+                );
+                Ok(())
+            }
+            DfsMetadataTableOp::ResolvePreparedOperation { digest, status } => {
+                let op = DfsMetadataTableOp::ResolvePreparedOperation {
+                    digest: digest.clone(),
+                    status,
+                };
+                self.validate_checked(&op)?;
+                rollback.record(self, &op);
+                let mut record = self
+                    .prepared_operations_v7
+                    .get(&digest.operation_id)
+                    .expect("validated resolution")
+                    .clone();
+                record.status = status;
+                self.put_prepared_operation_indexed(record);
+                Ok(())
+            }
+            op => {
+                self.apply_with_rollback(op, rollback);
+                Ok(())
+            }
         }
-        let DfsMetadataTableOp::CommitNamespacePrepare {
-            operation_id,
-            operation_digest,
-            owner_epoch,
-            retained_at,
-        } = op
-        else {
-            self.apply_with_rollback(op, rollback);
-            return Ok(());
-        };
-        #[cfg(test)]
-        NAMESPACE_COMMIT_ROLLBACK_MATERIALIZATIONS.set(
-            NAMESPACE_COMMIT_ROLLBACK_MATERIALIZATIONS
-                .get()
-                .saturating_add(1),
-        );
-        let mut prepare =
-            self.committed_namespace_prepare(&operation_id, &operation_digest, owner_epoch)?;
-        prepare.status = DfsNamespacePrepareStatus::Committed;
-        let retained_at = retained_at.unwrap_or(prepare.transaction.created_at);
-        let transaction_receipt =
-            DfsNamespaceTransactionReceipt::from_transaction(&prepare.transaction, retained_at)
-                .expect("namespace transaction JSON identity serialization is infallible");
-        let prepare_receipt = DfsNamespacePrepareReceipt::from_prepare(&prepare, retained_at)
-            .expect("a committed prepare always produces a terminal receipt");
-        for receipt in &prepare.content_receipts {
-            self.apply_with_rollback(
-                DfsMetadataTableOp::PutReceipt {
-                    receipt: receipt.clone(),
-                },
-                rollback,
-            );
-        }
-        preapply_committed_namespace_transaction_table_state_with_rollback(
-            self,
-            &prepare.transaction,
-            transaction_receipt,
-            rollback,
-        );
-        self.apply_with_rollback(
-            DfsMetadataTableOp::PutNamespacePrepareReceipt {
-                receipt: prepare_receipt,
-            },
-            rollback,
-        );
-        let request_op = if let Some(request) = prepare.completed_request {
-            self.missing_namespace_request_completion_op(Cow::Owned(request))
-        } else {
-            prepare
-                .completed_request_completion
-                .as_ref()
-                .and_then(|completion| {
-                    self.missing_compact_namespace_request_completion_op(completion)
-                })
-        };
-        if let Some(request_op) = request_op {
-            self.apply_with_rollback(request_op, rollback);
-        }
-        Ok(())
-    }
-
-    fn committed_namespace_prepare(
-        &self,
-        operation_id: &str,
-        operation_digest: &str,
-        owner_epoch: u64,
-    ) -> Result<DfsNamespacePrepareRecord> {
-        self.validated_committed_namespace_prepare(operation_id, operation_digest, owner_epoch)
-            .cloned()
-    }
-
-    fn validated_committed_namespace_prepare(
-        &self,
-        operation_id: &str,
-        operation_digest: &str,
-        owner_epoch: u64,
-    ) -> Result<&DfsNamespacePrepareRecord> {
-        let prepare = self.namespace_prepares.get(operation_id).ok_or_else(|| {
-            MetadataBackendError::Serde(format!(
-                "compact namespace commit {operation_id} has no preceding durable prepare"
-            ))
-        })?;
-        if prepare.operation_digest != operation_digest || prepare.owner_epoch != owner_epoch {
-            return Err(MetadataBackendError::Serde(format!(
-                "compact namespace commit {operation_id} digest/epoch fence mismatch"
-            )));
-        }
-        if prepare.status == DfsNamespacePrepareStatus::Aborted {
-            return Err(MetadataBackendError::Serde(format!(
-                "compact namespace commit {operation_id} refers to an aborted prepare"
-            )));
-        }
-        Ok(prepare)
-    }
-
-    fn materialize_committed_namespace_prepare(
-        &mut self,
-        operation_id: &str,
-        operation_digest: &str,
-        owner_epoch: u64,
-        retained_at: Option<OffsetDateTime>,
-    ) -> Result<()> {
-        #[cfg(test)]
-        NAMESPACE_COMMIT_DIRECT_MATERIALIZATIONS.set(
-            NAMESPACE_COMMIT_DIRECT_MATERIALIZATIONS
-                .get()
-                .saturating_add(1),
-        );
-        self.validated_committed_namespace_prepare(operation_id, operation_digest, owner_epoch)?;
-        // This path runs only after the compact table marker is durable. Take
-        // ownership of the hidden body, materialize its canonical state, then
-        // retain only compact exact-retry evidence.
-        let mut prepare = self
-            .namespace_prepares
-            .remove(operation_id)
-            .expect("validated namespace prepare must remain present");
-        self.unindex_namespace_prepare_footprint(&prepare);
-        self.unindex_namespace_prepare_request(&prepare);
-        for receipt in &prepare.content_receipts {
-            self.apply(DfsMetadataTableOp::PutReceipt {
-                receipt: receipt.clone(),
-            });
-        }
-        prepare.status = DfsNamespacePrepareStatus::Committed;
-        let retained_at = retained_at.unwrap_or(prepare.transaction.created_at);
-        let transaction_receipt =
-            DfsNamespaceTransactionReceipt::from_transaction(&prepare.transaction, retained_at)
-                .expect("namespace transaction JSON identity serialization is infallible");
-        let prepare_receipt = DfsNamespacePrepareReceipt::from_prepare(&prepare, retained_at)
-            .expect("a committed prepare always produces a terminal receipt");
-        materialize_committed_namespace_transaction_table_state(
-            self,
-            &prepare.transaction,
-            transaction_receipt,
-        );
-        let request_op = if let Some(request) = prepare.completed_request.take() {
-            self.missing_namespace_request_completion_op(Cow::Owned(request))
-        } else {
-            prepare
-                .completed_request_completion
-                .as_ref()
-                .and_then(|completion| {
-                    self.missing_compact_namespace_request_completion_op(completion)
-                })
-        };
-        self.apply(DfsMetadataTableOp::PutNamespacePrepareReceipt {
-            receipt: prepare_receipt,
-        });
-        if let Some(request_op) = request_op {
-            self.apply(request_op);
-        }
-        Ok(())
     }
 
     pub(crate) fn namespace_request_completion_is_materialized(
@@ -1514,54 +1249,15 @@ impl DfsMetadataTables {
             || !self.intents.is_empty()
             || !self.intent_receipts.is_empty()
             || !self.intent_receipt_retention.is_empty()
-            || !self.conflicts.is_empty()
             || !self.advisory_lock_states.is_empty()
-            || !self.namespace_transactions.is_empty()
             || !self.namespace_transaction_receipts.is_empty()
             || !self.namespace_jobs.is_empty()
             || !self.namespace_job_receipts.is_empty()
             || !self.namespace_requests.is_empty()
             || !self.namespace_request_receipts.is_empty()
             || !self.compacted_tombstones.is_empty()
-            || !self.visible_commits.is_empty()
-            || !self.namespace_prepares.is_empty()
-            || !self.namespace_prepare_receipts.is_empty()
+            || !self.prepared_operations_v7.is_empty()
             || self.namespace_receipt_retention != DfsNamespaceReceiptRetentionState::default()
-    }
-
-    pub(crate) fn namespace_transaction_history_expired(
-        &self,
-        transaction: &DfsNamespaceTransaction,
-    ) -> bool {
-        self.namespace_receipt_retention
-            .transaction_floor
-            .as_ref()
-            .is_some_and(|floor| namespace_transaction_order_key(transaction) <= *floor)
-    }
-
-    pub(crate) fn namespace_prepare_history_expired(
-        &self,
-        prepare: &DfsNamespacePrepareRecord,
-    ) -> bool {
-        self.namespace_receipt_retention
-            .prepare_floor
-            .as_ref()
-            .is_some_and(|floor| namespace_prepare_order_key(prepare) <= *floor)
-    }
-
-    pub(crate) fn namespace_prepare_history_has_evictions(&self) -> bool {
-        self.namespace_receipt_retention.prepare_floor.is_some()
-    }
-
-    pub(crate) fn namespace_job_history_expired(
-        &self,
-        created_at: OffsetDateTime,
-        job_id: &str,
-    ) -> bool {
-        self.namespace_receipt_retention
-            .job_floor
-            .as_ref()
-            .is_some_and(|floor| namespace_job_order_key(created_at, job_id) <= *floor)
     }
 
     pub(crate) fn namespace_request_history_expired(
@@ -1617,7 +1313,7 @@ impl DfsMetadataTables {
     }
 
     fn namespace_prepare_footprint_indexes_from_history(
-        namespace_prepares: &BTreeMap<String, DfsNamespacePrepareRecord>,
+        prepared_operations_v7: &BTreeMap<String, DfsPreparedOperationRecord>,
     ) -> (
         BTreeMap<DfsFileSystemId, BTreeMap<DfsObjectId, BTreeSet<String>>>,
         BTreeMap<DfsFileSystemId, BTreeMap<String, BTreeSet<String>>>,
@@ -1626,9 +1322,9 @@ impl DfsMetadataTables {
             BTreeMap::<DfsFileSystemId, BTreeMap<DfsObjectId, BTreeSet<String>>>::new();
         let mut path_owners =
             BTreeMap::<DfsFileSystemId, BTreeMap<String, BTreeSet<String>>>::new();
-        for prepare in namespace_prepares
+        for prepare in prepared_operations_v7
             .values()
-            .filter(|prepare| prepare.status == DfsNamespacePrepareStatus::Prepared)
+            .filter(|prepare| prepare.status == DfsPreparedOperationStatus::Prepared)
         {
             let (object_ids, paths) = namespace_prepare_footprint(prepare).into_parts();
             for object_id in object_ids {
@@ -1651,15 +1347,35 @@ impl DfsMetadataTables {
         (object_owners, path_owners)
     }
 
+    pub(crate) fn rebuild_prepared_operation_reservations(&mut self) -> Result<()> {
+        for record in self.prepared_operations_v7.values() {
+            record.validate()?;
+        }
+        for (operation_id, witness) in &self.prepared_operation_evictions {
+            witness.validate()?;
+            if operation_id != &witness.digest.operation_id
+                || self.prepared_operations_v7.contains_key(operation_id)
+            {
+                return Err(MetadataBackendError::Serde(
+                    "snapshot operation outcome overlaps a full body or changes indexed identity"
+                        .into(),
+                ));
+            }
+        }
+        self.rebuild_namespace_prepare_footprint_indexes();
+        self.rebuild_namespace_prepare_request_index();
+        Ok(())
+    }
+
     fn rebuild_namespace_prepare_footprint_indexes(&mut self) {
         let (object_owners, path_owners) =
-            Self::namespace_prepare_footprint_indexes_from_history(&self.namespace_prepares);
+            Self::namespace_prepare_footprint_indexes_from_history(&self.prepared_operations_v7);
         self.namespace_prepare_object_owners = object_owners;
         self.namespace_prepare_path_owners = path_owners;
     }
 
     fn namespace_prepare_request_key(
-        prepare: &DfsNamespacePrepareRecord,
+        prepare: &DfsPreparedOperationRecord,
     ) -> Option<(NodeId, String)> {
         prepare
             .completed_request
@@ -1678,8 +1394,8 @@ impl DfsMetadataTables {
             })
     }
 
-    fn index_namespace_prepare_request(&mut self, prepare: &DfsNamespacePrepareRecord) {
-        if prepare.status != DfsNamespacePrepareStatus::Prepared {
+    fn index_namespace_prepare_request(&mut self, prepare: &DfsPreparedOperationRecord) {
+        if prepare.status != DfsPreparedOperationStatus::Prepared {
             return;
         }
         let Some(request_key) = Self::namespace_prepare_request_key(prepare) else {
@@ -1692,12 +1408,12 @@ impl DfsMetadataTables {
     }
 
     fn namespace_prepare_request_index_from_history(
-        namespace_prepares: &BTreeMap<String, DfsNamespacePrepareRecord>,
+        prepared_operations_v7: &BTreeMap<String, DfsPreparedOperationRecord>,
     ) -> BTreeMap<(NodeId, String), BTreeSet<String>> {
         let mut request_owners = BTreeMap::<(NodeId, String), BTreeSet<String>>::new();
-        for prepare in namespace_prepares
+        for prepare in prepared_operations_v7
             .values()
-            .filter(|prepare| prepare.status == DfsNamespacePrepareStatus::Prepared)
+            .filter(|prepare| prepare.status == DfsPreparedOperationStatus::Prepared)
         {
             let Some(request_key) = Self::namespace_prepare_request_key(prepare) else {
                 continue;
@@ -1710,8 +1426,8 @@ impl DfsMetadataTables {
         request_owners
     }
 
-    fn unindex_namespace_prepare_request(&mut self, prepare: &DfsNamespacePrepareRecord) {
-        if prepare.status != DfsNamespacePrepareStatus::Prepared {
+    fn unindex_namespace_prepare_request(&mut self, prepare: &DfsPreparedOperationRecord) {
+        if prepare.status != DfsPreparedOperationStatus::Prepared {
             return;
         }
         let Some(request_key) = Self::namespace_prepare_request_key(prepare) else {
@@ -1729,17 +1445,49 @@ impl DfsMetadataTables {
         }
     }
 
+    pub(crate) fn prepared_operation_for_request(
+        &self,
+        requester: &NodeId,
+        request_id: &str,
+    ) -> Result<Option<&DfsPreparedOperationRecord>> {
+        let key = (requester.clone(), request_id.to_owned());
+        let Some(ids) = self.namespace_prepare_request_owners.get(&key) else {
+            return Ok(None);
+        };
+        let records = ids
+            .iter()
+            .map(|id| {
+                self.prepared_operations_v7.get(id).ok_or_else(|| {
+                    MetadataBackendError::Serde(
+                        "request reservation indexes a missing prepared body".into(),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let live = records.iter().copied().filter(|record| !records.iter().any(|replacement| {
+            replacement.payload.metadata_effects.iter().any(|effect| matches!(effect,
+                crate::DfsPreparedMetadataEffect::ResolvePreparedOperation { digest, status: DfsPreparedOperationStatus::Superseded }
+                if digest == &record.digest))
+        })).collect::<Vec<_>>();
+        match live.as_slice() {
+            [record] => Ok(Some(*record)),
+            _ => Err(MetadataBackendError::Serde(
+                "request has competing or cyclic prepared reservations".into(),
+            )),
+        }
+    }
+
     fn rebuild_namespace_prepare_request_index(&mut self) {
         self.namespace_prepare_request_owners =
-            Self::namespace_prepare_request_index_from_history(&self.namespace_prepares);
+            Self::namespace_prepare_request_index_from_history(&self.prepared_operations_v7);
     }
 
     fn index_namespace_prepare_footprint(
         &mut self,
-        prepare: &DfsNamespacePrepareRecord,
+        prepare: &DfsPreparedOperationRecord,
         footprint: DfsNamespacePrepareFootprint,
     ) {
-        if prepare.status != DfsNamespacePrepareStatus::Prepared {
+        if prepare.status != DfsPreparedOperationStatus::Prepared {
             return;
         }
         let (object_ids, paths) = footprint.into_parts();
@@ -1761,26 +1509,40 @@ impl DfsMetadataTables {
         }
     }
 
-    fn unindex_namespace_prepare_footprint(&mut self, prepare: &DfsNamespacePrepareRecord) {
-        if prepare.status != DfsNamespacePrepareStatus::Prepared {
+    fn unindex_namespace_prepare_footprint(&mut self, prepare: &DfsPreparedOperationRecord) {
+        if prepare.status != DfsPreparedOperationStatus::Prepared {
             return;
         }
         // The payload was shape-validated before this Prepared record entered
         // the table. Walk its borrowed keys directly when releasing ownership;
         // rebuilding an owned footprint here would clone every object ID and
         // retain another pair of large sets on the foreground commit path.
-        for object_id in prepare
+        let object_ids = prepare
             .expected_object_versions
             .iter()
-            .map(|expected| &expected.object_id)
+            .map(|expected| expected.object_id.clone())
             .chain(
                 prepare
                     .transaction
                     .objects
                     .iter()
-                    .map(|object| &object.object_id),
+                    .map(|object| object.object_id.clone()),
             )
-        {
+            .chain(
+                prepare
+                    .transaction
+                    .versions
+                    .iter()
+                    .map(|version| version.object_id.clone()),
+            )
+            .chain(
+                prepare
+                    .metadata_effects
+                    .iter()
+                    .flat_map(|effect| effect.affected_object_ids()),
+            )
+            .collect::<BTreeSet<_>>();
+        for object_id in &object_ids {
             let remove_file_system = self
                 .namespace_prepare_object_owners
                 .get_mut(&prepare.file_system_id)
@@ -1831,33 +1593,33 @@ impl DfsMetadataTables {
         }
     }
 
-    fn put_namespace_prepare_indexed_with_footprint(
+    fn put_prepared_operation_indexed_with_footprint(
         &mut self,
-        prepare: DfsNamespacePrepareRecord,
+        prepare: DfsPreparedOperationRecord,
         footprint: DfsNamespacePrepareFootprint,
     ) {
         let operation_id = prepare.operation_id.clone();
-        if let Some(previous) = self.namespace_prepares.remove(&operation_id) {
+        if let Some(previous) = self.prepared_operations_v7.remove(&operation_id) {
             self.unindex_namespace_prepare_footprint(&previous);
             self.unindex_namespace_prepare_request(&previous);
         }
         self.index_namespace_prepare_footprint(&prepare, footprint);
         self.index_namespace_prepare_request(&prepare);
-        self.namespace_prepares.insert(operation_id, prepare);
+        self.prepared_operations_v7.insert(operation_id, prepare);
     }
 
-    fn put_namespace_prepare_indexed(&mut self, prepare: DfsNamespacePrepareRecord) {
-        if prepare.status != DfsNamespacePrepareStatus::Prepared {
+    pub(super) fn put_prepared_operation_indexed(&mut self, prepare: DfsPreparedOperationRecord) {
+        if prepare.status != DfsPreparedOperationStatus::Prepared {
             let operation_id = prepare.operation_id.clone();
-            if let Some(previous) = self.namespace_prepares.remove(&operation_id) {
+            if let Some(previous) = self.prepared_operations_v7.remove(&operation_id) {
                 self.unindex_namespace_prepare_footprint(&previous);
                 self.unindex_namespace_prepare_request(&previous);
             }
-            self.namespace_prepares.insert(operation_id, prepare);
+            self.prepared_operations_v7.insert(operation_id, prepare);
             return;
         }
         let footprint = namespace_prepare_footprint(&prepare);
-        self.put_namespace_prepare_indexed_with_footprint(prepare, footprint);
+        self.put_prepared_operation_indexed_with_footprint(prepare, footprint);
     }
 
     fn namespace_request_order_key(
@@ -1928,10 +1690,13 @@ impl DfsMetadataTables {
             return Ok((false, true));
         };
         for operation_id in owners.iter().take(max_prepares) {
-            let prepare = self.namespace_prepares.get(operation_id).ok_or_else(|| {
-                crate::MetadataBackendError::Serde("prepared reference owner is missing".into())
-            })?;
-            if prepare.status != DfsNamespacePrepareStatus::Prepared
+            let prepare = self
+                .prepared_operations_v7
+                .get(operation_id)
+                .ok_or_else(|| {
+                    crate::MetadataBackendError::Serde("prepared reference owner is missing".into())
+                })?;
+            if prepare.status != DfsPreparedOperationStatus::Prepared
                 || prepare.file_system_id != *file_system_id
             {
                 return Err(crate::MetadataBackendError::Serde(
@@ -1971,6 +1736,17 @@ impl DfsMetadataTables {
         Ok((false, owners.len() <= max_prepares))
     }
 
+    pub(crate) fn prepared_content_reference_owner_count(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        object_id: &DfsObjectId,
+    ) -> usize {
+        self.namespace_prepare_object_owners
+            .get(file_system_id)
+            .and_then(|objects| objects.get(object_id))
+            .map_or(0, BTreeSet::len)
+    }
+
     pub(crate) fn namespace_prepare_normalized_path_owner_other_than(
         &self,
         file_system_id: &DfsFileSystemId,
@@ -1991,7 +1767,7 @@ impl DfsMetadataTables {
     #[cfg(test)]
     pub(crate) fn namespace_prepare_footprint_indexes_match_history(&self) -> bool {
         let (object_owners, path_owners) =
-            Self::namespace_prepare_footprint_indexes_from_history(&self.namespace_prepares);
+            Self::namespace_prepare_footprint_indexes_from_history(&self.prepared_operations_v7);
         self.namespace_prepare_object_owners == object_owners
             && self.namespace_prepare_path_owners == path_owners
     }
@@ -2001,12 +1777,6 @@ impl DfsMetadataTables {
         let object_before = match &effect {
             DfsMetadataStatusMutationEffect::Object(object_id) => {
                 Some(self.object_status_contribution(object_id))
-            }
-            _ => None,
-        };
-        let conflict_before = match &effect {
-            DfsMetadataStatusMutationEffect::Conflict(object_id, conflict_id) => {
-                Some(self.conflict_is_open(object_id, conflict_id))
             }
             _ => None,
         };
@@ -2028,23 +1798,7 @@ impl DfsMetadataTables {
                     after,
                 );
             }
-            DfsMetadataStatusMutationEffect::Conflict(object_id, conflict_id) => {
-                let before =
-                    conflict_before.expect("conflict status mutation captured prior contribution");
-                let after = self.conflict_is_open(&object_id, &conflict_id);
-                match (before, after) {
-                    (false, true) => {
-                        self.status_index.open_conflict_count =
-                            self.status_index.open_conflict_count.saturating_add(1);
-                    }
-                    (true, false) => {
-                        debug_assert!(self.status_index.open_conflict_count > 0);
-                        self.status_index.open_conflict_count =
-                            self.status_index.open_conflict_count.saturating_sub(1);
-                    }
-                    _ => {}
-                }
-            }
+
             DfsMetadataStatusMutationEffect::NamespaceJob(job_id) => {
                 let before = namespace_job_before
                     .expect("namespace-job status mutation captured prior contribution");
@@ -2162,17 +1916,6 @@ impl DfsMetadataTables {
                         state.order = state.order.max(old.order);
                         if state.grant.is_none() {
                             state.grant = old.grant.clone();
-                        }
-                    }
-                    // Older writers omit namespaces they cannot represent.
-                    // A V6 row is a complete, conditionally authored map: an
-                    // omitted namespace there can be an intentional clear.
-                    if version.metadata_format == crate::DfsRevisionMetadataFormat::Legacy {
-                        for (namespace, payload) in &existing.module_metadata {
-                            version
-                                .module_metadata
-                                .entry(namespace.clone())
-                                .or_insert_with(|| payload.clone());
                         }
                     }
                     if version.content_durability.is_none() {
@@ -2359,43 +2102,24 @@ impl DfsMetadataTables {
             DfsMetadataTableOp::MergeIntentReceiptRetention { retention } => {
                 self.intent_receipt_retention.merge_conservative(retention);
             }
-            DfsMetadataTableOp::PutConflict { conflict } => {
-                self.conflicts.insert(
-                    (conflict.object_id.clone(), conflict.conflict_id.clone()),
-                    conflict,
-                );
-            }
+
             DfsMetadataTableOp::PutAdvisoryLockState { state } => {
                 self.advisory_lock_states
                     .insert(state.object_id.clone(), state);
             }
-            DfsMetadataTableOp::RemoveConflict {
+
+            DfsMetadataTableOp::MergeContentReferenceOutcomeRetention {
                 object_id,
-                conflict_id,
+                retention,
             } => {
-                self.conflicts.remove(&(object_id, conflict_id));
-            }
-            DfsMetadataTableOp::PutVisibleCommit {
-                object_id,
-                version,
-                commit,
-            } => {
-                self.visible_commits.insert((object_id, version), commit);
-            }
-            DfsMetadataTableOp::RemoveVisibleCommit { object_id, version } => {
-                self.visible_commits.remove(&(object_id, version));
-            }
-            DfsMetadataTableOp::PutNamespaceTransaction { transaction } => {
-                let transaction_id = transaction.transaction_id.clone();
-                self.namespace_transaction_receipts
-                    .remove(&transaction.transaction_id);
-                self.namespace_transactions
-                    .insert(transaction.transaction_id.clone(), transaction);
-                self.refresh_content_reference_outcome_index(&transaction_id);
+                self.namespace_receipt_retention
+                    .content_reference_outcome_retention
+                    .entry(object_id)
+                    .and_modify(|current| current.merge_conservative(&retention))
+                    .or_insert(retention);
             }
             DfsMetadataTableOp::PutNamespaceTransactionReceipt { receipt } => {
                 let transaction_id = receipt.transaction_id.clone();
-                self.namespace_transactions.remove(&receipt.transaction_id);
                 self.namespace_transaction_receipts
                     .insert(receipt.transaction_id.clone(), receipt);
                 self.refresh_content_reference_outcome_index(&transaction_id);
@@ -2409,50 +2133,30 @@ impl DfsMetadataTables {
                 self.namespace_receipt_retention
                     .merge_conservative(retention);
             }
-            DfsMetadataTableOp::PutNamespacePrepare { prepare } => {
-                self.namespace_prepare_receipts
-                    .remove(&prepare.operation_id);
-                self.put_namespace_prepare_indexed(*prepare);
+
+            DfsMetadataTableOp::RemovePreparedOperation { digest } => {
+                self.apply_checked(DfsMetadataTableOp::RemovePreparedOperation { digest })
+                    .expect("checked operation eviction");
             }
-            DfsMetadataTableOp::PutNamespacePrepareJournalReference {
-                journal_sequence,
-                operation_id,
-                ..
+            DfsMetadataTableOp::ResolvePreparedOperation { digest, status } => {
+                self.apply_checked(DfsMetadataTableOp::ResolvePreparedOperation { digest, status })
+                    .expect("validated current resolution");
+            }
+            DfsMetadataTableOp::PutPreparedOperationV7 { record } => {
+                self.apply_checked(DfsMetadataTableOp::PutPreparedOperationV7 { record })
+                    .expect("native prepared record must pass its exact checked projection");
+            }
+            DfsMetadataTableOp::CommitPreparedOperationV7 {
+                digest,
+                committed_entry,
             } => {
-                panic!(
-                    "namespace prepare {operation_id} table reference at journal sequence {journal_sequence} must be resolved before apply"
-                );
+                self.apply_checked(DfsMetadataTableOp::CommitPreparedOperationV7 {
+                    digest,
+                    committed_entry,
+                })
+                .expect("native digest marker must reference its exact prepared body");
             }
-            DfsMetadataTableOp::CommitNamespacePrepare {
-                operation_id,
-                operation_digest,
-                owner_epoch,
-                retained_at,
-            } => {
-                self.materialize_committed_namespace_prepare(
-                    &operation_id,
-                    &operation_digest,
-                    owner_epoch,
-                    retained_at,
-                )
-                .expect("compact namespace commit must reference its exact durable prepare");
-            }
-            DfsMetadataTableOp::PutNamespacePrepareReceipt { receipt } => {
-                if let Some(previous) = self.namespace_prepares.remove(&receipt.operation_id) {
-                    self.unindex_namespace_prepare_footprint(&previous);
-                    self.unindex_namespace_prepare_request(&previous);
-                }
-                self.namespace_prepare_receipts
-                    .insert(receipt.operation_id.clone(), receipt);
-            }
-            DfsMetadataTableOp::RemoveNamespacePrepareReceipt {
-                operation_id,
-                retention,
-            } => {
-                self.namespace_prepare_receipts.remove(&operation_id);
-                self.namespace_receipt_retention
-                    .merge_conservative(retention);
-            }
+
             DfsMetadataTableOp::PutNamespaceJob { job } => {
                 self.namespace_job_receipts.remove(&job.job_id);
                 self.namespace_jobs.insert(job.job_id.clone(), job);
@@ -2558,31 +2262,6 @@ impl DfsMetadataTables {
             })
     }
 
-    /// Return true when a compacted tombstone proves that replaying `object`
-    /// during namespace-transaction recovery would restore stale state.
-    ///
-    /// An exact compacted tombstone is already fully materialized. A newer
-    /// tombstone may also fence an older transaction, but only when the object
-    /// and its namespace identity match; path reuse by another object must not
-    /// suppress recovery.
-    pub(crate) fn compacted_tombstone_fences_namespace_recovery(
-        &self,
-        object: &DfsObjectMetadata,
-    ) -> bool {
-        if self.compacted_tombstone_matches(object) {
-            return true;
-        }
-        self.compacted_tombstones
-            .get(&object.object_id)
-            .is_some_and(|stored| {
-                stored.kind == DfsObjectKind::Tombstone
-                    && stored.file_system_id == object.file_system_id
-                    && normalize_path(&stored.path) == normalize_path(&object.path)
-                    && (stored.changed_at_unix_nanos, &stored.version)
-                        > (object.changed_at_unix_nanos, &object.version)
-            })
-    }
-
     fn put_hardlink_index(
         &mut self,
         target_object_id: DfsObjectId,
@@ -2663,13 +2342,11 @@ pub(crate) struct DfsMetadataTableRollback {
     intents: HashMap<(DfsObjectId, String), Option<DfsWriteIntentRecord>>,
     intent_receipts: HashMap<(DfsObjectId, String), Option<DfsWriteIntentReceipt>>,
     intent_receipt_retention: Option<DfsWriteIntentReceiptRetentionState>,
-    conflicts: HashMap<(DfsObjectId, String), Option<DfsConflictRecord>>,
     advisory_lock_states: HashMap<DfsObjectId, Option<DfsAdvisoryLockStateRecord>>,
-    visible_commits: HashMap<(DfsObjectId, DfsVersion), Option<DfsVisibleVersionCommitRecord>>,
-    namespace_transactions: HashMap<String, Option<DfsNamespaceTransaction>>,
     namespace_transaction_receipts: HashMap<String, Option<DfsNamespaceTransactionReceipt>>,
-    namespace_prepares: HashMap<String, Option<DfsNamespacePrepareRecord>>,
-    namespace_prepare_receipts: HashMap<String, Option<DfsNamespacePrepareReceipt>>,
+    prepared_operations_v7:
+        HashMap<String, Option<crate::metadata_records::DfsPreparedOperationRecord>>,
+    prepared_operation_evictions: HashMap<String, Option<DfsPreparedOperationEviction>>,
     namespace_jobs: HashMap<String, Option<DfsNamespaceJobRecord>>,
     namespace_job_receipts: HashMap<String, Option<DfsNamespaceJobReceipt>>,
     namespace_requests: HashMap<(NodeId, String), Option<DfsNamespaceRequestRecord>>,
@@ -2684,6 +2361,29 @@ impl DfsMetadataTableRollback {
             self.status_index = Some(tables.status_index.clone());
         }
         match op {
+            DfsMetadataTableOp::RemovePreparedOperation { digest } => {
+                record_rollback_value(
+                    &mut self.prepared_operation_evictions,
+                    &tables.prepared_operation_evictions,
+                    digest.operation_id.clone(),
+                );
+                record_rollback_value(
+                    &mut self.prepared_operations_v7,
+                    &tables.prepared_operations_v7,
+                    digest.operation_id.clone(),
+                );
+            }
+            DfsMetadataTableOp::PutPreparedOperationV7 { record } => record_rollback_value(
+                &mut self.prepared_operations_v7,
+                &tables.prepared_operations_v7,
+                record.digest.operation_id.clone(),
+            ),
+            DfsMetadataTableOp::CommitPreparedOperationV7 { digest, .. }
+            | DfsMetadataTableOp::ResolvePreparedOperation { digest, .. } => record_rollback_value(
+                &mut self.prepared_operations_v7,
+                &tables.prepared_operations_v7,
+                digest.operation_id.clone(),
+            ),
             DfsMetadataTableOp::PutFileSystem { file_system } => record_rollback_value(
                 &mut self.file_systems,
                 &tables.file_systems,
@@ -2943,56 +2643,20 @@ impl DfsMetadataTableRollback {
                     self.intent_receipt_retention = Some(tables.intent_receipt_retention.clone());
                 }
             }
-            DfsMetadataTableOp::PutConflict { conflict } => record_rollback_value(
-                &mut self.conflicts,
-                &tables.conflicts,
-                (conflict.object_id.clone(), conflict.conflict_id.clone()),
-            ),
+
             DfsMetadataTableOp::PutAdvisoryLockState { state } => record_rollback_value(
                 &mut self.advisory_lock_states,
                 &tables.advisory_lock_states,
                 state.object_id.clone(),
             ),
-            DfsMetadataTableOp::RemoveConflict {
-                object_id,
-                conflict_id,
-            } => record_rollback_value(
-                &mut self.conflicts,
-                &tables.conflicts,
-                (object_id.clone(), conflict_id.clone()),
-            ),
-            DfsMetadataTableOp::PutVisibleCommit {
-                object_id, version, ..
-            } => record_rollback_value(
-                &mut self.visible_commits,
-                &tables.visible_commits,
-                (object_id.clone(), version.clone()),
-            ),
-            DfsMetadataTableOp::RemoveVisibleCommit { object_id, version } => {
-                record_rollback_value(
-                    &mut self.visible_commits,
-                    &tables.visible_commits,
-                    (object_id.clone(), version.clone()),
-                )
-            }
-            DfsMetadataTableOp::PutNamespaceTransaction { transaction } => {
-                record_rollback_value(
-                    &mut self.namespace_transactions,
-                    &tables.namespace_transactions,
-                    transaction.transaction_id.clone(),
-                );
-                record_rollback_value(
-                    &mut self.namespace_transaction_receipts,
-                    &tables.namespace_transaction_receipts,
-                    transaction.transaction_id.clone(),
-                );
+
+            DfsMetadataTableOp::MergeContentReferenceOutcomeRetention { .. } => {
+                if self.namespace_receipt_retention.is_none() {
+                    self.namespace_receipt_retention =
+                        Some(tables.namespace_receipt_retention.clone());
+                }
             }
             DfsMetadataTableOp::PutNamespaceTransactionReceipt { receipt } => {
-                record_rollback_value(
-                    &mut self.namespace_transactions,
-                    &tables.namespace_transactions,
-                    receipt.transaction_id.clone(),
-                );
                 record_rollback_value(
                     &mut self.namespace_transaction_receipts,
                     &tables.namespace_transaction_receipts,
@@ -3010,61 +2674,7 @@ impl DfsMetadataTableRollback {
                         Some(tables.namespace_receipt_retention.clone());
                 }
             }
-            DfsMetadataTableOp::PutNamespacePrepare { prepare } => {
-                #[cfg(test)]
-                NAMESPACE_PREPARE_ROLLBACK_MATERIALIZATIONS.set(
-                    NAMESPACE_PREPARE_ROLLBACK_MATERIALIZATIONS
-                        .get()
-                        .saturating_add(1),
-                );
-                record_rollback_value(
-                    &mut self.namespace_prepares,
-                    &tables.namespace_prepares,
-                    prepare.operation_id.clone(),
-                );
-                record_rollback_value(
-                    &mut self.namespace_prepare_receipts,
-                    &tables.namespace_prepare_receipts,
-                    prepare.operation_id.clone(),
-                );
-            }
-            DfsMetadataTableOp::PutNamespacePrepareJournalReference {
-                journal_sequence,
-                operation_id,
-                ..
-            } => {
-                panic!(
-                    "namespace prepare {operation_id} table reference at journal sequence {journal_sequence} must be resolved before rollback planning"
-                );
-            }
-            DfsMetadataTableOp::CommitNamespacePrepare { operation_id, .. } => {
-                panic!(
-                    "compact namespace commit {operation_id} must be applied after its durable table marker, never preapplied with rollback"
-                );
-            }
-            DfsMetadataTableOp::PutNamespacePrepareReceipt { receipt } => {
-                record_rollback_value(
-                    &mut self.namespace_prepares,
-                    &tables.namespace_prepares,
-                    receipt.operation_id.clone(),
-                );
-                record_rollback_value(
-                    &mut self.namespace_prepare_receipts,
-                    &tables.namespace_prepare_receipts,
-                    receipt.operation_id.clone(),
-                );
-            }
-            DfsMetadataTableOp::RemoveNamespacePrepareReceipt { operation_id, .. } => {
-                record_rollback_value(
-                    &mut self.namespace_prepare_receipts,
-                    &tables.namespace_prepare_receipts,
-                    operation_id.clone(),
-                );
-                if self.namespace_receipt_retention.is_none() {
-                    self.namespace_receipt_retention =
-                        Some(tables.namespace_receipt_retention.clone());
-                }
-            }
+
             DfsMetadataTableOp::PutNamespaceJob { job } => {
                 record_rollback_value(
                     &mut self.namespace_jobs,
@@ -3150,7 +2760,45 @@ impl DfsMetadataTableRollback {
         }
     }
 
+    pub(crate) fn new_repair_owners(
+        &self,
+        tables: &DfsMetadataTables,
+    ) -> Vec<DfsWriteIntentRecord> {
+        self.intents
+            .iter()
+            .filter_map(|(key, original)| {
+                if original.is_some() || !matches!(self.intent_receipts.get(key), Some(None)) {
+                    return None;
+                }
+                tables
+                    .intents
+                    .get(key)
+                    .filter(|owner| {
+                        owner.publication.is_retained_repair()
+                            || crate::placement::current_placement_repair_owner_matches_identity(
+                                owner,
+                            )
+                    })
+                    .cloned()
+            })
+            .collect()
+    }
+
     pub(crate) fn rollback(self, tables: &mut DfsMetadataTables) {
+        rollback_map(
+            &mut tables.prepared_operation_evictions,
+            self.prepared_operation_evictions,
+        );
+        for (operation_id, previous) in self.prepared_operations_v7 {
+            match previous {
+                Some(record) => {
+                    tables.prepared_operations_v7.insert(operation_id, record);
+                }
+                None => {
+                    tables.prepared_operations_v7.remove(&operation_id);
+                }
+            }
+        }
         // Restore only affected candidate rows/families. A failed namespace
         // batch must not turn rollback into a scan of unrelated versions.
         let changed_objects = self.objects.keys().cloned().collect::<Vec<_>>();
@@ -3170,9 +2818,8 @@ impl DfsMetadataTableRollback {
             }
         }
         let changed_reference_outcomes = self
-            .namespace_transactions
+            .namespace_transaction_receipts
             .keys()
-            .chain(self.namespace_transaction_receipts.keys())
             .cloned()
             .collect::<BTreeSet<_>>();
         rollback_map(&mut tables.file_systems, self.file_systems);
@@ -3216,13 +2863,7 @@ impl DfsMetadataTableRollback {
             tables.intent_receipt_retention = retention;
         }
         tables.rebuild_intent_indexes();
-        rollback_map(&mut tables.conflicts, self.conflicts);
         rollback_map(&mut tables.advisory_lock_states, self.advisory_lock_states);
-        rollback_map(&mut tables.visible_commits, self.visible_commits);
-        rollback_map(
-            &mut tables.namespace_transactions,
-            self.namespace_transactions,
-        );
         rollback_map(
             &mut tables.namespace_transaction_receipts,
             self.namespace_transaction_receipts,
@@ -3230,11 +2871,6 @@ impl DfsMetadataTableRollback {
         for transaction_id in changed_reference_outcomes {
             tables.refresh_content_reference_outcome_index(&transaction_id);
         }
-        rollback_map(&mut tables.namespace_prepares, self.namespace_prepares);
-        rollback_map(
-            &mut tables.namespace_prepare_receipts,
-            self.namespace_prepare_receipts,
-        );
         tables.rebuild_namespace_prepare_footprint_indexes();
         tables.rebuild_namespace_prepare_request_index();
         rollback_map(&mut tables.namespace_jobs, self.namespace_jobs);
@@ -3353,13 +2989,12 @@ mod version_metadata_tests {
     use super::*;
 
     #[test]
-    fn legacy_rows_preserve_unknown_namespaces_and_v6_clears_are_authoritative() {
+    fn current_rows_allow_authoritative_namespace_clear() {
         let value = crate::DfsModuleMetadataValue {
             schema_version: 1,
             payload: serde_json::json!({"opaque": true}),
         };
         let original = crate::DfsObjectVersionRecord {
-            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
             file_system_id: crate::DfsFileSystemId::generate(),
             object_id: crate::DfsObjectId::generate(),
             version: crate::DfsVersion::generate(),
@@ -3382,22 +3017,11 @@ mod version_metadata_tests {
             version: original.clone(),
         });
 
-        let mut old_writer = original.clone();
-        old_writer.metadata_format = crate::DfsRevisionMetadataFormat::Legacy;
-        old_writer.module_metadata.clear();
-        tables.apply(DfsMetadataTableOp::PutVersion {
-            version: old_writer,
-        });
-        assert_eq!(
-            tables.versions[&key].module_metadata,
-            original.module_metadata
-        );
-
         let mut clear = original;
         clear.module_metadata.remove("org.example.owner");
         let encoded = sinomo_core::object::serde_ext::to_bytes(
             &clear,
-            6,
+            7,
             sinomo_core::object::LengthMode::U32,
         )
         .unwrap();
@@ -3413,12 +3037,117 @@ mod version_metadata_tests {
         clear.module_metadata.clear();
         let encoded = sinomo_core::object::serde_ext::to_bytes(
             &clear,
-            6,
+            7,
             sinomo_core::object::LengthMode::U32,
         )
         .unwrap();
         let decoded = sinomo_core::object::serde_ext::from_bytes(&encoded).unwrap();
         tables.apply(DfsMetadataTableOp::PutVersion { version: decoded });
         assert!(tables.versions[&key].module_metadata.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod repair_birth_selection_tests {
+    use super::*;
+
+    // DATA-only selection inputs: these rows do not supply authority or receipts.
+    fn placement_owner() -> DfsWriteIntentRecord {
+        let node = sinomo_core::node::NodeId::from_legacy_named("birth-selection-owner").unwrap();
+        let mut object = crate::posix_object::new_posix_metadata_object(
+            &node,
+            "/services/birth-selection",
+            crate::DfsObjectKind::File,
+        );
+        object.content_hash = Some("blake3:birth-selection".to_string());
+        let intent = crate::DistributedWriteIntent {
+            publication: Default::default(),
+            intent_id: format!(
+                "placement:birth-selection:{}:{}",
+                object.object_id, object.version
+            ),
+            file_system_id: object.file_system_id.clone(),
+            object_id: object.object_id.clone(),
+            base_version: Some(object.version.clone()),
+            target_version: object.version.clone(),
+            requesting_node_id: node.clone(),
+            operation_id: None,
+            operation_order_token: None,
+            owner_epoch: 7,
+            desired_replica_nodes: vec![node],
+            policy: crate::DfsReplicationPolicy::new(1, 1).unwrap(),
+            touch_parent_on_create: false,
+            create_predecessor_object_id: None,
+            state: crate::DfsWriteIntentState::Committed,
+        };
+        crate::intent::write_intent_record(&intent, Some("blake3:birth-selection"), Some(object))
+    }
+
+    fn newly_touched_owner(
+        owner: DfsWriteIntentRecord,
+    ) -> (DfsMetadataTables, DfsMetadataTableRollback) {
+        let key = (owner.object_id.clone(), owner.intent_id.clone());
+        let mut tables = DfsMetadataTables::default();
+        tables.intents.insert(key.clone(), owner);
+        let mut rollback = DfsMetadataTableRollback::default();
+        rollback.intents.insert(key.clone(), None);
+        rollback.intent_receipts.insert(key, None);
+        (tables, rollback)
+    }
+
+    #[test]
+    fn current_placement_birth_requires_explicit_new_full_and_compact_owner() {
+        let owner = placement_owner();
+        let key = (owner.object_id.clone(), owner.intent_id.clone());
+        let (tables, mut rollback) = newly_touched_owner(owner.clone());
+        assert_eq!(rollback.new_repair_owners(&tables), vec![owner.clone()]);
+
+        rollback.intents.insert(key.clone(), Some(owner.clone()));
+        assert!(rollback.new_repair_owners(&tables).is_empty());
+        rollback.intents.insert(key.clone(), None);
+        rollback.intent_receipts.remove(&key);
+        assert!(rollback.new_repair_owners(&tables).is_empty());
+        let receipt =
+            crate::DfsWriteIntentReceipt::from_intent(&owner, time::OffsetDateTime::UNIX_EPOCH)
+                .unwrap();
+        rollback.intent_receipts.insert(key.clone(), Some(receipt));
+        assert!(rollback.new_repair_owners(&tables).is_empty());
+        rollback.intent_receipts.insert(key.clone(), None);
+        let mut removed = tables.clone();
+        removed.intents.remove(&key);
+        assert!(rollback.new_repair_owners(&removed).is_empty());
+    }
+
+    #[test]
+    fn current_placement_birth_rejects_prepared_or_other_request_identities() {
+        let owner = placement_owner();
+        let mut rejected = Vec::new();
+        let mut prepared = owner.clone();
+        prepared.status = crate::DfsWriteIntentStatus::ReceiptsPending;
+        rejected.push(prepared);
+        let mut aborted = owner.clone();
+        aborted.status = crate::DfsWriteIntentStatus::Aborted;
+        rejected.push(aborted);
+        let mut ordinary = owner.clone();
+        ordinary.intent_id = "dfs_write_op_birth_selection".to_string();
+        rejected.push(ordinary);
+        let mut caller_owned = owner.clone();
+        caller_owned.operation_id = Some("caller-operation".to_string());
+        rejected.push(caller_owned);
+        let mut wrong_base = owner.clone();
+        wrong_base.base_version = None;
+        rejected.push(wrong_base);
+        let mut wrong_object = owner.clone();
+        wrong_object.object_id = crate::DfsObjectId::generate();
+        rejected.push(wrong_object);
+        let mut wrong_version = owner.clone();
+        wrong_version.target_version = crate::DfsVersion::generate();
+        wrong_version.base_version = Some(wrong_version.target_version.clone());
+        rejected.push(wrong_version);
+
+        for changed in rejected {
+            let (tables, rollback) = newly_touched_owner(changed);
+            assert!(rollback.new_repair_owners(&tables).is_empty());
+        }
     }
 }

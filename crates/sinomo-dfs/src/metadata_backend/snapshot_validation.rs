@@ -58,9 +58,8 @@ pub(super) fn require_replica_snapshot_namespace_transaction_file_system(
 }
 
 /// Validate the complete canonical table image before replica snapshot ingest
-/// acquires the backend writer lock. Derived indexes are included so a legacy
-/// op snapshot and a structured snapshot are checked at the same boundary.
-pub(super) fn require_replica_snapshot_tables_file_system(
+/// acquires the backend writer lock. Derived indexes and all retained prepared bodies are checked at the same boundary.
+pub(crate) fn require_replica_snapshot_tables_file_system(
     tables: &DfsMetadataTables,
     expected: &DfsFileSystemId,
 ) -> Result<()> {
@@ -218,13 +217,7 @@ pub(super) fn require_replica_snapshot_tables_file_system(
             expected,
         )?;
     }
-    for conflict in tables.conflicts.values() {
-        require_replica_snapshot_record_file_system(
-            "conflict record",
-            &conflict.file_system_id,
-            expected,
-        )?;
-    }
+
     for state in tables.advisory_lock_states.values() {
         require_replica_snapshot_record_file_system(
             "advisory-lock state",
@@ -232,26 +225,7 @@ pub(super) fn require_replica_snapshot_tables_file_system(
             expected,
         )?;
     }
-    for commit in tables.visible_commits.values() {
-        crate::file_history::validate_file_version_record(&commit.visible_version)?;
-        require_replica_snapshot_record_file_system(
-            "visible-commit object record",
-            &commit.committed_object.file_system_id,
-            expected,
-        )?;
-        require_replica_snapshot_record_file_system(
-            "visible-commit version record",
-            &commit.visible_version.file_system_id,
-            expected,
-        )?;
-    }
-    for transaction in tables.namespace_transactions.values() {
-        require_replica_snapshot_namespace_transaction_file_system(
-            "namespace transaction",
-            transaction,
-            expected,
-        )?;
-    }
+
     for receipt in tables.namespace_transaction_receipts.values() {
         receipt
             .validate_content_reference_annotation()
@@ -262,37 +236,35 @@ pub(super) fn require_replica_snapshot_tables_file_system(
             expected,
         )?;
     }
-    for prepare in tables.namespace_prepares.values() {
-        prepare
-            .validate_default_layout_migration_fence()
-            .map_err(MetadataBackendError::Serde)?;
+
+    for record in tables.prepared_operations_v7.values() {
+        record.validate()?;
         require_replica_snapshot_record_file_system(
-            "namespace prepare",
-            &prepare.file_system_id,
+            "prepared operation",
+            &record.digest.file_system_id,
             expected,
         )?;
         require_replica_snapshot_namespace_transaction_file_system(
-            "namespace prepare transaction",
-            &prepare.transaction,
+            "prepared operation transaction",
+            &record.payload.transaction,
             expected,
         )?;
-    }
-    for receipt in tables.namespace_prepare_receipts.values() {
-        if crate::metadata_records::is_default_layout_migration_fence(&receipt.operation_id)
-            && receipt.status != DfsNamespacePrepareStatus::Aborted
-        {
-            return Err(MetadataBackendError::Serde(
-                "default layout migration fence snapshot receipt must record abort".into(),
-            ));
+        for effect in &record.payload.metadata_effects {
+            for object_id in effect.affected_object_ids() {
+                if tables
+                    .objects
+                    .get(&object_id)
+                    .is_some_and(|object| &object.file_system_id != expected)
+                {
+                    return Err(MetadataBackendError::Serde(
+                        "prepared operation effect crosses filesystem scope".into(),
+                    ));
+                }
+            }
         }
-        require_replica_snapshot_record_file_system(
-            "namespace prepare receipt",
-            &receipt.file_system_id,
-            expected,
-        )?;
     }
     for job in tables.namespace_jobs.values() {
-        crate::file_history::validate_file_restore_job(job)?;
+        crate::service_restore_jobs::validate_content_copy_job(job)?;
         require_replica_snapshot_record_file_system(
             "namespace job",
             &job.file_system_id,
@@ -300,7 +272,7 @@ pub(super) fn require_replica_snapshot_tables_file_system(
         )?;
     }
     for receipt in tables.namespace_job_receipts.values() {
-        crate::file_history::validate_file_restore_job_receipt(receipt)?;
+        crate::service_restore_jobs::validate_content_copy_job_receipt(receipt)?;
         require_replica_snapshot_record_file_system(
             "namespace job receipt",
             &receipt.file_system_id,
@@ -324,7 +296,7 @@ pub(super) fn require_replica_snapshot_tables_file_system(
     Ok(())
 }
 
-pub(super) fn require_version_pin_table_invariants(tables: &DfsMetadataTables) -> Result<()> {
+pub(crate) fn require_version_pin_table_invariants(tables: &DfsMetadataTables) -> Result<()> {
     for version in tables.versions.values() {
         crate::file_history::validate_file_version_record(version)?;
     }

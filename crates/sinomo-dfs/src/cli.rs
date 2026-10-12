@@ -22,11 +22,7 @@ pub enum DfsCliCommand<C = ()> {
         object_id: DfsObjectId,
         options: DfsCommonOptions,
     },
-    Conflicts(DfsFilterOptions),
-    ResolveConflicts(DfsConflictResolveOptions),
-    ConflictVersions(DfsConflictVersionsOptions),
-    UseConflictVersion(DfsConflictUseVersionOptions),
-    SaveConflictVersion(DfsConflictSaveVersionOptions),
+
     Repair(DfsFilterOptions),
     RetryRepairs {
         target: Option<NodeId>,
@@ -85,47 +81,6 @@ pub struct DfsFilterOptions {
     pub object_id: Option<DfsObjectId>,
     pub limit: Option<usize>,
     pub cursor: Option<DfsOperatorInspectionCursor>,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct DfsConflictResolveOptions {
-    pub common: DfsCommonOptions,
-    pub file_system_id: DfsFileSystemId,
-    pub path: Option<String>,
-    pub object_id: Option<DfsObjectId>,
-    pub conflict_ids: Vec<String>,
-    pub delete_file: bool,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct DfsConflictVersionsOptions {
-    pub common: DfsCommonOptions,
-    pub file_system_id: DfsFileSystemId,
-    pub path: Option<String>,
-    pub object_id: Option<DfsObjectId>,
-    pub conflict_ids: Vec<String>,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct DfsConflictUseVersionOptions {
-    pub common: DfsCommonOptions,
-    pub file_system_id: DfsFileSystemId,
-    pub path: Option<String>,
-    pub object_id: Option<DfsObjectId>,
-    pub version: DfsVersion,
-    pub expected_version: Option<DfsVersion>,
-    pub operation_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct DfsConflictSaveVersionOptions {
-    pub common: DfsCommonOptions,
-    pub file_system_id: DfsFileSystemId,
-    pub path: Option<String>,
-    pub object_id: Option<DfsObjectId>,
-    pub version: DfsVersion,
-    pub conflict_ids: Vec<String>,
-    pub destination_path: String,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -262,69 +217,7 @@ pub fn dfs_cli_spec() -> CliCommandSpec {
             json(),
         ]
     };
-    let conflict_target = || {
-        [
-            metadata_root(),
-            filesystem(),
-            option("--path", "DFS path", "path"),
-            option("--object", "DFS object id", "object-id"),
-            option("--id", "conflict id", "conflict-id")
-                .with_aliases(["--conflict", "--conflict-id"])
-                .repeatable(),
-            json(),
-        ]
-    };
-    let conflicts = {
-        let mut resolve = conflict_target().to_vec();
-        resolve.push(CliOptionSpec::flag(
-            "--delete-file",
-            "unlink the conflicted file",
-        ));
-        let versions = conflict_target();
-        let mut save_version = conflict_target().to_vec();
-        save_version.push(option("--version", "stored DFS version", "version").required());
-        save_version.push(
-            option("--to", "destination DFS path", "path")
-                .with_aliases(["--destination", "--dest"])
-                .required(),
-        );
-        let use_version = vec![
-            filesystem(),
-            option("--path", "destination DFS path", "path"),
-            option(
-                "--object",
-                "source and destination object identity",
-                "object-id",
-            ),
-            option("--version", "explicitly retained source version", "version").required(),
-            option(
-                "--expected-version",
-                "observed destination generation",
-                "version",
-            ),
-            option(
-                "--operation-id",
-                "stable restore identity for exact retries",
-                "operation-id",
-            ),
-            json(),
-        ];
-        CliCommandSpec::new("conflicts", "inspect and resolve DFS conflicts")
-            .with_options(filter())
-            .with_children([
-                CliCommandSpec::new("resolve", "remove matching conflict records")
-                    .with_options(resolve),
-                CliCommandSpec::new("versions", "show stored conflicting versions")
-                    .with_options(versions),
-                CliCommandSpec::new(
-                    "use-version",
-                    "restore retained content as a new current generation",
-                )
-                .with_options(use_version),
-                CliCommandSpec::new("save-version", "copy a conflict version for manual merge")
-                    .with_options(save_version),
-            ])
-    };
+
     let pin_mode = || {
         CliValueSpec::new("metadata|content", "pin mode")
             .with_choices([
@@ -365,7 +258,6 @@ pub fn dfs_cli_spec() -> CliCommandSpec {
                     "object-id",
                     "DFS object id",
                 ))]),
-            conflicts,
             CliCommandSpec::new("repair", "list inferred replica repairs").with_options(filter())
                 .with_children([CliCommandSpec::new("retry", "reconstruct pending repairs through the resident DFS owner")
                     .with_options([option("--target", "target cluster node", "node-id"),
@@ -559,49 +451,6 @@ fn dfs_filter_from_matches(matches: &CliCommandMatches) -> Result<DfsFilterOptio
     })
 }
 
-struct DfsConflictTargetMatches {
-    pub common: DfsCommonOptions,
-    pub file_system_id: DfsFileSystemId,
-    pub path: Option<String>,
-    pub object_id: Option<DfsObjectId>,
-    pub conflict_ids: Vec<String>,
-}
-
-fn dfs_conflict_target_from_matches(
-    matches: &CliCommandMatches,
-) -> Result<DfsConflictTargetMatches, CliParseError> {
-    let path = matches
-        .value("--path")
-        .map(|value| non_empty_string(value, "path"))
-        .transpose()
-        .map_err(semantic_parse_error)?;
-    let object_id = matches
-        .value("--object")
-        .map(parse_dfs_object_id)
-        .transpose()
-        .map_err(semantic_parse_error)?;
-    if path.is_none() && object_id.is_none() {
-        return Err(CliParseError::Parse {
-            detail: "DFS conflict command requires --path or --object".to_string(),
-        });
-    }
-    Ok(DfsConflictTargetMatches {
-        common: dfs_common_from_matches(matches),
-        file_system_id: matches
-            .value("--filesystem")
-            .map(parse_dfs_file_system_id)
-            .transpose()
-            .map_err(semantic_parse_error)?
-            .unwrap_or_else(default_dfs_file_system_id),
-        path,
-        object_id,
-        conflict_ids: matches
-            .values("--id")
-            .map(|value| non_empty_string(value, "conflict id").map_err(semantic_parse_error))
-            .collect::<Result<Vec<_>, _>>()?,
-    })
-}
-
 pub fn parse_dfs_matches<C>(
     matches: &CliCommandMatches,
 ) -> Result<DfsCliCommand<C>, CliParseError> {
@@ -632,68 +481,7 @@ pub fn parse_dfs_matches<C>(
                 .map_err(semantic_parse_error)?,
             options: dfs_common_from_matches(matches),
         }),
-        ["dfs", "conflicts"] => dfs_filter_from_matches(matches).map(DfsCliCommand::Conflicts),
-        ["dfs", "conflicts", "resolve"] => {
-            let target = dfs_conflict_target_from_matches(matches)?;
-            Ok(DfsCliCommand::ResolveConflicts(DfsConflictResolveOptions {
-                common: target.common,
-                file_system_id: target.file_system_id,
-                path: target.path,
-                object_id: target.object_id,
-                conflict_ids: target.conflict_ids,
-                delete_file: matches.contains("--delete-file"),
-            }))
-        }
-        ["dfs", "conflicts", "versions"] => {
-            let target = dfs_conflict_target_from_matches(matches)?;
-            Ok(DfsCliCommand::ConflictVersions(
-                DfsConflictVersionsOptions {
-                    common: target.common,
-                    file_system_id: target.file_system_id,
-                    path: target.path,
-                    object_id: target.object_id,
-                    conflict_ids: target.conflict_ids,
-                },
-            ))
-        }
-        ["dfs", "conflicts", "use-version"] => {
-            let target = dfs_conflict_target_from_matches(matches)?;
-            Ok(DfsCliCommand::UseConflictVersion(
-                DfsConflictUseVersionOptions {
-                    common: target.common,
-                    file_system_id: target.file_system_id,
-                    path: target.path,
-                    object_id: target.object_id,
-                    version: parse_dfs_version(required_option(matches, "--version")?)
-                        .map_err(semantic_parse_error)?,
-                    expected_version: matches
-                        .value("--expected-version")
-                        .map(parse_dfs_version)
-                        .transpose()
-                        .map_err(semantic_parse_error)?,
-                    operation_id: matches.value("--operation-id").map(str::to_string),
-                },
-            ))
-        }
-        ["dfs", "conflicts", "save-version"] => {
-            let target = dfs_conflict_target_from_matches(matches)?;
-            Ok(DfsCliCommand::SaveConflictVersion(
-                DfsConflictSaveVersionOptions {
-                    common: target.common,
-                    file_system_id: target.file_system_id,
-                    path: target.path,
-                    object_id: target.object_id,
-                    version: parse_dfs_version(required_option(matches, "--version")?)
-                        .map_err(semantic_parse_error)?,
-                    conflict_ids: target.conflict_ids,
-                    destination_path: non_empty_string(
-                        required_option(matches, "--to")?,
-                        "destination path",
-                    )
-                    .map_err(semantic_parse_error)?,
-                },
-            ))
-        }
+
         ["dfs", "repair"] => dfs_filter_from_matches(matches).map(DfsCliCommand::Repair),
         ["dfs", "repair", "retry"] => {
             if let Some(option) = [

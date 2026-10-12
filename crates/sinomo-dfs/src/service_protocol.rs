@@ -59,18 +59,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 match self.take_write_outcome(request_id) {
                     Ok(NetworkedDfsWriteOutcome::Pending { .. }) => all_ready = false,
                     Ok(NetworkedDfsWriteOutcome::Committed { .. }) => {}
-                    Ok(NetworkedDfsWriteOutcome::Conflict { conflict }) => {
-                        terminal_error.get_or_insert_with(|| {
-                            DfsError::WriteReconciliationRequired {
-                                operation_id: request_id.clone(),
-                                object_id: conflict.object_id,
-                                reason: format!(
-                                    "remote write returned conflict {}",
-                                    conflict.conflict_id
-                                ),
-                            }
-                        });
-                    }
+
                     Err(error) => {
                         terminal_error.get_or_insert(error);
                     }

@@ -361,11 +361,27 @@ struct RequestAttemptLedgerCacheEntry {
     log_identity: Option<FileIdentity>,
     log_records: usize,
     log_bytes: u64,
-    last_used: u64,
+}
+
+// The registry owns only stable per-ledger descriptors. A checked-out or queued
+// descriptor must survive eviction and staged failure so the same root cannot
+// acquire two independent materialized views.
+struct RequestAttemptLedgerCacheSlot {
+    entry: Mutex<Option<RequestAttemptLedgerCacheEntry>>,
+    last_used: AtomicU64,
+}
+
+impl RequestAttemptLedgerCacheSlot {
+    fn new() -> Self {
+        Self {
+            entry: Mutex::new(None),
+            last_used: AtomicU64::new(kv_read_cache_tick()),
+        }
+    }
 }
 
 static REQUEST_ATTEMPT_LEDGER_CACHE: LazyLock<
-    Mutex<HashMap<PathBuf, RequestAttemptLedgerCacheEntry>>,
+    Mutex<HashMap<PathBuf, Arc<RequestAttemptLedgerCacheSlot>>>,
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[cfg(test)]
@@ -374,11 +390,10 @@ pub(crate) fn write_cached_request_attempt_checkpoint_for_test(
     paths: &ClusterKvPaths,
 ) -> Result<(), KvError> {
     let checkpoint = {
-        let cache = REQUEST_ATTEMPT_LEDGER_CACHE
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let slot = request_attempt_cache_slot(paths, None)?;
+        let cache = lock_request_attempt_cache(paths, &slot.entry, None)?;
         cache
-            .get(&paths.request_attempts)
+            .as_ref()
             .expect("materialized request-attempt ledger")
             .ledger
             .checkpoint()
@@ -443,15 +458,20 @@ pub(crate) fn lock_cluster_kv_request_attempt_ledger_for_test(
     lock_request_attempt_ledger(paths)
 }
 
-fn lock_request_attempt_cache_before(
+fn lock_request_attempt_cache<'a, T>(
     paths: &ClusterKvPaths,
-    operation_deadline: Instant,
-) -> Result<std::sync::MutexGuard<'static, HashMap<PathBuf, RequestAttemptLedgerCacheEntry>>, KvError>
-{
+    cache: &'a Mutex<T>,
+    operation_deadline: Option<Instant>,
+) -> Result<std::sync::MutexGuard<'a, T>, KvError> {
+    let Some(operation_deadline) = operation_deadline else {
+        return Ok(cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()));
+    };
     let mut attempts = 0_u32;
     loop {
         ensure_request_attempt_deadline(paths, Some(operation_deadline))?;
-        match REQUEST_ATTEMPT_LEDGER_CACHE.try_lock() {
+        match cache.try_lock() {
             Ok(cache) => {
                 ensure_request_attempt_deadline(paths, Some(operation_deadline))?;
                 return Ok(cache);
@@ -477,20 +497,58 @@ fn lock_request_attempt_cache_before(
 }
 
 fn evict_request_attempt_cache_entry_if_needed(
-    cache: &mut HashMap<PathBuf, RequestAttemptLedgerCacheEntry>,
+    cache: &mut HashMap<PathBuf, Arc<RequestAttemptLedgerCacheSlot>>,
     protected: &Path,
-) {
-    if cache.contains_key(protected) || cache.len() < FILE_CACHE_CAPACITY {
-        return;
+) -> Vec<Arc<RequestAttemptLedgerCacheSlot>> {
+    let mut retired = Vec::new();
+    let retained_capacity = if cache.contains_key(protected) {
+        FILE_CACHE_CAPACITY
+    } else {
+        FILE_CACHE_CAPACITY.saturating_sub(1)
+    };
+    while cache.len() > retained_capacity {
+        // This check is made under the registry mutex. Every slot user retains
+        // its Arc before releasing that mutex, including queued lock waiters.
+        // Removing only idle descriptors therefore cannot fork a root owner.
+        let eviction_candidate = cache
+            .iter()
+            .filter(|(path, slot)| path.as_path() != protected && Arc::strong_count(slot) == 1)
+            .min_by_key(|(_, slot)| slot.last_used.load(Ordering::Relaxed))
+            .map(|(path, _)| path.clone());
+        let Some(path) = eviction_candidate else {
+            // Active roots may temporarily exceed the retained-cache bound;
+            // a later access reclaims idle slots without detaching waiters.
+            break;
+        };
+        if let Some(slot) = cache.remove(&path) {
+            retired.push(slot);
+        }
     }
-    let eviction_candidate = cache
-        .iter()
-        .filter(|(path, _)| path.as_path() != protected)
-        .min_by_key(|(_, entry)| entry.last_used)
-        .map(|(path, _)| path.clone());
-    if let Some(path) = eviction_candidate {
-        cache.remove(&path);
-    }
+    retired
+}
+
+fn request_attempt_cache_slot(
+    paths: &ClusterKvPaths,
+    operation_deadline: Option<Instant>,
+) -> Result<Arc<RequestAttemptLedgerCacheSlot>, KvError> {
+    let mut registry =
+        lock_request_attempt_cache(paths, &REQUEST_ATTEMPT_LEDGER_CACHE, operation_deadline)?;
+    ensure_request_attempt_deadline(paths, operation_deadline)?;
+    let key = &paths.request_attempts;
+    let retired = evict_request_attempt_cache_entry_if_needed(&mut registry, key);
+    let slot = Arc::clone(
+        registry
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(RequestAttemptLedgerCacheSlot::new())),
+    );
+    slot.last_used
+        .store(kv_read_cache_tick(), Ordering::Relaxed);
+    // The registry is released before acquiring the root mutex or reading,
+    // checkpointing, encoding, or syncing any ledger file. Reclaimed ledger
+    // allocations are also dropped outside the registry critical section.
+    drop(registry);
+    drop(retired);
+    Ok(slot)
 }
 
 fn load_request_attempt_ledger(
@@ -616,33 +674,29 @@ fn load_request_attempt_ledger(
         log_identity: file_identity(&paths.request_attempts_log),
         log_records,
         log_bytes,
-        last_used: kv_read_cache_tick(),
     })
 }
 
 fn request_attempt_cache_entry<'a>(
     paths: &ClusterKvPaths,
-    cache: &'a mut HashMap<PathBuf, RequestAttemptLedgerCacheEntry>,
+    cache: &'a mut Option<RequestAttemptLedgerCacheEntry>,
     operation_deadline: Option<Instant>,
 ) -> Result<&'a mut RequestAttemptLedgerCacheEntry, KvError> {
     ensure_request_attempt_deadline(paths, operation_deadline)?;
-    let key = paths.request_attempts.clone();
     let checkpoint_identity = file_identity(&paths.request_attempts);
     let log_identity = file_identity(&paths.request_attempts_log);
-    let cache_is_current = cache.get(&key).is_some_and(|entry| {
+    let cache_is_current = cache.as_ref().is_some_and(|entry| {
         entry.checkpoint_identity == checkpoint_identity && entry.log_identity == log_identity
     });
     if !cache_is_current {
         let entry = load_request_attempt_ledger(paths, operation_deadline)?;
         ensure_request_attempt_deadline(paths, operation_deadline)?;
-        evict_request_attempt_cache_entry_if_needed(cache, &key);
-        cache.insert(key.clone(), entry);
+        *cache = Some(entry);
     }
     let entry = cache
-        .get_mut(&key)
+        .as_mut()
         .expect("request-attempt cache entry inserted above");
     ensure_request_attempt_deadline(paths, operation_deadline)?;
-    entry.last_used = kv_read_cache_tick();
     Ok(entry)
 }
 
@@ -702,12 +756,8 @@ fn record_cluster_kv_request_attempt_with_deadline(
     expected_submission: Option<&ClusterKvRequestAttemptSubmissionReceipt>,
 ) -> Result<bool, KvError> {
     let _lock = lock_request_attempt_ledger_before(paths, operation_deadline)?;
-    let mut cache = match operation_deadline {
-        Some(deadline) => lock_request_attempt_cache_before(paths, deadline)?,
-        None => REQUEST_ATTEMPT_LEDGER_CACHE
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()),
-    };
+    let slot = request_attempt_cache_slot(paths, operation_deadline)?;
+    let mut cache = lock_request_attempt_cache(paths, &slot.entry, operation_deadline)?;
     let entry = request_attempt_cache_entry(paths, &mut cache, operation_deadline)?;
     if request_attempt_log_should_checkpoint(entry) {
         // Checkpoint publication and its sequence-fenced log truncation form
@@ -806,22 +856,21 @@ pub(crate) fn mark_cluster_kv_request_submitted_with_receipt(
 }
 
 struct StagedRequestAttemptCache<'a> {
-    cache: &'a mut HashMap<PathBuf, RequestAttemptLedgerCacheEntry>,
-    key: PathBuf,
+    cache: &'a mut Option<RequestAttemptLedgerCacheEntry>,
     durable: bool,
 }
 
 impl Drop for StagedRequestAttemptCache<'_> {
     fn drop(&mut self) {
         if !self.durable {
-            self.cache.remove(&self.key);
+            *self.cache = None;
         }
     }
 }
 
 /// Persists independently identified submissions with one ledger flush. The
-/// cache mutex hides staged records until durability; any failure evicts the
-/// staged view so the next caller replays the actual on-disk prefix.
+/// per-ledger cache mutex hides staged records until durability; any failure
+/// clears that slot's staged view so the next caller replays the on-disk prefix.
 pub(crate) fn mark_cluster_kv_requests_submitted_together(
     paths: &ClusterKvPaths,
     requests: &[&KvCommandRequest],
@@ -831,10 +880,10 @@ pub(crate) fn mark_cluster_kv_requests_submitted_together(
         return Ok(Vec::new());
     }
     let _lock = lock_request_attempt_ledger_before(paths, Some(deadline))?;
-    let mut cache = lock_request_attempt_cache_before(paths, deadline)?;
+    let slot = request_attempt_cache_slot(paths, Some(deadline))?;
+    let mut cache = lock_request_attempt_cache(paths, &slot.entry, Some(deadline))?;
     let mut staged = StagedRequestAttemptCache {
         cache: &mut cache,
-        key: paths.request_attempts.clone(),
         durable: false,
     };
     let result = (|| {
@@ -1044,9 +1093,8 @@ pub fn read_cluster_kv_request_attempt(
     request_id: &KvRequestId,
 ) -> Result<Option<KvRequestOutcome>, KvError> {
     let _lock = lock_request_attempt_ledger(paths)?;
-    let mut cache = REQUEST_ATTEMPT_LEDGER_CACHE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let slot = request_attempt_cache_slot(paths, None)?;
+    let mut cache = lock_request_attempt_cache(paths, &slot.entry, None)?;
     Ok(request_attempt_cache_entry(paths, &mut cache, None)?
         .ledger
         .outcome(request_id))
@@ -1061,7 +1109,8 @@ pub fn read_cluster_kv_request_attempt_before(
     operation_deadline: Instant,
 ) -> Result<Option<KvRequestOutcome>, KvError> {
     let _lock = lock_request_attempt_ledger_before(paths, Some(operation_deadline))?;
-    let mut cache = lock_request_attempt_cache_before(paths, operation_deadline)?;
+    let slot = request_attempt_cache_slot(paths, Some(operation_deadline))?;
+    let mut cache = lock_request_attempt_cache(paths, &slot.entry, Some(operation_deadline))?;
     let outcome = request_attempt_cache_entry(paths, &mut cache, Some(operation_deadline))?
         .ledger
         .outcome(request_id);
@@ -1095,4 +1144,215 @@ pub fn resolve_cluster_kv_request_outcome(
             }
         }),
     )
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    fn put(key: &str) -> KvCommandRequest {
+        KvCommandRequest::generated(KvCommand::Op(KvOp::Put {
+            key: key.to_owned(),
+            value: b"actual-ledger-request".to_vec(),
+            lease_id: None,
+        }))
+    }
+
+    #[test]
+    fn held_root_cache_allows_other_root_submission_and_preserves_absolute_deadline() {
+        let first = sinomo_testdir::TestDir::new("ledger-cache-first-root");
+        let second = sinomo_testdir::TestDir::new("ledger-cache-second-root");
+        let first_paths = ClusterKvPaths::new(first.path());
+        let second_paths = ClusterKvPaths::new(second.path());
+        let original = put("/first/original");
+        mark_cluster_kv_request_submitted(&first_paths, &original).unwrap();
+        let slot = request_attempt_cache_slot(&first_paths, None).unwrap();
+        let held = lock_request_attempt_cache(&first_paths, &slot.entry, None).unwrap();
+
+        // Fault only the first root's real cache critical section. The second
+        // root still uses the ordinary grouped durable submission and read.
+        let other = put("/second/submitted");
+        let receipts = mark_cluster_kv_requests_submitted_together(
+            &second_paths,
+            &[&other],
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap();
+        assert!(receipts[0].as_ref().unwrap().is_some());
+        assert!(matches!(
+            read_cluster_kv_request_attempt(&second_paths, &other.request_id).unwrap(),
+            Some(KvRequestOutcome::Unknown { .. })
+        ));
+
+        let expired = put("/first/must-not-submit-late");
+        let deadline = Instant::now() + Duration::from_millis(50);
+        assert!(matches!(
+            mark_cluster_kv_requests_submitted_together(&first_paths, &[&expired], deadline),
+            Err(KvError::Busy { .. })
+        ));
+        drop(held);
+        assert!(
+            read_cluster_kv_request_attempt(&first_paths, &expired.request_id)
+                .unwrap()
+                .is_none(),
+            "an expired root-cache waiter must not append after release"
+        );
+        assert!(matches!(
+            read_cluster_kv_request_attempt(&first_paths, &original.request_id).unwrap(),
+            Some(KvRequestOutcome::Unknown { .. })
+        ));
+    }
+
+    #[test]
+    fn checked_out_slot_survives_lru_pressure_and_staged_invalidation() {
+        // This is descriptor ownership DATA only. Durable replay and fault
+        // behavior are exercised separately through the ordinary ledger APIs.
+        let protected = PathBuf::from("protected-ledger");
+        let mut registry = HashMap::new();
+        registry.insert(
+            protected.clone(),
+            Arc::new(RequestAttemptLedgerCacheSlot::new()),
+        );
+        let queued = Arc::clone(registry.get(&protected).unwrap());
+        let mut held = queued.entry.lock().unwrap();
+        for index in 1..FILE_CACHE_CAPACITY {
+            registry.insert(
+                PathBuf::from(format!("idle-ledger-{index}")),
+                Arc::new(RequestAttemptLedgerCacheSlot::new()),
+            );
+        }
+        let incoming = PathBuf::from("incoming-ledger");
+        let retired = evict_request_attempt_cache_entry_if_needed(&mut registry, &incoming);
+        assert_eq!(retired.len(), 1);
+        assert_eq!(registry.len(), FILE_CACHE_CAPACITY - 1);
+        assert!(Arc::ptr_eq(registry.get(&protected).unwrap(), &queued));
+        let same = Arc::clone(registry.get(&protected).unwrap());
+        drop(StagedRequestAttemptCache {
+            cache: &mut held,
+            durable: false,
+        });
+        assert!(held.is_none());
+        assert!(Arc::ptr_eq(registry.get(&protected).unwrap(), &same));
+        drop(held);
+        drop(same);
+        drop(queued);
+        drop(retired);
+    }
+
+    #[test]
+    fn existing_root_access_reclaims_idle_overflow_without_evicting_its_slot() {
+        let protected = PathBuf::from("overflow-protected-ledger");
+        let slot = Arc::new(RequestAttemptLedgerCacheSlot::new());
+        let mut registry = HashMap::new();
+        registry.insert(protected.clone(), Arc::clone(&slot));
+        for index in 0..FILE_CACHE_CAPACITY {
+            registry.insert(
+                PathBuf::from(format!("overflow-idle-ledger-{index}")),
+                Arc::new(RequestAttemptLedgerCacheSlot::new()),
+            );
+        }
+        let retired = evict_request_attempt_cache_entry_if_needed(&mut registry, &protected);
+        assert_eq!(retired.len(), 1);
+        assert_eq!(registry.len(), FILE_CACHE_CAPACITY);
+        assert!(Arc::ptr_eq(registry.get(&protected).unwrap(), &slot));
+        drop(retired);
+    }
+
+    #[test]
+    fn partial_persist_failure_discards_staging_and_replays_only_durable_prefix() {
+        let root = sinomo_testdir::TestDir::new("ledger-cache-partial-persist");
+        let paths = ClusterKvPaths::new(root.path());
+        let first = put("/partial/durable");
+        let second = put("/partial/not-durable");
+        let slot;
+        {
+            let _file_lock = lock_request_attempt_ledger(&paths).unwrap();
+            slot = request_attempt_cache_slot(&paths, None).unwrap();
+            let mut cache = lock_request_attempt_cache(&paths, &slot.entry, None).unwrap();
+            let staged = StagedRequestAttemptCache {
+                cache: &mut cache,
+                durable: false,
+            };
+            let entry = request_attempt_cache_entry(&paths, staged.cache, None).unwrap();
+            for (index, request) in [&first, &second].into_iter().enumerate() {
+                let mutation = entry
+                    .ledger
+                    .prepare(KvRequestAttemptRecord {
+                        request_id: request.request_id.clone(),
+                        command_digest: request.digest().unwrap(),
+                        state: KvRequestAttemptState::Submitted,
+                        updated_at: OffsetDateTime::now_utc(),
+                    })
+                    .unwrap()
+                    .unwrap();
+                let sequence = entry.ledger.log_sequence + 1;
+                let record = KvRequestAttemptLogRecord {
+                    sequence,
+                    mutation: mutation.persisted(),
+                };
+                entry.ledger.apply_prepared(mutation, sequence).unwrap();
+                if index == 0 {
+                    // The first record really reaches the ordinary append and
+                    // data-sync boundary; the next record is interrupted.
+                    append_request_attempt_log_record(&paths, &record).unwrap();
+                }
+            }
+            let mut append =
+                durable_file::open_file_for_append(&paths.request_attempts_log).unwrap();
+            std::io::Write::write_all(&mut append.file, &[0, 0]).unwrap();
+            durable_file::sync_open_file(
+                &mut append.file,
+                &paths.request_attempts_log,
+                durable_file::DurableFileSync::Data,
+            )
+            .unwrap();
+            // Leave durable=false, as the normal group does on append/sync
+            // error. The cached second submission must be forgotten.
+            drop(staged);
+            assert!(cache.is_none());
+        }
+        let next = request_attempt_cache_slot(&paths, None).unwrap();
+        assert!(Arc::ptr_eq(&slot, &next));
+        assert!(matches!(
+            read_cluster_kv_request_attempt(&paths, &first.request_id).unwrap(),
+            Some(KvRequestOutcome::Unknown { .. })
+        ));
+        assert!(
+            read_cluster_kv_request_attempt(&paths, &second.request_id)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(fs::metadata(&paths.request_attempts_log).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn poisoned_staging_replays_actual_disk_without_changing_submission_outcome() {
+        let root = sinomo_testdir::TestDir::new("ledger-cache-poisoned-staging");
+        let paths = ClusterKvPaths::new(root.path());
+        let request = put("/poison/submitted");
+        mark_cluster_kv_request_submitted(&paths, &request).unwrap();
+        let slot = request_attempt_cache_slot(&paths, None).unwrap();
+        let worker_slot = Arc::clone(&slot);
+        assert!(
+            thread::spawn(move || {
+                let mut cache = worker_slot.entry.lock().unwrap();
+                let _staged = StagedRequestAttemptCache {
+                    cache: &mut cache,
+                    durable: false,
+                };
+                panic!("negative scheduling fault after cache staging");
+            })
+            .join()
+            .is_err()
+        );
+        assert!(slot.entry.is_poisoned());
+        assert!(Arc::ptr_eq(
+            &slot,
+            &request_attempt_cache_slot(&paths, None).unwrap()
+        ));
+        assert!(matches!(
+            read_cluster_kv_request_attempt(&paths, &request.request_id).unwrap(),
+            Some(KvRequestOutcome::Unknown { .. })
+        ));
+    }
 }

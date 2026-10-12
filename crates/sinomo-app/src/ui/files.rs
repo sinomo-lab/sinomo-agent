@@ -56,23 +56,23 @@ use sui::{
 
 #[cfg(test)]
 use sinomo_cli::app_api::{
-    DfsConflictRecord, DfsFileSystemId, DfsObjectId, DfsOperatorClient, DfsOperatorObjectView,
-    DfsOperatorRepairView, DfsOperatorStatus, DfsVersion, SifsBrowser, SifsEntry,
-    SifsEntryMetadata, SifsEntryPage, SifsFileRead, SifsHealthSummary, SifsListOptions,
-    SifsListSortDirection, SifsListSortKey, SifsMetadataShardDetails, SifsObjectDetails,
-    SifsObjectHealth, SifsPlacementActivityRequest, SifsPlacementPolicy, SifsPlacementPreview,
-    SifsPlacementPreviewToken, SifsPlacementReconciliationJob, SifsPlacementScope,
-    SifsPlacementUpdateOutcome, SifsReplaceFileIfVersionOutcome,
+    DfsFileSystemId, DfsObjectId, DfsOperatorClient, DfsOperatorObjectView, DfsOperatorRepairView,
+    DfsOperatorStatus, DfsVersion, SifsBrowser, SifsEntry, SifsEntryMetadata, SifsEntryPage,
+    SifsFileRead, SifsHealthSummary, SifsListOptions, SifsListSortDirection, SifsListSortKey,
+    SifsMetadataShardDetails, SifsObjectDetails, SifsObjectHealth, SifsPlacementActivityRequest,
+    SifsPlacementPolicy, SifsPlacementPreview, SifsPlacementPreviewToken,
+    SifsPlacementReconciliationJob, SifsPlacementScope, SifsPlacementUpdateOutcome,
+    SifsReplaceFileIfVersionOutcome,
 };
 #[cfg(not(test))]
 use sinomo_client::{
-    DfsConflictRecord, DfsFileSystemId, DfsObjectId, DfsOperatorClient, DfsOperatorObjectView,
-    DfsOperatorRepairView, DfsOperatorStatus, SifsBrowser, SifsEntry, SifsEntryMetadata,
-    SifsEntryPage, SifsFileRead, SifsHealthSummary, SifsListOptions, SifsListSortDirection,
-    SifsListSortKey, SifsMetadataShardDetails, SifsObjectDetails, SifsObjectHealth,
-    SifsPlacementActivityRequest, SifsPlacementPolicy, SifsPlacementPreview,
-    SifsPlacementPreviewToken, SifsPlacementReconciliationJob, SifsPlacementScope,
-    SifsPlacementUpdateOutcome, SifsReplaceFileIfVersionOutcome,
+    DfsFileSystemId, DfsObjectId, DfsOperatorClient, DfsOperatorObjectView, DfsOperatorRepairView,
+    DfsOperatorStatus, SifsBrowser, SifsEntry, SifsEntryMetadata, SifsEntryPage, SifsFileRead,
+    SifsHealthSummary, SifsListOptions, SifsListSortDirection, SifsListSortKey,
+    SifsMetadataShardDetails, SifsObjectDetails, SifsObjectHealth, SifsPlacementActivityRequest,
+    SifsPlacementPolicy, SifsPlacementPreview, SifsPlacementPreviewToken,
+    SifsPlacementReconciliationJob, SifsPlacementScope, SifsPlacementUpdateOutcome,
+    SifsReplaceFileIfVersionOutcome,
 };
 use sinomo_runtime::dfs::{
     DfsFileHistoryCursor, DfsFileHistoryEntry, DfsFileHistoryListRequest,
@@ -1124,7 +1124,6 @@ impl HistoryTarget {
 /// staging, so confirming again after an error retries the same operation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum HistoryDecision {
-    KeepCurrent,
     Restore(Box<DfsFileHistoryRestoreRequest>),
     Recover(Box<HistoryRecoverDraft>),
     AddPin(Box<HistoryPinDraft>),
@@ -1176,10 +1175,6 @@ struct FilesHistoryPreview {
 
 #[derive(Clone, Debug)]
 enum HistoryWorkerAction {
-    ResolveConflicts {
-        object_id: DfsObjectId,
-        conflict_ids: Vec<String>,
-    },
     Restore(DfsFileHistoryRestoreRequest),
     Pin(DfsFileHistoryPinRequest),
 }
@@ -1241,9 +1236,7 @@ impl PlacementActivityFilter {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct FilesStorageOverview {
     status: DfsOperatorStatus,
-    conflicts: Vec<DfsConflictRecord>,
     repairs: Vec<DfsOperatorRepairView>,
-    conflicts_have_more: bool,
     repairs_have_more: bool,
 }
 
@@ -5494,10 +5487,6 @@ impl FilesState {
             self.ensure_worker(waker);
         }
         match decision {
-            HistoryDecision::KeepCurrent => {
-                self.history_decision = None;
-                self.resolve_history_conflicts(target);
-            }
             // The confirmed request retains the observation and operation identity
             // across an error, so another confirmation is an exact retry.
             HistoryDecision::Restore(request) => self.send_history_action(
@@ -5560,32 +5549,6 @@ impl FilesState {
                 "Releasing the name...",
             ),
         }
-    }
-
-    fn resolve_history_conflicts(&mut self, target: HistoryTarget) {
-        let Some(object) = self.history_object.as_ref() else {
-            return;
-        };
-        let conflict_ids = object
-            .conflicts
-            .iter()
-            .filter(|conflict| conflict.status == sinomo_runtime::dfs::DfsConflictStatus::Open)
-            .map(|conflict| conflict.conflict_id.clone())
-            .collect::<Vec<_>>();
-        if conflict_ids.is_empty() {
-            self.history_notice = Some("No open conflicts remain for this item.".to_string());
-            self.history_revision = self.history_revision.wrapping_add(1);
-            return;
-        }
-        let object_id = object.object.object_id.clone();
-        self.send_history_action(
-            target,
-            HistoryWorkerAction::ResolveConflicts {
-                object_id,
-                conflict_ids,
-            },
-            "Keeping the current version...",
-        );
     }
 
     fn send_history_action(
@@ -7981,13 +7944,10 @@ fn files_worker_loop(
                 let result = match (&operator, &operator_open_error) {
                     (Some(operator), _) => (|| {
                         let status = operator.status()?;
-                        let conflicts = operator.conflicts_page(None, None, 100, None)?;
                         let repairs = operator.repair_page(None, None, 100, None)?;
                         Ok(FilesStorageOverview {
                             status,
-                            conflicts_have_more: conflicts.next_cursor.is_some(),
                             repairs_have_more: repairs.next_cursor.is_some(),
-                            conflicts: conflicts.conflicts,
                             repairs: repairs.repairs,
                         })
                     })(),
@@ -8561,19 +8521,6 @@ fn apply_files_history_action(
     action: HistoryWorkerAction,
 ) -> Result<(String, Option<String>), String> {
     match action {
-        HistoryWorkerAction::ResolveConflicts {
-            object_id,
-            conflict_ids,
-        } => {
-            let report = operator.resolve_conflicts(None, Some(object_id), conflict_ids)?;
-            Ok((
-                format!(
-                    "Kept the current version and resolved {} conflict record(s).",
-                    report.removed.len()
-                ),
-                Some(target.path().to_string()),
-            ))
-        }
         HistoryWorkerAction::Restore(request) => {
             let restored = operator
                 .restore_file_history(&request)
@@ -11604,12 +11551,6 @@ fn sifs_entry_placement_badge(metadata: &SifsEntryMetadata) -> FileRowPlacementB
         let desired = placement.desired_replicas.max(count).max(1);
         let replicas = Some((count, desired));
         return match placement.agent_state.as_str() {
-            "conflicted" => FileRowPlacementBadge {
-                label: "conflict".to_string(),
-                tone: SemanticTone::Warning,
-                icon: IconGlyph::Alert,
-                replicas,
-            },
             "pending-write" => FileRowPlacementBadge {
                 label: "syncing".to_string(),
                 tone: SemanticTone::Accent,
@@ -11833,13 +11774,7 @@ fn sifs_replication_summary(details: Option<&SifsObjectDetails>, clustered: bool
     if details.policy.starts_with("replicated") {
         if let Some(health) = details.health.as_ref() {
             let repair_count = sifs_repair_backlog_count(health);
-            if health.open_conflict_count > 0 {
-                return format!(
-                    "replicated; {}, {} open",
-                    sifs_replica_coverage_label(details),
-                    plural(health.open_conflict_count, "conflict")
-                );
-            }
+
             if repair_count > 0 {
                 return format!(
                     "replicated; {}, {} pending",
@@ -11900,13 +11835,7 @@ fn sifs_health_summary(details: Option<&SifsObjectDetails>) -> String {
     let Some(health) = details.and_then(|details| details.health.as_ref()) else {
         return "operator health not loaded".to_string();
     };
-    if health.open_conflict_count > 0 {
-        return format!(
-            "{}; {} open",
-            health.agent_state,
-            plural(health.open_conflict_count, "conflict")
-        );
-    }
+
     let repair_count = sifs_repair_backlog_count(health);
     if repair_count > 0 {
         let missing = sifs_missing_replica_summary(health);
@@ -11978,9 +11907,7 @@ fn sifs_compact_placement_summary(
         .health
         .as_ref()
         .map(|health| {
-            if health.open_conflict_count > 0 {
-                plural(health.open_conflict_count, "conflict")
-            } else if sifs_repair_backlog_count(health) > 0 {
+            if sifs_repair_backlog_count(health) > 0 {
                 plural(sifs_repair_backlog_count(health), "repair")
             } else if sifs_agent_state_is_current(&health.agent_state) {
                 "healthy".to_string()
@@ -12045,9 +11972,6 @@ fn sifs_placement_next_step(details: Option<&SifsObjectDetails>, clustered: bool
     }
     if details.policy.starts_with("replicated") {
         if let Some(health) = details.health.as_ref() {
-            if health.open_conflict_count > 0 {
-                return "resolve SIFS conflicts before changing placement".to_string();
-            }
             if sifs_repair_backlog_count(health) > 0 {
                 return "run maintenance, then refresh availability".to_string();
             }
@@ -12095,12 +12019,11 @@ fn sifs_details_signature(details: Option<&SifsObjectDetails>) -> String {
                 .as_ref()
                 .map(|health| {
                     format!(
-                        "{}|{}|{}|{}|{}|{}|{}",
+                        "{}|{}|{}|{}|{}|{}",
                         health.agent_state,
                         health.version_count,
                         health.receipt_count,
                         health.intent_count,
-                        health.open_conflict_count,
                         health.pending_repair_count,
                         health.missing_replica_nodes.join(",")
                     )
@@ -15215,9 +15138,7 @@ fn open_settings_section(shared: &Shared, section: SettingsSection) {
 }
 
 fn sifs_health_has_attention(health: &SifsHealthSummary) -> bool {
-    health.open_conflict_count > 0
-        || health.pending_repair_count > 0
-        || health.failed_namespace_job_count > 0
+    health.pending_repair_count > 0 || health.failed_namespace_job_count > 0
 }
 
 fn sifs_health_has_activity(health: &SifsHealthSummary) -> bool {
@@ -15226,17 +15147,7 @@ fn sifs_health_has_activity(health: &SifsHealthSummary) -> bool {
 
 fn sifs_health_status_detail(health: &SifsHealthSummary) -> String {
     let mut parts = Vec::new();
-    if health.open_conflict_count > 0 {
-        parts.push(format!(
-            "{} {}",
-            health.open_conflict_count,
-            if health.open_conflict_count == 1 {
-                "conflict"
-            } else {
-                "conflicts"
-            }
-        ));
-    }
+
     if health.pending_repair_count > 0 {
         parts.push(format!(
             "{} {}",
@@ -18599,11 +18510,7 @@ fn composed_inspector_content(shared: &Shared, reader: &ThemeReader) -> WidgetPo
                     ));
                     placement_detail_rows.push((
                         "Repair backlog",
-                        format!(
-                            "{} · {}",
-                            plural(health.pending_repair_count, "missing replica"),
-                            plural(health.open_conflict_count, "conflict")
-                        ),
+                        plural(health.pending_repair_count, "missing replica"),
                     ));
                     placement_detail_rows
                         .push(("Missing nodes", sifs_missing_replica_summary(health)));
@@ -22267,63 +22174,6 @@ fn files_placement_activity_sheet(shared: &Shared, reader: &ThemeReader) -> Widg
     )
 }
 
-fn storage_conflict_row(
-    shared: &Shared,
-    reader: &ThemeReader,
-    conflict: &DfsConflictRecord,
-) -> Surface {
-    let status = match &conflict.status {
-        sinomo_runtime::dfs::DfsConflictStatus::Open => "open",
-        sinomo_runtime::dfs::DfsConflictStatus::Resolved => "resolved",
-        sinomo_runtime::dfs::DfsConflictStatus::Superseded => "superseded",
-    };
-    let path = conflict.path.clone();
-    let reveal = shared.clone();
-    let action = sui::Button::new("Show file")
-        .icon(IconGlyph::Folder)
-        .min_height(30.0)
-        .appearance(ButtonAppearance::Ghost)
-        .tone(SemanticTone::Accent)
-        .theme_when(clone_reader(reader))
-        .on_press_with_ctx(move |ctx| {
-            let waker = { reveal.borrow().waker.clone() };
-            reveal
-                .files_mut()
-                .reveal_storage_issue_path(path.clone(), waker);
-            request_files_overlay_rebuild(ctx);
-        });
-    let body = TrailingSlotRow::new(
-        Stack::vertical()
-            .alignment(Alignment::Stretch)
-            .gap(5.0)
-            .with_child(
-                Label::new(conflict.path.clone())
-                    .text_style(reader().text_style(reader().palette.text)),
-            )
-            .with_child(
-                Label::new(format!(
-                    "{} · {status} · detected {}",
-                    conflict.reason,
-                    conflict
-                        .detected_at
-                        .format(&Rfc3339)
-                        .unwrap_or_else(|_| conflict.detected_at.to_string())
-                ))
-                .theme(reader()),
-            ),
-        action,
-    )
-    .trailing_width(108.0)
-    .trailing_height(30.0)
-    .gap(10.0);
-    Surface::panel(body)
-        .appearance(sui::SurfaceAppearance::Soft)
-        .tone(SemanticTone::Warning)
-        .padding(Insets::all(10.0))
-        .theme_when(clone_reader(reader))
-        .fill_width(true)
-}
-
 fn storage_repair_row(reader: &ThemeReader, repair: &DfsOperatorRepairView) -> Surface {
     let rows = vec![
         (
@@ -22354,8 +22204,7 @@ fn files_storage_center_sheet(shared: &Shared, reader: &ThemeReader) -> Option<W
     let mut content = Stack::vertical().alignment(Alignment::Stretch).gap(12.0);
     if let Some(overview) = overview.as_ref() {
         let status = &overview.status;
-        let attention = status.open_conflict_count > 0
-            || status.pending_repair_count > 0
+        let attention = status.pending_repair_count > 0
             || status.pending_write_count > 0
             || status.failed_namespace_job_count > 0;
         content = content.with_child(inspector_card(
@@ -22386,7 +22235,6 @@ fn files_storage_center_sheet(shared: &Shared, reader: &ThemeReader) -> Option<W
                         ("Objects", status.object_count.to_string()),
                         ("Versions", status.version_count.to_string()),
                         ("Pending writes", status.pending_write_count.to_string()),
-                        ("Open conflicts", status.open_conflict_count.to_string()),
                         ("Missing copies", status.pending_repair_count.to_string()),
                         ("Metadata shards", status.metadata_shards.len().to_string()),
                     ],
@@ -22404,37 +22252,6 @@ fn files_storage_center_sheet(shared: &Shared, reader: &ThemeReader) -> Option<W
                     .theme_when(clone_reader(reader)),
             );
         }
-
-        let mut conflict_rows = Stack::vertical().alignment(Alignment::Stretch).gap(8.0);
-        for conflict in overview.conflicts.iter().take(20) {
-            conflict_rows =
-                conflict_rows.with_child(storage_conflict_row(shared, reader, conflict));
-        }
-        if overview.conflicts.is_empty() {
-            conflict_rows = conflict_rows
-                .with_child(Label::new("No conflict records were returned.").theme(reader()));
-        } else if overview.conflicts.len() > 20 || overview.conflicts_have_more {
-            conflict_rows = conflict_rows.with_child(
-                StatusBadge::new(
-                    "More conflicts exist. Open a file from its row, or use the bounded DFS operator command for the complete paged list.",
-                )
-                .tone(SemanticTone::Info)
-                .theme_when(clone_reader(reader)),
-            );
-        }
-        for omission in &status.bounded_omissions {
-            content = content.with_child(
-                StatusBadge::new(format!("Bounded view: {}", omission.legacy_reason()))
-                    .icon(IconGlyph::Alert)
-                    .tone(SemanticTone::Info)
-                    .theme_when(clone_reader(reader)),
-            );
-        }
-        content = content.with_child(
-            PanelSection::new("Conflict records", conflict_rows)
-                .theme_when(clone_reader(reader))
-                .gap(8.0),
-        );
 
         let mut repair_rows = Stack::vertical().alignment(Alignment::Stretch).gap(8.0);
         for repair in overview.repairs.iter().take(20) {
@@ -22549,7 +22366,7 @@ fn files_storage_center_sheet(shared: &Shared, reader: &ThemeReader) -> Option<W
             reader,
             IconGlyph::Hourglass,
             "Checking storage",
-            "Reading bounded DFS status, conflict, and missing-copy pages.",
+            "Reading DFS status and missing-copy pages.",
         ))
         .with_child(centered_note(
             reader,
@@ -22585,7 +22402,7 @@ fn files_storage_center_sheet(shared: &Shared, reader: &ThemeReader) -> Option<W
     Some(WidgetPod::new(
         SideSheet::new("Storage health", body)
             .theme_when(clone_reader(reader))
-            .description("DFS objects, pending work, conflicts, and missing copies")
+            .description("DFS objects, pending work, and missing copies")
             .placement(SideSheetPlacement::Right)
             .width(780.0)
             .modal(true)
@@ -22594,14 +22411,6 @@ fn files_storage_center_sheet(shared: &Shared, reader: &ThemeReader) -> Option<W
             .action(close)
             .on_dismiss(move || dismiss.files_mut().close_storage_center()),
     ))
-}
-
-fn history_open_conflict_count(object: &DfsOperatorObjectView) -> usize {
-    object
-        .conflicts
-        .iter()
-        .filter(|conflict| conflict.status == sinomo_runtime::dfs::DfsConflictStatus::Open)
-        .count()
 }
 
 fn history_note(reader: &ThemeReader, text: impl Into<String>) -> Label {
@@ -23009,15 +22818,9 @@ fn history_decision_panel(
     loading: bool,
 ) -> Surface {
     let (title, summary, confirm_label, tone) = match decision {
-        HistoryDecision::KeepCurrent => (
-            "Keep the current version?".to_string(),
-            "Keep the current visible version and close every open conflict record for this item. No content is merged.",
-            "Confirm current version",
-            SemanticTone::Warning,
-        ),
         HistoryDecision::Restore(_) => (
             "Restore this version?".to_string(),
-            "The file gets a new current version with the saved content, but only if it has not changed since this view loaded. The content it replaces is kept only if you saved it or an automatic rule covers it. Conflict records stay available for separate review.",
+            "The file gets a new current version with the saved content, but only if it has not changed since this view loaded. The content it replaces is kept only if you saved it or an automatic rule covers it.",
             "Restore version",
             SemanticTone::Warning,
         ),
@@ -23117,7 +22920,8 @@ fn history_decision_panel(
                     }),
             );
         }
-        HistoryDecision::KeepCurrent | HistoryDecision::Unpin(_) => {}
+
+        HistoryDecision::Unpin(_) => {}
     }
     let back = shared.clone();
     let confirm = shared.clone();
@@ -23160,121 +22964,49 @@ fn history_decision_panel(
 }
 
 fn history_issues_card(
-    shared: &Shared,
+    _shared: &Shared,
     reader: &ThemeReader,
     object: &DfsOperatorObjectView,
 ) -> Surface {
-    let conflicts = history_open_conflict_count(object);
-    let repairs = object.repairs.len();
-    let (headline, tone, explanation) = if conflicts > 0 && repairs > 0 {
-        (
-            format!(
-                "{} · {}",
-                plural(conflicts, "conflict"),
-                plural(repairs, "missing copy")
-            ),
-            SemanticTone::Warning,
-            "First choose the version that should remain visible; content is never silently merged. Then run maintenance after the missing device or route is available.",
-        )
-    } else if conflicts > 0 {
-        (
-            plural(conflicts, "conflict"),
-            SemanticTone::Warning,
-            "Choose the version that should remain visible. Keeping the current version only removes the selected conflict records; content is never silently merged.",
-        )
-    } else if repairs > 0 {
-        (
-            plural(repairs, "missing copy"),
-            SemanticTone::Warning,
-            "The file remains readable from its current locations. Run maintenance after the missing device or route is available.",
-        )
+    let count = object.repairs.len();
+    let tone = if count == 0 {
+        SemanticTone::Success
     } else {
-        (
-            "No open issues".to_string(),
-            SemanticTone::Success,
-            "The current version has no open conflict or missing-copy record.",
-        )
+        SemanticTone::Warning
     };
-    let theme = reader();
-    let mut explanation_style = theme.text_style(theme.palette.text_muted);
-    explanation_style.font_size = theme.text.sm.size;
-    explanation_style.line_height = theme.text.sm.line_height;
     let mut body = Stack::vertical()
         .alignment(Alignment::Stretch)
         .gap(9.0)
         .with_child(
-            StatusBadge::new(headline)
-                .icon(if conflicts + repairs > 0 {
-                    IconGlyph::Alert
-                } else {
-                    IconGlyph::Check
-                })
-                .tone(tone)
-                .theme_when(clone_reader(reader)),
-        )
-        .with_child(Label::new(explanation).text_style(explanation_style));
-    let mut issue_rows = Vec::new();
-    for conflict in object
-        .conflicts
-        .iter()
-        .filter(|conflict| conflict.status == sinomo_runtime::dfs::DfsConflictStatus::Open)
-        .take(4)
-    {
-        issue_rows.push((
-            "Conflict",
-            format!(
-                "{} · detected {}",
-                conflict.reason,
-                conflict
-                    .detected_at
-                    .format(&Rfc3339)
-                    .unwrap_or_else(|_| conflict.detected_at.to_string())
-            ),
-        ));
-    }
+            StatusBadge::new(if count == 0 {
+                "No missing copies".into()
+            } else {
+                plural(count, "missing copy")
+            })
+            .icon(if count == 0 {
+                IconGlyph::Check
+            } else {
+                IconGlyph::Alert
+            })
+            .tone(tone)
+            .theme_when(clone_reader(reader)),
+        );
     for repair in object.repairs.iter().take(4) {
-        issue_rows.push((
-            "Missing copy",
+        body = body.with_child(history_note(
+            reader,
             format!(
                 "Version {} is missing from {}",
                 middle_short(repair.version.as_str(), 18),
-                short_node_label(repair.missing_replica_node_id.as_str())
+                short_node_label(repair.missing_replica_node_id.as_str()),
             ),
         ));
     }
-    if !issue_rows.is_empty() {
-        body = body.with_child(detail_rows_widget(issue_rows, reader));
-    }
-
-    if conflicts > 0 {
-        let action = shared.clone();
-        body = body.with_child(
-            sui::Button::new("Keep current version")
-                .icon(IconGlyph::Check)
-                .min_height(32.0)
-                .appearance(ButtonAppearance::Tonal)
-                .tone(SemanticTone::Accent)
-                .theme_when(clone_reader(reader))
-                .enabled(!shared.files().history_loading)
-                .on_press_with_ctx(move |ctx| {
-                    action
-                        .files_mut()
-                        .stage_history_decision(HistoryDecision::KeepCurrent);
-                    request_files_overlay_rebuild(ctx);
-                }),
-        );
-    }
-    if repairs > 0 {
-        body = body.with_child(file_action_button(
-            shared,
-            reader,
-            FileContextAction::RepairReplicas,
-            "Run maintenance and refresh",
-            IconGlyph::Redo,
-            ButtonAppearance::Ghost,
-        ));
-    }
-    inspector_card("Issues", body, reader, None, false)
+    Surface::panel(body)
+        .appearance(sui::SurfaceAppearance::Soft)
+        .tone(tone)
+        .padding(Insets::all(12.0))
+        .theme_when(clone_reader(reader))
+        .fill_width(true)
 }
 
 fn files_history_sheet(
@@ -23431,7 +23163,7 @@ fn files_history_sheet(
             .gap(10.0),
     );
     if let Some(object) = object.as_ref() {
-        let has_issues = history_open_conflict_count(object) + object.repairs.len() > 0;
+        let has_issues = !object.repairs.is_empty();
         if !folder_mode || has_issues {
             content = content.with_child(history_issues_card(shared, reader, object));
         }
@@ -23505,7 +23237,7 @@ fn files_history_sheet(
             .description(if folder_mode {
                 "Saved versions in this folder, including deleted files"
             } else {
-                "Saved versions, conflicts, and missing copies"
+                "Saved versions and missing copies"
             })
             .placement(SideSheetPlacement::Right)
             .width(720.0)
@@ -24150,7 +23882,6 @@ mod tests {
             },
             versions: vec![
                 sinomo_runtime::dfs::DfsObjectVersionRecord {
-                    metadata_format: sinomo_runtime::dfs::DfsRevisionMetadataFormat::Legacy,
                     content_durability: None,
                     retention: Default::default(),
                     module_metadata: Default::default(),
@@ -24165,7 +23896,6 @@ mod tests {
                     visible: true,
                 },
                 sinomo_runtime::dfs::DfsObjectVersionRecord {
-                    metadata_format: sinomo_runtime::dfs::DfsRevisionMetadataFormat::Legacy,
                     content_durability: None,
                     retention: Default::default(),
                     module_metadata: Default::default(),
@@ -24182,23 +23912,7 @@ mod tests {
             ],
             receipts: Vec::new(),
             intents: Vec::new(),
-            conflicts: vec![sinomo_runtime::dfs::DfsConflictRecord {
-                conflict_id: "conflict-1".to_string(),
-                file_system_id: file_system_id.clone(),
-                object_id: object_id.clone(),
-                path: "/documents/report.txt".to_string(),
-                base_version: None,
-                local_version: current.clone(),
-                remote_version: older.clone(),
-                detected_by_node_id: node_a,
-                reason: "concurrent edits".to_string(),
-                local_content_hash: Some("current-hash".to_string()),
-                remote_content_hash: Some("older-hash".to_string()),
-                created_by_intent_id: None,
-                strategy: None,
-                status: sinomo_runtime::dfs::DfsConflictStatus::Open,
-                detected_at: timestamp,
-            }],
+
             repairs: vec![sinomo_runtime::dfs::DfsOperatorRepairView {
                 intent_id: "repair-1".to_string(),
                 file_system_id,
@@ -24207,7 +23921,7 @@ mod tests {
                 content_hash: Some("current-hash".to_string()),
                 missing_replica_node_id: node_b,
             }],
-            agent_state: sinomo_runtime::dfs::DfsAgentObjectState::Conflicted,
+            agent_state: sinomo_runtime::dfs::DfsAgentObjectState::PendingRepair,
         };
         let older = &mut view.versions[1];
         let mut captured = view.object.clone();
@@ -24244,7 +23958,7 @@ mod tests {
                 receipt_count: 48,
                 intent_count: 4,
                 pending_write_count: 1,
-                open_conflict_count: object.conflicts.len(),
+
                 pending_repair_count: object.repairs.len(),
                 repair_attempt_count: 2,
                 pending_namespace_job_count: 0,
@@ -24253,9 +23967,9 @@ mod tests {
                 metadata_shards: Vec::new(),
                 repair_attempts: Vec::new(),
             },
-            conflicts: object.conflicts,
+
             repairs: object.repairs,
-            conflicts_have_more: false,
+
             repairs_have_more: false,
         }
     }
@@ -24677,7 +24391,6 @@ mod tests {
     fn history_restore_retry_keeps_the_confirmed_request_after_new_metadata() {
         let shared = Shared::new(AppState::ready(Backend::local_fallback()));
         let mut object = test_operator_object();
-        object.conflicts.clear();
         let (tx, rx) = mpsc::channel();
         let mut files = shared.files_mut();
         open_test_history(&mut files, &object);
@@ -27167,7 +26880,6 @@ mod tests {
         policy.required_node_ids = vec![required];
         policy.min_distinct_zones = 2;
         let config = DfsFileSystemConfig {
-            metadata_format: sinomo_runtime::dfs::DfsRevisionMetadataFormat::Legacy,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: DfsFileSystemId::from_legacy_named("sifs").expect("filesystem"),
@@ -27989,7 +27701,7 @@ mod tests {
             object_count: 776,
             version_count: 2482,
             pending_write_count: 43,
-            open_conflict_count: 21,
+
             pending_repair_count: 18,
             pending_namespace_job_count: 0,
             failed_namespace_job_count: 0,
@@ -29568,7 +29280,7 @@ mod tests {
         files.inspector_details_open = true;
         let rows = unselected_inspector_rows(&files);
         assert!(rows.iter().any(|(label, value)| {
-            *label == "DFS detail" && value == "DFS 21 conflicts, 18 repairs, 43 pending writes"
+            *label == "DFS detail" && value == "DFS 18 repairs, 43 pending writes"
         }));
 
         files.sifs_health = None;
@@ -29634,7 +29346,7 @@ mod tests {
                 .any(|(label, value)| { *label == "Daemon" && value == "daemon 127.0.0.1:21353" })
         );
         assert!(rows.iter().any(|(label, value)| {
-            *label == "DFS detail" && value == "DFS 21 conflicts, 18 repairs, 43 pending writes"
+            *label == "DFS detail" && value == "DFS 18 repairs, 43 pending writes"
         }));
 
         window
@@ -30024,7 +29736,7 @@ mod tests {
             version_count: 2,
             receipt_count: 1,
             intent_count: 1,
-            open_conflict_count: 0,
+
             pending_repair_count: 1,
             missing_replica_nodes: vec!["node-c".to_string()],
         });
@@ -30043,11 +29755,7 @@ mod tests {
             sifs_replication_summary(Some(&details), true),
             "replicated; 2 replicas current"
         );
-        details.health.as_mut().unwrap().open_conflict_count = 1;
-        assert_eq!(
-            sifs_replication_summary(Some(&details), true),
-            "replicated; 2 replicas, 1 conflict open"
-        );
+
         details.policy = "local-owned".to_string();
         assert_eq!(
             sifs_replication_summary(Some(&details), true),
@@ -30135,17 +29843,6 @@ mod tests {
                 label: "repair".to_string(),
                 tone: SemanticTone::Warning,
                 icon: IconGlyph::Redo,
-                replicas: Some((1, 2)),
-            }
-        );
-
-        metadata.placement.as_mut().unwrap().agent_state = "conflicted".to_string();
-        assert_eq!(
-            sifs_entry_placement_badge(&metadata),
-            FileRowPlacementBadge {
-                label: "conflict".to_string(),
-                tone: SemanticTone::Warning,
-                icon: IconGlyph::Alert,
                 replicas: Some((1, 2)),
             }
         );
@@ -30330,7 +30027,7 @@ mod tests {
             version_count: 1,
             receipt_count: 2,
             intent_count: 0,
-            open_conflict_count: 0,
+
             pending_repair_count: 0,
             missing_replica_nodes: Vec::new(),
         });
@@ -30343,7 +30040,7 @@ mod tests {
             version_count: 1,
             receipt_count: 1,
             intent_count: 1,
-            open_conflict_count: 0,
+
             pending_repair_count: 1,
             missing_replica_nodes: vec!["node-c".to_string()],
         });
@@ -30386,7 +30083,7 @@ mod tests {
                 version_count: 2,
                 receipt_count: 1,
                 intent_count: 1,
-                open_conflict_count: 0,
+
                 pending_repair_count: 1,
                 missing_replica_nodes: vec!["node-b-long-identifier".to_string()],
             }),
@@ -30459,7 +30156,7 @@ mod tests {
                 version_count: 1,
                 receipt_count: 2,
                 intent_count: 0,
-                open_conflict_count: 0,
+
                 pending_repair_count: 0,
                 missing_replica_nodes: Vec::new(),
             }),
@@ -30530,7 +30227,7 @@ mod tests {
             version_count: 1,
             receipt_count: 2,
             intent_count: 0,
-            open_conflict_count: 0,
+
             pending_repair_count: 0,
             missing_replica_nodes: Vec::new(),
         });
@@ -30538,11 +30235,7 @@ mod tests {
             sifs_placement_next_step(Some(&details), true),
             "placement is healthy; use details for object and version ids"
         );
-        details.health.as_mut().unwrap().open_conflict_count = 1;
-        assert_eq!(
-            sifs_placement_next_step(Some(&details), true),
-            "resolve SIFS conflicts before changing placement"
-        );
+
         details.policy = "local-owned".to_string();
         assert_eq!(
             sifs_placement_next_step(Some(&details), true),
@@ -30717,7 +30410,7 @@ mod tests {
             object_count: 776,
             version_count: 2482,
             pending_write_count: 43,
-            open_conflict_count: 21,
+
             pending_repair_count: 18,
             pending_namespace_job_count: 0,
             failed_namespace_job_count: 0,
@@ -34143,7 +33836,7 @@ mod tests {
                 version_count: 1,
                 receipt_count: 1,
                 intent_count: 1,
-                open_conflict_count: 0,
+
                 pending_repair_count: 1,
                 missing_replica_nodes: vec!["node-b".to_string()],
             });
@@ -35253,7 +34946,7 @@ mod tests {
                 version_count: 1,
                 receipt_count: 1,
                 intent_count: 1,
-                open_conflict_count: 0,
+
                 pending_repair_count: 1,
                 missing_replica_nodes: vec!["node-c".to_string()],
             });

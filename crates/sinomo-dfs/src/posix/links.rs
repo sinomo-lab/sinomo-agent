@@ -44,9 +44,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<DfsStat> {
         let _namespace_plan = self.namespace_execution.begin_planning();
         self.with_posix_commit_operation_deadline(|service| {
-            service.posix_symlink_with_create_attrs_with_current_deadline(
-                target, link_path, options, attrs,
-            )
+            service.with_metadata_lookup_cache_mut(|service| {
+                service.posix_symlink_with_create_attrs_with_current_deadline(
+                    target, link_path, options, attrs,
+                )
+            })
         })
     }
 
@@ -61,7 +63,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         validate_posix_symlink_target(target)?;
         let (link_path, requires_directory) =
             normalize_posix_path_with_trailing_directory(link_path)?;
-        let link_path = self.resolve_posix_path(&link_path, false)?;
+        let link_path = self.resolve_posix_path_distributed(&link_path, false)?;
         if requires_directory {
             self.ensure_resolved_path_is_directory_no_follow(&link_path)?;
             return Err(DfsPosixError::AlreadyExists { path: link_path });
@@ -169,13 +171,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     intent_id,
                     durable_receipts,
                     required_receipts,
-                })
-            }
-            NetworkedDfsWriteOutcome::Conflict { conflict } => {
-                self.remove_transient_object_metadata(&object.object_id);
-                Err(DfsPosixError::Conflict {
-                    path: link_path,
-                    reason: conflict.reason,
                 })
             }
         }
@@ -298,9 +293,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             kind: DfsObjectKind::Hardlink,
             tombstone_provenance: None,
             owner_node_id: self.node_id.clone(),
-            current_locations: target.current_locations.clone(),
-            content_hash: target.content_hash.clone(),
-            content_size_bytes: target.content_size_bytes,
+            // The directory entry refers to the canonical object's generation;
+            // it does not own a second generation or a copied durability grant.
+            current_locations: Vec::new(),
+            content_hash: None,
+            content_size_bytes: None,
             link_target_object_id: Some(target.object_id.clone()),
             mode: target.mode,
             uid: target.uid,

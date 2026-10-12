@@ -1,6 +1,7 @@
-use crate::invite_publish::read_cluster_invitation_from_kv;
+use crate::keyspace::{cluster_invitation_key, cluster_member_key};
+use crate::kv_local_store::kv_err;
 use crate::prelude::*;
-use crate::read_cluster_state;
+use crate::read_cluster_state_without_kv_async;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ring::rand::{SecureRandom, SystemRandom};
 use ring::signature::{ED25519, UnparsedPublicKey};
@@ -9,6 +10,7 @@ use sinomo_network::NetworkError;
 #[allow(unused_imports)]
 pub use sinomo_network::is_loopback_connect_address;
 use sinomo_node::NodeIdentity;
+use sinomo_service::ClusterAccess;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 pub const CLUSTER_INVITE_AUTH_PROTOCOL: &str = "sinomo.cluster-invite.v1";
@@ -226,33 +228,73 @@ pub fn verify_cluster_invite_challenge_proof(
         .map_err(|_| NetworkError::AuthDenied)
 }
 
-pub fn create_cluster_invite_challenge_proof(
+pub async fn create_cluster_invite_challenge_proof(
     paths: &ClusterPaths,
     identity: &NodeIdentity,
     request: &ClusterInviteChallengeRequest,
-    now: OffsetDateTime,
+    cluster: &dyn ClusterAccess,
 ) -> Result<ClusterInviteChallengeProof, NetworkError> {
     if request.protocol != CLUSTER_INVITE_CHALLENGE_PROTOCOL || request.challenge.trim().is_empty()
     {
         return Err(NetworkError::AuthDenied);
     }
-    let invite = read_cluster_invitation_from_kv(paths, &request.invite_id)?;
+    // Local bootstrap state identifies this process; permission comes only from
+    // the invitation and membership records in one native current-term read.
+    let runtime = tokio::runtime::Handle::try_current().map_err(|source| NetworkError::Io {
+        operation: "read join challenge local identity".to_string(),
+        detail: format!("join challenge runtime is unavailable: {source}"),
+    })?;
+    let state = read_cluster_state_without_kv_async(&runtime, paths).await?;
+    let invite_key = cluster_invitation_key(&request.invite_id);
+    let member_key = cluster_member_key(&state.local_node_id);
+    let authoritative = cluster
+        .kv_get_authoritative_exact_set_async(vec![invite_key.clone(), member_key.clone()])
+        .await
+        .map_err(|source| match source {
+            sinomo_service::ServiceError::Network(source) => source,
+            source => NetworkError::ClusterReadOnly {
+                detail: format!("join challenge authority read failed: {source}"),
+            },
+        })?;
+    if !matches!(
+        authoritative.authority.basis,
+        sinomo_kv::KvAuthorityBasis::CurrentTermQuorum {
+            voter_acks,
+            required_quorum,
+        } if required_quorum > 0 && voter_acks >= required_quorum
+    ) {
+        return Err(NetworkError::ClusterReadOnly {
+            detail: "join challenge requires current-term quorum authority".to_string(),
+        });
+    }
+    let [invite_entry, member_entry] = authoritative.value.as_slice() else {
+        return Err(NetworkError::AuthDenied);
+    };
+    let invite_entry = invite_entry
+        .as_ref()
+        .ok_or_else(|| NetworkError::StorageIo {
+            path: invite_key.clone(),
+            detail: "cluster invitation is not published".to_string(),
+        })?;
+    let member_entry = member_entry.as_ref().ok_or(NetworkError::AuthDenied)?;
+    if invite_entry.key != invite_key || member_entry.key != member_key {
+        return Err(NetworkError::AuthDenied);
+    }
+    let invite: ClusterJoinInvite = invite_entry.decode().map_err(kv_err)?;
+    let local_member: ClusterMemberRecord = member_entry.decode().map_err(kv_err)?;
+    let now = OffsetDateTime::now_utc();
     if invite.expires_at <= now {
         return Err(NetworkError::AuthExpired);
     }
-    let state = read_cluster_state(paths)?;
-    if invite.cluster_id != state.cluster_id {
+    if invite.invite_id != request.invite_id
+        || invite.cluster_id != state.cluster_id
+        || local_member.cluster_id != state.cluster_id
+        || local_member.node_id != state.local_node_id
+        || local_member.node_public_key != identity.public_key
+        || !local_member.state.is_authorized()
+    {
         return Err(NetworkError::AuthDenied);
     }
-    let local_member = state
-        .members
-        .iter()
-        .find(|member| {
-            member.node_id == state.local_node_id
-                && member.node_public_key == identity.public_key
-                && member.state.is_authorized()
-        })
-        .ok_or(NetworkError::AuthDenied)?;
     let is_issuer = invite.issuer_node_id == local_member.node_id
         && invite.issuer_public_key == identity.public_key;
     let is_channel = invite.communication_channels.iter().any(|channel| {

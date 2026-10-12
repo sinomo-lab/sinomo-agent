@@ -49,6 +49,29 @@ impl DfsRoutedCall {
     }
 }
 
+/// Preserve the same normal message route while moving a native snapshot's
+/// captured file resource into its streaming body. Data heads never restore a
+/// body by guessing a path or deserializing a full-table image.
+pub(crate) fn native_snapshot_routed_call(
+    message: DfsRoutedMessage,
+) -> Result<DfsRoutedCall, crate::DfsError> {
+    if let crate::DfsNetworkMessage::MetadataSnapshotInstall(command) = &message.message {
+        let image = command.image()?;
+        let attachment = DfsOutboundAttachment {
+            descriptor: DfsRpcAttachmentDescriptor {
+                total_size_bytes: image.total_size_bytes,
+                content_hash: None,
+            },
+            source: image
+                .attachment_source()
+                .map_err(crate::DfsError::from_network)?,
+        };
+        Ok(DfsRoutedCall::with_attachment(message, attachment))
+    } else {
+        Ok(DfsRoutedCall::value(message))
+    }
+}
+
 /// One independently routable DFS call in a bounded replica fan-out.
 ///
 /// The target is retained alongside the routed frame so transports can return
@@ -99,6 +122,21 @@ impl DfsMetadataJournalBatchDirectGroup {
 }
 
 impl DfsOutboundAttachment {
+    pub(crate) fn from_quarantined_patch(
+        blob: std::sync::Arc<crate::content_store::ContentStoreQuarantinedBlob>,
+    ) -> Result<Self, crate::DfsError> {
+        let reader = blob.open_patch_reader()?;
+        Ok(Self {
+            descriptor: DfsRpcAttachmentDescriptor {
+                total_size_bytes: blob.size_bytes,
+                content_hash: Some(blob.content_hash.clone()),
+            },
+            source: ObjectRpcBodySource::from_reader(reader, Some(blob.size_bytes))
+                .with_lifetime_guard(blob)
+                .map_err(crate::DfsError::from_network)?,
+        })
+    }
+
     pub fn from_reader(
         reader: ObjectVersionReader,
         total_size_bytes: u64,
@@ -162,12 +200,6 @@ pub trait DfsTransportIdentity {
 }
 
 impl DfsTransportIdentity for sinomo_core::network::InProcessTransport {
-    fn local_node_id(&self) -> &NodeId {
-        self.local_node_id()
-    }
-}
-
-impl DfsTransportIdentity for sinomo_core::network::AsyncInProcessTransport {
     fn local_node_id(&self) -> &NodeId {
         self.local_node_id()
     }
@@ -250,6 +282,7 @@ pub trait DfsMessageTransport: DfsTransportIdentity {
     fn prepare_background_replica_dispatch(
         &mut self,
         _requests: Vec<DfsRoutedSend>,
+        _producer_delivery: &[Option<(bool, Option<sinomo_core::network::NetworkDeliveryState>)>],
     ) -> Result<(), NetworkError> {
         Err(NetworkError::Io {
             operation: "prepare background DFS replica dispatch".to_string(),
@@ -353,6 +386,19 @@ pub trait DfsMessageTransport: DfsTransportIdentity {
         _response_timeout: Duration,
     ) -> Result<Option<Vec<(NodeId, DfsMetadataJournalBatchResponse)>>, NetworkError> {
         Ok(None)
+    }
+
+    /// Take only the requested namespace response from this transport's real
+    /// inbox. Unrelated requests and replies retain their existing custody.
+    /// This grants no authority; the caller revalidates the dispatch assignment.
+    fn take_namespace_response(
+        &mut self,
+        _request_id: &str,
+    ) -> Result<Option<DfsRoutedMessage>, NetworkError> {
+        Err(NetworkError::Io {
+            operation: "receive scoped DFS metadata query".into(),
+            detail: "transport has no selective namespace response custody".into(),
+        })
     }
 
     fn drain_incoming_messages(&mut self) -> Result<Vec<DfsRoutedMessage>, NetworkError>;
@@ -649,324 +695,5 @@ impl DfsMessageTransport for sinomo_core::network::InProcessTransport {
 
     fn wait_for_incoming(&self, timeout: Duration) -> Result<bool, NetworkError> {
         self.wait_for_incoming_object_rpc_request(timeout)
-    }
-}
-
-impl AsyncDfsMessageTransport for sinomo_core::network::AsyncInProcessTransport {
-    fn local_node_id(&self) -> &NodeId {
-        self.local_node_id()
-    }
-
-    fn send_routed_call_async<'a>(
-        &'a mut self,
-        target_node_id: &'a NodeId,
-        call: DfsRoutedCall,
-    ) -> DfsMessageTransportFuture<'a, Result<(), NetworkError>> {
-        Box::pin(async move {
-            let message = materialize_dfs_routed_call(call).await?;
-            let request = dfs_routed_message_rpc_request(&message)?;
-            self.send_object_rpc_request_async(
-                target_node_id,
-                request,
-                sinomo_core::network::AsyncNetworkSendOptions::default(),
-            )
-            .await
-        })
-    }
-
-    fn send_routed_calls_bounded_async<'a>(
-        &'a mut self,
-        requests: Vec<DfsRoutedSend>,
-        max_inflight: usize,
-    ) -> DfsMessageTransportFuture<'a, Result<Vec<DfsRoutedSendOutcome>, NetworkError>> {
-        Box::pin(async move {
-            if requests.is_empty() {
-                return Ok(Vec::new());
-            }
-            if requests.len() == 1 {
-                let request = requests.into_iter().next().expect("one routed call");
-                let result = self
-                    .send_routed_call_async(&request.target_node_id, request.call)
-                    .await;
-                return Ok(vec![DfsRoutedSendOutcome {
-                    target_node_id: request.target_node_id,
-                    result,
-                }]);
-            }
-
-            let max_inflight = max_inflight.max(1).min(requests.len());
-            // The transport owns its receive queue and is therefore not cloned. Its outbound
-            // object-RPC path only borrows shared channel handles, so locally polling borrowed
-            // send futures gives the same bounded overlap without splitting receive ownership.
-            let transport = &*self;
-            let mut pending = VecDeque::from_iter(requests.into_iter().enumerate());
-            let mut active: Vec<DfsMessageTransportFuture<'_, (usize, DfsRoutedSendOutcome)>> =
-                Vec::with_capacity(max_inflight);
-            let mut completed = Vec::with_capacity(pending.len());
-
-            while !pending.is_empty() || !active.is_empty() {
-                while active.len() < max_inflight {
-                    let Some((index, request)) = pending.pop_front() else {
-                        break;
-                    };
-                    active.push(Box::pin(async move {
-                        let result = send_async_in_process_routed_call(
-                            transport,
-                            &request.target_node_id,
-                            request.call,
-                        )
-                        .await;
-                        (
-                            index,
-                            DfsRoutedSendOutcome {
-                                target_node_id: request.target_node_id,
-                                result,
-                            },
-                        )
-                    }));
-                }
-
-                let (active_index, completion) = std::future::poll_fn(|context| {
-                    for (active_index, future) in active.iter_mut().enumerate() {
-                        if let std::task::Poll::Ready(completion) = future.as_mut().poll(context) {
-                            return std::task::Poll::Ready((active_index, completion));
-                        }
-                    }
-                    std::task::Poll::Pending
-                })
-                .await;
-                drop(active.swap_remove(active_index));
-                completed.push(completion);
-            }
-
-            completed.sort_by_key(|(index, _)| *index);
-            Ok(completed.into_iter().map(|(_, outcome)| outcome).collect())
-        })
-    }
-
-    fn drain_incoming_messages_async<'a>(
-        &'a mut self,
-    ) -> DfsMessageTransportFuture<'a, Result<Vec<DfsRoutedMessage>, NetworkError>> {
-        Box::pin(async move {
-            Ok(self
-                .drain_incoming_object_rpc_requests(usize::MAX)
-                .await?
-                .into_iter()
-                .filter_map(|request| dfs_routed_message_from_object_rpc_request(&request).ok())
-                .collect())
-        })
-    }
-
-    fn pending_incoming_count_async<'a>(
-        &'a mut self,
-    ) -> DfsMessageTransportFuture<'a, Result<Option<usize>, NetworkError>> {
-        Box::pin(async move { self.pending_incoming_object_rpc_request_count().await })
-    }
-
-    fn wait_for_incoming_async<'a>(
-        &'a mut self,
-        timeout: Duration,
-    ) -> DfsMessageTransportFuture<'a, Result<bool, NetworkError>> {
-        Box::pin(async move { self.wait_for_incoming_object_rpc_request(timeout).await })
-    }
-}
-
-async fn send_async_in_process_routed_call(
-    transport: &sinomo_core::network::AsyncInProcessTransport,
-    target_node_id: &NodeId,
-    call: DfsRoutedCall,
-) -> Result<(), NetworkError> {
-    let message = materialize_dfs_routed_call(call).await?;
-    let request = dfs_routed_message_rpc_request(&message)?;
-    transport
-        .send_object_rpc_request_async(
-            target_node_id,
-            request,
-            sinomo_core::network::AsyncNetworkSendOptions::default(),
-        )
-        .await
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{
-        DfsFileSystemId, DfsNetworkMessage, DfsObjectId, DfsReadRequest, DfsStageBlobCommand,
-        DfsVersion, content_hash,
-    };
-    use sinomo_core::network::AsyncInProcessNetwork;
-
-    fn node_id(value: &str) -> NodeId {
-        NodeId::from_legacy_named(value).expect("node id")
-    }
-
-    fn read_message(
-        source_node_id: &NodeId,
-        target_node_id: &NodeId,
-        frame_id: u64,
-    ) -> DfsRoutedMessage {
-        DfsRoutedMessage {
-            source_node_id: source_node_id.clone(),
-            target_node_id: target_node_id.clone(),
-            frame_id,
-            message_id: frame_id,
-            message: DfsNetworkMessage::ReadRequest(DfsReadRequest {
-                request_id: format!("prefill-{frame_id}"),
-                object_id: DfsObjectId::from_legacy_named(format!("prefill-object-{frame_id}"))
-                    .expect("object id"),
-                version: None,
-                content_hash: None,
-                content_size_bytes: None,
-                range_offset: None,
-                range_max_bytes: None,
-            }),
-        }
-    }
-
-    fn attachment_send(
-        source_node_id: &NodeId,
-        target_node_id: &NodeId,
-        frame_id: u64,
-    ) -> DfsRoutedSend {
-        let bytes = vec![u8::try_from(frame_id).unwrap_or_default(); 16];
-        let hash = content_hash(&bytes);
-        DfsRoutedSend::new(
-            target_node_id.clone(),
-            DfsRoutedCall::with_attachment(
-                DfsRoutedMessage {
-                    source_node_id: source_node_id.clone(),
-                    target_node_id: target_node_id.clone(),
-                    frame_id,
-                    message_id: frame_id,
-                    message: DfsNetworkMessage::StageBlob(DfsStageBlobCommand {
-                        request_id: format!("stage-{frame_id}"),
-                        intent_id: format!("intent-{frame_id}"),
-                        file_system_id: DfsFileSystemId::from_legacy_named("fanout-test-sifs")
-                            .expect("file system id"),
-                        object_id: DfsObjectId::from_legacy_named(format!(
-                            "fanout-object-{frame_id}"
-                        ))
-                        .expect("object id"),
-                        expected_base_version: None,
-                        version: DfsVersion::from_legacy_named(format!(
-                            "fanout-version-{frame_id}"
-                        ))
-                        .expect("version"),
-                        content_hash: hash.clone(),
-                        bytes: Vec::new(),
-                        object_metadata: None,
-                        authority_shard: None,
-                    }),
-                },
-                DfsOutboundAttachment::from_bytes(bytes, hash),
-            ),
-        )
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn async_in_process_call_fanout_honors_cap_and_preserves_ordered_failures() {
-        let network = AsyncInProcessNetwork::with_mailbox_capacity_and_per_target_send_limit(1, 1);
-        let local = node_id("async-attachment-fanout-local");
-        let blocked = node_id("async-attachment-fanout-blocked");
-        let releasable = node_id("async-attachment-fanout-releasable");
-        let next = node_id("async-attachment-fanout-next");
-        let missing = node_id("async-attachment-fanout-missing");
-        let mut sender = network.add_node(local.clone());
-        let mut blocked_receiver = network.add_node(blocked.clone());
-        let mut releasable_receiver = network.add_node(releasable.clone());
-        let mut next_receiver = network.add_node(next.clone());
-
-        AsyncDfsMessageTransport::send_routed_call_async(
-            &mut sender,
-            &blocked,
-            DfsRoutedCall::value(read_message(&local, &blocked, 1)),
-        )
-        .await
-        .expect("prefill blocked mailbox");
-        AsyncDfsMessageTransport::send_routed_call_async(
-            &mut sender,
-            &releasable,
-            DfsRoutedCall::value(read_message(&local, &releasable, 2)),
-        )
-        .await
-        .expect("prefill releasable mailbox");
-
-        let requests = vec![
-            attachment_send(&local, &blocked, 10),
-            attachment_send(&local, &releasable, 11),
-            attachment_send(&local, &next, 12),
-            attachment_send(&local, &missing, 13),
-        ];
-        let fanout = tokio::spawn(async move {
-            AsyncDfsMessageTransport::send_routed_calls_bounded_async(&mut sender, requests, 2)
-                .await
-        });
-
-        assert!(
-            !AsyncDfsMessageTransport::wait_for_incoming_async(
-                &mut next_receiver,
-                Duration::from_millis(50),
-            )
-            .await
-            .expect("check capped third send"),
-            "the third send must not start while both permits are occupied"
-        );
-
-        let prefill = releasable_receiver
-            .drain_incoming_object_rpc_requests(1)
-            .await
-            .expect("release second mailbox");
-        assert_eq!(prefill.len(), 1);
-        assert!(
-            AsyncDfsMessageTransport::wait_for_incoming_async(
-                &mut next_receiver,
-                Duration::from_secs(1),
-            )
-            .await
-            .expect("wait for third send"),
-            "releasing the second send must let the third overlap the blocked first send"
-        );
-
-        let prefill = blocked_receiver
-            .drain_incoming_object_rpc_requests(1)
-            .await
-            .expect("release first mailbox");
-        assert_eq!(prefill.len(), 1);
-
-        let outcomes = tokio::time::timeout(Duration::from_secs(1), fanout)
-            .await
-            .expect("fan-out completion")
-            .expect("fan-out task")
-            .expect("fan-out orchestration");
-        assert_eq!(
-            outcomes
-                .iter()
-                .map(|outcome| outcome.target_node_id.clone())
-                .collect::<Vec<_>>(),
-            vec![
-                blocked.clone(),
-                releasable.clone(),
-                next.clone(),
-                missing.clone()
-            ]
-        );
-        assert!(outcomes[0].result.is_ok());
-        assert!(outcomes[1].result.is_ok());
-        assert!(outcomes[2].result.is_ok());
-        assert!(matches!(
-            &outcomes[3].result,
-            Err(NetworkError::UnknownNode { node_id }) if node_id == &missing
-        ));
-
-        for receiver in [
-            &mut blocked_receiver,
-            &mut releasable_receiver,
-            &mut next_receiver,
-        ] {
-            let messages = AsyncDfsMessageTransport::drain_incoming_messages_async(receiver)
-                .await
-                .expect("drain fan-out attachment message");
-            assert_eq!(messages.len(), 1);
-        }
     }
 }

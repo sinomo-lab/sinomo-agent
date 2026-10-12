@@ -140,19 +140,16 @@ fn reconciliation_input_value(entry: &KvEntry) -> Vec<u8> {
         // Codec selection also consumes advertised decoder support. During an
         // upgrade those capabilities can change after the startup pass; omitting
         // them strands the shard on its previous writer contract indefinitely.
-        let namespace_prepare_capabilities = [
-            sinomo_core::node::DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY,
-            sinomo_core::node::DFS_METADATA_PACKED_NAMESPACE_PREPARE_V2_CAPABILITY,
-            sinomo_core::node::DFS_METADATA_PACKED_NAMESPACE_PREPARE_V3_CAPABILITY,
-        ]
-        .into_iter()
-        .filter(|required| {
-            member
-                .capabilities
-                .iter()
-                .any(|value| value.as_str() == *required)
-        })
-        .collect();
+        let namespace_prepare_capabilities =
+            [sinomo_core::node::DFS_METADATA_PREPARED_OPERATION_V7_CAPABILITY]
+                .into_iter()
+                .filter(|required| {
+                    member
+                        .capabilities
+                        .iter()
+                        .any(|value| value.as_str() == *required)
+                })
+                .collect();
         // Ignore unrelated capabilities, liveness timestamps and observed latency.
         return sinomo_core::kv::encode_kv_value(&DefaultDfsMemberProjection {
             cluster_id: &member.cluster_id,
@@ -770,7 +767,7 @@ mod tests {
         );
         let _ = rx.borrow_and_update();
         let capability = sinomo_core::CapabilityName::new(
-            sinomo_core::node::DFS_METADATA_PACKED_NAMESPACE_PREPARE_V3_CAPABILITY,
+            sinomo_core::node::DFS_METADATA_PREPARED_OPERATION_V7_CAPABILITY,
         )
         .unwrap();
         for (revision, capabilities, should_wake) in [

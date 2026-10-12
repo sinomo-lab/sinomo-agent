@@ -1,9 +1,8 @@
-//! Write ownership, timeout, and owner-handoff service operations.
+//! Write ownership and timeout service operations.
 //!
 //! This module owns user-facing control operations that adjust write
 //! lifecycle state outside the normal stage/commit data path: confirmed
-//! write timeout handling, aborts, object metadata selection for writes,
-//! and metadata-shard owner handoff.
+//! write timeout handling, aborts, and object metadata selection for writes.
 
 use crate::*;
 
@@ -26,9 +25,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }),
                 outcome @ NetworkedDfsWriteOutcome::Committed { .. } => {
                     Ok(DfsConfirmedTimeoutOutcome::Committed(outcome))
-                }
-                NetworkedDfsWriteOutcome::Conflict { conflict } => {
-                    Ok(DfsConfirmedTimeoutOutcome::Conflict { conflict })
                 }
             },
             DfsConfirmedTimeoutAction::Abort => {
@@ -117,134 +113,353 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         intent_id: &str,
     ) -> Result<DistributedWriteIntent, DfsError> {
+        if self.transport.delegates_local_namespace_authority()
+            || self.writes.pending_routed_writes.contains_key(intent_id)
+        {
+            return self.route_pending_write_abort(intent_id);
+        }
+        self.abort_pending_write_locally(intent_id)
+    }
+
+    pub(crate) fn abort_pending_write_locally(
+        &mut self,
+        intent_id: &str,
+    ) -> Result<DistributedWriteIntent, DfsError> {
+        let original =
+            self.coordinator
+                .intent(intent_id)
+                .cloned()
+                .ok_or_else(|| DfsError::Distributed {
+                    message: format!("unknown pending write intent: {intent_id}"),
+                })?;
+        if original.state != DfsWriteIntentState::AwaitingReceipts {
+            return Err(DfsError::Distributed {
+                message: "closed write intent cannot be aborted".into(),
+            });
+        }
         let content_hash = self
             .writes
             .pending_writes
             .get(intent_id)
             .map(|pending| pending.content_hash.clone());
-        let intent = self.coordinator.abort_intent(intent_id)?;
-        self.put_metadata_intent(&intent, content_hash.as_deref())?;
-        self.abort_create_namespace_prepare(&intent)?;
-        self.remove_pending_write_state(intent_id);
-        Ok(intent)
-    }
-
-    fn abort_create_namespace_prepare(
-        &mut self,
-        intent: &DistributedWriteIntent,
-    ) -> Result<(), DfsError> {
-        if !intent.touch_parent_on_create {
-            return Ok(());
-        }
-        let operation_id = format!("namespace:create:{}", intent.intent_id);
-        let Some(backend) = self.metadata_backend.as_mut() else {
-            return Ok(());
-        };
-        let Some(prepare) = backend.get_namespace_prepare(&operation_id)? else {
-            return Ok(());
-        };
-        match prepare.status {
-            DfsNamespacePrepareStatus::Prepared => {
-                backend.abort_prepared_namespace_transaction(
-                    &operation_id,
-                    &prepare.operation_digest,
-                    prepare.owner_epoch,
-                )?;
-                Ok(())
-            }
-            DfsNamespacePrepareStatus::Aborted => Ok(()),
-            DfsNamespacePrepareStatus::Committed => Err(DfsError::Metadata {
-                message: format!(
-                    "cannot abort write intent {} because namespace prepare {operation_id} is committed",
-                    intent.intent_id
-                ),
-            }),
-        }
-    }
-
-    pub fn handoff_object_owner(
-        &mut self,
-        object_id: &DfsObjectId,
-        shard_id: &str,
-        expected_epoch: u64,
-    ) -> Result<DfsOwnerHandoffOutcome, DfsError> {
-        let object = self.current_read_object_metadata(object_id)?;
-        let previous_owner_node_id = object.owner_node_id.clone();
-        let Some(expected_hash) = object.content_hash.as_deref() else {
-            return Ok(DfsOwnerHandoffOutcome::Rejected {
-                reason:
-                    "candidate cannot prove latest content for an object without a visible hash"
-                        .to_string(),
+        let mut candidate = original.clone();
+        candidate.state = DfsWriteIntentState::Aborted;
+        // This is desired DATA only. The coordinator remains pending until the
+        // existing kernel durably publishes the same terminal intent/resolution.
+        self.put_metadata_intent(&candidate, content_hash.as_deref())?;
+        let record = self
+            .metadata_backend
+            .as_ref()
+            .ok_or_else(|| DfsError::Metadata {
+                message: "write abort requires an actual durable backend".into(),
+            })?
+            .get_intent(&original.object_id, intent_id)?
+            .ok_or_else(|| DfsError::Metadata {
+                message: "write abort lost its actual durable terminal intent".into(),
+            })?;
+        let terminal = crate::intent::distributed_intent_from_record(&record);
+        if terminal != candidate || record.status != DfsWriteIntentStatus::Aborted {
+            return Err(DfsError::Metadata {
+                message: "write abort did not retain its exact terminal body".into(),
             });
+        }
+        self.retire_aborted_write_execution(&terminal)?;
+        Ok(terminal)
+    }
+
+    fn retire_aborted_write_execution(
+        &mut self,
+        terminal: &DistributedWriteIntent,
+    ) -> Result<(), DfsError> {
+        let retry_records = self
+            .repair_attempt_records
+            .keys()
+            .any(|(id, _)| id == &terminal.intent_id)
+            || self
+                .writes
+                .pending_writes
+                .get(&terminal.intent_id)
+                .is_some_and(|pending| !pending.repair_retries.is_empty());
+        if let Some(current) = self.coordinator.intent(&terminal.intent_id).cloned() {
+            let mut expected = current.clone();
+            expected.state = DfsWriteIntentState::Aborted;
+            if &expected != terminal {
+                return Err(DfsError::Metadata {
+                    message: "aborted terminal body differs from live execution".into(),
+                });
+            }
+            if current.state == DfsWriteIntentState::AwaitingReceipts {
+                self.coordinator.abort_intent(&terminal.intent_id)?;
+            } else if current.state != DfsWriteIntentState::Aborted {
+                return Err(DfsError::Metadata {
+                    message: "closed live execution differs from durable abort".into(),
+                });
+            }
+        }
+        self.remove_pending_write_state(&terminal.intent_id);
+        self.repair_attempt_records
+            .retain(|(id, _), _| id != &terminal.intent_id);
+        if retry_records {
+            // Actual tracked retries need the SAME normal queue reconciliation.
+            self.record_message_committed_work(DfsMessageCommittedWork {
+                repair_maintenance: true,
+                ..Default::default()
+            });
+        }
+        Ok(())
+    }
+
+    fn route_pending_write_abort(
+        &mut self,
+        intent_id: &str,
+    ) -> Result<DistributedWriteIntent, DfsError> {
+        // Only the original retained request supplies this locator. An absent or
+        // expired request is uncertainty, never permission to guess a write owner.
+        let pending = self
+            .writes
+            .pending_routed_writes
+            .get(intent_id)
+            .and_then(|tracked| {
+                // A real remote intent is an alias whose body intentionally
+                // lives only on the original canonical request.
+                self.writes
+                    .pending_routed_writes
+                    .get(&tracked.canonical_request_id)
+            })
+            .cloned()
+            .or_else(|| {
+                self.writes
+                    .pending_routed_writes
+                    .values()
+                    .find(|pending| {
+                        pending.command.as_ref().is_some_and(|command| {
+                            crate::intent::stable_write_intent_id(
+                                &command.request.requesting_node_id,
+                                &command.request.object_id,
+                                &command.request_id,
+                            ) == intent_id
+                        })
+                    })
+                    .cloned()
+            })
+            .ok_or_else(|| DfsError::Distributed {
+                message: format!("pending write {intent_id} has no retained original request"),
+            })?;
+        let command = pending
+            .command
+            .as_ref()
+            .ok_or_else(|| DfsError::Distributed {
+                message: "completed or expired routed writes cannot authorize an abort".into(),
+            })?;
+        if command.request.requesting_node_id != self.node_id {
+            return Err(DfsError::Distributed {
+                message: "write abort requires its original authenticated requester".into(),
+            });
+        }
+        let object = match self.current_read_object_metadata(&command.request.object_id) {
+            Ok(object) => object,
+            Err(DfsError::UnknownObject { .. }) => {
+                command
+                    .object_metadata
+                    .clone()
+                    .ok_or_else(|| DfsError::Distributed {
+                        message: "pending create abort has no original object locator".into(),
+                    })?
+            }
+            Err(error) => return Err(error),
         };
-        let manifest = match self
-            .content
-            .read_manifest(object.object_id.as_str(), object.version.as_str())
+        let shard = self
+            .select_metadata_shard_for_object(&object)?
+            .ok_or_else(|| crate::service_replica::missing_metadata_shard_assignment(&object))?;
+        let actual_intent_id = crate::intent::stable_write_intent_id(
+            &command.request.requesting_node_id,
+            &command.request.object_id,
+            &command.request_id,
+        );
+        if pending
+            .remote_intent_id
+            .as_ref()
+            .is_some_and(|actual| actual != &actual_intent_id)
         {
-            Ok(manifest) => manifest,
-            Err(error) => {
-                return Ok(DfsOwnerHandoffOutcome::Rejected {
-                    reason: format!("candidate is missing latest manifest: {error}"),
+            return Err(DfsError::Distributed {
+                message: "pending write abort changed its original stable intent binding".into(),
+            });
+        }
+        let response = self
+            .route_namespace_operation_to_metadata_primary_with_request_id_and_options(
+                format!(
+                    "abort:{}",
+                    blake3::hash(actual_intent_id.as_bytes()).to_hex()
+                ),
+                command.request.file_system_id.clone(),
+                shard.primary_node_id,
+                DfsNamespaceOperation::AbortPendingWrite {
+                    path: object.path,
+                    object_id: command.request.object_id.clone(),
+                    target_version: command.request.target_version.clone(),
+                    intent_id: actual_intent_id.clone(),
+                    write_operation_id: command.request_id.clone(),
+                },
+                crate::DFS_ROUTED_NAMESPACE_OP_TIMEOUT,
+                false,
+                false,
+            )?;
+        let intent = match (response.result, response.posix_coordination_result) {
+            (
+                DfsNamespaceResult::Applied,
+                Some(DfsPosixCoordinationResult::AbortedWriteIntent(intent)),
+            ) => *intent,
+            (DfsNamespaceResult::Rejected { reason, .. }, _) => {
+                return Err(DfsError::Distributed { message: reason });
+            }
+            _ => {
+                return Err(DfsError::Distributed {
+                    message: "write abort lacks its actual typed durable intent outcome".into(),
                 });
             }
         };
-        if manifest.content_hash != expected_hash {
-            return Ok(DfsOwnerHandoffOutcome::Rejected {
-                reason: "candidate manifest hash does not match visible object hash".to_string(),
+        if intent.state != DfsWriteIntentState::Aborted
+            || intent.intent_id != actual_intent_id
+            || intent.file_system_id != command.request.file_system_id
+            || intent.object_id != command.request.object_id
+            || intent.target_version != command.request.target_version
+            || intent.requesting_node_id != self.node_id
+            || intent.operation_id.as_deref() != Some(command.request_id.as_str())
+        {
+            return Err(DfsError::Distributed {
+                message: "write abort response changed its exact original intent binding".into(),
             });
         }
+        self.abandon_pending_routed_write(&pending.canonical_request_id);
+        Ok(intent)
+    }
 
-        let Some(kv) = self.control_plane.as_mut() else {
-            return Ok(DfsOwnerHandoffOutcome::Rejected {
-                reason: "owner handoff requires control-plane shard fencing".to_string(),
+    pub(crate) fn abort_routed_pending_write(
+        &mut self,
+        requester: &sinomo_core::node::NodeId,
+        file_system_id: &DfsFileSystemId,
+        operation: &DfsNamespaceOperation,
+    ) -> Result<DistributedWriteIntent, DfsError> {
+        let DfsNamespaceOperation::AbortPendingWrite {
+            path,
+            object_id,
+            target_version,
+            intent_id,
+            write_operation_id,
+        } = operation
+        else {
+            return Err(DfsError::Distributed {
+                message: "invalid write abort operation".into(),
             });
         };
-        let transferred = DfsControlPlaneStore::new(kv.as_mut()).transfer_metadata_shard_primary(
-            &object.file_system_id,
-            shard_id,
-            expected_epoch,
-            self.node_id.clone(),
-        )?;
-        let Some(transferred) = transferred else {
-            return Ok(DfsOwnerHandoffOutcome::Rejected {
-                reason: "control-plane epoch compare failed".to_string(),
+        crate::service_routed_write::validate_write_operation_id(write_operation_id)?;
+        let record = self
+            .metadata_backend
+            .as_ref()
+            .ok_or_else(|| DfsError::Metadata {
+                message: "write abort requires actual durable metadata".into(),
+            })?
+            .get_intent(object_id, intent_id)?
+            .ok_or_else(|| DfsError::Distributed {
+                message: "write abort has no exact durable intent".into(),
+            })?;
+        if record.file_system_id != *file_system_id
+            || record.object_id != *object_id
+            || record.target_version != *target_version
+            || record.intent_id != *intent_id
+            || record.coordinator_node_id != *requester
+            || record.operation_id.as_deref() != Some(write_operation_id.as_str())
+            || crate::intent::stable_write_intent_id(requester, object_id, write_operation_id)
+                != *intent_id
+        {
+            return Err(DfsError::Distributed {
+                message: "write abort changed its original durable actor or intent binding".into(),
             });
+        }
+        record
+            .publication
+            .validate()
+            .map_err(|message| DfsError::Metadata { message })?;
+        record.policy.validate()?;
+        let actual = match self.current_read_object_metadata(object_id) {
+            Ok(object) => object,
+            Err(DfsError::UnknownObject { .. }) => {
+                record
+                    .object_metadata
+                    .clone()
+                    .ok_or_else(|| DfsError::Distributed {
+                        message: "pending create abort has no durable object locator".into(),
+                    })?
+            }
+            Err(error) => return Err(error),
         };
-
-        let file_system_to_persist =
-            if let Some(file_system) = self.metadata.filesystems.get_mut(&object.file_system_id) {
-                file_system.owner_node_id = self.node_id.clone();
-                Some(file_system.clone())
-            } else {
-                None
-            };
-        if let Some(file_system) = file_system_to_persist.as_ref() {
-            if let Some(backend) = self.metadata_backend.as_mut() {
-                backend.ensure_file_system(file_system)?;
-            }
-            if let Some(kv) = self.control_plane.as_mut() {
-                DfsControlPlaneStore::new(kv.as_mut())
-                    .put_file_system_config(&DfsFileSystemConfig::from(file_system))?;
-            }
+        if actual.object_id != *object_id
+            || actual.file_system_id != *file_system_id
+            || actual.path != *path
+        {
+            return Err(DfsError::Distributed {
+                message: "write abort path does not name its actual durable object".into(),
+            });
         }
-
-        let mut updated_object = object.clone();
-        updated_object.owner_node_id = self.node_id.clone();
-        if !updated_object.current_locations.contains(&self.node_id) {
-            updated_object.current_locations.push(self.node_id.clone());
+        let shard = self
+            .select_metadata_shard_for_object(&actual)?
+            .ok_or_else(|| crate::service_replica::missing_metadata_shard_assignment(&actual))?;
+        if shard.primary_node_id != self.node_id {
+            return Err(DfsError::StaleOwnerEpoch {
+                file_system_id: shard.file_system_id,
+                local_node_id: self.node_id.clone(),
+                primary_node_id: shard.primary_node_id,
+                epoch: shard.epoch,
+            });
         }
-        self.metadata
-            .objects
-            .insert(updated_object.object_id.clone(), updated_object.clone());
-        self.put_visible_object_in_metadata_backend(&updated_object)?;
-
-        Ok(DfsOwnerHandoffOutcome::Transferred {
-            file_system_id: updated_object.file_system_id,
-            object_id: updated_object.object_id,
-            previous_owner_node_id,
-            new_owner_node_id: self.node_id.clone(),
-            previous_epoch: expected_epoch,
-            new_epoch: transferred.epoch,
-        })
+        self.ensure_object_not_in_cross_shard_flight(&actual)?;
+        let intent = crate::intent::distributed_intent_from_record(&record);
+        if record.status == DfsWriteIntentStatus::Aborted {
+            // Replay the same actual durable outcome; never author another body.
+            self.retire_aborted_write_execution(&intent)?;
+            return Ok(intent);
+        }
+        if !crate::intent::write_intent_status_is_active(&record.status) {
+            return Err(DfsError::Distributed {
+                message: "closed write intent cannot be aborted".into(),
+            });
+        }
+        if record.publication.is_current()
+            && record
+                .base_version
+                .as_ref()
+                .is_some_and(|base| base != &actual.version)
+        {
+            return Err(DfsError::Distributed {
+                message: "write abort observed a changed current head".into(),
+            });
+        }
+        // Reuse normal per-intent hydration on the actual admitted owner.
+        // It restores only real durable bodies, receipts and content sources.
+        self.restore_pending_write_for_intent_if_missing(intent_id, object_id)?;
+        if self.coordinator.intent(intent_id) != Some(&intent) {
+            return Err(DfsError::Distributed {
+                message: "live write intent differs from its actual durable body".into(),
+            });
+        }
+        self.abort_pending_write_locally(intent_id)?;
+        let aborted = self
+            .metadata_backend
+            .as_ref()
+            .expect("checked actual backend")
+            .get_intent(object_id, intent_id)?
+            .ok_or_else(|| DfsError::Metadata {
+                message: "write abort lost its actual durable terminal intent".into(),
+            })?;
+        let expected = crate::intent::distributed_intent_from_record(&record);
+        let terminal = crate::intent::distributed_intent_from_record(&aborted);
+        let mut unchanged = terminal.clone();
+        unchanged.state = expected.state.clone();
+        if aborted.status != DfsWriteIntentStatus::Aborted || unchanged != expected {
+            return Err(DfsError::Metadata {
+                message: "write abort changed its exact durable intent body".into(),
+            });
+        }
+        Ok(terminal)
     }
 }

@@ -38,14 +38,24 @@ pub(crate) fn metadata_publish_lanes_from_authority(
     Ok(lanes)
 }
 
+#[cfg(test)]
+pub(crate) type DfsMetadataPublishPlanningAdmission = Arc<crate::DfsMutationAdmission>;
+#[cfg(not(test))]
+pub(crate) type DfsMetadataPublishPlanningAdmission = crate::DfsMutationAdmission;
+
 pub(crate) async fn run_metadata_publish_lane_planning_with_admission<T, F>(
     mutation_scheduler: Arc<DfsMutationScheduler>,
     lane: DfsMutationLaneKey,
+    task_owner: &crate::runtime_host::DfsRuntimeHost,
     mut plan: F,
 ) -> Result<T, String>
 where
     T: Send + 'static,
-    F: FnMut() -> Result<DfsMetadataPublishPlanningAttempt<T>, String> + Send + 'static,
+    F: FnMut(
+            &DfsMetadataPublishPlanningAdmission,
+        ) -> Result<DfsMetadataPublishPlanningAttempt<T>, String>
+        + Send
+        + 'static,
 {
     let execution_scope = DfsMessageExecutionScope::ExactShard {
         file_system_id: lane.file_system_id,
@@ -56,15 +66,26 @@ where
             .admit(&execution_scope)
             .await
             .map_err(|error| format!("DFS metadata publish admission failed: {error}"))?;
-        let (returned_plan, attempt) = tokio::task::spawn_blocking(move || {
+        // Test observers borrow this actual guard through Weak; they do not
+        // acquire another permit or require unrelated native owners to be idle.
+        #[cfg(test)]
+        let admission = Arc::new(admission);
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::task::spawn_blocking(move || {
             // A cancelled scheduler future cannot release admission while its
             // blocking durable-view refresh is still reading the shard.
-            let _admission = admission;
-            let attempt = plan();
-            (plan, attempt)
-        })
-        .await
-        .map_err(|error| format!("DFS metadata publish planning task failed: {error}"))?;
+            let attempt = plan(&admission);
+            // Preserve the prior JoinHandle boundary: the returned plan is
+            // consumed only after exact admission has been released.
+            drop(admission);
+            let _ = result_tx.send((plan, attempt));
+        });
+        // Register the same blocking child before the first await. Cancelling
+        // its outer publisher must not detach a still-running FD/guard owner.
+        task_owner.own_task(task);
+        let (returned_plan, attempt) = result_rx.await.map_err(|error| {
+            format!("DFS metadata publish planning task ended without a result: {error}")
+        })?;
         plan = returned_plan;
         match attempt? {
             DfsMetadataPublishPlanningAttempt::Complete(result) => return Ok(result),
@@ -80,6 +101,7 @@ where
 
 pub(crate) async fn run_metadata_publish_blocking_execution<G, T, Fut>(
     runtime: tokio::runtime::Handle,
+    task_owner: &crate::runtime_host::DfsRuntimeHost,
     execution_guard: G,
     execute: Fut,
 ) -> Result<T, String>
@@ -88,12 +110,17 @@ where
     T: Send + 'static,
     Fut: Future<Output = Result<T, String>> + Send + 'static,
 {
-    tokio::task::spawn_blocking(move || {
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::task::spawn_blocking(move || {
         // Tokio cannot cancel an already-running blocking closure. Retain the
         // host capability until nested async transport/cursor commits finish.
-        let _execution_guard = execution_guard;
-        runtime.block_on(execute)
-    })
-    .await
-    .map_err(|error| format!("DFS metadata publish execution task failed: {error}"))?
+        let result = runtime.block_on(execute);
+        // Match the former JoinHandle boundary before exposing any result.
+        drop(execution_guard);
+        let _ = result_tx.send(result);
+    });
+    task_owner.own_task(task);
+    result_rx.await.map_err(|error| {
+        format!("DFS metadata publish execution task ended without a result: {error}")
+    })?
 }

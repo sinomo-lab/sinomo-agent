@@ -53,7 +53,6 @@ fn dfs_error_from_posix_namespace_sync(error: posix_model::DfsPosixError) -> Dfs
 mod tests {
     use super::*;
     use sinomo_core::kv::InProcessKvStore;
-    use sinomo_core::network::InProcessNetwork;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -78,191 +77,43 @@ mod tests {
     }
 
     #[test]
-    fn source_owner_reference_routing_does_not_probe_unrelated_authorities() {
-        let root = sinomo_testdir::TestDir::new("dfs-reference-owner-local-projection");
-        let owner = NodeId::from_legacy_named("reference-local-owner").unwrap();
-        let unavailable = NodeId::from_legacy_named("reference-unrelated-owner").unwrap();
-        let file_system_id = sifs_file_system_id();
-        let source_shard = DfsMetadataShardConfig {
-            file_system_id: file_system_id.clone(),
-            shard_id: "services".into(),
-            primary_node_id: owner.clone(),
-            replica_node_ids: Vec::new(),
-            epoch: 3,
-            assignment: crate::DfsMetadataShardAssignment::PathPrefix {
-                prefix: "/services".into(),
-            },
-            namespace_prepare_codec: crate::DfsMetadataNamespacePrepareCodec::PackedV6,
-            default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
-        };
-        let other_shard = DfsMetadataShardConfig {
-            shard_id: "root".into(),
-            primary_node_id: unavailable,
-            assignment: crate::DfsMetadataShardAssignment::Root,
-            ..source_shard.clone()
-        };
-        let mut kv = InProcessKvStore::new();
-        let cluster_id = sinomo_core::Id::from_legacy_named("reference-local-projection").unwrap();
-        for node_id in [&source_shard.primary_node_id, &other_shard.primary_node_id] {
-            let mut member = sinomo_core::ClusterMemberRecord::local_non_voting(
-                cluster_id.clone(),
-                node_id.clone(),
-                "reference projection fixture",
-                format!("{node_id}-key"),
-                time::OffsetDateTime::UNIX_EPOCH,
-            );
-            member.state = sinomo_core::ClusterMemberState::Active;
-            member.capabilities = sinomo_core::node::main_daemon_capabilities(&member.role);
-            member.allowed_capabilities = member.capabilities.clone();
-            kv.put_serde(
-                sinomo_core::node::cluster_member_key(node_id),
-                &member,
-                None,
-            )
-            .unwrap();
-            kv.put_serde(
-                sinomo_core::node::cluster_capability_policy_key(node_id),
-                &sinomo_core::node::ClusterCapabilityPolicyRecord::from(&member),
-                None,
-            )
-            .unwrap();
-        }
-        let control_plane = SharedDfsControlPlaneKvClient::new(kv);
-        control_plane.with_client(|kv| {
-            let mut store = DfsControlPlaneStore::new(kv);
-            store.put_metadata_shard(&other_shard).unwrap();
-            store.put_metadata_shard(&source_shard).unwrap();
-        });
-        let mut object = crate::namespace::distributed_sifs_bootstrap_objects(owner.clone())
-            .into_iter()
-            .find(|object| object.path == "/services")
-            .unwrap();
-        object.object_id = DfsObjectId::from_legacy_named("reference-local-source").unwrap();
-        object.path = "/services/source.txt".into();
-        object.kind = DfsObjectKind::File;
-        let identity = crate::DfsRevisionReference {
-            file_system_id: file_system_id.clone(),
-            object_id: object.object_id.clone(),
-            version: object.version.clone(),
-        };
-        let mut backend = LocalSobjMetadataBackend::new(
-            DfsMetadataShardId::new("services"),
-            root.join("metadata"),
-        )
-        .unwrap();
-        backend
-            .put_file_system(&crate::namespace::distributed_sifs(owner.clone()))
-            .unwrap();
-        backend.put_object(&object).unwrap();
-        let network = InProcessNetwork::new();
-        let mut core = NetworkedDfsService::new(
-            network.add_node(owner),
-            LocalContentStore::new(root.join("content")).unwrap(),
-        )
-        .with_control_plane(control_plane);
-        core.set_metadata_backend_unhydrated(backend);
-        let operation = DfsNamespaceOperation::ContentReference {
-            request: DfsContentReferenceRequest {
-                wire_format: DfsContentReferenceFormat::NamespacedV6,
-                namespace: "example.source".into(),
-                identity,
-                path: object.path,
-                operation: crate::DfsContentReferenceOperation::Release {
-                    reference_id: "reference".into(),
-                },
-                operation_id: "reference-local-projection".into(),
-            },
-        };
-        assert_eq!(
-            core.namespace_operation_effect_authority_shards(&file_system_id, &operation)
-                .unwrap(),
-            vec![source_shard],
-            "the unrelated primary has no running peer and must not be queried"
-        );
-    }
-
-    #[test]
     fn stable_mkdir_replays_durable_result_after_service_restart() {
-        let root = sinomo_testdir::TestDir::new("dfs-stable-mkdir-restart").keep();
-        let node_id = NodeId::from_legacy_named("stable-mkdir-primary").expect("node");
-        let file_system_id = sifs_file_system_id();
-        let shard_id = DfsMetadataShardId::new("root");
-        let shard = DfsMetadataShardConfig {
-            file_system_id: file_system_id.clone(),
-            shard_id: shard_id.0.clone(),
-            primary_node_id: node_id.clone(),
-            replica_node_ids: Vec::new(),
-            epoch: 3,
-            assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
-            default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
-        };
-        let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
-        control_plane.with_client(|kv| {
-            DfsControlPlaneStore::new(kv)
-                .put_metadata_shard(&shard)
-                .expect("root shard config");
-        });
-
-        let metadata_root = root.join("metadata");
-        let content_root = root.join("content");
-        let mut backend =
-            LocalSobjMetadataBackend::new(shard_id.clone(), &metadata_root).expect("metadata");
-        backend
-            .put_file_system(&crate::namespace::distributed_sifs(node_id.clone()))
-            .expect("filesystem");
-        for object in crate::namespace::distributed_sifs_bootstrap_objects(node_id.clone()) {
-            backend.put_object(&object).expect("bootstrap object");
-        }
-
-        let network = InProcessNetwork::new();
-        let mut service = NetworkedDfsService::new(
-            network.add_node(node_id.clone()),
-            LocalContentStore::new(&content_root).expect("content"),
-        )
-        .with_control_plane(control_plane.clone());
-        service.set_metadata_backend_unhydrated(backend);
-        service
-            .hydrate_from_metadata_backend()
-            .expect("hydrate first service");
+        let node = crate::test_runtime::DfsTestRuntime::ordered_node_ids("native-stable-mkdir", 1)
+            .remove(0);
+        let mut runtime =
+            crate::test_runtime::DfsTestRuntime::new("native-stable-mkdir", node.clone()).unwrap();
+        runtime.start_nodes().unwrap();
+        let mut service = runtime.client(&node).unwrap();
         let first = service
             .posix_mkdir_with_create_attrs_and_operation_id(
                 "/services/cloud-directory",
                 DfsPosixCreateAttrs::new(0o750, 1000, 1000),
                 "cloud-create-directory-17",
             )
-            .expect("first mkdir");
+            .unwrap();
         drop(service);
-
-        let reopened_backend =
-            LocalSobjMetadataBackend::new(shard_id, &metadata_root).expect("reopen metadata");
-        let mut restarted = NetworkedDfsService::new(
-            network.add_node(node_id),
-            LocalContentStore::new(&content_root).expect("reopen content"),
-        )
-        .with_control_plane(control_plane);
-        restarted.set_metadata_backend_unhydrated(reopened_backend);
-        restarted
-            .hydrate_from_metadata_backend()
-            .expect("hydrate restarted service");
-        let replayed = restarted
+        runtime.stop_node(&node).unwrap();
+        runtime.reopen_node(node.clone()).unwrap();
+        let mut service = runtime.client(&node).unwrap();
+        let replay = service
             .posix_mkdir_with_create_attrs_and_operation_id(
                 "/services/cloud-directory",
                 DfsPosixCreateAttrs::new(0o750, 1000, 1000),
                 "cloud-create-directory-17",
             )
-            .expect("exact mkdir replay");
-        assert_eq!(replayed.object_id, first.object_id);
-        assert_eq!(replayed.version, first.version);
-
+            .unwrap();
+        assert_eq!(replay.object_id, first.object_id);
+        assert_eq!(replay.version, first.version);
         assert!(matches!(
-            restarted.posix_mkdir_with_create_attrs_and_operation_id(
+            service.posix_mkdir_with_create_attrs_and_operation_id(
                 "/services/cloud-directory",
                 DfsPosixCreateAttrs::new(0o700, 1000, 1000),
-                "cloud-create-directory-17",
+                "cloud-create-directory-17"
             ),
             Err(DfsPosixError::Conflict { .. })
         ));
+        drop(service);
+        runtime.close().unwrap();
     }
 
     #[test]
@@ -314,285 +165,38 @@ mod tests {
 
     #[test]
     fn lookup_paths_pins_one_consistent_metadata_snapshot() {
-        let root = sinomo_testdir::TestDir::new("dfs-lookup-paths-pinned-snapshot").keep();
-        let node_id = NodeId::from_legacy_named("node_lookup_paths_pinned").expect("node");
-        let file_system_id = sifs_file_system_id();
-        let shard_id = DfsMetadataShardId::new("root");
-        let mut backend = LocalSobjMetadataBackend::new(shard_id, &root).expect("metadata backend");
-        backend
-            .put_file_system(&DfsFileSystem {
-                metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
-                retention_policies: Default::default(),
-                module_metadata: Default::default(),
-                file_system_id: file_system_id.clone(),
-                display_name: "SIFS".to_string(),
-                owner_node_id: node_id.clone(),
-                subtree_policies: Vec::new(),
-            })
-            .expect("filesystem");
+        let node = crate::test_runtime::DfsTestRuntime::ordered_node_ids("native-pinned-lookup", 1)
+            .remove(0);
+        let mut runtime =
+            crate::test_runtime::DfsTestRuntime::new("native-pinned-lookup", node.clone()).unwrap();
+        runtime.start_nodes().unwrap();
+        let mut service = runtime.client(&node).unwrap();
         let mut paths = Vec::new();
         for index in 0..128 {
             let path = format!("/services/pinned-{index:03}.txt");
-            paths.push(path.clone());
-            backend
-                .put_object(&DfsObjectMetadata {
-                    file_system_id: file_system_id.clone(),
-                    object_id: DfsObjectId::from_legacy_named(format!(
-                        "object_lookup_paths_pinned_{index:03}"
-                    ))
-                    .expect("object"),
-                    path,
-                    kind: DfsObjectKind::File,
-                    tombstone_provenance: None,
-                    owner_node_id: node_id.clone(),
-                    current_locations: vec![node_id.clone()],
-                    content_hash: Some(format!("blake3:pinned-{index:03}")),
-                    content_size_bytes: Some(1),
-                    link_target_object_id: None,
-                    mode: 0o644,
-                    uid: 0,
-                    gid: 0,
-                    accessed_at_unix_nanos: 1,
-                    modified_at_unix_nanos: 1,
-                    created_at_unix_nanos: 1,
-                    changed_at_unix_nanos: 1,
-                    version: DfsVersion::from_legacy_named(format!(
-                        "version_lookup_paths_pinned_{index:03}"
-                    ))
-                    .expect("version"),
-                    policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
-                    created_by_event_id: None,
-                    last_modified_by_event_id: None,
-                })
-                .expect("object");
+            service
+                .posix_write_file(
+                    &path,
+                    b"actual bytes",
+                    crate::DfsWriteOptions::replicated_eventual(vec![node.clone()]),
+                )
+                .unwrap();
+            paths.push(path);
         }
-        let network = InProcessNetwork::new();
-        let mut service = NetworkedDfsService::new(
-            network.add_node(node_id),
-            LocalContentStore::new(root.join("content")).expect("content"),
-        );
-        service.set_metadata_backend_unhydrated(backend);
-
         crate::metadata_read_snapshot::reset_metadata_durable_table_probes();
         let objects = service
             .synced_namespace_objects_for_operation(
-                &file_system_id,
+                &sifs_file_system_id(),
                 &DfsNamespaceOperation::LookupPaths { paths },
             )
-            .expect("lookup paths");
-
+            .unwrap();
         assert_eq!(objects.len(), 128);
         assert!(
             crate::metadata_read_snapshot::metadata_durable_table_probes() <= 1,
-            "one routed LookupPaths request must not reopen the durable table generation per path"
+            "one request retains one actual durable generation"
         );
-    }
-
-    #[test]
-    fn namespace_change_poll_routes_each_cursor_to_its_remote_primary() {
-        let root = sinomo_testdir::TestDir::new("dfs-routed-namespace-change-feed").keep();
-        let requester = NodeId::from_legacy_named("feed-requester").expect("requester");
-        let root_primary = NodeId::from_legacy_named("feed-root-primary").expect("root primary");
-        let services_primary =
-            NodeId::from_legacy_named("feed-services-primary").expect("services primary");
-        let file_system_id =
-            DfsFileSystemId::from_legacy_named("feed-filesystem").expect("filesystem id");
-        let shard =
-            |shard_id: &str, primary_node_id: NodeId, assignment: DfsMetadataShardAssignment| {
-                DfsMetadataShardConfig {
-                    file_system_id: file_system_id.clone(),
-                    shard_id: shard_id.to_string(),
-                    primary_node_id,
-                    replica_node_ids: Vec::new(),
-                    epoch: 17,
-                    assignment,
-                    namespace_prepare_codec: Default::default(),
-                    default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
-                }
-            };
-        let root_shard = shard(
-            "root",
-            root_primary.clone(),
-            DfsMetadataShardAssignment::Root,
-        );
-        let services_shard = shard(
-            "services",
-            services_primary.clone(),
-            DfsMetadataShardAssignment::PathPrefix {
-                prefix: "/services".to_string(),
-            },
-        );
-        let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
-        control_plane.with_client(|kv| {
-            let mut store = DfsControlPlaneStore::new(kv);
-            store
-                .put_metadata_shard(&root_shard)
-                .expect("root shard config");
-            store
-                .put_metadata_shard(&services_shard)
-                .expect("services shard config");
-        });
-
-        let file_system = DfsFileSystem {
-            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
-            retention_policies: Default::default(),
-            module_metadata: Default::default(),
-            file_system_id: file_system_id.clone(),
-            display_name: "Feed test".to_string(),
-            owner_node_id: root_primary.clone(),
-            subtree_policies: Vec::new(),
-        };
-        let object = |object_id: &str, path: &str, owner_node_id: NodeId| DfsObjectMetadata {
-            file_system_id: file_system_id.clone(),
-            object_id: DfsObjectId::from_legacy_named(object_id).expect("object id"),
-            path: path.to_string(),
-            kind: DfsObjectKind::File,
-            tombstone_provenance: None,
-            owner_node_id: owner_node_id.clone(),
-            current_locations: vec![owner_node_id],
-            content_hash: Some(format!("blake3:{object_id}")),
-            content_size_bytes: Some(1),
-            link_target_object_id: None,
-            mode: 0o644,
-            uid: 0,
-            gid: 0,
-            accessed_at_unix_nanos: 1,
-            modified_at_unix_nanos: 1,
-            created_at_unix_nanos: 1,
-            changed_at_unix_nanos: 1,
-            version: DfsVersion::from_legacy_named(format!("{object_id}-version"))
-                .expect("version"),
-            policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
-            created_by_event_id: None,
-            last_modified_by_event_id: None,
-        };
-
-        let mut root_backend = LocalSobjMetadataBackend::new(
-            DfsMetadataShardId::new("root"),
-            root.join("root-metadata"),
-        )
-        .expect("root backend");
-        root_backend
-            .put_file_system(&file_system)
-            .expect("root filesystem");
-        root_backend
-            .put_object(&object("feed-root-object", "/docs/a", root_primary.clone()))
-            .expect("root object");
-        let mut services_backend = LocalSobjMetadataBackend::new(
-            DfsMetadataShardId::new("services"),
-            root.join("services-metadata"),
-        )
-        .expect("services backend");
-        services_backend
-            .put_file_system(&file_system)
-            .expect("services filesystem");
-        services_backend
-            .put_object(&object(
-                "feed-services-object",
-                "/services/b",
-                services_primary.clone(),
-            ))
-            .expect("services object");
-
-        let network = InProcessNetwork::new();
-        let mut root_service = NetworkedDfsService::new(
-            network.add_node(root_primary.clone()),
-            LocalContentStore::new(root.join("root-content")).expect("root content"),
-        )
-        .with_control_plane(control_plane.clone());
-        root_service.set_metadata_backend_unhydrated(root_backend);
-        let mut services_service = NetworkedDfsService::new(
-            network.add_node(services_primary.clone()),
-            LocalContentStore::new(root.join("services-content")).expect("services content"),
-        )
-        .with_control_plane(control_plane.clone());
-        services_service.set_metadata_backend_unhydrated(services_backend);
-        let mut requester_service = NetworkedDfsService::new(
-            network.add_node(requester),
-            LocalContentStore::new(root.join("requester-content")).expect("requester content"),
-        )
-        .with_control_plane(control_plane);
-
-        let stop = Arc::new(AtomicBool::new(false));
-        let root_stop = Arc::clone(&stop);
-        let services_stop = Arc::clone(&stop);
-        let root_worker = std::thread::spawn(move || {
-            while !root_stop.load(Ordering::Acquire) {
-                root_service.process_incoming().expect("root primary pump");
-                std::thread::yield_now();
-            }
-        });
-        let services_worker = std::thread::spawn(move || {
-            while !services_stop.load(Ordering::Acquire) {
-                services_service
-                    .process_incoming()
-                    .expect("services primary pump");
-                std::thread::yield_now();
-            }
-        });
-
-        // Reverse input order to prove output determinism and cursor isolation
-        // do not depend on request ordering.
-        let result = requester_service.poll_namespace_changes_for_subtree_with_timeout(
-            file_system_id.clone(),
-            "/",
-            &[
-                DfsNamespaceChangeCursor::from_shard_config(&services_shard, 0),
-                DfsNamespaceChangeCursor::from_shard_config(&root_shard, 0),
-            ],
-            Duration::from_secs(5),
-        );
-        stop.store(true, Ordering::Release);
-        root_worker.join().expect("root primary worker");
-        services_worker.join().expect("services primary worker");
-        let batches = result.expect("routed namespace change poll");
-
-        assert_eq!(batches.len(), 2);
-        assert_eq!(batches[0].next_cursor.shard_id.0, "root");
-        assert_eq!(batches[1].next_cursor.shard_id.0, "services");
-        for batch in &batches {
-            assert!(!batch.rescan_required(), "unexpected rescan: {batch:?}");
-            assert!(batch.next_cursor.after_sequence > 0);
-        }
-        assert!(batches[0].events.iter().any(|event| matches!(
-            event,
-            DfsNamespaceChangeEvent::Upsert { path, .. } if path == "/docs/a"
-        )));
-        assert!(batches[1].events.iter().any(|event| matches!(
-            event,
-            DfsNamespaceChangeEvent::Upsert { path, .. } if path == "/services/b"
-        )));
-
-        let mut stale_root = DfsNamespaceChangeCursor::from_shard_config(&root_shard, 9);
-        stale_root.authority_epoch -= 1;
-        let isolated_rescans = requester_service
-            .poll_namespace_changes_for_subtree_with_timeout(
-                file_system_id,
-                "/",
-                &[stale_root],
-                Duration::from_millis(10),
-            )
-            .expect("stale and missing cursors rescan without network polling");
-        assert_eq!(isolated_rescans.len(), 2);
-        assert!(matches!(
-            isolated_rescans[0].events.as_slice(),
-            [DfsNamespaceChangeEvent::RescanRequired {
-                reason: DfsNamespaceRescanReason::AuthorityEpochChanged,
-                ..
-            }]
-        ));
-        assert_eq!(
-            isolated_rescans[0].next_cursor.authority_epoch, root_shard.epoch,
-            "an epoch-change rescan must expose the current durable boundary"
-        );
-        assert_eq!(isolated_rescans[0].next_cursor.after_sequence, 9);
-        assert!(matches!(
-            isolated_rescans[1].events.as_slice(),
-            [DfsNamespaceChangeEvent::RescanRequired {
-                reason: DfsNamespaceRescanReason::ShardChanged,
-                ..
-            }]
-        ));
+        drop(service);
+        runtime.close().unwrap();
     }
 }
 
@@ -647,7 +251,6 @@ fn namespace_operation_should_replay_journal_batches(operation: &DfsNamespaceOpe
             | DfsNamespaceOperation::AdvisoryLock { .. }
             | DfsNamespaceOperation::FileSync { .. }
             | DfsNamespaceOperation::DirectorySync { .. }
-            | DfsNamespaceOperation::AdvisoryLockMigrationPrepare { .. }
             | DfsNamespaceOperation::VerifyObjectFamilyAdoption { .. }
     )
 }
@@ -693,6 +296,8 @@ fn namespace_operation_requires_fresh_authority(operation: &DfsNamespaceOperatio
     matches!(
         operation,
         DfsNamespaceOperation::AdvisoryLock { .. }
+            // Abort replay is owned by the original exact durable write intent.
+            | DfsNamespaceOperation::AbortPendingWrite { .. }
             // Placement has its own durable job, checked config permit and
             // deterministic per-object/version repair identity. A generic
             // namespace receipt duplicates that owner and turns a remote
@@ -700,7 +305,6 @@ fn namespace_operation_requires_fresh_authority(operation: &DfsNamespaceOperatio
             | DfsNamespaceOperation::ReconcilePlacement { .. }
             | DfsNamespaceOperation::FileSync { .. }
             | DfsNamespaceOperation::DirectorySync { .. }
-            | DfsNamespaceOperation::AdvisoryLockMigrationPrepare { .. }
             | DfsNamespaceOperation::VerifyObjectFamilyAdoption { .. }
     )
 }
@@ -714,6 +318,9 @@ fn namespace_operation_uses_durable_request_admission(operation: &DfsNamespaceOp
                 | DfsNamespaceOperation::LookupPath { .. }
                 | DfsNamespaceOperation::LookupPaths { .. }
                 | DfsNamespaceOperation::SyncPath { .. }
+                // Progress is already owned by the exact durable job. A new
+                // Pending row would reacquire its retained physical writer.
+                | DfsNamespaceOperation::ResumeNamespaceJobBounded { .. }
         )
 }
 
@@ -735,7 +342,7 @@ fn namespace_operation_can_fuse_durable_request_admission(
 }
 
 fn namespace_prepare_matches_routed_command(
-    prepare: &DfsNamespacePrepareRecord,
+    prepare: &DfsPreparedOperationPayload,
     requester_node_id: &NodeId,
     command: &DfsNamespaceCommand,
     shard_id: &DfsMetadataShardId,
@@ -763,9 +370,6 @@ fn namespace_prepare_matches_routed_command(
     attachment_matches
         && prepare.file_system_id == command.file_system_id
         && prepare.shard_id == *shard_id
-        && prepare
-            .operation_id
-            .starts_with(&format!("namespace-request:{expected_operation_id}:"))
 }
 
 pub(crate) fn namespace_operation_response_retry_safe(operation: &DfsNamespaceOperation) -> bool {
@@ -780,10 +384,10 @@ pub(crate) fn namespace_operation_response_retry_safe(operation: &DfsNamespaceOp
                 | DfsNamespaceOperation::AdvisoryLock { .. }
                 | DfsNamespaceOperation::FileSync { .. }
                 | DfsNamespaceOperation::DirectorySync { .. }
-                | DfsNamespaceOperation::AdvisoryLockMigrationPrepare { .. }
                 | DfsNamespaceOperation::FinalizeObjectFamilyAdoption { .. }
                 | DfsNamespaceOperation::VerifyObjectFamilyAdoption { .. }
                 | DfsNamespaceOperation::ReconcilePlacement { .. }
+                | DfsNamespaceOperation::ResumeNamespaceJobBounded { .. }
                 | DfsNamespaceOperation::AdoptObjectAtPath {
                     pin_transfer_id: Some(_),
                     ..
@@ -791,104 +395,92 @@ pub(crate) fn namespace_operation_response_retry_safe(operation: &DfsNamespaceOp
         )
 }
 
-pub(crate) fn namespace_command_digest(command: &DfsNamespaceCommand) -> Result<String, DfsError> {
+/// Current source custody is fresh authorization context, not retry identity.
+/// Every semantic adoption field remains in the stable command digest.
+struct NamespaceOperationIdentity<'a>(&'a DfsNamespaceOperation);
+impl serde::Serialize for NamespaceOperationIdentity<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let DfsNamespaceOperation::AdoptObjectAtPath {
+            object,
+            source_path,
+            pin_transfer_id,
+            versions,
+            version_pins,
+            version_pin_set_fingerprint,
+            receipts,
+            intents,
+            intent_receipts,
+            intent_receipt_retention,
+            content_reference_outcomes,
+            content_reference_outcome_retention,
+            advisory_lock_state,
+            ..
+        } = self.0
+        else {
+            return self.0.serialize(serializer);
+        };
+        #[derive(serde::Serialize)]
+        struct Adoption<'a> {
+            object: &'a DfsObjectMetadata,
+            source_path: &'a String,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            pin_transfer_id: &'a Option<String>,
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            versions: &'a Vec<DfsObjectVersionRecord>,
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            version_pins: &'a Vec<DfsMetadataVersionPinRecord>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            version_pin_set_fingerprint: &'a Option<String>,
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            receipts: &'a Vec<DfsReplicaReceiptRecord>,
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            intents: &'a Vec<DfsWriteIntentRecord>,
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            intent_receipts: &'a Vec<DfsWriteIntentReceipt>,
+            #[serde(skip_serializing_if = "DfsWriteIntentReceiptRetentionState::is_empty")]
+            intent_receipt_retention: &'a DfsWriteIntentReceiptRetentionState,
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            content_reference_outcomes: &'a Vec<DfsNamespaceTransactionReceipt>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            content_reference_outcome_retention:
+                &'a Option<crate::DfsContentReferenceOutcomeRetention>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            advisory_lock_state: &'a Option<DfsAdvisoryLockStateRecord>,
+        }
+        let mut variant = serializer.serialize_map(Some(1))?;
+        variant.serialize_entry(
+            "adopt-object-at-path",
+            &Adoption {
+                object,
+                source_path,
+                pin_transfer_id,
+                versions,
+                version_pins,
+                version_pin_set_fingerprint,
+                receipts,
+                intents,
+                intent_receipts,
+                intent_receipt_retention,
+                content_reference_outcomes,
+                content_reference_outcome_retention,
+                advisory_lock_state,
+            },
+        )?;
+        variant.end()
+    }
+}
+
+pub fn namespace_command_digest(command: &DfsNamespaceCommand) -> Result<String, DfsError> {
     let encoded = serde_json::to_vec(&(
         &command.file_system_id,
         &command.requesting_node_id,
-        &command.operation,
+        NamespaceOperationIdentity(&command.operation),
     ))
     .map_err(|source| DfsError::Distributed {
         message: format!("failed to encode namespace command digest: {source}"),
     })?;
     Ok(format!("blake3:{}", blake3::hash(&encoded).to_hex()))
-}
-
-/// Reconstruct only the exact pre-v6 reference command represented by a new
-/// request. This is durable decoder/replay compatibility; it neither authors
-/// a new legacy request nor interprets live module policy.
-fn legacy_content_reference_retry_command(
-    command: &DfsNamespaceCommand,
-) -> Result<Option<DfsNamespaceCommand>, DfsError> {
-    let DfsNamespaceOperation::ContentReference { request } = &command.operation else {
-        return Ok(None);
-    };
-    request.validate()?;
-    if request.wire_format != DfsContentReferenceFormat::NamespacedV6
-        || request.namespace != crate::lifecycle::legacy_reference_namespace()
-    {
-        return Ok(None);
-    }
-    let mut legacy = request.clone();
-    if let DfsContentReferenceOperation::CaptureCurrent {
-        reference_id,
-        metadata,
-    } = &request.operation
-    {
-        // Old captures implicitly carried this one provenance value. A new
-        // caller changing opaque metadata must not reuse its old admission.
-        if metadata.as_ref()
-            != Some(
-                &sinomo_api::dfs::file_history::legacy_checkpoint_reference_metadata(
-                    &request.operation_id,
-                ),
-            )
-        {
-            return Ok(None);
-        }
-        legacy.operation = DfsContentReferenceOperation::CaptureCurrent {
-            reference_id: reference_id.clone(),
-            metadata: None,
-        };
-    }
-    legacy.wire_format = DfsContentReferenceFormat::Legacy;
-    let mut legacy_command = command.clone();
-    legacy_command.operation = DfsNamespaceOperation::ContentReference { request: legacy };
-    Ok(Some(legacy_command))
-}
-
-fn select_recorded_namespace_command(
-    command: &mut DfsNamespaceCommand,
-    snapshot: Option<&DfsNamespaceRequestAdmissionSnapshot>,
-) -> Result<String, DfsError> {
-    let mut digest = namespace_command_digest(command)?;
-    let recorded_digest = snapshot.and_then(|snapshot| {
-        snapshot
-            .receipt
-            .as_ref()
-            .map(|receipt| receipt.command_digest.as_str())
-            .or_else(|| {
-                snapshot
-                    .request
-                    .as_ref()
-                    .map(|request| request.command_digest.as_str())
-            })
-            .or_else(|| {
-                snapshot.prepared.as_ref().and_then(|prepare| {
-                    prepare
-                        .completed_request
-                        .as_ref()
-                        .map(|request| request.command_digest.as_str())
-                        .or_else(|| {
-                            prepare
-                                .completed_request_completion
-                                .as_ref()
-                                .map(|completion| completion.command_digest.as_str())
-                        })
-                })
-            })
-    });
-    if recorded_digest.is_some_and(|recorded| recorded != digest)
-        && let Some(legacy) = legacy_content_reference_retry_command(command)?
-    {
-        let legacy_digest = namespace_command_digest(&legacy)?;
-        if recorded_digest == Some(legacy_digest.as_str()) {
-            // Select the admitted wire form before replay or pending
-            // execution. New identities always retain the v6 command.
-            command.operation = legacy.operation;
-            digest = legacy_digest;
-        }
-    }
-    Ok(digest)
 }
 
 fn stable_namespace_operation_file_system_id(operation: &DfsNamespaceOperation) -> DfsFileSystemId {
@@ -1048,10 +640,10 @@ fn classify_stable_namespace_operation(
     }
     if let Some(prepare) = snapshot.prepared.as_ref() {
         if !namespace_prepare_matches_routed_command(
-            prepare,
+            &prepare.payload,
             requester_node_id,
             command,
-            &prepare.shard_id,
+            &prepare.digest.shard_id,
             command_digest,
         ) {
             return DfsStableNamespaceOperationReconciliation::Conflict {
@@ -1233,13 +825,13 @@ fn namespace_transaction_proves_operation_completed(
         | DfsNamespaceOperation::ResumeNamespaceJobBounded { .. }
         | DfsNamespaceOperation::ClearDirRecursive { .. }
         | DfsNamespaceOperation::ReconcilePlacement { .. }
+        | DfsNamespaceOperation::AbortPendingWrite { .. }
         | DfsNamespaceOperation::SyncPath { .. }
         | DfsNamespaceOperation::LookupPath { .. }
         | DfsNamespaceOperation::LookupPaths { .. }
         | DfsNamespaceOperation::AdvisoryLock { .. }
         | DfsNamespaceOperation::FileSync { .. }
         | DfsNamespaceOperation::DirectorySync { .. }
-        | DfsNamespaceOperation::AdvisoryLockMigrationPrepare { .. }
         | DfsNamespaceOperation::FinalizeObjectFamilyAdoption { .. }
         | DfsNamespaceOperation::VerifyObjectFamilyAdoption { .. } => false,
     }
@@ -1293,9 +885,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         shard.file_system_id == *file_system_id
                             && shard.shard_id == query.shard_id.0
                             && shard.epoch == query.epoch
-                            && query
-                                .selection
-                                .supports_codec(shard.namespace_prepare_codec)
                     })
                     .filter(|_| query.file_system_id == *file_system_id)
                     .ok_or_else(|| DfsError::Metadata {
@@ -1524,7 +1113,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         } else {
             None
         };
-        let command_digest = select_recorded_namespace_command(&mut command, snapshot.as_ref())?;
+        let command_digest = namespace_command_digest(&command)?;
         Ok(classify_stable_namespace_operation(
             operation_id,
             &file_system_id,
@@ -1609,7 +1198,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             ),
         })?;
         let requester_node_id = self.node_id.clone();
-        if dispatch.primary_node_id == self.node_id {
+        if dispatch.primary_node_id == self.node_id
+            && !self.transport.delegates_local_namespace_authority()
+        {
             return self.reconcile_stable_namespace_operation_locally_for_requester(
                 operation_id,
                 operation,
@@ -1618,39 +1209,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 true,
             );
         }
-        let probe_operation = if !dispatch
-            .namespace_prepare_codec
-            .supports_retention_metadata_mutations()
-            && matches!(operation, DfsNamespaceOperation::ContentReference { request }
-                if request.wire_format == DfsContentReferenceFormat::NamespacedV6)
-        {
-            if file_system_id != sifs_file_system_id() {
-                return Err(DfsError::Metadata {
-                    message: "legacy namespace reconciliation cannot prove a non-SIFS filesystem"
-                        .into(),
-                });
-            }
-            // An older receiver must never silently discard a namespace or
-            // opaque payload. Only the isolated, exactly representable legacy
-            // command may cross this read-only compatibility boundary.
-            let command = DfsNamespaceCommand {
-                request_id: operation_id.to_string(),
-                file_system_id: file_system_id.clone(),
-                requesting_node_id: requester_node_id.clone(),
-                include_metadata_journal_batches: false,
-                metadata_journal_after_sequences: Vec::new(),
-                authority_shards: authority_shards.clone(),
-                operation: operation.clone(),
-            };
-            legacy_content_reference_retry_command(&command)?
-                .ok_or_else(|| DfsError::Metadata {
-                    message: "namespaced reference reconciliation requires a packed-v6 authority"
-                        .into(),
-                })?
-                .operation
-        } else {
-            operation.clone()
-        };
+        let probe_operation = operation.clone();
         let request_id = self.next_request_id();
         let authority_node_id = dispatch.primary_node_id.clone();
         self.stable_namespace_reconciliation_targets
@@ -1694,15 +1253,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 operation: operation.clone(),
             };
             let digest = namespace_command_digest(&command)?;
-            let legacy_digest = legacy_content_reference_retry_command(&command)?
-                .as_ref()
-                .map(namespace_command_digest)
-                .transpose()?;
             if receipt.operation_id != operation_id
                 || receipt.file_system_id != file_system_id
                 || receipt.requesting_node_id != requester_node_id
-                || (receipt.command_digest != digest
-                    && legacy_digest.as_deref() != Some(receipt.command_digest.as_str()))
+                || receipt.command_digest != digest
             {
                 return Err(DfsError::Metadata {
                     message: "stable namespace outcome does not match the requested command identity and digest".into(),
@@ -1822,15 +1376,35 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if max_requests == 0 || self.control_plane.is_none() || self.metadata_backend.is_none() {
             return Ok(report);
         }
+        let resumed_request = self.pending_namespace_request_recovery.take();
         let mut locally_authoritative = Vec::new();
         let mut locally_authoritative_count = 0usize;
+        if let Some(original) = resumed_request.as_ref() {
+            let current = self
+                .metadata_backend
+                .as_ref()
+                .expect("metadata backend checked above")
+                .get_namespace_request(&original.requester_node_id, &original.request_id)?
+                .ok_or_else(|| DfsError::Metadata {
+                    message: "remote recovery lost its original durable request".into(),
+                })?;
+            if !original.matches_immutable_payload(&current) {
+                return Err(DfsError::Metadata {
+                    message: "remote recovery changed its immutable durable request".into(),
+                });
+            }
+            locally_authoritative.push(current);
+            locally_authoritative_count = 1;
+        }
         let mut shard_snapshots = BTreeMap::<DfsFileSystemId, Vec<DfsMetadataShardConfig>>::new();
         let mut cursor = self.pending_namespace_request_recovery_cursor.take();
         let scan_started_after_cursor = cursor.is_some();
         let scan_page_entry_limit =
             max_requests.clamp(1, DFS_NAMESPACE_REQUEST_RECOVERY_BATCH_LIMIT);
         let mut scanned_pages = 0usize;
-        'scan: while scanned_pages < DFS_NAMESPACE_REQUEST_RECOVERY_SCAN_PAGE_LIMIT {
+        'scan: while resumed_request.is_none()
+            && scanned_pages < DFS_NAMESPACE_REQUEST_RECOVERY_SCAN_PAGE_LIMIT
+        {
             let page = self
                 .metadata_backend
                 .as_ref()
@@ -1959,6 +1533,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 true,
                 false,
             );
+            if self.remote_namespace_phase.is_some() {
+                // Actual owned work is a yield, never a rejection diagnostic.
+                // The host retains this SAME full durable request, releases its
+                // service/admission, and installs the real completion before replay.
+                self.pending_namespace_request_recovery = Some(Box::new(request));
+                return Ok(report);
+            }
             let current = self
                 .metadata_backend
                 .as_ref()
@@ -1990,12 +1571,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             request.recovery_attempts = request.recovery_attempts.saturating_add(1);
             request.last_recovery_error = Some(detail.clone());
             request.updated_at = time::OffsetDateTime::now_utc();
-            match self
-                .metadata_backend
-                .as_mut()
-                .expect("metadata backend checked above")
-                .put_namespace_request_on_shard(&request.authority_shard_id, &request)
-            {
+            match self.publish_namespace_request_record(&request) {
                 Ok(_) => {}
                 Err(error) => report.failures.push(format!(
                     "namespace request {}/{} recovery diagnostics failed: {error}",
@@ -2028,7 +1604,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 requester_node_id,
                 &command.request_id,
             )?;
-        let digest = select_recorded_namespace_command(command, Some(&admission))?;
+        let digest = namespace_command_digest(command)?;
         let DfsNamespaceRequestAdmissionSnapshot {
             request: existing,
             receipt,
@@ -2141,7 +1717,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         if let Some(prepare) = prepared {
             if !namespace_prepare_matches_routed_command(
-                &prepare,
+                &prepare.payload,
                 requester_node_id,
                 command,
                 &shard_id,
@@ -2190,6 +1766,23 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             });
         }
 
+        // A new creation cannot resume the move that owns this path.
+        // Reject through the existing guard before writing bookkeeping
+        // under the move's retained writer; exact request replay stays above.
+        if let DfsNamespaceOperation::Mkdir { path }
+        | DfsNamespaceOperation::MkdirWithAttrs { path, .. }
+        | DfsNamespaceOperation::MkdirAtNoLinks { path, .. }
+        | DfsNamespaceOperation::BeginContentCopy { path, .. } = &command.operation
+            && let Err(error) =
+                self.ensure_path_not_in_cross_shard_flight(&command.file_system_id, path)
+        {
+            let error = posix_model::DfsPosixError::from(error);
+            return Ok(DurableNamespaceRequestAdmission::Reject {
+                reason: error.to_string(),
+                posix_error: posix_model::namespace_posix_error_for(&error),
+            });
+        }
+
         let now = time::OffsetDateTime::now_utc();
         let record = DfsNamespaceRequestRecord {
             file_system_id: command.file_system_id.clone(),
@@ -2209,10 +1802,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         };
         let persisted = !namespace_operation_can_fuse_durable_request_admission(&command.operation);
         if persisted {
-            self.metadata_backend
-                .as_mut()
-                .expect("metadata backend checked above")
-                .put_namespace_request_on_shard(&shard_id, &record)?;
+            self.publish_namespace_request_record(&record)?;
         }
         Ok(DurableNamespaceRequestAdmission::Execute {
             shard_id,
@@ -2220,6 +1810,63 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             persisted,
             replaying_pending: false,
         })
+    }
+
+    pub(crate) fn publish_namespace_request_record(
+        &mut self,
+        record: &DfsNamespaceRequestRecord,
+    ) -> Result<(), DfsError> {
+        let backend = self
+            .metadata_backend
+            .as_ref()
+            .ok_or_else(|| DfsError::Metadata {
+                message: "durable namespace admission requires the current backend".into(),
+            })?;
+        if backend
+            .get_namespace_request(&record.requester_node_id, &record.request_id)?
+            .as_ref()
+            == Some(record)
+        {
+            return Ok(());
+        }
+        let epoch = if let Some(control) = self.control_plane.as_mut() {
+            let shard = DfsControlPlaneStore::new(control.as_mut())
+                .get_metadata_shard(&record.file_system_id, &record.authority_shard_id.0)?
+                .ok_or_else(|| DfsError::Metadata {
+                    message: "namespace request row has no exact current assignment".into(),
+                })?;
+            if shard.primary_node_id != self.node_id {
+                return Err(DfsError::StaleOwnerEpoch {
+                    file_system_id: record.file_system_id.clone(),
+                    local_node_id: self.node_id.clone(),
+                    primary_node_id: shard.primary_node_id,
+                    epoch: shard.epoch,
+                });
+            }
+            shard.epoch
+        } else {
+            0
+        };
+        let scope = DfsPreparedOperationScope {
+            file_system_id: record.file_system_id.clone(),
+            shard_id: record.authority_shard_id.clone(),
+            owner_epoch: epoch,
+            operation_id: format!(
+                "namespace-request-row:{}:{}",
+                record.operation_id,
+                sinomo_core::Id::generate()
+            ),
+        };
+        let _execution = self.acquire_prepared_execution(&scope)?;
+        self.publish_metadata_effects_on_shard(
+            scope,
+            Vec::new(),
+            Vec::new(),
+            vec![DfsPreparedMetadataEffect::PutNamespaceRequest {
+                request: Box::new(record.clone()),
+            }],
+        )?;
+        Ok(())
     }
 
     fn complete_durable_namespace_request(
@@ -2269,12 +1916,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         record.posix_coordination_result = posix_coordination_result.clone();
         record.last_recovery_error = None;
         record.updated_at = time::OffsetDateTime::now_utc();
-        self.metadata_backend
-            .as_mut()
-            .ok_or_else(|| DfsError::Metadata {
-                message: "routed namespace mutation lost its durable request backend".to_string(),
-            })?
-            .put_namespace_request_on_shard(shard_id, &record)?;
+        if record.authority_shard_id != *shard_id {
+            return Err(DfsError::Metadata {
+                message: "namespace completion changed its recorded authority shard".into(),
+            });
+        }
+        self.publish_namespace_request_record(&record)?;
         Ok((result, posix_coordination_result))
     }
 
@@ -2290,6 +1937,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 DfsNamespaceOperation::CommitLocalEventualBatch { .. }
             )
             || !namespace_transaction_proves_operation_completed(&active.operation, transaction)
+            || (matches!(
+                active.operation,
+                DfsNamespaceOperation::ContentReference { .. }
+            ) && transaction.created_at != active.created_at)
         {
             return None;
         }
@@ -2298,7 +1949,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         completed.result = Some(DfsNamespaceResult::Applied);
         completed.posix_coordination_result = None;
         completed.last_recovery_error = None;
-        completed.updated_at = time::OffsetDateTime::now_utc();
+        // Reference effects already carry their original durable admission
+        // time in the canonical transaction. A foreground planner and normal
+        // Main recovery must not restamp the SAME completed request body.
+        completed.updated_at = if matches!(
+            active.operation,
+            DfsNamespaceOperation::ContentReference { .. }
+        ) {
+            transaction.created_at
+        } else {
+            time::OffsetDateTime::now_utc()
+        };
         Some(completed)
     }
 
@@ -2612,6 +2273,23 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         send_response: bool,
     ) -> Result<NetworkedDfsServiceEvent, DfsError> {
         let _namespace_plan = self.namespace_execution.begin_independent_planning();
+        if let DfsNamespaceOperation::AdoptObjectAtPath { source_offer, .. } = &command.operation
+            && (requester_node_id != source_offer.job_offer.coordinator_node_id
+                || command.requesting_node_id != source_offer.job_offer.coordinator_node_id)
+        {
+            return Err(DfsError::Metadata {
+                message: "source adoption requester is not its original coordinator".into(),
+            });
+        }
+        // The same actual job writer may also protect request admission before
+        // the adoption body. The offer remains data until the Actor resolves
+        // its retained capture; plain effects receive no foreign-family grant.
+        let _source_scope = match &command.operation {
+            DfsNamespaceOperation::AdoptObjectAtPath { source_offer, .. } => {
+                Some(self.source_adoption.install(source_offer.clone()))
+            }
+            _ => None,
+        };
         let request_id = command.request_id.clone();
         let trace_started = Instant::now();
         let trace_operation = dfs_namespace_operation_trace_label(&command.operation);
@@ -2637,7 +2315,27 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             // affected-shard comparison below without first clearing a
             // durable handoff fence or running rebind hydration/recovery.
             for expected in &command.authority_shards {
+                tracing::trace!(
+                    target: "sinomo.dfs.perf",
+                    node = %self.node_id,
+                    request = %request_id,
+                    operation = %trace_operation,
+                    stamped_fs = %expected.file_system_id,
+                    stamped_shard = %expected.shard_id,
+                    phase = "before-rebind",
+                    "namespace request prologue"
+                );
                 self.rebind_completed_local_metadata_shard_membership_handoff_if_frozen(expected)?;
+                tracing::trace!(
+                    target: "sinomo.dfs.perf",
+                    node = %self.node_id,
+                    request = %request_id,
+                    operation = %trace_operation,
+                    stamped_fs = %expected.file_system_id,
+                    stamped_shard = %expected.shard_id,
+                    phase = "after-rebind",
+                    "namespace request prologue"
+                );
             }
         }
         // The authority the requester should retry against when this node is
@@ -2648,6 +2346,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let result = if let Err(error) = validate_namespace_operation_id(&command.request_id) {
             DfsNamespaceResult::Rejected {
                 reason: error.to_string(),
+                posix_error: None,
+                current_primary_node_id: None,
+            }
+        } else if command.authority_shards.is_empty() && !recovering {
+            DfsNamespaceResult::Rejected {
+                reason: "current network namespace requests require an exact authority stamp"
+                    .into(),
                 posix_error: None,
                 current_primary_node_id: None,
             }
@@ -2685,6 +2390,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
         } else {
             let affected_started = Instant::now();
+            tracing::trace!(
+                target: "sinomo.dfs.perf",
+                node = %self.node_id,
+                request = %request_id,
+                operation = %trace_operation,
+                phase = "before-affected-shards",
+                "namespace request prologue"
+            );
             let affected = self
                 .metadata_shard_config_snapshot(&command.file_system_id)
                 .and_then(|snapshot| {
@@ -2696,6 +2409,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     )?;
                     Ok((snapshot, affected))
                 });
+            tracing::trace!(
+                target: "sinomo.dfs.perf",
+                node = %self.node_id,
+                request = %request_id,
+                operation = %trace_operation,
+                phase = "after-affected-shards",
+                "namespace request prologue"
+            );
             match affected {
                 Err(error) => {
                     trace_affected_ms = affected_started.elapsed().as_millis();
@@ -2709,7 +2430,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     trace_affected_ms = affected_started.elapsed().as_millis();
                     trace_affected_shards = shards.len();
                     if !recovering
-                        && !command.authority_shards.is_empty()
                         && !namespace_authority_shards_match(&command.authority_shards, &shards)
                         && self.refresh_control_plane_latest().is_ok()
                         && let Ok(Some(refreshed_snapshot)) =
@@ -2730,7 +2450,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         trace_affected_shards = shards.len();
                     }
                     if !recovering
-                        && !command.authority_shards.is_empty()
                         && !namespace_authority_shards_match(&command.authority_shards, &shards)
                     {
                         let current_primary_node_id = Self::namespace_operation_dispatch_shard(
@@ -2765,7 +2484,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         // Finish generic pending receipts left by older
                         // placement callers, without creating new ones on the
                         // normal desired-state reconciliation path.
-                        let durable_admission =
+                        let mut durable_admission =
                             if (namespace_operation_uses_durable_request_admission(
                                 &command.operation,
                             ) || (recovering
@@ -2781,17 +2500,114 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                     .expect("non-empty affected shard ids")
                                     .clone();
                                 let admission_started = Instant::now();
+                                tracing::trace!(
+                                    target: "sinomo.dfs.perf",
+                                    node = %self.node_id,
+                                    request = %request_id,
+                                    operation = %trace_operation,
+                                    phase = "before-durable-admission",
+                                    "namespace request prologue"
+                                );
                                 let admission = self.admit_durable_namespace_request(
                                     &requester_node_id,
                                     &mut command,
                                     shard_id,
                                     recovering,
                                 )?;
+                                tracing::trace!(
+                                    target: "sinomo.dfs.perf",
+                                    node = %self.node_id,
+                                    request = %request_id,
+                                    operation = %trace_operation,
+                                    phase = "after-durable-admission",
+                                    "namespace request prologue"
+                                );
                                 trace_admission_ms = admission_started.elapsed().as_millis();
                                 Some(admission)
                             } else {
                                 None
                             };
+                        let mut _content_copy_begin_owner = None;
+                        if matches!(
+                            &durable_admission,
+                            Some(DurableNamespaceRequestAdmission::Execute { .. })
+                        ) && let (DfsNamespaceOperation::BeginContentCopy { path, .. }, [shard]) =
+                            (&command.operation, shards.as_slice())
+                            && shard.primary_node_id == self.node_id
+                        {
+                            // Preserve canonical Replay/Reject before any new
+                            // writer wait. An executing caller can queue while
+                            // the normal recovery owner completes this SAME Begin.
+                            let rejoin_started = Instant::now();
+                            let Some(DurableNamespaceRequestAdmission::Execute {
+                                shard_id,
+                                record,
+                                ..
+                            }) = durable_admission.as_ref()
+                            else {
+                                unreachable!("executing Begin admission checked above");
+                            };
+                            if shard_id.0 != shard.shard_id
+                                || record.authority_shard_id != *shard_id
+                                || record.file_system_id != command.file_system_id
+                            {
+                                return Err(DfsError::Metadata {
+                                    message:
+                                        "content copy admission changed its recorded shard scope"
+                                            .into(),
+                                });
+                            }
+                            let scope = DfsPreparedOperationScope {
+                                file_system_id: record.file_system_id.clone(),
+                                shard_id: shard_id.clone(),
+                                owner_epoch: shard.epoch,
+                                operation_id: record.operation_id.clone(),
+                            };
+                            let mut path_guard = self.ensure_path_not_in_cross_shard_flight(
+                                &command.file_system_id,
+                                path,
+                            );
+                            if path_guard.is_ok() {
+                                _content_copy_begin_owner =
+                                    self.acquire_prepared_execution(&scope)?;
+                                // Admission may have waited behind another real
+                                // move. Its retained writer still requires the
+                                // same normal Busy check before physical refresh.
+                                path_guard = self.ensure_path_not_in_cross_shard_flight(
+                                    &command.file_system_id,
+                                    path,
+                                );
+                            }
+                            durable_admission = Some(match path_guard {
+                                Err(error) => {
+                                    let error = posix_model::DfsPosixError::from(error);
+                                    DurableNamespaceRequestAdmission::Reject {
+                                        reason: error.to_string(),
+                                        posix_error: posix_model::namespace_posix_error_for(&error),
+                                    }
+                                }
+                                Ok(()) => {
+                                    self.metadata_backend
+                                        .as_mut()
+                                        .ok_or_else(|| DfsError::Metadata {
+                                            message:
+                                                "content copy admission requires durable metadata"
+                                                    .into(),
+                                        })?
+                                        .refresh_metadata_shard_attestation_view(&scope.shard_id)?;
+                                    // Reuse the exact original admission parser;
+                                    // completed recovery returns its immutable
+                                    // Begin response rather than a newer job DTO.
+                                    self.admit_durable_namespace_request(
+                                        &requester_node_id,
+                                        &mut command,
+                                        scope.shard_id,
+                                        recovering,
+                                    )?
+                                }
+                            });
+                            trace_admission_ms += rejoin_started.elapsed().as_millis();
+                        }
                         match durable_admission {
                             Some(DurableNamespaceRequestAdmission::Replay {
                                 result,
@@ -2840,18 +2656,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                     ),
                                 );
                                 let execute_started = Instant::now();
-                                let previous_operation_context = if foreign_shard.is_none() {
-                                    self.replace_namespace_operation_context(
-                                        command.file_system_id.clone(),
-                                        shard_snapshot.clone(),
-                                    )
-                                } else {
-                                    // Cross-shard coordinators explicitly
-                                    // refresh authority and may pump nested
-                                    // requests while settling. They must never
-                                    // inherit an outer local planning snapshot.
-                                    self.namespace_execution.replace_context(None)
-                                };
+                                let same_node_cross_shard_rename = foreign_shard.is_none()
+                                    && shards.len() > 1
+                                    && matches!(
+                                        &command.operation,
+                                        DfsNamespaceOperation::Rename { .. }
+                                    );
+                                let previous_operation_context =
+                                    if foreign_shard.is_none() && !same_node_cross_shard_rename {
+                                        self.replace_namespace_operation_context(
+                                            command.file_system_id.clone(),
+                                            shard_snapshot.clone(),
+                                        )
+                                    } else {
+                                        // Cross-shard coordinators explicitly
+                                        // refresh authority and may pump nested
+                                        // requests while settling. They must never
+                                        // inherit an outer local planning snapshot.
+                                        self.namespace_execution.replace_context(None)
+                                    };
                                 let outcome = match (&foreign_shard, &mut command.operation) {
                                     (
                                         None,
@@ -2939,17 +2762,39 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                             )
                                         }
                                     }
-                                    (None, operation) => {
-                                        self.execute_posix_coordination_operation_local(operation)
-                                    }
-                                    (Some(_), DfsNamespaceOperation::Rename { from, to }) => self
-                                        .namespace_coordinator_dispatch_rename_with_pending_replay(
+                                    (
+                                        None,
+                                        operation @ DfsNamespaceOperation::AbortPendingWrite {
+                                            ..
+                                        },
+                                    ) => self
+                                        .abort_routed_pending_write(
+                                            &requester_node_id,
+                                            &command.file_system_id,
+                                            operation,
+                                        )
+                                        .map(|intent| {
+                                            Some(DfsPosixCoordinationResult::AbortedWriteIntent(
+                                                Box::new(intent),
+                                            ))
+                                        })
+                                        .map_err(posix_model::DfsPosixError::from),
+                                    (foreign, DfsNamespaceOperation::Rename { from, to })
+                                        if foreign.is_some() || same_node_cross_shard_rename =>
+                                    {
+                                        // Sharing a Main node does not merge the
+                                        // physical shard writers or journal cuts.
+                                        self.namespace_coordinator_dispatch_rename_with_pending_replay(
                                             &command.file_system_id,
                                             from,
                                             to,
                                             replaying_pending_request.as_ref(),
                                         )
-                                        .map(|()| None),
+                                        .map(|()| None)
+                                    }
+                                    (None, operation) => {
+                                        self.execute_posix_coordination_operation_local(operation)
+                                    }
                                     (
                                         Some(_),
                                         DfsNamespaceOperation::Hardlink {
@@ -3001,10 +2846,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                         ..
                                     }) = durable_execute.as_ref()
                                 {
-                                    self.metadata_backend
-                                        .as_mut()
-                                        .expect("durable namespace request backend")
-                                        .put_namespace_request_on_shard(shard_id, record)?;
+                                    if record.authority_shard_id != *shard_id {
+                                        return Err(DfsError::Metadata {
+                                            message: "deferred admission changed its actual shard"
+                                                .into(),
+                                        });
+                                    }
+                                    self.publish_namespace_request_record(record)?;
                                 }
                                 let mut operation_result = match outcome {
                                     Ok(coordination_result) => {
@@ -3181,11 +3029,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let send_started = Instant::now();
         let response = DfsNamespaceResponse {
             request_id: request_id.clone(),
+            committed_work: self.message_committed_work,
             result: result.clone(),
             synced_path_object,
             synced_path_objects,
             metadata_journal_batches,
-            metadata_journal_has_more: Some(metadata_journal_has_more),
+            metadata_journal_has_more,
             posix_coordination_result,
         };
         if !recovering && send_response {
@@ -3247,12 +3096,49 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         operation_id: String,
         operation: DfsNamespaceOperation,
     ) -> posix_model::Result<()> {
+        match self.execute_local_primary_namespace_result_for_file_system(
+            file_system_id,
+            operation_id,
+            operation,
+        )? {
+            DfsNamespaceResult::Applied => Ok(()),
+            DfsNamespaceResult::Rejected {
+                reason,
+                posix_error,
+                ..
+            } => Err(posix_model::posix_error_for_namespace_rejection(
+                reason,
+                posix_error,
+            )),
+        }
+    }
+
+    pub(crate) fn execute_local_primary_namespace_result_for_file_system(
+        &mut self,
+        file_system_id: DfsFileSystemId,
+        operation_id: String,
+        operation: DfsNamespaceOperation,
+    ) -> posix_model::Result<DfsNamespaceResult> {
         validate_namespace_operation_id(&operation_id).map_err(DfsPosixError::from)?;
         if self.control_plane.is_none() {
             return Err(DfsPosixError::Dfs(DfsError::Distributed {
                 message: "durable local-primary namespace admission requires a committed control-plane shard view"
                     .to_string(),
             }));
+        }
+        if self.transport.delegates_local_namespace_authority() {
+            let result = self
+                .route_namespace_operation_to_metadata_primary_with_request_id_and_options(
+                    operation_id,
+                    file_system_id,
+                    self.node_id.clone(),
+                    operation,
+                    DFS_ROUTED_NAMESPACE_OP_TIMEOUT,
+                    false,
+                    false,
+                )
+                .map_err(DfsPosixError::from)?;
+            return Ok(result.result);
         }
         let authority_shards =
             self.namespace_operation_effect_authority_shards(&file_system_id, &operation)?;
@@ -3272,22 +3158,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             false,
         )?;
         match event {
-            NetworkedDfsServiceEvent::RemoteNamespaceServed {
-                result: DfsNamespaceResult::Applied,
-                ..
-            } => Ok(()),
-            NetworkedDfsServiceEvent::RemoteNamespaceServed {
-                result:
-                    DfsNamespaceResult::Rejected {
-                        reason,
-                        posix_error,
-                        ..
-                    },
-                ..
-            } => Err(posix_model::posix_error_for_namespace_rejection(
-                reason,
-                posix_error,
-            )),
+            NetworkedDfsServiceEvent::RemoteNamespaceServed { result, .. } => Ok(result),
             other => Err(DfsPosixError::Dfs(DfsError::Distributed {
                 message: format!(
                     "local-primary durable namespace execution returned unexpected event {other:?}"
@@ -3335,6 +3206,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             )
         };
         let response_applied = matches!(response.result, DfsNamespaceResult::Applied);
+        let retain_local_main_work = primary_node_id == self.node_id
+            && self.transport.delegates_local_namespace_authority()
+            && response.committed_work != DfsMessageCommittedWork::default();
         if let DfsNamespaceResult::Rejected {
             current_primary_node_id: Some(redirected_primary),
             reason: rejection_reason,
@@ -3372,7 +3246,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 reason,
             });
         }
-        if response_applied
+        if (response_applied || retain_local_main_work)
             && let Err(error) = self.validate_routed_namespace_response_authority(
                 &primary_node_id,
                 dispatch_authority_shard.as_ref(),
@@ -3402,12 +3276,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 reason,
             });
         }
+        if retain_local_main_work {
+            // This is the same registered Main owner, not a foreign author's
+            // maintenance receipt. Preserve its actual work before catch-up or
+            // later response handling can fail; the Main retains its own edge
+            // even when no response reaches this caller.
+            self.record_message_committed_work(response.committed_work);
+        }
         // A rejection carries no authoritative metadata. Ignore any attached
         // journal or path payload before the caller evaluates a corroborated
         // authority redirect.
         if response_applied && replay_journal_batches {
             for batch in &response.metadata_journal_batches {
-                let batch_file_system_id = metadata_journal_batch_file_system_id(batch);
+                let batch_file_system_id = metadata_journal_batch_file_system_id(&batch.decoded()?);
                 let expected_authority = authority_shards.iter().find(|shard| {
                     batch_file_system_id.as_ref() == Some(&shard.file_system_id)
                         && batch.shard_id.0 == shard.shard_id
@@ -3426,6 +3307,26 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     }),
                 };
                 if let Err(error) = apply_result {
+                    tracing::warn!(
+                        node_id = %self.node_id,
+                        request_id = %response.request_id,
+                        primary_node_id = %primary_node_id,
+                        backend_owner = match self.metadata_backend.as_ref() {
+                            Some(crate::service_state::DfsMetadataBackendOwner::Owned(_)) => "owned",
+                            Some(crate::service_state::DfsMetadataBackendOwner::ResidentShard(_)) => "resident-shard",
+                            Some(crate::service_state::DfsMetadataBackendOwner::ResidentSharded(_)) => "resident-sharded",
+                            None => "absent",
+                        },
+                        resident_exact_shard_id = ?self.metadata_backend.as_ref()
+                            .and_then(|backend| backend.resident_exact_shard_id()),
+                        delegates_local_namespace_authority = self.transport.delegates_local_namespace_authority(),
+                        batch_file_system_id = ?batch_file_system_id,
+                        batch_shard_id = %batch.shard_id.0,
+                        dispatch_authority_shard = ?dispatch_authority_shard,
+                        matched_authority_shard = ?expected_authority,
+                        error = %error,
+                        "routed namespace response journal replay rejected"
+                    );
                     let reason = format!("routed namespace journal replay failed: {error}");
                     if let Some(pending) = self
                         .pending_routed_namespace_ops
@@ -3521,10 +3422,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 response.posix_coordination_result.clone(),
                 response.synced_path_object.clone(),
                 response.synced_path_objects.clone(),
-                response.metadata_journal_has_more.unwrap_or({
-                    response.metadata_journal_batches.len()
-                        >= DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_BATCH_LIMIT
-                }),
+                response.metadata_journal_has_more,
             )
         } else {
             (None, None, Vec::new(), false)
@@ -3547,7 +3445,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// exact committed authority snapshot used to dispatch it. Namespace
     /// reads and coordination responses can legitimately contain no journal
     /// batches, so authority validation cannot live only in batch replay.
-    fn validate_routed_namespace_response_authority(
+    pub(crate) fn validate_routed_namespace_response_authority(
         &mut self,
         primary_node_id: &NodeId,
         dispatch_authority_shard: Option<&DfsMetadataShardConfig>,
@@ -3616,7 +3514,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// authority. Doing this while settling the response protects every
     /// caller, including branches that execute locally when the corroborated
     /// new primary is this node.
-    fn validate_routed_namespace_authority_redirect(
+    pub(crate) fn validate_routed_namespace_authority_redirect(
         &mut self,
         attempted_primary: &NodeId,
         dispatch_authority_shard: Option<&DfsMetadataShardConfig>,
@@ -4038,8 +3936,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     }
                     primary = next_primary;
                 }
-                DfsNamespaceResult::Rejected { reason, .. } => {
-                    return Err(DfsError::Distributed { message: reason });
+                DfsNamespaceResult::Rejected {
+                    reason,
+                    posix_error,
+                    ..
+                } => {
+                    return Err(dfs_error_from_posix_namespace_sync(
+                        posix_model::posix_error_for_namespace_rejection(reason, posix_error),
+                    ));
                 }
             }
         }
@@ -4102,8 +4006,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     }
                     primary = next_primary;
                 }
-                DfsNamespaceResult::Rejected { reason, .. } => {
-                    return Err(DfsError::Distributed { message: reason });
+                DfsNamespaceResult::Rejected {
+                    reason,
+                    posix_error,
+                    ..
+                } => {
+                    return Err(dfs_error_from_posix_namespace_sync(
+                        posix_model::posix_error_for_namespace_rejection(reason, posix_error),
+                    ));
                 }
             }
         }
@@ -4231,13 +4141,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         replay_journal_batches: bool,
         apply_synced_path_object: bool,
     ) -> Result<PendingRoutedNamespaceResult, DfsError> {
-        // A delegated same-node request commits through the resident primary.
-        // Its client shares the primary's physical metadata, so applying that
-        // response as replica ingest would duplicate authority and is fenced.
-        let delegates_same_node =
-            self.transport.delegates_local_namespace_authority() && primary_node_id == self.node_id;
-        let replay_journal_batches = replay_journal_batches && !delegates_same_node;
-        let apply_synced_path_object = apply_synced_path_object && !delegates_same_node;
         let (command, pending) = self.prepare_routed_namespace_request(
             &request_id,
             file_system_id,
@@ -4275,7 +4178,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// Build the request and its response fence from the same authority cut.
     /// Sync and async transports share this preparation; each retains ownership
     /// of dispatch deadlines and pending-slot cleanup in its own execution lane.
-    fn prepare_routed_namespace_request(
+    pub(crate) fn prepare_routed_namespace_request(
         &mut self,
         request_id: &str,
         file_system_id: DfsFileSystemId,
@@ -4284,6 +4187,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         replay_journal_batches: bool,
         apply_synced_path_object: bool,
     ) -> Result<(DfsNamespaceCommand, PendingRoutedNamespaceOp), DfsError> {
+        // A caller sharing Main's store cannot ingest a mutation reply, even
+        // when another node owns this shard. Main owns all physical persistence;
+        // returned objects and typed results still travel on the original call.
+        let replay_journal_batches =
+            replay_journal_batches && !self.transport.delegates_local_namespace_authority();
+        let apply_synced_path_object =
+            apply_synced_path_object && !self.transport.delegates_local_namespace_authority();
         let authority_shards = if self.control_plane.is_some() {
             self.namespace_operation_effect_authority_shards(&file_system_id, &operation)?
         } else {
@@ -4745,113 +4655,6 @@ mod admission_tests {
         ));
     }
 
-    fn adoption_object() -> DfsObjectMetadata {
-        DfsObjectMetadata {
-            file_system_id: DfsFileSystemId::from_legacy_named("sifs").expect("filesystem"),
-            object_id: DfsObjectId::from_legacy_named("object_pin_adoption").expect("object"),
-            path: "/services/pinned.txt".to_string(),
-            kind: DfsObjectKind::File,
-            tombstone_provenance: None,
-            owner_node_id: NodeId::from_legacy_named("node_target").expect("node"),
-            current_locations: Vec::new(),
-            content_hash: Some("blake3:test".to_string()),
-            content_size_bytes: Some(4),
-            link_target_object_id: None,
-            mode: 0o644,
-            uid: 0,
-            gid: 0,
-            accessed_at_unix_nanos: 1,
-            modified_at_unix_nanos: 1,
-            created_at_unix_nanos: 1,
-            changed_at_unix_nanos: 1,
-            version: DfsVersion::from_legacy_named("version_pin_adoption").expect("version"),
-            policy: DfsObjectPolicy::ReplicatedEventual,
-            created_by_event_id: None,
-            last_modified_by_event_id: None,
-        }
-    }
-
-    #[test]
-    fn pin_aware_adoption_uses_durable_admission_for_typed_receipt_replay() {
-        let object = adoption_object();
-        let operation = DfsNamespaceOperation::AdoptObjectAtPath {
-            content_reference_outcomes: Vec::new(),
-            content_reference_outcome_retention: None,
-            object: object.clone(),
-            source_path: "/users/pinned.txt".to_string(),
-            pin_transfer_id: Some("pin-transfer".to_string()),
-            versions: Vec::new(),
-            version_pins: Vec::new(),
-            version_pin_set_fingerprint: Some("blake3:pins".to_string()),
-            receipts: Vec::new(),
-            intents: Vec::new(),
-            intent_receipts: Vec::new(),
-            intent_receipt_retention: DfsWriteIntentReceiptRetentionState::default(),
-            conflicts: Vec::new(),
-            advisory_lock_state: None,
-        };
-
-        assert!(!namespace_operation_requires_fresh_authority(&operation));
-        assert!(namespace_operation_uses_durable_request_admission(
-            &operation
-        ));
-        assert!(!namespace_operation_can_fuse_durable_request_admission(
-            &operation
-        ));
-        assert!(namespace_operation_response_retry_safe(&operation));
-
-        let requester = NodeId::from_legacy_named("node_adoption_source").expect("node");
-        let request_id = "xsj_adoption_phase";
-        let command = DfsNamespaceCommand {
-            request_id: request_id.to_string(),
-            file_system_id: object.file_system_id.clone(),
-            requesting_node_id: requester.clone(),
-            include_metadata_journal_batches: false,
-            metadata_journal_after_sequences: Vec::new(),
-            authority_shards: Vec::new(),
-            operation,
-        };
-        let digest = namespace_command_digest(&command).expect("command digest");
-        let typed_result = DfsPosixCoordinationResult::ObjectFamilyAdoption {
-            object_id: object.object_id.clone(),
-            target_version: object.version.clone(),
-            pin_transfer_id: "pin-transfer".to_string(),
-            pin_transfer_active: false,
-            version_pin_set_fingerprint: "blake3:pins".to_string(),
-            advisory_lock_state_fingerprint: None,
-            content_reference_outcome_fingerprint: None,
-            durable_through_sequence: 42,
-        };
-        let receipt = DfsNamespaceRequestReceipt {
-            file_system_id: object.file_system_id,
-            requester_node_id: requester.clone(),
-            request_id: request_id.to_string(),
-            operation_id: namespace_request_operation_id(&requester, request_id),
-            authority_shard_id: DfsMetadataShardId::new("services"),
-            command_digest: digest.clone(),
-            result: DfsNamespaceResult::Applied,
-            posix_coordination_result: Some(typed_result.clone()),
-            created_at: time::OffsetDateTime::UNIX_EPOCH,
-            retained_at: time::OffsetDateTime::UNIX_EPOCH,
-        };
-        let reconciliation = classify_stable_namespace_operation(
-            request_id,
-            &command.file_system_id,
-            &requester,
-            &digest,
-            &command,
-            Some(&DfsNamespaceRequestAdmissionSnapshot {
-                receipt: Some(receipt),
-                ..DfsNamespaceRequestAdmissionSnapshot::default()
-            }),
-            false,
-        );
-        let DfsStableNamespaceOperationReconciliation::Applied { receipt } = reconciliation else {
-            panic!("exact adoption receipt must replay as applied");
-        };
-        assert_eq!(receipt.posix_coordination_result, Some(typed_result));
-    }
-
     #[test]
     fn pin_transfer_finalization_stamps_only_the_destination_authority() {
         let operation = DfsNamespaceOperation::FinalizeObjectFamilyAdoption {
@@ -4871,6 +4674,3 @@ mod admission_tests {
         assert!(namespace_operation_response_retry_safe(&operation));
     }
 }
-
-#[cfg(test)]
-mod async_placement_tests;

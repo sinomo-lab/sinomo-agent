@@ -1066,7 +1066,7 @@ fn capture_files_composed() {
                 version_count: 1,
                 receipt_count: 2,
                 intent_count: 0,
-                open_conflict_count: 0,
+
                 pending_repair_count: 0,
                 missing_replica_nodes: Vec::new(),
             }),

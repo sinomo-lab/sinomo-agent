@@ -6,6 +6,7 @@ capture-performance.py. Supports retained snapshots and process restarts.
 """
 import argparse
 import collections
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -391,6 +392,139 @@ def operation_view(report, root_stage, expected_roots=None, root_node=None, root
             "stages": stages, "spans": selected_spans, "node_io": logical_node_io(selected_spans)}
 
 
+def write_operation_view(report, probe, operation, root_node, write_percentile=95, expected_roots=None):
+    """Select a measured API percentile sample after proving sequential correspondence.
+
+    The probe has no span IDs. Ordinal matching is permitted only for its complete
+    ordered, single-caller workload, never between independent captures.
+    """
+    if operation not in ("create", "overwrite"):
+        raise ValueError("write operation must be create or overwrite")
+    if type(write_percentile) not in (int, float) or not math.isfinite(write_percentile) or not 0 < write_percentile <= 100:
+        raise ValueError("write percentile must be greater than 0 and at most 100")
+    if not isinstance(probe, dict) or not isinstance(probe.get("diagnostics"), dict) or not isinstance(probe.get("case"), dict):
+        raise ValueError("write probe must contain case and diagnostics objects")
+    diagnostics = probe["diagnostics"]
+    if probe["case"].get("id") != "cluster.dfs.write-latency" or probe.get("status") not in ("passed", "failed"):
+        raise ValueError("expected a completed cluster.dfs.write-latency probe")
+    if (diagnostics.get("correctness_passed") is not True or diagnostics.get("wait_for_commit") is not True
+            or diagnostics.get("benchmark_retries") != 0 or diagnostics.get("node") != root_node):
+        raise ValueError("probe must prove successful committed writes without benchmark retries on the selected caller")
+    if diagnostics.get("retain_fixture") is not True and diagnostics.get("cleanup_passed") is not True:
+        raise ValueError("probe must retain its fixture or prove successful cleanup")
+    iterations, warmup = diagnostics.get("iterations"), diagnostics.get("warmup_iterations")
+    if type(iterations) is not int or iterations <= 0 or type(warmup) is not int or warmup < 0:
+        raise ValueError("probe requires positive iterations and nonnegative warmup iterations")
+    scenario = diagnostics.get("replication_scenario")
+    policies = {"w1-n2": {"consistency": "replicated-eventual", "min_commit_replicas": 1, "desired_replicas": 2},
+                "w2-n3": {"consistency": "replicated-eventual", "min_commit_replicas": 2, "desired_replicas": 3}}
+    policy, base = policies.get(scenario) if isinstance(scenario, str) else None, diagnostics.get("base")
+    if not policy or diagnostics.get("requested_placement_policy") != policy or not isinstance(base, str) or not base:
+        raise ValueError("probe requires exact requested W/N policy and fixture evidence")
+    samples = diagnostics.get("samples", [])
+    count = 2 * (iterations + warmup)
+    if not isinstance(samples, list) or len(samples) != count or expected_roots is not None and expected_roots != count:
+        raise ValueError("write sample/expected-root count does not match the complete probe workload")
+    paths = set()
+    for ordinal, sample in enumerate(samples):
+        if not isinstance(sample, dict):
+            raise ValueError("each write sample must be an object")
+        index, expected_operation = ordinal // 2, ("create", "overwrite")[ordinal % 2]
+        if (type(sample.get("index")) is not int or sample["index"] != index
+                or sample.get("operation") != expected_operation or sample.get("measured") is not (index >= warmup)):
+            raise ValueError("write samples must preserve complete sequential create/overwrite and warmup order")
+        if (sample.get("succeeded") is not True or sample.get("error") is not None
+                or type(sample.get("elapsed_us")) is not int or sample["elapsed_us"] < 0):
+            raise ValueError("write sample lacks a successful valid API duration")
+        if (sample.get("placement_verified") is not True or sample.get("placement_policy") != policy
+                or sample.get("placement_source_path") != base):
+            raise ValueError("write sample lacks matching verified W/N policy evidence")
+        path = sample.get("path")
+        if not isinstance(path, str) or not path.startswith(base.rstrip("/") + "/"):
+            raise ValueError("write sample path is outside the verified fixture")
+        if ordinal % 2:
+            if path != samples[ordinal - 1]["path"]:
+                raise ValueError("create/overwrite pair must use the same path")
+        elif path in paths:
+            raise ValueError("each create/overwrite pair requires a unique path")
+        else:
+            paths.add(path)
+    # Gate failure is valid profiling evidence when every write and correctness
+    # check succeeded and the original failure is exactly its exclusive p95 limit.
+    limit = diagnostics.get("max_p95_us")
+    if type(limit) is not int or limit < 0:
+        raise ValueError("probe requires its original p95 limit")
+    failures = []
+    for name in ("create", "overwrite"):
+        values = [s["elapsed_us"] for s in samples if s["operation"] == name and s["measured"]]
+        p95 = percentile(values, .95)
+        if limit and p95 >= limit:
+            failures.append(f"{name} p95={p95}us is not below {limit}us")
+    if ((probe["status"] == "failed" and (not failures or probe.get("summary") != failures[0]))
+            or (probe["status"] == "passed" and failures)):
+        raise ValueError("probe gate status does not match the complete measured p95 evidence")
+    # The maintained CLI exits 2 for a failed verification gate, even when all
+    # operations succeeded. The exact threshold failure was proved above.
+    expected_exit = 0 if probe["status"] == "passed" else 2
+    if report["manifest"].get("workload_exit_code") != expected_exit:
+        raise ValueError("capture workload exit does not match a completed write probe")
+    caller_coverage = [row for row in report["coverage"] if row["node"] == root_node]
+    if len(caller_coverage) != 1 or any(issue not in ("unfinished span(s)",
+            "span crosses capture boundary or start is missing", "I/O without a complete captured stage")
+            for issue in caller_coverage[0]["issues"]):
+        raise ValueError("caller trace loss, missing identity or restart prevents sequential write matching")
+    if any(row.get("stage") == "dfs.browser.write" for row in caller_coverage[0].get("censored_spans", [])):
+        raise ValueError("censored caller write roots prevent sequential write matching")
+    roots = [row for row in report["spans"] if row["stage"] == "dfs.browser.write" and row["node"] == root_node]
+    incarnations = {tuple(row["process"]) for row in roots}
+    incarnation = next(iter(incarnations), ())
+    if (len(roots) != count or len(incarnations) != 1 or len(incarnation) != 4
+            or incarnation[0] != root_node or incarnation[1] != "daemon" or not incarnation[2] or not incarnation[3]):
+        raise ValueError("expected every write root on a single selected caller daemon incarnation")
+    if any(type(row.get("start_ns")) is not int or row["start_ns"] < 0 for row in roots):
+        raise ValueError("write roots require valid monotonic start times")
+    roots.sort(key=lambda row: row["start_ns"])
+    if len({row["start_ns"] for row in roots}) != count or len({row["span_id"] for row in roots}) != count:
+        raise ValueError("write root identity/start order is ambiguous")
+    spans = {(tuple(row["process"]), row["span_id"]): row for row in report["spans"]}
+    envelopes, rpc_ids = [], set()
+    for ordinal, row in enumerate(roots):
+        duration = row.get("duration_ns")
+        if (type(duration) is not int or duration < 0 or duration > samples[ordinal]["elapsed_us"] * 1000 + 999
+                or row.get("outcome") not in ("ok", "unknown")):
+            raise ValueError("browser duration/outcome contradicts its successful API timer")
+        if ordinal and roots[ordinal - 1]["start_ns"] + roots[ordinal - 1]["duration_ns"] > row["start_ns"]:
+            raise ValueError("overlapping write roots prevent sequential matching")
+        envelope = next((spans[(tuple(row["process"]), sid)] for sid in reversed(row["ancestors"])
+                         if spans.get((tuple(row["process"]), sid), {}).get("stage") == "network.server"), None)
+        if (not envelope or not row.get("rpc_request_id") or envelope.get("rpc_request_id") != row["rpc_request_id"]
+                or row["rpc_request_id"] in rpc_ids or envelope["start_ns"] > row["start_ns"]
+                or envelope["start_ns"] + envelope["duration_ns"] < row["start_ns"] + duration):
+            raise ValueError("write root requires a unique enclosing RPC identity and complete server span")
+        rpc_ids.add(row["rpc_request_id"]); envelopes.append(envelope)
+    measured = [(sample["elapsed_us"], ordinal) for ordinal, sample in enumerate(samples)
+                if sample["operation"] == operation and sample["measured"]]
+    rank = math.ceil(len(measured) * write_percentile / 100)
+    elapsed_us, ordinal = sorted(measured)[rank - 1]
+    original_issues = report["issues"]
+    issues = [issue for issue in original_issues if not (probe["status"] == "failed"
+              and issue == "Workload did not complete successfully")]
+    view = operation_view({**report, "issues": issues, "complete": not issues}, "dfs.browser.write", 1,
+                          root_node, roots[ordinal]["span_id"])
+    view.update(capture_issues=original_issues, capture_complete=report["complete"],
+                write_selection={"operation": operation, "percentile": write_percentile,
+                    "rank": rank, "measured_sample_count": len(measured), "warmup_pairs": warmup,
+                    "matched_root_count": count, "sample_ordinal": ordinal,
+                    "tie_sample_ordinals": [i for value, i in measured if value == elapsed_us],
+                    "tie_break": "API elapsed_us, then original sample ordinal",
+                    "raw_sample": samples[ordinal], "browser_root": roots[ordinal],
+                    "server_rpc": envelopes[ordinal], "replication_scenario": scenario,
+                    "probe_gate_status": probe["status"], "probe_gate_summary": probe.get("summary"),
+                    "probe_p95_limit_us": limit, "timing_scope": diagnostics.get("timing_scope", "unavailable"),
+                    "classification": "selected operation from this diagnostic capture; separate from the original matrix"})
+    return view
+
+
 def number(value):
     return "n/a" if value is None else f"{value:.3f}" if isinstance(value, float) else str(value)
 
@@ -404,6 +538,27 @@ def io_value(io, kind, field):
 
 def markdown(report):
     manifest = report["manifest"]
+    selection_lines = []
+    if report.get("write_selection"):
+        selected = report["write_selection"]
+        sample, browser, server = selected["raw_sample"], selected["browser_root"], selected["server_rpc"]
+        selection_lines = ["Selected write evidence comes from this diagnostic follow-up capture. It is separate from the original matrix and does not backfill its span identities. API timing and daemon span timing have different scopes; no stage percentiles are subtracted or added to attribute this operation.", "",
+            "| Selected write | Value |", "|---|---|",
+            f"| Operation / API percentile | {selected['operation']} / p{number(selected['percentile'])} |",
+            f"| Nearest rank / measured samples | {selected['rank']} / {selected['measured_sample_count']} |",
+            f"| Warmup pairs / matched browser roots | {selected['warmup_pairs']} / {selected['matched_root_count']} |",
+            f"| Sample ordinal / probe index | {selected['sample_ordinal']} / {sample['index']} |",
+            f"| API write timer ms | {sample['elapsed_us'] / 1000:.3f} |",
+            f"| API timing scope | {selected['timing_scope']} |",
+            f"| Browser span ms / ID | {browser['duration_ns'] / 1e6:.3f} / {browser['span_id']} |",
+            f"| Enclosing server span ms / ID / RPC | {server['duration_ns'] / 1e6:.3f} / {server['span_id']} / {server['rpc_request_id']} |",
+            f"| Caller process incarnation | {json.dumps(browser['process'])} |",
+            f"| W/N scenario | {selected['replication_scenario']} |",
+            f"| Probe p95 gate / exclusive limit us | {selected['probe_gate_status']} / {selected['probe_p95_limit_us']} |",
+            f"| Original gate summary | {selected['probe_gate_summary']} |",
+            f"| Equal-duration candidates / tie break | {selected['tie_sample_ordinals']} / {selected['tie_break']} |", "",
+            "All warmup and measured sample pairs were matched in original order to unique, complete, nonoverlapping browser roots on one caller incarnation. Roots carry no operation IDs: this is guarded sequential correspondence, followed by exact RPC/ancestry joins. The raw selected sample is:", "",
+            "```json", json.dumps(sample, indent=2), "```", ""]
     lines = [f"# Performance capture {report['capture_id']}", "",
              "| Run identity | Value |", "|---|---|",
              f"| Source revision | {manifest.get('source_revision', 'unavailable')} |",
@@ -412,6 +567,7 @@ def markdown(report):
              f"| Workload exit | {manifest.get('workload_exit_code', 'unavailable')} |",
              f"| Report coverage | {'complete at instrumented boundaries' if report['complete'] else 'partial'} |",
              f"| Scope | {report.get('root_stage', 'whole capture')} |", "",
+             *selection_lines,
              "| Acceptance lane | Samples | p50 / p95 / p99 / max | Throughput | Target | Result |",
              "|---|---:|---|---|---|---|",
              "| Verification gate results | unavailable | unavailable | unavailable | unchanged configured targets | see the generated verification report |", "",
@@ -479,11 +635,32 @@ def main():
     parser.add_argument("--expected-roots", type=int, help="expected foreground operation count, including warmup")
     parser.add_argument("--root-node", help="node of one selected foreground span")
     parser.add_argument("--root-span-id", type=int, help="process-local ID of one selected foreground span")
+    parser.add_argument("--write-latency-probe", type=Path, help="captured cluster.dfs.write-latency JSON; must match workload.stdout")
+    parser.add_argument("--write-operation", choices=("create", "overwrite"), help="select a measured API percentile operation")
+    parser.add_argument("--write-percentile", type=float, help="nearest-rank API percentile to select (default: 95)")
     parser.add_argument("--output-stem", choices=("performance", "workload", "create", "overwrite"))
     args = parser.parse_args()
+    selecting_write = args.write_latency_probe is not None or args.write_operation is not None or args.write_percentile is not None
+    if selecting_write and (args.write_latency_probe is None or args.write_operation is None
+            or args.root_stage != "dfs.browser.write" or args.root_node is None or args.root_span_id is not None):
+        parser.error("write percentile selection requires --write-latency-probe, --write-operation, --root-stage dfs.browser.write and --root-node; do not supply --root-span-id")
     report = summarize(args.capture)
     stem = "performance"
-    if args.root_stage:
+    if selecting_write:
+        try:
+            probe_bytes = args.write_latency_probe.read_bytes()
+            probe = json.loads(probe_bytes)
+            if probe != json.loads((args.capture / "workload.stdout").read_text()):
+                raise ValueError("write probe does not match this capture's workload.stdout")
+            report = write_operation_view(report, probe, args.write_operation, args.root_node,
+                                          args.write_percentile if args.write_percentile is not None else 95,
+                                          args.expected_roots)
+            report["write_selection"].update(probe_artifact=str(args.write_latency_probe),
+                                              probe_sha256=hashlib.sha256(probe_bytes).hexdigest())
+        except (ValueError, OSError) as error:
+            parser.error(str(error))
+        stem = args.write_operation
+    elif args.root_stage:
         report = operation_view(report, args.root_stage, args.expected_roots, args.root_node, args.root_span_id)
         stem = "workload"
     elif args.root_node is not None or args.root_span_id is not None:

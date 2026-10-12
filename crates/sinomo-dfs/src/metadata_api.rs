@@ -8,8 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use sinomo_core::node::NodeId;
 
 use crate::advisory_lock::{
-    DfsAdvisoryLockApplyResult, DfsAdvisoryLockCommand, DfsAdvisoryLockStateRecord,
-    DfsAdvisoryLockTransitionContext,
+    DfsAdvisoryLockCommand, DfsAdvisoryLockStateRecord, DfsAdvisoryLockTransitionContext,
 };
 use crate::content_root_catalog::{
     DfsContentRootCatalogIncompleteReason, DfsContentRootCatalogPage,
@@ -35,72 +34,6 @@ use crate::posix_path::posix_path_is_at_or_under_prefix;
 use crate::{
     DfsFileSystem, DfsFileSystemId, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsVersion,
 };
-
-#[cfg(test)]
-std::thread_local! {
-    static NAMESPACE_PREPARE_NORMALIZATION_PASSES: std::cell::Cell<usize> = const {
-        std::cell::Cell::new(0)
-    };
-}
-
-#[cfg(test)]
-pub(crate) fn record_namespace_prepare_normalization_pass() {
-    NAMESPACE_PREPARE_NORMALIZATION_PASSES.with(|passes| {
-        passes.set(passes.get().saturating_add(1));
-    });
-}
-
-#[cfg(test)]
-pub(crate) fn reset_namespace_prepare_normalization_passes() {
-    NAMESPACE_PREPARE_NORMALIZATION_PASSES.with(|passes| passes.set(0));
-}
-
-#[cfg(test)]
-pub(crate) fn namespace_prepare_normalization_passes() -> usize {
-    NAMESPACE_PREPARE_NORMALIZATION_PASSES.with(std::cell::Cell::get)
-}
-
-/// Proof that a mutable namespace prepare is in canonical normalized order.
-///
-/// The wrapped record remains owned by the caller, but safe external code
-/// cannot forge this proof because construction and mutable access are kept at
-/// the DFS normalization boundary. Backend implementations may inspect the
-/// canonical record and either use the default borrowed fallback or consume
-/// the proof in an optimized implementation.
-pub struct DfsNormalizedNamespacePrepare<'a> {
-    prepare: &'a mut DfsNamespacePrepareRecord,
-}
-
-impl<'a> DfsNormalizedNamespacePrepare<'a> {
-    pub(crate) fn new(prepare: &'a mut DfsNamespacePrepareRecord) -> Self {
-        #[cfg(test)]
-        record_namespace_prepare_normalization_pass();
-        crate::metadata_records::normalize_namespace_prepare_in_place(prepare);
-        Self { prepare }
-    }
-
-    /// Borrow the canonical record without weakening its normalization proof.
-    pub fn as_record(&self) -> &DfsNamespacePrepareRecord {
-        self.prepare
-    }
-
-    pub(crate) fn set_operation_digest(&mut self, operation_digest: String) {
-        self.prepare.operation_digest = operation_digest;
-    }
-}
-
-/// Result of fencing a replica-location update against the current object.
-///
-/// `None` from [`DfsMetadataBackend::add_object_location_if_current`] means
-/// the object no longer names the expected visible version. A returned value
-/// always carries the current object and explicitly says whether the backend
-/// appended a journal entry, so callers can retain the matching replication
-/// wake across partial receipt/location retries.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DfsObjectLocationUpdate {
-    pub object: DfsObjectMetadata,
-    pub journal_appended: bool,
-}
 
 /// Durable shard-local freeze installed while a same-primary membership
 /// handoff carries the retiring authority's exact state.
@@ -129,10 +62,8 @@ pub struct DfsMetadataShardWriteFreeze {
     ///
     /// New markers start at the handoff prefix. Checkpoint publication
     /// advances this proof before pruning the journal history needed to
-    /// reconstruct it. `None` is accepted only for markers written by older
-    /// binaries and is upgraded during their first exact-proof rebind.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rebind_prefix_proof: Option<crate::DfsMetadataPrefixProof>,
+    /// reconstruct it. Current markers always carry the exact proof.
+    pub rebind_prefix_proof: crate::DfsMetadataPrefixProof,
 }
 
 /// Capability for one replica ingest from an already validated active source.
@@ -154,173 +85,21 @@ pub struct DfsMetadataReplicaIngestPermit {
     pending_primary_handoff_id: Option<String>,
 }
 
-/// Compact evidence derived from one validated namespace-prepare payload.
-///
-/// The durable-journal ACK path constructs this from the identity retained in
-/// the exact, structurally validated journal payload. It therefore does not
-/// need to expand a packed prepare into the rebuildable materialized tables
-/// before acknowledging it. The ordinary apply path can construct the same
-/// evidence from its canonical allocation, and retries without fresh evidence
-/// retain the durable verification fallback.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct DfsValidatedNamespaceAuthorityProof {
-    file_system_id: DfsFileSystemId,
-    shard_id: DfsMetadataShardId,
-    owner_epoch: u64,
-    operation_id: String,
-    status: DfsNamespacePrepareStatus,
-    prepare_sequence: u64,
-    payload_digest: String,
-}
-
-impl DfsValidatedNamespaceAuthorityProof {
-    pub(crate) fn from_validated_payload(
-        payload: &DfsNamespacePreparePayloadRef<'_>,
-        prepare_sequence: u64,
-    ) -> Option<Self> {
-        if prepare_sequence == 0 {
-            return None;
-        }
-        let (file_system_id, operation_id, status, shard_id, owner_epoch, payload_digest) =
-            match payload {
-                DfsNamespacePreparePayloadRef::Canonical {
-                    file_system_id,
-                    operation_id,
-                    status,
-                    prepare,
-                } => {
-                    if prepare.file_system_id != **file_system_id
-                        || prepare.operation_id != *operation_id
-                        || prepare.status != **status
-                    {
-                        return None;
-                    }
-                    (
-                        *file_system_id,
-                        *operation_id,
-                        *status,
-                        &prepare.shard_id,
-                        prepare.owner_epoch,
-                        prepare.operation_digest.as_str(),
-                    )
-                }
-                DfsNamespacePreparePayloadRef::PackedV1 {
-                    file_system_id,
-                    operation_id,
-                    status,
-                    prepare,
-                } => (
-                    *file_system_id,
-                    *operation_id,
-                    *status,
-                    prepare.shard_id(),
-                    prepare.owner_epoch(),
-                    prepare.operation_digest(),
-                ),
-                DfsNamespacePreparePayloadRef::PackedV2 {
-                    file_system_id,
-                    operation_id,
-                    status,
-                    prepare,
-                } => (
-                    *file_system_id,
-                    *operation_id,
-                    *status,
-                    prepare.shard_id(),
-                    prepare.owner_epoch(),
-                    prepare.operation_digest(),
-                ),
-            };
-        Some(Self {
-            file_system_id: file_system_id.clone(),
-            shard_id: shard_id.clone(),
-            owner_epoch,
-            operation_id: operation_id.to_string(),
-            status: status.clone(),
-            prepare_sequence,
-            payload_digest: payload_digest.to_string(),
-        })
-    }
-
-    pub(crate) fn from_canonical_prepare(
-        prepare: &DfsNamespacePrepareRecord,
-        prepare_sequence: u64,
-        canonical_payload_digest: String,
-    ) -> Option<Self> {
-        (prepare_sequence > 0 && prepare.operation_digest == canonical_payload_digest).then(|| {
-            Self {
-                file_system_id: prepare.file_system_id.clone(),
-                shard_id: prepare.shard_id.clone(),
-                owner_epoch: prepare.owner_epoch,
-                operation_id: prepare.operation_id.clone(),
-                status: prepare.status.clone(),
-                prepare_sequence,
-                payload_digest: canonical_payload_digest,
-            }
-        })
-    }
-
-    pub(crate) fn confirms(
-        &self,
-        shard: &DfsMetadataShardConfig,
-        operation: &crate::DfsMetadataAuthorityOperation,
-    ) -> bool {
-        let crate::DfsMetadataAuthorityOperation::NamespaceMutation {
-            operation_id,
-            file_system_id,
-            prepare_sequence,
-            payload_digest,
-        } = operation
-        else {
-            return false;
-        };
-        self.status == DfsNamespacePrepareStatus::Prepared
-            && self.file_system_id == shard.file_system_id
-            && self.shard_id.0 == shard.shard_id
-            && self.owner_epoch == shard.epoch
-            && &self.operation_id == operation_id
-            && &self.file_system_id == file_system_id
-            && self.prepare_sequence == *prepare_sequence
-            && &self.payload_digest == payload_digest
-    }
-}
-
 /// Result of one replica journal apply plus any proof computed from entries
 /// that became durable during that exact call.
 #[doc(hidden)]
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DfsMetadataReplicaApplyReport {
     applied_entries: usize,
-    namespace_authority_proof: Option<DfsValidatedNamespaceAuthorityProof>,
+    namespace_authority_proof: Option<DfsPreparedOperationDigest>,
     durable_prefix_proof: Option<DfsMetadataPrefixProof>,
     materialization_pending: bool,
 }
 
 impl DfsMetadataReplicaApplyReport {
-    pub(crate) fn without_authority_proofs(applied_entries: usize) -> Self {
-        Self {
-            applied_entries,
-            namespace_authority_proof: None,
-            durable_prefix_proof: None,
-            materialization_pending: false,
-        }
-    }
-
-    pub(crate) fn with_namespace_authority_proof(
-        applied_entries: usize,
-        namespace_authority_proof: Option<DfsValidatedNamespaceAuthorityProof>,
-    ) -> Self {
-        Self {
-            applied_entries,
-            namespace_authority_proof,
-            durable_prefix_proof: None,
-            materialization_pending: false,
-        }
-    }
-
     pub(crate) fn with_durable_ingest(
         applied_entries: usize,
-        namespace_authority_proof: Option<DfsValidatedNamespaceAuthorityProof>,
+        namespace_authority_proof: Option<DfsPreparedOperationDigest>,
         durable_prefix_proof: DfsMetadataPrefixProof,
         materialization_pending: bool,
     ) -> Self {
@@ -348,11 +127,18 @@ impl DfsMetadataReplicaApplyReport {
         &self,
         shard: &DfsMetadataShardConfig,
         operation: &crate::DfsMetadataAuthorityOperation,
-    ) -> Option<&DfsValidatedNamespaceAuthorityProof> {
+    ) -> Option<&DfsPreparedOperationDigest> {
         self.namespace_authority_proof
             .as_ref()
-            .filter(|proof| proof.confirms(shard, operation))
+            .filter(|proof| matches!(operation, crate::DfsMetadataAuthorityOperation::PreparedOperation {operation_id,file_system_id,shard_id,owner_epoch,prepare_sequence,payload_digest} if operation_id==&proof.operation_id && file_system_id==&proof.file_system_id && shard_id==&proof.shard_id && *owner_epoch==proof.owner_epoch && *prepare_sequence==proof.prepare_sequence && payload_digest==&proof.payload_digest && proof.file_system_id==shard.file_system_id && proof.shard_id.0==shard.shard_id && proof.owner_epoch==shard.epoch))
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DfsMetadataHistoryEffectsPlan {
+    pub report: DfsMetadataHistoryGcReport,
+    pub effects_by_scope:
+        BTreeMap<(DfsFileSystemId, DfsMetadataShardId), Vec<crate::DfsPreparedMetadataEffect>>,
 }
 
 /// One bounded durable view used to admit an idempotent namespace request.
@@ -366,7 +152,7 @@ impl DfsMetadataReplicaApplyReport {
 pub struct DfsNamespaceRequestAdmissionSnapshot {
     pub request: Option<DfsNamespaceRequestRecord>,
     pub receipt: Option<DfsNamespaceRequestReceipt>,
-    pub prepared: Option<DfsNamespacePrepareRecord>,
+    pub prepared: Option<DfsPreparedOperationRecord>,
     pub history_expired: bool,
 }
 
@@ -541,7 +327,119 @@ pub(crate) fn namespace_prepare_expectations_from_lookups(
 /// transactions, and metadata journals. The trait intentionally exposes paged
 /// scans as primitives so service and operator code can walk large namespaces
 /// without materializing every record class at once.
+#[derive(Clone, Debug)]
+pub struct DfsCrossShardPinTransferPlan {
+    pub effects: Vec<crate::DfsPreparedMetadataEffect>,
+    pub active: bool,
+}
+#[derive(Clone, Debug)]
+pub struct DfsForeignShardSourceEvictionPlan {
+    pub physical_source_shard: DfsMetadataShardId,
+    pub expected_objects: Vec<DfsNamespaceObjectVersionExpectation>,
+    pub expected_paths: Vec<DfsNamespacePathOccupantExpectation>,
+    pub expected_journal_sequence: u64,
+    pub effects: Vec<crate::DfsPreparedMetadataEffect>,
+}
+
 pub trait DfsMetadataBackend: std::fmt::Debug + Send {
+    fn plan_cross_shard_pin_transfer(
+        &self,
+        transfer_id: &str,
+        moved_object: &DfsObjectMetadata,
+        source_path: &str,
+        incoming_versions: &[DfsObjectVersionRecord],
+        incoming_pins: &[DfsMetadataVersionPinRecord],
+    ) -> Result<DfsCrossShardPinTransferPlan>;
+    fn plan_foreign_shard_source_eviction(
+        &self,
+        moved_object: &DfsObjectMetadata,
+        old_path: &str,
+        captured_source_family: &DfsCrossShardSourceFamily,
+        transfer_id: Option<&str>,
+        target_shard_id: &DfsMetadataShardId,
+    ) -> Result<DfsForeignShardSourceEvictionPlan>;
+    fn prepared_operation_record(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<crate::DfsPreparedOperationRecord>>;
+    fn list_prepared_operations(&self) -> Result<Vec<crate::DfsPreparedOperationRecord>>;
+    fn prepared_operation_for_request(
+        &self,
+        requester_node_id: &sinomo_core::node::NodeId,
+        request_id: &str,
+    ) -> Result<Option<crate::DfsPreparedOperationRecord>>;
+
+    /// Shared observation-only view of already-held native storage. This performs
+    /// no IO, opens no backend and conveys no writer or publication authority.
+    #[cfg(any(test, feature = "test-support"))]
+    fn native_held_snapshot_for_scope(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        shard_id: &DfsMetadataShardId,
+    ) -> Option<crate::NativeHeldMetadataSnapshotV1>;
+
+    /// Persist one complete immutable v7 operation. Publication effects remain
+    /// hidden until its exact digest is committed with an owned writer guard.
+    fn prepare_operation(
+        &mut self,
+        _payload: crate::metadata_records::DfsPreparedOperationPayload,
+        _source: Option<&crate::source_adoption::DfsSourceAdoptionWitness>,
+    ) -> Result<crate::metadata_records::DfsPreparedOperationDigest>;
+
+    fn prepared_operation_digest(
+        &self,
+        _operation_id: &str,
+    ) -> Result<Option<crate::metadata_records::DfsPreparedOperationDigest>>;
+
+    fn prepared_operation_payload(
+        &self,
+        _operation_id: &str,
+    ) -> Result<Option<std::sync::Arc<crate::metadata_records::DfsPreparedOperationPayload>>>;
+
+    /// Read-only exact terminal evidence. No acknowledgement round or new
+    /// publication marker is required for an already materialized commit.
+    fn committed_prepared_operation(
+        &self,
+        _digest: &crate::metadata_records::DfsPreparedOperationDigest,
+    ) -> Result<Option<DfsMetadataJournalEntry>>;
+
+    /// Physical owner identity is an index key, never authority.
+    fn publication_owner_scope(
+        &self,
+        _file_system_id: &DfsFileSystemId,
+        _shard_id: &DfsMetadataShardId,
+    ) -> Result<crate::publication_guard::DfsPublicationOwnerScope>;
+
+    /// Acquire and retain the actual writer lock before final authority reads.
+    fn publication_writer_session(
+        &mut self,
+        _file_system_id: &DfsFileSystemId,
+        _shard_id: &DfsMetadataShardId,
+        _digest: &crate::metadata_records::DfsPreparedOperationDigest,
+        _source: Option<&crate::DfsSourceAdoptionWitness>,
+    ) -> Result<crate::publication_guard::DfsPublicationWriterSession>;
+
+    fn publication_writer_file_system(
+        &self,
+        _file_system_id: &DfsFileSystemId,
+        _session: &crate::publication_guard::DfsPublicationWriterSession,
+    ) -> Result<Option<DfsFileSystem>>;
+
+    fn publication_writer_object(
+        &self,
+        _file_system_id: &DfsFileSystemId,
+        _object_id: &DfsObjectId,
+        _session: &crate::publication_guard::DfsPublicationWriterSession,
+    ) -> Result<Option<DfsObjectMetadata>>;
+
+    /// Consume actual authorization and publish only the previously sealed body.
+    fn commit_prepared_operation(
+        &mut self,
+        _digest: &crate::metadata_records::DfsPreparedOperationDigest,
+        _guard: crate::publication_guard::DfsPublicationGuard,
+        enrollment: Option<&mut dyn FnMut(&[crate::DfsRepairAttemptRecord]) -> Result<()>>,
+    ) -> Result<crate::metadata_records::DfsPreparedOperationCommitResult>;
+
     /// Pin one coherent in-memory metadata generation for a bounded bulk read.
     ///
     /// Full-catalog hydration calls many paging and point-read methods through
@@ -582,88 +480,16 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         self.end_consistent_read_snapshot();
     }
 
-    /// Create or replace a filesystem record and journal the mutation.
-    fn put_file_system(&mut self, file_system: &DfsFileSystem) -> Result<DfsMetadataJournalEntry>;
-
     /// Fetch a filesystem record by id.
     fn get_file_system(&self, file_system_id: &DfsFileSystemId) -> Result<Option<DfsFileSystem>>;
-
-    /// Ensure a filesystem record exists, returning a journal entry only when
-    /// storage changed.
-    fn ensure_file_system(
-        &mut self,
-        file_system: &DfsFileSystem,
-    ) -> Result<Option<DfsMetadataJournalEntry>> {
-        if self
-            .get_file_system(&file_system.file_system_id)?
-            .as_ref()
-            .is_some_and(|current| {
-                crate::placement::dfs_file_system_semantically_eq(current, file_system)
-            })
-        {
-            return Ok(None);
-        }
-        self.put_file_system(file_system).map(Some)
-    }
-
-    /// Ensure a filesystem record exists on one exact metadata shard.
-    ///
-    /// Single-shard backends delegate to their ordinary ensure. Sharded
-    /// routers override this so a primary never authors the same filesystem
-    /// record on sibling shards for which it is only a replica.
-    fn ensure_file_system_on_shard(
-        &mut self,
-        _shard_id: &DfsMetadataShardId,
-        file_system: &DfsFileSystem,
-    ) -> Result<Option<DfsMetadataJournalEntry>> {
-        self.ensure_file_system(file_system)
-    }
+    fn get_file_system_on_shard(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        file_system_id: &DfsFileSystemId,
+    ) -> Result<Option<DfsFileSystem>>;
 
     /// List all filesystem records known to this backend.
     fn list_file_systems(&self) -> Result<Vec<DfsFileSystem>>;
-
-    /// Create or replace an object metadata record and journal the mutation.
-    fn put_object(&mut self, object: &DfsObjectMetadata) -> Result<DfsMetadataJournalEntry>;
-
-    /// Add a replica location only while the durable object still names the
-    /// expected visible version and content. Implementations must fence the
-    /// check and update as one metadata write so a concurrent rename or unlink
-    /// cannot be followed by a stale location update that resurrects the old
-    /// path. Returns the current object plus whether a journal entry was
-    /// appended, or `None` when the durable object has moved, advanced,
-    /// disappeared, or become a tombstone.
-    fn add_object_location_if_current(
-        &mut self,
-        object_id: &DfsObjectId,
-        expected_version: &DfsVersion,
-        expected_content_hash: &str,
-        replica_node_id: &NodeId,
-    ) -> Result<Option<DfsObjectLocationUpdate>>;
-
-    /// Remove a failed location and its matching version/receipt claims only
-    /// while the durable visible object still has the observed version/hash.
-    /// The comparison and all edits must share one writer admission. A stale
-    /// read response must never publish its old object or version snapshot.
-    fn remove_object_location_if_current(
-        &mut self,
-        object_id: &DfsObjectId,
-        expected_version: &DfsVersion,
-        expected_content_hash: Option<&str>,
-        replica_node_id: &NodeId,
-    ) -> Result<Option<DfsObjectLocationUpdate>>;
-
-    /// Store several object records using the backend's default single-record
-    /// path unless the implementation overrides it with an atomic batch.
-    fn put_objects(
-        &mut self,
-        objects: &[DfsObjectMetadata],
-    ) -> Result<Vec<DfsMetadataJournalEntry>> {
-        let mut entries = Vec::with_capacity(objects.len());
-        for object in objects {
-            entries.push(self.put_object(object)?);
-        }
-        Ok(entries)
-    }
 
     /// Fetch an object record by object id.
     fn get_object(&self, object_id: &DfsObjectId) -> Result<Option<DfsObjectMetadata>>;
@@ -679,9 +505,7 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         &self,
         _shard_id: &DfsMetadataShardId,
         object_id: &DfsObjectId,
-    ) -> Result<Option<DfsObjectMetadata>> {
-        self.get_object(object_id)
-    }
+    ) -> Result<Option<DfsObjectMetadata>>;
 
     /// Fetch the durable whole-file advisory-lock aggregate for an object.
     fn get_advisory_lock_state(
@@ -689,28 +513,6 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         file_system_id: &DfsFileSystemId,
         object_id: &DfsObjectId,
     ) -> Result<Option<DfsAdvisoryLockStateRecord>>;
-
-    /// Apply one advisory-lock command as a single journaled state transition.
-    ///
-    /// Synchronous distributed callers must replicate the result's shard
-    /// through `durable_through_sequence` before acknowledging success.
-    fn apply_advisory_lock_command(
-        &mut self,
-        file_system_id: &DfsFileSystemId,
-        object_id: &DfsObjectId,
-        context: DfsAdvisoryLockTransitionContext,
-        command: &DfsAdvisoryLockCommand,
-    ) -> Result<DfsAdvisoryLockApplyResult>;
-
-    /// Install an exact aggregate as part of a serialized object-shard move.
-    ///
-    /// This is not a lock-operation API. The destination must install the
-    /// object first, reject a conflicting aggregate, and epoch-fence/warm the
-    /// copied state before issuing any new grant.
-    fn install_advisory_lock_state_for_migration(
-        &mut self,
-        state: &DfsAdvisoryLockStateRecord,
-    ) -> Result<Option<DfsMetadataJournalEntry>>;
 
     /// Fetch the visible object at a normalized filesystem path.
     fn get_object_by_path(
@@ -729,18 +531,14 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         _shard_id: &DfsMetadataShardId,
         file_system_id: &DfsFileSystemId,
         path: &str,
-    ) -> Result<Option<DfsObjectMetadata>> {
-        self.get_object_by_path(file_system_id, path)
-    }
+    ) -> Result<Option<DfsObjectMetadata>>;
 
     /// Capture every object-version and path-occupant precondition for one
     /// namespace prepare on an exact shard.
     ///
-    /// The compatibility implementation uses the existing point-read API.
-    /// Backends that expose immutable table snapshots should override this so
-    /// discovery of current object paths, path occupants, and occupant versions
-    /// all observe one table generation. Prepare and commit still revalidate
-    /// the returned values while holding the metadata write lock.
+    /// Object paths, path occupants and occupant versions must observe one
+    /// immutable table generation. Prepare and commit revalidate these exact
+    /// predicates under the publication writer lock.
     fn namespace_prepare_expectations(
         &self,
         shard_id: &DfsMetadataShardId,
@@ -749,13 +547,7 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         Vec<DfsNamespaceObjectVersionExpectation>,
         Vec<DfsNamespacePathOccupantExpectation>,
         BTreeSet<String>,
-    )> {
-        namespace_prepare_expectations_from_lookups(
-            transaction,
-            |object_id| self.get_object_on_shard(shard_id, object_id),
-            |file_system_id, path| self.get_object_by_path_on_shard(shard_id, file_system_id, path),
-        )
-    }
+    )>;
 
     /// Compatibility helper that drains all object pages for a filesystem.
     fn objects_for_file_system(
@@ -1083,40 +875,6 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         Ok(found)
     }
 
-    /// Create or replace an object-version record and journal the mutation.
-    fn put_version(&mut self, version: &DfsObjectVersionRecord) -> Result<DfsMetadataJournalEntry>;
-
-    /// Durably retain one immutable metadata version for an independent
-    /// checkpoint or recovery consumer.
-    ///
-    /// This is intentionally unrelated to namespace path pins or content
-    /// placement pins. Implementations must journal the pin before reporting
-    /// success.
-    fn put_version_pin(
-        &mut self,
-        pin: &DfsMetadataVersionPinRecord,
-    ) -> Result<Option<DfsMetadataJournalEntry>> {
-        let _ = pin;
-        Err(MetadataBackendError::Serde(
-            "metadata backend does not support durable version pins".to_string(),
-        ))
-    }
-
-    /// Remove one exact consumer's durable version pin. Other pin identities
-    /// for the same immutable version remain authoritative GC roots.
-    fn remove_version_pin(
-        &mut self,
-        file_system_id: &DfsFileSystemId,
-        object_id: &DfsObjectId,
-        version: &DfsVersion,
-        pin_id: &str,
-    ) -> Result<Option<DfsMetadataJournalEntry>> {
-        let _ = (file_system_id, object_id, version, pin_id);
-        Err(MetadataBackendError::Serde(
-            "metadata backend does not support durable version pins".to_string(),
-        ))
-    }
-
     /// List all durable version pins attached to one object. The object-family
     /// migration path uses this to preserve checkpoint roots with authority.
     ///
@@ -1149,54 +907,14 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         ))
     }
 
-    /// Preinstall the exact immutable-version and durable-pin family on the
-    /// shard selected by `object.path`, before a cross-shard adoption makes
-    /// that object visible there. Implementations must reconcile stale copied
-    /// pins to the exact supplied set.
-    fn install_cross_shard_version_pin_family(
-        &mut self,
-        object: &DfsObjectMetadata,
-        versions: &[DfsObjectVersionRecord],
-        pins: &[DfsMetadataVersionPinRecord],
-    ) -> Result<()> {
-        let _ = (object, versions, pins);
-        Err(MetadataBackendError::Serde(
-            "metadata backend does not support fenced cross-shard version-pin installation"
-                .to_string(),
-        ))
-    }
-
-    /// Reconcile one deterministic cross-primary handoff's source pin set on
-    /// the destination. Implementations must update provenance and every
-    /// provenance-owned pin as one journal mutation.
-    fn reconcile_cross_shard_pin_transfer(
-        &mut self,
-        transfer_id: &str,
-        object: &DfsObjectMetadata,
-        source_path: &str,
-        versions: &[DfsObjectVersionRecord],
-        source_pins: &[DfsMetadataVersionPinRecord],
-    ) -> Result<bool> {
-        let _ = (transfer_id, object, source_path, versions, source_pins);
-        Err(MetadataBackendError::Serde(
-            "metadata backend does not support durable cross-shard pin transfers".to_string(),
-        ))
-    }
-
-    /// Journal the completion of a destination pin transfer after the source
-    /// shard's fenced eviction is durable. Missing provenance is an
-    /// idempotent already-finalized result.
-    fn finalize_cross_shard_pin_transfer(
-        &mut self,
-        transfer_id: &str,
-        object: &DfsObjectMetadata,
-        source_path: &str,
-    ) -> Result<()> {
-        let _ = (transfer_id, object, source_path);
-        Err(MetadataBackendError::Serde(
-            "metadata backend does not support cross-shard pin-transfer finalization".to_string(),
-        ))
-    }
+    /// Inspect current prepared-reference owners through the object index.
+    /// The second result is false when the bounded scan is incomplete.
+    fn prepared_content_reference_protection(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        object_id: &DfsObjectId,
+        max_prepares: usize,
+    ) -> Result<(bool, bool)>;
 
     /// Return active target-side pin-transfer provenance for one object.
     fn cross_shard_pin_transfers_for_object(
@@ -1206,40 +924,6 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         let _ = object_id;
         Err(MetadataBackendError::Serde(
             "metadata backend does not support cross-shard pin-transfer scans".to_string(),
-        ))
-    }
-
-    /// Install one exact active pin-transfer record while physically moving an
-    /// authoritative object family between metadata shards.
-    ///
-    /// Unlike ordinary handoff reconciliation, this operation preserves the
-    /// source record's identity, timestamps, and owned-pin set exactly. The
-    /// transfer and every owned pin must become durable in one journal
-    /// mutation so a crash cannot leave unowned copied pins behind.
-    fn install_cross_shard_pin_transfer_for_authoritative_migration(
-        &mut self,
-        transfer: &DfsCrossShardPinTransferRecord,
-        versions: &[DfsObjectVersionRecord],
-    ) -> Result<()> {
-        let _ = (transfer, versions);
-        Err(MetadataBackendError::Serde(
-            "metadata backend does not support authoritative pin-transfer migration".to_string(),
-        ))
-    }
-
-    /// Remove one target-side transfer record before replacing a physically
-    /// migrated object's durable pin family. Missing provenance is an
-    /// idempotent already-removed result; owned pins remain for the subsequent
-    /// explicit pin-clear stage.
-    fn remove_cross_shard_pin_transfer_for_authoritative_migration(
-        &mut self,
-        file_system_id: &DfsFileSystemId,
-        object_id: &DfsObjectId,
-        transfer_id: &str,
-    ) -> Result<()> {
-        let _ = (file_system_id, object_id, transfer_id);
-        Err(MetadataBackendError::Serde(
-            "metadata backend does not support authoritative pin-transfer removal".to_string(),
         ))
     }
 
@@ -1271,48 +955,29 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         ))
     }
 
-    /// Store an object record and its version. Implementations may override
-    /// this to persist both records in one durable metadata batch.
-    fn put_object_and_version(
+    /// Capture only the actual source family under its physical writer and
+    /// handoff fences. The Actor must separately verify current source authority.
+    fn capture_source_adoption_source(
         &mut self,
-        object: &DfsObjectMetadata,
-        version: &DfsObjectVersionRecord,
-    ) -> Result<Vec<DfsMetadataJournalEntry>> {
-        let object_entry = self.put_object(object)?;
-        let version_entry = self.put_version(version)?;
-        Ok(vec![object_entry, version_entry])
-    }
+        object_id: &DfsObjectId,
+        source_path: &str,
+    ) -> Result<crate::metadata_backend::DfsSourceAdoptionSourceCapture>;
 
-    /// Atomically commit an existing object's next visible content version
-    /// together with its write intent and durable receipts.
-    ///
-    /// Implementations must validate the intent base version and receipt
-    /// threshold while holding the same metadata write lock used to publish the
-    /// visible-version transition. New-object publication remains a namespace
-    /// transaction and must not use this method.
-    fn put_object_version_intent_and_receipts(
+    /// Capture the actual original Running job under its physical writer and
+    /// handoff fences. Remote job rows or source families cannot create custody.
+    fn capture_source_adoption_job(
         &mut self,
-        object: &DfsObjectMetadata,
-        version: &DfsObjectVersionRecord,
-        intent: &DfsWriteIntentRecord,
-        receipts: &[DfsReplicaReceiptRecord],
-    ) -> Result<Vec<DfsMetadataJournalEntry>>;
+        job_id: &str,
+    ) -> Result<crate::metadata_backend::DfsSourceAdoptionJobCapture>;
 
-    /// Atomically publish a new object and its parent-directory touch together
-    /// with the write intent and durable receipts that authorize the first
-    /// visible version.
-    ///
-    /// The namespace transaction must contain the child and its first visible
-    /// version. Implementations must preserve replay-prefix safety: the child
-    /// remains invisible before the transaction entry, and any visible prefix
-    /// already contains the commit-ready intent and receipt threshold.
-    fn commit_create_intent_receipts_and_namespace(
+    /// Capture the physical source family while retaining its existing writer
+    /// and handoff fences. This is owned source custody, not author permission.
+    fn capture_source_adoption(
         &mut self,
-        pending_intent: &DfsWriteIntentRecord,
-        receipts: &[DfsReplicaReceiptRecord],
-        transaction: &DfsNamespaceTransaction,
-        committed_intent: &DfsWriteIntentRecord,
-    ) -> Result<Vec<DfsMetadataJournalEntry>>;
+        object_id: &DfsObjectId,
+        source_path: &str,
+        job_id: &str,
+    ) -> Result<crate::metadata_backend::DfsSourceAdoptionCapture>;
 
     /// Fetch one object-version record by object id and version id.
     fn get_version(
@@ -1320,20 +985,6 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         object_id: &DfsObjectId,
         version: &DfsVersion,
     ) -> Result<Option<DfsObjectVersionRecord>>;
-
-    /// Explicitly retain content and its independent consumer pin atomically.
-    /// An already installed identical capture is idempotent after later writes.
-    fn capture_file_version(
-        &mut self,
-        record: &DfsObjectVersionRecord,
-        pin: &DfsMetadataVersionPinRecord,
-        expected_current_version: Option<&DfsVersion>,
-    ) -> Result<Option<DfsMetadataJournalEntry>> {
-        let _ = (record, pin, expected_current_version);
-        Err(MetadataBackendError::Serde(
-            "metadata backend does not support explicit file captures".into(),
-        ))
-    }
 
     /// Fetch object/version pairs in caller-provided order.
     fn get_object_version_pairs(
@@ -1468,11 +1119,9 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
                 .filter(|pin| pin.version == version.version)
                 .cloned()
                 .collect::<Vec<_>>();
-            let has_reference = references.iter().any(|pin| {
-                namespace.is_none_or(|owner| {
-                    pin.namespace.as_deref().unwrap_or("module.dfs.history") == owner
-                })
-            });
+            let has_reference = references
+                .iter()
+                .any(|pin| namespace.is_none_or(|owner| pin.namespace == owner));
             if !crate::file_history::retained_namespace_is_live(
                 &version,
                 namespace,
@@ -1503,8 +1152,8 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
 
     fn query_file_history_on_shard(
         &self,
-        query: &crate::DfsFileHistoryShardQuery,
-    ) -> Result<crate::DfsFileHistoryShardResult> {
+        query: &crate::DfsMetadataShardQuery,
+    ) -> Result<crate::DfsMetadataQueryResult> {
         let _ = query;
         Err(MetadataBackendError::Serde(
             "backend does not support shard-scoped file history".into(),
@@ -1527,29 +1176,6 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         after: Option<&DfsObjectVersionPageCursor>,
         max_entries: usize,
     ) -> Result<DfsObjectVersionPage>;
-
-    /// Create or replace a replica receipt and journal the mutation.
-    fn put_receipt(&mut self, receipt: &DfsReplicaReceiptRecord)
-    -> Result<DfsMetadataJournalEntry>;
-
-    /// Remove a replica receipt and journal the mutation when one existed.
-    fn remove_receipt(
-        &mut self,
-        object_id: &DfsObjectId,
-        version: &DfsVersion,
-        replica_node_id: &NodeId,
-    ) -> Result<Option<DfsMetadataJournalEntry>>;
-
-    /// Store a receipt with optional object context. Sharded backends use the
-    /// object to avoid an extra lookup when routing the receipt.
-    fn put_receipt_for_object(
-        &mut self,
-        object: Option<&DfsObjectMetadata>,
-        receipt: &DfsReplicaReceiptRecord,
-    ) -> Result<DfsMetadataJournalEntry> {
-        let _ = object;
-        self.put_receipt(receipt)
-    }
 
     /// Compatibility helper that drains all receipts for one object version.
     fn receipts_for_version(
@@ -1577,64 +1203,16 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         max_entries: usize,
     ) -> Result<DfsReplicaReceiptPage>;
 
-    /// Create or replace a write-intent record and journal the mutation.
-    fn put_intent(&mut self, intent: &DfsWriteIntentRecord) -> Result<DfsMetadataJournalEntry>;
-
-    /// Store a write intent with optional object context for sharded routing.
-    fn put_intent_for_object(
-        &mut self,
-        object: Option<&DfsObjectMetadata>,
-        intent: &DfsWriteIntentRecord,
-    ) -> Result<DfsMetadataJournalEntry> {
-        let _ = object;
-        self.put_intent(intent)
-    }
-
-    /// Install one full intent from a source shard that is still authoritative
-    /// for the object's metadata family.
-    ///
-    /// Unlike an ordinary retry, this may cross a destination retention floor:
-    /// the source's durable record is the exact history being transferred, not
-    /// an unproven request being admitted as fresh.
-    fn put_migrated_intent_for_object(
-        &mut self,
-        object: Option<&DfsObjectMetadata>,
-        intent: &DfsWriteIntentRecord,
-    ) -> Result<DfsMetadataJournalEntry>;
-
-    /// Install one exact compact intent receipt while moving an authoritative
-    /// object metadata family. Implementations must preserve the receipt shape
-    /// instead of expanding it through `DfsWriteIntentRecord`.
-    fn put_intent_receipt_for_object(
-        &mut self,
-        object: Option<&DfsObjectMetadata>,
-        receipt: &DfsWriteIntentReceipt,
-    ) -> Result<DfsMetadataJournalEntry>;
-
-    /// Finish replaced current-content repair obligations under a placement
-    /// mutation permit. Preserve exact retry receipts and independent retained
-    /// history repair owners. The replacement intent must already be durable.
-    /// Returns the retired identities; each call processes at most `limit`.
-    fn compact_replaced_placement_intents(
-        &mut self,
-        object: &DfsObjectMetadata,
-        replacement_intent_id: &str,
-        limit: usize,
-    ) -> Result<Vec<String>>;
-
     /// Inspect the active object/version intent index for a placement-owned
     /// repair contract. Compacted retry history is not a live obligation.
     fn has_current_placement_repair_owner(&self, object: &DfsObjectMetadata) -> Result<bool>;
 
-    /// Merge source-shard receipt-eviction floors into the destination through
-    /// the normal authoritative journal/table path.
-    fn merge_intent_receipt_retention_for_object(
-        &mut self,
-        object: Option<&DfsObjectMetadata>,
-        file_system_id: &DfsFileSystemId,
-        object_id: &DfsObjectId,
-        retention: &DfsWriteIntentReceiptRetentionState,
-    ) -> Result<DfsMetadataJournalEntry>;
+    /// Actual unit-test scan counters from already initialized physical children.
+    /// These memory-only observations never open a backend or grant authority.
+    #[cfg(test)]
+    fn test_receipt_scan_counts_by_shard(&self) -> BTreeMap<DfsMetadataShardId, (usize, usize)>;
+    #[cfg(test)]
+    fn reset_test_receipt_scan_counts_by_shard(&self);
 
     /// Return full intents, compact receipts, and conservative eviction floors
     /// from one shard-local metadata snapshot.
@@ -1666,22 +1244,6 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         Ok(self.object_write_intent_history(object_id)?.retention)
     }
 
-    /// Store a write intent and its receipts. Implementations may override
-    /// this to persist them in one durable metadata batch.
-    fn put_intent_and_receipts_for_object(
-        &mut self,
-        object: Option<&DfsObjectMetadata>,
-        intent: &DfsWriteIntentRecord,
-        receipts: &[DfsReplicaReceiptRecord],
-    ) -> Result<Vec<DfsMetadataJournalEntry>> {
-        let mut entries = Vec::with_capacity(1 + receipts.len());
-        entries.push(self.put_intent_for_object(object, intent)?);
-        for receipt in receipts {
-            entries.push(self.put_receipt_for_object(object, receipt)?);
-        }
-        Ok(entries)
-    }
-
     /// Fetch a write intent by object id and intent id.
     fn get_intent(
         &self,
@@ -1699,18 +1261,6 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         shard_id: &DfsMetadataShardId,
         object_id: &DfsObjectId,
         intent_id: &str,
-    ) -> Result<Option<DfsWriteIntentRecord>>;
-
-    /// Reconcile one unchanged non-terminal current-write record against the
-    /// unchanged visible object. The caller establishes shard authority; the
-    /// backend preserves published outcomes and aborts only superseded work.
-    fn reconcile_write_intent_if_unchanged(
-        &mut self,
-        shard_id: &DfsMetadataShardId,
-        expected_intent: &DfsWriteIntentRecord,
-        expected_object: Option<&DfsObjectMetadata>,
-        allow_abort_missing: bool,
-        reject_if_unpublished: bool,
     ) -> Result<Option<DfsWriteIntentRecord>>;
 
     /// Fetch one exact receipt key from one physical local metadata shard.
@@ -1844,11 +1394,7 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     ) -> Result<DfsReplicaReceiptScanPage>;
 
     /// Return one cursor-bounded global page of conflict records.
-    fn conflict_records_page(
-        &self,
-        after: Option<&DfsConflictScanCursor>,
-        max_entries: usize,
-    ) -> Result<DfsConflictScanPage>;
+
     /// Compatibility helper for callers that still need a full materialized
     /// list. Implementations should expose the paged scan APIs as primitives.
     fn all_versions(&self) -> Result<Vec<DfsObjectVersionRecord>> {
@@ -1875,12 +1421,6 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     }
     /// Compatibility helper for callers that still need a full materialized
     /// list. Implementations should expose the paged scan APIs as primitives.
-    fn all_conflicts(&self) -> Result<Vec<DfsConflictRecord>> {
-        collect_metadata_pages(|cursor| {
-            let page = self.conflict_records_page(cursor, OBJECT_LOCAL_METADATA_PAGE_SIZE)?;
-            Ok((page.conflicts, page.next_cursor))
-        })
-    }
 
     /// Add one object's versions, receipts, intents, conflicts, and repair
     /// count into an in-progress summary.
@@ -1951,22 +1491,6 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
                 })?;
             }
             Ok(version_page.next_cursor)
-        })?;
-
-        walk_metadata_pages(|conflict_cursor| {
-            let conflict_page = self.conflicts_for_object_page(
-                &object.object_id,
-                conflict_cursor,
-                OBJECT_LOCAL_METADATA_PAGE_SIZE,
-            )?;
-            summary.open_conflict_count = summary.open_conflict_count.saturating_add(
-                conflict_page
-                    .conflicts
-                    .iter()
-                    .filter(|conflict| conflict.status == DfsConflictStatus::Open)
-                    .count(),
-            );
-            Ok(conflict_page.next_cursor)
         })?;
 
         summary.pending_repair_count =
@@ -2096,264 +1620,8 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         Ok(Some(summary))
     }
 
-    /// Publish a version as the visible version of an object after validating
-    /// expected-version and receipt requirements.
-    fn commit_visible_version(
-        &mut self,
-        expected_version: &DfsVersion,
-        committed_object: &DfsObjectMetadata,
-        visible_version: &DfsObjectVersionRecord,
-        required_replica_node_ids: &[NodeId],
-    ) -> Result<DfsMetadataJournalEntry>;
-
-    /// Publish a visible version while retaining the exact caller-owned
-    /// operation identity in the durable journal. Backends predating this
-    /// additive API remain source-compatible and conservatively omit the
-    /// provenance; production DFS backends override it.
-    fn commit_visible_version_with_operation_id(
-        &mut self,
-        expected_version: &DfsVersion,
-        committed_object: &DfsObjectMetadata,
-        visible_version: &DfsObjectVersionRecord,
-        required_replica_node_ids: &[NodeId],
-        _operation_id: Option<&str>,
-    ) -> Result<DfsMetadataJournalEntry> {
-        self.commit_visible_version(
-            expected_version,
-            committed_object,
-            visible_version,
-            required_replica_node_ids,
-        )
-    }
-
-    /// Atomically apply a namespace transaction and journal the mutation.
-    fn apply_namespace_transaction(
-        &mut self,
-        transaction: &DfsNamespaceTransaction,
-    ) -> Result<DfsMetadataJournalEntry>;
-
-    /// Apply a local transaction against the planner's original observations.
-    /// Implementations compare the complete object/path read set and publish
-    /// under the same writer lock. This does not authorize a cluster mutation;
-    /// clustered callers use the certified prepare/commit path instead.
-    fn apply_namespace_transaction_if_unchanged(
-        &mut self,
-        transaction: &DfsNamespaceTransaction,
-        expected_objects: &[DfsNamespaceObjectVersionExpectation],
-        expected_paths: &[DfsNamespacePathOccupantExpectation],
-        operation_id: Option<&str>,
-    ) -> Result<DfsMetadataJournalEntry>;
-
-    /// Apply a namespace transaction with exact stable-write provenance.
-    fn apply_namespace_transaction_with_operation_id(
-        &mut self,
-        transaction: &DfsNamespaceTransaction,
-        _operation_id: Option<&str>,
-    ) -> Result<DfsMetadataJournalEntry> {
-        self.apply_namespace_transaction(transaction)
-    }
-
-    /// Durably reserve one shard-local namespace transaction without making
-    /// any of its object or path changes visible.
-    ///
-    /// Implementations must validate all object-version and path-occupant
-    /// expectations, reject overlap with another active prepare, and persist
-    /// only the hidden prepare record while holding the metadata write lock.
-    fn prepare_namespace_transaction(
-        &mut self,
-        prepare: &DfsNamespacePrepareRecord,
-    ) -> Result<DfsMetadataJournalEntry>;
-
-    /// Persist the ordinary hidden intent, exact content receipts, and namespace
-    /// prepare in that order. Durable backends may share a segment sync; the
-    /// default retains the established serial boundary for other implementations.
-    /// Existing compatible owners retain their first durable creation time;
-    /// callers build terminal identity from the returned intent or receipt.
-    fn prepare_intent_receipts_and_namespace(
-        &mut self,
-        object: Option<&DfsObjectMetadata>,
-        intent: &DfsWriteIntentRecord,
-        receipts: &[DfsReplicaReceiptRecord],
-        prepare: &DfsNamespacePrepareRecord,
-    ) -> Result<Vec<DfsMetadataJournalEntry>> {
-        let mut entries = self.put_intent_and_receipts_for_object(object, intent, receipts)?;
-        entries.push(self.prepare_namespace_transaction(prepare)?);
-        Ok(entries)
-    }
-
-    /// In-place counterpart used by large foreground prepares.
-    ///
-    /// The caller keeps ownership for later in-memory publication and for
-    /// precise conflict-to-path error mapping. The default normalizes this
-    /// allocation once and delegates to the canonical entry point below.
-    fn prepare_namespace_transaction_in_place(
-        &mut self,
-        prepare: &mut DfsNamespacePrepareRecord,
-    ) -> Result<DfsMetadataJournalEntry> {
-        self.prepare_normalized_namespace_transaction_in_place(DfsNormalizedNamespacePrepare::new(
-            prepare,
-        ))
-    }
-
-    /// Persist a namespace prepare that is already in canonical normalized
-    /// order, without repeating the large-vector normalization passes.
-    ///
-    /// The unforgeable wrapper proves that the DFS boundary normalized the
-    /// record and retained its exclusive mutable borrow. Backends that validate
-    /// routing or persist packed records should override this method so the
-    /// same allocation flows through every layer. The default preserves
-    /// compatibility with borrowed-only backends.
-    fn prepare_normalized_namespace_transaction_in_place(
-        &mut self,
-        prepare: DfsNormalizedNamespacePrepare<'_>,
-    ) -> Result<DfsMetadataJournalEntry> {
-        self.prepare_namespace_transaction(prepare.as_record())
-    }
-
-    /// Move an exact durable namespace prepare to a newer shard-owner epoch.
-    ///
-    /// Implementations must compare `expected_operation_digest` and
-    /// `expected_owner_epoch` while holding the metadata write lock, require
-    /// the current and rebound records to remain `Prepared`, and preserve the
-    /// operation id, filesystem/shard, expectations, and transaction exactly.
-    /// Only the owner epoch and its derived operation digest may change.
-    fn rebind_prepared_namespace_transaction(
-        &mut self,
-        operation_id: &str,
-        expected_operation_digest: &str,
-        expected_owner_epoch: u64,
-        rebound_prepare: &DfsNamespacePrepareRecord,
-    ) -> Result<DfsMetadataJournalEntry>;
-
-    /// Revalidate and atomically publish an existing hidden namespace prepare.
-    ///
-    /// The digest and owner epoch fence operation-id reuse. Implementations
-    /// must apply the prepared namespace transaction and mark the record
-    /// committed in one durable metadata table batch.
-    fn commit_prepared_namespace_transaction(
-        &mut self,
-        operation_id: &str,
-        expected_operation_digest: &str,
-        expected_owner_epoch: u64,
-    ) -> Result<DfsMetadataJournalEntry>;
-
-    /// Commit a prepare whose exact durable shard is already known.
-    ///
-    /// The default preserves compatibility for unsharded backends. Sharded
-    /// routers override this to avoid probing every local shard after the
-    /// authority protocol has already returned the prepare and its shard.
-    fn commit_prepared_namespace_transaction_on_shard(
-        &mut self,
-        shard_id: &DfsMetadataShardId,
-        operation_id: &str,
-        expected_operation_digest: &str,
-        expected_owner_epoch: u64,
-    ) -> Result<DfsMetadataJournalEntry> {
-        let _ = shard_id;
-        self.commit_prepared_namespace_transaction(
-            operation_id,
-            expected_operation_digest,
-            expected_owner_epoch,
-        )
-    }
-
-    /// Publish a shard-bound namespace commit and its exact terminal intent
-    /// in logical order. Durable implementations may share a journal sync.
-    #[allow(clippy::too_many_arguments)]
-    fn commit_prepared_namespace_transaction_and_intent_on_shard(
-        &mut self,
-        shard_id: &DfsMetadataShardId,
-        operation_id: &str,
-        expected_operation_digest: &str,
-        expected_owner_epoch: u64,
-        committed_object: &DfsObjectMetadata,
-        committed_intent: &DfsWriteIntentRecord,
-    ) -> Result<Vec<DfsMetadataJournalEntry>> {
-        let commit = self.commit_prepared_namespace_transaction_on_shard(
-            shard_id,
-            operation_id,
-            expected_operation_digest,
-            expected_owner_epoch,
-        )?;
-        let terminal = self.put_intent_for_object(Some(committed_object), committed_intent)?;
-        Ok(vec![commit, terminal])
-    }
-
-    /// Release an exact hidden namespace prepare without publishing it.
-    ///
-    /// The digest and owner epoch fence operation-id reuse. Implementations
-    /// must reject a committed prepare and durably move a prepared record to
-    /// `Aborted`, releasing its active object/path footprint atomically with
-    /// the journaled terminal marker.
-    fn abort_prepared_namespace_transaction(
-        &mut self,
-        operation_id: &str,
-        expected_operation_digest: &str,
-        expected_owner_epoch: u64,
-    ) -> Result<DfsMetadataJournalEntry>;
-
-    /// Fetch a durable hidden namespace prepare by operation id.
-    fn get_namespace_prepare(
-        &self,
-        operation_id: &str,
-    ) -> Result<Option<DfsNamespacePrepareRecord>> {
-        let _ = operation_id;
-        Ok(None)
-    }
-
-    /// Inspect an exact prepare only in its already-selected authority shard.
-    /// Durable sharded backends must not open unrelated resident generations
-    /// merely to preserve this owner's original encoded retry certificate.
-    fn get_namespace_prepare_on_shard(
-        &self,
-        shard_id: &DfsMetadataShardId,
-        operation_id: &str,
-    ) -> Result<Option<DfsNamespacePrepareRecord>> {
-        Ok(self
-            .get_namespace_prepare(operation_id)?
-            .filter(|prepare| prepare.shard_id == *shard_id))
-    }
-
-    /// Return only hidden namespace prepares which still require recovery.
-    ///
-    /// Replica snapshot export is intentionally not the inspection API here:
-    /// it clones and fingerprints every metadata table even though recovery
-    /// needs only this bounded active subset.
-    fn list_prepared_namespace_prepares(&self) -> Result<Vec<DfsNamespacePrepareRecord>>;
-
-    /// Inspect bounded source-local prepared reference additions. The second
-    /// value proves completeness; unsupported or exhausted evidence cannot
-    /// authorize reclamation. Destination copy selection is not a reference.
-    fn prepared_content_reference_protection(
-        &self,
-        _file_system_id: &DfsFileSystemId,
-        _object_id: &DfsObjectId,
-        _max_prepares: usize,
-    ) -> Result<(bool, bool)> {
-        Ok((false, false))
-    }
-
-    /// Move an exact non-terminal write intent to a newer shard-owner epoch.
-    ///
-    /// The compare and replacement must be atomic. Implementations must reject
-    /// any payload/status change and may change only `owner_epoch` plus the
-    /// bookkeeping `updated_at` timestamp.
-    fn rebind_prepared_write_intent(
-        &mut self,
-        object: Option<&DfsObjectMetadata>,
-        expected_intent: &DfsWriteIntentRecord,
-        rebound_intent: &DfsWriteIntentRecord,
-    ) -> Result<DfsMetadataJournalEntry>;
-
     /// Fetch a recorded namespace transaction by id when the backend supports
     /// transaction recovery.
-    fn get_namespace_transaction(
-        &self,
-        transaction_id: &str,
-    ) -> Result<Option<DfsNamespaceTransaction>> {
-        let _ = transaction_id;
-        Ok(None)
-    }
 
     /// Exact compact outcome identity retained after a transaction body is
     /// checkpointed. Backends without durable receipts fail closed for callers
@@ -2361,12 +1629,7 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     fn get_namespace_transaction_receipt(
         &self,
         transaction_id: &str,
-    ) -> Result<Option<crate::DfsNamespaceTransactionReceipt>> {
-        let _ = transaction_id;
-        Err(MetadataBackendError::Serde(
-            "backend does not support terminal namespace transaction receipts".into(),
-        ))
-    }
+    ) -> Result<Option<crate::DfsNamespaceTransactionReceipt>>;
 
     /// One bounded object-indexed page of durable reference outcome witnesses.
     fn content_reference_outcomes_for_object_page(
@@ -2375,21 +1638,13 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         _object_id: &DfsObjectId,
         _after: Option<&str>,
         _max_entries: usize,
-    ) -> Result<crate::DfsContentReferenceOutcomePage> {
-        Err(MetadataBackendError::Serde(
-            "backend does not support object-indexed reference outcomes".into(),
-        ))
-    }
+    ) -> Result<crate::DfsContentReferenceOutcomePage>;
 
     fn content_reference_outcome_retention(
         &self,
         _file_system_id: &DfsFileSystemId,
         _object_id: &DfsObjectId,
-    ) -> Result<Option<crate::DfsContentReferenceOutcomeRetention>> {
-        Err(MetadataBackendError::Serde(
-            "backend does not support reference outcome expiry".into(),
-        ))
-    }
+    ) -> Result<Option<crate::DfsContentReferenceOutcomeRetention>>;
 
     fn content_reference_outcome_history_expired(
         &self,
@@ -2410,22 +1665,6 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
                 None => retention.opaque_operation_history_evicted,
             },
         )
-    }
-
-    /// Install transferred outcomes under the selected object authority before
-    /// acknowledging adoption. Witnesses do not replay old transaction bodies.
-    fn install_content_reference_outcomes(
-        &mut self,
-        _object: &DfsObjectMetadata,
-        outcomes: &[crate::DfsNamespaceTransactionReceipt],
-        retention: Option<&crate::DfsContentReferenceOutcomeRetention>,
-    ) -> Result<Vec<DfsMetadataJournalEntry>> {
-        if outcomes.is_empty() && retention.is_none() {
-            return Ok(Vec::new());
-        }
-        Err(MetadataBackendError::Serde(
-            "backend does not support reference outcome transfer".into(),
-        ))
     }
 
     /// Project retention-eligible tombstones without taking a write lock.
@@ -2459,13 +1698,10 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
 
     /// Append and materialize a bounded authoritative metadata-history GC
     /// batch. Implementations must journal every observable removal.
-    fn gc_metadata_history(
+    fn plan_metadata_history_gc(
         &mut self,
         options: DfsMetadataHistoryGcOptions,
-    ) -> Result<DfsMetadataHistoryGcReport> {
-        let _ = options;
-        Ok(DfsMetadataHistoryGcReport::default())
-    }
+    ) -> Result<DfsMetadataHistoryEffectsPlan>;
 
     /// Return one bounded, stable page of shard-local content reachability
     /// roots from an exact durable metadata cut.
@@ -2488,54 +1724,6 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     /// Return the exact metadata roots which local version-manifest and blob
     /// reclamation must preserve.
     fn metadata_content_protection(&self) -> Result<DfsMetadataContentProtection>;
-
-    /// Records that an object moved to a metadata shard owned by another
-    /// node: journals a same-object-id tombstone in the shard that held the
-    /// record (so that shard's replicas observe the departure) and repoints
-    /// the local object→shard index at the destination shard. Single-shard
-    /// backends never split authority, so the default is a no-op.
-    fn evict_object_record_for_foreign_shard_move(
-        &mut self,
-        moved_object: &DfsObjectMetadata,
-        source_path: &str,
-    ) -> Result<()> {
-        let _ = (moved_object, source_path);
-        Ok(())
-    }
-
-    /// Complete a cross-primary source eviction only if the source journal
-    /// head and exact durable pin set still match what the destination
-    /// acknowledged. Implementations must remove the copied source pins and
-    /// author the source-eviction marker under one metadata writer fence.
-    fn evict_object_record_for_foreign_shard_move_with_pin_fence(
-        &mut self,
-        moved_object: &DfsObjectMetadata,
-        source_path: &str,
-        expected_source_object: &DfsObjectMetadata,
-        expected_source_journal_sequence: u64,
-        expected_version_pins: &[DfsMetadataVersionPinRecord],
-        pin_transfer_id: Option<&str>,
-    ) -> Result<()> {
-        let _ = (
-            moved_object,
-            source_path,
-            expected_source_object,
-            expected_source_journal_sequence,
-            expected_version_pins,
-            pin_transfer_id,
-        );
-        Err(MetadataBackendError::Serde(
-            "metadata backend does not support fenced cross-shard source eviction".to_string(),
-        ))
-    }
-
-    /// Durably create or advance one routed namespace request admission record
-    /// on the exact authority shard that will execute the operation.
-    fn put_namespace_request_on_shard(
-        &mut self,
-        shard_id: &DfsMetadataShardId,
-        request: &DfsNamespaceRequestRecord,
-    ) -> Result<DfsMetadataJournalEntry>;
 
     /// Fetch a durable namespace request by authenticated requester and id.
     fn get_namespace_request(
@@ -2574,36 +1762,14 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     /// Read all durable idempotency evidence needed to admit one namespace
     /// request from a single coherent metadata generation.
     ///
-    /// Sharded implementations inspect each locally retained shard once and
-    /// read all indexes from that table image. This compatibility
-    /// implementation preserves existing backend behavior; durable local
-    /// backends override it with a single table snapshot per shard.
+    /// Inspect each retained shard once and read all admission indexes from
+    /// the same immutable table generation.
     fn namespace_request_admission_snapshot(
         &mut self,
         shard_id: &DfsMetadataShardId,
         requester_node_id: &NodeId,
         request_id: &str,
-    ) -> Result<DfsNamespaceRequestAdmissionSnapshot> {
-        let receipt = self.get_namespace_request_receipt(requester_node_id, request_id)?;
-        let request = self.get_namespace_request(requester_node_id, request_id)?;
-        let prepared =
-            self.get_prepared_namespace_prepare_for_request(requester_node_id, request_id)?;
-        let history_expired = if receipt.is_none() && request.is_none() && prepared.is_none() {
-            self.namespace_request_history_expired_on_shard(
-                shard_id,
-                requester_node_id,
-                request_id,
-            )?
-        } else {
-            false
-        };
-        Ok(DfsNamespaceRequestAdmissionSnapshot {
-            request,
-            receipt,
-            prepared,
-            history_expired,
-        })
-    }
+    ) -> Result<DfsNamespaceRequestAdmissionSnapshot>;
 
     /// Return durable routed namespace requests for bounded autonomous
     /// inspection. Recovery should use `list_pending_namespace_requests_page`
@@ -2622,46 +1788,16 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         max_entries: usize,
     ) -> Result<DfsPendingNamespaceRequestPage>;
 
-    /// Return the hidden prepared transaction, if any, that owns the terminal
-    /// outcome for an exact still-pending routed namespace request.
-    fn get_prepared_namespace_prepare_for_request(
-        &self,
-        requester_node_id: &NodeId,
-        request_id: &str,
-    ) -> Result<Option<DfsNamespacePrepareRecord>>;
-
-    /// Create or replace a namespace maintenance job.
-    fn put_namespace_job(&mut self, job: &DfsNamespaceJobRecord) -> Result<()> {
-        let _ = job;
-        Ok(())
-    }
-
     /// Fetch a namespace maintenance job by id.
-    fn get_namespace_job(&self, job_id: &str) -> Result<Option<DfsNamespaceJobRecord>> {
-        let _ = job_id;
-        Ok(None)
-    }
-
-    /// Persist compact terminal evidence for a namespace job.
-    ///
-    /// This does not remove the full job. Metadata history GC journals that
-    /// transition separately after every recovery root has been checked.
-    fn put_namespace_job_receipt(&mut self, receipt: &DfsNamespaceJobReceipt) -> Result<()> {
-        let _ = receipt;
-        Ok(())
-    }
+    fn get_namespace_job(&self, job_id: &str) -> Result<Option<DfsNamespaceJobRecord>>;
 
     /// Fetch compact terminal namespace-job evidence by durable job id.
-    fn get_namespace_job_receipt(&self, job_id: &str) -> Result<Option<DfsNamespaceJobReceipt>> {
-        let _ = job_id;
-        Ok(None)
-    }
+    fn get_namespace_job_receipt(&self, job_id: &str) -> Result<Option<DfsNamespaceJobReceipt>>;
 
     /// Find completed job evidence for an exact durable routed request.
     ///
-    /// Receipts written from legacy jobs have no `origin`; implementations
-    /// conservatively retain the historical path/kind/time fallback for those
-    /// rows while requiring an exact identity match for new receipts.
+    /// Match the actual durable origin identity; diagnostic path/time values
+    /// do not replace routed request provenance.
     fn completed_namespace_job_receipt_for_paths_since(
         &self,
         file_system_id: &DfsFileSystemId,
@@ -2670,17 +1806,7 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         kinds: &[DfsNamespaceJobKind],
         created_at: time::OffsetDateTime,
         origin: &DfsNamespaceJobOrigin,
-    ) -> Result<Option<DfsNamespaceJobReceipt>> {
-        let _ = (
-            file_system_id,
-            root_path,
-            target_path,
-            kinds,
-            created_at,
-            origin,
-        );
-        Ok(None)
-    }
+    ) -> Result<Option<DfsNamespaceJobReceipt>>;
 
     /// Collect all namespace jobs through the bounded paging primitive.
     fn list_namespace_jobs(&self) -> Result<Vec<DfsNamespaceJobRecord>> {
@@ -2704,49 +1830,6 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         })
     }
 
-    /// Create or replace a conflict record and journal the mutation.
-    fn put_conflict(&mut self, conflict: &DfsConflictRecord) -> Result<DfsMetadataJournalEntry>;
-
-    /// Fetch one conflict record by object id and conflict id.
-    fn get_conflict(
-        &self,
-        object_id: &DfsObjectId,
-        conflict_id: &str,
-    ) -> Result<Option<DfsConflictRecord>>;
-
-    /// Compatibility helper that drains all conflicts for one object.
-    fn conflicts_for_object(&self, object_id: &DfsObjectId) -> Result<Vec<DfsConflictRecord>> {
-        collect_metadata_pages(|cursor| {
-            let page =
-                self.conflicts_for_object_page(object_id, cursor, OBJECT_LOCAL_METADATA_PAGE_SIZE)?;
-            Ok((page.conflicts, page.next_cursor))
-        })
-    }
-
-    /// Return one cursor-bounded page of conflicts for one object.
-    fn conflicts_for_object_page(
-        &self,
-        object_id: &DfsObjectId,
-        after: Option<&DfsConflictPageCursor>,
-        max_entries: usize,
-    ) -> Result<DfsConflictPage>;
-
-    /// Remove one conflict record and journal the mutation when one existed.
-    fn remove_conflict(
-        &mut self,
-        object_id: &DfsObjectId,
-        conflict_id: &str,
-    ) -> Result<Option<DfsConflictRecord>>;
-
-    /// Update one conflict status and journal the mutation when the record
-    /// changed.
-    fn update_conflict_status(
-        &mut self,
-        object_id: &DfsObjectId,
-        conflict_id: &str,
-        status: DfsConflictStatus,
-    ) -> Result<Option<DfsConflictRecord>>;
-
     /// Read all journal entries after `after_sequence`.
     fn journal_since(&self, after_sequence: u64) -> Result<Vec<DfsMetadataJournalEntry>>;
 
@@ -2766,6 +1849,13 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     /// Snapshot of one shard's tables, for replica snapshot repair. Backends
     /// that cannot scope an export to a single shard return `None` and the
     /// repair is skipped.
+    /// Capture the sole current native record image. This is DATA only and
+    /// cannot mint the replica permit consumed by install.
+    fn export_shard_snapshot_image(
+        &self,
+        _shard_id: &DfsMetadataShardId,
+    ) -> Result<Option<crate::DfsMetadataSnapshotImage>>;
+
     fn export_shard_table_snapshot(
         &self,
         shard_id: &DfsMetadataShardId,
@@ -2780,9 +1870,7 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     fn metadata_prefix_proof(
         &self,
         _shard_id: &DfsMetadataShardId,
-    ) -> Result<Option<DfsMetadataPrefixProof>> {
-        Ok(None)
-    }
+    ) -> Result<Option<DfsMetadataPrefixProof>>;
 
     /// Observe authorized journal ingest and snapshot replacement across local
     /// backend handles. Notifications are hints, not substitutes for reading
@@ -2917,12 +2005,15 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     /// complete active shard configuration before clearing the pending freeze
     /// or running append-producing recovery. The calling backend instance is
     /// rebound to that exact generation; independently opened stale instances
-    /// stay fenced until they separately prove and observe it.
+    /// stay fenced until they separately prove and observe it. The exact
+    /// prefix checked by the caller is revalidated under the refreshed writer
+    /// before epoch binding, marker changes, rebind checkpointing or explicit recovery.
     fn clear_metadata_shard_membership_handoff_freeze(
         &mut self,
         _shard_id: &DfsMetadataShardId,
         _handoff_id: &str,
         _active_shard: &DfsMetadataShardConfig,
+        _checked_prefix: &DfsMetadataPrefixProof,
     ) -> Result<bool> {
         Ok(false)
     }
@@ -2968,19 +2059,12 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     }
 
     /// Return the exact immutable SOBJ frames for a previously selected
-    /// journal batch. Durable local backends override this to borrow the bytes
-    /// already stored in the authoritative journal; the default remains a
-    /// deterministic encode-once compatibility path.
+    /// journal batch. These must be the bytes already stored in its
+    /// authoritative journal; decoded records cannot be re-encoded as evidence.
     fn journal_frames_for_batch(
         &self,
         batch: &DfsMetadataJournalBatch,
-    ) -> Result<Vec<DfsMetadataJournalFrameRecord>> {
-        batch
-            .entries
-            .iter()
-            .map(crate::metadata_journal::encode_metadata_journal_frame_record)
-            .collect()
-    }
+    ) -> Result<Vec<DfsMetadataJournalFrameRecord>>;
 
     /// Share fresh, already verified foreground ACKs with other local sender
     /// handles. This is a non-durable scheduling hint, never publication authority.
@@ -2998,9 +2082,7 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         &self,
         _target_node_id: &NodeId,
         _shard_id: &DfsMetadataShardId,
-    ) -> Result<u64> {
-        Ok(0)
-    }
+    ) -> Result<u64>;
 
     /// Checkpoint the next journal sequence to send to a target for a shard.
     /// This derived hint may be lost on crash; it cannot certify receiver
@@ -3010,58 +2092,32 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         _target_node_id: &NodeId,
         _shard_id: &DfsMetadataShardId,
         _next_after_sequence: u64,
-    ) -> Result<()> {
-        Ok(())
-    }
-
-    /// Checkpoint independently monotonic sender cursors as one bounded group.
-    /// These are scheduling hints, not receiver durability or authority proof.
-    fn put_metadata_replication_cursors(
-        &mut self,
-        shard_id: &DfsMetadataShardId,
-        cursors: &[(NodeId, u64)],
-    ) -> Result<()> {
-        for (node, sequence) in cursors {
-            self.put_metadata_replication_cursor(node, shard_id, *sequence)?;
-        }
-        Ok(())
-    }
+    ) -> Result<()>;
 
     /// Return the replica-local exact-checkpoint floor persisted before a
     /// successful prefix acknowledgement.
     fn metadata_prefix_ack_floor(
         &self,
         _shard_id: &DfsMetadataShardId,
-    ) -> Result<Option<DfsMetadataPrefixAckFloor>> {
-        Ok(None)
-    }
+    ) -> Result<Option<DfsMetadataPrefixAckFloor>>;
 
     /// Persist a monotonic exact-checkpoint floor before acknowledging the
     /// corresponding prefix probe.
-    fn put_metadata_prefix_ack_floor(&mut self, _floor: &DfsMetadataPrefixAckFloor) -> Result<()> {
-        Ok(())
-    }
+    fn put_metadata_prefix_ack_floor(&mut self, _floor: &DfsMetadataPrefixAckFloor) -> Result<()>;
 
     /// Return the replica-local floor persisted before an exact ordinary-write
     /// authority acknowledgement.
     fn metadata_authority_ack_floor(
         &self,
         _shard_id: &DfsMetadataShardId,
-    ) -> Result<Option<DfsMetadataAuthorityAckFloor>> {
-        Ok(None)
-    }
+    ) -> Result<Option<DfsMetadataAuthorityAckFloor>>;
 
     /// Persist a monotonic ordinary-write authority floor before returning the
     /// corresponding request nonce.
     fn put_metadata_authority_ack_floor(
         &mut self,
         floor: &DfsMetadataAuthorityAckFloor,
-    ) -> Result<()> {
-        Err(MetadataBackendError::Serde(format!(
-            "metadata backend cannot durably fence authority acknowledgement for shard {} sequence {}",
-            floor.shard_id.0, floor.journal_sequence
-        )))
-    }
+    ) -> Result<()>;
 
     /// Return the durable replay cursor for journal entries originating from
     /// `source_shard_id`. Local durable backends require this to match their
@@ -3078,13 +2134,6 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
 
     /// Return per-shard metadata journal and replay status.
     fn metadata_shard_statuses(&self) -> Result<Vec<DfsMetadataShardStatus>>;
-
-    /// Bounded progress records only; inspection must not start migration work.
-    fn metadata_storage_migrations(
-        &self,
-    ) -> Result<Vec<sinomo_core::storage::migration::MigrationJob>> {
-        Ok(Vec::new())
-    }
 
     /// Resolve the durable shard which owns one namespace path when this
     /// backend can prove that routing identity.
@@ -3103,103 +2152,29 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         Ok((statuses.len() == 1).then(|| statuses[0].shard_id.clone()))
     }
 
-    /// Persist and materialize a replicated journal batch.
-    ///
-    /// `batch.shard_id` is the logical shard identity and must match the
-    /// target backend's shard. Replicas use distinct node/storage identities,
-    /// not distinct logical shard IDs.
-    fn apply_journal_batch(&mut self, batch: &DfsMetadataJournalBatch) -> Result<usize>;
-
-    /// Persist a replicated batch using exact source evidence validated by the
-    /// metadata replication boundary. Implementations with no membership
-    /// author fence may retain the ordinary mutation path; local durable
-    /// backends override this to admit only an exact activated generation when
-    /// the ordinary path is fenced.
-    fn apply_journal_batch_with_replica_permit(
-        &mut self,
-        _permit: &DfsMetadataReplicaIngestPermit,
-        batch: &DfsMetadataJournalBatch,
-    ) -> Result<usize> {
-        self.apply_journal_batch(batch)
-    }
-
-    /// Apply a replicated batch and return compact authority evidence derived
-    /// from records newly materialized by this exact call.
-    ///
-    /// Backends that do not retain the decoded apply result use the compatible
-    /// default below. Callers then verify an authority probe from durable tables
-    /// exactly as before.
-    fn apply_journal_batch_with_replica_permit_report(
-        &mut self,
-        permit: &DfsMetadataReplicaIngestPermit,
-        batch: &DfsMetadataJournalBatch,
-    ) -> Result<DfsMetadataReplicaApplyReport> {
-        self.apply_journal_batch_with_replica_permit(permit, batch)
-            .map(DfsMetadataReplicaApplyReport::without_authority_proofs)
-    }
-
-    /// Persist and validate an exact replica batch without requiring the
-    /// rebuildable materialized table cache to reach the same boundary before
-    /// returning. Durable local backends override this for versioned authority
-    /// probes; compatibility backends retain the stronger synchronous apply.
-    fn persist_journal_batch_with_replica_permit_report(
-        &mut self,
-        permit: &DfsMetadataReplicaIngestPermit,
-        batch: &DfsMetadataJournalBatch,
-    ) -> Result<DfsMetadataReplicaApplyReport> {
-        self.apply_journal_batch_with_replica_permit_report(permit, batch)
-    }
-
+    /// Persist the original replica frames under their validated source permit.
+    /// Durability acknowledgement does not require the rebuildable tables to
+    /// reach the same cut; authoring and handoff retain their refresh fences.
     fn persist_journal_frames_with_replica_permit_report(
         &mut self,
         permit: &DfsMetadataReplicaIngestPermit,
         batch: &DfsMetadataJournalBatch,
         frames: &[DfsMetadataJournalFrameRecord],
-    ) -> Result<DfsMetadataReplicaApplyReport> {
-        if !batch.entries.is_empty() || frames.is_empty() {
-            return Err(MetadataBackendError::Serde(format!(
-                "metadata shard {} exact-frame ingest requires one carrier",
-                batch.shard_id.0
-            )));
-        }
-        let entries = frames
-            .iter()
-            .map(crate::metadata_journal::decode_metadata_journal_frame_record)
-            .collect::<Result<Vec<_>>>()?;
-        self.persist_journal_batch_with_replica_permit_report(
-            permit,
-            &DfsMetadataJournalBatch {
-                shard_id: batch.shard_id.clone(),
-                entries,
-                next_after_sequence: batch.next_after_sequence,
-            },
-        )
-    }
+    ) -> Result<DfsMetadataReplicaApplyReport>;
 
     /// Persist an authority operation whose exact target prefix is known.
     ///
     /// Durable local backends use `expected_target_prefix` to authenticate a
     /// delayed authority operation after a later ordinary catch-up prefix has
-    /// already materialized. Compatibility backends keep their stronger
-    /// synchronous apply boundary; the common authority verifier still checks
-    /// their resulting materialized prefix before acknowledging the probe.
+    /// already materialized. The exact source frames and prepared prefix remain
+    /// required for acknowledgement.
     fn persist_authority_journal_frames_with_replica_permit_report(
         &mut self,
         permit: &DfsMetadataReplicaIngestPermit,
         batch: &DfsMetadataJournalBatch,
         frames: &[DfsMetadataJournalFrameRecord],
         expected_target_prefix: &DfsMetadataPrefixProof,
-    ) -> Result<DfsMetadataReplicaApplyReport> {
-        if !expected_target_prefix.is_well_formed()
-            || expected_target_prefix.journal_sequence != batch.next_after_sequence
-        {
-            return Err(MetadataBackendError::Serde(format!(
-                "metadata shard {} authority ingest has an invalid expected prefix at sequence {}",
-                batch.shard_id.0, batch.next_after_sequence
-            )));
-        }
-        self.persist_journal_frames_with_replica_permit_report(permit, batch, frames)
-    }
+    ) -> Result<DfsMetadataReplicaApplyReport>;
 
     /// Materialize any journal suffix previously admitted at the durable ACK
     /// boundary. Promotion, snapshots, and ordinary authoritative writes must
@@ -3207,17 +2182,6 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     fn materialize_pending_replica_journal(&mut self) -> Result<usize> {
         Ok(0)
     }
-
-    /// Replace local metadata tables with a replicated snapshot.
-    ///
-    /// `source_shard_id` must match the target backend's logical shard
-    /// identity; snapshot replication does not adopt or rename shards.
-    fn replace_with_replicated_snapshot(
-        &mut self,
-        source_shard_id: DfsMetadataShardId,
-        replayed_through_sequence: u64,
-        snapshot: DfsMetadataTableSnapshot,
-    ) -> Result<bool>;
 
     /// Replace local metadata tables using exact source evidence validated by
     /// the metadata replication boundary. The local durable implementation
@@ -3228,10 +2192,8 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         _permit: &DfsMetadataReplicaIngestPermit,
         source_shard_id: DfsMetadataShardId,
         replayed_through_sequence: u64,
-        snapshot: DfsMetadataTableSnapshot,
-    ) -> Result<bool> {
-        self.replace_with_replicated_snapshot(source_shard_id, replayed_through_sequence, snapshot)
-    }
+        snapshot: crate::DfsMetadataSnapshotImage,
+    ) -> Result<bool>;
 
     /// Create a subscription cursor for journal polling.
     fn subscribe(&self, after_sequence: u64) -> DfsMetadataSubscription;

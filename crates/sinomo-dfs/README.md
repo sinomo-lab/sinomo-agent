@@ -29,7 +29,6 @@ DFS metadata records the stable identity and visible state of filesystem objects
 - current content hash,
 - current replica locations,
 - policy,
-- future split-cluster conflict records,
 - write intents and receipts,
 - durable namespace-request admission and terminal results.
 
@@ -66,12 +65,11 @@ Object versions can be represented as manifests over extents. Full-object writes
 - version records,
 - write-intent records,
 - replica receipts,
-- future split-cluster conflict records,
 - namespace transactions,
 - namespace-request admission records,
-- recoverable visible-version commits.
+- immutable prepared operations and exact digest commits.
 
-Visible metadata commits and namespace transactions are written as replayable records before materialization, so reopening the backend can complete an interrupted operation without duplicating already-materialized table batches.
+Every journal mutation is either a complete `PrepareOperationV7` payload or its exact `CommitPreparedOperationV7` digest. Namespace, content visibility, receipt staging, durable jobs and GC effects use this one family. An opaque `DfsPublicationGuard` retains normal runtime ownership and authorization through commit. Reopen and replica replay use the same projection as publication.
 
 Mutating namespace RPCs first persist a request record keyed by authenticated
 requester and request id with the semantic operation, stable operation id, and
@@ -85,13 +83,13 @@ automatically recovering state rather than an operator action.
 
 Metadata journal replication is bounded by both entry count and encoded batch size. Oversized single entries still advance by themselves so a large namespace operation cannot stall a follower cursor forever. Daemon maintenance drains multiple bounded batches per publish call, with a cap that keeps each maintenance pass finite while avoiding one-batch-per-interval convergence for large metadata backlogs.
 
-The table tail log is compacted into a structured snapshot after it grows large enough, which keeps reopen cost bounded by the latest materialized snapshot plus recent writes instead of all historical namespace churn. Older operation-list snapshots are migrated to the structured snapshot format on open.
+The table tail log is compacted into a streamed snapshot using storage schema 8, bounding reopen cost by the latest checkpoint and recent writes. Its storage version is independent of the V7 operation family. `sinomo-dfs` accepts only current storage and wire formats.
 
-Legacy per-record `.sobj` metadata layouts are loaded into the compact table snapshot during backend open. New writes use the packed table path only.
+`sinomo-dfs-migration` owns incremental, on-demand conversion of retained storage. The Main or Embedded component supplies its cold-open provider; original source digests, archived bytes, restart progress and native installation authority remain explicit. Incompatible peer versions must be upgraded.
 
 Operator status includes per-shard journal positions, inbound replay cursors, and configured replica cursor lag so cluster checks can distinguish object-level repair work from metadata replication backlog.
 
-Sparse legacy journal entries are hydrated from keyed backend records before replication when possible. If an unrecoverable namespace transaction lacks its transaction record, service replay fails explicitly instead of importing an entire filesystem as a fallback.
+Replication carries the original current journal frames in one bounded carrier. Their contiguous scope and prefix are validated before ingestion; sender-side re-encoding cannot substitute for the durable bytes.
 
 ### Scale Benchmarks
 
@@ -208,169 +206,36 @@ files
 
 The exact storage format is intentionally hidden behind crate APIs and metadata backend traits. Other crates should use the DFS interfaces instead of reading these files directly.
 
-## Usage Examples
+## Using the SIFS POSIX Facade
 
-### Store a Local Object Version
+The Main or Embedded DFS component supplies the client, transport, data owner,
+metadata backend and publication executor. Mutations use that mounted runtime;
+constructing a content store or backend does not grant publication authority.
 
 ```rust
-use sinomo_core::{DfsFileSystemId, DfsObjectId, DfsObjectPolicy, DfsVersion, NodeId};
-use sinomo_dfs::{DfsFileSystem, DfsObjectKind, DfsObjectMetadata, LocalContentStore, NetworkedDfsService};
-use sinomo_network::InProcessNetwork;
+use sinomo_dfs::{DfsNodeTransport, DfsWriteOptions, NetworkedDfsService};
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-let node_id = NodeId::from_legacy_named("node_owner")?;
-let file_system_id = DfsFileSystemId::from_legacy_named("sifs")?;
-let object_id = DfsObjectId::from_legacy_named("obj_readme_example")?;
-let version = DfsVersion::from_legacy_named("version_1")?;
-
-let network = InProcessNetwork::new();
-let content = LocalContentStore::new("/tmp/sinomo-dfs-example-owner")?;
-let mut dfs = NetworkedDfsService::new(network.add_node(node_id.clone()), content);
-
-dfs.add_file_system(DfsFileSystem {
-    file_system_id: file_system_id.clone(),
-    display_name: "SIFS".to_string(),
-    owner_node_id: node_id.clone(),
-    subtree_policies: Vec::new(),
-})?;
-
-let object = DfsObjectMetadata {
-    object_id: object_id.clone(),
-    file_system_id,
-    path: "/users/example.txt".to_string(),
-    kind: DfsObjectKind::File,
-    owner_node_id: node_id,
-    current_locations: Vec::new(),
-    content_hash: None,
-    link_target_object_id: None,
-    version,
-    policy: DfsObjectPolicy::LocalOwned,
-    created_by_event_id: None,
-    last_modified_by_event_id: None,
-};
-
-let content_hash = dfs.put_local_object_version(object, b"hello dfs")?;
-let read = dfs.read_local_object(&object_id)?.expect("object bytes");
-assert_eq!(read.bytes, b"hello dfs");
-assert_eq!(read.content_hash.as_deref(), Some(content_hash.as_str()));
-Ok(())
+fn write_example(
+    dfs: &mut NetworkedDfsService<DfsNodeTransport>,
+    options: DfsWriteOptions,
+) -> Result<(), sinomo_dfs::DfsPosixError> {
+    dfs.posix_mkdir_all("/users/example")?;
+    dfs.posix_write_file("/users/example/hello.txt", b"hello from SIFS", options)?;
+    assert_eq!(dfs.posix_read_file("/users/example/hello.txt")?, b"hello from SIFS");
+    Ok(())
 }
 ```
 
-### Replicate an Eventual Object
-
-```rust
-use sinomo_core::{DfsFileSystemId, DfsObjectId, DfsObjectPolicy, DfsVersion, DfsWriteRequest, NodeId};
-use sinomo_dfs::{
-    DfsFileSystem, DfsObjectKind, DfsObjectMetadata, DfsReplicationPolicy, LocalContentStore,
-    NetworkedDfsService, NetworkedDfsWriteOutcome,
-};
-use sinomo_network::InProcessNetwork;
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-let owner = NodeId::from_legacy_named("node_owner")?;
-let replica = NodeId::from_legacy_named("node_replica")?;
-let file_system_id = DfsFileSystemId::from_legacy_named("sifs")?;
-let object_id = DfsObjectId::from_legacy_named("obj_replicated")?;
-let version_1 = DfsVersion::from_legacy_named("version_1")?;
-let version_2 = DfsVersion::from_legacy_named("version_2")?;
-
-let network = InProcessNetwork::new();
-let mut owner_dfs = NetworkedDfsService::new(
-    network.add_node(owner.clone()),
-    LocalContentStore::new("/tmp/sinomo-dfs-owner")?,
-);
-let mut replica_dfs = NetworkedDfsService::new(
-    network.add_node(replica.clone()),
-    LocalContentStore::new("/tmp/sinomo-dfs-replica")?,
-);
-
-let file_system = DfsFileSystem {
-    file_system_id: file_system_id.clone(),
-    display_name: "SIFS".to_string(),
-    owner_node_id: owner.clone(),
-    subtree_policies: Vec::new(),
-};
-let object = DfsObjectMetadata {
-    object_id: object_id.clone(),
-    file_system_id: file_system_id.clone(),
-    path: "/services/artifact.bin".to_string(),
-    kind: DfsObjectKind::Artifact,
-    owner_node_id: owner.clone(),
-    current_locations: vec![owner.clone()],
-    content_hash: None,
-    link_target_object_id: None,
-    version: version_1,
-    policy: DfsObjectPolicy::ReplicatedEventual,
-    created_by_event_id: None,
-    last_modified_by_event_id: None,
-};
-
-owner_dfs.add_file_system(file_system.clone())?;
-replica_dfs.add_file_system(file_system)?;
-owner_dfs.add_object_metadata(object.clone())?;
-replica_dfs.add_object_metadata(object)?;
-
-let outcome = owner_dfs.write_distributed_eventual(
-    DfsWriteRequest {
-        file_system_id,
-        object_id: object_id.clone(),
-        target_version: version_2,
-        requesting_node_id: owner,
-    },
-    b"replicated bytes".to_vec(),
-    vec![owner_dfs.node_id().clone(), replica.clone()],
-    DfsReplicationPolicy::new(2, 2)?,
-)?;
-
-assert!(matches!(outcome, NetworkedDfsWriteOutcome::Pending { .. }));
-replica_dfs.process_incoming()?;
-owner_dfs.process_incoming()?;
-replica_dfs.process_incoming()?;
-
-let read = replica_dfs.read_local_object(&object_id)?.expect("replica data");
-assert_eq!(read.bytes, b"replicated bytes");
-Ok(())
-}
-```
-
-### Use the SIFS POSIX Facade
-
-```rust
-use sinomo_core::NodeId;
-use sinomo_dfs::{DfsWriteOptions, LocalContentStore, NetworkedDfsService};
-use sinomo_network::InProcessNetwork;
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-let node = NodeId::from_legacy_named("node_posix")?;
-let network = InProcessNetwork::new();
-let mut dfs = NetworkedDfsService::new(
-    network.add_node(node.clone()),
-    LocalContentStore::new("/tmp/sinomo-dfs-posix")?,
-);
-
-dfs.bootstrap_distributed_sifs()?;
-dfs.posix_mkdir_all("/users/example")?;
-dfs.posix_write_file(
-    "/users/example/hello.txt",
-    b"hello from SIFS",
-    DfsWriteOptions::replicated_eventual(vec![node]),
-)?;
-
-let entries = dfs.posix_list_dir("/users/example")?;
-assert_eq!(entries[0].name, "hello.txt");
-let bytes = dfs.posix_read_file("/users/example/hello.txt")?;
-assert_eq!(bytes, b"hello from SIFS");
-Ok(())
-}
-```
+Tests use the shared embedded runtime in `test_support::DfsTestRuntime` with
+`test-support` enabled. Its normal clients use `DfsNodeTransport`, native
+component startup, authenticated ingress and the same guarded publication path.
 
 ## Operational Notes
 
 - Do not put large file bytes in `sinomo-kv`; DFS content stores carry bytes.
-- Do not put per-file metadata, content manifests, intents, receipts, or conflicts in `sinomo-kv`; DFS metadata shards carry high-cardinality state.
+- Do not put per-file metadata, content manifests, intents or receipts in `sinomo-kv`; DFS metadata shards carry high-cardinality state.
 - Treat metadata backend records as the source of restart recovery.
 - Use SOBJ or packed binary formats for internal DFS storage; JSON/JSONL is reserved for CLI output, service display, benchmark artifacts, and legacy migration.
 - Use SIFS path APIs for filesystem-like workflows and object/version APIs for replication, repair, audit, and operator tooling.
-- Never create conflict records for normal quorum-backed write races. Reject, retry, keep pending, or fail fast instead. Conflict records are future split-cluster recovery metadata only.
+- Quorum-backed write races reject, retry or remain pending according to their exact durable outcome.
 - Local-owned subtrees remain useful for sensitive or node-specific files even inside the cluster root filesystem.

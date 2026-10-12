@@ -384,6 +384,14 @@ impl DistributedEventualCoordinator {
         }
     }
 
+    /// Metadata reconstruction cannot discard the current operation's durable
+    /// work handoff. Keep only its existing capture mode/data, not the caches.
+    pub(crate) fn reset_projection_preserving_message_capture(&mut self) {
+        let captured = self.message_repair_jobs.take();
+        *self = Self::new();
+        self.message_repair_jobs = captured;
+    }
+
     pub(crate) fn observe_restored_intent_counter_floor(&mut self, floor: u64) {
         self.next_intent_id = self.next_intent_id.max(floor.saturating_add(1));
     }
@@ -394,6 +402,10 @@ impl DistributedEventualCoordinator {
 
     pub(crate) fn begin_message_repair_job_capture(&mut self) {
         self.message_repair_jobs = Some(Vec::new());
+    }
+
+    pub(crate) fn message_repair_capture_status(&self) -> Option<usize> {
+        self.message_repair_jobs.as_ref().map(Vec::len)
     }
 
     pub(crate) fn take_message_repair_jobs(&mut self) -> Vec<DistributedRepairJob> {
@@ -1004,9 +1016,7 @@ impl DistributedEventualCoordinator {
 
         if matches!(
             intent.state,
-            DfsWriteIntentState::Rejected
-                | DfsWriteIntentState::Conflict
-                | DfsWriteIntentState::Aborted
+            DfsWriteIntentState::Rejected | DfsWriteIntentState::Aborted
         ) {
             return Err(DfsDistributedError::IntentClosed {
                 intent_id: intent_id.to_string(),
@@ -1290,6 +1300,19 @@ impl DistributedEventualCoordinator {
     }
 
     pub(crate) fn commit_intent(&mut self, intent_id: &str) -> Result<(), DfsDistributedError> {
+        self.commit_intent_with_publication(intent_id, true)
+    }
+    pub(crate) fn restore_recorded_committed_intent(
+        &mut self,
+        intent_id: &str,
+    ) -> Result<(), DfsDistributedError> {
+        self.commit_intent_with_publication(intent_id, false)
+    }
+    fn commit_intent_with_publication(
+        &mut self,
+        intent_id: &str,
+        published: bool,
+    ) -> Result<(), DfsDistributedError> {
         let durable_nodes = self.durable_receipt_nodes(intent_id);
         let mut intent = self.intents.get(intent_id).cloned().ok_or_else(|| {
             DfsDistributedError::UnknownIntent {
@@ -1303,7 +1326,7 @@ impl DistributedEventualCoordinator {
 
         intent.state = DfsWriteIntentState::Committed;
         self.replace_indexed_intent(intent.clone());
-        if intent.publication.is_current() {
+        if published && intent.publication.is_current() {
             self.committed_versions.insert(
                 ObjectKey::new(intent.file_system_id.clone(), intent.object_id.clone()),
                 intent.target_version.clone(),
@@ -1780,10 +1803,20 @@ mod tests {
                 Some("preserve".into()),
                 None,
                 crate::DfsWritePublication::Retained {
-                    capture: Box::new(serde_json::from_value::<crate::DfsRetainedContentPublication>(serde_json::json!({"pin_id": "local-operation", "source": crate::DfsFileVersionSource::LocalOperation {
-                            operation_id: "preserve".into(),
-                            base_version: Some(version("stale-local-base")),
-                        }})).unwrap()),
+                    capture: Box::new(crate::DfsRetainedContentPublication {
+                        namespace: "module.dfs.history".into(),
+                        reference_id: "local-operation".into(),
+                        metadata: Some(crate::DfsModuleMetadataValue {
+                            schema_version: 1,
+                            payload: serde_json::to_value(
+                                crate::DfsFileVersionSource::LocalOperation {
+                                    operation_id: "preserve".into(),
+                                    base_version: Some(version("stale-local-base")),
+                                },
+                            )
+                            .unwrap(),
+                        }),
+                    }),
                 },
             )
             .unwrap();

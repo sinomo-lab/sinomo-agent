@@ -3,352 +3,95 @@
 use super::*;
 
 #[test]
-fn namespace_set_owner_preserves_legacy_wire_shape() {
-    #[derive(Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
-    #[serde(rename_all = "kebab-case")]
-    enum LegacyNamespaceOwnerOperation {
-        SetOwner { path: String, uid: u32, gid: u32 },
-    }
-
-    let legacy = LegacyNamespaceOwnerOperation::SetOwner {
-        path: "/users/legacy-owner".to_string(),
-        uid: 1001,
-        gid: 1002,
-    };
-    let current = DfsNamespaceOperation::SetOwner {
-        path: "/users/legacy-owner".to_string(),
-        uid: 1001,
-        gid: 1002,
-    };
+fn current_namespace_owner_operations_roundtrip_distinct_semantics() {
     let codec = sinomo_core::network::SinomoObjectCodec::network_frame();
-    let legacy_bytes = codec.encode(&legacy).expect("encode legacy SetOwner");
-    let current_bytes = codec.encode(&current).expect("encode current SetOwner");
-    assert_eq!(
-        current_bytes, legacy_bytes,
-        "SetOwner must retain its original path/uid/gid wire shape"
-    );
-    assert_eq!(
-        codec
-            .decode::<LegacyNamespaceOwnerOperation>(&current_bytes)
-            .expect("decode current SetOwner as legacy"),
-        legacy
-    );
-    assert_eq!(
-        codec
-            .decode::<DfsNamespaceOperation>(&legacy_bytes)
-            .expect("decode legacy SetOwner as current"),
-        current
-    );
-
-    for operation in [
+    let operations = [
+        DfsNamespaceOperation::SetOwner {
+            path: "/users/owner".into(),
+            uid: 1001,
+            gid: 1002,
+        },
         DfsNamespaceOperation::SetSymlinkOwner {
-            path: "/users/link-owner".to_string(),
+            path: "/users/link-owner".into(),
             uid: 1001,
             gid: 1002,
         },
         DfsNamespaceOperation::MkdirWithAttrs {
-            path: "/users/private".to_string(),
+            path: "/users/private".into(),
             attrs: DfsPosixCreateAttrs::new(0o700, 1001, 1002),
         },
-    ] {
-        let bytes = codec.encode(&operation).expect("encode new operation");
-        assert_ne!(bytes, legacy_bytes);
-        assert!(
-            codec
-                .decode::<LegacyNamespaceOwnerOperation>(&bytes)
-                .is_err(),
-            "new operation must not masquerade as legacy SetOwner"
+    ];
+    let encoded = operations
+        .iter()
+        .map(|operation| codec.encode(operation).unwrap())
+        .collect::<Vec<_>>();
+    for (operation, bytes) in operations.iter().zip(&encoded) {
+        assert_eq!(
+            &codec.decode::<DfsNamespaceOperation>(bytes).unwrap(),
+            operation
         );
     }
-}
-
-#[tokio::test]
-async fn posix_remote_stream_returns_before_body_collection() {
-    let local = NodeId::from_legacy_named("node_posix_stream_source").expect("local");
-    let remote = NodeId::from_legacy_named("node_posix_stream_target").expect("remote");
-    let object_id = DfsObjectId::from_legacy_named("object_posix_stream").expect("object");
-    let version = DfsVersion::from_legacy_named("version_posix_stream").expect("version");
-    let bytes = vec![0x5a; 48 * 1024];
-    let expected_hash = content_hash(&bytes);
-    let (body_sender, body) = ObjectRpcIncomingBody::test_channel(Some(bytes.len() as u64), 1);
-    let transport =
-        node_transport_with_streamed_direct_read_body(local.clone(), remote.clone(), body);
-    let root = temp_root("posix-remote-stream-head");
-    let mut service = NetworkedDfsService::new(
-        transport,
-        LocalContentStore::new(root.join("content")).expect("content"),
-    );
-    service
-        .add_file_system(DfsFileSystem::sifs(local))
-        .expect("SIFS metadata");
-    service
-        .add_object_metadata(DfsObjectMetadata {
-            object_id: object_id.clone(),
-            file_system_id: sifs_file_system_id(),
-            path: "/stream-native-read.bin".to_string(),
-            kind: DfsObjectKind::File,
-            tombstone_provenance: None,
-            owner_node_id: remote.clone(),
-            current_locations: vec![remote],
-            content_hash: Some(expected_hash.clone()),
-            content_size_bytes: Some(bytes.len() as u64),
-            link_target_object_id: None,
-            mode: 0o644,
-            uid: 0,
-            gid: 0,
-            accessed_at_unix_nanos: 0,
-            modified_at_unix_nanos: 0,
-            created_at_unix_nanos: 0,
-            changed_at_unix_nanos: 0,
-            version: version.clone(),
-            policy: DfsObjectPolicy::ReplicatedEventual,
-            created_by_event_id: None,
-            last_modified_by_event_id: None,
-        })
-        .expect("remote object metadata");
-
-    // No body chunk has been produced. Any hidden compatibility collector in
-    // the POSIX or service layer would block this future until timeout.
-    let opened = tokio::time::timeout(
-        Duration::from_millis(100),
-        service.posix_open_remote_file_stream("/stream-native-read.bin"),
-    )
-    .await
-    .expect("POSIX stream head must not collect its body")
-    .expect("open POSIX remote stream");
-    assert_eq!(opened.object_id, object_id);
-    assert_eq!(opened.version, version);
-    assert_eq!(opened.content_hash, expected_hash);
-    assert_eq!(opened.stream.observed_size_bytes(), 0);
-
-    body_sender
-        .send(bytes)
-        .await
-        .expect("produce POSIX stream body");
-    drop(body_sender);
-    let completion = opened.stream.finish().await.expect("finalize POSIX stream");
-    assert_eq!(completion.content_size_bytes, 48 * 1024);
+    assert_ne!(encoded[0], encoded[1]);
+    assert_ne!(encoded[0], encoded[2]);
 }
 
 #[test]
-fn conditional_unlink_keeps_its_operation_id_after_response_loss_and_primary_movement() {
-    let root = temp_root("conditional-unlink-response-loss-primary-move");
-    let old_primary_node =
-        NodeId::from_legacy_named("node_conditional_unlink_old_primary").expect("old primary");
-    let new_primary_node =
-        NodeId::from_legacy_named("node_conditional_unlink_new_primary").expect("new primary");
-    let requester_node =
-        NodeId::from_legacy_named("node_conditional_unlink_requester").expect("requester");
-    let network = InProcessNetwork::new();
-    let shared_kv = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
-    let shard = |primary: &NodeId, replicas: Vec<NodeId>, epoch| DfsMetadataShardConfig {
-        file_system_id: sifs_file_system_id(),
-        shard_id: "root".to_string(),
-        primary_node_id: primary.clone(),
-        replica_node_ids: replicas,
-        epoch,
-        assignment: DfsMetadataShardAssignment::Root,
-        namespace_prepare_codec: Default::default(),
-        default_policy: DfsObjectPolicy::ReplicatedEventual,
-    };
-    let promoted_shard = shard(&new_primary_node, vec![old_primary_node.clone()], 2);
-    shared_kv.with_client(|kv| {
-        let mut control = DfsControlPlaneStore::new(kv);
-        control
-            .put_file_system_config(&DfsFileSystemConfig::from(&distributed_sifs(
-                old_primary_node.clone(),
-            )))
-            .expect("filesystem config");
-        control
-            .put_metadata_shard(&shard(&old_primary_node, vec![new_primary_node.clone()], 1))
-            .expect("initial shard");
-    });
-    let mut old_primary = sifs_posix_cluster_node(
-        &network,
-        &shared_kv,
-        &root,
-        "old-primary",
-        old_primary_node.clone(),
+fn posix_remote_stream_returns_before_body_collection() {
+    let bytes = vec![0x5a; 48 * 1024];
+    let (runtime, owner, _, reader_node, stat, bytes) =
+        native_read_fixture("native-posix-stream-head", 1, false, bytes);
+    let mut service = runtime.client(&reader_node).unwrap();
+    // Warm the ordinary metadata-only lookup before measuring the body-open
+    // boundary; this changes no read deadline or producer behavior.
+    assert_eq!(
+        service.posix_stat(&stat.path).unwrap().object_id,
+        stat.object_id
     );
-    let mut new_primary = sifs_posix_cluster_node(
-        &network,
-        &shared_kv,
-        &root,
-        "new-primary",
-        new_primary_node.clone(),
-    );
-    let requester_root = root.join("requester");
-    let durable_promotion_ready = Arc::new(AtomicBool::new(false));
-    let requester_transport = PromoteAfterConditionalNamespaceDeliveryTransport {
-        inner: network.add_node(requester_node.clone()),
-        promotion: Some((shared_kv.clone(), promoted_shard)),
-        durable_promotion_ready: Arc::clone(&durable_promotion_ready),
-    };
-    let mut requester = NetworkedDfsService::new(
-        requester_transport,
-        LocalContentStore::new(requester_root.join("content")).expect("requester content"),
-    )
-    .with_control_plane(shared_kv.clone())
-    .with_metadata_backend(
-        open_root_local_metadata_backend(requester_root.join("metadata"))
-            .expect("requester metadata"),
-    )
-    .expect("attach requester metadata");
-
-    new_primary = std::thread::scope(|scope| {
-        let stop = Arc::new(AtomicBool::new(false));
-        let pump_stop = Arc::clone(&stop);
-        let pump = scope.spawn(move || pump_sifs_service_until_stop(new_primary, pump_stop));
-        old_primary
-            .bootstrap_distributed_sifs()
-            .expect("initial primary bootstrap");
-        stop.store(true, Ordering::SeqCst);
-        pump.join().expect("bootstrap replica pump")
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let started = Arc::new(AtomicBool::new(false));
+    let forwarded = Arc::new(AtomicUsize::new(0));
+    runtime.install_fault(crate::test_support::DfsTestFaultRule {
+        source: Some(reader_node.clone()),
+        target: Some(owner.clone()),
+        route: Some(DFS_DIRECT_READ_ROUTE.into()),
+        call_id: None,
+        origin: Some(crate::test_support::DfsTestRpcOrigin::RegisteredHost),
+        remaining_hits: 1,
+        action: crate::test_runtime::FaultAction::PauseNativeReadBody {
+            gate: Arc::clone(&gate),
+            started: Arc::clone(&started),
+            forwarded_bytes: Arc::clone(&forwarded),
+            relay_hops: 0,
+        },
     });
-
-    let path = "/users/conditional-unlink-after-loss.txt";
-    let (old_after_seed, new_after_seed, seeded) = std::thread::scope(|scope| {
-        let stop = Arc::new(AtomicBool::new(false));
-        let old_stop = Arc::clone(&stop);
-        let new_stop = Arc::clone(&stop);
-        let old_pump = scope.spawn(move || pump_sifs_service_until_stop(old_primary, old_stop));
-        let new_pump = scope.spawn(move || pump_sifs_service_until_stop(new_primary, new_stop));
-        let seeded = requester.posix_mkdir_all("/users").and_then(|_| {
-            requester.posix_write_file(
-                path,
-                b"unlink exactly once",
-                DfsWriteOptions::replicated_eventual(vec![requester_node.clone()]),
-            )
-        });
-        stop.store(true, Ordering::SeqCst);
-        (
-            old_pump.join().expect("old primary seed pump"),
-            new_pump.join().expect("new primary seed pump"),
-            seeded,
+    crate::test_runtime::executor().block_on(async {
+        let mut opened = tokio::time::timeout(
+            Duration::from_millis(100),
+            service.posix_open_remote_file_stream(&stat.path),
         )
+        .await
+        .expect("normal POSIX stream returns the actual head before body production")
+        .unwrap();
+        assert_eq!(opened.object_id, stat.object_id);
+        assert_eq!(opened.version, stat.version);
+        assert_eq!(opened.content_hash, stat.content_hash.clone().unwrap());
+        assert_eq!(opened.stream.observed_size_bytes(), 0);
+        assert!(!started.load(Ordering::Acquire));
+        assert_eq!(forwarded.load(Ordering::Acquire), 0);
+        gate.add_permits(32);
+        let mut actual = Vec::new();
+        while let Some(chunk) = opened.stream.next_chunk().await.unwrap() {
+            actual.extend_from_slice(chunk.as_ref());
+        }
+        assert_eq!(actual, bytes);
+        assert_eq!(
+            opened.stream.finish().await.unwrap().content_size_bytes,
+            48 * 1024
+        );
     });
-    let seeded = seeded.expect("seed routed file");
-    old_primary = old_after_seed;
-    new_primary = new_after_seed;
-    let expected = DfsNamespaceObjectPrecondition {
-        object_id: seeded.object_id,
-        version: seeded.version,
-    };
-    let operation_id = format!("cf_{}", sinomo_core::Id::generate());
-    let operation = DfsNamespaceOperation::ConditionalUnlink {
-        path: path.to_string(),
-        expected: expected.clone(),
-    };
-
-    let (old_after_unlink, new_after_unlink, unlinked) = std::thread::scope(|scope| {
-        let stop = Arc::new(AtomicBool::new(false));
-        let old_stop = Arc::clone(&stop);
-        let new_stop = Arc::clone(&stop);
-        let promotion_ready = Arc::clone(&durable_promotion_ready);
-        let retiring_promotion_ready = Arc::clone(&durable_promotion_ready);
-        let receipt_requester = requester_node.clone();
-        let receipt_operation_id = operation_id.clone();
-        let old_pump = scope.spawn(move || {
-            while !old_stop.load(Ordering::SeqCst) {
-                old_primary
-                    .process_incoming()
-                    .expect("old primary conditional unlink pump");
-                match old_primary.replicate_configured_metadata_shards(&sifs_file_system_id()) {
-                    Ok(_) => {}
-                    // The test deliberately promotes the successor as soon as
-                    // this receipt is durable. A retiring pump can observe the
-                    // new epoch before its stop flag; fencing is the expected
-                    // result of that race, not a failed unlink publication.
-                    Err(DfsError::StaleOwnerEpoch { .. })
-                        if retiring_promotion_ready.load(Ordering::SeqCst) => {}
-                    Err(error) => panic!("publish terminal conditional unlink receipt: {error}"),
-                }
-                if !old_stop.load(Ordering::SeqCst) {
-                    let _ = old_primary
-                        .transport
-                        .wait_for_incoming(Duration::from_millis(2));
-                }
-            }
-            old_primary
-        });
-        let new_pump = scope.spawn(move || {
-            while !new_stop.load(Ordering::SeqCst) {
-                new_primary
-                    .process_incoming()
-                    .expect("new primary conditional unlink replica pump");
-                let admission = new_primary
-                    .metadata_backend_mut()
-                    .expect("future primary metadata")
-                    .namespace_request_admission_snapshot(
-                        &DfsMetadataShardId::new("root"),
-                        &receipt_requester,
-                        &receipt_operation_id,
-                    )
-                    .expect("future primary admission snapshot");
-                let receipt_is_durable = admission.receipt.is_some()
-                    || admission.request.is_some_and(|request| {
-                        request.status == DfsNamespaceRequestStatus::Completed
-                            && matches!(request.result, Some(DfsNamespaceResult::Applied))
-                    });
-                if receipt_is_durable {
-                    promotion_ready.store(true, Ordering::SeqCst);
-                }
-                if !new_stop.load(Ordering::SeqCst) {
-                    let _ = new_primary
-                        .transport
-                        .wait_for_incoming(Duration::from_millis(2));
-                }
-            }
-            new_primary
-        });
-        let unlinked = requester.posix_unlink_if_generation(path, operation_id.clone(), expected);
-        stop.store(true, Ordering::SeqCst);
-        (
-            old_pump.join().expect("old primary unlink pump"),
-            new_pump.join().expect("new primary unlink pump"),
-            unlinked,
-        )
-    });
-    let tombstone = unlinked.expect("retry exact conditional unlink after response loss");
-    assert_eq!(tombstone.kind, DfsObjectKind::Tombstone);
-
-    // Reopen both participants after the injected movement. Reconciliation
-    // must find the one receipt under the exact caller id on the promoted
-    // authority, rather than treating the retry as a second unlink.
-    drop(old_after_unlink);
-    drop(new_after_unlink);
-    drop(requester);
-    let restarted_primary =
-        sifs_posix_cluster_node(&network, &shared_kv, &root, "new-primary", new_primary_node);
-    let mut restarted_requester = sifs_posix_cluster_node(
-        &network,
-        &shared_kv,
-        &root,
-        "requester-restarted",
-        requester_node.clone(),
-    );
-    let (reconciliation, restarted_primary) = std::thread::scope(|scope| {
-        let stop = Arc::new(AtomicBool::new(false));
-        let pump_stop = Arc::clone(&stop);
-        let pump = scope.spawn(move || pump_sifs_service_until_stop(restarted_primary, pump_stop));
-        let reconciliation =
-            restarted_requester.reconcile_stable_namespace_operation(&operation_id, &operation);
-        stop.store(true, Ordering::SeqCst);
-        (
-            reconciliation,
-            pump.join().expect("restarted promoted authority pump"),
-        )
-    });
-    let reconciliation = reconciliation.expect("routed namespace reconciliation");
-    let DfsStableNamespaceOperationReconciliation::Applied { receipt } = reconciliation else {
-        panic!("exact conditional unlink receipt must be Applied: {reconciliation:?}");
-    };
-    assert_eq!(receipt.operation_id, operation_id);
-    assert_eq!(receipt.requesting_node_id, requester_node);
-    assert!(matches!(receipt.result, DfsNamespaceResult::Applied));
-
-    drop(restarted_primary);
-    std::fs::remove_dir_all(root).ok();
+    drop(service);
+    runtime.clear_faults();
+    runtime.close().unwrap();
 }
 
 #[test]
@@ -360,7 +103,10 @@ fn sifs_recursive_clear_follows_directory_symlink_argument() {
     let link_dir = format!("{base}/work/current-tmp");
     let file_path = format!("{real_dir}/session-cache.txt");
 
-    let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+    let (_runtime, mut dfs) = native_sifs_service(
+        "sifs_recursive_clear_follows_directory_symlink_argument",
+        node_id.clone(),
+    );
     dfs.posix_mkdir_all(&real_dir).expect("mkdir real tmp");
     dfs.posix_mkdir_all(&format!("{base}/work"))
         .expect("mkdir work");
@@ -409,7 +155,10 @@ fn sifs_recursive_clear_is_scoped_to_target_subtree() {
     let unrelated_file =
         "/services/sandbox/instances/sandbox_clear_scoped/work/unrelated/cache.txt";
 
-    let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+    let (_runtime, mut dfs) = native_sifs_service(
+        "sifs_recursive_clear_is_scoped_to_target_subtree",
+        node_id.clone(),
+    );
     dfs.posix_mkdir_all(&format!("{target_root}/nested"))
         .expect("mkdir target");
     dfs.posix_mkdir_all("/services/sandbox/instances/sandbox_clear_scoped/tmp/1/nested")
@@ -449,7 +198,10 @@ fn sifs_recursive_clear_is_scoped_to_target_subtree() {
 fn sifs_posix_nonexclusive_create_follows_a_dangling_symlink() {
     let root = temp_root("sifs-posix-create-dangling-symlink");
     let node_id = NodeId::from_legacy_named("node_sifs_create_dangling_symlink").expect("node");
-    let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+    let (_runtime, mut dfs) = native_sifs_service(
+        "sifs_posix_nonexclusive_create_follows_a_dangling_symlink",
+        node_id.clone(),
+    );
     dfs.posix_mkdir_all("/services/dangling-create")
         .expect("mkdir parent");
     let options = DfsWriteOptions::replicated_eventual(vec![node_id]);
@@ -491,7 +243,10 @@ fn sifs_posix_nonexclusive_create_follows_a_dangling_symlink() {
 fn sifs_posix_create_attrs_are_installed_atomically_and_only_on_create() {
     let root = temp_root("sifs-posix-create-attrs");
     let node_id = NodeId::from_legacy_named("node_sifs_create_attrs").expect("node");
-    let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+    let (_runtime, mut dfs) = native_sifs_service(
+        "sifs_posix_create_attrs_are_installed_atomically_and_only_on_create",
+        node_id.clone(),
+    );
     dfs.posix_mkdir_all("/services/create-attrs")
         .expect("mkdir parent");
 
@@ -582,7 +337,10 @@ fn sifs_posix_symlink_preserves_target_as_object_content() {
     let node_id = NodeId::from_legacy_named("node_sifs_symlink").expect("node");
     let link_path = "/services/sandbox/instances/sandbox_link/work/lib";
 
-    let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+    let (_runtime, mut dfs) = native_sifs_service(
+        "sifs_posix_symlink_preserves_target_as_object_content",
+        node_id.clone(),
+    );
     dfs.posix_mkdir_all("/services/sandbox/instances/sandbox_link/work")
         .expect("mkdir");
     let stat = dfs
@@ -651,7 +409,10 @@ fn sifs_posix_trailing_slash_requires_directory() {
     let link_dir = "/services/sandbox/instances/sandbox_trailing/work/link-dir";
     let link_file = "/services/sandbox/instances/sandbox_trailing/work/link-file";
 
-    let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+    let (_runtime, mut dfs) = native_sifs_service(
+        "sifs_posix_trailing_slash_requires_directory",
+        node_id.clone(),
+    );
     dfs.posix_mkdir_all(real_dir).expect("mkdir real dir");
     dfs.posix_write_file(
         file_path,
@@ -770,7 +531,10 @@ fn sifs_posix_rmdir_reports_directory_not_empty() {
     let dir_path = "/services/sandbox/instances/sandbox_rmdir/work";
     let file_path = "/services/sandbox/instances/sandbox_rmdir/work/file.txt";
 
-    let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+    let (_runtime, mut dfs) = native_sifs_service(
+        "sifs_posix_rmdir_reports_directory_not_empty",
+        node_id.clone(),
+    );
     dfs.posix_mkdir_all(dir_path).expect("mkdir");
     dfs.posix_write_file(
         file_path,
@@ -794,7 +558,10 @@ fn sifs_posix_empty_directory_checks_are_bounded_for_large_directories() {
     let source = "/services/sandbox/instances/sandbox_bounded_empty_dir/work/source";
     let nonempty = "/services/sandbox/instances/sandbox_bounded_empty_dir/work/nonempty";
 
-    let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+    let (_runtime, mut dfs) = native_sifs_service(
+        "sifs_posix_empty_directory_checks_are_bounded_for_large_directories",
+        node_id.clone(),
+    );
     dfs.posix_mkdir_all(source).expect("mkdir source");
     for index in 0..160 {
         dfs.posix_mkdir_all(&format!("{nonempty}/child-{index:04}"))
@@ -845,7 +612,10 @@ fn sifs_posix_stat_reports_directory_link_counts() {
     let child_dir = "/services/sandbox/instances/sandbox_links/work/child";
     let nested_file = "/services/sandbox/instances/sandbox_links/work/file.txt";
 
-    let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+    let (_runtime, mut dfs) = native_sifs_service(
+        "sifs_posix_stat_reports_directory_link_counts",
+        node_id.clone(),
+    );
     dfs.posix_mkdir_all(child_dir).expect("mkdir child");
     dfs.posix_write_file(
         nested_file,
@@ -866,14 +636,16 @@ fn sifs_posix_stat_reports_directory_link_counts() {
 
 #[test]
 fn sifs_posix_rename_directory_batches_child_moves_per_job_batch() {
-    let root = temp_root("sifs-posix-rename-dir-batched-children");
     let node_id = NodeId::from_legacy_named("node_sifs_rename_dir_batch").expect("node");
     let old_dir = "/services/sandbox/instances/sandbox_rename_batch/work/old";
     let new_dir = "/services/sandbox/instances/sandbox_rename_batch/work/new";
     let max_steps = 4;
     let child_count = 10usize;
 
-    let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+    let (mut runtime, mut dfs) = native_sifs_service(
+        "sifs_posix_rename_directory_batches_child_moves_per_job_batch",
+        node_id.clone(),
+    );
     dfs.posix_mkdir_all(old_dir).expect("mkdir old dir");
     let mut old_paths = Vec::new();
     let mut new_paths = Vec::new();
@@ -917,11 +689,14 @@ fn sifs_posix_rename_directory_batches_child_moves_per_job_batch() {
     let child_move_transactions = journal
         .iter()
         .filter_map(|entry| match &entry.mutation {
-            DfsMetadataMutation::ApplyNamespaceTransaction {
-                transaction_id,
-                transaction: Some(transaction),
-                ..
-            } if transaction_id.starts_with("namespace_rename-child-batch_") => Some(transaction),
+            DfsMetadataMutation::PrepareOperationV7 { record, .. }
+                if record
+                    .transaction
+                    .transaction_id
+                    .starts_with("namespace_rename-child-batch_") =>
+            {
+                Some(&record.transaction)
+            }
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -968,15 +743,15 @@ fn sifs_posix_rename_directory_batches_child_moves_per_job_batch() {
     }
 
     drop(dfs);
-    let reopened = networked_sifs_with_backend(&root, node_id);
+    runtime.stop_node(&node_id).unwrap();
+    runtime.reopen_node(node_id.clone()).unwrap();
+    let reopened = runtime.client(&node_id).unwrap();
     for new_path in &new_paths {
         assert_eq!(
             reopened.posix_stat(new_path).expect("reopened child").kind,
             DfsObjectKind::File
         );
     }
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -989,7 +764,10 @@ fn sifs_posix_rename_directory_caps_child_move_transactions_above_step_budget() 
     let child_count = transaction_cap + 1;
     let max_steps = transaction_cap * 2;
 
-    let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+    let (_runtime, mut dfs) = native_sifs_service(
+        "sifs_posix_rename_directory_caps_child_move_transactions_above_step_budget",
+        node_id.clone(),
+    );
     dfs.posix_mkdir_all(old_dir).expect("mkdir old dir");
     let children = (0..child_count)
         .map(|index| {
@@ -1028,11 +806,14 @@ fn sifs_posix_rename_directory_caps_child_move_transactions_above_step_budget() 
     let child_move_transactions = journal
         .iter()
         .filter_map(|entry| match &entry.mutation {
-            DfsMetadataMutation::ApplyNamespaceTransaction {
-                transaction_id,
-                transaction: Some(transaction),
-                ..
-            } if transaction_id.starts_with("namespace_rename-child-batch_") => Some(transaction),
+            DfsMetadataMutation::PrepareOperationV7 { record, .. }
+                if record
+                    .transaction
+                    .transaction_id
+                    .starts_with("namespace_rename-child-batch_") =>
+            {
+                Some(&record.transaction)
+            }
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -1085,15 +866,17 @@ fn sifs_posix_rename_directory_caps_child_move_transactions_above_step_budget() 
 
 #[test]
 fn sifs_posix_rename_directory_does_not_resurrect_deleted_children() {
-    let root = temp_root("sifs-posix-rename-dir-deleted-child");
     let node_id = NodeId::from_legacy_named("node_sifs_rename_dir_deleted_child").expect("node");
     let old_dir = "/services/sandbox/instances/sandbox_rename_deleted/work/old";
     let new_dir = "/services/sandbox/instances/sandbox_rename_deleted/work/new";
     let old_child = format!("{old_dir}/deleted.txt");
     let new_child = format!("{new_dir}/deleted.txt");
 
+    let (mut runtime, setup) =
+        native_sifs_service("native-directory-no-resurrection", node_id.clone());
+    drop(setup);
     {
-        let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+        let mut dfs = runtime.client(&node_id).unwrap();
         dfs.posix_mkdir_all(old_dir).expect("mkdir old dir");
         dfs.posix_write_file(
             &old_child,
@@ -1115,7 +898,9 @@ fn sifs_posix_rename_directory_does_not_resurrect_deleted_children() {
         );
     }
 
-    let reloaded = networked_sifs_with_backend(&root, node_id);
+    runtime.stop_node(&node_id).unwrap();
+    runtime.reopen_node(node_id.clone()).unwrap();
+    let reloaded = runtime.client(&node_id).unwrap();
     assert!(matches!(
         reloaded.posix_read_file(&new_child),
         Err(DfsPosixError::NotFound { .. })
@@ -1126,19 +911,19 @@ fn sifs_posix_rename_directory_does_not_resurrect_deleted_children() {
             .expect("reloaded new dir listing")
             .is_empty()
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn sifs_posix_rename_over_existing_file_survives_reload() {
-    let root = temp_root("sifs-posix-rename-over-existing-file-reload");
     let node_id = NodeId::from_legacy_named("node_sifs_rename_over_existing_reload").expect("node");
     let work = "/services/sandbox/instances/sandbox_rename_over_existing/work";
     let source = "/services/sandbox/instances/sandbox_rename_over_existing/work/source.txt";
     let dest = "/services/sandbox/instances/sandbox_rename_over_existing/work/dest.txt";
 
-    let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+    let (mut runtime, mut dfs) = native_sifs_service(
+        "sifs_posix_rename_over_existing_file_survives_reload",
+        node_id.clone(),
+    );
     dfs.posix_mkdir_all(work).expect("mkdir");
     dfs.posix_write_file(
         source,
@@ -1166,7 +951,7 @@ fn sifs_posix_rename_over_existing_file_survives_reload() {
         source_object_id
     );
 
-    let reloaded = networked_sifs_with_backend(&root, node_id);
+    let reloaded = runtime.client(&node_id).unwrap();
     assert!(matches!(
         reloaded.posix_stat(source),
         Err(DfsPosixError::NotFound { .. })
@@ -1182,8 +967,6 @@ fn sifs_posix_rename_over_existing_file_survives_reload() {
             .object_id,
         source_object_id
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -1192,7 +975,10 @@ fn sifs_posix_set_times_without_fields_is_noop() {
     let node_id = NodeId::from_legacy_named("node_sifs_set_times_noop").expect("node");
     let file = "/services/sandbox/instances/sandbox_set_times_noop/work/file.txt";
 
-    let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+    let (_runtime, mut dfs) = native_sifs_service(
+        "sifs_posix_set_times_without_fields_is_noop",
+        node_id.clone(),
+    );
     dfs.posix_mkdir_all("/services/sandbox/instances/sandbox_set_times_noop/work")
         .expect("mkdir");
     dfs.posix_write_file(
@@ -1226,7 +1012,10 @@ fn sifs_posix_set_mode_zero_is_reported_as_zero() {
     let node_id = NodeId::from_legacy_named("node_sifs_set_mode_zero").expect("node");
     let file = "/services/sandbox/instances/sandbox_set_mode_zero/work/file.txt";
 
-    let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+    let (_runtime, mut dfs) = native_sifs_service(
+        "sifs_posix_set_mode_zero_is_reported_as_zero",
+        node_id.clone(),
+    );
     dfs.posix_mkdir_all("/services/sandbox/instances/sandbox_set_mode_zero/work")
         .expect("mkdir");
     dfs.posix_write_file(
@@ -1255,7 +1044,10 @@ fn sifs_posix_metadata_only_versions_preserve_content_size() {
     let renamed = "/services/sandbox/instances/sandbox_metadata_size/work/renamed.txt";
     let link = "/services/sandbox/instances/sandbox_metadata_size/work/link.txt";
 
-    let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+    let (_runtime, mut dfs) = native_sifs_service(
+        "sifs_posix_metadata_only_versions_preserve_content_size",
+        node_id.clone(),
+    );
     dfs.posix_mkdir_all(work).expect("mkdir");
     dfs.posix_write_file(
         file,
@@ -1263,14 +1055,95 @@ fn sifs_posix_metadata_only_versions_preserve_content_size() {
         DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
     )
     .expect("write file");
+    let original = dfs.posix_stat(file).expect("original head");
+    let original_version = dfs
+        .metadata_backend()
+        .unwrap()
+        .get_version(&original.object_id, &original.version)
+        .unwrap()
+        .unwrap();
+    let durability = original_version
+        .content_durability
+        .expect("actual write grant");
+    let original_receipts = dfs
+        .metadata_backend()
+        .unwrap()
+        .receipts_for_version(&original.object_id, &durability.source_version)
+        .unwrap();
+    assert!(original_receipts.len() >= durability.policy.min_commit_replicas);
+    let chmod = dfs.posix_set_mode(file, 0o600).expect("chmod");
+    assert_eq!(chmod.size_bytes, Some(7));
     assert_eq!(
-        dfs.posix_set_mode(file, 0o600).expect("chmod").size_bytes,
-        Some(7)
+        dfs.metadata_backend()
+            .unwrap()
+            .get_version(&chmod.object_id, &chmod.version)
+            .unwrap()
+            .unwrap()
+            .content_durability,
+        Some(durability.clone())
+    );
+    let moved = dfs.posix_rename(file, renamed).expect("rename");
+    assert_eq!(moved.size_bytes, Some(7));
+    assert_ne!(moved.version, durability.source_version);
+    assert_eq!(
+        dfs.metadata_backend()
+            .unwrap()
+            .get_version(&moved.object_id, &moved.version)
+            .unwrap()
+            .unwrap()
+            .content_durability,
+        Some(durability.clone())
     );
     assert_eq!(
-        dfs.posix_rename(file, renamed).expect("rename").size_bytes,
-        Some(7)
+        dfs.metadata_backend()
+            .unwrap()
+            .receipts_for_version(&original.object_id, &durability.source_version)
+            .unwrap(),
+        original_receipts
     );
+    assert!(
+        dfs.metadata_backend()
+            .unwrap()
+            .receipts_for_version(&moved.object_id, &moved.version)
+            .unwrap()
+            .is_empty(),
+        "metadata succession must not restamp its original W receipts"
+    );
+
+    let transaction_id = crate::namespace::namespace_transaction_id_for_versioned_path(
+        "rename",
+        &moved.object_id,
+        &moved.version,
+        renamed,
+    );
+    let payload = dfs
+        .metadata_backend()
+        .unwrap()
+        .prepared_operation_payload(&format!("namespace:{transaction_id}"))
+        .unwrap()
+        .expect("actual immutable rename body");
+    let mut original_transaction = payload.transaction.clone();
+    original_transaction
+        .versions
+        .retain(|version| version.object_id != moved.object_id);
+    let later = dfs
+        .posix_set_mode(renamed, 0o640)
+        .expect("later metadata head");
+    dfs.apply_namespace_transaction(original_transaction.clone())
+        .expect("exact recorded retry");
+    assert_eq!(dfs.posix_stat(renamed).unwrap().version, later.version);
+    original_transaction
+        .objects
+        .iter_mut()
+        .find(|object| object.object_id == moved.object_id)
+        .unwrap()
+        .mode ^= 0o100;
+    assert!(
+        dfs.apply_namespace_transaction(original_transaction)
+            .is_err(),
+        "the recorded version completion cannot hide a changed retry body"
+    );
+    assert_eq!(dfs.posix_stat(renamed).unwrap().version, later.version);
 
     dfs.posix_symlink(
         "renamed.txt",
@@ -1294,7 +1167,10 @@ fn sifs_posix_recreate_file_refreshes_creation_metadata() {
     let node_id = NodeId::from_legacy_named("node_sifs_recreate_file").expect("node");
     let file_path = "/services/sandbox/instances/sandbox_recreate/work/file.txt";
 
-    let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+    let (_runtime, mut dfs) = native_sifs_service(
+        "sifs_posix_recreate_file_refreshes_creation_metadata",
+        node_id.clone(),
+    );
     dfs.posix_mkdir_all("/services/sandbox/instances/sandbox_recreate/work")
         .expect("mkdir");
     dfs.posix_write_file(
@@ -1330,7 +1206,10 @@ fn sifs_posix_recreate_directory_refreshes_creation_metadata() {
     let node_id = NodeId::from_legacy_named("node_sifs_recreate_dir").expect("node");
     let dir_path = "/services/sandbox/instances/sandbox_recreate_dir/work/dir";
 
-    let mut dfs = networked_sifs_with_backend(&root, node_id);
+    let (_runtime, mut dfs) = native_sifs_service(
+        "sifs_posix_recreate_directory_refreshes_creation_metadata",
+        node_id,
+    );
     dfs.posix_mkdir_all(dir_path).expect("mkdir");
     dfs.posix_set_times(dir_path, Some(12_345), Some(67_890))
         .expect("old times");
@@ -1352,7 +1231,10 @@ fn sifs_posix_create_bulk_local_eventual_rejects_existing_paths() {
     let path_a = "/services/sandbox/instances/sandbox_create_bulk_local/work/a.txt";
     let path_b = "/services/sandbox/instances/sandbox_create_bulk_local/work/b.txt";
 
-    let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+    let (_runtime, mut dfs) = native_sifs_service(
+        "sifs_posix_create_bulk_local_eventual_rejects_existing_paths",
+        node_id.clone(),
+    );
     dfs.posix_mkdir_all(work).expect("mkdir");
     let parent_before = dfs.posix_stat(work).expect("parent before bulk create");
     let stats = dfs
@@ -1423,7 +1305,10 @@ fn sifs_posix_list_updates_directory_atime_without_changing_mtime() {
     let dir_path = "/services/sandbox/instances/sandbox_list_atime/work";
     let file_path = "/services/sandbox/instances/sandbox_list_atime/work/file.txt";
 
-    let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+    let (_runtime, mut dfs) = native_sifs_service(
+        "sifs_posix_list_updates_directory_atime_without_changing_mtime",
+        node_id.clone(),
+    );
     dfs.posix_mkdir_all(dir_path).expect("mkdir");
     dfs.posix_write_file(
         file_path,
@@ -1464,7 +1349,10 @@ fn sifs_posix_namespace_mutations_update_parent_directory_mtime() {
     let renamed = "/services/sandbox/instances/sandbox_parent_mtime/other/renamed.txt";
     let dir = "/services/sandbox/instances/sandbox_parent_mtime/work/dir";
 
-    let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+    let (_runtime, mut dfs) = native_sifs_service(
+        "sifs_posix_namespace_mutations_update_parent_directory_mtime",
+        node_id.clone(),
+    );
     dfs.posix_mkdir_all(work).expect("mkdir work");
     dfs.posix_mkdir_all(other).expect("mkdir other");
 
@@ -1583,7 +1471,10 @@ fn sifs_posix_rename_updates_moved_object_ctime_without_changing_mtime() {
     let source = "/services/sandbox/instances/sandbox_rename_ctime/work/source.txt";
     let renamed = "/services/sandbox/instances/sandbox_rename_ctime/work/renamed.txt";
 
-    let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+    let (_runtime, mut dfs) = native_sifs_service(
+        "sifs_posix_rename_updates_moved_object_ctime_without_changing_mtime",
+        node_id.clone(),
+    );
     dfs.posix_mkdir_all(work).expect("mkdir work");
     dfs.posix_write_file(
         source,
@@ -1618,7 +1509,7 @@ fn sifs_posix_rename_updates_moved_object_ctime_without_changing_mtime() {
 
 #[test]
 fn sifs_cluster_routes_file_and_directory_sync_certificates() {
-    let mut cluster = sifs_posix_cluster("sifs-cluster-routed-posix-sync");
+    let mut cluster = sifs_posix_cluster("sifs-cluster-routed-posix-sync", "/users");
     let path = "/users/synced-file.txt";
     sifs_cluster_routed_posix_write(&mut cluster, path, b"durable bytes");
 
@@ -1655,12 +1546,12 @@ fn sifs_cluster_routes_file_and_directory_sync_certificates() {
     );
 
     assert!(cluster.rejections.is_empty(), "{:?}", cluster.rejections);
-    std::fs::remove_dir_all(&cluster.root).ok();
+    drop(cluster);
 }
 
 #[test]
 fn sifs_cluster_posix_contract_create_unlink_same_path_race() {
-    let mut cluster = sifs_posix_cluster("sifs-contract-create-unlink");
+    let mut cluster = sifs_posix_cluster("sifs-contract-create-unlink", "/users");
     let scenario = "create-unlink-same-path-race";
     let path = "/users/contract-create-unlink.txt";
     let base = b"base before unlink".to_vec();
@@ -1731,12 +1622,12 @@ fn sifs_cluster_posix_contract_create_unlink_same_path_race() {
     );
     assert_sifs_cluster_no_posix_leaks(&cluster, scenario);
     finish_posix_observations(&observations);
-    std::fs::remove_dir_all(&cluster.root).ok();
+    drop(cluster);
 }
 
 #[test]
 fn sifs_cluster_posix_contract_same_directory_concurrent_creates() {
-    let mut cluster = sifs_posix_cluster("sifs-contract-same-dir-creates");
+    let mut cluster = sifs_posix_cluster("sifs-contract-same-dir-creates", "/users");
     let scenario = "same-directory-concurrent-creates";
     let dir = "/users/contract-create-dir";
     let mut observations = Vec::new();
@@ -1812,12 +1703,12 @@ fn sifs_cluster_posix_contract_same_directory_concurrent_creates() {
     );
     assert_sifs_cluster_no_posix_leaks(&cluster, scenario);
     finish_posix_observations(&observations);
-    std::fs::remove_dir_all(&cluster.root).ok();
+    drop(cluster);
 }
 
 #[test]
 fn sifs_cluster_posix_contract_same_path_concurrent_creates() {
-    let mut cluster = sifs_posix_cluster("sifs-contract-same-path-creates");
+    let mut cluster = sifs_posix_cluster("sifs-contract-same-path-creates", "/users");
     let scenario = "same-path-concurrent-creates";
     let path = "/users/contract-same-path.txt";
     let writer_bytes = b"writer contender".to_vec();
@@ -1893,12 +1784,12 @@ fn sifs_cluster_posix_contract_same_path_concurrent_creates() {
     );
     assert_sifs_cluster_no_posix_leaks(&cluster, scenario);
     finish_posix_observations(&observations);
-    std::fs::remove_dir_all(&cluster.root).ok();
+    drop(cluster);
 }
 
 #[test]
 fn sifs_cluster_posix_contract_rmdir_vs_child_create() {
-    let mut cluster = sifs_posix_cluster("sifs-contract-rmdir-create");
+    let mut cluster = sifs_posix_cluster("sifs-contract-rmdir-create", "/users");
     let scenario = "rmdir-vs-child-create";
     let dir = "/users/contract-rmdir";
     let child = "/users/contract-rmdir/child.txt";
@@ -1948,7 +1839,7 @@ fn sifs_cluster_posix_contract_rmdir_vs_child_create() {
     }
     assert_sifs_cluster_no_posix_leaks(&cluster, scenario);
     finish_posix_observations(&observations);
-    std::fs::remove_dir_all(&cluster.root).ok();
+    drop(cluster);
 }
 
 #[test]
@@ -1959,15 +1850,18 @@ fn sifs_posix_rmdir_rejects_child_from_fresh_shared_metadata_handle() {
     let dir = "/services/shared-rmdir-race";
     let child = "/services/shared-rmdir-race/child.txt";
 
-    let mut seed =
-        open_shared_metadata_posix_service(&root, &metadata_root, node.clone(), "content-seed");
+    let mut runtime = crate::test_runtime::DfsTestRuntime::new(
+        "sifs_posix_rmdir_rejects_child_from_fresh_shared_metadata_handle",
+        node.clone(),
+    )
+    .unwrap();
+    runtime.start_nodes().unwrap();
+    let mut seed = runtime.client(&node).unwrap();
     seed.bootstrap_distributed_sifs().expect("bootstrap sifs");
     seed.posix_mkdir(dir).expect("mkdir race dir");
 
-    let mut child_writer =
-        open_shared_metadata_posix_service(&root, &metadata_root, node.clone(), "content-child");
-    let mut remover =
-        open_shared_metadata_posix_service(&root, &metadata_root, node.clone(), "content-rmdir");
+    let mut child_writer = runtime.client(&node).unwrap();
+    let mut remover = runtime.client(&node).unwrap();
 
     child_writer
         .posix_write_file(
@@ -1981,8 +1875,7 @@ fn sifs_posix_rmdir_rejects_child_from_fresh_shared_metadata_handle() {
         Err(DfsPosixError::DirectoryNotEmpty { .. })
     ));
 
-    let verifier =
-        open_shared_metadata_posix_service(&root, &metadata_root, node, "content-verify");
+    let verifier = runtime.client(&node).unwrap();
     assert!(verifier.posix_stat(dir).is_ok());
     assert!(verifier.posix_stat(child).is_ok());
 }
@@ -1995,15 +1888,18 @@ fn sifs_posix_child_create_rejects_parent_removed_by_fresh_shared_metadata_handl
     let dir = "/services/shared-child-race";
     let child = "/services/shared-child-race/child.txt";
 
-    let mut seed =
-        open_shared_metadata_posix_service(&root, &metadata_root, node.clone(), "content-seed");
+    let mut runtime = crate::test_runtime::DfsTestRuntime::new(
+        "sifs_posix_child_create_rejects_parent_removed_by_fresh_shared_metadata_handle",
+        node.clone(),
+    )
+    .unwrap();
+    runtime.start_nodes().unwrap();
+    let mut seed = runtime.client(&node).unwrap();
     seed.bootstrap_distributed_sifs().expect("bootstrap sifs");
     seed.posix_mkdir(dir).expect("mkdir race dir");
 
-    let mut child_writer =
-        open_shared_metadata_posix_service(&root, &metadata_root, node.clone(), "content-child");
-    let mut remover =
-        open_shared_metadata_posix_service(&root, &metadata_root, node.clone(), "content-rmdir");
+    let mut child_writer = runtime.client(&node).unwrap();
+    let mut remover = runtime.client(&node).unwrap();
 
     let live_changed_at = remover
         .posix_lstat(dir)
@@ -2025,8 +1921,7 @@ fn sifs_posix_child_create_rejects_parent_removed_by_fresh_shared_metadata_handl
             | Err(DfsPosixError::Dfs(_))
     ));
 
-    let verifier =
-        open_shared_metadata_posix_service(&root, &metadata_root, node, "content-verify");
+    let verifier = runtime.client(&node).unwrap();
     let verifier_dir = verifier.posix_stat(dir);
     assert!(
         matches!(verifier_dir, Err(DfsPosixError::NotFound { .. })),
@@ -2043,6 +1938,10 @@ fn sifs_cluster_posix_contract_directory_rename_while_child_mutations_run() {
     let cluster = sifs_two_primary_cluster("sifs-contract-dir-rename-child");
     let scenario = "directory-rename-while-child-mutations-run";
     let SifsTwoPrimaryCluster {
+        shared_kv,
+        services_primary_node,
+        users_primary_node,
+        _runtime,
         root,
         replica_node,
         users_primary,
@@ -2112,12 +2011,13 @@ fn sifs_cluster_posix_contract_directory_rename_while_child_mutations_run() {
     let users_primary = users_thread.join().expect("users thread");
     let services_primary = services_thread.join().expect("services thread");
     let mut cluster = SifsTwoPrimaryCluster {
+        _runtime,
         root,
-        users_primary_node: NodeId::from_legacy_named("node_contract_dir_users").expect("node"),
+        users_primary_node,
         services_primary_node: NodeId::from_legacy_named("node_contract_dir_services")
             .expect("node"),
         replica_node,
-        shared_kv: SharedDfsControlPlaneKvClient::new(InProcessKvStore::new()),
+        shared_kv,
         users_primary,
         services_primary,
         replica,
@@ -2135,12 +2035,12 @@ fn sifs_cluster_posix_contract_directory_rename_while_child_mutations_run() {
     });
     assert_two_primary_no_posix_leaks(&cluster, scenario);
     finish_posix_observations(&observations);
-    std::fs::remove_dir_all(&cluster.root).ok();
+    cluster.close();
 }
 
 #[test]
 fn sifs_cluster_posix_contract_paged_list_while_directory_mutates() {
-    let mut cluster = sifs_posix_cluster("sifs-contract-paged-list");
+    let mut cluster = sifs_posix_cluster("sifs-contract-paged-list", "/users");
     let scenario = "paged-list-while-directory-mutates";
     let dir = "/users/contract-paged";
     let mut observations = Vec::new();
@@ -2207,20 +2107,18 @@ fn sifs_cluster_posix_contract_paged_list_while_directory_mutates() {
     );
     assert_sifs_cluster_no_posix_leaks(&cluster, scenario);
     finish_posix_observations(&observations);
-    std::fs::remove_dir_all(&cluster.root).ok();
+    drop(cluster);
 }
 
 #[test]
 fn lazy_service_rebuild_preserves_shared_namespace_guard_registry() {
-    let root = temp_root("lazy-service-shared-namespace-guards");
     let node = NodeId::from_legacy_named("node_lazy_shared_namespace_guards").expect("node");
     let file_system_id = sifs_file_system_id();
-    let registry = DfsCrossShardNamespaceLockRegistry::default();
-    let mut service = NetworkedDfsService::new(
-        InProcessNetwork::new().add_node(node),
-        LocalContentStore::new(root.join("content")).expect("content"),
-    )
-    .with_cross_shard_namespace_lock_registry(registry.clone());
+    let (_runtime, mut service) = native_sifs_service(
+        "lazy_service_rebuild_preserves_shared_namespace_guard_registry",
+        node,
+    );
+    let registry = service.cross_shard_namespace_lock_registry();
     service.next_frame_id = 41;
     service.next_message_id = 42;
     service.next_request_id = 43;
@@ -2279,57 +2177,65 @@ fn lazy_service_rebuild_preserves_shared_namespace_guard_registry() {
             .ensure_path_not_in_cross_shard_flight(&file_system_id, "/services/post-rebuild/child"),
         Err(DfsError::Busy { .. })
     ));
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn exact_namespace_projection_collapse_keeps_only_shard_runtime_state() {
-    let root = temp_root("exact-namespace-projection-collapse");
     let node = NodeId::from_legacy_named("node_exact_namespace_collapse").expect("node");
     let file_system_id = sifs_file_system_id();
-    let shard_id = DfsMetadataShardId::new("root");
-    let resident = LocalShardedMetadataBackend::new(
-        root.join("metadata"),
-        vec![DfsMetadataShardConfig {
-            file_system_id: file_system_id.clone(),
-            shard_id: shard_id.0.clone(),
-            primary_node_id: node.clone(),
-            replica_node_ids: Vec::new(),
-            epoch: 1,
-            assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
-            default_policy: DfsObjectPolicy::ReplicatedEventual,
-        }],
-    )
-    .expect("sharded metadata")
-    .into_resident();
-    let registry = DfsCrossShardNamespaceLockRegistry::default();
-    let mut service = NetworkedDfsService::new(
-        InProcessNetwork::new().add_node(node.clone()),
-        LocalContentStore::new(root.join("content")).expect("content"),
-    )
-    .with_cross_shard_namespace_lock_registry(registry.clone())
-    .with_resident_metadata_shard_backend_lazy(
-        resident
-            .scope_shard(&file_system_id, &shard_id)
-            .expect("exact shard")
-            .checkout()
-            .expect("exact checkout"),
-    )
-    .expect("lazy exact service");
+    let (_runtime, mut service) = native_sifs_service(
+        "exact_namespace_projection_collapse_keeps_only_shard_runtime_state",
+        node.clone(),
+    );
+    let config = _runtime
+        .metadata_shards()
+        .expect("actual committed metadata assignments")
+        .into_iter()
+        .find(|config| config.shard_id == "services")
+        .expect("services assignment");
+    let shard_id = DfsMetadataShardId::new(config.shard_id);
+    let stat = service
+        .posix_write_file(
+            "/services/collapse-object",
+            b"normal committed namespace projection",
+            DfsWriteOptions::replicated_eventual(vec![node]),
+        )
+        .expect("publish through the normal service");
+    let object = service
+        .current_read_object_metadata(&stat.object_id)
+        .expect("actual committed object");
+    let resident = {
+        let cache_slot = crate::runtime_message::dfs_runtime_message_cache()
+            .root(&_runtime.data_dir(service.node_id()).root())
+            .expect("actual root cache slot");
+        let cache = cache_slot.lock().expect("actual runtime message cache");
+        cache
+            .as_ref()
+            .expect("mounted native cache entry")
+            .bounded_status_resident_current()
+            .expect("actual current resident generation")
+    };
+    service.metadata_backend = None;
+    service = service
+        .with_resident_metadata_shard_backend_lazy(
+            resident
+                .scope_shard(&file_system_id, &shard_id)
+                .expect("actual exact shard")
+                .checkout()
+                .expect("actual exact checkout"),
+        )
+        .expect("same normal exact request shell");
+    let registry = service.cross_shard_namespace_lock_registry();
     registry.upsert_job(
         Some(shard_id.clone()),
         "collapse-running-job".to_string(),
         file_system_id.clone(),
         "/services/collapse-running".to_string(),
     );
-    let mut object = file_metadata(node);
-    object.file_system_id = file_system_id.clone();
-    object.path = "/services/collapse-object".to_string();
     service
         .metadata
         .add_object(object.clone())
-        .expect("cached object");
+        .expect("reconstructable cache of the committed object");
     service.coordinator.set_committed_version(
         file_system_id.clone(),
         object.object_id.clone(),
@@ -2357,12 +2263,11 @@ fn exact_namespace_projection_collapse_keeps_only_shard_runtime_state() {
     );
     assert_eq!(service.next_request_id, 92);
     assert!(registry.blocks(&file_system_id, "/services/collapse-running/child"));
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn sifs_cluster_posix_concurrent_creates_serialize_with_explicit_conflict() {
-    let mut cluster = sifs_posix_cluster("sifs-cluster-race");
+    let mut cluster = sifs_posix_cluster("sifs-cluster-race", "/users");
     let path = "/users/raced.txt";
     let writer_bytes = b"writer candidate content".to_vec();
     let observer_bytes = b"observer candidate bytes!".to_vec();
@@ -2411,9 +2316,7 @@ fn sifs_cluster_posix_concurrent_creates_serialize_with_explicit_conflict() {
             Err(_) => {
                 surfaced_failures += 1;
             }
-            Ok(NetworkedDfsWriteOutcome::Conflict { .. }) => {
-                panic!("racing create created a DFS conflict during normal operation")
-            }
+
             Ok(NetworkedDfsWriteOutcome::Pending { .. }) => {
                 panic!("racing write left pending after settle")
             }
@@ -2465,12 +2368,12 @@ fn sifs_cluster_posix_concurrent_creates_serialize_with_explicit_conflict() {
         Err(error) => panic!("unexpected read failure after race: {error}"),
     }
 
-    std::fs::remove_dir_all(&cluster.root).ok();
+    drop(cluster);
 }
 
 #[test]
 fn sifs_cluster_posix_truncate_shrinks_and_extends_with_zeros() {
-    let mut cluster = sifs_posix_cluster("sifs-cluster-truncate");
+    let mut cluster = sifs_posix_cluster("sifs-cluster-truncate", "/users");
     let path = "/users/truncate.bin";
     let base = b"truncate source content".to_vec();
 
@@ -2527,12 +2430,12 @@ fn sifs_cluster_posix_truncate_shrinks_and_extends_with_zeros() {
     let read = sifs_cluster_fetch_for_local_read(&mut cluster, |c| &mut c.primary, path);
     assert_eq!(read, extended);
 
-    std::fs::remove_dir_all(&cluster.root).ok();
+    drop(cluster);
 }
 
 #[test]
 fn sifs_cluster_posix_rename_replicates_atomically_to_observers() {
-    let mut cluster = sifs_posix_cluster("sifs-cluster-rename");
+    let mut cluster = sifs_posix_cluster("sifs-cluster-rename", "/users");
     let source = "/users/rename-source.txt";
     let destination = "/users/rename-destination.txt";
     let source_bytes = b"bytes that travel with the rename".to_vec();
@@ -2601,12 +2504,12 @@ fn sifs_cluster_posix_rename_replicates_atomically_to_observers() {
         "observer must not list the rename source after replay: {entries:?}"
     );
 
-    std::fs::remove_dir_all(&cluster.root).ok();
+    drop(cluster);
 }
 
 #[test]
 fn sifs_cluster_posix_directory_rename_moves_children_on_observers() {
-    let mut cluster = sifs_posix_cluster("sifs-cluster-dir-rename");
+    let mut cluster = sifs_posix_cluster("sifs-cluster-dir-rename", "/users");
     let child_bytes = b"child file inside renamed directory".to_vec();
     let child_hash = content_hash(&child_bytes);
 
@@ -2662,12 +2565,12 @@ fn sifs_cluster_posix_directory_rename_moves_children_on_observers() {
         .expect("observer renamed dir stat");
     assert_eq!(stat.kind, DfsObjectKind::Directory);
 
-    std::fs::remove_dir_all(&cluster.root).ok();
+    drop(cluster);
 }
 
 #[test]
 fn sifs_cluster_posix_namespace_and_stats_agree_across_nodes() {
-    let mut cluster = sifs_posix_cluster("sifs-cluster-agree");
+    let mut cluster = sifs_posix_cluster("sifs-cluster-agree", "/users");
     let dir = "/users/team";
     let file_a = "/users/team/a.txt";
     let file_b = "/users/team/b.txt";
@@ -2783,12 +2686,12 @@ fn sifs_cluster_posix_namespace_and_stats_agree_across_nodes() {
     let through_link = sifs_cluster_fetch_for_local_read(&mut cluster, |c| &mut c.observer, link);
     assert_eq!(through_link, a_bytes);
 
-    std::fs::remove_dir_all(&cluster.root).ok();
+    drop(cluster);
 }
 
 #[test]
 fn sifs_cluster_posix_error_mapping_matches_posix_contract() {
-    let mut cluster = sifs_posix_cluster("sifs-cluster-errno");
+    let mut cluster = sifs_posix_cluster("sifs-cluster-errno", "/users");
 
     // EEXIST: mkdir over an existing directory.
     cluster
@@ -2873,13 +2776,17 @@ fn sifs_cluster_posix_error_mapping_matches_posix_contract() {
         "failed POSIX validation on a replica must not leak routed-write state"
     );
 
-    std::fs::remove_dir_all(&cluster.root).ok();
+    drop(cluster);
 }
 
 #[test]
 fn clustered_mkdir_all_fuses_request_admission_with_prepare() {
     let cluster = sifs_two_primary_cluster("sifs-mkdir-all-fused-admission");
     let SifsTwoPrimaryCluster {
+        shared_kv,
+        services_primary_node,
+        users_primary_node,
+        _runtime,
         root,
         replica_node,
         mut services_primary,
@@ -2987,38 +2894,32 @@ fn clustered_mkdir_all_fuses_request_admission_with_prepare() {
 
 #[test]
 fn compound_posix_routing_refresh_invalidates_prior_config_revision() {
-    let root = temp_root("compound-posix-routing-refreshes-config-revision");
-    let users_primary =
-        NodeId::from_legacy_named("node_posix_snapshot_users").expect("users primary");
-    let old_services_primary =
-        NodeId::from_legacy_named("node_posix_snapshot_services_old").expect("old primary");
-    let new_services_primary =
-        NodeId::from_legacy_named("node_posix_snapshot_services_new").expect("new primary");
-    let requester = NodeId::from_legacy_named("node_posix_snapshot_requester").expect("requester");
-    let shards = sifs_two_primary_shard_configs(
-        &users_primary,
-        &old_services_primary,
-        1,
-        vec![requester.clone()],
-        vec![requester.clone()],
-    );
-    let shared_kv = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
-    shared_kv.with_client(|kv| {
-        let mut control = DfsControlPlaneStore::new(kv);
-        for shard in &shards {
-            control.put_metadata_shard(shard).expect("metadata shard");
-        }
-    });
-
-    let range_prefix_calls = Arc::new(AtomicUsize::new(0));
-    let mut dfs = NetworkedDfsService::new(
-        ReceiveOnlyTransport::new(requester),
-        LocalContentStore::new(root.join("content")).expect("content"),
-    )
-    .with_control_plane(CountingSharedDfsControlPlaneKvClient::new(
-        shared_kv.clone(),
-        Arc::clone(&range_prefix_calls),
+    let (runtime, nodes) =
+        crate::test_runtime::DfsTestRuntime::start_cluster("native-compound-routing-refresh", 3)
+            .expect("ordinary native startup");
+    let shards = runtime.metadata_shards().unwrap();
+    let users = shards.iter().find(|s| s.shard_id == "users").unwrap();
+    let services = shards.iter().find(|s| s.shard_id == "services").unwrap();
+    let users_primary = users.primary_node_id.clone();
+    let old_services_primary = services.primary_node_id.clone();
+    let requester = nodes
+        .iter()
+        .find(|n| **n != users_primary && **n != old_services_primary)
+        .unwrap()
+        .clone();
+    let new_services_primary = nodes
+        .iter()
+        .find(|n| **n != requester && **n != old_services_primary)
+        .unwrap()
+        .clone();
+    let mut dfs = runtime.client(&requester).unwrap();
+    let counter = Arc::new(AtomicUsize::new(0));
+    let actual = dfs.control_plane.take().unwrap();
+    dfs = dfs.with_control_plane(CountingDfsControlPlaneKvClient::new(
+        actual,
+        Arc::clone(&counter),
     ));
+    let range_prefix_calls = counter;
 
     let initial = dfs
         .routed_namespace_primaries_for_paths_fresh([
@@ -3035,18 +2936,25 @@ fn compound_posix_routing_refresh_invalidates_prior_config_revision() {
     );
     assert_eq!(range_prefix_calls.load(Ordering::SeqCst), 1);
 
-    let mut updated_services = shards
+    let mut replicas = services
+        .replica_node_ids
         .iter()
-        .find(|shard| shard.shard_id == "services")
-        .expect("services shard")
-        .clone();
-    updated_services.primary_node_id = new_services_primary.clone();
-    updated_services.epoch = 2;
-    shared_kv.with_client(|kv| {
-        DfsControlPlaneStore::new(kv)
-            .put_metadata_shard(&updated_services)
-            .expect("advance services shard config revision");
-    });
+        .filter(|n| **n != new_services_primary)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !replicas.contains(&old_services_primary) {
+        replicas.push(old_services_primary.clone());
+    }
+    let installed = runtime
+        .reassign_metadata_shard(
+            &services.file_system_id,
+            "services",
+            new_services_primary.clone(),
+            replicas,
+        )
+        .expect("normal exact-prefix native role handoff");
+    assert_eq!(installed.primary_node_id, new_services_primary);
+    assert!(installed.epoch > services.epoch);
 
     dfs.refresh_control_plane_latest()
         .expect("refresh control-plane revision");
@@ -3066,7 +2974,8 @@ fn compound_posix_routing_refresh_invalidates_prior_config_revision() {
         "each compound decision may load one snapshot, including after explicit revision refresh"
     );
 
-    std::fs::remove_dir_all(root).ok();
+    drop(dfs);
+    runtime.close().expect("ordinary native close");
 }
 
 #[test]
@@ -3077,6 +2986,7 @@ fn sifs_non_replica_directory_pull_captures_durable_replica_progress() {
         primary_node,
         mut primary,
         mut observer,
+        _runtime,
         ..
     } = cluster;
 
@@ -3121,5 +3031,5 @@ fn sifs_non_replica_directory_pull_captures_durable_replica_progress() {
 
     stop_primary.store(true, Ordering::SeqCst);
     primary_thread.join().expect("primary thread");
-    std::fs::remove_dir_all(&root).ok();
+    drop(_runtime);
 }

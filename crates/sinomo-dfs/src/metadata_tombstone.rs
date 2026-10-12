@@ -71,18 +71,6 @@ pub(crate) fn tombstone_has_live_references(
             .next()
             .is_some()
         || tables
-            .conflicts
-            .range((Included((object_id.clone(), String::new())), Unbounded))
-            .take_while(|((record_object_id, _), _)| record_object_id == object_id)
-            .next()
-            .is_some()
-        || tables
-            .visible_commits
-            .range((Included((object_id.clone(), id_lower_bound())), Unbounded))
-            .take_while(|((record_object_id, _), _)| record_object_id == object_id)
-            .next()
-            .is_some()
-        || tables
             .hardlinks
             .iter()
             .any(|((target_object_id, hardlink_object_id), path_record)| {
@@ -297,7 +285,6 @@ mod tests {
 
         tables.apply(DfsMetadataTableOp::PutVersion {
             version: DfsObjectVersionRecord {
-                metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
                 content_durability: None,
                 retention: Default::default(),
                 module_metadata: Default::default(),

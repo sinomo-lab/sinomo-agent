@@ -9526,6 +9526,7 @@ dependencies = [
  "blake3",
  "fs2",
  "serde",
+ "serde_bytes",
  "serde_json",
  "sinomo-config",
  "sinomo-core",
@@ -9847,7 +9848,6 @@ dependencies = [
  "sinomo-config",
  "sinomo-core",
  "sinomo-device",
- "sinomo-dfs-history",
  "sinomo-module",
  "sinomo-testdir",
  "thiserror 2.0.20",
@@ -9921,6 +9921,25 @@ dependencies = [
  "sinomo-dfs",
  "sinomo-module",
  "sinomo-testdir",
+ "time",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "sinomo-dfs-migration"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "fs2",
+ "serde",
+ "serde_bytes",
+ "serde_json",
+ "sinomo-core",
+ "sinomo-dfs",
+ "sinomo-module",
+ "sinomo-testdir",
+ "thiserror 2.0.20",
  "time",
  "tokio",
  "tracing",
@@ -10390,6 +10409,7 @@ dependencies = [
  "sinomo-dfs",
  "sinomo-dfs-attachments",
  "sinomo-dfs-history",
+ "sinomo-dfs-migration",
  "sinomo-dfs-nfs",
  "sinomo-eval",
  "sinomo-installer",
@@ -10463,6 +10483,7 @@ dependencies = [
  "sinomo-dfs",
  "sinomo-module",
  "sinomo-module-api",
+ "sinomo-runtime",
  "sinomo-sandbox",
  "sinomo-testdir",
  "tar",

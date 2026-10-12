@@ -76,6 +76,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+use tracing::Instrument;
 
 pub trait ClusterKvTxnQuorumHost {
     fn refresh_current_cluster_kv_store(
@@ -3455,6 +3456,11 @@ where
     let deadline = started
         .checked_add(options.raft_append_timeout)
         .unwrap_or(started);
+    let projection_span = tracing::trace_span!(
+        target: "sinomo.perf", "cluster.kv.authority_projection",
+        stage = "cluster.kv.authority_projection", request_id = %request.request_id,
+        cluster_root = %paths.root.display(), local_node_id = %state.local_node_id,
+    );
     let mut consensus_state = project_committed_cluster_raft_authority_before_deadline(
         runtime,
         paths,
@@ -3462,6 +3468,7 @@ where
         deadline,
         "project committed cluster Raft config for compact transaction",
     )
+    .instrument(projection_span)
     .await?;
     let allow_forwarding = options.allow_forwarding;
     let mut kv_host = NetworkClusterKvTxnQuorumAsyncHost {
@@ -3471,12 +3478,18 @@ where
         deadline,
         host,
     };
+    let quorum_span = tracing::trace_span!(
+        target: "sinomo.perf", "cluster.kv.compact_quorum",
+        stage = "cluster.kv.compact_quorum", request_id = %request.request_id,
+        cluster_root = %paths.root.display(), local_node_id = %consensus_state.local_node_id,
+    );
     let result = sinomo_kv::commit_cluster_kv_txn_compact_with_quorum_async_with_host(
         &mut consensus_state,
         request,
         sinomo_kv::ClusterKvTxnQuorumDriverOptions { allow_forwarding },
         &mut kv_host,
     )
+    .instrument(quorum_span)
     .await?;
     state.term = state.term.max(consensus_state.term);
     state.kv_revision = state.kv_revision.max(consensus_state.kv_revision);
@@ -5178,7 +5191,13 @@ pub async fn handle_cluster_kv_txn_request_compact_async_with_host<H>(
 where
     H: ClusterKvTxnQuorumAsyncHost,
 {
+    let config_read_span = tracing::trace_span!(
+        target: "sinomo.perf", "cluster.kv.config_read",
+        stage = "cluster.kv.config_read", request_id = %request.request_id,
+        cluster_root = %paths.root.display(),
+    );
     let mut state = read_cluster_state_without_kv_async(runtime, paths)
+        .instrument(config_read_span)
         .await
         .map_err(|error| match error {
             NetworkError::ClusterOrphan => NetworkError::ClusterReadOnly {

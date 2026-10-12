@@ -67,11 +67,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                     NetworkedDfsRangeReadStreamOutcome::Found(stream) => {
                                         DfsReadResult::RangeFound(stream.data)
                                     }
-                                    NetworkedDfsRangeReadStreamOutcome::Conflicted {
-                                        conflicts,
-                                    } => DfsReadResult::Rejected {
-                                        reason: read_conflicts_reason(conflicts),
-                                    },
+
                                     NetworkedDfsRangeReadStreamOutcome::PendingReplication
                                     | NetworkedDfsRangeReadStreamOutcome::NotFound => {
                                         DfsReadResult::NotFound
@@ -99,11 +95,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                     NetworkedDfsReadStreamOutcome::Found(stream) => {
                                         DfsReadResult::Found(stream.data)
                                     }
-                                    NetworkedDfsReadStreamOutcome::Conflicted { conflicts } => {
-                                        DfsReadResult::Rejected {
-                                            reason: read_conflicts_reason(conflicts),
-                                        }
-                                    }
+
                                     NetworkedDfsReadStreamOutcome::PendingReplication
                                     | NetworkedDfsReadStreamOutcome::NotFound => {
                                         DfsReadResult::NotFound
@@ -852,27 +844,91 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         } else {
             None
         };
-        // Authorization can block while another lane commits. The backend
-        // therefore rechecks this read's original version/hash and edits only
-        // its location claims under one writer lock.
-        if let Some(object) = backend_object.as_ref()
-            && self
-                .select_metadata_shard_for_object(object)?
-                .is_none_or(|shard| shard.primary_node_id == self.node_id)
-            && let Some(backend) = self.metadata_backend.as_mut()
-            && let Some(update) = backend.remove_object_location_if_current(
-                object_id,
-                version,
-                content_hash.as_deref(),
-                source_node_id,
-            )?
-        {
-            self.apply_metadata_object_to_service_state(update.object)?;
-            if update.journal_appended {
+        if let Some(object) = backend_object {
+            let scope = match self.metadata_effect_scope_for_object(
+                &object,
+                format!("location-withdrawal:{}", sinomo_core::Id::generate()),
+            ) {
+                Ok(scope) => scope,
+                Err(DfsError::StaleOwnerEpoch { .. }) => return Ok(()),
+                Err(error) => return Err(error),
+            };
+            let _execution = self.acquire_prepared_execution(&scope)?;
+            let backend = self.metadata_backend.as_ref().expect("location backend");
+            let Some(mut current) = backend.get_object_on_shard(&scope.shard_id, object_id)? else {
+                return Ok(());
+            };
+            if current.version != *version || current.content_hash != *content_hash {
+                return Ok(());
+            }
+            let cut = backend
+                .export_shard_table_snapshot(&scope.shard_id)?
+                .ok_or_else(|| DfsError::Metadata {
+                    message: "location withdrawal has no current shard cut".into(),
+                })?;
+            let mut effects = Vec::new();
+            if current.current_locations.contains(source_node_id) {
+                current
+                    .current_locations
+                    .retain(|node| node != source_node_id);
+                effects.push(DfsPreparedMetadataEffect::PutObject {
+                    object: current.clone(),
+                });
+            }
+            if let Some(mut record) = backend.get_version(object_id, version)?
+                && record.content_hash == *content_hash
+                && record.locations.contains(source_node_id)
+            {
+                record.locations.retain(|node| node != source_node_id);
+                effects.push(DfsPreparedMetadataEffect::PutVersion { version: record });
+            }
+            if backend
+                .receipts_for_version(object_id, version)?
+                .iter()
+                .any(|receipt| receipt.replica_node_id == *source_node_id)
+            {
+                if !effects
+                    .iter()
+                    .any(|effect| matches!(effect, DfsPreparedMetadataEffect::PutObject { .. }))
+                {
+                    effects.push(DfsPreparedMetadataEffect::PutObject {
+                        object: current.clone(),
+                    });
+                }
+                if !effects
+                    .iter()
+                    .any(|effect| matches!(effect, DfsPreparedMetadataEffect::PutVersion { .. }))
+                    && let Some(record) = backend.get_version(object_id, version)?
+                {
+                    effects.push(DfsPreparedMetadataEffect::PutVersion { version: record });
+                }
+                effects.push(DfsPreparedMetadataEffect::RemoveReceipt {
+                    object_id: object_id.clone(),
+                    version: version.clone(),
+                    replica_node_id: source_node_id.clone(),
+                });
+            }
+            if !effects.is_empty() {
+                let mut payload = DfsPreparedOperationPayload::for_metadata_effects(
+                    scope,
+                    vec![DfsNamespaceObjectVersionExpectation {
+                        object_id: object_id.clone(),
+                        expected_version: Some(version.clone()),
+                    }],
+                    vec![DfsNamespacePathOccupantExpectation {
+                        path: current.path.clone(),
+                        expected_object_id: Some(object_id.clone()),
+                    }],
+                    effects,
+                    time::OffsetDateTime::now_utc(),
+                )?;
+                payload.expected_journal_sequence = Some(cut.prefix_proof.journal_sequence);
+                self.publish_metadata_effect_payload(payload)?;
+                self.apply_metadata_object_to_service_state(current)?;
                 self.record_message_committed_work(DfsMessageCommittedWork {
                     publish_metadata: true,
                     repair_maintenance: true,
-                    ..DfsMessageCommittedWork::default()
+                    ..Default::default()
                 });
             }
         }
@@ -907,12 +963,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             loop {
                 attempts = attempts.saturating_add(1);
                 let selected_shard = self.select_metadata_shard_for_object(&object)?;
-                let guard = selected_shard.as_ref().map(|shard| {
-                    crate::service_replica::metadata_shard_publication_guard(
-                        &shard.file_system_id,
-                        &shard.shard_id,
-                    )
-                });
+                let guard = selected_shard
+                    .as_ref()
+                    .map(|shard| {
+                        self.metadata_shard_fence_guard(&shard.file_system_id, &shard.shard_id)
+                    })
+                    .transpose()?;
                 let certified_shard =
                     match self.certified_local_metadata_owner_shard_for_object(&object) {
                         Ok(shard) => shard,

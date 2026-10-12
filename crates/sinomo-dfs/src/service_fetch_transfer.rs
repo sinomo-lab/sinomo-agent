@@ -38,7 +38,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         certified_shards: &[DfsMetadataShardConfig],
     ) -> Result<Option<VerifiedDfsBlobFetch>, DfsError> {
         let Some(intent) = backend.get_intent(&command.object_id, &command.intent_id)? else {
-            return Ok(None); // Preserve legacy unknown-intent behavior globally.
+            return Ok(None);
         };
         let Some(object) = backend
             .get_object(&command.object_id)?
@@ -339,13 +339,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 reason,
             });
         };
+        // Expiry releases scheduling activity, but retains the original named
+        // request. Its exact authenticated reply still belongs to this owner.
+        let expected_request_id = pending
+            .fetch_inflight_request_ids
+            .get(&frame_source_node_id);
         let restored_fetch_response = pending.fetch_inflight_from.is_empty()
             && pending.fetch_inflight_request_ids.is_empty()
             && self.restored_fetch_response_source_is_authorized_without_inflight(
                 &response,
                 &frame_source_node_id,
             )?;
-        if !pending.fetch_inflight_from.contains(&frame_source_node_id) && !restored_fetch_response
+        if !pending.fetch_inflight_from.contains(&frame_source_node_id)
+            && expected_request_id.is_none()
+            && !restored_fetch_response
         {
             return Ok(NetworkedDfsServiceEvent::BlobFetchRejected {
                 intent_id: response.intent_id,
@@ -354,10 +361,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 reason: "unexpected DFS fetch response source".to_string(),
             });
         }
-        if let Some(expected_request_id) = pending
-            .fetch_inflight_request_ids
-            .get(&frame_source_node_id)
-        {
+        if let Some(expected_request_id) = expected_request_id {
             if expected_request_id != &response.request_id {
                 return Ok(NetworkedDfsServiceEvent::BlobFetchRejected {
                     intent_id: response.intent_id,
@@ -562,13 +566,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         content_hash: String,
         size_bytes: u64,
     ) -> Result<NetworkedDfsServiceEvent, DfsError> {
-        self.record_fetched_pending_write_size(
-            &intent_id,
-            &object_id,
-            &version,
-            &content_hash,
-            size_bytes,
-        )?;
+        if let Some(pending) = self.writes.pending_writes.get_mut(&intent_id)
+            && pending.size_bytes == 0
+        {
+            pending.size_bytes = size_bytes;
+        }
         self.record_local_pending_write_receipt_if_desired(
             &intent_id,
             &object_id,
@@ -583,30 +585,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             source_node_id,
             content_hash,
         })
-    }
-
-    fn record_fetched_pending_write_size(
-        &mut self,
-        intent_id: &str,
-        object_id: &DfsObjectId,
-        version: &DfsVersion,
-        content_hash: &str,
-        size_bytes: u64,
-    ) -> Result<(), DfsError> {
-        if let Some(pending) = self.writes.pending_writes.get_mut(intent_id)
-            && pending.size_bytes == 0
-        {
-            pending.size_bytes = size_bytes;
-        }
-        if let Some(backend) = self.metadata_backend.as_mut()
-            && let Some(mut version_record) = backend.get_version(object_id, version)?
-            && version_record.content_hash.as_deref() == Some(content_hash)
-            && version_record.size_bytes != Some(size_bytes)
-        {
-            version_record.size_bytes = Some(size_bytes);
-            backend.put_version(&version_record)?;
-        }
-        Ok(())
     }
 
     pub(crate) fn record_local_pending_write_receipt_if_desired(

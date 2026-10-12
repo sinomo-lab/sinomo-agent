@@ -57,9 +57,10 @@ without decoding a feature's metadata payload.
 The history module uses its namespace to translate source and capture provenance
 into user-facing history. Other modules can retain immutable revisions under
 their own namespaces without introducing a second content database or modifying
-history's semantics. Legacy typed retention/history fields decode through the
-migration layer; new PackedV6 metadata writers emit the generic representation.
-Compatibility applies to persisted data, not an unsupported mixed-writer claim.
+history's semantics. `sinomo-dfs-migration` alone interprets retained legacy
+records and converts them into the current representation. The DFS runtime
+accepts only its current storage and wire protocols; incompatible nodes must be
+upgraded before participating.
 
 Retained-revision path queries use generic derived indexes over captured grant
 paths and current object families. Table operations, replay and rollback maintain
@@ -100,7 +101,7 @@ epoch, policy and durability checks. Feature algorithms cannot substitute
 component-event handlers for atomic publication or content-reference safety.
 Namespace and cluster-control events wake reconstructible attachment work;
 durable namespace-feed cursors recover missed delivery and lag.
-The authoritative feed also projects V6 revision and reference changes as
+The authoritative feed also projects revision and reference changes as
 `RevisionMetadataChanged` identity notifications with the same shard, epoch,
 journal sequence and ordinal provenance. These notifications are shard-scoped;
 each consumer resolves identity scope and final authority before reading data
@@ -162,9 +163,12 @@ All visible writes serialize through the responsible owner or metadata-shard
 primary. Ordinary DFS metadata and content stay off cluster KV: a healthy
 primary first journals a hidden operation prepare in DFS metadata, then proves
 the current assignment with a fresh acknowledgement from every configured
-metadata-shard replica that durably applied and verified that exact prepare.
-The prepare carries the pending intent and `W` receipts and, for namespace
-changes, the complete transaction without making it visible. If the complete
+metadata-shard replica that durably persisted and verified that exact prepare.
+The sole journal family is `PrepareOperationV7(payload)` followed by
+`CommitPreparedOperationV7(digest)`. The complete payload seals namespace
+changes, metadata effects, original read predicates, content receipts, intent
+transitions and terminal request outcomes before authority collection. The
+commit marker carries only the exact prepared digest and slot. If the complete
 shard cannot acknowledge, the operation may continue only after its
 purpose-specific DFS recovery quorum is satisfied and cluster Raft commits an
 operation-bound permit for that exact prepare, assignment, and epoch. A
@@ -173,9 +177,9 @@ insufficient.
 
 KV access on DFS operation paths is explicit. Namespace routing and policy reads
 reuse the existing retained configuration projections; peer routing and connection
-health remain owned by the network layer. Codec compatibility is checked when a
-shard configuration is admitted or changed. History-enabled file operations check
-the configured codec locally instead of rereading every participant's member and
+health remain owned by the network layer. Current protocol support is checked
+when a shard configuration is admitted or changed. File operations reuse that
+admitted configuration instead of rereading every participant's member and
 capability-policy records.
 
 Ordinary daemon writes take one published configuration view for filesystem
@@ -263,8 +267,8 @@ repair matching locations, but cannot republish their old object image.
 
 Namespace planners retain the object versions and path occupants they observed
 before constructing a mutation. These original predicates accompany the hidden
-prepare and are checked again at publication; standalone namespace transactions
-perform the same check under their backend writer lock. Separate saga phases and
+prepare and are checked again under its publication writer lock. Namespace
+transactions use this same prepare/commit family. Separate saga phases and
 reentrant requests collect separate observations. A later phase may deliberately
 read a committed successor, while records already planned by its caller retain
 their original predicates. Missing-replica pruning is a conditional update to
@@ -298,6 +302,12 @@ lazily for standalone and specialized operations whose contracts the browser
 wire API cannot express. Owner identity, operation deadlines and ambiguous
 mutation delivery remain checked; a selected owner's failure does not silently
 redirect normal operations to a local writer.
+
+Native clients that delegate namespace authority also send current, retained
+and exclusive content publication to that resident Main when the local node is
+the metadata primary. Byte, manifest and reader inputs keep their original
+operation identity and source custody. Main owns admission and completed-handoff
+rebind; replies return to the original caller's registered inbox.
 
 An immutable blob fetch may use content-read admission only after a guarded
 read of a currently certified, fully materialized shard verifies its original
@@ -391,10 +401,11 @@ periodic tick. A pending handoff owned by another node does not schedule a local
 coordinator. Triggered reconciliation retains the same write-fence and joint-
 quorum activation rules; the trigger changes scheduling, not authority.
 
-Every distributed SIFS bootstrap performs the completed-generation rebind
-check before its first authoritative namespace mutation. This closes the
-fresh-service-lane case where cluster activation and the durable marker survive
-but process-local authority binding does not. The marker remains immutable
+The resident SIFS bootstrap owner performs the completed-generation rebind
+check before its first authoritative namespace mutation. Delegating clients
+seed only their filesystem projection; Main owns bootstrap completion and retry.
+This closes the case where cluster activation and the durable marker survive
+but a fresh owner has no process-local authority binding. The marker remains immutable
 handoff evidence; later contiguous journal entries advance the current prefix
 without invalidating it.
 
@@ -487,11 +498,9 @@ ordinary authority floor, so an older in-flight snapshot cannot erase an
 acknowledged prepare. These floors are small replica-local DFS coordination
 records; they are not file metadata in cluster KV and do not require Raft.
 
-Each logical floor has its own checksummed local append log. Before the first
-append-based acknowledgement, a durable format pointer replaces the old SOBJ
-sidecar, so a binary that only understands the old representation rejects the
-store. An interrupted migration merges any newer legacy floor before publishing
-that pointer. Every update, including an equal or older retry after a failed
+Each logical floor has its own checksummed local append log and current format
+pointer. Conversion of old floor sidecars belongs to `sinomo-dfs-migration`;
+normal acknowledgement never interprets an old representation. Every update, including an equal or older retry after a failed
 sync, synchronizes the current log and its parent before replying. The log is
 checkpointed at 128 records; replacement preserves the latest complete floor.
 Missing migrated logs and complete invalid records fail closed. Incomplete EOF
@@ -522,25 +531,27 @@ writer lock; it preserves a stronger certified journal suffix when table
 materialization is deferred. A head or cursor hint cannot extend the certified
 history, and retained acknowledgement floors still fence source rollback.
 
-For an ordinary prepared create, the final namespace commit marker and exact
-terminal write intent remain two ordered canonical journal records. A local
-backend may append them together and share one file sync within a segment; a
-segment boundary retains one sync per segment. The complete ordered
-materializer preserves namespace expansion, rollback and journal-reference
-replay costs. Compacted, already-terminal and bulk retries retain their serial
-record forms. Content receipt thresholds and the final operation-bound
-publication guard are unchanged.
+Current publication has one durable prepare and one digest-only commit marker.
+A create seals the parent and child records, visible version, exact content
+receipts and terminal intent in the same immutable payload. Receipt staging,
+repair metadata, request admission and GC transitions use metadata effects in
+that same family. The materializer expands the committed body once; recovery
+replays these same two record kinds.
 
-The ordinary hidden create prepare may likewise group the pending intent,
-exact content receipts, and namespace prepare into one same-segment sync, in
-that order. Its bounded child/parent transaction validates the durable parent,
-exclusive path expectations, immutable intent identity, canonical digest and
-receipt threshold before any append. The trailing prepare uses the full ordered
-table materializer, including deferred resolved state and journal-reference
-replay cost. Authority collection begins only after this complete group is
-certified. Every interrupted prefix stays hidden and retries at a fresh sequence
-after owner-scoped recovery; terminal, compacted, history-bearing and broader
-namespace operations retain the existing serial path.
+`DfsPublicationGuard` is opaque and can be created only by the authorization
+boundary. It retains the actual data owner, admitted effect-shard execution,
+current authority evidence, handoff exclusion and physical writer session until
+publication finishes. A digest, content receipt, routing hint or held backend
+cannot manufacture this guard. Exact committed retries return retained evidence
+without authoring another commit or replacing a newer visible head.
+
+Storage conversion runs incrementally at cold open through a provider owned by
+the normal Main or Embedded component. `sinomo-dfs-migration` decodes original
+source formats and verifies their original digests before normalization, retains
+source archives and restart progress, and stages a current image without exposing
+it. Native source and target authority must certify installation and retirement.
+The DFS crate supplies current staging and admission interfaces, with no old
+reader, old journal family or mixed-version writer path.
 
 The commit path must preserve these properties:
 
@@ -548,7 +559,7 @@ The commit path must preserve these properties:
 2. The authority validates its epoch, policy, and base version.
 3. Content is durable on the nodes required by policy.
 4. Matching receipts exist before the visible version advances.
-5. The exact hidden intent/receipt/namespace prepare is durable on every
+5. The exact complete operation prepare is durable on every
    configured metadata-shard replica, or the purpose-specific DFS recovery
    quorum has been fenced by an operation-bound cluster-Raft permit.
 6. The metadata commit revalidates the typed authorization and compares the
@@ -594,10 +605,9 @@ cannot authorize absence aging or destructive GC.
 The reservation sentinel's version 2 gates this local persistence contract and
 its supported content-binding layout. Existing handles reread it after taking
 the cross-process lock; older writers and unknown future layouts fail closed.
-Version 1 reservations remain readable and conservatively retained until a
-current writer renews them or positive catalog coverage releases them. An old
-operation already past the lock during activation still has an unstamped root,
-so migration cannot mistake that operation for an earlier fenced reservation.
+The migration provider preserves old reservations and their original provenance
+while converting storage. Current DFS opens only the selected current layout;
+missing source provenance cannot authorize destructive collection.
 
 ## Metadata Authority
 
@@ -659,19 +669,20 @@ rotated generation therefore replays neither the superseded prefix nor a
 partial suffix; a crash before publication leaves the old snapshot, rotated
 generation, and active suffix authoritative.
 
-Local V1/V2 snapshots remain readable during a physical upgrade. The checkpoint
-worker uses the shared `sinomo_core::storage::migration` state machine to copy
-the sealed generation into a V3 stream of checksummed SOBJ records. Copy and
-source-comparison verification advance durable family/key cursors under bounded
-record, byte, and time budgets. Output is synchronized before progress; restart
-truncates only an uncheckpointed staging tail and resumes the recorded batch.
-Publication compares the source generation under the metadata writer lock and
-atomically replaces the snapshot. New active journal entries remain a suffix,
-so migration cannot overwrite concurrent namespace or pin changes. Per-node
-jobs are observable through `dfs status --json` and stay in DFS-owned storage.
-File contents and authenticated journal history are not rewritten by the job.
-See [storage migrations](developer/storage-migrations.md) for reusable owner
-contracts, lifecycle integration, and scale limitations.
+Current checkpoints use snapshot storage schema 9 and checksummed streamed SOBJ
+records. The normal DFS reader accepts this schema only. The operation journal
+uses the independent V7 prepare/commit family.
+
+`sinomo-dfs-migration` owns older snapshot, journal, content and local-state
+decoders. Its cold-open provider advances bounded conversion and verification
+cursors on demand. Original bytes and digests are retained before adapting
+source records. Output is synchronized before progress; restart discards only
+an uncheckpointed staging suffix. Installation compares the captured source
+generation and publishes a current candidate through native authority. Old
+records and proofs are conversion data and cannot grant publication authority.
+An incompatible daemon must be upgraded before joining the current execution
+path. See [storage migrations](developer/storage-migrations.md) for shared
+storage ownership and durable progress contracts.
 
 Only after the snapshot and newer table-log suffix are durable may checkpoint
 maintenance prune journal segments strictly older than `S`. It always retains
@@ -765,11 +776,9 @@ N-W repair cannot override a later committed head.
 Public exact-version reads resolve current authority and require the current
 identity or a live retention grant. A leftover blob alone does not grant access
 to history. Historical reads use bounded ranges and distinguish expired or
-absent retention from unavailable content. History mutation admission requires
-PackedV6 and `dfs.metadata.namespace-prepare.packed.v6` across all assigned
-metadata peers before publishing generic retention or module metadata. Older
-PackedV3/V4/V5 records decode through migration; they do not authorize mixed
-old/new writers.
+absent retention from unavailable content. History mutation admission requires `dfs.metadata.prepared-operation.v7`
+across all assigned metadata peers. The migration crate converts older packed
+records before current DFS opens them. Incompatible nodes must be upgraded.
 
 See the [file history guide](user/file-history.md) and
 [API reference](developer/dfs-file-history.md) for commands and contracts, and
@@ -801,14 +810,13 @@ still performs its existing private-stage synchronization before a bounded small
 payload can be adopted into the binding log. Large and extent representations
 retain their existing paths.
 
-The mandatory reservation sentinel selects this layout and rejects binaries
-that do not understand it. The DFS component activates it only after acquiring
-its exclusive data owner and draining legacy store and reader leases, before
-publishing routes or starting workers. Activation is restartable through the
-shared storage migration runner. Existing legacy files remain an authoritative
-mixed baseline by reference; no conversion changes their bytes or interpretation.
-Inline live entries and explicit deletion/release records own only the identities
-they adopt. Missing inline keys permit legacy fallback; tombstones do not.
+The mandatory current sentinel selects this layout. Cold open first runs the
+component-owned migration provider, then opens only current storage before
+publishing routes or starting workers. Fresh initialization holds the content
+owner and persists an initialization intent bound to the physical root; restart
+completes that same initialization before publishing the current sentinel.
+Inline entries and explicit deletion/release records form the current projection.
+There is no legacy read fallback inside the DFS content store.
 
 The current catalog selects a generation of bounded checksummed segments. Sealed
 segments carry durable lengths and digests; an incomplete active suffix can be
@@ -818,15 +826,15 @@ namespace before granting a receipt. This uses the normal filesystem fsync crash
 model, not a promise against arbitrary post-acknowledgement media rollback.
 
 Stats, quota admission, scrubbing, reservation reconciliation, and GC consume the
-same mixed projection. Logical deletion becomes durable before old files are
+same current projection. Logical deletion becomes durable before old files are
 reclaimed. Compaction copies exact payloads, manifests, ages, reservation states,
 and tombstones into a private generation in bounded batches, verifies the copy,
 and publishes its catalog last. Foreground changes supersede an unfinished copy. This initial compactor requires
 a quiet interval spanning its bounded copy and verification steps; continuous
 writes can postpone reclamation, although segment rotation remains bounded.
 It does not claim guaranteed compaction progress under unending mutations.
-Readers retain exact locations and generation or legacy reclamation pins; retiring
-a logical entry cannot invalidate a lazy reader's unopened extents. Old generation
+Readers retain exact locations and generation reclamation pins; retiring a
+logical entry cannot invalidate a lazy reader's unopened extents. Old generation
 files are reclaimed in bounded passes only after those readers drain.
 
 Content-store durability does not grant namespace authority. A node can possess
@@ -1100,7 +1108,7 @@ mutation is still running.
 A configuration transition during lane selection is a typed pre-execution
 replan, including transitions after the first preflight fence or while an
 admitted resident backend is selected. The original request and authority epoch
-remain intact. Message, publication and maintenance owners release their
+remain intact. Message, direct replica, publication and maintenance owners release their
 admission and backend-bearing guards before consuming the current retained
 projection and trying at most two replans. Ready successor projections require
 no new ReadIndex. Actual backend, decoding and post-execution failures remain
@@ -1424,10 +1432,10 @@ open-handle identity remain target hardening. FUSE data I/O now targets the
 stable object id and fails closed if the pathname has been replaced; it does
 not yet retain an unlinked inode after the last name disappears. Each shard
 persists an incremental hash-chain prefix proof, so healthy exact-head probes
-compare sequence and digest in O(1) work. A legacy shard hashes its materialized
-snapshot once to seed the chain; a genuine sequence/digest mismatch still uses
-an authoritative full snapshot repair. Bounded journal catch-up before that
-snapshot is future scale hardening.
+compare sequence and digest in O(1) work. Storage conversion verifies the
+original source cut before certifying a current chain. A sequence/digest mismatch
+uses authoritative current snapshot repair; ordinary catch-up uses bounded
+original-frame journal pages.
 
 ## Opt-in Local-first Degraded Operation
 

@@ -52,9 +52,6 @@ impl<T: DfsMessageTransport> DfsHistoryService<'_, T> {
             .core
             .metadata_shard_authorities(&sifs_file_system_id())?
         {
-            if !shard.namespace_prepare_codec.supports_file_history() {
-                continue;
-            }
             let result = self.core.query_metadata_authority(
                 &shard,
                 DfsMetadataSelection::NamespaceJob {

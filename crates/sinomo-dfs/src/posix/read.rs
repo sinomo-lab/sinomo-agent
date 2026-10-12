@@ -13,7 +13,7 @@ use crate::namespace::next_version;
 use crate::posix_model::{
     DfsPosixDistributedFilePrefixReadOutcome, DfsPosixDistributedFileReadOutcome,
     DfsPosixDistributedOpenedFileRangeReadOutcome, DfsPosixError, DfsPosixFileRangeReadStream,
-    DfsPosixFileReadStream, DfsStat, Result, read_conflict_error,
+    DfsPosixFileReadStream, DfsStat, Result,
 };
 use crate::posix_path::normalize_posix_path;
 use crate::{
@@ -113,20 +113,19 @@ fn distributed_file_content_outcome(
                 ),
             })
         }
-        NetworkedDfsReadOutcome::Conflicted { conflicts, .. } => {
-            Err(read_conflict_error(path, conflicts))
-        }
     }
 }
 
-fn legacy_distributed_file_read_result(
-    outcome: DfsPosixDistributedFileReadOutcome,
-) -> Result<Vec<u8>> {
+fn distributed_file_read_result(outcome: DfsPosixDistributedFileReadOutcome) -> Result<Vec<u8>> {
     match outcome {
         DfsPosixDistributedFileReadOutcome::Found { bytes } => Ok(bytes),
-        DfsPosixDistributedFileReadOutcome::NotFound { path }
-        | DfsPosixDistributedFileReadOutcome::ContentUnavailable { path, .. } => {
+        DfsPosixDistributedFileReadOutcome::NotFound { path } => {
             Err(DfsPosixError::NotFound { path })
+        }
+        DfsPosixDistributedFileReadOutcome::ContentUnavailable { path, detail } => {
+            Err(DfsPosixError::Dfs(DfsError::Distributed {
+                message: format!("content for {path} is unavailable: {detail}"),
+            }))
         }
     }
 }
@@ -171,9 +170,6 @@ fn distributed_file_range_content_outcome(
                     object.object_id, object.version
                 ),
             })
-        }
-        NetworkedDfsRangeReadOutcome::Conflicted { conflicts, .. } => {
-            Err(read_conflict_error(path, conflicts))
         }
     }
 }
@@ -230,32 +226,37 @@ fn distributed_file_prefix_content_outcome(
                 ),
             },
         ),
-        NetworkedDfsRangeReadOutcome::Conflicted { conflicts, .. } => {
-            Err(read_conflict_error(path, conflicts))
-        }
     }
 }
 
-fn legacy_distributed_opened_file_range_read_result(
+fn distributed_opened_file_range_read_result(
     outcome: DfsPosixDistributedOpenedFileRangeReadOutcome,
 ) -> Result<(DfsStat, DfsPosixFilePrefixRead)> {
     match outcome {
         DfsPosixDistributedOpenedFileRangeReadOutcome::Found { stat, read } => Ok((stat, read)),
-        DfsPosixDistributedOpenedFileRangeReadOutcome::NotFound { path }
-        | DfsPosixDistributedOpenedFileRangeReadOutcome::ContentUnavailable { path, .. } => {
+        DfsPosixDistributedOpenedFileRangeReadOutcome::NotFound { path } => {
             Err(DfsPosixError::NotFound { path })
+        }
+        DfsPosixDistributedOpenedFileRangeReadOutcome::ContentUnavailable { path, detail } => {
+            Err(DfsPosixError::Dfs(DfsError::Distributed {
+                message: format!("content for {path} is unavailable: {detail}"),
+            }))
         }
     }
 }
 
-fn legacy_distributed_file_prefix_read_result(
+fn distributed_file_prefix_read_result(
     outcome: DfsPosixDistributedFilePrefixReadOutcome,
 ) -> Result<DfsPosixFilePrefixRead> {
     match outcome {
         DfsPosixDistributedFilePrefixReadOutcome::Found { read } => Ok(read),
-        DfsPosixDistributedFilePrefixReadOutcome::NotFound { path }
-        | DfsPosixDistributedFilePrefixReadOutcome::ContentUnavailable { path, .. } => {
+        DfsPosixDistributedFilePrefixReadOutcome::NotFound { path } => {
             Err(DfsPosixError::NotFound { path })
+        }
+        DfsPosixDistributedFilePrefixReadOutcome::ContentUnavailable { path, detail } => {
+            Err(DfsPosixError::Dfs(DfsError::Distributed {
+                message: format!("content for {path} is unavailable: {detail}"),
+            }))
         }
     }
 }
@@ -540,9 +541,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 NetworkedDfsReadOutcome::PendingReplication { .. }
                 | NetworkedDfsReadOutcome::NotConfirmed { .. }
                 | NetworkedDfsReadOutcome::NotFound => Err(DfsPosixError::NotFound { path }),
-                NetworkedDfsReadOutcome::Conflicted { conflicts, .. } => {
-                    Err(read_conflict_error(path, conflicts))
-                }
             }
         })
     }
@@ -565,9 +563,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 NetworkedDfsRangeReadOutcome::PendingReplication { .. }
                 | NetworkedDfsRangeReadOutcome::NotConfirmed { .. }
                 | NetworkedDfsRangeReadOutcome::NotFound => Err(DfsPosixError::NotFound { path }),
-                NetworkedDfsRangeReadOutcome::Conflicted { conflicts, .. } => {
-                    Err(read_conflict_error(path, conflicts))
-                }
             }
         })
     }
@@ -606,9 +601,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }),
             NetworkedDfsReadStreamOutcome::PendingReplication
             | NetworkedDfsReadStreamOutcome::NotFound => Err(DfsPosixError::NotFound { path }),
-            NetworkedDfsReadStreamOutcome::Conflicted { conflicts } => {
-                Err(read_conflict_error(path, conflicts))
-            }
         }
     }
 
@@ -631,15 +623,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }),
             NetworkedDfsRangeReadStreamOutcome::PendingReplication
             | NetworkedDfsRangeReadStreamOutcome::NotFound => Err(DfsPosixError::NotFound { path }),
-            NetworkedDfsRangeReadStreamOutcome::Conflicted { conflicts } => {
-                Err(read_conflict_error(path, conflicts))
-            }
         }
     }
 
     pub fn posix_read_file_distributed(&mut self, path: &str) -> Result<Vec<u8>> {
         let _namespace_plan = self.namespace_execution.begin_planning();
-        legacy_distributed_file_read_result(self.posix_read_file_distributed_outcome(path)?)
+        distributed_file_read_result(self.posix_read_file_distributed_outcome(path)?)
     }
 
     /// Read a distributed file without collapsing content availability into
@@ -713,7 +702,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<DfsPosixFilePrefixRead> {
         let _namespace_plan = self.namespace_execution.begin_planning();
         let outcome = self.posix_read_file_prefix_distributed_outcome(path, max_bytes)?;
-        legacy_distributed_file_prefix_read_result(outcome)
+        distributed_file_prefix_read_result(outcome)
     }
 
     /// Read a bounded distributed file prefix without collapsing content
@@ -791,7 +780,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         max_bytes: usize,
     ) -> Result<(DfsStat, DfsPosixFilePrefixRead)> {
         let _namespace_plan = self.namespace_execution.begin_planning();
-        legacy_distributed_opened_file_range_read_result(
+        distributed_opened_file_range_read_result(
             self.posix_read_file_prefix_beneath_no_links_distributed_outcome(
                 root, path, max_bytes,
             )?,
@@ -801,9 +790,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// Typed counterpart of
     /// [`Self::posix_read_file_prefix_beneath_no_links_distributed`].
     ///
-    /// Compatibility callers retain the historical NotFound collapse. VFS and
-    /// service boundaries that make optional-read decisions use this method so
-    /// an exact opened file with unavailable content cannot look absent.
+    /// Preserve exact opened-file availability for callers making optional-read decisions.
     pub fn posix_read_file_prefix_beneath_no_links_distributed_outcome(
         &mut self,
         root: &str,
@@ -828,7 +815,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         max_bytes: usize,
     ) -> Result<(DfsStat, DfsPosixFilePrefixRead)> {
         let _namespace_plan = self.namespace_execution.begin_planning();
-        legacy_distributed_opened_file_range_read_result(
+        distributed_opened_file_range_read_result(
             self.posix_read_file_range_beneath_no_links_distributed_outcome(
                 root, path, offset, max_bytes,
             )?,
@@ -915,9 +902,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             NetworkedDfsRangeReadOutcome::PendingReplication { .. }
             | NetworkedDfsRangeReadOutcome::NotConfirmed { .. }
             | NetworkedDfsRangeReadOutcome::NotFound => Err(DfsPosixError::NotFound { path }),
-            NetworkedDfsRangeReadOutcome::Conflicted { conflicts, .. } => {
-                Err(read_conflict_error(path, conflicts))
-            }
         }
     }
 
@@ -925,7 +909,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let _namespace_plan = self.namespace_execution.begin_planning();
         self.posix_read_files_distributed_outcomes(paths)
             .into_iter()
-            .map(|result| result.and_then(legacy_distributed_file_read_result))
+            .map(|result| result.and_then(distributed_file_read_result))
             .collect()
     }
 
@@ -1136,9 +1120,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     DfsPosixDistributedFileReadOutcome::Found { bytes },
                 ));
             }
-            NetworkedDfsReadOutcome::Conflicted { conflicts, .. } => {
-                return Err(read_conflict_error(path, conflicts));
-            }
+
             outcome @ NetworkedDfsReadOutcome::NotConfirmed { .. }
             | outcome @ NetworkedDfsReadOutcome::NotFound => {
                 return distributed_file_content_outcome(path, &object, outcome)
@@ -1361,9 +1343,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             NetworkedDfsReadOutcome::PendingReplication { .. }
             | NetworkedDfsReadOutcome::NotConfirmed { .. }
             | NetworkedDfsReadOutcome::NotFound => Err(DfsPosixError::NotFound { path }),
-            NetworkedDfsReadOutcome::Conflicted { conflicts, .. } => {
-                Err(read_conflict_error(path, conflicts))
-            }
         }
     }
 
@@ -1402,9 +1381,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             NetworkedDfsReadOutcome::PendingReplication { .. }
             | NetworkedDfsReadOutcome::NotConfirmed { .. }
             | NetworkedDfsReadOutcome::NotFound => Err(DfsPosixError::NotFound { path }),
-            NetworkedDfsReadOutcome::Conflicted { conflicts, .. } => {
-                Err(read_conflict_error(path, conflicts))
-            }
         }
     }
 
@@ -1513,15 +1489,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         max_bytes: usize,
     ) -> Result<Vec<u8>> {
         let _namespace_plan = self.namespace_execution.begin_planning();
-        legacy_distributed_file_read_result(
+        distributed_file_read_result(
             self.posix_read_file_range_for_opened_stat_outcome(path, opened, offset, max_bytes)?,
         )
     }
 
     /// Typed exact-content range read for an already opened metadata receipt.
     ///
-    /// The legacy method above intentionally preserves its public NotFound
-    /// compatibility contract. Guarded VFS reads use this outcome so a retained
+    /// Guarded VFS reads use this outcome so a retained
     /// receipt with an unavailable immutable content version remains distinct
     /// from namespace absence.
     pub fn posix_read_file_range_for_opened_stat_outcome(
@@ -1584,15 +1559,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         update_access: bool,
     ) -> Result<Vec<u8>> {
         let _namespace_plan = self.namespace_execution.begin_planning();
-        legacy_distributed_file_read_result(
-            self.posix_read_file_range_for_opened_metadata_outcome(
-                path,
-                object,
-                offset,
-                max_bytes,
-                update_access,
-            )?,
-        )
+        distributed_file_read_result(self.posix_read_file_range_for_opened_metadata_outcome(
+            path,
+            object,
+            offset,
+            max_bytes,
+            update_access,
+        )?)
     }
 
     fn posix_read_file_range_for_opened_metadata_outcome(
@@ -1812,7 +1785,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     /// The caller must resolve a current or explicitly retained descriptor from
     /// metadata authority before calling. Reading that immutable identity does
-    /// not select a namespace winner or resolve legacy conflict records.
+    /// select a namespace winner.
     pub(crate) fn read_immutable_object_metadata_range_or_fetch_remote_without_cache(
         &mut self,
         object: &DfsObjectMetadata,
@@ -2023,9 +1996,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             NetworkedDfsReadOutcome::NotConfirmed { .. } | NetworkedDfsReadOutcome::NotFound => {
                 Err(DfsPosixError::NotFound { path })
             }
-            NetworkedDfsReadOutcome::Conflicted { conflicts, .. } => {
-                Err(read_conflict_error(path, conflicts))
-            }
         }
     }
 }
@@ -2103,38 +2073,9 @@ impl NetworkedDfsService<DfsNodeTransport> {
 #[cfg(test)]
 mod opened_stat_tests {
     use super::*;
-    use crate::{DfsRoutedCall, DfsRoutedMessage, DfsTransportIdentity, LocalContentStore};
+    use crate::DfsWriteOptions;
+    use crate::LocalContentStore;
     use sinomo_core::DfsObjectPolicy;
-    use sinomo_core::network::NetworkError;
-
-    #[derive(Clone, Debug)]
-    struct NoNetworkTransport {
-        local_node_id: NodeId,
-    }
-
-    impl DfsTransportIdentity for NoNetworkTransport {
-        fn local_node_id(&self) -> &NodeId {
-            &self.local_node_id
-        }
-    }
-
-    impl DfsMessageTransport for NoNetworkTransport {
-        fn send_routed_call(
-            &mut self,
-            target_node_id: &NodeId,
-            _call: DfsRoutedCall,
-        ) -> std::result::Result<(), NetworkError> {
-            Err(NetworkError::UnknownNode {
-                node_id: target_node_id.clone(),
-            })
-        }
-
-        fn drain_incoming_messages(
-            &mut self,
-        ) -> std::result::Result<Vec<DfsRoutedMessage>, NetworkError> {
-            Ok(Vec::new())
-        }
-    }
 
     #[test]
     fn distributed_content_outcome_keeps_replica_unavailability_distinct_from_path_absence() {
@@ -2218,24 +2159,35 @@ mod opened_stat_tests {
             ));
         }
 
-        let root = sinomo_testdir::TestDir::new("sinomo-dfs-hardlink-target-unavailable");
-        let mut service = NetworkedDfsService::new(
-            NoNetworkTransport {
-                local_node_id: local,
-            },
-            LocalContentStore::new(root.join("content")).expect("content store"),
-        );
-        let mut hardlink = object.clone();
-        hardlink.object_id = DfsObjectId::from_legacy_named("hardlink_typed_content_unavailable")
-            .expect("hardlink id");
-        hardlink.path = "/catalog-link.sobj".to_string();
-        hardlink.kind = DfsObjectKind::Hardlink;
-        hardlink.link_target_object_id = Some(
-            DfsObjectId::from_legacy_named("missing_hardlink_target").expect("missing target id"),
-        );
+        let (native, mut service) = crate::test_support::DfsTestRuntime::start_single_node(
+            "native-hardlink-content-unavailable",
+            local.clone(),
+        )
+        .expect("normal initialized native owner");
+        // The normal producer creates the real dentry and immutable payload.
+        // One bounded disk-loss negative removes only its actual loose bytes.
+        let bytes = vec![b'a'; 16 * 1024 + 1];
+        let source = service
+            .posix_write_file(
+                "/catalog.sobj",
+                &bytes,
+                DfsWriteOptions::replicated_eventual(vec![local.clone()]),
+            )
+            .expect("normal source publication");
         service
-            .add_object_metadata(hardlink.clone())
-            .expect("publish present hardlink dentry");
+            .posix_hardlink("/catalog.sobj", "/catalog-link.sobj")
+            .expect("normal hardlink publication");
+        let hardlink = service
+            .metadata_backend()
+            .unwrap()
+            .get_object_by_path(&source.file_system_id, "/catalog-link.sobj")
+            .unwrap()
+            .unwrap();
+        assert_eq!(hardlink.kind, DfsObjectKind::Hardlink);
+        service
+            .content()
+            .debug_remove_loose_blob(source.content_hash.as_ref().unwrap())
+            .expect("remove actual referenced loose payload");
         assert!(matches!(
             service
                 .posix_read_file_distributed_outcome(&hardlink.path)
@@ -2244,7 +2196,7 @@ mod opened_stat_tests {
         ));
         assert!(matches!(
             service.posix_read_file_distributed(&hardlink.path),
-            Err(DfsPosixError::NotFound { .. })
+            Err(DfsPosixError::Dfs(DfsError::Distributed { .. }))
         ));
         assert!(matches!(
             service
@@ -2254,7 +2206,7 @@ mod opened_stat_tests {
         ));
         assert!(matches!(
             service.posix_read_file_prefix_distributed(&hardlink.path, 4),
-            Err(DfsPosixError::NotFound { .. })
+            Err(DfsPosixError::Dfs(DfsError::Distributed { .. }))
         ));
         assert!(matches!(
             service
@@ -2273,13 +2225,12 @@ mod opened_stat_tests {
             &bulk_outcomes[1],
             Ok(DfsPosixDistributedFileReadOutcome::NotFound { .. })
         ));
-        let legacy_bulk = service.posix_read_files_distributed(&bulk_paths);
-        assert!(
-            legacy_bulk
-                .iter()
-                .all(|result| matches!(result, Err(DfsPosixError::NotFound { .. }))),
-            "legacy bulk callers retain their POSIX NotFound compatibility: {legacy_bulk:?}"
-        );
+        let bulk = service.posix_read_files_distributed(&bulk_paths);
+        assert!(matches!(
+            &bulk[0],
+            Err(DfsPosixError::Dfs(DfsError::Distributed { .. }))
+        ));
+        assert!(matches!(&bulk[1], Err(DfsPosixError::NotFound { .. })));
 
         let pending = PosixPendingBulkRead {
             index: 0,
@@ -2310,53 +2261,29 @@ mod opened_stat_tests {
                 .expect("classify tombstone"),
             DistributedPosixFileContentObjectOutcome::NotFound { .. }
         ));
+
+        drop(service);
+        native.close().expect("normal native owner shutdown");
     }
 
     #[test]
     fn opened_stat_read_keeps_exact_version_without_resolving_current_path_metadata() {
-        let root = sinomo_testdir::TestDir::new("sinomo-dfs-opened-stat-read");
         let local = NodeId::from_legacy_named("node_opened_stat_read").expect("node id");
-        let object_id =
-            DfsObjectId::from_legacy_named("object_opened_stat_read").expect("object id");
-        let mut service = NetworkedDfsService::new(
-            NoNetworkTransport {
-                local_node_id: local.clone(),
-            },
-            LocalContentStore::new(root.join("content")).expect("content store"),
-        );
-        let mut object = DfsObjectMetadata {
-            object_id,
-            file_system_id: sifs_file_system_id(),
-            path: "/opened.txt".to_string(),
-            kind: DfsObjectKind::File,
-            tombstone_provenance: None,
-            owner_node_id: local.clone(),
-            current_locations: vec![local],
-            content_hash: None,
-            content_size_bytes: None,
-            link_target_object_id: None,
-            mode: 0o644,
-            uid: 1000,
-            gid: 1000,
-            accessed_at_unix_nanos: 1,
-            modified_at_unix_nanos: 1,
-            created_at_unix_nanos: 1,
-            changed_at_unix_nanos: 1,
-            version: DfsVersion::from_legacy_named("version_opened_stat_1").expect("first version"),
-            policy: DfsObjectPolicy::ReplicatedEventual,
-            created_by_event_id: None,
-            last_modified_by_event_id: None,
-        };
+        let (native, mut service) = crate::test_support::DfsTestRuntime::start_single_node(
+            "native-opened-stat-read",
+            local.clone(),
+        )
+        .expect("normal initialized native owner");
+        let options = DfsWriteOptions::replicated_eventual(vec![local]);
         service
-            .put_local_object_version(object.clone(), b"version-one")
-            .expect("publish first version");
-        let opened = service.posix_stat("/opened.txt").expect("opened stat");
-
-        object.version =
-            DfsVersion::from_legacy_named("version_opened_stat_2").expect("second version");
+            .posix_write_file("/opened.txt", b"version-one", options.clone())
+            .expect("normal first version publication");
+        let opened = service
+            .posix_stat("/opened.txt")
+            .expect("actual opened stat");
         service
-            .put_local_object_version(object, b"version-two")
-            .expect("publish second version");
+            .posix_write_file("/opened.txt", b"version-two", options)
+            .expect("normal second version publication");
         assert_ne!(
             service
                 .posix_stat("/opened.txt")
@@ -2365,16 +2292,21 @@ mod opened_stat_tests {
             opened.version
         );
 
+        service
+            .posix_rename("/opened.txt", "/moved-after-open.txt")
+            .expect("normal rename after open");
+        assert!(matches!(
+            service.posix_stat("/opened.txt"),
+            Err(DfsPosixError::NotFound { .. })
+        ));
         assert_eq!(
             service
-                .posix_read_file_range_for_opened_stat(
-                    "/renamed-or-unlinked-after-open.txt",
-                    &opened,
-                    0,
-                    usize::MAX,
-                )
+                .posix_read_file_range_for_opened_stat("/opened.txt", &opened, 0, usize::MAX,)
                 .expect("read exact opened version"),
             b"version-one"
         );
+
+        drop(service);
+        native.close().expect("normal native owner shutdown");
     }
 }

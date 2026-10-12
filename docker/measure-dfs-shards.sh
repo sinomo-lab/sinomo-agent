@@ -40,8 +40,6 @@
 #   SINOMO_DFS_PERF_COMPOSE_OVERRIDE        optional second compose file used to form the project
 #   SINOMO_DFS_PERF_MODE                    debug-gate (default), release-ceiling, or sustained-churn
 #   SINOMO_DFS_PERF_BINARY_PROFILE          debug (default) or release; release-ceiling requires release
-#   SINOMO_DFS_PERF_EXPECT_NAMESPACE_PREPARE_CODEC
-#                                             required live shard codec (packed-v2)
 #   SINOMO_DFS_PERF_FILES                   files per shard lane per phase (mode default)
 #   SINOMO_DFS_PERF_BYTES                   bytes per file (1)
 #   SINOMO_DFS_PERF_SUSTAINED_ROUNDS        extra back-to-back three-lane rounds (mode default)
@@ -89,7 +87,7 @@ COMPOSE_OVERRIDE_FILE="${SINOMO_DFS_PERF_COMPOSE_OVERRIDE:-}"
 COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-${SINOMO_DFS_PERF_PROJECT:-sinomo-dfs-test}}"
 PERF_MODE="${SINOMO_DFS_PERF_MODE:-debug-gate}"
 BINARY_PROFILE="${SINOMO_DFS_PERF_BINARY_PROFILE:-debug}"
-EXPECTED_NAMESPACE_PREPARE_CODEC="${SINOMO_DFS_PERF_EXPECT_NAMESPACE_PREPARE_CODEC:-packed-v2}"
+EXPECTED_METADATA_PROTOCOL_VERSION=7
 case "$PERF_MODE" in
   debug-gate)
     MODE_DEFAULT_FILES=1024
@@ -522,12 +520,7 @@ case "$BINARY_PROFILE" in
   debug | release) ;;
   *) die "SINOMO_DFS_PERF_BINARY_PROFILE must be debug or release, got '$BINARY_PROFILE'" ;;
 esac
-case "$EXPECTED_NAMESPACE_PREPARE_CODEC" in
-  legacy | packed-v1 | packed-v2) ;;
-  *)
-    die "SINOMO_DFS_PERF_EXPECT_NAMESPACE_PREPARE_CODEC must be legacy, packed-v1, or packed-v2, got '$EXPECTED_NAMESPACE_PREPARE_CODEC'"
-    ;;
-esac
+
 if [[ "$PERF_MODE" == release-ceiling && "$BINARY_PROFILE" != release ]]; then
   die "release-ceiling mode requires SINOMO_DFS_PERF_BINARY_PROFILE=release; this is an operator assertion recorded with the artifacts"
 fi
@@ -574,7 +567,7 @@ if [[ -n "$BATCH_SIZE_SWEEP" ]]; then
   {
     printf 'mode\t%s\n' "$PERF_MODE"
     printf 'binary_profile_operator_assertion\t%s\n' "$BINARY_PROFILE"
-    printf 'expected_namespace_prepare_codec\t%s\n' "$EXPECTED_NAMESPACE_PREPARE_CODEC"
+    printf 'expected_metadata_protocol_version\t%s\n' "$EXPECTED_METADATA_PROTOCOL_VERSION"
     printf 'batch_sizes\t%s\n' "$compact_sweep"
     printf 'gate_contract\tfull-configured-gate-per-batch-size\n'
   } >"$ARTIFACTS/batch-sweep-config.tsv"
@@ -753,11 +746,10 @@ fi
 log "preflight: resolving live shard routing"
 run_node_timeout 60 node1 sinomo test run cluster.dfs.shard-layout \
   --require-cluster --json \
-  --param "expected-namespace-prepare-codec=$EXPECTED_NAMESPACE_PREPARE_CODEC" \
   >"$ARTIFACTS/shard-layout.before.json" \
   2>"$ARTIFACTS/shard-layout.before.stderr.log" \
   || die "cluster.dfs.shard-layout failed; the running containers may need the newly built binary"
-jq -e --arg expected_codec "$EXPECTED_NAMESPACE_PREPARE_CODEC" '
+jq -e --argjson expected_protocol "$EXPECTED_METADATA_PROTOCOL_VERSION" '
   .status == "passed"
   and .diagnostics.distinct_shard_count == 3
   and (.diagnostics.shards | length) == 3
@@ -768,7 +760,7 @@ jq -e --arg expected_codec "$EXPECTED_NAMESPACE_PREPARE_CODEC" '
     and (.primary_node_id | type) == "string"
     and (.replica_node_ids | type) == "array"
     and (.epoch | type) == "number"
-    and .namespace_prepare_codec == $expected_codec)
+    and .metadata_protocol_version == $expected_protocol)
 ' "$ARTIFACTS/shard-layout.before.json" >/dev/null \
   || die "cluster.dfs.shard-layout returned incomplete runtime routing evidence"
 
@@ -778,18 +770,18 @@ declare -A lane_primary_id=()
 declare -A lane_primary_service=()
 declare -A lane_epoch=()
 declare -A lane_replica_count=()
-declare -A lane_namespace_prepare_codec=()
-while IFS=$'\t' read -r lane base shard primary epoch replica_count namespace_prepare_codec; do
+declare -A lane_metadata_protocol_version=()
+while IFS=$'\t' read -r lane base shard primary epoch replica_count metadata_protocol_version; do
   lane_base[$lane]="$base"
   lane_shard[$lane]="$shard"
   lane_primary_id[$lane]="$primary"
   lane_epoch[$lane]="$epoch"
   lane_replica_count[$lane]="$replica_count"
-  lane_namespace_prepare_codec[$lane]="$namespace_prepare_codec"
+  lane_metadata_protocol_version[$lane]="$metadata_protocol_version"
 done < <(jq -r '.diagnostics.shards[] |
   [.lane, .base_prefix, .shard_id, .primary_node_id,
    (.epoch | tostring), (.replica_node_ids | length | tostring),
-   .namespace_prepare_codec] | @tsv' \
+   .metadata_protocol_version] | @tsv' \
   "$ARTIFACTS/shard-layout.before.json")
 
 declare -A primary_services=()
@@ -852,7 +844,7 @@ done
   printf 'performance_mode\t%s\n' "$PERF_MODE"
   printf 'binary_profile_operator_assertion\t%s\n' "$BINARY_PROFILE"
   printf 'binary_profile_verified_by_script\tno\n'
-  printf 'expected_namespace_prepare_codec\t%s\n' "$EXPECTED_NAMESPACE_PREPARE_CODEC"
+  printf 'expected_metadata_protocol_version\t%s\n' "$EXPECTED_METADATA_PROTOCOL_VERSION"
   printf 'compose_project\t%s\n' "$COMPOSE_PROJECT_NAME"
   printf 'compose_file\t%s\n' "$COMPOSE_FILE"
   printf 'compose_override_file\t%s\n' "${COMPOSE_OVERRIDE_FILE:-none}"
@@ -881,10 +873,10 @@ done
   printf 'max_idle_ms\t%s\n' "$MAX_IDLE_MS"
   printf 'workload_window_attribution\tclient-process-liveness-plus-warmup-approximation\n'
   for lane in "${LANES[@]}"; do
-    printf '%s\tshard=%s\tprimary=%s\tclient=%s\tepoch=%s\tbase=%s\tnamespace_prepare_codec=%s\n' \
+    printf '%s\tshard=%s\tprimary=%s\tclient=%s\tepoch=%s\tbase=%s\tmetadata_protocol_version=%s\n' \
       "$lane" "${lane_shard[$lane]}" "${lane_primary_service[$lane]}" \
       "${lane_client[$lane]}" "${lane_epoch[$lane]}" "${lane_base[$lane]}" \
-      "${lane_namespace_prepare_codec[$lane]}"
+      "${lane_metadata_protocol_version[$lane]}"
   done
   for node in "${NODES[@]}"; do
     cpu_max="$(<"${container_cgroup[$node]}/cpu.max")"
@@ -2801,16 +2793,15 @@ fi
 
 run_node_timeout 60 node1 sinomo test run cluster.dfs.shard-layout \
   --require-cluster --json \
-  --param "expected-namespace-prepare-codec=$EXPECTED_NAMESPACE_PREPARE_CODEC" \
   >"$ARTIFACTS/shard-layout.after.json" \
   2>"$ARTIFACTS/shard-layout.after.stderr.log" || gate_failed=1
 jq -S '[.diagnostics.shards[] | {
   lane, base_prefix, shard_id, primary_node_id, replica_node_ids, epoch,
-  namespace_prepare_codec
+  metadata_protocol_version
 }]' "$ARTIFACTS/shard-layout.before.json" >"$ARTIFACTS/shard-layout.before.canonical.json"
 jq -S '[.diagnostics.shards[] | {
   lane, base_prefix, shard_id, primary_node_id, replica_node_ids, epoch,
-  namespace_prepare_codec
+  metadata_protocol_version
 }]' "$ARTIFACTS/shard-layout.after.json" >"$ARTIFACTS/shard-layout.after.canonical.json" \
   || gate_failed=1
 if ! cmp -s "$ARTIFACTS/shard-layout.before.canonical.json" \

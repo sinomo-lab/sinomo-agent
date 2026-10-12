@@ -24,9 +24,7 @@ use crate::{
 
 pub const DFS_CONTENT_ROOT_CATALOG_FORMAT_VERSION: u32 = 2;
 pub const DFS_CONTENT_ROOT_CATALOG_PREFIX_PROOF_VERSION: u32 = 2;
-const DFS_CONTENT_ROOT_CATALOG_LEGACY_PREFIX_PROOF_VERSION: u32 = 1;
-/// Historical conservative page size retained for callers that deliberately
-/// prefer the old, smaller transfer unit.
+/// Smaller transfer unit for callers with a tighter page budget.
 pub const DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_ENTRIES: usize = 256;
 /// Preferred encoded size for ordinary catalog pages.
 ///
@@ -38,10 +36,9 @@ pub const DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_BYTES: usize = 256 * 1024;
 pub const DFS_CONTENT_ROOT_CATALOG_PAGE_ENTRY_LIMIT: usize = 2048;
 pub const DEFAULT_DFS_CONTENT_ROOT_CATALOG_PAGE_ENTRIES: usize =
     DFS_CONTENT_ROOT_CATALOG_PAGE_ENTRY_LIMIT;
-const DFS_METADATA_PREFIX_PROOF_V1_DIGEST_PREFIX: &str = "dfs-metadata-prefix-v1:blake3:";
 const DFS_METADATA_PREFIX_PROOF_V2_DIGEST_PREFIX: &str = "dfs-metadata-prefix-v2:blake3:";
 const DFS_CONTENT_ROOT_CATALOG_JSON_TOPOLOGY_PREFIX: &[u8] =
-    b"sinomo-dfs-content-root-catalog-topology-json-v1\0";
+    b"sinomo-dfs-content-root-catalog-topology-json-v7\0";
 
 fn catalog_error(detail: impl Into<String>) -> MetadataBackendError {
     MetadataBackendError::Serde(detail.into())
@@ -55,15 +52,11 @@ fn valid_fingerprint(value: &str) -> bool {
 }
 
 fn valid_state_fingerprint(value: &str) -> bool {
-    valid_state_fingerprint_for_version(DFS_CONTENT_ROOT_CATALOG_LEGACY_PREFIX_PROOF_VERSION, value)
-        || valid_state_fingerprint_for_version(DFS_CONTENT_ROOT_CATALOG_PREFIX_PROOF_VERSION, value)
+    valid_state_fingerprint_for_version(DFS_CONTENT_ROOT_CATALOG_PREFIX_PROOF_VERSION, value)
 }
 
 fn valid_state_fingerprint_for_version(version: u32, value: &str) -> bool {
     let prefix = match version {
-        DFS_CONTENT_ROOT_CATALOG_LEGACY_PREFIX_PROOF_VERSION => {
-            DFS_METADATA_PREFIX_PROOF_V1_DIGEST_PREFIX
-        }
         DFS_CONTENT_ROOT_CATALOG_PREFIX_PROOF_VERSION => DFS_METADATA_PREFIX_PROOF_V2_DIGEST_PREFIX,
         _ => return false,
     };
@@ -1776,27 +1769,13 @@ pub fn dfs_content_root_catalog_topology_digest_with_file_systems(
 fn encode_content_root_catalog_topology(
     topology: &impl Serialize,
 ) -> Result<Vec<u8>, MetadataBackendError> {
-    match encode_sobj(topology) {
-        Ok(encoded) => Ok(encoded),
-        Err(sobj_error) => {
-            // SOBJ collections require every element to share one inferred
-            // shape. Valid DFS topology can contain mixed enum variants and
-            // policy records with different omitted optional fields, so retain
-            // the legacy digest whenever SOBJ can represent the value and use
-            // a domain-separated canonical JSON fallback otherwise.
-            let json = serde_json::to_vec(topology).map_err(|json_error| {
-                catalog_error(format!(
-                    "DFS content-root catalog topology cannot be encoded as SOBJ ({sobj_error}) or JSON ({json_error})"
-                ))
-            })?;
-            let mut encoded = Vec::with_capacity(
-                DFS_CONTENT_ROOT_CATALOG_JSON_TOPOLOGY_PREFIX.len() + json.len(),
-            );
-            encoded.extend_from_slice(DFS_CONTENT_ROOT_CATALOG_JSON_TOPOLOGY_PREFIX);
-            encoded.extend_from_slice(&json);
-            Ok(encoded)
-        }
-    }
+    // One encoding handles current heterogeneous assignments and module values.
+    let json = serde_json::to_vec(topology).map_err(|error| catalog_error(error.to_string()))?;
+    let mut encoded =
+        Vec::with_capacity(DFS_CONTENT_ROOT_CATALOG_JSON_TOPOLOGY_PREFIX.len() + json.len());
+    encoded.extend_from_slice(DFS_CONTENT_ROOT_CATALOG_JSON_TOPOLOGY_PREFIX);
+    encoded.extend_from_slice(&json);
+    Ok(encoded)
 }
 
 fn canonical_content_root_catalog_shards(
@@ -1843,9 +1822,9 @@ impl LocalDfsContentRootCatalogStore {
     }
 
     pub fn load(&self) -> Result<Option<DfsContentRootCatalog>, MetadataBackendError> {
-        let mut catalog =
-            match read_sobj_optional::<DfsContentRootCatalogDurableEnvelope>(&self.path) {
-                Ok(Some(envelope)) => {
+        let mut catalog: Option<DfsContentRootCatalog> =
+            match read_sobj_optional::<DfsContentRootCatalogDurableEnvelope>(&self.path)? {
+                Some(envelope) => {
                     if envelope.storage_format_version
                         != DFS_CONTENT_ROOT_CATALOG_STORAGE_FORMAT_VERSION
                     {
@@ -1862,15 +1841,7 @@ impl LocalDfsContentRootCatalogStore {
                         })?,
                     )
                 }
-                Ok(None) => None,
-                // Accept direct pre-envelope catalogs written by development
-                // builds. The next successful publication migrates them.
-                Err(envelope_error) => {
-                    match read_sobj_optional::<DfsContentRootCatalog>(&self.path) {
-                        Ok(catalog) => catalog,
-                        Err(_) => return Err(envelope_error),
-                    }
-                }
+                None => None,
             };
         if let Some(catalog) = catalog.as_mut() {
             catalog.validate_structure()?;
@@ -1984,7 +1955,7 @@ mod tests {
             replica_node_ids: vec![node("catalog-replica")],
             epoch: 7,
             assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
+
             default_policy: DfsObjectPolicy::ReplicatedConfirmed,
         }
     }
@@ -1992,7 +1963,6 @@ mod tests {
     fn file_system_config() -> DfsFileSystemConfig {
         let shard = shard_config();
         DfsFileSystemConfig {
-            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: shard.file_system_id,
@@ -2164,7 +2134,7 @@ mod tests {
     }
 
     #[test]
-    fn page_contract_accepts_legacy_and_byte_bounded_target_batches() {
+    fn page_contract_accepts_small_and_byte_bounded_batches_and_rejects_old_proofs() {
         let mut legacy_request = request();
         legacy_request.max_entries = DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_ENTRIES;
         let legacy_page = complete_page(
@@ -2176,19 +2146,21 @@ mod tests {
         );
         legacy_page
             .validate_for_request(&legacy_request)
-            .expect("legacy 256-entry page remains valid");
+            .expect("256-entry page meets the current bound");
         let mut legacy_proof_page = complete_page(&legacy_request, 9, Vec::new());
         legacy_proof_page.coverage = DfsContentRootCatalogCoverage::Complete {
-            prefix_proof_version: DFS_CONTENT_ROOT_CATALOG_LEGACY_PREFIX_PROOF_VERSION,
+            prefix_proof_version: 1,
             journal_sequence: legacy_request.minimum_journal_sequence,
             state_fingerprint: format!(
-                "{DFS_METADATA_PREFIX_PROOF_V1_DIGEST_PREFIX}{}",
+                "dfs-metadata-prefix-v1:blake3:{}",
                 blake3::hash(b"legacy-catalog-proof").to_hex()
             ),
         };
-        legacy_proof_page
-            .validate_for_request(&legacy_request)
-            .expect("stored V1 catalog proof remains valid during migration");
+        assert!(
+            legacy_proof_page
+                .validate_for_request(&legacy_request)
+                .is_err()
+        );
 
         let mut target_request = request();
         target_request.max_entries = DFS_CONTENT_ROOT_CATALOG_PAGE_ENTRY_LIMIT;
@@ -2474,8 +2446,8 @@ mod tests {
     fn topology_digest_supports_mixed_sifs_policies_and_shard_assignments() {
         let mut file_system = file_system_config();
         file_system.subtree_policies = vec![
-            crate::DfsSubtreePolicy::legacy("/files/local", DfsObjectPolicy::LocalOwned),
-            crate::DfsSubtreePolicy::legacy("/services", DfsObjectPolicy::ReplicatedEventual),
+            crate::DfsSubtreePolicy::new("/files/local", DfsObjectPolicy::LocalOwned, 1, 1),
+            crate::DfsSubtreePolicy::new("/services", DfsObjectPolicy::ReplicatedEventual, 1, 2),
         ];
         let root_shard = shard_config();
         let mut services_shard = root_shard.clone();
@@ -2789,7 +2761,6 @@ mod tests {
     fn configured_file_system_without_shards_cannot_authorize_collection() {
         let configured = file_system_config();
         let configured_without_shards = DfsFileSystemConfig {
-            metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: fs("catalog-empty-fs"),
@@ -2887,6 +2858,7 @@ mod tests {
         desired_shard.replica_node_ids = vec![retiring_shard.primary_node_id.clone()];
         desired_shard.epoch += 1;
         let handoff = DfsMetadataShardMembershipHandoff {
+            cause: crate::DfsMetadataShardHandoffCause::Membership,
             handoff_id: "catalog-handoff".to_string(),
             retiring_shard,
             desired_shard,

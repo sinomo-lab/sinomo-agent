@@ -10,9 +10,8 @@ use super::{
     ClusterRemoveOptions, ClusterRenameOptions, ClusterRoleOptions, ClusterRolloutBuildRequest,
     ClusterStateAuthorityOptions, DaemonCliCommand, DaemonClusterStatus, DaemonPaths,
     DaemonProbeStatus, DaemonRunOptions, DaemonStatus, DaemonStatusOptions, DfsCliCommand,
-    DfsCommonOptions, DfsConflictResolveOptions, DfsConflictSaveVersionOptions,
-    DfsConflictUseVersionOptions, DfsConflictVersionsOptions, DfsFilterOptions,
-    DfsHostMountOptions, DfsMetadataShardTransferPrimaryOptions, DfsMountOptions, DfsPinCliCommand,
+    DfsCommonOptions, DfsFilterOptions, DfsHostMountOptions,
+    DfsMetadataShardTransferPrimaryOptions, DfsMountOptions, DfsPinCliCommand,
     DfsPlacementAuthorityClearOptions, DfsPlacementAuthorityCliCommand,
     DfsPlacementAuthorityInspectOptions, DfsPlacementAuthorityRecovery, InstallLayout,
     InstallOptions, InteractionModel, InteractionRuntime, InteractionSession, InteractionSurface,
@@ -8206,143 +8205,7 @@ fn dfs_parser_accepts_operator_and_pin_commands() {
             json: true,
         })
     );
-    assert_eq!(
-        parse_dfs_schema_for_test(&[
-            "conflicts".to_string(),
-            "--filesystem".to_string(),
-            "01hxy6qa9k0t9vr4g9n8d3q5d0".to_string(),
-            "--object".to_string(),
-            "01hxy6qa9k0t9vr4g9n8d3q5d1".to_string(),
-            "--limit".to_string(),
-            "128".to_string(),
-        ])
-        .expect("dfs conflicts"),
-        DfsCliCommand::Conflicts(DfsFilterOptions {
-            common: DfsCommonOptions::default(),
-            file_system_id: Some(
-                sinomo_runtime::dfs::DfsFileSystemId::new("01hxy6qa9k0t9vr4g9n8d3q5d0")
-                    .expect("filesystem")
-            ),
-            object_id: Some(
-                sinomo_runtime::dfs::DfsObjectId::new("01hxy6qa9k0t9vr4g9n8d3q5d1")
-                    .expect("object")
-            ),
-            limit: Some(128),
-            cursor: None,
-        })
-    );
-    assert_eq!(
-        parse_dfs_schema_for_test(&[
-            "conflicts".to_string(),
-            "resolve".to_string(),
-            "--path".to_string(),
-            "/services/sinomo-agent/channels/index.json".to_string(),
-            "--filesystem".to_string(),
-            "01hxy6qa9k0t9vr4g9n8d3q5d0".to_string(),
-            "--id".to_string(),
-            "conflict_a".to_string(),
-            "--delete-file".to_string(),
-            "--json".to_string(),
-        ])
-        .expect("dfs conflicts resolve"),
-        DfsCliCommand::ResolveConflicts(DfsConflictResolveOptions {
-            common: DfsCommonOptions {
-                metadata_root: None,
-                cluster: false,
-                json: true,
-            },
-            file_system_id: sinomo_runtime::dfs::DfsFileSystemId::new("01hxy6qa9k0t9vr4g9n8d3q5d0")
-                .expect("filesystem"),
-            path: Some("/services/sinomo-agent/channels/index.json".to_string()),
-            object_id: None,
-            conflict_ids: vec!["conflict_a".to_string()],
-            delete_file: true,
-        })
-    );
-    assert_eq!(
-        parse_dfs_schema_for_test(&[
-            "conflicts".to_string(),
-            "versions".to_string(),
-            "--path".to_string(),
-            "/services/sinomo-agent/channels/index.json".to_string(),
-            "--id".to_string(),
-            "conflict_a".to_string(),
-            "--json".to_string(),
-        ])
-        .expect("dfs conflicts versions"),
-        DfsCliCommand::ConflictVersions(DfsConflictVersionsOptions {
-            common: DfsCommonOptions {
-                metadata_root: None,
-                cluster: false,
-                json: true,
-            },
-            file_system_id: default_dfs_file_system_id(),
-            path: Some("/services/sinomo-agent/channels/index.json".to_string()),
-            object_id: None,
-            conflict_ids: vec!["conflict_a".to_string()],
-        })
-    );
-    assert_eq!(
-        parse_dfs_schema_for_test(&[
-            "conflicts".to_string(),
-            "use-version".to_string(),
-            "--object".to_string(),
-            "01hxy6qa9k0t9vr4g9n8d3q5d1".to_string(),
-            "--version".to_string(),
-            "01hxy6qa9k0t9vr4g9n8d3q5d3".to_string(),
-            "--expected-version".to_string(),
-            "01hxy6qa9k0t9vr4g9n8d3q5d4".to_string(),
-            "--operation-id".to_string(),
-            "restore-once".to_string(),
-        ])
-        .expect("dfs conflicts use-version"),
-        DfsCliCommand::UseConflictVersion(DfsConflictUseVersionOptions {
-            common: DfsCommonOptions::default(),
-            file_system_id: default_dfs_file_system_id(),
-            path: None,
-            object_id: Some(
-                sinomo_runtime::dfs::DfsObjectId::new("01hxy6qa9k0t9vr4g9n8d3q5d1")
-                    .expect("object")
-            ),
-            version: sinomo_runtime::dfs::DfsVersion::new("01hxy6qa9k0t9vr4g9n8d3q5d3")
-                .expect("version"),
-            expected_version: Some(
-                sinomo_runtime::dfs::DfsVersion::new("01hxy6qa9k0t9vr4g9n8d3q5d4").unwrap()
-            ),
-            operation_id: Some("restore-once".into()),
-        })
-    );
-    assert_eq!(
-        parse_dfs_schema_for_test(&[
-            "conflicts".to_string(),
-            "save-version".to_string(),
-            "--object".to_string(),
-            "01hxy6qa9k0t9vr4g9n8d3q5d1".to_string(),
-            "--version".to_string(),
-            "01hxy6qa9k0t9vr4g9n8d3q5d3".to_string(),
-            "--to".to_string(),
-            "/services/recovered/chat-sessions-index.remote.json".to_string(),
-            "--json".to_string(),
-        ])
-        .expect("dfs conflicts save-version"),
-        DfsCliCommand::SaveConflictVersion(DfsConflictSaveVersionOptions {
-            common: DfsCommonOptions {
-                metadata_root: None,
-                cluster: false,
-                json: true,
-            },
-            file_system_id: default_dfs_file_system_id(),
-            path: None,
-            object_id: Some(
-                sinomo_runtime::dfs::DfsObjectId::new("01hxy6qa9k0t9vr4g9n8d3q5d1")
-                    .expect("object")
-            ),
-            version: sinomo_runtime::dfs::DfsVersion::new("01hxy6qa9k0t9vr4g9n8d3q5d3")
-                .expect("version"),
-            conflict_ids: Vec::new(),
-            destination_path: "/services/recovered/chat-sessions-index.remote.json".to_string(),
-        })
-    );
+
     assert!(matches!(
         parse_dfs_schema_for_test(&[
             "path".to_string(),
@@ -8673,115 +8536,48 @@ fn dfs_parser_requires_explicit_placement_authority_recovery_evidence() {
 
 #[test]
 fn dfs_operator_inspection_uses_configured_metadata_shards() {
-    let root = sinomo_testdir::TestDir::new("sinomo-cli-dfs-sharded-inspection");
-    let data_dir = SinomoDataDir::new(&root);
-    data_dir.ensure_root_layout().expect("root layout");
-    let cluster_paths = ClusterPaths::new(&data_dir);
-    cluster_paths.ensure().expect("cluster paths");
-    let now = time::OffsetDateTime::now_utc();
-    let cluster_id =
-        ClusterId::from_legacy_named("cluster_cli_dfs_sharded_inspection").expect("cluster");
-    let node_id = NodeId::from_legacy_named("node_cli_dfs_sharded_inspection").expect("node");
-    let state = ClusterBootstrapState::initialized_locally(
-        cluster_id,
-        "cli dfs sharded inspection",
-        node_id.clone(),
-        "local",
-        "pk-local",
-        now,
-    );
-    sinomo_runtime::cluster::write_cluster_state(&cluster_paths, &state)
-        .expect("write cluster state");
-    sinomo_runtime::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
-        .expect("sync cluster state");
-
-    let file_system = distributed_sifs(node_id.clone());
-    let root_shard = DfsMetadataShardConfig {
-        file_system_id: file_system.file_system_id.clone(),
-        shard_id: "root".to_string(),
-        primary_node_id: node_id.clone(),
-        replica_node_ids: Vec::new(),
-        epoch: 1,
-        assignment: DfsMetadataShardAssignment::Root,
-        namespace_prepare_codec: Default::default(),
-        default_policy: DfsObjectPolicy::ReplicatedEventual,
-    };
-    let services_shard = DfsMetadataShardConfig {
-        file_system_id: file_system.file_system_id.clone(),
-        shard_id: "services".to_string(),
-        primary_node_id: node_id.clone(),
-        replica_node_ids: Vec::new(),
-        epoch: 1,
-        assignment: DfsMetadataShardAssignment::PathPrefix {
-            prefix: "/services".to_string(),
-        },
-        namespace_prepare_codec: Default::default(),
-        default_policy: DfsObjectPolicy::ReplicatedEventual,
-    };
-    append_cluster_raft_command(
-        &cluster_paths,
-        &node_id,
-        KvCommand::Txn(KvTxn {
-            compares: Vec::new(),
-            success: vec![
-                KvOp::put_serde(
-                    metadata_shard_key(&file_system.file_system_id, "root"),
-                    &root_shard,
-                    None,
-                )
-                .expect("root shard op"),
-                KvOp::put_serde(
-                    metadata_shard_key(&file_system.file_system_id, "services"),
-                    &services_shard,
-                    None,
-                )
-                .expect("services shard op"),
-            ],
-            failure: Vec::new(),
-        }),
+    let (runtime, nodes) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_cluster(
+        "cli-dfs-native-sharded-inspection",
+        1,
     )
-    .expect("write shard configs");
-
-    let mut backend = sinomo_runtime::dfs::open_local_sharded_metadata_backend(
-        sinomo_runtime::dfs::default_dfs_metadata_shards_root(&data_dir),
-        vec![root_shard, services_shard],
-    )
-    .expect("open sharded backend");
-    let mut object = distributed_sifs_bootstrap_objects(node_id)
-        .into_iter()
-        .next()
-        .expect("bootstrap object");
-    object.path = "/services/cli-sharded-inspection.txt".to_string();
-    backend.put_file_system(&file_system).expect("filesystem");
-    backend.put_object(&object).expect("object");
-    backend
-        .put_version(&DfsObjectVersionRecord {
-            metadata_format: sinomo_runtime::dfs::DfsRevisionMetadataFormat::Legacy,
-            content_durability: None,
-            retention: Default::default(),
-            module_metadata: Default::default(),
-            file_system_id: object.file_system_id.clone(),
-            object_id: object.object_id.clone(),
-            version: object.version.clone(),
-            content_hash: object.content_hash.clone(),
-            size_bytes: object.content_size_bytes,
-            locations: object.current_locations.clone(),
-            created_by_event_id: object.created_by_event_id.clone(),
-            created_at: now,
-            visible: true,
-        })
-        .expect("version");
-
+    .expect("normal current DFS startup");
+    let data_dir = runtime.data_dir(&nodes[0]).clone();
+    let shards = runtime
+        .metadata_shards()
+        .expect("actual native metadata assignments");
+    assert!(shards.iter().any(|shard| shard.shard_id == "root"));
+    let services = shards
+        .iter()
+        .find(|shard| shard.shard_id == "services")
+        .expect("services assignment");
+    let path = "/services/cli-sharded-inspection.txt";
+    let mut writer = runtime
+        .client(&services.primary_node_id)
+        .expect("actual current primary");
+    let object = writer
+        .posix_write_file(
+            path,
+            b"current native inspection",
+            sinomo_runtime::dfs::DfsWriteOptions {
+                policy: sinomo_runtime::dfs::DfsReplicationPolicy::new(1, 1).unwrap(),
+                replica_candidates: vec![services.primary_node_id.clone()],
+                wait_for_commit: true,
+                foreground_replica_repair: false,
+            },
+        )
+        .expect("real content persistence and guarded metadata publication");
+    drop(writer);
     let metadata = open_dfs_metadata_for_inspection_with_data_dir(None, &data_dir)
         .expect("open inspection metadata");
     let inspector = metadata.inspector();
     let inspected = inspector
-        .object_by_path(&file_system.file_system_id, &object.path)
+        .object_by_path(&runtime.file_system().file_system_id, path)
         .expect("inspect path")
         .expect("object by path");
-
     assert_eq!(inspected.object.object_id, object.object_id);
-    assert_eq!(inspected.object.path, object.path);
+    assert_eq!(inspected.object.path, path);
+    drop(metadata);
+    runtime.close().expect("normal current runtime closes");
 }
 
 #[test]

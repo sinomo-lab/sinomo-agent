@@ -49,6 +49,8 @@ pub fn validate_write_operation_id(operation_id: &str) -> Result<(), DfsError> {
 struct RoutedWriteManifestPublicationReceipt {
     request_id: String,
     object_id: DfsObjectId,
+    file_system_id: DfsFileSystemId,
+    path: Option<String>,
     publication: Option<DfsWritePublication>,
 }
 
@@ -140,10 +142,18 @@ mod canonical_completion_proof_tests {
             .is_none()
         );
         let retained = DfsWritePublication::Retained {
-            capture: Box::new(serde_json::from_value::<crate::DfsRetainedContentPublication>(serde_json::json!({"pin_id": "completion-pin", "source": DfsFileVersionSource::LocalOperation {
-                    operation_id: "completion-operation".into(),
-                    base_version: None,
-                }})).unwrap()),
+            capture: Box::new(crate::DfsRetainedContentPublication {
+                namespace: "module.dfs.history".into(),
+                reference_id: "completion-pin".into(),
+                metadata: Some(crate::DfsModuleMetadataValue {
+                    schema_version: 1,
+                    payload: serde_json::to_value(DfsFileVersionSource::LocalOperation {
+                        operation_id: "completion-operation".into(),
+                        base_version: None,
+                    })
+                    .unwrap(),
+                }),
+            }),
         };
         assert!(
             CanonicalCurrentWriteCompletion::from_current_publication(
@@ -284,14 +294,14 @@ fn classify_stable_write_operation(
                     ),
                 }
             }
-            DfsWriteIntentStatus::Rejected
-            | DfsWriteIntentStatus::Conflict
-            | DfsWriteIntentStatus::Aborted => DfsStableWriteOperationReconciliation::Conflict {
-                reason: format!(
-                    "write operation {operation_id} terminated without committing (status {:?})",
-                    record.status
-                ),
-            },
+            DfsWriteIntentStatus::Rejected | DfsWriteIntentStatus::Aborted => {
+                DfsStableWriteOperationReconciliation::Conflict {
+                    reason: format!(
+                        "write operation {operation_id} terminated without committing (status {:?})",
+                        record.status
+                    ),
+                }
+            }
         };
     }
     if history_expired {
@@ -443,7 +453,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .ok_or_else(|| DfsError::Distributed {
                 message: format!("stable write reconciliation for {path} has no authority shard"),
             })?;
-        if authority_shard.primary_node_id == self.node_id {
+        if authority_shard.primary_node_id == self.node_id
+            && !self.transport.delegates_local_namespace_authority()
+        {
             return self.reconcile_stable_write_operation_locally_for_requester(
                 object_id,
                 operation_id,
@@ -606,11 +618,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         command: &DfsDistributedWriteCommand,
     ) -> Result<(), DfsError> {
-        let Some(expected) = command.authority_shard.as_ref() else {
-            // Rolling-upgrade requests without the additive authority stamp
-            // are admitted through the daemon's global compatibility lane.
-            return Ok(());
-        };
+        let expected = command
+            .authority_shard
+            .as_ref()
+            .ok_or_else(|| DfsError::Distributed {
+                message: "routed write requires its exact current authority stamp".into(),
+            })?;
         self.rebind_completed_local_metadata_shard_membership_handoff_if_frozen(expected)?;
         let Some(object) = command.object_metadata.as_ref() else {
             return Err(DfsError::Distributed {
@@ -813,7 +826,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             self.restore_pending_write_for_intent_if_missing(&record.intent_id, &record.object_id)?;
             self.restore_backend_receipt_pages_for_intent(&record, true)?;
             if matches!(record.status, DfsWriteIntentStatus::Committed) {
-                self.restore_visible_committed_object_location_receipts(&record)?;
+                self.restore_recorded_content_receipts(&record)?;
             }
             let Some(intent) = self.coordinator.intent(&record.intent_id).cloned() else {
                 return Ok(None);
@@ -837,79 +850,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             });
         }
 
-        // Rolling-upgrade fallback for intents created before routed request
-        // ids became the durable intent identity.
-        if exclusive_create_is_still_visible == Some(false) {
-            return Ok(None);
-        }
-        if let Some(intent) = self
-            .coordinator
-            .claimed_intent_for_target(
-                &command.request.file_system_id,
-                &command.request.object_id,
-                &command.request.target_version,
-            )
-            .cloned()
-            && distributed_intent_matches_routed_write_command(&intent, requester_node_id, command)
-            && self.routed_write_intent_matches_content_identity(
-                &intent,
-                &expected_content_hash,
-                expected_content_size_bytes,
-            )?
-        {
-            return self.replayed_routed_write_outcome_for_intent(&intent);
-        }
-
-        let matching_record = {
-            let Some(backend) = self.metadata_backend.as_ref() else {
-                return Ok(None);
-            };
-            let Some(version) =
-                backend.get_version(&command.request.object_id, &command.request.target_version)?
-            else {
-                return Ok(None);
-            };
-            if version
-                .size_bytes
-                .is_some_and(|size| size != expected_content_size_bytes)
-            {
-                return Ok(None);
-            }
-            let mut matching_record = None;
-            walk_metadata_pages(|cursor| {
-                let page = backend.intents_for_object_version_page(
-                    &command.request.object_id,
-                    &command.request.target_version,
-                    cursor,
-                    DFS_METADATA_OBJECT_INTENT_PAGE_SIZE,
-                )?;
-                for record in page.intents {
-                    if write_intent_record_matches_routed_write_command(
-                        &record,
-                        requester_node_id,
-                        command,
-                        &expected_content_hash,
-                    ) {
-                        matching_record = Some(record);
-                        return Ok(None);
-                    }
-                }
-                Ok(page.next_cursor)
-            })?;
-            matching_record
-        };
-        let Some(record) = matching_record else {
-            return Ok(None);
-        };
-        self.restore_pending_write_for_intent_if_missing(&record.intent_id, &record.object_id)?;
-        self.restore_backend_receipt_pages_for_intent(&record, true)?;
-        if matches!(record.status, DfsWriteIntentStatus::Committed) {
-            self.restore_visible_committed_object_location_receipts(&record)?;
-        }
-        let Some(intent) = self.coordinator.intent(&record.intent_id).cloned() else {
-            return Ok(None);
-        };
-        self.replayed_routed_write_outcome_for_intent(&intent)
+        Ok(None)
     }
 
     /// Proves that an in-memory intent belongs to this exact write payload
@@ -985,6 +926,202 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         )
     }
 
+    fn prepare_routed_patch_command(
+        &mut self,
+        command: &mut DfsDistributedWriteCommand,
+        preingested_blob: &mut Option<ContentStoreQuarantinedBlob>,
+    ) -> Result<Option<crate::content_store::ContentManifest>, DfsError> {
+        let Some(patch) = command.patch.clone() else {
+            return Ok(None);
+        };
+        let conflict = || DfsError::WriteOperationIdConflict {
+            operation_id: command.request_id.clone(),
+            object_id: command.request.object_id.clone(),
+        };
+        if !command.publication.is_current()
+            || command.exclusive_create
+            || command.touch_parent_on_create
+            || command.requester_blob_pre_staged
+            || patch.patch_size_bytes == 0
+            || patch.offset > patch.base_size_bytes
+            || patch.offset.checked_add(patch.patch_size_bytes).is_none()
+        {
+            return Err(conflict());
+        }
+        let base = command.expected_base_version.clone().ok_or_else(conflict)?;
+        let (input_hash, input_size) = if let Some(blob) = preingested_blob.as_ref() {
+            (blob.content_hash.clone(), blob.size_bytes)
+        } else {
+            (
+                crate::content_store::content_hash(&command.bytes),
+                command.bytes.len() as u64,
+            )
+        };
+        if input_hash != patch.patch_hash
+            || input_size != patch.patch_size_bytes
+            || command
+                .content_hash
+                .as_ref()
+                .is_some_and(|hash| hash != &input_hash)
+            || command
+                .content_size_bytes
+                .is_some_and(|size| size != input_size)
+        {
+            return Err(conflict());
+        }
+        let intent_id = stable_write_intent_id(
+            &command.request.requesting_node_id,
+            &command.request.object_id,
+            &command.request_id,
+        );
+        let record = self
+            .metadata_backend
+            .as_ref()
+            .map(|backend| backend.get_intent(&command.request.object_id, &intent_id))
+            .transpose()?
+            .flatten();
+        if let Some(record) = record.as_ref() {
+            if record.file_system_id != command.request.file_system_id
+                || record.object_id != command.request.object_id
+                || record.target_version != command.request.target_version
+                || record.base_version.as_ref() != Some(&base)
+                || record.coordinator_node_id != command.request.requesting_node_id
+                || record.operation_id.as_deref() != Some(command.request_id.as_str())
+            {
+                return Err(conflict());
+            }
+            let observed_base = self
+                .metadata_backend
+                .as_ref()
+                .map(|backend| backend.get_version(&command.request.object_id, &base))
+                .transpose()?
+                .flatten()
+                .ok_or_else(|| DfsError::WriteReconciliationRequired {
+                    operation_id: command.request_id.clone(),
+                    object_id: command.request.object_id.clone(),
+                    reason: "routed patch base identity is no longer retained".into(),
+                })?;
+            if observed_base.file_system_id != command.request.file_system_id
+                || observed_base.object_id != command.request.object_id
+                || observed_base.version != base
+                || observed_base.content_hash.as_ref() != Some(&patch.base_content_hash)
+                || observed_base.size_bytes != Some(patch.base_size_bytes)
+            {
+                return Err(conflict());
+            }
+        } else {
+            let current = self.current_object_for_write(&command.request.object_id)?;
+            if current.version != base {
+                return Err(crate::service_write::stale_write_base_error(
+                    &current,
+                    &base,
+                    &command.request.target_version,
+                ));
+            }
+            if current.file_system_id != command.request.file_system_id
+                || !matches!(current.kind, DfsObjectKind::File | DfsObjectKind::Symlink)
+                || current.content_hash.as_ref() != Some(&patch.base_content_hash)
+                || current.content_size_bytes != Some(patch.base_size_bytes)
+            {
+                return Err(conflict());
+            }
+        }
+        let base_identity = crate::content_store::ContentVersionIdentity {
+            content_hash: patch.base_content_hash.clone(),
+            size_bytes: patch.base_size_bytes,
+        };
+        let replay = self.content.replay_object_version_patch_manifest(
+            command.request.object_id.as_str(),
+            base.as_str(),
+            command.request.target_version.as_str(),
+            patch.offset,
+            &patch.patch_hash,
+            patch.patch_size_bytes,
+            &base_identity,
+        )?;
+        let Some(manifest) = replay else {
+            if record.is_some() {
+                return Err(DfsError::WriteReconciliationRequired {
+                    operation_id: command.request_id.clone(),
+                    object_id: command.request.object_id.clone(),
+                    reason: "routed patch has an actual intent but no retained exact extent layout"
+                        .into(),
+                });
+            }
+            return Ok(None);
+        };
+        // Only actual immutable replay DATA is normalized here. New content
+        // binding waits for the existing final authority/object admission.
+        preingested_blob.take();
+        command.bytes.clear();
+        command.content_hash = Some(manifest.content_hash.clone());
+        command.content_size_bytes = Some(manifest.size_bytes);
+        Ok(Some(manifest))
+    }
+
+    fn bind_admitted_routed_patch(
+        &mut self,
+        command: &DfsDistributedWriteCommand,
+        preingested_blob: &mut Option<ContentStoreQuarantinedBlob>,
+    ) -> Result<crate::content_store::ContentManifest, DfsError> {
+        let patch = command
+            .patch
+            .as_ref()
+            .ok_or_else(|| DfsError::Distributed {
+                message: "admitted ranged write lost its patch descriptor".into(),
+            })?;
+        let base = command
+            .expected_base_version
+            .as_ref()
+            .ok_or_else(|| DfsError::Distributed {
+                message: "admitted ranged write lost its exact base version".into(),
+            })?;
+        let current = self.current_object_for_write(&command.request.object_id)?;
+        if current.version != *base {
+            return Err(crate::service_write::stale_write_base_error(
+                &current,
+                base,
+                &command.request.target_version,
+            ));
+        }
+        if current.file_system_id != command.request.file_system_id
+            || current.content_hash.as_ref() != Some(&patch.base_content_hash)
+            || current.content_size_bytes != Some(patch.base_size_bytes)
+        {
+            return Err(DfsError::WriteOperationIdConflict {
+                operation_id: command.request_id.clone(),
+                object_id: command.request.object_id.clone(),
+            });
+        }
+        let identity = crate::content_store::ContentVersionIdentity {
+            content_hash: patch.base_content_hash.clone(),
+            size_bytes: patch.base_size_bytes,
+        };
+        Ok(if let Some(blob) = preingested_blob.take() {
+            self.content
+                .bind_quarantined_patch(
+                    command.request.object_id.as_str(),
+                    base.as_str(),
+                    command.request.target_version.as_str(),
+                    patch.offset,
+                    blob,
+                    &identity,
+                )?
+                .manifest
+        } else {
+            self.content
+                .put_object_version_patch_with_info_and_base_identity(
+                    command.request.object_id.as_str(),
+                    base.as_str(),
+                    command.request.target_version.as_str(),
+                    patch.offset,
+                    &command.bytes,
+                    Some(&identity),
+                )?
+                .manifest
+        })
+    }
+
     pub(crate) fn handle_preingested_distributed_write_request(
         &mut self,
         requester_node_id: NodeId,
@@ -1032,6 +1169,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let trace_manifest_only = command.content_hash.is_some();
         let mut created_object_path = None;
         let mut injected_transient_metadata = false;
+        let mut patch_manifest = None;
         let apply_started = Instant::now();
         let result = if requester_node_id != command.request.requesting_node_id {
             DfsDistributedWriteResult::Rejected {
@@ -1046,6 +1184,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             DfsDistributedWriteResult::Rejected {
                 reason: error.to_string(),
                 current_primary_node_id,
+            }
+        } else if let Err(error) = self
+            .prepare_routed_patch_command(&mut command, &mut preingested_blob)
+            .map(|manifest| patch_manifest = manifest)
+        {
+            DfsDistributedWriteResult::Rejected {
+                reason: error.to_string(),
+                current_primary_node_id: None,
             }
         } else if let Some(replayed_result) =
             match self.replayed_routed_write_outcome_if_known(&requester_node_id, &command) {
@@ -1071,12 +1217,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         {
             replayed_result
         } else {
-            let authority_validation = if command.publication.is_current() {
-                self.rebase_routed_path_write_if_current(&mut command)
-                    .and_then(|()| self.validate_routed_write_command_authority(&command))
-            } else {
-                self.validate_routed_write_command_authority(&command)
-            };
+            let authority_validation =
+                if command.publication.is_current() && command.patch.is_none() {
+                    self.rebase_routed_path_write_if_current(&mut command)
+                        .and_then(|()| self.validate_routed_write_command_authority(&command))
+                } else {
+                    self.validate_routed_write_command_authority(&command)
+                };
             let requester_binding_is_exact = requester_staged_binding.as_ref().is_some_and(
                 |(file_system_id, object_id, version, hash, size)| {
                     file_system_id == &command.request.file_system_id
@@ -1090,33 +1237,36 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 && !self
                     .transport
                     .can_return_committed_foreground_response_before_replica_repair();
-            let manifest = match command.content_hash.clone() {
-                Some(content_hash) => {
-                    let content_size_bytes =
-                        command
-                            .content_size_bytes
-                            .ok_or_else(|| DfsError::Distributed {
+            let manifest = if command.patch.is_some() {
+                Ok(None)
+            } else {
+                match command.content_hash.clone() {
+                    Some(content_hash) => {
+                        let content_size_bytes =
+                            command
+                                .content_size_bytes
+                                .ok_or_else(|| DfsError::Distributed {
+                                    message: format!(
+                                        "routed reader-backed write for {} missing content size",
+                                        command.request.object_id
+                                    ),
+                                });
+                        if !command.bytes.is_empty() {
+                            Err(DfsError::Distributed {
                                 message: format!(
-                                    "routed reader-backed write for {} missing content size",
+                                    "routed reader-backed write for {} must not include inline bytes",
                                     command.request.object_id
                                 ),
-                            });
-                    if !command.bytes.is_empty() {
-                        Err(DfsError::Distributed {
-                            message: format!(
-                                "routed reader-backed write for {} must not include inline bytes",
-                                command.request.object_id
-                            ),
-                        })
-                    } else if command.requester_blob_pre_staged && preingested_blob.is_some() {
-                        Err(DfsError::Distributed {
-                            message: format!(
-                                "routed streamed write for {} cannot claim requester-pre-staged content",
-                                command.request.object_id
-                            ),
-                        })
-                    } else {
-                        content_size_bytes.and_then(|size| {
+                            })
+                        } else if command.requester_blob_pre_staged && preingested_blob.is_some() {
+                            Err(DfsError::Distributed {
+                                message: format!(
+                                    "routed streamed write for {} cannot claim requester-pre-staged content",
+                                    command.request.object_id
+                                ),
+                            })
+                        } else {
+                            content_size_bytes.and_then(|size| {
                             if let Some(blob) = preingested_blob.as_ref() {
                                 if blob.content_hash != content_hash {
                                     return Err(DfsError::ContentHashMismatch {
@@ -1135,15 +1285,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             }
                             Ok(Some((content_hash, size)))
                         })
+                        }
                     }
+                    None if preingested_blob.is_some() => Err(DfsError::Distributed {
+                        message: format!(
+                            "routed streamed write for {} is missing its finalized content identity",
+                            command.request.object_id
+                        ),
+                    }),
+                    None => Ok(None),
                 }
-                None if preingested_blob.is_some() => Err(DfsError::Distributed {
-                    message: format!(
-                        "routed streamed write for {} is missing its finalized content identity",
-                        command.request.object_id
-                    ),
-                }),
-                None => Ok(None),
             };
             match authority_validation.and(manifest).and_then(|manifest| {
                 let exclusive_create_event_id = routed_exclusive_create_event_id(&command);
@@ -1162,7 +1313,29 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     if created && touch_parent_on_create {
                         created_object_path = routed_object_path;
                     }
-                    if let Some((content_hash, content_size_bytes)) = manifest {
+                    if let Some(patch) = command.patch.as_ref() {
+                        let actual_manifest = match patch_manifest.take() {
+                            Some(manifest) => manifest,
+                            None => {
+                                self.bind_admitted_routed_patch(&command, &mut preingested_blob)?
+                            }
+                        };
+                        let base = command.expected_base_version.clone().ok_or_else(|| {
+                            DfsError::Distributed {
+                                message: "routed patch lost its exact base version".into(),
+                            }
+                        })?;
+                        self.write_stable_ingested_distributed_patch_manifest(
+                            command.request,
+                            base,
+                            patch,
+                            actual_manifest,
+                            command.desired_replica_nodes,
+                            command.policy,
+                            request_id.clone(),
+                            write_foreground_replica_repair,
+                        )
+                    } else if let Some((content_hash, content_size_bytes)) = manifest {
                         if command.requester_blob_pre_staged {
                             self.write_stable_remote_distributed_manifest(
                                 command.request,
@@ -1348,7 +1521,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             }
                         }
                         NetworkedDfsWriteOutcome::Committed { .. } => outcome.clone(),
-                        NetworkedDfsWriteOutcome::Conflict { .. } => outcome.clone(),
                     };
                     DfsDistributedWriteResult::Outcome {
                         outcome: response_outcome,
@@ -1359,40 +1531,123 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         .coordinator
                         .claimed_intent_for_target(&file_system_id, &object_id, &target_version)
                         .cloned();
+                    // A target collision can belong to another accepted request.
+                    // Its body, claim and transient object are not this failure's cleanup.
+                    let owns_failed_claim = failed_intent.as_ref().is_none_or(|intent| {
+                        intent.requesting_node_id == requester_node_id
+                            && intent.operation_id.as_deref() == Some(request_id.as_str())
+                            && intent.intent_id
+                                == stable_write_intent_id(
+                                    &requester_node_id,
+                                    &object_id,
+                                    &request_id,
+                                )
+                    });
                     let committed = failed_intent.as_ref().is_some_and(|intent| {
                         matches!(intent.state, DfsWriteIntentState::Committed)
                     });
-                    let mut cleanup_error = None;
-                    if injected_transient_metadata && !committed {
-                        let mut cleanup_completed = true;
-                        if let Some(intent) = failed_intent {
-                            let content_hash = self
-                                .writes
-                                .pending_writes
-                                .get(&intent.intent_id)
-                                .map(|pending| pending.content_hash.clone());
-                            let aborted =
-                                if matches!(intent.state, DfsWriteIntentState::AwaitingReceipts) {
-                                    match self.coordinator.abort_intent(&intent.intent_id) {
-                                        Ok(aborted) => Some(aborted),
-                                        Err(source) => {
-                                            cleanup_error = Some(source.to_string());
-                                            cleanup_completed = false;
-                                            None
+                    if let Some(intent) = failed_intent.as_ref().filter(|_| owns_failed_claim) {
+                        let prepared = self
+                            .metadata_backend
+                            .as_ref()
+                            .ok_or_else(|| DfsError::Metadata {
+                                message:
+                                    "routed write recovery requires its actual durable backend"
+                                        .into(),
+                            })?
+                            .prepared_operation_record(&format!("write:{}", intent.intent_id))?;
+                        if let Some(prepared) = prepared.filter(|prepared| {
+                            matches!(
+                                prepared.status,
+                                DfsPreparedOperationStatus::Prepared
+                                    | DfsPreparedOperationStatus::Committed
+                            )
+                        }) {
+                            prepared.validate()?;
+                            let original =
+                                prepared.payload.prepared_intent.as_ref().ok_or_else(|| {
+                                    DfsError::Metadata {
+                                        message:
+                                            "routed write preparation lost its captured intent"
+                                                .into(),
+                                    }
+                                })?;
+                            let mut sealed_intent =
+                                crate::intent::distributed_intent_from_record(original);
+                            // The prepared intent records the original active state;
+                            // live execution may already have observed its terminal commit.
+                            sealed_intent.state = intent.state.clone();
+                            let target = prepared
+                                .transaction
+                                .objects
+                                .iter()
+                                .find(|object| object.object_id == object_id);
+                            let descriptor_matches = target.is_some_and(|target| {
+                                target.file_system_id == file_system_id
+                                    && target.version == target_version
+                                    && target.content_hash.is_some()
+                                    && target.content_size_bytes.is_some()
+                                    && original.content_hash == target.content_hash
+                                    && match self.writes.pending_writes.get(&intent.intent_id) {
+                                        Some(pending) => {
+                                            target.content_hash.as_deref()
+                                                == Some(pending.content_hash.as_str())
+                                                && target.content_size_bytes
+                                                    == Some(pending.size_bytes)
+                                        }
+                                        // A genuine committed body retains the complete
+                                        // immutable descriptor after its transfer retires.
+                                        None => {
+                                            prepared.status == DfsPreparedOperationStatus::Committed
                                         }
                                     }
-                                } else {
-                                    Some(intent.clone())
-                                };
-                            if let Some(aborted) = aborted {
-                                if let Err(source) =
-                                    self.put_metadata_intent(&aborted, content_hash.as_deref())
-                                {
-                                    cleanup_error = Some(source.to_string());
-                                    cleanup_completed = false;
-                                } else {
-                                    self.writes.pending_writes.remove(&intent.intent_id);
-                                }
+                            });
+                            if sealed_intent != *intent
+                                || !descriptor_matches
+                                || prepared.digest.operation_id
+                                    != format!("write:{}", intent.intent_id)
+                                || prepared.digest.file_system_id != file_system_id
+                                || prepared.digest.owner_epoch != intent.owner_epoch
+                                || original.intent_id != intent.intent_id
+                                || original.file_system_id != file_system_id
+                                || original.object_id != object_id
+                                || original.target_version != target_version
+                                || original.base_version != intent.base_version
+                                || original.owner_epoch != intent.owner_epoch
+                                || original.coordinator_node_id != requester_node_id
+                                || original.operation_id.as_deref() != Some(request_id.as_str())
+                                || !prepared.transaction.objects.iter().any(|object| {
+                                    object.file_system_id == file_system_id
+                                        && object.object_id == object_id
+                                        && object.version == target_version
+                                })
+                            {
+                                return Err(DfsError::Metadata {
+                                    message:
+                                        "routed write failure differs from its retained preparation"
+                                            .into(),
+                                });
+                            }
+                            // The same complete kernel body still owns recovery.
+                            // A failed authority read or uncertain publication cannot
+                            // author a contradictory automatic abort of that body.
+                            return Err(DfsError::NetworkDelivery {
+                                message: format!(
+                                    "write {request_id} retains its exact durable preparation and requires authoritative reconciliation: {error}"
+                                ),
+                                delivery_state:
+                                    sinomo_core::network::NetworkDeliveryState::PossiblyApplied,
+                            });
+                        }
+                    }
+                    let mut cleanup_error = None;
+                    if injected_transient_metadata && !committed && owns_failed_claim {
+                        let mut cleanup_completed = true;
+                        if let Some(intent) = failed_intent {
+                            if let Err(source) = self.abort_pending_write_locally(&intent.intent_id)
+                            {
+                                cleanup_error = Some(source.to_string());
+                                cleanup_completed = false;
                             }
                         }
                         if cleanup_completed {
@@ -1683,6 +1938,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             authority_shard: canonical.authority_shard.clone(),
             command: None,
             attachment_bytes: None,
+            patch_attachment: None,
             authority_redirects_remaining: canonical.authority_redirects_remaining,
             remote_intent_id: canonical.remote_intent_id.clone(),
             durable_receipts: canonical.durable_receipts,
@@ -1719,6 +1975,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     .as_ref()
                     .map(|command| command.request.object_id.clone())
                     .unwrap_or_else(|| pending.object_id.clone()),
+                file_system_id: pending.authority_shard.file_system_id.clone(),
+                path: pending
+                    .command
+                    .as_ref()
+                    .and_then(|command| command.object_metadata.as_ref())
+                    .map(|object| object.path.clone()),
             });
         for pending in self
             .writes
@@ -1728,6 +1990,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         {
             pending.command = None;
             pending.attachment_bytes = None;
+            pending.patch_attachment = None;
             pending.result = Some(result.clone());
             pending.compact_retained_at = Some(Instant::now());
         }
@@ -1785,6 +2048,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             pending.command = None;
             pending.attachment_bytes = None;
+            pending.patch_attachment = None;
             pending.compact_retained_at = Some(Instant::now());
         }
         self.prune_retained_routed_writes();
@@ -1988,6 +2252,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         current_primary_node_id.clone(),
                         command.clone(),
                         pending.attachment_bytes.clone(),
+                        pending.patch_attachment.clone(),
                         pending.authority_shard.clone(),
                         pending.authority_redirects_remaining,
                     ))
@@ -1996,6 +2261,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 current_primary_node_id,
                 mut command,
                 attachment_bytes,
+                patch_attachment,
                 previous_authority,
                 redirects_remaining,
             )) = redirect
@@ -2140,6 +2406,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         .get_mut(&canonical_request_id)
                     {
                         pending.authority_redirects_remaining = redirects_remaining - 1;
+                        pending.patch_attachment = patch_attachment.clone();
                     }
                     let sent = if let Some(bytes) = attachment_bytes {
                         let routed =
@@ -2152,6 +2419,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             sinomo_core::network::NetworkError::UnknownNode { .. } => Ok(false),
                             error => Err(DfsError::from_network(error)),
                         })
+                    } else if let Some(attachment) = patch_attachment {
+                        let routed =
+                            self.next_dfs_routed_message(&current_primary_node_id, message);
+                        let body = DfsOutboundAttachment::from_quarantined_patch(attachment.0)?;
+                        self.transport
+                            .send_routed_call(
+                                &current_primary_node_id,
+                                DfsRoutedCall::with_attachment(routed, body),
+                            )
+                            .map(|()| true)
+                            .or_else(|error| match error {
+                                sinomo_core::network::NetworkError::UnknownNode { .. } => Ok(false),
+                                error => Err(DfsError::from_network(error)),
+                            })
                     } else {
                         self.send_dfs_message_if_routable(&current_primary_node_id, message)
                     };
@@ -2202,9 +2483,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     .complete_pending_routed_write(&canonical_request_id, Ok(outcome.clone()))
                     .map(|publication| (publication, outcome.clone()));
             }
-            DfsDistributedWriteResult::Outcome { outcome } => {
-                self.complete_pending_routed_write(&canonical_request_id, Ok(outcome.clone()));
-            }
             DfsDistributedWriteResult::ReconciliationRequired {
                 operation_id,
                 reason,
@@ -2244,6 +2522,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
         }
         if let Some((publication, outcome)) = committed_manifest_publish {
+            if primary_node_id == self.node_id
+                && self.transport.delegates_local_namespace_authority()
+                && let Err(error) = self
+                    .project_local_main_write_completion(&publication, &expected_authority_shard)
+            {
+                // The exact validated response has already retained its terminal
+                // outcome. A requester projection failure cannot uncommit Main's
+                // operation or cause it to be authored again.
+                dfs_perf_trace(format_args!(
+                    "routed-write-local-projection-failed node={} request={} object={} error={}",
+                    self.node_id, publication.request_id, publication.object_id, error
+                ));
+            }
             self.publish_committed_routed_write_manifest_if_local(&publication, &outcome);
         }
         Ok(NetworkedDfsServiceEvent::RemoteWriteCompleted {
@@ -2252,6 +2543,44 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             primary_node_id,
             result: response.result,
         })
+    }
+
+    /// A same-process Main writes the shared durable tables itself and sends no
+    /// replica journal to its requester. Retire that requester's planning overlay
+    /// and read the current durable object; a retained or superseded completion
+    /// must never install its historical target version as the current head.
+    fn project_local_main_write_completion(
+        &mut self,
+        publication: &RoutedWriteManifestPublicationReceipt,
+        authority_shard: &DfsMetadataShardConfig,
+    ) -> Result<(), DfsError> {
+        self.remove_transient_object_metadata(&publication.object_id);
+        let backend = self
+            .metadata_backend
+            .as_ref()
+            .ok_or_else(|| DfsError::Metadata {
+                message: "same-node Main write completion requires a durable metadata backend"
+                    .into(),
+            })?;
+        let object = backend.get_object_on_shard(
+            &DfsMetadataShardId::new(authority_shard.shard_id.clone()),
+            &publication.object_id,
+        )?;
+        let object = match (object, publication.path.as_deref()) {
+            (Some(object), _) => Some(object),
+            (None, Some(path)) => {
+                // Main may resolve a blind path write to an existing hardlink.
+                // Follow the normal durable path router, never the request's
+                // provisional inode or its proposed readable locations.
+                backend.get_object_by_path(&publication.file_system_id, path)?
+            }
+            (None, None) => None,
+        };
+        if let Some(object) = object {
+            self.apply_metadata_object_to_service_state(object)?;
+        }
+        self.clear_metadata_lookup_cache();
+        Ok(())
     }
 
     fn publish_committed_routed_write_manifest_if_local(
@@ -2714,10 +3043,18 @@ mod stable_reconciliation_tests {
         let operation_id = "retained-reconcile-operation";
         let mut record = committed_record(&requester, &object_id, operation_id, "blake3:expected");
         record.publication = DfsWritePublication::Retained {
-            capture: Box::new(serde_json::from_value::<crate::DfsRetainedContentPublication>(serde_json::json!({"pin_id": "explicit-pin", "source": crate::DfsFileVersionSource::LocalOperation {
-                    operation_id: "local-operation".into(),
-                    base_version: None,
-                }})).unwrap()),
+            capture: Box::new(crate::DfsRetainedContentPublication {
+                namespace: "module.dfs.history".into(),
+                reference_id: "explicit-pin".into(),
+                metadata: Some(crate::DfsModuleMetadataValue {
+                    schema_version: 1,
+                    payload: serde_json::to_value(crate::DfsFileVersionSource::LocalOperation {
+                        operation_id: "local-operation".into(),
+                        base_version: None,
+                    })
+                    .unwrap(),
+                }),
+            }),
         };
         assert!(matches!(
             classify(

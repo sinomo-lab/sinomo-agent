@@ -1314,12 +1314,13 @@ mod tests {
     fn wasix_sandbox_filesystem_root_preopen_lists_nested_sifs_mount_ancestors() {
         let name = "wasix_nested_sifs_mount";
         let root = sinomo_testdir::TestDir::new(name);
-        let network = InProcessNetwork::new();
         let node_id = NodeId::from_legacy_named(format!("node_{name}")).unwrap();
-        let mut dfs = NetworkedDfsService::new(
-            network.add_node(node_id),
-            LocalContentStore::new(root.join("content")).unwrap(),
-        );
+        let (native, mut dfs) =
+            sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+                "wasix_sandbox_filesystem_root_preopen_lists_nested_sifs_mount_ancestors",
+                node_id.clone(),
+            )
+            .expect("normal native DFS startup");
         dfs.bootstrap_distributed_sifs().unwrap();
         let shared_dir = "/services/shared/wasix-nested-readonly";
         dfs.posix_mkdir_all(shared_dir).unwrap();
@@ -1404,6 +1405,9 @@ mod tests {
         virtual_mio::block_on(virtual_fs::AsyncReadExt::read_to_end(&mut file, &mut bytes))
             .unwrap();
         assert_eq!(bytes, b"mounted");
+
+        drop(sifs_fs);
+        native.close().expect("normal native DFS shutdown");
     }
 
     #[test]
@@ -2229,12 +2233,13 @@ mod tests {
     #[test]
     fn wasix_sandbox_filesystem_open_write_handle_survives_later_chmod() {
         let root = sinomo_testdir::TestDir::new("sinomo-wasix-sandbox-fs-sifs");
-        let network = InProcessNetwork::new();
         let node_id = NodeId::from_legacy_named("node_wasix_sandbox_fs_chmod").unwrap();
-        let mut dfs = NetworkedDfsService::new(
-            network.add_node(node_id),
-            LocalContentStore::new(root.join("content")).unwrap(),
-        );
+        let (native, mut dfs) =
+            sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+                "wasix_sandbox_filesystem_open_write_handle_survives_later_chmod",
+                node_id.clone(),
+            )
+            .expect("normal native DFS startup");
         dfs.bootstrap_distributed_sifs().unwrap();
         let sandbox_id = SandboxId::from_legacy_named("sandbox_wasix_sandbox_fs_chmod").unwrap();
         let mut store = SifsSandboxInstanceStore::new(dfs);
@@ -2268,17 +2273,21 @@ mod tests {
         assert_eq!(guard.read_unchecked(&path, None).unwrap(), b"oldX");
         assert_eq!(guard.stat_unchecked(&path).unwrap().mode, 0);
         drop(guard);
+
+        drop(sifs_fs);
+        native.close().expect("normal native DFS shutdown");
     }
 
     #[test]
     fn wasix_sandbox_filesystem_open_read_handle_survives_later_chmod() {
         let root = sinomo_testdir::TestDir::new("sinomo-wasix-sandbox-fs-sifs-read");
-        let network = InProcessNetwork::new();
         let node_id = NodeId::from_legacy_named("node_wasix_sandbox_fs_read_chmod").unwrap();
-        let mut dfs = NetworkedDfsService::new(
-            network.add_node(node_id),
-            LocalContentStore::new(root.join("content")).unwrap(),
-        );
+        let (native, mut dfs) =
+            sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+                "wasix_sandbox_filesystem_open_read_handle_survives_later_chmod",
+                node_id.clone(),
+            )
+            .expect("normal native DFS startup");
         dfs.bootstrap_distributed_sifs().unwrap();
         let sandbox_id =
             SandboxId::from_legacy_named("sandbox_wasix_sandbox_fs_read_chmod").unwrap();
@@ -2315,6 +2324,9 @@ mod tests {
             sifs_fs.lock().unwrap().stat_unchecked(&path).unwrap().mode,
             0
         );
+
+        drop(sifs_fs);
+        native.close().expect("normal native DFS shutdown");
     }
 
     #[test]
@@ -2853,12 +2865,10 @@ mod tests {
     #[test]
     fn wasix_sandbox_filesystem_open_write_identity_prefers_workspace_over_read_only_alias() {
         let root = sinomo_testdir::TestDir::new("sinomo-wasix-sandbox-fs-identity-workspace");
-        let network = InProcessNetwork::new();
         let node_id = NodeId::from_legacy_named("node_wasix_identity_workspace").unwrap();
-        let mut dfs = NetworkedDfsService::new(
-            network.add_node(node_id),
-            LocalContentStore::new(root.join("content")).unwrap(),
-        );
+        let (native, mut dfs) = sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+            "wasix_sandbox_filesystem_open_write_identity_prefers_workspace_over_read_only_alias", node_id.clone(),
+        ).expect("normal native DFS startup");
         dfs.bootstrap_distributed_sifs().unwrap();
         let sandbox_id = SandboxId::from_legacy_named("sandbox_wasix_identity_workspace").unwrap();
         let mut store = SifsSandboxInstanceStore::new(dfs);
@@ -2908,6 +2918,9 @@ mod tests {
             b"old-renamed"
         );
         drop(guard);
+
+        drop(sifs_fs);
+        native.close().expect("normal native DFS shutdown");
     }
 
     #[test]
@@ -3511,12 +3524,13 @@ mod tests {
     #[test]
     fn wasix_sandbox_filesystem_follows_sifs_symlink_for_open_and_metadata() {
         let root = sinomo_testdir::TestDir::new("sinomo-wasix-sandbox-fs-sifs-link");
-        let network = InProcessNetwork::new();
         let node_id = NodeId::from_legacy_named("node_wasix_sifs_link").unwrap();
-        let mut dfs = NetworkedDfsService::new(
-            network.add_node(node_id),
-            LocalContentStore::new(root.join("content")).unwrap(),
-        );
+        let (native, mut dfs) =
+            sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+                "wasix_sandbox_filesystem_follows_sifs_symlink_for_open_and_metadata",
+                node_id.clone(),
+            )
+            .expect("normal native DFS startup");
         dfs.bootstrap_distributed_sifs().unwrap();
         let manifest = SandboxInstanceManifest::new(
             SandboxId::from_legacy_named("sandbox_wasix_sifs_link").unwrap(),
@@ -3559,6 +3573,9 @@ mod tests {
         virtual_mio::block_on(virtual_fs::AsyncReadExt::read_to_end(&mut file, &mut bytes))
             .unwrap();
         assert_eq!(bytes, b"target");
+
+        drop(sifs_fs);
+        native.close().expect("normal native DFS shutdown");
     }
 
     #[test]
@@ -3709,12 +3726,13 @@ mod tests {
     #[test]
     fn wasix_sandbox_filesystem_create_new_rejects_broken_sifs_symlink() {
         let root = sinomo_testdir::TestDir::new("sinomo-wasix-sandbox-fs-sifs-create-new-link");
-        let network = InProcessNetwork::new();
         let node_id = NodeId::from_legacy_named("node_wasix_create_new_link").unwrap();
-        let mut dfs = NetworkedDfsService::new(
-            network.add_node(node_id),
-            LocalContentStore::new(root.join("content")).unwrap(),
-        );
+        let (native, mut dfs) =
+            sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+                "wasix_sandbox_filesystem_create_new_rejects_broken_sifs_symlink",
+                node_id.clone(),
+            )
+            .expect("normal native DFS startup");
         dfs.bootstrap_distributed_sifs().unwrap();
         let manifest = SandboxInstanceManifest::new(
             SandboxId::from_legacy_named("sandbox_wasix_create_new_link").unwrap(),
@@ -3751,17 +3769,21 @@ mod tests {
                 .stat(&SandboxPath::new("/work/missing.txt").unwrap()),
             Err(SandboxFsError::NotFound { .. })
         ));
+
+        drop(sifs_fs);
+        native.close().expect("normal native DFS shutdown");
     }
 
     #[test]
     fn wasix_sandbox_filesystem_open_create_existing_file_does_not_rewrite_sifs() {
         let root = sinomo_testdir::TestDir::new("sinomo-wasix-sandbox-fs-sifs-create-existing");
-        let network = InProcessNetwork::new();
         let node_id = NodeId::from_legacy_named("node_wasix_create_existing").unwrap();
-        let mut dfs = NetworkedDfsService::new(
-            network.add_node(node_id),
-            LocalContentStore::new(root.join("content")).unwrap(),
-        );
+        let (native, mut dfs) =
+            sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+                "wasix_sandbox_filesystem_open_create_existing_file_does_not_rewrite_sifs",
+                node_id.clone(),
+            )
+            .expect("normal native DFS startup");
         dfs.bootstrap_distributed_sifs().unwrap();
         let manifest = SandboxInstanceManifest::new(
             SandboxId::from_legacy_named("sandbox_wasix_create_existing").unwrap(),
@@ -3796,17 +3818,21 @@ mod tests {
             sifs_fs.lock().unwrap().read(&path, None).unwrap(),
             b"content"
         );
+
+        drop(sifs_fs);
+        native.close().expect("normal native DFS shutdown");
     }
 
     #[test]
     fn wasix_sandbox_filesystem_separates_remove_file_and_remove_dir() {
         let root = sinomo_testdir::TestDir::new("sinomo-wasix-sandbox-fs-remove-kind");
-        let network = InProcessNetwork::new();
         let node_id = NodeId::from_legacy_named("node_wasix_remove_kind").unwrap();
-        let mut dfs = NetworkedDfsService::new(
-            network.add_node(node_id),
-            LocalContentStore::new(root.join("content")).unwrap(),
-        );
+        let (native, mut dfs) =
+            sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+                "wasix_sandbox_filesystem_separates_remove_file_and_remove_dir",
+                node_id.clone(),
+            )
+            .expect("normal native DFS startup");
         dfs.bootstrap_distributed_sifs().unwrap();
         let manifest = SandboxInstanceManifest::new(
             SandboxId::from_legacy_named("sandbox_wasix_remove_kind").unwrap(),
@@ -3840,17 +3866,21 @@ mod tests {
         virtual_fs::FileSystem::remove_file(&wasix_fs, "/work/file.txt".as_ref())
             .expect("remove file");
         virtual_fs::FileSystem::remove_dir(&wasix_fs, "/work/dir".as_ref()).expect("remove dir");
+
+        drop(sifs_fs);
+        native.close().expect("normal native DFS shutdown");
     }
 
     #[test]
     fn wasix_sandbox_filesystem_hard_link_uses_sandbox_fs() {
         let root = sinomo_testdir::TestDir::new("sinomo-wasix-sandbox-fs-hardlink");
-        let network = InProcessNetwork::new();
         let node_id = NodeId::from_legacy_named("node_wasix_hardlink").unwrap();
-        let mut dfs = NetworkedDfsService::new(
-            network.add_node(node_id),
-            LocalContentStore::new(root.join("content")).unwrap(),
-        );
+        let (native, mut dfs) =
+            sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node(
+                "wasix_sandbox_filesystem_hard_link_uses_sandbox_fs",
+                node_id.clone(),
+            )
+            .expect("normal native DFS startup");
         dfs.bootstrap_distributed_sifs().unwrap();
         let manifest = SandboxInstanceManifest::new(
             SandboxId::from_legacy_named("sandbox_wasix_hardlink").unwrap(),
@@ -3936,5 +3966,8 @@ mod tests {
             .read(&SandboxPath::new("/work/file.txt").unwrap(), None)
             .expect("read original");
         assert_eq!(bytes, b"updated");
+
+        drop(sifs_fs);
+        native.close().expect("normal native DFS shutdown");
     }
 }

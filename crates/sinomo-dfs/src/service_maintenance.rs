@@ -13,6 +13,290 @@ use crate::service_state::PendingMetadataReplicationResponseKind;
 use crate::*;
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
+    pub fn gc_metadata_history(
+        &mut self,
+        options: DfsMetadataHistoryGcOptions,
+    ) -> Result<DfsMetadataHistoryGcReport, DfsError> {
+        let plan = self
+            .metadata_backend
+            .as_mut()
+            .ok_or_else(|| DfsError::Metadata {
+                message: "history collection requires current durable metadata".into(),
+            })?
+            .plan_metadata_history_gc(options)?;
+        for ((fs, shard_id), effects) in plan.effects_by_scope {
+            if effects.is_empty() {
+                continue;
+            }
+            let epoch = if let Some(control) = self.control_plane.as_mut() {
+                let shard = DfsControlPlaneStore::new(control.as_mut())
+                    .get_metadata_shard(&fs, &shard_id.0)?
+                    .ok_or_else(|| DfsError::Metadata {
+                        message: "history collection has no exact current shard".into(),
+                    })?;
+                if shard.primary_node_id != self.node_id {
+                    return Err(DfsError::StaleOwnerEpoch {
+                        file_system_id: fs,
+                        local_node_id: self.node_id.clone(),
+                        primary_node_id: shard.primary_node_id,
+                        epoch: shard.epoch,
+                    });
+                }
+                shard.epoch
+            } else {
+                0
+            };
+            let scope = DfsPreparedOperationScope {
+                file_system_id: fs.clone(),
+                shard_id: shard_id.clone(),
+                owner_epoch: epoch,
+                operation_id: format!("history-gc:{}", sinomo_core::Id::generate()),
+            };
+            let _execution = self.acquire_prepared_execution(&scope)?;
+            let ids = effects
+                .iter()
+                .flat_map(|effect| effect.affected_object_ids())
+                .collect::<std::collections::BTreeSet<_>>();
+            let mut objects = Vec::new();
+            let mut paths = Vec::new();
+            for id in ids {
+                let row = self
+                    .metadata_backend
+                    .as_ref()
+                    .expect("GC backend")
+                    .get_object_on_shard(&shard_id, &id)?;
+                objects.push(DfsNamespaceObjectVersionExpectation {
+                    object_id: id,
+                    expected_version: row.as_ref().map(|row| row.version.clone()),
+                });
+                if let Some(row) = row {
+                    paths.push(DfsNamespacePathOccupantExpectation {
+                        path: row.path,
+                        expected_object_id: Some(row.object_id),
+                    });
+                }
+            }
+            let compacted = effects
+                .iter()
+                .filter_map(|effect| match effect {
+                    DfsPreparedMetadataEffect::PutIntentReceipt { receipt }
+                        if receipt.status == DfsWriteIntentStatus::Committed
+                            && !receipt.publication.is_retained_repair() =>
+                    {
+                        Some(receipt.clone())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let mut removed_owners = Vec::new();
+            for effect in &effects {
+                if let DfsPreparedMetadataEffect::RemoveRetainedRepairOwner {
+                    object_id,
+                    intent_id,
+                } = effect
+                {
+                    let history = self
+                        .metadata_backend
+                        .as_ref()
+                        .expect("GC backend")
+                        .object_write_intent_history(object_id)?;
+                    let owner = history
+                        .intents
+                        .into_iter()
+                        .find(|owner| {
+                            owner.intent_id == *intent_id
+                                && owner.publication.is_retained_repair()
+                                && owner.status == DfsWriteIntentStatus::Committed
+                        })
+                        .ok_or_else(|| DfsError::Metadata {
+                            message: "GC retained-owner removal lost its actual full owner".into(),
+                        })?;
+                    removed_owners.push(owner);
+                }
+            }
+            self.publish_metadata_effects_on_shard(scope, objects, paths, effects)?;
+            self.retire_compacted_repair_queue(&compacted, &removed_owners)?;
+        }
+        Ok(plan.report)
+    }
+
+    fn retire_compacted_repair_queue(
+        &mut self,
+        receipts: &[DfsWriteIntentReceipt],
+        removed_owners: &[DfsWriteIntentRecord],
+    ) -> Result<(), DfsError> {
+        if receipts.is_empty() && removed_owners.is_empty() {
+            return Ok(());
+        }
+        let Some(owners) = self.publication_execution.current() else {
+            // No runtime queue identity is invented for standalone DATA.
+            return Ok(());
+        };
+        let data_dir = sinomo_core::local::SinomoDataDir::new(owners.data_root());
+        let store =
+            LocalDfsRepairQueueStore::new(default_dfs_repair_attempt_snapshot_path(&data_dir));
+        let (view, observed) = store.view_for_maintenance()?;
+        let mut retired = std::collections::BTreeSet::new();
+        for receipt in receipts {
+            let records = view
+                .records
+                .iter()
+                .filter(|record| record.intent_id == receipt.intent_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            if records.is_empty() {
+                continue;
+            }
+            let backend = self.metadata_backend.as_ref().expect("GC backend");
+            // get_intent intentionally projects compact receipts. Full stored
+            // absence and the exact receipt must come from one actual snapshot.
+            let history = backend.object_write_intent_history(&receipt.object_id)?;
+            if history
+                .intents
+                .iter()
+                .any(|intent| intent.intent_id == receipt.intent_id)
+                || history
+                    .receipts
+                    .iter()
+                    .find(|stored| stored.intent_id == receipt.intent_id)
+                    != Some(receipt)
+            {
+                return Err(DfsError::Metadata {
+                    message: "committed GC changed its exact stored compacted repair identity"
+                        .into(),
+                });
+            }
+            let Some(version) = backend.get_version(&receipt.object_id, &receipt.target_version)?
+            else {
+                continue;
+            };
+            if receipt.publication.is_current() {
+                if version.file_system_id != receipt.file_system_id
+                    || version.object_id != receipt.object_id
+                    || version.version != receipt.target_version
+                    || version.content_hash != receipt.content_hash
+                    || records.iter().any(|row| {
+                        row.intent_id != receipt.intent_id
+                            || row.object_id != receipt.object_id
+                            || row.version != receipt.target_version
+                            || Some(row.content_hash.as_str()) != receipt.content_hash.as_deref()
+                            || !receipt
+                                .desired_replica_node_ids
+                                .contains(&row.missing_replica_node_id)
+                    })
+                {
+                    return Err(DfsError::Metadata {
+                        message: "compacted Current repair retirement differs from its exact stored owner and target".into(),
+                    });
+                }
+                let target_receipts =
+                    backend.receipts_for_version(&receipt.object_id, &receipt.target_version)?;
+                if records.iter().all(|row| {
+                    !row.in_flight
+                        && row.transfer_request_id.is_none()
+                        && row.transfer_kind.is_some()
+                        && (row.transfer_delivery_state
+                            == Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent)
+                            || row.completed_transfer_request_id.is_some())
+                        && target_receipts.iter().any(|target| {
+                            crate::content_durability::receipt_matches_target_version(
+                                target,
+                                &version,
+                                &row.missing_replica_node_id,
+                            )
+                        })
+                }) {
+                    // Metadata compaction preserves this original full tuple.
+                    // Settle only its already-proven carrier rows through the
+                    // SAME observed queue CAS before later witness eviction.
+                    retired.insert(receipt.intent_id.clone());
+                }
+                continue;
+            }
+            if !version.has_retention_grant() {
+                continue;
+            }
+            let expected = self.recorded_retained_repair_owner(&version)?;
+            let actual = history
+                .intents
+                .iter()
+                .find(|stored| stored.intent_id == expected.intent_id);
+            if compacted_retained_transfer_can_retire(
+                receipt, &version, &expected, actual, &records,
+            )? {
+                retired.insert(receipt.intent_id.clone());
+            }
+        }
+        let mut remaining = view
+            .records
+            .into_iter()
+            .filter(|record| !retired.contains(&record.intent_id))
+            .collect::<Vec<_>>();
+        let mut removed_runtime_owners = std::collections::BTreeSet::new();
+        for owner in removed_owners {
+            let backend = self.metadata_backend.as_ref().expect("GC backend");
+            let history = backend.object_write_intent_history(&owner.object_id)?;
+            if history
+                .intents
+                .iter()
+                .any(|record| record.intent_id == owner.intent_id)
+            {
+                return Err(DfsError::Metadata {
+                    message: "committed GC retained-owner removal remains unapplied".into(),
+                });
+            }
+            if let Some(version) = backend.get_version(&owner.object_id, &owner.target_version)? {
+                if version.file_system_id != owner.file_system_id
+                    || version.content_hash != owner.content_hash
+                    || version.has_retention_grant()
+                {
+                    return Err(DfsError::Metadata {
+                        message: "committed GC removal still has a different or retained target"
+                            .into(),
+                    });
+                }
+            }
+            for row in remaining
+                .iter_mut()
+                .filter(|row| row.intent_id == owner.intent_id)
+            {
+                if row.object_id != owner.object_id
+                    || row.version != owner.target_version
+                    || Some(row.content_hash.as_str()) != owner.content_hash.as_deref()
+                    || !owner
+                        .desired_replica_node_ids
+                        .contains(&row.missing_replica_node_id)
+                {
+                    return Err(DfsError::Metadata {
+                        message: "GC removed owner differs from its exact queued target".into(),
+                    });
+                }
+                // Physical GC withdraws execution. An unresolved carrier claim
+                // is retained unchanged; only its scheduling deadline parks.
+                if crate::service_repair::repair_transfer_custody_unresolved(row) {
+                    row.next_retry_unix_nanos = u64::MAX;
+                }
+            }
+            remaining.retain(|row| {
+                row.intent_id != owner.intent_id
+                    || crate::service_repair::repair_transfer_custody_unresolved(row)
+            });
+            removed_runtime_owners.insert(owner.intent_id.clone());
+        }
+        match store.reconcile_observed(&observed, &remaining)? {
+            crate::repair_queue_store::DfsRepairQueueObservedReconcileOutcome::Applied(_) => {
+                retired.extend(removed_runtime_owners);
+                self.retire_committed_repairs(&retired);
+                Ok(())
+            }
+            crate::repair_queue_store::DfsRepairQueueObservedReconcileOutcome::GenerationChanged { .. } => {
+                Err(DfsError::Metadata {
+                    message: "history GC committed; repair queue changed before its exact retirement checkpoint; convergence remains pending".into(),
+                })
+            }
+        }
+    }
+
     pub fn run_local_content_anti_entropy(
         &mut self,
         options: DfsAntiEntropyOptions,
@@ -175,11 +459,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // Metadata is the reachability authority. Journal and materialize its
         // bounded removals before deleting local manifests or blobs, then
         // derive content roots from the post-GC table image.
-        let metadata_history_gc =
-            match (options.metadata_history_gc, self.metadata_backend.as_mut()) {
-                (Some(options), Some(backend)) => Some(backend.gc_metadata_history(options)?),
-                (Some(_), None) | (None, _) => None,
-            };
+        let metadata_history_gc = options
+            .metadata_history_gc
+            .map(|options| self.gc_metadata_history(options))
+            .transpose()?;
         let content_gc_requested = options.version_gc.is_some() || options.orphan_gc.is_some();
         let content_reservation_reconciliation_requested =
             options.content_reservation_reconciliation.is_some();
@@ -441,163 +724,219 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 prefix_probe: None,
                 authority_probe: None,
                 durable_replication: None,
-                batch: batch.clone(),
+                batch: crate::metadata_replication::prepare_dfs_metadata_journal_frame_batch(
+                    self.metadata_backend
+                        .as_ref()
+                        .expect("journal source backend")
+                        .as_ref(),
+                    &batch,
+                )?,
             }),
         )?;
         Ok(sent.then_some(batch))
     }
+}
 
-    pub fn replicate_metadata_shard_to_configured_replicas(
-        &mut self,
-        file_system_id: &DfsFileSystemId,
-        shard_id: &str,
-    ) -> Result<Vec<DfsMetadataReplicationOutcome>, DfsError> {
-        self.replication
-            .pending_metadata_replications
-            .retain(|_, pending| pending.created_at.elapsed() < std::time::Duration::from_secs(60));
-        let Some(control_plane) = self.control_plane.as_mut() else {
-            return Ok(Vec::new());
-        };
-        let Some(shard) = DfsControlPlaneStore::new(control_plane.as_mut())
-            .get_metadata_shard(file_system_id, shard_id)?
-        else {
-            return Ok(Vec::new());
-        };
-        if shard.primary_node_id != self.node_id {
-            return Err(DfsError::StaleOwnerEpoch {
-                file_system_id: shard.file_system_id,
-                local_node_id: self.node_id.clone(),
-                primary_node_id: shard.primary_node_id,
-                epoch: shard.epoch,
-            });
-        }
+fn compacted_retained_transfer_can_retire(
+    receipt: &DfsWriteIntentReceipt,
+    version: &DfsObjectVersionRecord,
+    expected: &DfsWriteIntentRecord,
+    actual: Option<&DfsWriteIntentRecord>,
+    records: &[DfsRepairAttemptRecord],
+) -> Result<bool, DfsError> {
+    use sinomo_core::network::NetworkDeliveryState;
+    let Some(actual) = actual else {
+        return Ok(false);
+    };
+    let Some(durability) = &version.content_durability else {
+        return Ok(false);
+    };
+    if receipt.status != DfsWriteIntentStatus::Committed
+        || receipt.publication.is_current()
+        || receipt.publication.is_retained_repair()
+        || !version.has_retention_grant()
+        || version.file_system_id != receipt.file_system_id
+        || version.object_id != receipt.object_id
+        || version.version != receipt.target_version
+        || version.content_hash != receipt.content_hash
+        || durability.source_version != receipt.target_version
+        || durability.coordinator_node_id != receipt.coordinator_node_id
+        || durability.owner_epoch != receipt.owner_epoch
+        || durability.policy != receipt.policy
+        || durability.desired_replica_node_ids != receipt.desired_replica_node_ids
+        || actual.intent_id != expected.intent_id
+        || actual.intent_id == receipt.intent_id
+        || actual.status != DfsWriteIntentStatus::Committed
+        || actual.coordinator_node_id != expected.coordinator_node_id
+        || actual.owner_epoch != expected.owner_epoch
+        || !crate::file_history::retained_repair_plan_matches(actual, expected)
+        || records.iter().any(|record| {
+            record.intent_id != receipt.intent_id
+                || record.object_id != receipt.object_id
+                || record.version != receipt.target_version
+                || receipt.content_hash.as_deref() != Some(record.content_hash.as_str())
+                || !receipt
+                    .desired_replica_node_ids
+                    .contains(&record.missing_replica_node_id)
+        })
+    {
+        return Err(DfsError::Metadata {
+            message: "compacted repair retirement differs from its exact source and replacement durability".into(),
+        });
+    }
+    crate::file_history::validate_intent_publication(actual)?;
+    Ok(!records.is_empty()
+        && records.iter().all(|record| {
+            !record.in_flight
+                && record.transfer_request_id.is_none()
+                && record.transfer_kind.is_some()
+                && (record.transfer_delivery_state == Some(NetworkDeliveryState::DefinitelyNotSent)
+                    || record.completed_transfer_request_id.is_some())
+        }))
+}
 
-        let authority_file_system_id = shard.file_system_id.clone();
-        let authority_epoch = shard.epoch;
-        let shard_id = DfsMetadataShardId::new(shard.shard_id);
-        let local_node_id = self.node_id.clone();
-        let mut outcomes = Vec::new();
-        for target_node_id in shard
-            .replica_node_ids
-            .into_iter()
-            .filter(|target_node_id| target_node_id != &local_node_id)
-        {
-            let cursor_key = (target_node_id.clone(), shard_id.clone());
-            let after_sequence = if let Some(after_sequence) = self
-                .replication
-                .metadata_replication_cursors
-                .get(&cursor_key)
-            {
-                *after_sequence
-            } else if let Some(backend) = self.metadata_backend.as_ref() {
-                let after_sequence =
-                    backend.metadata_replication_cursor(&target_node_id, &shard_id)?;
-                self.replication
-                    .metadata_replication_cursors
-                    .insert(cursor_key.clone(), after_sequence);
-                after_sequence
-            } else {
-                0
-            };
-            let Some(batch) =
-                self.metadata_journal_batch_for_shard_since(&shard_id, after_sequence)?
-            else {
-                outcomes.push(DfsMetadataReplicationOutcome::NoChanges {
-                    target_node_id,
-                    shard_id: shard_id.clone(),
-                    after_sequence,
-                });
-                continue;
-            };
-            let pending_next_after_sequence = self
-                .replication
-                .pending_metadata_replications
-                .values()
-                .filter(|pending| {
-                    pending.target_node_id == target_node_id && pending.shard_id == shard_id
-                })
-                .map(|pending| pending.next_after_sequence)
-                .max();
-            if let Some(pending_next_after_sequence) = pending_next_after_sequence
-                && pending_next_after_sequence >= batch.next_after_sequence
-            {
-                outcomes.push(DfsMetadataReplicationOutcome::InFlight {
-                    target_node_id,
-                    shard_id: shard_id.clone(),
-                    next_after_sequence: pending_next_after_sequence,
-                });
-                continue;
-            }
-            let entries = batch.entries.len();
-            let next_after_sequence = batch.next_after_sequence;
-            let request_id = self.next_request_id();
-            self.replication.pending_metadata_replications.insert(
-                request_id.clone(),
-                PendingMetadataReplication {
-                    target_node_id: target_node_id.clone(),
-                    shard_id: shard_id.clone(),
-                    next_after_sequence,
-                    expected_response_kind: PendingMetadataReplicationResponseKind::JournalBatch,
-                    verify_prefix_only: false,
-                    required_authority_confirmation_id: None,
-                    created_at: std::time::Instant::now(),
-                },
-            );
-            let sent = self.send_dfs_message_if_routable(
-                &target_node_id,
-                DfsNetworkMessage::MetadataJournalBatch(DfsMetadataJournalBatchCommand {
-                    request_id: request_id.clone(),
-                    source_node_id: Some(self.node_id.clone()),
-                    file_system_id: Some(authority_file_system_id.clone()),
-                    authority_epoch: Some(authority_epoch),
-                    verify_prefix_only: false,
-                    prefix_probe: None,
-                    authority_probe: None,
-                    durable_replication: None,
-                    batch,
-                }),
-            )?;
-            if sent {
-                outcomes.push(DfsMetadataReplicationOutcome::Sent {
-                    target_node_id,
-                    shard_id: shard_id.clone(),
-                    entries,
-                    next_after_sequence,
-                });
-            } else {
-                self.replication
-                    .pending_metadata_replications
-                    .remove(&request_id);
-                outcomes.push(DfsMetadataReplicationOutcome::Unroutable {
-                    target_node_id,
-                    shard_id: shard_id.clone(),
-                    after_sequence,
-                });
-            }
+#[cfg(test)]
+mod compacted_transfer_retirement_data_tests {
+    use super::*;
+    fn actual_unknown_data() -> (
+        DfsWriteIntentReceipt,
+        DfsObjectVersionRecord,
+        DfsWriteIntentRecord,
+        Vec<DfsRepairAttemptRecord>,
+    ) {
+        let data: serde_json::Value = serde_json::from_str(include_str!(
+            "test_support/fixtures/native-retained-repair-retirement-r276-unknown.json"
+        ))
+        .unwrap();
+        (
+            serde_json::from_value(data["receipt"].clone()).unwrap(),
+            serde_json::from_value(data["version"].clone()).unwrap(),
+            serde_json::from_value(data["owner"].clone()).unwrap(),
+            serde_json::from_value(data["queue"].clone()).unwrap(),
+        )
+    }
+    #[test]
+    fn original_captured_transfer_omission_remains_unknown_after_mig_mapping() {
+        let (receipt, version, owner, queue) = actual_unknown_data();
+        let expected = crate::file_history::retained_repair_intent(&version, None).unwrap();
+        assert!(
+            !compacted_retained_transfer_can_retire(
+                &receipt,
+                &version,
+                &expected,
+                Some(&owner),
+                &queue,
+            )
+            .unwrap()
+        );
+    }
+    #[test]
+    fn current_queue_observations_require_explicit_unknown_fields() {
+        let data: serde_json::Value = serde_json::from_str(include_str!(
+            "test_support/fixtures/native-retained-repair-retirement-r276-unknown.json"
+        ))
+        .unwrap();
+        let original = data["queue"][0].clone();
+        let _: DfsRepairAttemptRecord = serde_json::from_value(original.clone()).unwrap();
+        for field in [
+            "transfer_delivery_state",
+            "completed_transfer_request_id",
+            "transfer_kind",
+        ] {
+            let mut missing = original.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<DfsRepairAttemptRecord>(missing).is_err());
         }
-        Ok(outcomes)
     }
 
-    pub fn replicate_configured_metadata_shards(
-        &mut self,
-        file_system_id: &DfsFileSystemId,
-    ) -> Result<Vec<DfsMetadataReplicationOutcome>, DfsError> {
-        let Some(control_plane) = self.control_plane.as_mut() else {
-            return Ok(Vec::new());
-        };
-        let shard_ids = DfsControlPlaneStore::new(control_plane.as_mut())
-            .list_metadata_shards(file_system_id)?
-            .into_iter()
-            .filter(|shard| shard.primary_node_id == self.node_id)
-            .map(|shard| shard.shard_id)
-            .collect::<Vec<_>>();
+    #[test]
+    fn current_null_transfer_kind_cannot_borrow_delivery_or_completion_evidence() {
+        let (_, _, _, queue) = actual_unknown_data();
+        for completion in [None, Some("actual-data-unknown-operation-kind".to_string())] {
+            let mut record = queue[0].clone();
+            record.in_flight = false;
+            record.transfer_request_id = None;
+            record.transfer_delivery_state =
+                Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent);
+            record.completed_transfer_request_id = completion;
+            record.transfer_kind = None;
+            // These explicit nullable combinations are legal current DATA.
+            // Their fields cannot identify which operation was settled.
+            let encoded = serde_json::to_value(&record).unwrap();
+            let decoded: DfsRepairAttemptRecord = serde_json::from_value(encoded).unwrap();
+            assert_eq!(decoded, record);
+            assert!(crate::service_repair::repair_transfer_custody_unresolved(
+                &decoded
+            ));
+            for kind in [
+                sinomo_api::dfs::maintenance::DfsRepairTransferKind::Stage,
+                sinomo_api::dfs::maintenance::DfsRepairTransferKind::Repair,
+            ] {
+                let mut known = decoded.clone();
+                known.transfer_kind = Some(kind);
+                assert!(!crate::service_repair::repair_transfer_custody_unresolved(
+                    &known
+                ));
+            }
+        }
+    }
 
-        let mut outcomes = Vec::new();
-        for shard_id in shard_ids {
-            outcomes.extend(
-                self.replicate_metadata_shard_to_configured_replicas(file_system_id, &shard_id)?,
+    #[test]
+    fn current_transfer_claims_and_changed_replacement_proofs_cannot_retire() {
+        let (receipt, version, owner, queue) = actual_unknown_data();
+        let expected = crate::file_history::retained_repair_intent(&version, None).unwrap();
+        for active in [true, false] {
+            let mut claimed = queue.clone();
+            claimed[0].in_flight = active;
+            claimed[0].transfer_request_id = Some("unresolved-transfer-data".into());
+            claimed[0].transfer_delivery_state =
+                Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent);
+            assert!(
+                !compacted_retained_transfer_can_retire(
+                    &receipt,
+                    &version,
+                    &expected,
+                    Some(&owner),
+                    &claimed,
+                )
+                .unwrap()
             );
         }
-        Ok(outcomes)
+        let mut wrong = owner.clone();
+        wrong.owner_epoch += 1;
+        assert!(
+            compacted_retained_transfer_can_retire(
+                &receipt,
+                &version,
+                &expected,
+                Some(&wrong),
+                &queue,
+            )
+            .is_err()
+        );
+        let mut wrong = owner.clone();
+        wrong.desired_replica_node_ids.pop();
+        assert!(
+            compacted_retained_transfer_can_retire(
+                &receipt,
+                &version,
+                &expected,
+                Some(&wrong),
+                &queue,
+            )
+            .is_err()
+        );
+        let mut wrong = queue.clone();
+        wrong[0].content_hash.push_str("-changed");
+        assert!(
+            compacted_retained_transfer_can_retire(
+                &receipt,
+                &version,
+                &expected,
+                Some(&owner),
+                &wrong,
+            )
+            .is_err()
+        );
     }
 }

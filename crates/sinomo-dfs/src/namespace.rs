@@ -16,17 +16,17 @@ pub const SIFS_SERVICES_PATH: &str = "/services";
 pub fn distributed_sifs(owner_node_id: NodeId) -> DfsFileSystem {
     let node_files_path = sifs_node_files_path(&owner_node_id);
     DfsFileSystem {
-        metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
         retention_policies: Default::default(),
         module_metadata: Default::default(),
         file_system_id: sifs_file_system_id(),
         display_name: "sifs".to_string(),
         owner_node_id,
-        subtree_policies: vec![
-            DfsSubtreePolicy::legacy(node_files_path, DfsObjectPolicy::LocalOwned),
-            DfsSubtreePolicy::legacy(SIFS_USERS_PATH, DfsObjectPolicy::ReplicatedEventual),
-            DfsSubtreePolicy::legacy(SIFS_SERVICES_PATH, DfsObjectPolicy::ReplicatedEventual),
-        ],
+        subtree_policies: vec![DfsSubtreePolicy::new(
+            node_files_path,
+            DfsObjectPolicy::LocalOwned,
+            1,
+            1,
+        )],
     }
 }
 
@@ -147,15 +147,7 @@ pub fn initial_version() -> DfsVersion {
     DfsVersion::from_legacy_named("version_1").expect("valid initial version")
 }
 
-pub fn next_version(version: &DfsVersion) -> DfsVersion {
-    let suffix = version
-        .as_str()
-        .strip_prefix("version_")
-        .unwrap_or(version.as_str());
-    if let Ok(number) = suffix.parse::<u64>() {
-        return DfsVersion::from_legacy_named(format!("version_{}", number.saturating_add(1)))
-            .expect("valid incremented version");
-    }
+pub fn next_version(_version: &DfsVersion) -> DfsVersion {
     DfsVersion::generate()
 }
 
@@ -230,12 +222,24 @@ mod tests {
         let objects = distributed_sifs_bootstrap_objects(node);
 
         assert_eq!(filesystem.file_system_id, sifs_file_system_id());
-        assert!(
-            filesystem
-                .subtree_policies
-                .iter()
-                .any(|policy| policy.path_prefix == SIFS_USERS_PATH)
-        );
+        let config = crate::DfsFileSystemConfig::from(&filesystem);
+        for path in [SIFS_USERS_PATH, SIFS_SERVICES_PATH] {
+            let resolved = crate::resolve_placement_policy(
+                &config,
+                path,
+                DfsObjectPolicy::ReplicatedEventual,
+                1,
+            )
+            .expect("single-node shared default");
+            assert_eq!(resolved.source_path, None);
+            assert_eq!(
+                (
+                    resolved.policy.min_commit_replicas,
+                    resolved.policy.desired_replicas
+                ),
+                (1, 1)
+            );
+        }
         assert!(filesystem.subtree_policies.iter().any(|policy| {
             policy.path_prefix == sifs_node_files_path(&filesystem.owner_node_id)
                 && policy.policy == DfsObjectPolicy::LocalOwned
@@ -322,31 +326,6 @@ mod tests {
         assert_ne!(
             eventual, confirmed,
             "a policy-only mutation is a different durable transaction payload"
-        );
-    }
-
-    #[test]
-    fn namespace_batch_transaction_id_matches_legacy_buffered_hash() {
-        let node = NodeId::from_legacy_named("node_namespace_batch_hash").expect("node");
-        let objects = distributed_sifs_bootstrap_objects(node);
-        let file_system_id = objects[0].file_system_id.clone();
-        let versions = Vec::new();
-        let legacy_payload = serde_json::to_vec(&(&file_system_id, &objects, &versions))
-            .expect("legacy namespace transaction payload is serializable");
-        let legacy = format!(
-            "namespace_visible-batch_{}",
-            blake3::hash(&legacy_payload).to_hex()
-        );
-
-        assert_eq!(
-            namespace_transaction_id_for_batch(
-                "visible-batch",
-                &file_system_id,
-                &objects,
-                &versions,
-            ),
-            legacy,
-            "streaming JSON into the transaction hash must preserve durable idempotency IDs"
         );
     }
 }

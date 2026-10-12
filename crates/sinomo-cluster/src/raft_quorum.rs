@@ -4770,9 +4770,13 @@ pub(crate) enum ClusterRaftBlockingDeadlinePolicy {
     CompleteAdmitted,
 }
 
-struct ClusterRaftSupervisedBlockingState<T> {
+type ClusterRaftErasedBlockingValue = Box<dyn std::any::Any + Send>;
+type ClusterRaftErasedBlockingWork =
+    Box<dyn FnOnce() -> Result<ClusterRaftErasedBlockingValue, NetworkError> + Send>;
+
+struct ClusterRaftSupervisedBlockingState {
     admission: AtomicU8,
-    result: Mutex<Option<Result<T, NetworkError>>>,
+    result: Mutex<Option<Result<ClusterRaftErasedBlockingValue, NetworkError>>>,
     completion: tokio::sync::Notify,
 }
 
@@ -4783,19 +4787,19 @@ struct ClusterRaftSupervisedBlockingState<T> {
 /// from the authority read that created it. The worker-side CAS gives timeout
 /// and external cancellation one exact point at which queued work can still be
 /// prevented from opening storage.
-struct ClusterRaftQueuedBlockingCancellation<T> {
-    state: Arc<ClusterRaftSupervisedBlockingState<T>>,
+struct ClusterRaftQueuedBlockingCancellation {
+    state: Arc<ClusterRaftSupervisedBlockingState>,
     abort: tokio::task::AbortHandle,
     armed: bool,
 }
 
-impl<T> ClusterRaftQueuedBlockingCancellation<T> {
+impl ClusterRaftQueuedBlockingCancellation {
     fn disarm(&mut self) {
         self.armed = false;
     }
 }
 
-impl<T> Drop for ClusterRaftQueuedBlockingCancellation<T> {
+impl Drop for ClusterRaftQueuedBlockingCancellation {
     fn drop(&mut self) {
         if self.armed
             && self
@@ -4837,9 +4841,9 @@ fn record_cluster_raft_blocking_deadline_overrun(
     .record(overrun.as_micros().min(u128::from(u64::MAX)) as f64);
 }
 
-async fn take_cluster_raft_supervised_blocking_result<T>(
-    state: &ClusterRaftSupervisedBlockingState<T>,
-) -> Result<T, NetworkError> {
+async fn take_cluster_raft_supervised_blocking_result(
+    state: &ClusterRaftSupervisedBlockingState,
+) -> Result<ClusterRaftErasedBlockingValue, NetworkError> {
     loop {
         // Register before checking the slot so completion between the check and
         // `.await` leaves a retained Notify permit instead of losing a wakeup.
@@ -4877,6 +4881,40 @@ where
     T: Send + 'static,
     F: FnOnce() -> Result<T, NetworkError> + Send + 'static,
 {
+    // Construct the erased adapter only when this async operation is polled.
+    // The same supervised worker owns the original work and all its leases.
+    let work: ClusterRaftErasedBlockingWork =
+        Box::new(move || work().map(|value| Box::new(value) as ClusterRaftErasedBlockingValue));
+    let value = run_cluster_raft_supervised_blocking_erased(
+        runtime,
+        deadline,
+        cancellation_policy,
+        metric_path,
+        phase,
+        operation,
+        work,
+    )
+    .await?;
+    value.downcast::<T>().map(|value| *value).map_err(|_| {
+        // The worker has already completed. A type mismatch cannot be reported
+        // as definitely unsent or converted into a fresh retry.
+        NetworkError::delivery_failed(
+            operation,
+            sinomo_network::NetworkDeliveryState::PossiblyApplied,
+            "supervised blocking result has an unexpected internal type",
+        )
+    })
+}
+
+async fn run_cluster_raft_supervised_blocking_erased(
+    runtime: &tokio::runtime::Handle,
+    deadline: Option<(Instant, NetworkError, ClusterRaftBlockingDeadlinePolicy)>,
+    cancellation_policy: ClusterRaftBlockingCancellationPolicy,
+    metric_path: &'static str,
+    phase: &'static str,
+    operation: &'static str,
+    work: ClusterRaftErasedBlockingWork,
+) -> Result<ClusterRaftErasedBlockingValue, NetworkError> {
     if cancellation_policy == ClusterRaftBlockingCancellationPolicy::CancelQueued
         && let Some((deadline, timeout_error, _)) = deadline.as_ref()
         && Instant::now() >= *deadline
@@ -7538,6 +7576,83 @@ mod read_index_tests {
             0,
             "expired queued work must never enter the blocking pool"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unpolled_supervised_work_releases_its_capture_without_execution() {
+        let leases = Arc::new(tokio::sync::Semaphore::new(1));
+        let lease = Arc::clone(&leases).acquire_owned().await.unwrap();
+        let ran = Arc::new(AtomicUsize::new(0));
+        let work_ran = Arc::clone(&ran);
+        let runtime = tokio::runtime::Handle::current();
+        let future = run_cluster_raft_supervised_blocking(
+            &runtime,
+            None,
+            ClusterRaftBlockingCancellationPolicy::CancelQueued,
+            "test",
+            "unpolled",
+            "unpolled supervised work",
+            move || {
+                work_ran.fetch_add(1, Ordering::SeqCst);
+                drop(lease);
+                Ok(())
+            },
+        );
+        assert_eq!(leases.available_permits(), 0);
+        assert_eq!(ran.load(Ordering::SeqCst), 0);
+        drop(future);
+        assert_eq!(ran.load(Ordering::SeqCst), 0);
+        assert_eq!(leases.available_permits(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_admitted_supervised_work_retains_its_lease_until_completion() {
+        let leases = Arc::new(tokio::sync::Semaphore::new(1));
+        let lease = Arc::clone(&leases).acquire_owned().await.unwrap();
+        let (started, admission) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let completed = Arc::new(AtomicUsize::new(0));
+        let work_completed = Arc::clone(&completed);
+        let caller = tokio::spawn(async move {
+            run_cluster_raft_supervised_blocking(
+                &tokio::runtime::Handle::current(),
+                None,
+                ClusterRaftBlockingCancellationPolicy::CancelQueued,
+                "test",
+                "admitted-cancellation",
+                "admitted supervised work",
+                move || {
+                    started.send(()).unwrap();
+                    released.recv().unwrap();
+                    assert_eq!(lease.num_permits(), 1);
+                    work_completed.fetch_add(1, Ordering::SeqCst);
+                    drop(lease);
+                    Ok(17_u64)
+                },
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), admission)
+            .await
+            .unwrap()
+            .unwrap();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            leases.available_permits(),
+            0,
+            "admitted cancellation must retain real custody"
+        );
+        assert_eq!(completed.load(Ordering::SeqCst), 0);
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while leases.available_permits() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(completed.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

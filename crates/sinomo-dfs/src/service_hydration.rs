@@ -5,206 +5,14 @@
 //! code.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::path::Path;
-use std::time::Instant;
-
-use sinomo_core::DfsObjectPolicy;
-use sinomo_core::DfsWriteReceipt;
-use sinomo_core::events::EventId;
-use time::OffsetDateTime;
 
 use crate::transfer::PendingNetworkedWrite;
 use crate::*;
 
 type HydrationReceiptsByVersion = BTreeMap<(DfsObjectId, DfsVersion), Vec<DfsReplicaReceiptRecord>>;
 
-#[cfg(test)]
-thread_local! {
-    static FULL_METADATA_HYDRATION_CALLS: std::cell::Cell<usize> =
-        const { std::cell::Cell::new(0) };
-}
-
-#[cfg(test)]
-pub(crate) fn reset_full_metadata_hydration_calls() {
-    FULL_METADATA_HYDRATION_CALLS.set(0);
-}
-
-#[cfg(test)]
-pub(crate) fn full_metadata_hydration_calls() -> usize {
-    FULL_METADATA_HYDRATION_CALLS.get()
-}
-
 fn hydration_never_cancelled() -> bool {
     false
-}
-
-pub(crate) fn run_metadata_hydration_runtime_probe(
-    root: &Path,
-    options: crate::DfsMetadataHydrationRuntimeProbeOptions,
-) -> Result<crate::DfsMetadataHydrationRuntimeProbeReport, DfsError> {
-    if options.object_count == 0 {
-        return Err(DfsError::Metadata {
-            message: "metadata hydration runtime probe object count must be positive".to_string(),
-        });
-    }
-    if root.exists()
-        && fs::read_dir(root)
-            .map_err(|source| DfsError::Metadata {
-                message: format!("read hydration probe root {}: {source}", root.display()),
-            })?
-            .next()
-            .is_some()
-    {
-        return Err(DfsError::Metadata {
-            message: format!(
-                "metadata hydration runtime probe requires an empty root: {}",
-                root.display()
-            ),
-        });
-    }
-
-    let total_started = Instant::now();
-    let node_id =
-        NodeId::from_legacy_named("node_metadata_hydration_runtime_probe").map_err(|source| {
-            DfsError::Metadata {
-                message: format!("construct hydration probe node id: {source}"),
-            }
-        })?;
-    let file_system_id =
-        DfsFileSystemId::from_legacy_named("sifs").map_err(|source| DfsError::Metadata {
-            message: format!("construct hydration probe filesystem id: {source}"),
-        })?;
-    let network = sinomo_core::network::InProcessNetwork::new();
-    let transport = network.add_node(node_id.clone());
-    let content = LocalContentStore::new(root.join("content"))?;
-    let backend =
-        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("metadata"))?;
-    let mut dfs = NetworkedDfsService::new(transport, content).with_metadata_backend(backend)?;
-    dfs.add_file_system(DfsFileSystem {
-        metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
-        retention_policies: Default::default(),
-        module_metadata: Default::default(),
-        file_system_id: file_system_id.clone(),
-        display_name: "metadata hydration runtime probe".to_string(),
-        owner_node_id: node_id.clone(),
-        subtree_policies: Vec::new(),
-    })?;
-
-    let write_started = Instant::now();
-    let mut tail_object_id = None;
-    let mut objects = Vec::with_capacity(options.object_count.saturating_add(1));
-    for index in 0..options.object_count {
-        let object_id =
-            DfsObjectId::from_legacy_named(format!("obj_hydration_runtime_probe_{index:06}"))
-                .map_err(|source| DfsError::Metadata {
-                    message: format!("construct hydration probe object id: {source}"),
-                })?;
-        let version =
-            DfsVersion::from_legacy_named(format!("version_hydration_runtime_probe_{index:06}"))
-                .map_err(|source| DfsError::Metadata {
-                    message: format!("construct hydration probe version: {source}"),
-                })?;
-        if index + 1 == options.object_count {
-            tail_object_id = Some(object_id.clone());
-        }
-        objects.push(DfsObjectMetadata {
-            object_id,
-            file_system_id: file_system_id.clone(),
-            path: format!("/runtime-probes/hydration/page-{index:06}.txt"),
-            kind: DfsObjectKind::File,
-            tombstone_provenance: None,
-            owner_node_id: node_id.clone(),
-            current_locations: vec![node_id.clone()],
-            content_hash: None,
-            content_size_bytes: Some(0),
-            link_target_object_id: None,
-            mode: 0o600,
-            uid: 0,
-            gid: 0,
-            accessed_at_unix_nanos: 0,
-            modified_at_unix_nanos: 0,
-            created_at_unix_nanos: 0,
-            changed_at_unix_nanos: 0,
-            version,
-            policy: DfsObjectPolicy::LocalOwned,
-            created_by_event_id: None,
-            last_modified_by_event_id: None,
-        });
-    }
-    let tombstone_id = DfsObjectId::from_legacy_named("obj_hydration_runtime_probe_tombstone")
-        .map_err(|source| DfsError::Metadata {
-            message: format!("construct hydration probe tombstone id: {source}"),
-        })?;
-    let tombstone_path = "/runtime-probes/hydration/deleted.txt".to_string();
-    objects.push(DfsObjectMetadata {
-        object_id: tombstone_id,
-        file_system_id: file_system_id.clone(),
-        path: tombstone_path.clone(),
-        kind: DfsObjectKind::Tombstone,
-        tombstone_provenance: None,
-        owner_node_id: node_id.clone(),
-        current_locations: vec![node_id],
-        content_hash: None,
-        content_size_bytes: None,
-        link_target_object_id: None,
-        mode: 0,
-        uid: 0,
-        gid: 0,
-        accessed_at_unix_nanos: 0,
-        modified_at_unix_nanos: 0,
-        created_at_unix_nanos: 0,
-        changed_at_unix_nanos: 0,
-        version: DfsVersion::from_legacy_named("version_hydration_runtime_probe_tombstone")
-            .map_err(|source| DfsError::Metadata {
-                message: format!("construct hydration probe tombstone version: {source}"),
-            })?,
-        policy: DfsObjectPolicy::LocalOwned,
-        created_by_event_id: None,
-        last_modified_by_event_id: None,
-    });
-    dfs.add_object_metadata_batch(objects)?;
-    let write_elapsed = write_started.elapsed();
-
-    dfs.reset_reconstructable_metadata_projection();
-    let hydration_started = Instant::now();
-    dfs.hydrate_from_metadata_backend()?;
-    let hydration_elapsed = hydration_started.elapsed();
-
-    let tail_object_id = tail_object_id.ok_or_else(|| DfsError::Metadata {
-        message: "metadata hydration runtime probe did not create a tail object".to_string(),
-    })?;
-    let expected_tail_path = format!(
-        "/runtime-probes/hydration/page-{:06}.txt",
-        options.object_count - 1
-    );
-    let tail_object_restored = dfs
-        .current_read_object_metadata(&tail_object_id)
-        .is_ok_and(|object| object.path == expected_tail_path);
-    let tombstone_restored = dfs
-        .tombstones_by_metadata_path
-        .contains_key(&(file_system_id, metadata_path(&tombstone_path)));
-    if !tail_object_restored || !tombstone_restored {
-        return Err(DfsError::Metadata {
-            message: format!(
-                "metadata hydration runtime probe lost durable state: tail_restored={tail_object_restored} tombstone_restored={tombstone_restored}"
-            ),
-        });
-    }
-
-    Ok(crate::DfsMetadataHydrationRuntimeProbeReport {
-        object_count: options.object_count as u64,
-        page_size: DFS_METADATA_HYDRATE_OBJECT_PAGE_SIZE as u64,
-        crossed_page_boundary: options.object_count > DFS_METADATA_HYDRATE_OBJECT_PAGE_SIZE,
-        write_elapsed_ms: write_elapsed.as_millis().min(u128::from(u64::MAX)) as u64,
-        hydration_elapsed_ms: hydration_elapsed.as_millis().min(u128::from(u64::MAX)) as u64,
-        total_elapsed_ms: total_started
-            .elapsed()
-            .as_millis()
-            .min(u128::from(u64::MAX)) as u64,
-        tail_object_restored,
-        tombstone_restored,
-    })
 }
 
 /// Whether one hydrated committed intent can still own repair work for the
@@ -294,7 +102,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.tombstones_by_metadata_path.clear();
         self.transient_metadata_object_ids.clear();
         self.transient_metadata_predecessor_object_ids.clear();
-        self.coordinator = DistributedEventualCoordinator::new();
+        self.coordinator
+            .reset_projection_preserving_message_capture();
         self.writes.pending_writes.clear();
         self.reads.pending_reads.clear();
         self.clear_metadata_lookup_cache();
@@ -608,19 +417,58 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         let mut observation =
             crate::background_observation::DfsBackgroundObservation::new("hydration", "rebuild");
-        self.metadata_backend
-            .as_deref_mut()
-            .expect("metadata backend checked above")
-            .begin_consistent_read_snapshot()?;
-        let result = self
-            .hydrate_from_consistent_metadata_snapshot_with_promotion_recovery_until_cancelled(
-                reconstruct_commit_promotions,
-                should_cancel,
-            );
-        self.metadata_backend
-            .as_deref_mut()
-            .expect("metadata backend remains installed during hydration")
-            .end_consistent_read_snapshot();
+        let result = (|| {
+            self.metadata_backend
+                .as_deref_mut()
+                .expect("metadata backend checked above")
+                .begin_consistent_read_snapshot()?;
+            // Preserve the original coherent catalog/reset setup, then end
+            // that read scope before recovery can publish or observe a commit.
+            let setup = (|| -> Result<bool, DfsError> {
+                let file_systems = self
+                    .metadata_backend
+                    .as_ref()
+                    .expect("metadata backend checked above")
+                    .list_file_systems()?;
+                if should_cancel() {
+                    return Ok(false);
+                }
+
+                self.reset_reconstructable_metadata_projection();
+                self.restore_durable_intent_counter_floor()?;
+                if !self.rebuild_cross_shard_namespace_locks_until_cancelled(should_cancel)? {
+                    return Ok(false);
+                }
+                if !self
+                    .project_hydration_file_systems_until_cancelled(&file_systems, should_cancel)
+                {
+                    return Ok(false);
+                }
+
+                Ok(true)
+            })();
+            self.metadata_backend
+                .as_deref_mut()
+                .expect("metadata backend remains installed during hydration")
+                .end_consistent_read_snapshot();
+            if !setup? || !self.recover_durable_namespace_prepares_until_cancelled(should_cancel)? {
+                return Ok(false);
+            }
+            self.metadata_backend
+                .as_deref_mut()
+                .expect("metadata backend checked above")
+                .begin_consistent_read_snapshot()?;
+            let result = self
+                .hydrate_from_consistent_metadata_snapshot_with_promotion_recovery_until_cancelled(
+                    reconstruct_commit_promotions,
+                    should_cancel,
+                );
+            self.metadata_backend
+                .as_deref_mut()
+                .expect("metadata backend remains installed during hydration")
+                .end_consistent_read_snapshot();
+            result
+        })();
         observation.finish(match &result {
             Ok(true) => "complete",
             Ok(false) => "cancelled",
@@ -629,31 +477,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         result
     }
 
-    fn hydrate_from_consistent_metadata_snapshot_with_promotion_recovery_until_cancelled(
+    fn project_hydration_file_systems_until_cancelled(
         &mut self,
-        reconstruct_commit_promotions: bool,
+        file_systems: &[DfsFileSystem],
         should_cancel: &(dyn Fn() -> bool + Sync),
-    ) -> Result<bool, DfsError> {
-        #[cfg(test)]
-        FULL_METADATA_HYDRATION_CALLS.set(FULL_METADATA_HYDRATION_CALLS.get().saturating_add(1));
-
-        let file_systems = self
-            .metadata_backend
-            .as_ref()
-            .expect("metadata backend checked above")
-            .list_file_systems()?;
-        if should_cancel() {
-            return Ok(false);
-        }
-
-        self.reset_reconstructable_metadata_projection();
-        self.restore_durable_intent_counter_floor()?;
-        if !self.rebuild_cross_shard_namespace_locks_until_cancelled(should_cancel)? {
-            return Ok(false);
-        }
-        for file_system in &file_systems {
+    ) -> bool {
+        for file_system in file_systems {
             if should_cancel() {
-                return Ok(false);
+                return false;
             }
             self.metadata.add_file_system(file_system.clone());
         }
@@ -665,14 +496,27 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             self.metadata
                 .add_file_system(DfsFileSystem::sifs(self.node_id.clone()));
         }
+        true
+    }
 
-        // Hidden namespace prepares are not part of the visible object scan.
-        // A certified current primary may safely rebind and finish standalone
-        // prepares now; write-coupled create prepares remain gated on their
-        // durable write receipts below.
-        if !self.recover_durable_namespace_prepares_until_cancelled(should_cancel)? {
+    fn hydrate_from_consistent_metadata_snapshot_with_promotion_recovery_until_cancelled(
+        &mut self,
+        reconstruct_commit_promotions: bool,
+        should_cancel: &(dyn Fn() -> bool + Sync),
+    ) -> Result<bool, DfsError> {
+        let file_systems = self
+            .metadata_backend
+            .as_ref()
+            .expect("metadata backend checked above")
+            .list_file_systems()?;
+        if should_cancel() {
             return Ok(false);
         }
+
+        if !self.project_hydration_file_systems_until_cancelled(&file_systems, should_cancel) {
+            return Ok(false);
+        }
+
         for file_system in &file_systems {
             if !try_walk_metadata_pages_until_cancelled(should_cancel, |cursor| {
                 let page = self
@@ -698,24 +542,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             })? {
                 return Ok(false);
             }
-        }
-        // Conflicts already have a global cursor-backed index. Scanning that
-        // index once avoids one empty per-object lookup (and its table refresh
-        // checks) for every hydrated object. On a mount with thousands of
-        // objects and no conflicts, the old N+1 path dominated startup.
-        if !try_walk_metadata_pages_until_cancelled(should_cancel, |cursor| {
-            let page = self
-                .metadata_backend
-                .as_ref()
-                .expect("metadata backend checked above")
-                .conflict_records_page(cursor, DFS_CONFLICT_SCAN_PAGE_SIZE)?;
-            crate::background_observation::hydration_items("conflicts", page.conflicts.len());
-            for conflict in page.conflicts {
-                self.metadata.add_conflict(conflict);
-            }
-            Ok::<_, DfsError>(page.next_cursor)
-        })? {
-            return Ok(false);
         }
         // Receipts already have a global cursor-backed index. Materialize it
         // once for restart hydration instead of doing two object/version scans
@@ -907,7 +733,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                     intent_record.target_version.clone(),
                                 ))
                                 .or_default();
-                            self.restore_visible_committed_object_location_receipts_from_hydration_scan(
+                            self.restore_backend_receipts_for_intent_from_hydration_scan(
                                 &intent_record,
                                 receipts,
                                 false,
@@ -928,11 +754,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     ))
                     .or_default();
                 self.restore_backend_receipts_for_intent_from_hydration_scan(
-                    &intent_record,
-                    receipts,
-                    false,
-                )?;
-                self.restore_visible_committed_object_location_receipts_from_hydration_scan(
                     &intent_record,
                     receipts,
                     false,
@@ -1090,14 +911,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             self.apply_recovered_commit_ready_intent(&intent_id)?;
             self.cleanup_committed_pending_write_if_repaired(&intent_id);
         }
-        // Request-owned namespace prepares were completed before the object
-        // scan above. Any admission which crashed before it could persist a
-        // prepare is now safe to resume from its exact durable operation. The
-        // bounded pass keeps service open finite; reactive maintenance repeats
-        // it until no locally authoritative request remains pending.
-        let _ = self.recover_pending_namespace_requests_bounded(
-            crate::service_routed_namespace::DFS_NAMESPACE_REQUEST_RECOVERY_BATCH_LIMIT,
-        )?;
+        // Request-owned prepares were completed before the object scan. Resume
+        // pending operations in ordinary maintenance, after this consistent-read
+        // snapshot ends, so its existing host can release admission for remote work.
         if should_cancel() {
             return Ok(false);
         }
@@ -1208,6 +1024,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let Some(backend) = self.metadata_backend.as_ref() else {
             return Ok(());
         };
+        tracing::trace!(
+            target: "sinomo.dfs.perf",
+            node = %self.node_id,
+            phase = "before-filesystems",
+            "resident metadata lazy hydration"
+        );
         for file_system in backend.list_file_systems()? {
             self.metadata.add_file_system(file_system);
         }
@@ -1223,12 +1045,36 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // the durable floor without materializing the intent bodies so a
         // rebuilt request shell cannot reuse an identifier after restart or
         // explicit disaster recovery.
+        tracing::trace!(
+            target: "sinomo.dfs.perf",
+            node = %self.node_id,
+            phase = "filesystems-loaded",
+            "resident metadata lazy hydration"
+        );
         self.restore_durable_intent_counter_floor()?;
+        tracing::trace!(
+            target: "sinomo.dfs.perf",
+            node = %self.node_id,
+            phase = "intent-floor-loaded",
+            "resident metadata lazy hydration"
+        );
         // Lazy services still process mutations. Restore the durable guards for
         // running cross-shard namespace jobs without paying for a full object,
         // version, intent, and receipt scan.
         self.rebuild_cross_shard_namespace_locks()?;
+        tracing::trace!(
+            target: "sinomo.dfs.perf",
+            node = %self.node_id,
+            phase = "namespace-locks-loaded",
+            "resident metadata lazy hydration"
+        );
         self.seed_local_metadata_journal_cursors_from_backend()?;
+        tracing::trace!(
+            target: "sinomo.dfs.perf",
+            node = %self.node_id,
+            phase = "journal-cursors-loaded",
+            "resident metadata lazy hydration"
+        );
         Ok(())
     }
 
@@ -1271,55 +1117,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// Whether the backend's current record for the intent is in a terminal
     /// state (the write finished one way or another), making a replayed
     /// snapshot of that intent historical rather than actionable.
-    fn backend_intent_record_is_terminal(
-        &self,
-        object_id: &DfsObjectId,
-        intent_id: &str,
-    ) -> Result<bool, DfsError> {
-        let Some(backend) = self.metadata_backend.as_ref() else {
-            return Ok(false);
-        };
-        Ok(backend
-            .get_intent(object_id, intent_id)?
-            .is_some_and(|record| {
-                matches!(
-                    record.status,
-                    DfsWriteIntentStatus::Committed
-                        | DfsWriteIntentStatus::Rejected
-                        | DfsWriteIntentStatus::Conflict
-                        | DfsWriteIntentStatus::Aborted
-                )
-            }))
-    }
 
-    pub(crate) fn restore_visible_committed_object_location_receipts(
+    pub(crate) fn restore_recorded_content_receipts(
         &mut self,
         intent_record: &DfsWriteIntentRecord,
     ) -> Result<(), DfsError> {
-        self.restore_visible_committed_object_location_receipts_with_repair_rebuild(
-            intent_record,
-            true,
-        )
+        let receipts = self.backend_receipts_for_version(
+            &intent_record.object_id,
+            &intent_record.target_version,
+        )?;
+        self.restore_backend_receipts_for_intent_from_hydration_scan(intent_record, &receipts, true)
     }
 
     /// See [`restore_backend_durable_receipt_with_repair_rebuild`](Self::restore_backend_durable_receipt_with_repair_rebuild)
     /// for the `rebuild_repair_jobs` contract; bulk hydration passes `false`
     /// and rebuilds once afterwards.
-    pub(crate) fn restore_visible_committed_object_location_receipts_with_repair_rebuild(
-        &mut self,
-        intent_record: &DfsWriteIntentRecord,
-        rebuild_repair_jobs: bool,
-    ) -> Result<(), DfsError> {
-        let mut receipts = self.backend_receipts_for_version(
-            &intent_record.object_id,
-            &intent_record.target_version,
-        )?;
-        self.restore_visible_committed_object_location_receipts_from_hydration_scan(
-            intent_record,
-            &mut receipts,
-            rebuild_repair_jobs,
-        )
-    }
 
     fn restore_backend_receipts_for_intent_from_hydration_scan(
         &mut self,
@@ -1343,118 +1155,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(())
     }
 
-    fn restore_visible_committed_object_location_receipts_from_hydration_scan(
-        &mut self,
-        intent_record: &DfsWriteIntentRecord,
-        receipts: &mut Vec<DfsReplicaReceiptRecord>,
-        rebuild_repair_jobs: bool,
-    ) -> Result<(), DfsError> {
-        if !matches!(intent_record.status, DfsWriteIntentStatus::Committed) {
-            return Ok(());
-        }
-        let Some(object) = self.metadata.object(&intent_record.object_id).cloned() else {
-            return Ok(());
-        };
-        if object.file_system_id != intent_record.file_system_id
-            || object.version != intent_record.target_version
-        {
-            return Ok(());
-        }
-        if let Some(content_hash) = intent_record.content_hash.as_deref()
-            && object.content_hash.as_deref() != Some(content_hash)
-        {
-            return Ok(());
-        }
-        let Some(content_hash) = object
-            .content_hash
-            .as_deref()
-            .or(intent_record.content_hash.as_deref())
-        else {
-            return Ok(());
-        };
-
-        let mut existing_receipts = BTreeSet::new();
-        for receipt in receipts.iter() {
-            if receipt.content_hash.as_deref() != Some(content_hash) {
-                continue;
-            }
-            existing_receipts.insert(receipt.replica_node_id.clone());
-            self.restore_backend_durable_receipt_with_repair_rebuild(
-                &intent_record.intent_id,
-                receipt.replica_node_id.clone(),
-                false,
-                rebuild_repair_jobs,
-            )?;
-        }
-
-        let owner_node_id = object.owner_node_id.clone();
-        for replica_node_id in object.current_locations {
-            if !intent_record
-                .desired_replica_node_ids
-                .contains(&replica_node_id)
-            {
-                continue;
-            }
-            let has_verified_local_blob = replica_node_id == self.node_id
-                && self
-                    .ensure_local_repair_manifest(&object.object_id, &object.version, content_hash)
-                    .unwrap_or(false);
-            if !existing_receipts.contains(&replica_node_id)
-                && has_verified_local_blob
-                && let Some(backend) = self.metadata_backend.as_mut()
-            {
-                let recovered_receipt = DfsReplicaReceiptRecord {
-                    receipt: DfsWriteReceipt {
-                        file_system_id: intent_record.file_system_id.clone(),
-                        object_id: intent_record.object_id.clone(),
-                        committed_version: intent_record.target_version.clone(),
-                        owner_node_id: owner_node_id.clone(),
-                        event_id: EventId::generate(),
-                    },
-                    replica_node_id: replica_node_id.clone(),
-                    content_hash: Some(content_hash.to_string()),
-                    received_at: OffsetDateTime::now_utc(),
-                };
-                backend.put_receipt(&recovered_receipt)?;
-                if let Some(existing_receipt) = receipts
-                    .iter_mut()
-                    .find(|receipt| receipt.replica_node_id == replica_node_id)
-                {
-                    *existing_receipt = recovered_receipt;
-                } else {
-                    receipts.push(recovered_receipt);
-                }
-                existing_receipts.insert(replica_node_id.clone());
-            }
-            if existing_receipts.contains(&replica_node_id) {
-                self.restore_backend_durable_receipt_with_repair_rebuild(
-                    &intent_record.intent_id,
-                    replica_node_id,
-                    false,
-                    rebuild_repair_jobs,
-                )?;
-            }
-        }
-        Ok(())
-    }
-
-    pub(crate) fn apply_metadata_journal_batch_to_service_state(
-        &mut self,
-        batch: &DfsMetadataJournalBatch,
-    ) -> Result<(), DfsError> {
-        for entry in &batch.entries {
-            self.apply_metadata_journal_entry_to_service_state(entry)?;
-        }
-        self.refresh_metadata_journal_batch_objects_from_backend(batch)?;
-        let cursor = self
-            .replication
-            .local_metadata_journal_cursors
-            .entry(batch.shard_id.clone())
-            .or_insert(0);
-        *cursor = (*cursor).max(batch.next_after_sequence);
-        Ok(())
-    }
-
     /// Refresh only the affected visible objects from the final durable view.
     /// Routed writers can retain optimistic create metadata until their reply
     /// is replayed; replace that projection without restoring historical intent
@@ -1464,11 +1164,35 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         batch: &DfsMetadataJournalBatch,
     ) -> Result<(), DfsError> {
         if self.metadata_backend.is_some() {
-            let affected_object_ids = batch
-                .entries
+            let payloads = crate::metadata_replication::committed_payloads_for_batch(
+                self.metadata_backend
+                    .as_ref()
+                    .expect("replica backend")
+                    .as_ref(),
+                batch,
+            )?;
+            let affected_object_ids = payloads
                 .iter()
-                .filter(|entry| entry.mutation.changes_visible_object_placement())
-                .flat_map(|entry| entry.mutation.affected_object_ids())
+                .flat_map(|payload| {
+                    payload
+                        .transaction
+                        .objects
+                        .iter()
+                        .map(|object| object.object_id.clone())
+                        .chain(
+                            payload
+                                .transaction
+                                .versions
+                                .iter()
+                                .map(|version| version.object_id.clone()),
+                        )
+                        .chain(
+                            payload
+                                .metadata_effects
+                                .iter()
+                                .flat_map(|effect| effect.affected_object_ids()),
+                        )
+                })
                 .collect::<BTreeSet<_>>();
             if !affected_object_ids.is_empty() {
                 self.metadata_backend
@@ -1511,21 +1235,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         batch: &DfsMetadataJournalBatch,
     ) -> Result<(), DfsError> {
-        for entry in &batch.entries {
-            let DfsMetadataMutation::PutNamespaceJob { job_id, job, .. } = &entry.mutation else {
-                continue;
-            };
-            let job = match job {
-                Some(job) => Some(job.clone()),
-                None => self
-                    .metadata_backend
-                    .as_ref()
-                    .map(|backend| backend.get_namespace_job(job_id))
-                    .transpose()?
-                    .flatten(),
-            };
-            if let Some(job) = job.as_ref() {
-                self.apply_cross_shard_namespace_job_guard(job)?;
+        // Ingest can precede queued table materialization. Share the normal
+        // exact durable-body resolver with data-plane and object projections.
+        let payloads = crate::metadata_replication::committed_payloads_for_batch(
+            self.metadata_backend
+                .as_deref()
+                .ok_or_else(|| DfsError::Metadata {
+                    message: "replicated commit has no durable backend".into(),
+                })?,
+            batch,
+        )?;
+        for payload in payloads {
+            for effect in &payload.metadata_effects {
+                if let DfsPreparedMetadataEffect::PutNamespaceJob { job } = effect {
+                    self.apply_cross_shard_namespace_job_guard(job)?;
+                }
             }
         }
 
@@ -1650,335 +1374,72 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
     }
 
-    fn apply_metadata_journal_entry_to_service_state(
+    pub(crate) fn refresh_recorded_prepared_rows(
         &mut self,
-        entry: &DfsMetadataJournalEntry,
+        payload: &DfsPreparedOperationPayload,
     ) -> Result<(), DfsError> {
-        match &entry.mutation {
-            DfsMetadataMutation::PutFileSystem { file_system, .. } => {
-                let Some(file_system) = file_system.as_ref() else {
-                    self.apply_missing_payload_metadata_journal_entry_to_service_state(entry)?;
-                    return Ok(());
-                };
-                self.metadata.add_file_system(file_system.clone());
-            }
-            DfsMetadataMutation::PutObject { object, .. } => {
-                let Some(object) = object.as_ref() else {
-                    self.apply_missing_payload_metadata_journal_entry_to_service_state(entry)?;
-                    return Ok(());
-                };
-                self.apply_metadata_object_to_service_state(object.clone())?;
-            }
-            DfsMetadataMutation::PutVersion { version_record, .. } => {
-                let Some(version_record) = version_record.as_ref() else {
-                    self.apply_missing_payload_metadata_journal_entry_to_service_state(entry)?;
-                    return Ok(());
-                };
-                self.apply_metadata_version_to_service_state(version_record);
-            }
-            DfsMetadataMutation::CaptureFileVersion { .. }
-            | DfsMetadataMutation::RemoveVersion { .. } => {}
-            DfsMetadataMutation::PutReceipt {
-                object_id,
-                version,
-                replica_node_id,
-                receipt,
-                ..
-            } => {
-                if receipt.is_none() {
-                    self.apply_missing_payload_metadata_journal_entry_to_service_state(entry)?;
-                    return Ok(());
+        let mut object_ids = payload
+            .transaction
+            .objects
+            .iter()
+            .map(|object| object.object_id.clone())
+            .chain(
+                payload
+                    .transaction
+                    .versions
+                    .iter()
+                    .map(|version| version.object_id.clone()),
+            )
+            .collect::<BTreeSet<_>>();
+        for effect in &payload.metadata_effects {
+            match effect {
+                DfsPreparedMetadataEffect::PutObject { object }
+                | DfsPreparedMetadataEffect::FinalizeCrossShardSourceEviction {
+                    tombstone: object,
+                    ..
+                } => {
+                    object_ids.insert(object.object_id.clone());
                 }
-                self.apply_metadata_receipt_to_service_state(object_id, version, replica_node_id)?;
-            }
-            DfsMetadataMutation::RemoveReceipt {
-                object_id,
-                version,
-                replica_node_id,
-                ..
-            } => {
-                if let Some(object) = self.metadata.objects.get_mut(object_id)
-                    && object.version == *version
-                {
-                    object
-                        .current_locations
-                        .retain(|node_id| node_id != replica_node_id);
+                DfsPreparedMetadataEffect::PutVersion { version } => {
+                    object_ids.insert(version.object_id.clone());
                 }
-            }
-            DfsMetadataMutation::PutIntent { intent, .. } => {
-                let Some(intent) = intent.as_ref() else {
-                    self.apply_missing_payload_metadata_journal_entry_to_service_state(entry)?;
-                    return Ok(());
-                };
-                self.apply_metadata_intent_to_service_state(intent)?;
-            }
-            DfsMetadataMutation::PutIntentReceipt { receipt, .. } => {
-                self.apply_metadata_intent_to_service_state(&receipt.to_intent_record())?;
-            }
-            DfsMetadataMutation::RemoveRetainedRepairOwner { intent_id, .. } => {
-                self.retire_committed_repair(intent_id);
-            }
-            DfsMetadataMutation::RemoveIntentReceipt { .. }
-            | DfsMetadataMutation::MergeIntentReceiptRetention { .. } => {}
-            DfsMetadataMutation::CommitVisibleVersion {
-                committed_object,
-                visible_version,
-                object_id,
-                committed_version,
-                ..
-            } => {
-                let Some(committed_object) = committed_object.as_ref() else {
-                    self.apply_missing_payload_metadata_journal_entry_to_service_state(entry)?;
-                    return Ok(());
-                };
-                let Some(visible_version) = visible_version.as_ref() else {
-                    self.apply_missing_payload_metadata_journal_entry_to_service_state(entry)?;
-                    return Ok(());
-                };
-                self.apply_metadata_object_to_service_state(committed_object.clone())?;
-                self.apply_metadata_version_to_service_state(visible_version);
-                self.restore_backend_receipts_for_visible_version(object_id, committed_version)?;
-            }
-            DfsMetadataMutation::RemoveVisibleCommit { .. } => {}
-            DfsMetadataMutation::PutVersionPin { .. }
-            | DfsMetadataMutation::RemoveVersionPin { .. }
-            | DfsMetadataMutation::ReconcileCrossShardPinTransfer { .. }
-            | DfsMetadataMutation::RemoveCrossShardPinTransfer { .. }
-            | DfsMetadataMutation::FinalizeCrossShardSourceEviction { .. } => {}
-            DfsMetadataMutation::PutConflict { conflict, .. } => {
-                let Some(conflict) = conflict.as_ref() else {
-                    self.apply_missing_payload_metadata_journal_entry_to_service_state(entry)?;
-                    return Ok(());
-                };
-                self.metadata.add_conflict(conflict.clone());
-            }
-            // Advisory locks are consumed directly from the authoritative
-            // metadata backend. Namespace jobs have no legacy object mirror,
-            // but their running/terminal state owns the replica-local
-            // failover guard and must update it on every replayed transition.
-            DfsMetadataMutation::PutAdvisoryLockState { .. }
-            | DfsMetadataMutation::PutNamespacePrepare { .. }
-            | DfsMetadataMutation::CommitNamespacePrepare { .. }
-            | DfsMetadataMutation::PutNamespaceRequest { .. }
-            | DfsMetadataMutation::PutNamespaceTransactionReceipt { .. }
-            | DfsMetadataMutation::RemoveNamespaceTransactionReceipt { .. }
-            | DfsMetadataMutation::PutNamespacePrepareReceipt { .. }
-            | DfsMetadataMutation::RemoveNamespacePrepareReceipt { .. }
-            | DfsMetadataMutation::PutNamespaceJobReceipt { .. }
-            | DfsMetadataMutation::RemoveNamespaceJobReceipt { .. }
-            | DfsMetadataMutation::PutNamespaceRequestReceipt { .. } => {}
-            DfsMetadataMutation::RemoveNamespaceRequestReceipt { .. } => {}
-            DfsMetadataMutation::PutNamespaceJob { job, .. } => {
-                let Some(job) = job.as_ref() else {
-                    self.apply_missing_payload_metadata_journal_entry_to_service_state(entry)?;
-                    return Ok(());
-                };
-                self.apply_cross_shard_namespace_job_guard(job)?;
-            }
-            DfsMetadataMutation::ApplyNamespaceTransaction { transaction, .. } => {
-                let Some(transaction) = transaction.as_ref() else {
-                    self.apply_missing_payload_metadata_journal_entry_to_service_state(entry)?;
-                    return Ok(());
-                };
-                self.apply_metadata_namespace_transaction_to_service_state(transaction)?;
+                DfsPreparedMetadataEffect::ReconcileCrossShardPinTransfer { versions, .. } => {
+                    object_ids.extend(versions.iter().map(|version| version.object_id.clone()));
+                }
+                _ => {}
             }
         }
-        Ok(())
-    }
-
-    fn apply_missing_payload_metadata_journal_entry_to_service_state(
-        &mut self,
-        entry: &DfsMetadataJournalEntry,
-    ) -> Result<(), DfsError> {
-        match &entry.mutation {
-            DfsMetadataMutation::PutFileSystem { file_system_id, .. } => {
-                let file_system = self
+        self.metadata_backend
+            .as_mut()
+            .expect("projection backend")
+            .begin_consistent_read_snapshot()?;
+        let result = (|| {
+            // Replaying a historical digest never restores its old visible head.
+            // Consult the actual current committed generation once instead.
+            for object_id in object_ids {
+                let object = self
                     .metadata_backend
                     .as_ref()
-                    .map(|backend| backend.get_file_system(file_system_id))
-                    .transpose()?
-                    .flatten();
-                if let Some(file_system) = file_system {
-                    self.metadata.add_file_system(file_system);
-                }
-            }
-            DfsMetadataMutation::PutObject { object_id, .. } => {
-                self.apply_backend_object_to_service_state(object_id)?;
-            }
-            DfsMetadataMutation::PutVersion {
-                object_id, version, ..
-            } => {
-                let version_record = self
-                    .metadata_backend
-                    .as_ref()
-                    .map(|backend| backend.get_version(object_id, version))
-                    .transpose()?
-                    .flatten();
-                if let Some(version_record) = version_record {
-                    self.apply_metadata_version_to_service_state(&version_record);
-                }
-            }
-            DfsMetadataMutation::CaptureFileVersion { .. }
-            | DfsMetadataMutation::RemoveVersion { .. } => {}
-            DfsMetadataMutation::PutReceipt {
-                object_id,
-                version,
-                replica_node_id,
-                ..
-            } => {
-                if self
-                    .backend_receipt_for_replica(object_id, version, replica_node_id)?
-                    .is_some()
-                {
-                    self.apply_metadata_receipt_to_service_state(
+                    .expect("projection backend")
+                    .get_object(&object_id)?;
+                if let Some(object) = object {
+                    self.apply_metadata_object_to_service_state(object)?;
+                } else {
+                    self.metadata.remove_object(&object_id);
+                    self.retire_replica_object_projections(vec![(
+                        payload.file_system_id.clone(),
                         object_id,
-                        version,
-                        replica_node_id,
-                    )?;
+                    )]);
                 }
             }
-            DfsMetadataMutation::RemoveReceipt {
-                object_id,
-                version,
-                replica_node_id,
-                ..
-            } => {
-                if let Some(object) = self.metadata.objects.get_mut(object_id)
-                    && object.version == *version
-                {
-                    object
-                        .current_locations
-                        .retain(|node_id| node_id != replica_node_id);
-                }
-            }
-            DfsMetadataMutation::PutIntent {
-                object_id,
-                intent_id,
-                ..
-            } => {
-                let intent = self
-                    .metadata_backend
-                    .as_ref()
-                    .map(|backend| backend.get_intent(object_id, intent_id))
-                    .transpose()?
-                    .flatten();
-                if let Some(intent) = intent {
-                    self.apply_metadata_intent_to_service_state(&intent)?;
-                }
-            }
-            DfsMetadataMutation::PutIntentReceipt { receipt, .. } => {
-                self.apply_metadata_intent_to_service_state(&receipt.to_intent_record())?;
-            }
-            DfsMetadataMutation::RemoveRetainedRepairOwner { intent_id, .. } => {
-                self.retire_committed_repair(intent_id);
-            }
-            DfsMetadataMutation::RemoveIntentReceipt { .. }
-            | DfsMetadataMutation::MergeIntentReceiptRetention { .. } => {}
-            DfsMetadataMutation::CommitVisibleVersion {
-                object_id,
-                committed_version,
-                ..
-            } => {
-                self.apply_backend_object_to_service_state(object_id)?;
-                let version_record = self
-                    .metadata_backend
-                    .as_ref()
-                    .map(|backend| backend.get_version(object_id, committed_version))
-                    .transpose()?
-                    .flatten();
-                if let Some(version_record) = version_record {
-                    self.apply_metadata_version_to_service_state(&version_record);
-                }
-                self.restore_backend_receipts_for_visible_version(object_id, committed_version)?;
-            }
-            DfsMetadataMutation::RemoveVisibleCommit { .. } => {}
-            DfsMetadataMutation::PutVersionPin { .. }
-            | DfsMetadataMutation::RemoveVersionPin { .. }
-            | DfsMetadataMutation::ReconcileCrossShardPinTransfer { .. }
-            | DfsMetadataMutation::RemoveCrossShardPinTransfer { .. }
-            | DfsMetadataMutation::FinalizeCrossShardSourceEviction { .. } => {}
-            DfsMetadataMutation::PutConflict {
-                object_id,
-                conflict_id,
-                ..
-            } => {
-                let conflict = self
-                    .metadata_backend
-                    .as_ref()
-                    .map(|backend| backend.get_conflict(object_id, conflict_id))
-                    .transpose()?
-                    .flatten();
-                if let Some(conflict) = conflict {
-                    self.metadata.add_conflict(conflict);
-                } else {
-                    self.metadata.remove_conflict(object_id, conflict_id);
-                }
-            }
-            DfsMetadataMutation::PutAdvisoryLockState { .. }
-            | DfsMetadataMutation::PutNamespacePrepare { .. }
-            | DfsMetadataMutation::CommitNamespacePrepare { .. }
-            | DfsMetadataMutation::PutNamespaceRequest { .. }
-            | DfsMetadataMutation::PutNamespaceTransactionReceipt { .. }
-            | DfsMetadataMutation::RemoveNamespaceTransactionReceipt { .. }
-            | DfsMetadataMutation::PutNamespacePrepareReceipt { .. }
-            | DfsMetadataMutation::RemoveNamespacePrepareReceipt { .. }
-            | DfsMetadataMutation::PutNamespaceJobReceipt { .. }
-            | DfsMetadataMutation::RemoveNamespaceJobReceipt { .. }
-            | DfsMetadataMutation::PutNamespaceRequestReceipt { .. } => {}
-            DfsMetadataMutation::RemoveNamespaceRequestReceipt { .. } => {}
-            DfsMetadataMutation::PutNamespaceJob { job_id, .. } => {
-                let job = self
-                    .metadata_backend
-                    .as_ref()
-                    .map(|backend| backend.get_namespace_job(job_id))
-                    .transpose()?
-                    .flatten();
-                if let Some(job) = job.as_ref() {
-                    self.apply_cross_shard_namespace_job_guard(job)?;
-                }
-            }
-            DfsMetadataMutation::ApplyNamespaceTransaction { transaction_id, .. } => {
-                let transaction = self
-                    .metadata_backend
-                    .as_ref()
-                    .map(|backend| backend.get_namespace_transaction(transaction_id))
-                    .transpose()?
-                    .flatten();
-                if let Some(transaction) = transaction {
-                    self.apply_metadata_namespace_transaction_to_service_state(&transaction)?;
-                } else {
-                    return Err(DfsError::Metadata {
-                        message: format!(
-                            "metadata journal entry {}:{} cannot apply namespace transaction {} without its transaction payload",
-                            entry.shard_id.0, entry.sequence, transaction_id
-                        ),
-                    });
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn apply_metadata_namespace_transaction_to_service_state(
-        &mut self,
-        transaction: &DfsNamespaceTransaction,
-    ) -> Result<(), DfsError> {
-        let mut objects = transaction.objects.clone();
-        objects.sort_by(|left, right| {
-            let left_is_tombstone = left.kind == DfsObjectKind::Tombstone;
-            let right_is_tombstone = right.kind == DfsObjectKind::Tombstone;
-            right_is_tombstone
-                .cmp(&left_is_tombstone)
-                .then_with(|| left.path.cmp(&right.path))
-                .then_with(|| left.object_id.cmp(&right.object_id))
-        });
-        for object in objects {
-            self.apply_metadata_object_to_service_state(object)?;
-        }
-        for version in &transaction.versions {
-            self.apply_metadata_version_to_service_state(version);
-        }
-        Ok(())
+            self.clear_metadata_lookup_cache();
+            Ok(())
+        })();
+        self.metadata_backend
+            .as_mut()
+            .expect("projection backend")
+            .end_consistent_read_snapshot();
+        result
     }
 
     pub(crate) fn apply_backend_object_to_service_state(
@@ -1997,21 +1458,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(())
     }
 
-    fn restore_backend_receipts_for_visible_version(
-        &mut self,
-        object_id: &DfsObjectId,
-        version: &DfsVersion,
-    ) -> Result<(), DfsError> {
-        for receipt in self.backend_receipts_for_version(object_id, version)? {
-            self.apply_metadata_receipt_to_service_state(
-                object_id,
-                version,
-                &receipt.replica_node_id,
-            )?;
-        }
-        Ok(())
-    }
-
     pub(crate) fn apply_metadata_object_to_service_state(
         &mut self,
         mut object: DfsObjectMetadata,
@@ -2026,7 +1472,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .contains_key(&object.file_system_id)
         {
             self.metadata.add_file_system(DfsFileSystem {
-                metadata_format: crate::DfsRevisionMetadataFormat::NamespacedV6,
                 retention_policies: Default::default(),
                 module_metadata: Default::default(),
                 file_system_id: object.file_system_id.clone(),
@@ -2045,148 +1490,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(())
     }
 
-    pub(crate) fn apply_metadata_version_to_service_state(
-        &mut self,
-        version: &DfsObjectVersionRecord,
-    ) {
-        if !version.visible {
-            return;
-        }
-        let Some(object) = self.metadata.objects.get_mut(&version.object_id) else {
-            return;
-        };
-        if object.version != version.version {
-            return;
-        }
-        if object.content_hash.is_none() {
-            object.content_hash = version.content_hash.clone();
-        }
-        if version.size_bytes.is_some() {
-            object.content_size_bytes = version.size_bytes;
-        }
-        if !version.locations.is_empty() {
-            object.current_locations = version.locations.clone();
-            normalize_current_locations(&mut object.current_locations);
-        }
-        self.coordinator.set_committed_version(
-            object.file_system_id.clone(),
-            object.object_id.clone(),
-            object.version.clone(),
-        );
-    }
-
-    fn apply_metadata_intent_to_service_state(
-        &mut self,
-        intent_record: &DfsWriteIntentRecord,
-    ) -> Result<(), DfsError> {
-        if !intent_record.publication.is_current() {
-            return self.restore_retained_content_intent(intent_record);
-        }
-        let intent = distributed_intent_from_record(intent_record);
-        match self.coordinator.restore_intent(intent) {
-            Ok(()) => {}
-            Err(DfsDistributedError::PendingIntentConflict { .. }) => {
-                self.mark_replayed_intent_as_rejected(intent_record)?;
-                return Ok(());
-            }
-            Err(
-                DfsDistributedError::DuplicateIntentId { .. }
-                | DfsDistributedError::DuplicateIntent { .. },
-            ) => {
-                if self
-                    .coordinator
-                    .intent(&intent_record.intent_id)
-                    .is_some_and(|intent| distributed_intent_matches_record(intent, intent_record))
-                {
-                    // Same intent replayed after local state had already advanced.
-                } else if matches!(intent_record.status, DfsWriteIntentStatus::Committed)
-                    && self
-                        .current_read_object_metadata(&intent_record.object_id)
-                        .is_ok_and(|object| {
-                            object.version == intent_record.target_version
-                                && intent_record.content_hash.as_deref().is_none_or(
-                                    |content_hash| {
-                                        object.content_hash.as_deref() == Some(content_hash)
-                                    },
-                                )
-                        })
-                {
-                    self.restore_visible_committed_object_location_receipts(intent_record)?;
-                } else {
-                    self.mark_replayed_intent_as_rejected(intent_record)?;
-                    return Ok(());
-                }
-            }
-            Err(DfsDistributedError::BaseVersionConflict { .. }) => {
-                if self
-                    .current_read_object_metadata(&intent_record.object_id)
-                    .is_ok_and(|object| {
-                        object.version == intent_record.target_version
-                            && intent_record
-                                .content_hash
-                                .as_deref()
-                                .is_none_or(|content_hash| {
-                                    object.content_hash.as_deref() == Some(content_hash)
-                                })
-                    })
-                {
-                    if matches!(intent_record.status, DfsWriteIntentStatus::Committed) {
-                        self.restore_visible_committed_object_location_receipts(intent_record)?;
-                    }
-                    return Ok(());
-                }
-                // Journal replay can revisit an intent that later history in
-                // the same stream already superseded — either because the
-                // backend applied the whole batch before service-state replay
-                // or because a republished batch duplicates entries this node
-                // replayed earlier. The backend's current intent record is
-                // authoritative: a terminal record makes the replayed entry
-                // historical rather than inconsistent.
-                if self.backend_intent_record_is_terminal(
-                    &intent_record.object_id,
-                    &intent_record.intent_id,
-                )? {
-                    return Ok(());
-                }
-                self.mark_replayed_intent_as_rejected(intent_record)?;
-                return Ok(());
-            }
-            Err(error) => return Err(error.into()),
-        }
-        self.restore_metadata_successor_head(intent_record)?;
-
-        if matches!(
-            intent_record.status,
-            DfsWriteIntentStatus::Staging
-                | DfsWriteIntentStatus::ReceiptsPending
-                | DfsWriteIntentStatus::Committed
-        ) && let Some(content_hash) = intent_record.content_hash.clone()
-            && !self
-                .writes
-                .pending_writes
-                .contains_key(&intent_record.intent_id)
-        {
-            let size_bytes = self
-                .pending_write_size_hint(
-                    &intent_record.object_id,
-                    &intent_record.target_version,
-                    &content_hash,
-                )?
-                .unwrap_or(0);
-            self.writes.pending_writes.insert(
-                intent_record.intent_id.clone(),
-                PendingNetworkedWrite::new(
-                    intent_record.object_id.clone(),
-                    intent_record.target_version.clone(),
-                    content_hash,
-                    size_bytes,
-                )
-                .with_foreground_replica_repair(false),
-            );
-        }
-        Ok(())
-    }
-
     fn mark_replayed_intent_as_rejected(
         &mut self,
         intent_record: &DfsWriteIntentRecord,
@@ -2195,19 +1498,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             self.reconcile_observed_write_intent_with_policy(intent_record, false, true)?;
         }
         self.remove_pending_write_state(&intent_record.intent_id);
-        Ok(())
-    }
-
-    fn apply_metadata_receipt_to_service_state(
-        &mut self,
-        object_id: &DfsObjectId,
-        version: &DfsVersion,
-        replica_node_id: &NodeId,
-    ) -> Result<(), DfsError> {
-        let intent_ids = self.backend_intent_ids_for_version(object_id, version)?;
-        for intent_id in intent_ids {
-            self.restore_backend_durable_receipt(&intent_id, replica_node_id.clone(), true)?;
-        }
         Ok(())
     }
 

@@ -13,7 +13,7 @@ use sinomo_core::{
 };
 use std::path::{Path, PathBuf};
 
-pub const DFS_PROTOCOL: &str = "sinomo.dfs.v1";
+pub const DFS_PROTOCOL: &str = "sinomo.dfs.v7";
 pub use sinomo_api::dfs::module_surface::SINOMO_DFS_MODULE_LEGACY_ID;
 pub use sinomo_api::dfs::module_surface::SINOMO_DFS_MODULE_OWNER;
 pub const SINOMO_DFS_NATIVE_REGISTRATION_KEY: &str = "sinomo-dfs";
@@ -54,24 +54,12 @@ pub fn register_storage_paths(
             "inline content mutation and migration owner fencing",
         ),
         (
-            "dfs/content/legacy-readers.lock",
-            "retained legacy content reader reclamation fence",
-        ),
-        (
-            "dfs/content/blob-packs",
-            "packed small DFS blob segment files and index records",
-        ),
-        (
             "dfs/content/objects",
             "dynamic DFS object manifests stored as sinomo-object files",
         ),
         (
             "dfs/content/catalog",
             "durable authoritative DFS content-root catalogs",
-        ),
-        (
-            "dfs/content/content-reservations",
-            "legacy single-version pre-catalog content reservations",
         ),
         (
             "dfs/content/content-reservation-reconciliation-cursor.sobj",
@@ -146,6 +134,27 @@ pub fn register_storage_paths(
     ] {
         layout.register_escape_path("sinomo-dfs", StorageRing::R1, relative_path, reason)?;
     }
+    layout.register_binary(
+        "sinomo-dfs",
+        StorageRing::R1,
+        "dfs/content/file-readers-v2.lock",
+    )?;
+    layout.register_binary(
+        "sinomo-dfs",
+        StorageRing::R1,
+        "dfs/content/content-reservations/write.lock",
+    )?;
+    layout.register_sinomo_object(
+        "sinomo-dfs",
+        StorageRing::R1,
+        "dfs/content/content-reservations/00/batch-format-v1.sobj",
+        sinomo_core::storage::ObjectSchema::new("ContentStoreReservationBatchSentinel", 1)
+            .field("format_version", "u32")
+            .field("marker", "String")
+            .field("store_incarnation", "String")
+            .field("catalog_scan_epoch", "u64")
+            .field("content_binding_layout", "String"),
+    )?;
     layout.register_binary("sinomo-dfs", StorageRing::R1, "dfs/host-mount.lock")
 }
 
@@ -210,6 +219,15 @@ pub fn dfs_module_surfaces() -> sinomo_module::ModuleSurfaces {
             "dfs.inspection.read",
             ModuleRouteAuth::LocalOrClusterMember,
         ))
+        .with_object_rpc_route(
+            ModuleObjectRpcRoute::new(
+                crate::source_adoption::SOURCE_ADOPTION_ROUTE,
+                DFS_RPC_CATEGORY,
+                "dfs.metadata.source-adoption",
+                ModuleRouteAuth::LocalOrClusterMember,
+            )
+            .require_exact_member_identity(),
+        )
         .with_object_rpc_route(
             ModuleObjectRpcRoute::new(
                 DFS_METADATA_JOURNAL_BATCH_ROUTE,
@@ -306,6 +324,7 @@ pub fn dfs_module_capabilities() -> ModuleCapabilities {
             dfs_capability("dfs.repair.retry"),
             dfs_capability("dfs.metadata.replicate"),
             dfs_capability("dfs.metadata.repair"),
+            dfs_capability("dfs.metadata.source-adoption"),
             dfs_capability("dfs.smoke.run"),
             dfs_capability("dfs.object.transfer"),
             dfs_capability("sifs.path.access"),
@@ -376,6 +395,7 @@ mod tests {
         for route in &registration.surfaces.object_rpc_routes {
             let expected_exact = route.route == crate::DFS_METADATA_JOURNAL_BATCH_ROUTE
                 || route.route == crate::DFS_METADATA_SNAPSHOT_INSTALL_ROUTE
+                || route.route == crate::source_adoption::SOURCE_ADOPTION_ROUTE
                 || crate::dfs_route_is_message_data_plane(&route.route);
             assert_eq!(
                 route.exact_member_identity, expected_exact,
@@ -385,7 +405,7 @@ mod tests {
         }
         assert_eq!(
             registration.surfaces.object_rpc_routes.len(),
-            DFS_OBJECT_RPC_ROUTES.len() + 2
+            DFS_OBJECT_RPC_ROUTES.len() + 3
         );
         assert!(
             registration
@@ -443,10 +463,10 @@ mod tests {
         register_storage_paths(&mut layout).expect("register DFS storage paths");
 
         for path in [
-            "dfs/content/blob-packs/index.sobj",
-            "dfs/content/blob-packs/segments/0000000000000000.pack",
+            "dfs/content/file-readers-v2.lock",
+            "dfs/content/content-reservations/write.lock",
+            "dfs/content/content-reservations/00/batch-format-v1.sobj",
             "dfs/content/catalog/metadata-content-roots.sobj",
-            "dfs/content/content-reservations/ab/abcdef.sobj",
             "dfs/content/content-reservation-reconciliation-cursor.sobj",
             "dfs/content/manifest-absence-observations/ab/abcdef.sobj",
             "dfs/content/orphan-observations/ab/abcdef.sobj",

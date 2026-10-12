@@ -11,7 +11,7 @@ use sinomo_network::{
     CLUSTER_MEMBER_PUBLISH_ROUTE, CLUSTER_MEMBERSHIP_RPC_CATEGORY, ObjectRpcRequest,
 };
 use sinomo_service::{
-    Service, ServiceContext, ServiceDisposition, ServiceError, ServiceFuture,
+    ClusterAccess, Service, ServiceContext, ServiceDisposition, ServiceError, ServiceFuture,
     ServiceRegistryBuilder, ServiceRoute,
 };
 use std::future::Future;
@@ -36,6 +36,7 @@ pub trait ClusterMembershipServiceHost: Send + Sync + 'static {
     fn local_join_challenge<'a>(
         &'a self,
         request: ClusterInviteChallengeRequest,
+        cluster: Arc<dyn ClusterAccess>,
     ) -> ClusterMembershipServiceFuture<'a, ClusterInviteChallengeProof>;
 
     fn forward_join_challenge<'a>(
@@ -167,13 +168,14 @@ impl Service for HostedClusterMembershipService {
                     "challenge invite={} received",
                     challenge.invite_id
                 ));
+                let cluster = ctx.require_cluster(CLUSTER_JOIN_CHALLENGE_ROUTE)?;
                 let challenge_for_timeout = challenge.clone();
                 let challenge_for_work = challenge.clone();
                 let host_for_work = Arc::clone(&host);
                 let proof = tokio::time::timeout(JOIN_CHALLENGE_BUDGET, async move {
                     let local_started = Instant::now();
                     match host_for_work
-                        .local_join_challenge(challenge_for_work.clone())
+                        .local_join_challenge(challenge_for_work.clone(), cluster)
                         .await
                     {
                         Ok(proof) => {

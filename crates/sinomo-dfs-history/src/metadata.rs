@@ -14,11 +14,7 @@ pub fn capture_from_version(
                 "unsupported History metadata version".into(),
             ));
         }
-        let source = metadata
-            .payload
-            .get("source")
-            .unwrap_or(&metadata.payload)
-            .clone();
+        let source = metadata.payload.clone();
         serde_json::from_value(source)
             .map_err(|error| MetadataBackendError::Serde(error.to_string()))?
     } else if grant.origin == DfsRetentionGrantOrigin::Rule {
@@ -61,25 +57,13 @@ pub(crate) fn entry_from_descriptor(
         .references
         .iter()
         .filter_map(|reference| {
-            if reference
-                .namespace
-                .as_deref()
-                .is_some_and(|namespace| namespace != HISTORY_MODULE_ID)
-            {
+            if reference.namespace != HISTORY_MODULE_ID {
                 return None;
             }
-            let prefix = format!("ref/{HISTORY_MODULE_ID}/");
-            Some(if reference.namespace.is_some() {
-                reference
-                    .pin_id
-                    .strip_prefix(&prefix)
-                    .unwrap_or(&reference.pin_id)
-                    .to_string()
-            } else {
-                // Legacy identifiers are raw user values. Even a value that
-                // resembles the new qualified prefix must remain unchanged.
-                reference.pin_id.clone()
-            })
+            reference
+                .pin_id
+                .strip_prefix(&format!("ref/{HISTORY_MODULE_ID}/"))
+                .map(str::to_string)
         })
         .collect();
     Ok(DfsFileHistoryEntry {
@@ -145,7 +129,6 @@ pub fn install_history_policy(
     policy: DfsFileHistoryPolicy,
 ) -> Result<(), MetadataBackendError> {
     policy.validate().map_err(MetadataBackendError::Serde)?;
-    file_system.metadata_format = DfsRevisionMetadataFormat::NamespacedV6;
     if policy.is_empty() {
         file_system.retention_policies.remove(HISTORY_MODULE_ID);
     } else {
@@ -156,14 +139,13 @@ pub fn install_history_policy(
     Ok(())
 }
 
-/// Construct a module-owned persisted capture for fixtures and explicit
-/// import tools. Core publication still validates scope and immutable grants.
+/// Construct current module-owned revision metadata without publishing it.
+/// Core publication still validates scope and immutable grants.
 pub fn install_history_capture(
     version: &mut DfsObjectVersionRecord,
     capture: DfsRetainedFileVersion,
     high_water: u64,
 ) -> Result<(), MetadataBackendError> {
-    version.metadata_format = DfsRevisionMetadataFormat::NamespacedV6;
     let state = version
         .retention
         .entry(HISTORY_MODULE_ID.into())

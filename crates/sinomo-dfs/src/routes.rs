@@ -326,6 +326,30 @@ fn dfs_network_message_execution_scope(message: &DfsNetworkMessage) -> DfsMessag
             namespace_authority_shard_execution_scope(command)
                 .unwrap_or(DfsMessageExecutionScope::ReadOnly)
         }
+        DfsNetworkMessage::NamespaceRequest(command)
+            if matches!(
+                command.operation,
+                DfsNamespaceOperation::Unlink { .. }
+                    | DfsNamespaceOperation::ConditionalUnlink { .. }
+            ) =>
+        {
+            // Canonical unlink may promote a hardlink from another physical
+            // shard. Its one path stamp cannot prove that complete footprint;
+            // use the existing all-shard coordinator shell to discover it.
+            DfsMessageExecutionScope::GlobalExclusive
+        }
+        DfsNetworkMessage::NamespaceRequest(command)
+            if matches!(
+                command.operation,
+                DfsNamespaceOperation::ResumeNamespaceJobBounded { .. }
+            ) =>
+        {
+            // The envelope identifies only the job's coordinator path. Its
+            // durable frames may own another shard's source reservation or a
+            // cross-shard namespace step, so one stamp cannot prove the full
+            // execution footprint before the job has been read.
+            DfsMessageExecutionScope::GlobalExclusive
+        }
         DfsNetworkMessage::NamespaceRequest(command) => {
             if let Some(scope) = namespace_authority_shard_execution_scope(command) {
                 return scope;
@@ -436,20 +460,9 @@ pub(crate) fn dfs_network_message_response_retry_safe(message: &DfsNetworkMessag
     )
 }
 
-pub fn dfs_message_requires_full_metadata_hydrate(_command: &DfsMessageCommand) -> bool {
-    // Every routed operation now resolves the exact records it needs from the
-    // authoritative backend. In particular, legacy unhinted reads use the same
-    // targeted object lookup as namespace reads; no message requires rebuilding
-    // the complete in-memory metadata projection before it can be served.
-    false
-}
-
 /// Backward-compatible name for callers that classify daemon message commands.
 /// Distributed operations perform targeted metadata validation in their own
 /// paths, so this compatibility classifier is always false.
-pub fn dfs_message_requires_fresh_metadata(command: &DfsMessageCommand) -> bool {
-    dfs_message_requires_full_metadata_hydrate(command)
-}
 
 pub(crate) fn dfs_network_message_allows_write_repair_progress(
     message: &DfsNetworkMessage,
@@ -537,11 +550,15 @@ pub fn dfs_metadata_snapshot_install_rpc_request(
 pub fn dfs_metadata_snapshot_install_rpc_call(
     command: &DfsMetadataSnapshotInstallCommand,
 ) -> Result<ObjectRpcCall, NetworkError> {
-    ObjectRpcCall::encode_borrowed_value(
+    let image = command.image().map_err(|e| NetworkError::Serialization {
+        detail: e.to_string(),
+    })?;
+    let request = ObjectRpcRequest::encode_body(
         DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
         DFS_RPC_CATEGORY,
         command,
-    )
+    )?;
+    Ok(ObjectRpcCall::new(request, image.attachment_source()?))
 }
 
 pub fn decode_dfs_metadata_snapshot_install_rpc_response(
@@ -619,11 +636,12 @@ mod tests {
     use super::*;
     use crate::{
         DfsContentRootCatalogPageRequest, DfsContentRootCatalogShardIdentity,
-        DfsDistributedWriteCommand, DfsMetadataJournalBatch, DfsMetadataShardAssignment,
-        DfsMetadataTableSnapshot, DfsNamespaceChangeCursor, DfsNamespaceChangePollRequest,
-        DfsNamespaceCommand, DfsNamespaceOperation, DfsNamespacePosixError, DfsNamespaceResponse,
-        DfsNamespaceResult, DfsObjectId, DfsReadRequest, DfsReplicationPolicy, DfsStageBlobCommand,
-        DfsVersion, dfs_content_root_catalog_topology_digest,
+        DfsDistributedWriteCommand, DfsMetadataJournalBatch, DfsMetadataJournalFrameBatch,
+        DfsMetadataShardAssignment, DfsMetadataTableSnapshot, DfsNamespaceChangeCursor,
+        DfsNamespaceChangePollRequest, DfsNamespaceCommand, DfsNamespaceOperation,
+        DfsNamespacePosixError, DfsNamespaceResponse, DfsNamespaceResult, DfsObjectId,
+        DfsReadRequest, DfsReplicationPolicy, DfsStageBlobCommand, DfsVersion,
+        dfs_content_root_catalog_topology_digest,
     };
     use sinomo_core::node::NodeId;
     use sinomo_core::{DfsObjectPolicy, DfsWriteRequest};
@@ -712,7 +730,7 @@ mod tests {
             replica_node_ids: Vec::new(),
             epoch: 7,
             assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
+
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         }
     }
@@ -729,9 +747,9 @@ mod tests {
             prefix_probe: None,
             authority_probe: None,
             durable_replication: None,
-            batch: DfsMetadataJournalBatch {
+            batch: DfsMetadataJournalFrameBatch {
                 shard_id: DfsMetadataShardId::new("scope-shard"),
-                entries: Vec::new(),
+                journal_frames: Vec::new(),
                 next_after_sequence: 0,
             },
         }
@@ -759,6 +777,7 @@ mod tests {
     fn symlink_content_pending_survives_namespace_wire_round_trip() {
         let command = message_command(DfsNetworkMessage::NamespaceResponse(DfsNamespaceResponse {
             request_id: "symlink-pending-response".to_string(),
+            committed_work: Default::default(),
             result: DfsNamespaceResult::Rejected {
                 reason: "symlink content is still converging".to_string(),
                 posix_error: Some(DfsNamespacePosixError::SymlinkContentPending {
@@ -771,7 +790,7 @@ mod tests {
             synced_path_object: None,
             synced_path_objects: Vec::new(),
             metadata_journal_batches: Vec::new(),
-            metadata_journal_has_more: None,
+            metadata_journal_has_more: false,
             posix_coordination_result: None,
         }));
 
@@ -782,21 +801,23 @@ mod tests {
             command
         );
 
-        let legacy_without_diagnostics: DfsNamespacePosixError =
-            serde_json::from_value(serde_json::json!({
+        for omitted in ["stage", "detail"] {
+            let mut incomplete = serde_json::json!({
                 "symlink-content-pending": {
-                    "path": "/services/link"
+                    "path": "/services/link",
+                    "stage": "fetch-link-body",
+                    "detail": "version v2 is pending at node-b"
                 }
-            }))
-            .expect("diagnostic fields are additive");
-        assert_eq!(
-            legacy_without_diagnostics,
-            DfsNamespacePosixError::SymlinkContentPending {
-                path: "/services/link".to_string(),
-                stage: String::new(),
-                detail: String::new(),
-            }
-        );
+            });
+            incomplete["symlink-content-pending"]
+                .as_object_mut()
+                .unwrap()
+                .remove(omitted);
+            assert!(
+                serde_json::from_value::<DfsNamespacePosixError>(incomplete).is_err(),
+                "current diagnostics require {omitted}"
+            );
+        }
     }
 
     #[test]
@@ -970,6 +991,38 @@ mod tests {
             DfsMessageExecutionScope::NamespacePaths { .. }
         ));
 
+        for operation in [
+            DfsNamespaceOperation::Unlink {
+                path: "/services/existing".into(),
+            },
+            DfsNamespaceOperation::ConditionalUnlink {
+                path: "/services/existing".into(),
+                expected: crate::DfsNamespaceObjectPrecondition {
+                    object_id: object_id("scope-canonical-object"),
+                    version: version("scope-canonical-version"),
+                },
+            },
+        ] {
+            for authority_shards in [Vec::new(), vec![shard.clone()]] {
+                let unlink =
+                    message_command(DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
+                        request_id: "scope-canonical-unlink".into(),
+                        file_system_id: file_system_id.clone(),
+                        requesting_node_id: node_id("scope-source"),
+                        include_metadata_journal_batches: false,
+                        metadata_journal_after_sequences: Vec::new(),
+                        authority_shards,
+                        operation: operation.clone(),
+                    }));
+                assert_eq!(
+                    dfs_message_execution_scope(&unlink),
+                    DfsMessageExecutionScope::GlobalExclusive,
+                    "a path stamp cannot exclude an alias in another physical shard"
+                );
+                assert!(!dfs_message_is_read_only_request(&unlink));
+            }
+        }
+
         let mut wrong_file_system = shard.clone();
         wrong_file_system.file_system_id = fs_id("scope-other-namespace-fs");
         assert!(matches!(
@@ -1011,14 +1064,18 @@ mod tests {
             primary_handoff_id: None,
             shard_id: DfsMetadataShardId::new("scope-snapshot-shard"),
             next_after_sequence: 0,
-            snapshot: DfsMetadataTableSnapshot {
-                format_version: 0,
-                materialized_through_sequence: None,
-                tables: None,
-                ops: Vec::new(),
-                semantic_state_fingerprint: None,
-                prefix_proof: None,
+            snapshot: crate::DfsMetadataSnapshotImageDescriptor {
+                format_version: crate::metadata_table_store::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
+                materialized_through_sequence: 0,
+                semantic_state_fingerprint: "scope-only-fixture".into(),
+                prefix_proof: crate::metadata_records::dfs_metadata_prefix_proof_genesis(
+                    &DfsMetadataShardId::new("scope-snapshot-shard"),
+                ),
+                total_size_bytes: 40,
+                stream_record_count: 0,
+                stream_digest: "0".repeat(64),
             },
+            image: None,
             reason: "scope test".to_string(),
         };
         assert_eq!(
@@ -1077,6 +1134,7 @@ mod tests {
         let requester = node_id("scope-requester");
         let mut write = DfsDistributedWriteCommand {
             publication: Default::default(),
+            patch: None,
             request_id: "scope-distributed-write".to_string(),
             request: DfsWriteRequest {
                 file_system_id: file_system_id.clone(),

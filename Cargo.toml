@@ -38,6 +38,7 @@ default-members = [
     "crates/sinomo-dfs",
     "crates/sinomo-dfs-attachments",
     "crates/sinomo-dfs-history",
+    "crates/sinomo-dfs-migration",
     "crates/sinomo-dfs-nfs",
     "crates/sinomo-eval",
     "crates/sinomo-events",
@@ -93,6 +94,12 @@ panic = "abort"
 [profile.dev]
 debug = "limited"
 incremental = true
+
+# Test executables contain many transport specializations. Local ThinLTO
+# reoptimizes their imports across codegen units after small edits; retain the
+# package optimization levels while avoiding that additional test link pass.
+[profile.test]
+lto = "off"
 
 [profile.dev.package."*"]
 debug = "limited"
@@ -155,6 +162,7 @@ sinomo-runtime = { path = "crates/sinomo-runtime" }
 sinomo-dfs = { path = "crates/sinomo-dfs" }
 sinomo-dfs-attachments = { path = "crates/sinomo-dfs-attachments" }
 sinomo-dfs-history = { path = "crates/sinomo-dfs-history" }
+sinomo-dfs-migration = { path = "crates/sinomo-dfs-migration" }
 sinomo-module = { path = "crates/sinomo-module" }
 sinomo-cli-registry = { path = "crates/sinomo-cli-registry" }
 sinomo-api = { path = "crates/sinomo-api" }

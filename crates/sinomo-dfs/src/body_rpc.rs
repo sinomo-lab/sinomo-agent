@@ -74,8 +74,10 @@ pub(crate) fn attach_dfs_message_request_attachment(
         | DfsNetworkMessage::RepairRetainedBlob(command) => command.bytes = bytes,
         DfsNetworkMessage::StagePatch(command) => command.bytes = bytes,
         DfsNetworkMessage::RepairReplica(command) => command.bytes = bytes,
-        DfsNetworkMessage::MetadataSnapshotInstall(command) => {
-            command.snapshot = SinomoObjectCodec::network_frame().decode(&bytes)?;
+        DfsNetworkMessage::MetadataSnapshotInstall(_) => {
+            return Err(serialization_error(
+                "native snapshot images require the owned streamed attachment path",
+            ));
         }
         DfsNetworkMessage::NamespaceRequest(command) => {
             let DfsNamespaceOperation::CommitLocalEventualBatch { transaction, .. } =

@@ -70,9 +70,9 @@ use sinomo_runtime::core::DfsObjectPolicy;
 use sinomo_runtime::dfs::{
     self, DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsAttachmentMessageCommand,
     DfsFetchBlobResponse, DfsFetchBlobResult, DfsFileSystemId, DfsMessageCommand,
-    DfsMetadataNamespacePrepareCodec, DfsNetworkMessage, DfsObjectId, DfsOperatorRepairView,
-    DfsOperatorStatus, DfsPlacementPolicy, DfsPlacementReconciliationState, DfsPlacementScope,
-    DfsReadData, DfsReadResponse, DfsReadResult, DfsRoutedMessage, DfsRpcAttachmentDescriptor,
+    DfsNetworkMessage, DfsObjectId, DfsOperatorRepairView, DfsOperatorStatus, DfsPlacementPolicy,
+    DfsPlacementReconciliationState, DfsPlacementScope, DfsReadData, DfsReadResponse,
+    DfsReadResult, DfsRoutedMessage, DfsRpcAttachmentDescriptor,
     DfsStableNamespaceOperationReconciliation, DfsStageBlobCommand, DfsVersion,
     SIFS_FILE_SYSTEM_ID,
 };
@@ -111,15 +111,7 @@ const DEFAULT_CONTENT_VERSION_GC_VERSIONS: usize = 10_000;
 const DEFAULT_CONTENT_VERSION_GC_WRITE_BATCH: usize = 4_096;
 const DEFAULT_CONTENT_VERSION_GC_MAX_TOTAL_MS: u64 = 120_000;
 const DEFAULT_CONTENT_VERSION_GC_MAX_RESTART_MS: u64 = 10_000;
-const DEFAULT_METADATA_HISTORY_GC_OVERWRITES: usize = 100_000;
-const DEFAULT_METADATA_HISTORY_GC_NAMESPACE_REQUESTS: usize = 1_000;
-const DEFAULT_METADATA_HISTORY_GC_CONTENT_BATCH: usize = 4_096;
-const DEFAULT_METADATA_HISTORY_GC_BATCH: u64 = 256;
-const DEFAULT_METADATA_HISTORY_GC_MAX_TOTAL_MS: u64 = 120_000;
-const DEFAULT_METADATA_HISTORY_GC_MAX_RESTART_MS: u64 = 30_000;
-const DEFAULT_METADATA_HYDRATION_OBJECTS: usize = 4_097;
-const DEFAULT_METADATA_HYDRATION_MAX_TOTAL_MS: u64 = 120_000;
-const DEFAULT_METADATA_HYDRATION_MAX_HYDRATE_MS: u64 = 30_000;
+
 const MAX_DFS_STORAGE_RUNTIME_PROBE_ITEMS: usize = 1_000_000;
 const EXPECT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const DEFAULT_ROUNDTRIP_BASE: &str = "/services/cluster-tests";
@@ -138,7 +130,6 @@ struct ScopedSifsTestNamespace {
 
 mod attachments;
 mod semantic_lost_reply;
-mod snapshot_reader_floor;
 
 struct ScopedDfsRuntimeProbeRoot {
     root: PathBuf,
@@ -323,7 +314,6 @@ pub fn register_dfs_cluster_test_cases(
     builder
         .register(attachments::dfs_file_attachments())
         .register(semantic_lost_reply::dfs_semantic_lost_reply())
-        .register(snapshot_reader_floor::dfs_metadata_snapshot_reader_floor())
         .register(dfs_read_your_write())
         .register(dfs_routed_status())
         .register(dfs_remote_shard_write())
@@ -339,8 +329,6 @@ pub fn register_dfs_cluster_test_cases(
         .register(dfs_raw_lightweight_latency())
         .register(dfs_protocol_codec_baseline())
         .register(dfs_content_version_gc())
-        .register(dfs_metadata_history_gc())
-        .register(dfs_metadata_hydration())
         .register(dfs_write())
         .register(dfs_write_latency())
         .register(dfs_expect_file())
@@ -377,30 +365,6 @@ sinomo_runtime::test::sinomo_test_case! {
         requirements: [],
         run: {
             run_content_version_gc(ctx)
-        }
-    }
-}
-
-sinomo_runtime::test::sinomo_test_case! {
-    pub fn dfs_metadata_history_gc(ctx) {
-        id: "cluster.dfs.metadata-history-gc",
-        summary: "Run isolated 100k metadata/content churn GC and enforce bounded retained state and restart performance",
-        tags: ["cluster-dfs", "probe", "performance", "storage-maintenance", "dfs-storage-runtime-acceptance"],
-        requirements: [],
-        run: {
-            run_metadata_history_gc(ctx)
-        }
-    }
-}
-
-sinomo_runtime::test::sinomo_test_case! {
-    pub fn dfs_metadata_hydration(ctx) {
-        id: "cluster.dfs.metadata-hydration",
-        summary: "Hydrate isolated durable DFS metadata across the 4096-object page boundary and report latency",
-        tags: ["cluster-dfs", "probe", "performance", "correctness", "storage-maintenance", "dfs-storage-runtime-acceptance"],
-        requirements: [],
-        run: {
-            run_metadata_hydration(ctx)
         }
     }
 }
@@ -566,7 +530,7 @@ sinomo_runtime::test::sinomo_test_case! {
 sinomo_runtime::test::sinomo_test_case! {
     pub fn dfs_invariants(ctx) {
         id: "cluster.dfs.invariants",
-        summary: "SIFS durable invariants: no open conflicts, leaked cross-shard locks, or reachable replica lag",
+        summary: "SIFS durable invariants: no leaked cross-shard locks or reachable replica lag",
         tags: ["cluster-dfs", "cluster-network-dfs-acceptance"],
         requirements: [SinomoTestRequirement::ClusterRuntime],
         run: {
@@ -844,8 +808,6 @@ fn run_routed_status(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let gate = DfsRoutedStatusGate::from_context(ctx, timeout_ms)?;
     let timeout = expect_timeout(ctx)?;
     let expected_targets = optional_usize_parameter(ctx, "expected-targets", 1)?;
-    let max_remote_open_conflicts =
-        optional_usize_parameter(ctx, "max-remote-open-conflicts", usize::MAX)?;
     let max_remote_pending_writes =
         optional_usize_parameter(ctx, "max-remote-pending-writes", usize::MAX)?;
     let max_remote_pending_repairs =
@@ -983,7 +945,6 @@ fn run_routed_status(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         }
         let dirty_statuses = routed_status_dirty_summaries(
             &statuses,
-            max_remote_open_conflicts,
             max_remote_pending_writes,
             max_remote_pending_repairs,
         );
@@ -1497,23 +1458,14 @@ fn run_remote_shard_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             split_failures.push(error);
         }
 
-        let publish_started = Instant::now();
-        let publish_report = backend.publish_metadata_after_mutation_report();
-        let publish_ms = publish_started.elapsed().as_millis() as u64;
-        ctx.record("publish_ms", publish_ms);
-        match publish_report {
-            Ok(report) => {
-                let publish_outcomes = report
-                    .outcomes
-                    .iter()
-                    .map(|outcome| format!("{outcome:?}"))
-                    .collect::<Vec<_>>();
-                ctx.record("publish_outcome_count", publish_outcomes.len());
-                ctx.record("publish_outcomes", publish_outcomes);
-            }
-            Err(error) => {
-                ctx.record("publish_error", error);
-            }
+        let dispatch_started = Instant::now();
+        let dispatch = backend.finish_pending_mutation_dispatch(Some(deadline));
+        ctx.record(
+            "pending_dispatch_ms",
+            dispatch_started.elapsed().as_millis() as u64,
+        );
+        if let Err(error) = dispatch {
+            ctx.record("pending_dispatch_error", error);
         }
     } else {
         let write_deadline = next_phase_deadline();
@@ -1585,7 +1537,7 @@ struct DfsShardLayoutProbe {
     primary_node_id: String,
     replica_node_ids: Vec<String>,
     epoch: u64,
-    namespace_prepare_codec: DfsMetadataNamespacePrepareCodec,
+    metadata_protocol_version: u8,
 }
 
 fn run_shard_layout(ctx: &mut SinomoTestContext) -> SinomoTestResult {
@@ -1610,8 +1562,6 @@ fn run_shard_layout(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let expected_replica_count = optional_usize_parameter(ctx, "expected-replica-count", 0)?;
     let expected_distinct_primary_count =
         optional_usize_parameter(ctx, "expected-distinct-primary-count", 0)?;
-    let expected_namespace_prepare_codec =
-        optional_namespace_prepare_codec_parameter(ctx, "expected-namespace-prepare-codec")?;
     let authority = ctx.authoritative_cluster_snapshot().ok_or_else(|| {
         SinomoTestError::failed(
             "live SIFS shard layout requires one invocation-scoped authoritative cluster snapshot",
@@ -1629,6 +1579,24 @@ fn run_shard_layout(ctx: &mut SinomoTestContext) -> SinomoTestResult {
                     "no live SIFS metadata shard controls {candidate_path} for the {lane} performance lane"
                 ))
             })?;
+        for member_id in std::iter::once(&shard.primary_node_id).chain(&shard.replica_node_ids) {
+            let member = authority
+                .snapshot()
+                .get(&sinomo_runtime::node::cluster_member_key(member_id))
+                .ok_or_else(|| {
+                    SinomoTestError::failed(format!("metadata member {member_id} is absent"))
+                })?
+                .decode::<sinomo_runtime::core::ClusterMemberRecord>()
+                .map_err(|error| SinomoTestError::failed(error.to_string()))?;
+            if !member.capabilities.iter().any(|capability| {
+                capability.as_str()
+                    == sinomo_runtime::node::DFS_METADATA_PREPARED_OPERATION_V7_CAPABILITY
+            }) {
+                return Err(SinomoTestError::failed(format!(
+                    "metadata member {member_id} must upgrade before the current protocol can be measured"
+                )));
+            }
+        }
         layouts.push(DfsShardLayoutProbe {
             lane,
             base_prefix,
@@ -1641,7 +1609,7 @@ fn run_shard_layout(ctx: &mut SinomoTestContext) -> SinomoTestResult {
                 .map(ToString::to_string)
                 .collect(),
             epoch: shard.epoch,
-            namespace_prepare_codec: shard.namespace_prepare_codec,
+            metadata_protocol_version: dfs::DFS_PREPARED_OPERATION_PROTOCOL_VERSION,
         });
     }
 
@@ -1705,72 +1673,10 @@ fn run_shard_layout(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             distinct_primary_node_ids.len()
         )));
     }
-    if let Some(expected) = expected_namespace_prepare_codec
-        && let Some(mismatch) = namespace_prepare_codec_mismatch_detail(&layouts, expected)
-    {
-        return Ok(SinomoTestOutcome::failed(format!(
-            "live SIFS metadata-shard layout expected namespace prepare codec {} on every lane, but observed {mismatch}",
-            namespace_prepare_codec_label(expected),
-        )));
-    }
-
     Ok(SinomoTestOutcome::passed(format!(
         "resolved {} live SIFS metadata-shard performance lanes from node {node}",
         layouts.len()
     )))
-}
-
-fn optional_namespace_prepare_codec_parameter(
-    ctx: &SinomoTestContext,
-    key: &str,
-) -> Result<Option<DfsMetadataNamespacePrepareCodec>, SinomoTestError> {
-    match ctx.parameter(key) {
-        Some(raw) => match raw.trim() {
-            "legacy" => Ok(Some(DfsMetadataNamespacePrepareCodec::Legacy)),
-            "packed-v1" => Ok(Some(DfsMetadataNamespacePrepareCodec::PackedV1)),
-            "packed-v2" => Ok(Some(DfsMetadataNamespacePrepareCodec::PackedV2)),
-            "packed-v3" => Ok(Some(DfsMetadataNamespacePrepareCodec::PackedV3)),
-            "packed-v6" => Ok(Some(DfsMetadataNamespacePrepareCodec::PackedV6)),
-            other => Err(SinomoTestError::InvalidParameter {
-                name: key.to_string(),
-                detail: format!(
-                    "expected `legacy`, `packed-v1`, `packed-v2`, `packed-v3`, or `packed-v6`, got `{other}`"
-                ),
-            }),
-        },
-        None => Ok(None),
-    }
-}
-
-fn namespace_prepare_codec_label(codec: DfsMetadataNamespacePrepareCodec) -> &'static str {
-    match codec {
-        DfsMetadataNamespacePrepareCodec::Legacy => "legacy",
-        DfsMetadataNamespacePrepareCodec::PackedV1 => "packed-v1",
-        DfsMetadataNamespacePrepareCodec::PackedV2 => "packed-v2",
-        DfsMetadataNamespacePrepareCodec::PackedV3 => "packed-v3",
-        DfsMetadataNamespacePrepareCodec::LegacyPackedV4 => "packed-v4",
-        DfsMetadataNamespacePrepareCodec::LegacyPackedV5 => "packed-v5",
-        DfsMetadataNamespacePrepareCodec::PackedV6 => "packed-v6",
-    }
-}
-
-fn namespace_prepare_codec_mismatch_detail(
-    layouts: &[DfsShardLayoutProbe],
-    expected: DfsMetadataNamespacePrepareCodec,
-) -> Option<String> {
-    let mismatches = layouts
-        .iter()
-        .filter(|layout| layout.namespace_prepare_codec != expected)
-        .map(|layout| {
-            format!(
-                "{}={} ({})",
-                layout.lane,
-                namespace_prepare_codec_label(layout.namespace_prepare_codec),
-                layout.shard_id
-            )
-        })
-        .collect::<Vec<_>>();
-    (!mismatches.is_empty()).then(|| mismatches.join(", "))
 }
 
 fn remote_shard_write_probe_prefix(shard_id: &str, run_id: &str) -> Option<String> {
@@ -2017,7 +1923,6 @@ fn dfs_status_probe_summary(
         ("file_systems", status.file_system_count as u64),
         ("objects", status.object_count as u64),
         ("pending_writes", status.pending_write_count as u64),
-        ("open_conflicts", status.open_conflict_count as u64),
         ("pending_repairs", active_pending_repairs as u64),
         ("total_pending_repairs", status.pending_repair_count as u64),
         (
@@ -2513,7 +2418,6 @@ fn dfs_service_advertisement_summary(
 
 fn routed_status_dirty_summaries(
     statuses: &BTreeMap<String, BTreeMap<&'static str, u64>>,
-    max_remote_open_conflicts: usize,
     max_remote_pending_writes: usize,
     max_remote_pending_repairs: usize,
 ) -> Vec<String> {
@@ -2522,11 +2426,9 @@ fn routed_status_dirty_summaries(
         .filter_map(|(target, status)| {
             let incomplete_reasons = *status.get("incomplete_reasons").unwrap_or(&0);
             let bounded_omissions = *status.get("bounded_omissions").unwrap_or(&0);
-            let open_conflicts = *status.get("open_conflicts").unwrap_or(&0);
             let pending_writes = *status.get("pending_writes").unwrap_or(&0);
             let pending_repairs = *status.get("pending_repairs").unwrap_or(&0);
             if incomplete_reasons > 0
-                || open_conflicts > max_remote_open_conflicts as u64
                 || pending_writes > max_remote_pending_writes as u64
                 || pending_repairs > max_remote_pending_repairs as u64
             {
@@ -2539,7 +2441,7 @@ fn routed_status_dirty_summaries(
                     .copied()
                     .unwrap_or(0);
                 Some(format!(
-                    "{target}: incomplete_reasons={incomplete_reasons}, bounded_omissions={bounded_omissions}, open_conflicts={open_conflicts}, pending_writes={pending_writes}, pending_repairs={pending_repairs}, total_pending_repairs={total_pending_repairs}, unavailable_pending_repairs={unavailable_pending_repairs}"
+                    "{target}: incomplete_reasons={incomplete_reasons}, bounded_omissions={bounded_omissions}, pending_writes={pending_writes}, pending_repairs={pending_repairs}, total_pending_repairs={total_pending_repairs}, unavailable_pending_repairs={unavailable_pending_repairs}"
                 ))
             } else {
                 None
@@ -3123,239 +3025,6 @@ fn run_content_version_gc(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     )))
 }
 
-fn run_metadata_history_gc(ctx: &mut SinomoTestContext) -> SinomoTestResult {
-    let overwrite_count =
-        optional_usize_parameter(ctx, "overwrites", DEFAULT_METADATA_HISTORY_GC_OVERWRITES)?;
-    let namespace_request_count = optional_usize_parameter(
-        ctx,
-        "namespace-requests",
-        DEFAULT_METADATA_HISTORY_GC_NAMESPACE_REQUESTS,
-    )?;
-    let content_batch_size = optional_usize_parameter(
-        ctx,
-        "content-batch",
-        DEFAULT_METADATA_HISTORY_GC_CONTENT_BATCH,
-    )?;
-    let gc_batch_size =
-        optional_u64_parameter(ctx, "gc-batch")?.unwrap_or(DEFAULT_METADATA_HISTORY_GC_BATCH);
-    let max_total_ms = optional_u64_parameter(ctx, "max-total-ms")?
-        .unwrap_or(DEFAULT_METADATA_HISTORY_GC_MAX_TOTAL_MS);
-    let max_restart_ms = optional_u64_parameter(ctx, "max-restart-ms")?
-        .unwrap_or(DEFAULT_METADATA_HISTORY_GC_MAX_RESTART_MS);
-    require_runtime_probe_count("overwrites", overwrite_count, 2)?;
-    require_runtime_probe_count("namespace-requests", namespace_request_count, 0)?;
-    require_runtime_probe_count("content-batch", content_batch_size, 1)?;
-    if gc_batch_size == 0 || gc_batch_size > MAX_DFS_STORAGE_RUNTIME_PROBE_ITEMS as u64 {
-        return Err(SinomoTestError::InvalidParameter {
-            name: "gc-batch".to_string(),
-            detail: format!(
-                "must be between 1 and {MAX_DFS_STORAGE_RUNTIME_PROBE_ITEMS}, got {gc_batch_size}"
-            ),
-        });
-    }
-
-    let root = ScopedDfsRuntimeProbeRoot::create(ctx, "metadata-history-gc")?;
-    let report = dfs::run_metadata_history_gc_runtime_probe(
-        root.path(),
-        dfs::DfsMetadataHistoryGcRuntimeProbeOptions {
-            overwrite_count,
-            namespace_request_count,
-            content_batch_size,
-            gc_batch_size,
-        },
-    )
-    .map_err(|error| {
-        SinomoTestError::failed(format!("metadata-history GC runtime probe failed: {error}"))
-    })?;
-
-    ctx.record("root", root.path().display().to_string());
-    ctx.record("performance", &report);
-    ctx.record("max_total_ms", max_total_ms);
-    ctx.record("max_restart_ms", max_restart_ms);
-    for (name, value, unit) in [
-        (
-            "overwrites",
-            report.overwrite_count,
-            SinomoTestMetricUnit::Count,
-        ),
-        (
-            "namespace_requests",
-            report.namespace_request_count,
-            SinomoTestMetricUnit::Count,
-        ),
-        (
-            "metadata_gc_passes",
-            report.metadata_gc_passes,
-            SinomoTestMetricUnit::Count,
-        ),
-        (
-            "orphan_gc_passes",
-            report.orphan_gc_passes,
-            SinomoTestMetricUnit::Count,
-        ),
-        (
-            "deleted_orphan_count",
-            report.deleted_orphan_count,
-            SinomoTestMetricUnit::Count,
-        ),
-        (
-            "content_write_elapsed_ms",
-            report.content_write_elapsed_ms,
-            SinomoTestMetricUnit::Milliseconds,
-        ),
-        (
-            "reservation_release_elapsed_ms",
-            report.reservation_release_elapsed_ms,
-            SinomoTestMetricUnit::Milliseconds,
-        ),
-        (
-            "metadata_write_elapsed_ms",
-            report.metadata_write_elapsed_ms,
-            SinomoTestMetricUnit::Milliseconds,
-        ),
-        (
-            "metadata_gc_elapsed_ms",
-            report.metadata_gc_elapsed_ms,
-            SinomoTestMetricUnit::Milliseconds,
-        ),
-        (
-            "content_gc_elapsed_ms",
-            report.content_gc_elapsed_ms,
-            SinomoTestMetricUnit::Milliseconds,
-        ),
-        (
-            "restart_elapsed_ms",
-            report.restart_elapsed_ms,
-            SinomoTestMetricUnit::Milliseconds,
-        ),
-        (
-            "total_elapsed_ms",
-            report.total_elapsed_ms,
-            SinomoTestMetricUnit::Milliseconds,
-        ),
-        (
-            "retained_metadata_records",
-            report.retained_metadata_record_count,
-            SinomoTestMetricUnit::Count,
-        ),
-        (
-            "retained_metadata_bytes",
-            report.retained_metadata_bytes,
-            SinomoTestMetricUnit::Bytes,
-        ),
-        (
-            "journal_bytes_after",
-            report.journal_bytes_after,
-            SinomoTestMetricUnit::Bytes,
-        ),
-        (
-            "snapshot_bytes_after",
-            report.snapshot_bytes_after,
-            SinomoTestMetricUnit::Bytes,
-        ),
-        (
-            "content_bytes_after",
-            report.content_bytes_after,
-            SinomoTestMetricUnit::Bytes,
-        ),
-    ] {
-        record_u64_metric(ctx, name, value, unit);
-    }
-
-    if max_total_ms > 0 && report.total_elapsed_ms > max_total_ms {
-        return Ok(SinomoTestOutcome::failed(format!(
-            "metadata-history GC runtime probe took {}ms, above allowed {max_total_ms}ms",
-            report.total_elapsed_ms
-        )));
-    }
-    if max_restart_ms > 0 && report.restart_elapsed_ms > max_restart_ms {
-        return Ok(SinomoTestOutcome::failed(format!(
-            "metadata-history GC restart took {}ms, above allowed {max_restart_ms}ms",
-            report.restart_elapsed_ms
-        )));
-    }
-    Ok(SinomoTestOutcome::passed(format!(
-        "metadata-history GC bounded {} overwrites to {} retained records and {} retained manifests; restart {}ms",
-        report.overwrite_count,
-        report.retained_metadata_record_count,
-        report.retained_manifest_count,
-        report.restart_elapsed_ms
-    )))
-}
-
-fn run_metadata_hydration(ctx: &mut SinomoTestContext) -> SinomoTestResult {
-    let object_count =
-        optional_usize_parameter(ctx, "objects", DEFAULT_METADATA_HYDRATION_OBJECTS)?;
-    let require_page_boundary = optional_bool_parameter(ctx, "require-page-boundary", true)?;
-    let max_total_ms = optional_u64_parameter(ctx, "max-total-ms")?
-        .unwrap_or(DEFAULT_METADATA_HYDRATION_MAX_TOTAL_MS);
-    let max_hydration_ms = optional_u64_parameter(ctx, "max-hydration-ms")?
-        .unwrap_or(DEFAULT_METADATA_HYDRATION_MAX_HYDRATE_MS);
-    require_runtime_probe_count("objects", object_count, 1)?;
-
-    let root = ScopedDfsRuntimeProbeRoot::create(ctx, "metadata-hydration")?;
-    let report = dfs::run_metadata_hydration_runtime_probe(
-        root.path(),
-        dfs::DfsMetadataHydrationRuntimeProbeOptions { object_count },
-    )
-    .map_err(|error| {
-        SinomoTestError::failed(format!("metadata hydration runtime probe failed: {error}"))
-    })?;
-
-    ctx.record("root", root.path().display().to_string());
-    ctx.record("performance", &report);
-    ctx.record("require_page_boundary", require_page_boundary);
-    ctx.record("max_total_ms", max_total_ms);
-    ctx.record("max_hydration_ms", max_hydration_ms);
-    record_u64_metric(
-        ctx,
-        "objects",
-        report.object_count,
-        SinomoTestMetricUnit::Count,
-    );
-    record_u64_metric(
-        ctx,
-        "write_elapsed_ms",
-        report.write_elapsed_ms,
-        SinomoTestMetricUnit::Milliseconds,
-    );
-    record_u64_metric(
-        ctx,
-        "hydration_elapsed_ms",
-        report.hydration_elapsed_ms,
-        SinomoTestMetricUnit::Milliseconds,
-    );
-    record_u64_metric(
-        ctx,
-        "total_elapsed_ms",
-        report.total_elapsed_ms,
-        SinomoTestMetricUnit::Milliseconds,
-    );
-
-    if require_page_boundary && !report.crossed_page_boundary {
-        return Ok(SinomoTestOutcome::failed(format!(
-            "metadata hydration used {} objects and did not cross the {}-object page boundary",
-            report.object_count, report.page_size
-        )));
-    }
-    if max_total_ms > 0 && report.total_elapsed_ms > max_total_ms {
-        return Ok(SinomoTestOutcome::failed(format!(
-            "metadata hydration runtime probe took {}ms, above allowed {max_total_ms}ms",
-            report.total_elapsed_ms
-        )));
-    }
-    if max_hydration_ms > 0 && report.hydration_elapsed_ms > max_hydration_ms {
-        return Ok(SinomoTestOutcome::failed(format!(
-            "metadata hydration took {}ms, above allowed {max_hydration_ms}ms",
-            report.hydration_elapsed_ms
-        )));
-    }
-    Ok(SinomoTestOutcome::passed(format!(
-        "metadata hydration restored {} objects across page size {} in {}ms",
-        report.object_count, report.page_size, report.hydration_elapsed_ms
-    )))
-}
-
 fn require_runtime_probe_count(
     name: &str,
     value: usize,
@@ -3417,12 +3086,7 @@ fn run_invariants(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             .map_err(SinomoTestError::failed)?;
         let metrics = snapshot.metrics;
         let mut violations = Vec::new();
-        if metrics.open_conflict_count != 0 {
-            violations.push(format!(
-                "open_conflict_count={}",
-                metrics.open_conflict_count
-            ));
-        }
+
         if metrics.cross_shard_namespace_lock_count != 0 {
             violations.push(format!(
                 "cross_shard_namespace_lock_count={}",
@@ -7175,103 +6839,6 @@ mod tests {
         );
     }
 
-    fn shard_layout_probe(
-        lane: &'static str,
-        codec: DfsMetadataNamespacePrepareCodec,
-    ) -> DfsShardLayoutProbe {
-        DfsShardLayoutProbe {
-            lane,
-            base_prefix: "/cluster-tests/dfs-perf",
-            shard_id: lane.to_string(),
-            file_system_id: SIFS_FILE_SYSTEM_ID.to_string(),
-            primary_node_id: "node-primary".to_string(),
-            replica_node_ids: vec!["node-replica".to_string()],
-            epoch: 7,
-            namespace_prepare_codec: codec,
-        }
-    }
-
-    #[test]
-    fn shard_layout_expected_namespace_prepare_codec_accepts_known_values_and_rejects_unknown() {
-        let omitted = SinomoTestContext::new("unused");
-        assert_eq!(
-            optional_namespace_prepare_codec_parameter(
-                &omitted,
-                "expected-namespace-prepare-codec"
-            )
-            .expect("omitted codec expectation"),
-            None
-        );
-
-        for (raw, expected) in [
-            ("legacy", DfsMetadataNamespacePrepareCodec::Legacy),
-            ("packed-v1", DfsMetadataNamespacePrepareCodec::PackedV1),
-            ("packed-v2", DfsMetadataNamespacePrepareCodec::PackedV2),
-            ("packed-v3", DfsMetadataNamespacePrepareCodec::PackedV3),
-            ("packed-v6", DfsMetadataNamespacePrepareCodec::PackedV6),
-        ] {
-            assert_eq!(namespace_prepare_codec_label(expected), raw);
-            let ctx = SinomoTestContext::new("unused")
-                .with_parameter("expected-namespace-prepare-codec", raw);
-            assert_eq!(
-                optional_namespace_prepare_codec_parameter(
-                    &ctx,
-                    "expected-namespace-prepare-codec"
-                )
-                .expect("known codec expectation"),
-                Some(expected)
-            );
-        }
-
-        for raw in ["packed-v4", "packed-v5", "packed-v7"] {
-            let invalid = SinomoTestContext::new("unused")
-                .with_parameter("expected-namespace-prepare-codec", raw);
-            assert!(matches!(
-                optional_namespace_prepare_codec_parameter(
-                    &invalid,
-                    "expected-namespace-prepare-codec"
-                ),
-                Err(SinomoTestError::InvalidParameter { ref name, ref detail })
-                    if name == "expected-namespace-prepare-codec"
-                        && detail.contains("legacy")
-                        && detail.contains("packed-v1")
-                        && detail.contains("packed-v2")
-                        && detail.contains("packed-v3")
-                        && detail.contains("packed-v6")
-            ));
-        }
-    }
-
-    #[test]
-    fn shard_layout_serializes_codec_and_reports_lane_mismatches() {
-        let legacy = shard_layout_probe("root", DfsMetadataNamespacePrepareCodec::Legacy);
-        let packed = shard_layout_probe("services", DfsMetadataNamespacePrepareCodec::PackedV1);
-        assert_eq!(
-            serde_json::to_value(&packed)
-                .expect("serialize shard layout")
-                .get("namespace_prepare_codec"),
-            Some(&serde_json::Value::String("packed-v1".to_string()))
-        );
-        assert_eq!(
-            namespace_prepare_codec_mismatch_detail(
-                &[legacy, packed],
-                DfsMetadataNamespacePrepareCodec::PackedV1,
-            )
-            .as_deref(),
-            Some("root=legacy (root)")
-        );
-        assert_eq!(
-            namespace_prepare_codec_mismatch_detail(
-                &[shard_layout_probe(
-                    "users",
-                    DfsMetadataNamespacePrepareCodec::PackedV1,
-                )],
-                DfsMetadataNamespacePrepareCodec::PackedV1,
-            ),
-            None
-        );
-    }
-
     #[test]
     fn bulk_write_syscw_affine_budget_accepts_boundary_and_rejects_excess() {
         let files = 64;
@@ -7736,6 +7303,9 @@ mod tests {
         missing_replica_node_id: NodeId,
     ) -> dfs::DfsRepairAttemptRecord {
         dfs::DfsRepairAttemptRecord {
+            transfer_delivery_state: None,
+            completed_transfer_request_id: None,
+            transfer_kind: None,
             intent_id: intent_id.to_string(),
             object_id: DfsObjectId::from_legacy_named(format!("object_{intent_id}"))
                 .expect("object id"),
@@ -8102,7 +7672,7 @@ mod tests {
             receipt_count: 4,
             intent_count: 5,
             pending_write_count: 0,
-            open_conflict_count: 0,
+
             pending_repair_count: 2,
             repair_attempt_count: 2,
             pending_namespace_job_count: 0,
@@ -8145,7 +7715,7 @@ mod tests {
             receipt_count: 4,
             intent_count: 5,
             pending_write_count: 0,
-            open_conflict_count: 0,
+
             pending_repair_count: 1,
             repair_attempt_count: 0,
             pending_namespace_job_count: 0,
@@ -8177,7 +7747,7 @@ mod tests {
             receipt_count: 0,
             intent_count: 0,
             pending_write_count: 0,
-            open_conflict_count: 0,
+
             pending_repair_count: 0,
             repair_attempt_count: 0,
             pending_namespace_job_count: 0,
@@ -8192,7 +7762,7 @@ mod tests {
         assert_eq!(summary.get("incomplete_reasons"), Some(&1));
         assert_eq!(summary.get("bounded_omissions"), Some(&0));
         let statuses = BTreeMap::from([("remote-node".to_string(), summary)]);
-        let dirty = routed_status_dirty_summaries(&statuses, usize::MAX, usize::MAX, usize::MAX);
+        let dirty = routed_status_dirty_summaries(&statuses, usize::MAX, usize::MAX);
         assert_eq!(dirty.len(), 1);
         assert!(dirty[0].contains("remote-node: incomplete_reasons=1"));
 
@@ -8203,13 +7773,7 @@ mod tests {
         assert_eq!(unobserved_summary.get("incomplete_reasons"), Some(&1));
         let unobserved_statuses = BTreeMap::from([("remote-node".to_string(), unobserved_summary)]);
         assert_eq!(
-            routed_status_dirty_summaries(
-                &unobserved_statuses,
-                usize::MAX,
-                usize::MAX,
-                usize::MAX,
-            )
-            .len(),
+            routed_status_dirty_summaries(&unobserved_statuses, usize::MAX, usize::MAX,).len(),
             1,
             "old or bounded remote status must not report a false clean lock count"
         );
@@ -8219,8 +7783,7 @@ mod tests {
         assert_eq!(complete_summary.get("incomplete_reasons"), Some(&0));
         let complete_statuses = BTreeMap::from([("remote-node".to_string(), complete_summary)]);
         assert!(
-            routed_status_dirty_summaries(&complete_statuses, usize::MAX, usize::MAX, usize::MAX,)
-                .is_empty()
+            routed_status_dirty_summaries(&complete_statuses, usize::MAX, usize::MAX,).is_empty()
         );
     }
 
@@ -8237,7 +7800,7 @@ mod tests {
             receipt_count: 0,
             intent_count: 0,
             pending_write_count: 0,
-            open_conflict_count: 0,
+
             pending_repair_count: 0,
             repair_attempt_count: 0,
             pending_namespace_job_count: 0,
@@ -8256,7 +7819,7 @@ mod tests {
         assert_eq!(summary.get("bounded_omissions"), Some(&1));
         let statuses = BTreeMap::from([("remote-node".to_string(), summary)]);
         assert!(
-            routed_status_dirty_summaries(&statuses, 0, 0, 0).is_empty(),
+            routed_status_dirty_summaries(&statuses, 0, 0).is_empty(),
             "a typed bounded omission is not itself observed debt"
         );
 
@@ -8264,13 +7827,13 @@ mod tests {
         assert!(completeness.blocking_incomplete_reasons.is_empty());
         assert_eq!(completeness.bounded_omissions, vec![legacy_reason]);
 
-        status.open_conflict_count = 1;
+        status.pending_write_count = 1;
         let debt_summary = dfs_status_probe_summary(&status, &[], &unavailable_repair_targets);
         let debt_statuses = BTreeMap::from([("remote-node".to_string(), debt_summary)]);
         assert_eq!(
-            routed_status_dirty_summaries(&debt_statuses, 0, 0, 0).len(),
+            routed_status_dirty_summaries(&debt_statuses, 0, 0).len(),
             1,
-            "nonzero observed conflict debt must still fail beside an omission"
+            "observed pending writes must still fail beside an omission"
         );
 
         status

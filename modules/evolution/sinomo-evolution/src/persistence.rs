@@ -33,7 +33,7 @@ use sinomo_runtime::dfs::{
     DfsNodeTransport, DfsObjectRpcSendOptions, DfsPeerTransport, DfsPeerTransportError,
     DfsPeerTransportFuture, DfsWriteOptions, LocalContentStore, NetworkedDfsService,
     default_dfs_metadata_root, default_dfs_metadata_shards_root,
-    discovered_cluster_dfs_peer_node_ids, fallback_dfs_node_id, metadata_shards_prefix,
+    discovered_cluster_dfs_peer_node_ids, metadata_shards_prefix,
     open_local_sharded_metadata_backend, open_root_local_metadata_backend,
     publish_cluster_dfs_metadata_journal_with_peer_transport, sifs_file_system_id,
 };
@@ -3601,7 +3601,10 @@ fn open_evolution_sifs_service(
             })?;
         (state.local_node_id, peer_node_ids)
     } else {
-        (fallback_dfs_node_id(), Vec::new())
+        return Err(EvolutionPersistenceError::Sifs {
+            path: cluster_paths.state.display().to_string(),
+            detail: "SIFS requires an initialized node".into(),
+        });
     };
     let content = LocalContentStore::new(data_dir.dfs_dir().join("content")).map_err(|source| {
         EvolutionPersistenceError::Sifs {

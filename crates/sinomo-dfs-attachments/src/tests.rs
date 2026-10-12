@@ -1,6 +1,6 @@
 use super::*;
 use sinomo_core::kv::{KvEntry, KvError, KvRevision, KvTxn, KvTxnResponse};
-use sinomo_core::network::{InProcessNetwork, InProcessTransport};
+
 use sinomo_core::node::NodeId;
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -10,18 +10,17 @@ fn temp_root(name: &str) -> sinomo_testdir::TestDir {
     sinomo_testdir::TestDir::new(&format!("sinomo-dfs-attachments-{name}"))
 }
 
-fn networked_sifs_with_backend(
-    root: &Path,
-    node_id: NodeId,
-) -> NetworkedDfsService<InProcessTransport> {
-    let network = InProcessNetwork::new();
-    let content = LocalContentStore::new(root.join("content")).expect("content");
-    let metadata = open_root_local_metadata_backend(root.join("metadata")).expect("metadata");
-    let mut dfs = NetworkedDfsService::new(network.add_node(node_id), content)
-        .with_metadata_backend(metadata)
-        .expect("metadata backend");
-    dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
-    dfs
+fn native_attachment_service(
+    name: &str,
+    node: NodeId,
+) -> (
+    sinomo_dfs::test_support::DfsTestRuntime,
+    NetworkedDfsService<sinomo_dfs::DfsNodeTransport>,
+) {
+    let mut runtime = sinomo_dfs::test_support::DfsTestRuntime::new(name, node.clone()).unwrap();
+    runtime.start_nodes().unwrap();
+    let service = runtime.client(&node).unwrap();
+    (runtime, service)
 }
 
 fn options(node: &NodeId) -> DfsWriteOptions {
@@ -96,7 +95,8 @@ fn attachment_density_benchmark() {
     assert!(files > 0 && kinds > 0 && size <= DFS_ATTACHMENT_MAX_PAYLOAD_BYTES);
     let root = temp_root("attachment-density-benchmark");
     let node = NodeId::from_legacy_named("attachment-density-benchmark").unwrap();
-    let mut dfs = networked_sifs_with_backend(&root, node.clone());
+    let (mut runtime, mut dfs) =
+        native_attachment_service("attachment_density_benchmark", node.clone());
     let mut sources = Vec::new();
     for i in 0..files {
         sources.push(source(
@@ -104,7 +104,7 @@ fn attachment_density_benchmark() {
                 .unwrap(),
         ));
     }
-    let before_bytes = disk_bytes(&root);
+    let before_bytes = disk_bytes(&runtime.data_dir(&node).dfs_dir());
     let started = Instant::now();
     let mut write_micros = Vec::new();
     for (i, source) in sources.iter().enumerate() {
@@ -163,7 +163,7 @@ fn attachment_density_benchmark() {
         } else {
             0
         };
-    let after_bytes = disk_bytes(&root);
+    let after_bytes = disk_bytes(&runtime.data_dir(&node).dfs_dir());
     let object_count = dfs
         .metadata_backend()
         .unwrap()
@@ -172,7 +172,9 @@ fn attachment_density_benchmark() {
         .object_count;
     drop(dfs);
     let opened = Instant::now();
-    let mut dfs = networked_sifs_with_backend(&root, node);
+    runtime.stop_node(&node).unwrap();
+    runtime.reopen_node(node.clone()).unwrap();
+    let mut dfs = runtime.client(&node).unwrap();
     dfs.file_attachment(
         DfsAttachmentRequest::Get {
             source: sources[0].clone(),
@@ -197,13 +199,18 @@ fn attachment_density_benchmark() {
     let output = std::env::var("SINOMO_ATTACHMENT_BENCH_OUTPUT").expect("benchmark output path");
     std::fs::write(output, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
     eprintln!("{report}");
+    drop(dfs);
+    runtime.close().unwrap();
 }
 
 #[test]
 fn attachments_persist_ranges_cas_and_source_fences() {
     let root = temp_root("attachments");
     let node = NodeId::from_legacy_named("attachments-node").unwrap();
-    let mut dfs = networked_sifs_with_backend(&root, node.clone());
+    let (mut runtime, mut dfs) = native_attachment_service(
+        "attachments_persist_ranges_cas_and_source_fences",
+        node.clone(),
+    );
     let stat = dfs
         .posix_write_file("/users/source", b"original", options(&node))
         .unwrap();
@@ -230,7 +237,9 @@ fn attachments_persist_ranges_cas_and_source_fences() {
         stat.version
     );
     drop(dfs);
-    let mut dfs = networked_sifs_with_backend(&root, node.clone());
+    runtime.stop_node(&node).unwrap();
+    runtime.reopen_node(node.clone()).unwrap();
+    let mut dfs = runtime.client(&node).unwrap();
     let get = dfs
         .file_attachment(
             DfsAttachmentRequest::Get {
@@ -337,13 +346,18 @@ fn attachments_persist_ranges_cas_and_source_fences() {
         )
         .is_err()
     );
+    drop(dfs);
+    runtime.close().unwrap();
 }
 
 #[test]
 fn attachment_pages_follow_identity_without_full_directory_collection() {
     let root = temp_root("attachment-pages");
     let node = NodeId::from_legacy_named("attachment-pages-node").unwrap();
-    let mut dfs = networked_sifs_with_backend(&root, node.clone());
+    let (mut runtime, mut dfs) = native_attachment_service(
+        "attachment_pages_follow_identity_without_full_directory_collection",
+        node.clone(),
+    );
     let stat = dfs
         .posix_write_file("/users/source", b"source", options(&node))
         .unwrap();
@@ -361,20 +375,14 @@ fn attachment_pages_follow_identity_without_full_directory_collection() {
         )
         .unwrap();
     }
-    // Populate a large unrelated namespace directly as a test fixture. The
-    // queried file has only 17 attachments regardless of global object count.
-    let template = dfs
-        .metadata_backend()
-        .unwrap()
-        .get_object(&stat.object_id)
-        .unwrap()
-        .unwrap();
-    dfs.add_object_metadata_batch((0..10_000).map(|i| {
-        let mut object = template.clone();
-        object.object_id = DfsObjectId::from_legacy_named(&format!("unrelated-{i}")).unwrap();
-        object.path = format!("users/unrelated-{i}");
-        object
-    }))
+    // Populate unrelated objects through the normal batched write path. The
+    // queried source still has only 17 attachments across this larger namespace.
+    let unrelated = (0..10_000)
+        .map(|i| format!("/users/unrelated-{i}"))
+        .collect::<Vec<_>>();
+    dfs.posix_write_files_local_eventual_with_known_parents(
+        unrelated.iter().map(|path| (path.as_str(), b"".as_slice())),
+    )
     .unwrap();
     dfs.posix_rename(&source.path, "/users/renamed").unwrap();
     source.path = "/users/renamed".into();
@@ -425,6 +433,8 @@ fn attachment_pages_follow_identity_without_full_directory_collection() {
         )
         .is_err()
     );
+    drop(dfs);
+    runtime.close().unwrap();
 }
 
 #[test]
@@ -470,7 +480,10 @@ fn attachment_builtin_validation_and_custom_schema_roundtrip() {
 fn attachments_compact_batch_and_enforce_producer_ownership() {
     let root = temp_root("attachment-producers");
     let node = NodeId::from_legacy_named("attachment-producers").unwrap();
-    let mut dfs = networked_sifs_with_backend(&root, node.clone());
+    let (mut runtime, mut dfs) = native_attachment_service(
+        "attachments_compact_batch_and_enforce_producer_ownership",
+        node.clone(),
+    );
     let stat = dfs
         .posix_write_file("/users/source", b"source", options(&node))
         .unwrap();
@@ -563,13 +576,18 @@ fn attachments_compact_batch_and_enforce_producer_ownership() {
     );
     dfs.file_attachment_as("component:two", extra, Some(options(&node)))
         .unwrap();
+    drop(dfs);
+    runtime.close().unwrap();
 }
 
 #[test]
 fn attachments_cleanup_preserves_live_payloads_and_pinned_sources() {
     let root = temp_root("attachment-cleanup");
     let node = NodeId::from_legacy_named("attachment-cleanup").unwrap();
-    let mut dfs = networked_sifs_with_backend(&root, node.clone());
+    let (mut runtime, mut dfs) = native_attachment_service(
+        "attachments_cleanup_preserves_live_payloads_and_pinned_sources",
+        node.clone(),
+    );
     for pinned in [false, true] {
         let stat = dfs
             .posix_write_file(
@@ -605,7 +623,6 @@ fn attachments_cleanup_preserves_live_payloads_and_pinned_sources() {
         );
         if pinned {
             dfs.retain_content_revision(DfsContentReferenceRequest {
-                wire_format: DfsContentReferenceFormat::NamespacedV6,
                 namespace: "org.example.attachment-retention".into(),
                 path: source.path.clone(),
                 identity: DfsFileVersionIdentity {
@@ -634,13 +651,18 @@ fn attachments_cleanup_preserves_live_payloads_and_pinned_sources() {
             assert!(dfs.posix_stat_distributed(&directory).is_err());
         }
     }
+    drop(dfs);
+    runtime.close().unwrap();
 }
 
 #[test]
 fn attachment_cleanup_parks_until_committed_namespace_notification() {
     let root = temp_root("attachment-cleanup-missed-notification");
     let node = NodeId::from_legacy_named("attachment-cleanup-missed-notification").unwrap();
-    let mut dfs = networked_sifs_with_backend(&root, node.clone());
+    let (mut runtime, mut dfs) = native_attachment_service(
+        "attachment_cleanup_parks_until_committed_namespace_notification",
+        node.clone(),
+    );
     let stat = dfs
         .posix_write_file("/users/source", b"source", options(&node))
         .unwrap();
@@ -656,7 +678,8 @@ fn attachment_cleanup_parks_until_committed_namespace_notification() {
         Some(options(&node)),
     )
     .unwrap();
-    let data_dir = sinomo_core::local::SinomoDataDir::new(&root);
+    let data_dir = runtime.data_dir(&node).clone();
+    let shards = runtime.metadata_shards().unwrap();
     let checkpoint = crate::attachment_maintenance::checkpoint_path(&data_dir);
     let catalog = format!("{}/catalog.sobj", dfs_attachment_catalog_directory(&source));
     let start = crate::dfs_now_unix_nanos();
@@ -664,14 +687,14 @@ fn attachment_cleanup_parks_until_committed_namespace_notification() {
     for step in 0..4 {
         dfs.maintain_file_attachments_bounded_at(
             &checkpoint,
-            &[],
+            &shards,
             8,
             start + step * 30_000_000_000,
         )
         .unwrap();
     }
     let before = std::fs::read(&checkpoint).unwrap();
-    dfs.maintain_file_attachments_bounded_at(&checkpoint, &[], 8, start + 120_000_000_000)
+    dfs.maintain_file_attachments_bounded_at(&checkpoint, &shards, 8, start + 120_000_000_000)
         .unwrap();
     assert_eq!(
         std::fs::read(&checkpoint).unwrap(),
@@ -685,26 +708,31 @@ fn attachment_cleanup_parks_until_committed_namespace_notification() {
         crate::attachment_maintenance::deadline(&data_dir).unwrap(),
         None
     );
-    let mut writer = networked_sifs_with_backend(&root, node);
+    let mut writer = runtime.client(&node).unwrap();
     let tracker = crate::DfsCommittedWorkTracker::new();
     writer.set_committed_work_tracker(tracker.clone());
     writer.posix_unlink(&source.path).unwrap();
     drop(writer); // The committed edge outlives the response and service owner.
     assert!(tracker.take().semantic_changes);
     crate::attachment_maintenance::notify(&data_dir);
-    dfs.maintain_file_attachments_bounded_at(&checkpoint, &[], 8, start + 150_000_000_000)
+    dfs.maintain_file_attachments_bounded_at(&checkpoint, &shards, 8, start + 150_000_000_000)
         .unwrap();
     assert!(matches!(
         dfs.posix_stat_distributed(&catalog),
         Err(DfsPosixError::NotFound { .. })
     ));
+    drop(dfs);
+    runtime.close().unwrap();
 }
 
 #[test]
 fn attachments_stream_validation_rejects_bad_lengths_and_transcripts() {
     let root = temp_root("attachment-stream-validation");
     let node = NodeId::from_legacy_named("attachment-stream-validation").unwrap();
-    let mut dfs = networked_sifs_with_backend(&root, node.clone());
+    let (mut runtime, mut dfs) = native_attachment_service(
+        "attachments_stream_validation_rejects_bad_lengths_and_transcripts",
+        node.clone(),
+    );
     let stat = dfs
         .posix_write_file("/users/source", b"source", options(&node))
         .unwrap();
@@ -744,13 +772,18 @@ fn attachments_stream_validation_rejects_bad_lengths_and_transcripts() {
         )
         .is_err()
     );
+    drop(dfs);
+    runtime.close().unwrap();
 }
 
 #[test]
 fn attachments_generation_claims_deduplicate_and_fence_publication() {
     let root = temp_root("attachment-generation");
     let node = NodeId::from_legacy_named("attachment-generation").unwrap();
-    let mut dfs = networked_sifs_with_backend(&root, node.clone());
+    let (mut runtime, mut dfs) = native_attachment_service(
+        "attachments_generation_claims_deduplicate_and_fence_publication",
+        node.clone(),
+    );
     let stat = dfs
         .posix_write_file("/users/source", b"source", options(&node))
         .unwrap();
@@ -774,7 +807,9 @@ fn attachments_generation_claims_deduplicate_and_fence_publication() {
         DfsAttachmentResponse::Generation { granted: true, .. }
     ));
     drop(dfs);
-    let mut dfs = networked_sifs_with_backend(&root, node.clone());
+    runtime.stop_node(&node).unwrap();
+    runtime.reopen_node(node.clone()).unwrap();
+    let mut dfs = runtime.client(&node).unwrap();
     assert_eq!(
         dfs.file_attachment_as("component:one", claim.clone(), Some(options(&node)))
             .unwrap(),
@@ -903,13 +938,18 @@ fn attachments_generation_claims_deduplicate_and_fence_publication() {
         options(&node),
     )
     .unwrap();
+    drop(dfs);
+    runtime.close().unwrap();
 }
 
 #[test]
 fn small_attachment_spill_keeps_catalog_payload_bounded() {
     let root = temp_root("attachment-inline-budget");
     let node = NodeId::from_legacy_named("attachment-inline-budget").unwrap();
-    let mut dfs = networked_sifs_with_backend(&root, node.clone());
+    let (mut runtime, mut dfs) = native_attachment_service(
+        "small_attachment_spill_keeps_catalog_payload_bounded",
+        node.clone(),
+    );
     let stat = dfs
         .posix_write_file("/users/source", b"source", options(&node))
         .unwrap();
@@ -945,6 +985,8 @@ fn small_attachment_spill_keeps_catalog_payload_bounded() {
     assert!(
         matches!(dfs.file_attachment(DfsAttachmentRequest::Read { source, key: last.metadata.key, revision: last.revision, offset: 0, max_bytes: DFS_ATTACHMENT_MAX_RANGE_BYTES }, None).unwrap(), DfsAttachmentResponse::Data { bytes, eof: true } if bytes == vec![(inline_slots+2) as u8; DFS_ATTACHMENT_INLINE_BYTES])
     );
+    drop(dfs);
+    runtime.close().unwrap();
 }
 
 #[derive(Debug)]
@@ -976,7 +1018,10 @@ impl DfsControlPlaneKvClient for UnavailableControlPlane {
 fn unavailable_lifecycle_authority_defers_attachment_reclamation() {
     let root = temp_root("unavailable-lifecycle-authority");
     let node = NodeId::from_legacy_named("unavailable-lifecycle-authority").unwrap();
-    let mut dfs = networked_sifs_with_backend(&root, node.clone());
+    let (mut runtime, mut dfs) = native_attachment_service(
+        "unavailable_lifecycle_authority_defers_attachment_reclamation",
+        node.clone(),
+    );
     let stat = dfs
         .posix_write_file("/users/source", b"source", options(&node))
         .unwrap();
@@ -1002,7 +1047,9 @@ fn unavailable_lifecycle_authority_defers_attachment_reclamation() {
     let mut dfs = dfs.with_control_plane(UnavailableControlPlane);
     assert!(dfs.maintain_attachment_source(&source, None, 64).is_err());
     drop(dfs);
-    let mut dfs = networked_sifs_with_backend(&root, node);
+    runtime.stop_node(&node).unwrap();
+    runtime.reopen_node(node.clone()).unwrap();
+    let mut dfs = runtime.client(&node).unwrap();
     assert!(dfs.posix_stat_distributed(&catalog).is_ok());
     let after = dfs
         .posix_list_dir_beneath_no_links_distributed_page("/", &directory, None, 64)
@@ -1012,13 +1059,18 @@ fn unavailable_lifecycle_authority_defers_attachment_reclamation() {
         before.entries, after.entries,
         "missing authority cannot erase payloads or catalog generations"
     );
+    drop(dfs);
+    runtime.close().unwrap();
 }
 
 #[test]
 fn absent_object_identity_does_not_authorize_attachment_reclamation() {
     let root = temp_root("absent-lifecycle-identity");
     let node = NodeId::from_legacy_named("absent-lifecycle-identity").unwrap();
-    let mut dfs = networked_sifs_with_backend(&root, node);
+    let (mut runtime, mut dfs) = native_attachment_service(
+        "absent_object_identity_does_not_authorize_attachment_reclamation",
+        node.clone(),
+    );
     let unknown = DfsObjectId::from_legacy_named("absent-source-object").unwrap();
     let lifecycle = dfs
         .object_lifecycle(&sifs_file_system_id(), &unknown)
@@ -1028,19 +1080,23 @@ fn absent_object_identity_does_not_authorize_attachment_reclamation() {
         !lifecycle.reclaimable,
         "missing metadata is not source deletion evidence"
     );
+    drop(dfs);
+    runtime.close().unwrap();
 }
 
 #[test]
 fn last_generic_source_reference_release_wakes_catalog_cleanup_from_durable_feed() {
     let root = temp_root("last-reference-release");
     let node = NodeId::from_legacy_named("last-reference-release").unwrap();
-    let mut dfs = networked_sifs_with_backend(&root, node.clone());
+    let (mut runtime, mut dfs) = native_attachment_service(
+        "last_generic_source_reference_release_wakes_catalog_cleanup_from_durable_feed",
+        node.clone(),
+    );
     let stat = dfs
         .posix_write_file("/users/source", b"source", options(&node))
         .unwrap();
     let source = source(&stat);
     let reference = DfsContentReferenceRequest {
-        wire_format: DfsContentReferenceFormat::NamespacedV6,
         namespace: "org.example.attachment-retention".into(),
         path: source.path.clone(),
         identity: DfsRevisionReference {
@@ -1066,14 +1122,15 @@ fn last_generic_source_reference_release_wakes_catalog_cleanup_from_durable_feed
         Some(options(&node)),
     )
     .unwrap();
-    let data = sinomo_core::local::SinomoDataDir::new(&root);
+    let data = runtime.data_dir(&node).clone();
+    let shards = runtime.metadata_shards().unwrap();
     let checkpoint = crate::attachment_maintenance::checkpoint_path(&data);
     let catalog = format!("{}/catalog.sobj", dfs_attachment_catalog_directory(&source));
     let start = crate::dfs_now_unix_nanos();
     for step in 0..4 {
         dfs.maintain_file_attachments_bounded_at(
             &checkpoint,
-            &[],
+            &shards,
             8,
             start + step * 30_000_000_000,
         )
@@ -1081,7 +1138,7 @@ fn last_generic_source_reference_release_wakes_catalog_cleanup_from_durable_feed
     }
     dfs.posix_unlink(&source.path).unwrap();
     crate::attachment_maintenance::notify(&data);
-    dfs.maintain_file_attachments_bounded_at(&checkpoint, &[], 8, start + 150_000_000_000)
+    dfs.maintain_file_attachments_bounded_at(&checkpoint, &shards, 8, start + 150_000_000_000)
         .unwrap();
     assert!(dfs.posix_stat_distributed(&catalog).is_ok());
     assert_eq!(
@@ -1100,10 +1157,12 @@ fn last_generic_source_reference_release_wakes_catalog_cleanup_from_durable_feed
     // The event is only a wake: the durable V6 revision change supplies the
     // source identity, and the maintenance task rechecks canonical lifecycle.
     crate::attachment_maintenance::notify(&data);
-    dfs.maintain_file_attachments_bounded_at(&checkpoint, &[], 8, start + 180_000_000_000)
+    dfs.maintain_file_attachments_bounded_at(&checkpoint, &shards, 8, start + 180_000_000_000)
         .unwrap();
     assert!(matches!(
         dfs.posix_stat_distributed(&catalog),
         Err(DfsPosixError::NotFound { .. })
     ));
+    drop(dfs);
+    runtime.close().unwrap();
 }

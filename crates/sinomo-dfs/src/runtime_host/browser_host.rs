@@ -64,6 +64,35 @@ impl crate::DfsBrowserServiceHost for RuntimeDfsBrowserServiceHost {
         })?;
         Ok(Some(owner))
     }
+    fn publication_execution_provider(
+        &self,
+        _paths: &[&str],
+    ) -> Result<
+        Option<Arc<crate::DfsPublicationExecutionProvider>>,
+        sinomo_core::service::ServiceError,
+    > {
+        let authority = self.metadata_authority.as_ref().ok_or_else(|| {
+            sinomo_core::service::ServiceError::Service("browser has no configuration owner".into())
+        })?;
+        let owner = self.data_owner.upgrade().ok_or_else(|| {
+            sinomo_core::service::ServiceError::Service("DFS component is no longer active".into())
+        })?;
+        let data_dir = SinomoDataDir::new(
+            daemon_data_dir(&self.paths)
+                .map_err(|error| sinomo_core::service::ServiceError::Service(error.to_string()))?,
+        );
+        let scheduler = daemon_dfs_mutation_scheduler(&data_dir)
+            .map_err(|error| sinomo_core::service::ServiceError::Service(error.to_string()))?;
+        Ok(Some(
+            crate::publication_guard::DfsPublicationExecutionProvider::from_runtime(
+                data_dir.root(),
+                owner,
+                scheduler,
+                Arc::clone(authority),
+                self.runtime.clone(),
+            ),
+        ))
+    }
     fn control_plane_client(
         &self,
         cluster_paths: &ClusterPaths,
@@ -93,11 +122,11 @@ impl crate::DfsBrowserServiceHost for RuntimeDfsBrowserServiceHost {
 
     fn schedule_metadata_publish(
         &self,
-        _data_dir: &SinomoDataDir,
+        data_dir: &SinomoDataDir,
         runtime: &tokio::runtime::Handle,
         traceparent: Option<&str>,
     ) {
-        notify_daemon_dfs_maintenance_work();
+        notify_daemon_dfs_maintenance_work(data_dir);
         match schedule_daemon_dfs_metadata_publish_on_runtime(
             &self.paths,
             runtime,
@@ -117,7 +146,7 @@ impl crate::DfsBrowserServiceHost for RuntimeDfsBrowserServiceHost {
     }
 
     fn notify_maintenance(&self) {
-        notify_daemon_dfs_maintenance_work();
+        notify_daemon_dfs_maintenance_work_for_paths(&self.paths);
     }
 
     fn publish_namespace_change(
