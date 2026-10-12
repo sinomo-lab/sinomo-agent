@@ -250,6 +250,35 @@ impl DaemonDefaultDfsReconciliationReactor {
 
         let mut deferred_recovery_error = None;
         if work.recover_prior_process_permit {
+            if work.refresh_before_recovery {
+                // Mount installs orchestration; the initial retained generation
+                // owns bounded local-state preparation and startup edge replay.
+                let task_owner = registered_dfs_runtime_host(&self.data_dir)?.ok_or_else(|| {
+                    DaemonError::Network {
+                        address: "DFS startup mounted-work replay".into(),
+                        detail: "startup replay has no registered runtime host".into(),
+                    }
+                })?;
+                let owner = require_daemon_dfs_data_owner_lock(paths)?;
+                let task_paths = paths.clone();
+                let task_runtime = runtime.clone();
+                let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+                let child = runtime.spawn_blocking(move || {
+                    let _actual_owner = owner;
+                    let result = replay_daemon_dfs_mounted_mutation_committed_work_on_runtime(
+                        &task_paths,
+                        &task_runtime,
+                    );
+                    let _ = result_tx.send(result);
+                });
+                // Register before awaiting: cancellation cannot detach storage
+                // work from the normal component's actual child-task drain.
+                task_owner.own_task(child);
+                result_rx.await.map_err(|source| DaemonError::Network {
+                    address: "DFS startup mounted-work replay".into(),
+                    detail: format!("startup replay task stopped before returning: {source}"),
+                })??;
+            }
             match recover_prior_process_default_dfs_placement_authority_async_on_runtime(
                 paths,
                 runtime,

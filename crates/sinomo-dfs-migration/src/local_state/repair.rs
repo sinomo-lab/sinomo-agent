@@ -922,6 +922,132 @@ mod tests {
         panic!("bounded conversion did not finish");
     }
     #[test]
+    fn native_factory_resumes_over_budget_legacy_local_state_before_ready() {
+        use sinomo_dfs::test_support::DfsTestRuntime;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        const BUDGET: usize = sinomo_dfs::DFS_STORAGE_PREPARATION_RECORD_BUDGET;
+        const COUNT: usize = 2 * BUDGET + 1;
+        let name = "native-large-local-state-startup";
+        let node = DfsTestRuntime::ordered_node_ids(name, 1).remove(0);
+        let mut native = DfsTestRuntime::new(name, node.clone()).unwrap();
+        let root = native.data_dir(&node).dfs_dir();
+        let originals = (0..COUNT)
+            .map(|index| {
+                let mut value = record();
+                value["intent_id"] = json!(format!("original-transfer-{index:04}"));
+                value
+            })
+            .collect::<Vec<_>>();
+        source(&root, json!({"records": originals}), &[], false);
+        let original_bytes = fs::read(root.join("maintenance").join(SNAPSHOT)).unwrap();
+        let mut expected = originals;
+        for value in &mut expected {
+            normalize_record(value).unwrap();
+        }
+        let expected = expected
+            .into_iter()
+            .map(|value| {
+                serde_json::from_value::<sinomo_dfs::DfsRepairAttemptRecord>(value).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let pending = Arc::new(AtomicUsize::new(0));
+        let ready = Arc::new(AtomicUsize::new(0));
+        let seen_pending = Arc::clone(&pending);
+        let seen_ready = Arc::clone(&ready);
+        let expected_ready = expected.clone();
+        let builder: sinomo_dfs::DfsStoragePreparationProviderBuilder =
+            Arc::new(move |context, lifecycle| {
+                let provider = crate::authority::storage_preparation_provider(context, lifecycle)?;
+                let actual = context.data_dir().dfs_dir().canonicalize().unwrap();
+                let seen_pending = Arc::clone(&seen_pending);
+                let seen_ready = Arc::clone(&seen_ready);
+                let expected = expected_ready.clone();
+                Ok(Arc::new(move |root, scope, budget| {
+                    let result = provider(root, scope, budget)?;
+                    // Content and metadata forward this same LocalState dependency.
+                    // Observe actual bounded progress, rather than only its outer scope.
+                    if let DfsStoragePreparation::Pending { processed_records } = result {
+                        assert_eq!(budget, BUDGET);
+                        assert!(processed_records <= budget);
+                        tracing::debug!(target: "sinomo.dfs.migration", root = %root.display(),
+                            scope = ?scope, processed_records, budget,
+                            "native startup provider returned actual bounded Pending");
+                        if processed_records > 0 {
+                            seen_pending.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                    if matches!(scope, sinomo_dfs::DfsStoragePreparationScope::LocalState) {
+                        assert_eq!(root, actual);
+                        assert_eq!(budget, BUDGET);
+                        match result {
+                            DfsStoragePreparation::Pending { .. } => {}
+                            DfsStoragePreparation::Ready => {
+                                assert_eq!(
+                                    fs::read(root.join("local-state-converted-v8")).unwrap(),
+                                    b"dfs-local-state-converted-v8\n"
+                                );
+                                if seen_ready.fetch_add(1, Ordering::SeqCst) == 0 {
+                                    let current = LocalDfsRepairQueueStore::new(
+                                        root.join("maintenance").join(SNAPSHOT),
+                                    )
+                                    .view()
+                                    .unwrap();
+                                    assert_eq!(current.records, expected);
+                                }
+                            }
+                        }
+                    }
+                    Ok(result)
+                }))
+            });
+        native
+            .configure_component_factories(vec![
+                Arc::new(sinomo_dfs::component_factory_with_storage_preparation(builder).unwrap()),
+                Arc::new(crate::authority::staged_import_component_factory().unwrap()),
+            ])
+            .unwrap();
+        native
+            .start_nodes()
+            .expect("normal component mount retains bounded Pending recovery");
+        assert!(pending.load(Ordering::SeqCst) >= 2);
+        assert!(ready.load(Ordering::SeqCst) > 0);
+        let retained = root
+            .join("migration-retained/local-state/repair-v8/source")
+            .join(SNAPSHOT);
+        assert_eq!(fs::read(&retained).unwrap(), original_bytes);
+        assert!(expected.iter().all(|row| row.in_flight
+            && row.transfer_request_id.as_deref() == Some("actual-request")
+            && row.transfer_delivery_state.is_none()
+            && row.completed_transfer_request_id.is_none()
+            && row.transfer_kind.is_none()));
+        let marker = fs::read(root.join("local-state-converted-v8")).unwrap();
+        let mut client = native.client(&node).unwrap();
+        let path = "/services/after-bounded-native-storage-prepare";
+        client
+            .posix_write_file(
+                path,
+                b"actual ready bytes",
+                sinomo_dfs::DfsWriteOptions::replicated_eventual(vec![node.clone()]),
+            )
+            .unwrap();
+        drop(client);
+        native.stop_node(&node).unwrap();
+        native.reopen_node(node.clone()).unwrap();
+        let mut client = native.client(&node).unwrap();
+        assert_eq!(
+            client.posix_read_file_distributed(path).unwrap(),
+            b"actual ready bytes"
+        );
+        assert_eq!(
+            fs::read(root.join("local-state-converted-v8")).unwrap(),
+            marker
+        );
+        assert_eq!(fs::read(retained).unwrap(), original_bytes);
+        drop(client);
+        native.close().unwrap();
+    }
+
+    #[test]
     fn original_missing_transfer_observations_import_only_as_current_unknown() {
         let mut original = record();
         assert!(
