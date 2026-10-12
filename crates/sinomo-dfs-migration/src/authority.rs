@@ -2133,13 +2133,26 @@ mod provider_lifecycle_tests {
 
     #[test]
     fn native_released_seven_field_namespace_source_reopens_with_current_authority() {
+        native_released_namespace_source_reopens(false);
+    }
+
+    #[test]
+    fn native_original_write_plan_survives_a_released_version_without_durability() {
+        native_released_namespace_source_reopens(true);
+    }
+
+    fn native_released_namespace_source_reopens(omit_source_durability: bool) {
         use sinomo_core::object::{LengthMode, serde_ext};
         use sinomo_dfs::{
             DfsMetadataShardId, DfsNamespaceObjectVersionExpectation,
             DfsNamespacePathOccupantExpectation, DfsNamespaceTransaction,
             DfsPreparedOperationStatus, test_support::DfsTestRuntime,
         };
-        let name = "native-seven-field-namespace-cold-admission";
+        let name = if omit_source_durability {
+            "native-original-write-plan-cold-admission"
+        } else {
+            "native-seven-field-namespace-cold-admission"
+        };
         let node = DfsTestRuntime::ordered_node_ids(name, 1).remove(0);
         let mut native = DfsTestRuntime::new(name, node.clone()).unwrap();
         native
@@ -2203,6 +2216,25 @@ mod provider_lifecycle_tests {
                 .iter()
                 .any(|row| row.object_id == object.object_id && row.version == object.version)
         );
+        let original_version = snapshot
+            .tables
+            .versions
+            .iter()
+            .find(|row| row.object_id == object.object_id && row.version == object.version)
+            .unwrap()
+            .clone();
+        let original_receipts = snapshot
+            .tables
+            .receipts
+            .iter()
+            .filter(|row| {
+                row.receipt.object_id == object.object_id
+                    && row.receipt.committed_version == object.version
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(original_version.content_durability.is_some());
+        assert!(!original_receipts.is_empty());
         drop(observed);
         drop(entered);
         // Keep every genuine native file. This modeled released SOURCE checkpoint
@@ -2255,6 +2287,24 @@ mod provider_lifecycle_tests {
         let mut source = serde_json::to_value(&snapshot).unwrap();
         source["format_version"] = serde_json::json!(2);
         source["tables"]["namespace_prepares"] = serde_json::json!([original_prepare]);
+        if omit_source_durability {
+            let version = source["tables"]["versions"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|row| {
+                    row["object_id"] == object.object_id.as_str()
+                        && row["version"] == object.version.as_str()
+                })
+                .unwrap();
+            assert!(
+                version
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("content_durability")
+                    .is_some()
+            );
+        }
         // Only the SOURCE representation checksum changes. Every logical row
         // and the real cut remain; all original native files stay in baseline.
         let mut checksum = source.clone();
@@ -2305,6 +2355,37 @@ mod provider_lifecycle_tests {
         assert_eq!(imported.payload.expected_path_occupants, expected_paths);
         assert!(imported.payload.completed_request.is_none());
         assert!(imported.payload.completed_request_completion.is_none());
+        if omit_source_durability {
+            let snapshot = owner
+                .metadata_backend()
+                .unwrap()
+                .export_table_snapshot()
+                .unwrap();
+            let version = snapshot
+                .tables
+                .versions
+                .iter()
+                .find(|row| row.object_id == object.object_id && row.version == object.version)
+                .unwrap();
+            assert_eq!(
+                version.content_durability,
+                original_version.content_durability
+            );
+            let receipts = snapshot
+                .tables
+                .receipts
+                .iter()
+                .filter(|row| {
+                    row.receipt.object_id == object.object_id
+                        && row.receipt.committed_version == object.version
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            assert_eq!(
+                receipts, original_receipts,
+                "schema conversion must preserve actual original receipt identities"
+            );
+        }
         drop(owner);
         let mut client = native.client(&node).unwrap();
         assert_eq!(client.posix_read_file_distributed(path).unwrap(), first);

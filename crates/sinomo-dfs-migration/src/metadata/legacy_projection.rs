@@ -1779,6 +1779,7 @@ impl LegacyProjection {
         self.recover_visible_commits()?;
         self.capture_legacy_intents()?;
         let mut tables = self.state()?.snapshot();
+        super::retained_content::restore_recorded_source_durability(&mut tables)?;
         for fallback in self.retired_adoption_receipts.values() {
             if let Some(actual) = tables.namespace_request_receipts.iter().find(|row| {
                 row.requester_node_id == fallback.requester_node_id
