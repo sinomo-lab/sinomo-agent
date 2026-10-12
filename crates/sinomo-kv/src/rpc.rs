@@ -534,7 +534,9 @@ pub fn project_cluster_kv_authoritative_entries(
         .try_reserve(keys.len())
         .map_err(|_| KvError::ResourceExhausted {
             operation: "project authoritative exact-key response".to_string(),
-            requested_bytes: keys.len().saturating_mul(std::mem::size_of::<Option<KvEntry>>()),
+            requested_bytes: keys
+                .len()
+                .saturating_mul(std::mem::size_of::<Option<KvEntry>>()),
         })?;
     for key in keys {
         values.push(
@@ -612,6 +614,84 @@ pub fn project_cluster_kv_authoritative_range_prefix(
         )?,
         authority: read.authority,
     })
+}
+
+/// Bootstrap/recovery reads consume ONE owned, native ReadIndex snapshot. This
+/// does not join independently observed pages or reopen an observational file.
+/// The complete result remains bounded by the native snapshot resource budget;
+/// crossing either bound rejects the whole read rather than truncating it.
+pub fn project_cluster_kv_authoritative_complete_range_prefix(
+    read: &KvAuthoritativeRead<KvSnapshot>,
+    prefix: &str,
+) -> Result<KvAuthoritativeRead<Vec<KvEntry>>, KvError> {
+    validate_cluster_kv_authoritative_snapshot_read(read)?;
+    let mut previous: Option<&str> = None;
+    for entry in &read.value.entries {
+        if previous.is_some_and(|key| key >= entry.key.as_str())
+            || entry.create_revision > entry.modify_revision
+            || entry.modify_revision > read.authority.revision
+        {
+            return Err(KvError::AuthorityUnavailable {
+                detail: "complete prefix source is not one canonical proof-bound snapshot".into(),
+            });
+        }
+        previous = Some(&entry.key);
+    }
+    let projected = KvAuthoritativeRead {
+        value: read.value.range_prefix_limited_by_payload_bytes(
+            prefix,
+            CLUSTER_KV_COMPLETE_RANGE_PREFIX_MAX_ENTRIES,
+            CLUSTER_KV_COMPLETE_RANGE_PREFIX_MAX_PAYLOAD_BYTES,
+        )?,
+        authority: read.authority,
+    };
+    validate_cluster_kv_authoritative_complete_range_prefix_read(prefix, &projected)?;
+    Ok(projected)
+}
+
+pub fn validate_cluster_kv_authoritative_complete_range_prefix_read(
+    prefix: &str,
+    read: &KvAuthoritativeRead<Vec<KvEntry>>,
+) -> Result<(), KvError> {
+    validate_cluster_kv_current_term_authority_proof(&read.authority)?;
+    if read.value.len() > CLUSTER_KV_COMPLETE_RANGE_PREFIX_MAX_ENTRIES {
+        return Err(KvError::RangeLimit {
+            prefix: prefix.into(),
+            max_entries: CLUSTER_KV_COMPLETE_RANGE_PREFIX_MAX_ENTRIES,
+        });
+    }
+    let mut bytes = 0_usize;
+    let mut previous: Option<&str> = None;
+    for entry in &read.value {
+        if entry.value.len() > MAX_KV_VALUE_BYTES {
+            return Err(KvError::ValueTooLarge {
+                actual_bytes: entry.value.len(),
+                max_bytes: MAX_KV_VALUE_BYTES,
+            });
+        }
+        bytes = bytes
+            .saturating_add(entry.key.len())
+            .saturating_add(entry.value.len());
+        if bytes > CLUSTER_KV_COMPLETE_RANGE_PREFIX_MAX_PAYLOAD_BYTES {
+            return Err(KvError::RangePayloadLimit {
+                prefix: prefix.into(),
+                observed_bytes: bytes,
+                max_bytes: CLUSTER_KV_COMPLETE_RANGE_PREFIX_MAX_PAYLOAD_BYTES,
+            });
+        }
+        if !entry.key.starts_with(prefix)
+            || previous.is_some_and(|key| key >= entry.key.as_str())
+            || entry.create_revision > entry.modify_revision
+            || entry.modify_revision > read.authority.revision
+        {
+            return Err(KvError::AuthorityUnavailable {
+                detail: "complete prefix entries have inconsistent scope, order, or proof revision"
+                    .into(),
+            });
+        }
+        previous = Some(&entry.key);
+    }
+    Ok(())
 }
 
 pub fn cluster_kv_authoritative_watch_start_rpc_payload(
@@ -878,7 +958,10 @@ pub struct ClusterRaftAppendRequest {
     /// Ordinary heartbeats and replication requests deliberately leave this
     /// false. Receivers may then answer a marked same-term probe from their
     /// exact resident Raft view without entering the durable mutation queues.
-    #[serde(default, skip_serializing_if = "cluster_raft_read_index_probe_is_false")]
+    #[serde(
+        default,
+        skip_serializing_if = "cluster_raft_read_index_probe_is_false"
+    )]
     pub read_index_probe: bool,
 }
 

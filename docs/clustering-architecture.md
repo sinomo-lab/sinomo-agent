@@ -246,6 +246,20 @@ Public reads use one of two explicit consistency contracts:
   committed log index. It fails rather than degrading to a local read when the
   barrier cannot be established.
 
+Cold bootstrap and explicit configuration-gap recovery may request a complete
+authoritative prefix through `ClusterAccess::kv_range_prefix_complete_authoritative_async`.
+This operation captures one native current-term quorum-backed snapshot and
+projects the requested prefix from that exact owned generation. It does not
+combine pages, reopen the observational checkpoint, or register idle work.
+The complete projection is limited to 65,536 entries and the existing 64 MiB
+native snapshot payload budget; individual values remain limited to 4 MiB.
+An exceeded bound rejects the whole read. The distinct authenticated
+`/cluster/kv/authoritative/complete-range-prefix` route fails on older receivers.
+Ordinary prefix reads retain their 4,096-entry/8 MiB limits, and command/write
+limits are unchanged. Complete reads are recovery operations rather than the
+ordinary point/prefix request path; forwarded recovery may transfer one native
+snapshot before projecting the prefix.
+
 For a leader with an entry committed in its current term, point and bounded
 prefix reads use a ReadIndex-style empty AppendEntries quorum confirmation and
 then project from the resident index. This does not append a log entry. The
