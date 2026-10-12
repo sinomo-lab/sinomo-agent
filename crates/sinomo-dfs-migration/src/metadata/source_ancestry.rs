@@ -136,7 +136,11 @@ impl OwnedSourceAncestryReader {
         }
         if self.frame.is_none() {
             let path = super::evidence_path(&self.stage, self.next_sequence);
-            let file = File::open(&path).map_err(error)?;
+            let file =
+                File::open(&path).map_err(|source| sinomo_dfs::MetadataBackendError::Io {
+                    path: path.clone(),
+                    source,
+                })?;
             let length = file.metadata().map_err(error)?.len();
             if length == 0 || length > MAX_FRAME_BYTES {
                 return Err(error("retained ancestry frame is empty or exceeds 64MiB"));

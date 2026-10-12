@@ -538,6 +538,73 @@ impl MetadataImportAuthority for NativeImportAuthority {
         .map_err(error)?;
         Ok((policy, plan.desired_replica_nodes))
     }
+    fn current_receiver_stage_pending(
+        &self,
+        destination: &Path,
+        shard: &sinomo_dfs::DfsMetadataShardId,
+    ) -> Result<bool> {
+        let directories = match std::fs::read_dir(&self.receiver_root) {
+            Ok(directories) => directories,
+            Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(cause) => return Err(error(cause)),
+        };
+        let marker = destination.join("metadata-import-v7.json");
+        let installed: Option<serde_json::Value> = if marker.is_file() {
+            Some(serde_json::from_slice(&std::fs::read(marker).map_err(error)?).map_err(error)?)
+        } else {
+            None
+        };
+        for directory in directories {
+            let directory = directory.map_err(error)?;
+            if !directory.file_type().map_err(error)?.is_dir() {
+                continue;
+            }
+            let root = directory.path();
+            if !root.join("native-activation-request.json").is_file() {
+                continue;
+            }
+            let path = root.join("native-import-plan.json");
+            if !path.is_file() {
+                continue;
+            }
+            let plan: MetadataImportPlan =
+                serde_json::from_slice(&std::fs::read(path).map_err(error)?).map_err(error)?;
+            Self::validate_plan(&plan)?;
+            if plan.source_cut.scope_shard != *shard {
+                continue;
+            }
+            if let Some(marker) = installed.as_ref().filter(|marker| {
+                marker["installation_complete"].as_bool() == Some(true)
+                    && marker["source_cut"]["scope_shard"] == serde_json::json!(shard)
+            }) {
+                let exact_installed = marker["authority_binding"].as_str()
+                    == Some(plan.expected_handoff.handoff_id.as_str())
+                    && marker["native_image"]["prefix_proof"]
+                        == serde_json::json!(plan.target_exact_prefix)
+                    && marker["native_image"]["state_fingerprint"]
+                        == serde_json::json!(plan.current_image_fingerprint);
+                let installed_assignment: Option<DfsMetadataShardConfig> = marker
+                    .get("installed_native_assignment")
+                    .filter(|value| !value.is_null())
+                    .cloned()
+                    .map(serde_json::from_value)
+                    .transpose()
+                    .map_err(error)?;
+                let superseded = installed_assignment.as_ref().is_some_and(|installed| {
+                    installed.file_system_id == plan.expected_handoff.desired_shard.file_system_id
+                        && installed.shard_id == plan.expected_handoff.desired_shard.shard_id
+                        && installed.epoch > plan.expected_handoff.desired_shard.epoch
+                });
+                if exact_installed || superseded {
+                    continue;
+                }
+            }
+            // Files select a possible receiver only. received() obtains the real
+            // current assignment, activation, native receipts and exact ancestry.
+            return Ok(true);
+        }
+        Ok(false)
+    }
     fn received(
         &self,
         source: &crate::metadata::MetadataSourceContentWorkScope,
@@ -1085,8 +1152,12 @@ impl MetadataImportAuthority for NativeImportAuthority {
         if !proof.acknowledged_node_ids.contains(&self.local_node()?) {
             return Ok(None);
         }
-        let _ancestry_fences =
-            self.verify_recovered_source_ancestry(&plan, provenance_plan_root, actual_source_root)?;
+        let _ancestry_fences = self.verify_recovered_source_ancestry(
+            &plan,
+            provenance_plan_root,
+            actual_source_root,
+            &proposal.source_root,
+        )?;
         let candidate = crate::metadata::inspect_import_candidate(resolved_image_root)?;
         if candidate.prefix_proof != plan.target_exact_prefix
             || candidate.state_fingerprint != plan.current_image_fingerprint
@@ -2133,27 +2204,39 @@ mod provider_lifecycle_tests {
 
     #[test]
     fn native_released_seven_field_namespace_source_reopens_with_current_authority() {
-        native_released_namespace_source_reopens(false);
+        native_released_namespace_source_reopens(false, false);
     }
 
     #[test]
     fn native_original_write_plan_survives_a_released_version_without_durability() {
-        native_released_namespace_source_reopens(true);
+        native_released_namespace_source_reopens(true, false);
     }
 
-    fn native_released_namespace_source_reopens(omit_source_durability: bool) {
+    #[test]
+    fn native_original_publication_grant_survives_real_same_version_placement() {
+        native_released_namespace_source_reopens(true, true);
+    }
+
+    fn native_released_namespace_source_reopens(
+        omit_source_durability: bool,
+        same_version_placement: bool,
+    ) {
         use sinomo_core::object::{LengthMode, serde_ext};
         use sinomo_dfs::{
             DfsMetadataShardId, DfsNamespaceObjectVersionExpectation,
             DfsNamespacePathOccupantExpectation, DfsNamespaceTransaction,
             DfsPreparedOperationStatus, test_support::DfsTestRuntime,
         };
-        let name = if omit_source_durability {
+        let name = if same_version_placement {
+            "native-original-grant-after-real-placement"
+        } else if omit_source_durability {
             "native-original-write-plan-cold-admission"
         } else {
             "native-seven-field-namespace-cold-admission"
         };
-        let node = DfsTestRuntime::ordered_node_ids(name, 1).remove(0);
+        let nodes =
+            DfsTestRuntime::ordered_node_ids(name, if same_version_placement { 2 } else { 1 });
+        let node = nodes[0].clone();
         let mut native = DfsTestRuntime::new(name, node.clone()).unwrap();
         native
             .configure_component_factories(vec![
@@ -2166,15 +2249,98 @@ mod provider_lifecycle_tests {
                 Arc::new(staged_import_component_factory().unwrap()),
             ])
             .unwrap();
+        for peer in &nodes[1..] {
+            native.define_node(peer.clone()).unwrap();
+        }
         native.start_nodes().unwrap();
         let path = "/native-seven-field-preserved";
         let first = b"normal native content before released-source conversion";
-        let options = sinomo_dfs::DfsWriteOptions::replicated_eventual(vec![node.clone()]);
+        if same_version_placement {
+            let mut policy = sinomo_dfs::DfsPlacementPolicy::new(
+                sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+                1,
+                2,
+            )
+            .unwrap();
+            policy.required_node_ids = nodes.clone();
+            native
+                .apply_placement_policy(
+                    &node,
+                    path,
+                    sinomo_dfs::DfsPlacementScope::SelfOnly,
+                    policy,
+                )
+                .unwrap();
+        }
+        let options = if same_version_placement {
+            sinomo_dfs::DfsWriteOptions {
+                replica_candidates: nodes.clone(),
+                policy: sinomo_dfs::DfsReplicationPolicy::new(1, 2).unwrap(),
+                wait_for_commit: true,
+                foreground_replica_repair: true,
+            }
+        } else {
+            sinomo_dfs::DfsWriteOptions::replicated_eventual(vec![node.clone()])
+        };
         let mut client = native.client(&node).unwrap();
         let object = client
             .posix_write_file(path, first, options.clone())
             .unwrap();
+        if same_version_placement {
+            client
+                .posix_sync_file(path, sinomo_dfs::DfsPosixSyncKind::File)
+                .unwrap();
+        }
         drop(client);
+        let placement = if same_version_placement {
+            let mut policy = sinomo_dfs::DfsPlacementPolicy::new(
+                sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+                1,
+                1,
+            )
+            .unwrap();
+            policy.required_node_ids = vec![node.clone()];
+            policy.forbidden_node_ids = vec![nodes[1].clone()];
+            let job = native
+                .apply_placement_policy(
+                    &node,
+                    path,
+                    sinomo_dfs::DfsPlacementScope::SelfOnly,
+                    policy,
+                )
+                .unwrap();
+            let control = native.shared_control_plane().unwrap();
+            let deadline =
+                std::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+            loop {
+                let current = control
+                    .with_client(|kv| {
+                        sinomo_dfs::DfsControlPlaneStore::new(kv.as_mut()).placement_reconciliation(
+                            &sinomo_dfs::sifs_file_system_id(),
+                            &job.job_id,
+                        )
+                    })
+                    .unwrap()
+                    .unwrap();
+                if current.state == sinomo_dfs::DfsPlacementReconciliationState::Completed {
+                    break;
+                }
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                assert!(
+                    !remaining.is_zero(),
+                    "normal placement must finish within its existing network budget"
+                );
+                let pass = native.maintenance_tick(&node, remaining).unwrap();
+                assert!(
+                    pass.outcome.is_ok(),
+                    "actual normal served placement: {:?}",
+                    pass.outcome
+                );
+            }
+            Some(job.job_id)
+        } else {
+            None
+        };
         let assignment = native.root_shard().unwrap();
         assert_eq!(assignment.primary_node_id, node);
         let root = native.data_dir(&node).dfs_dir().join("metadata/root");
@@ -2233,7 +2399,72 @@ mod provider_lifecycle_tests {
             })
             .cloned()
             .collect::<Vec<_>>();
+        let original_fenced = snapshot
+            .tables
+            .prepared_operations_v7
+            .iter()
+            .filter(|row| row.payload.expected_journal_sequence.is_some())
+            .cloned()
+            .collect::<Vec<_>>();
+        if same_version_placement {
+            assert!(
+                !original_fenced.is_empty(),
+                "normal placement must produce a real journal-fenced operation"
+            );
+            for record in &original_fenced {
+                let source = serde_json::to_value(record).unwrap();
+                crate::legacy_wire::validate_original_v7_record(&source).unwrap();
+                let mut wrong_slot = source;
+                wrong_slot["digest"]["prepare_sequence"] =
+                    serde_json::json!(record.digest.prepare_sequence + 1);
+                assert!(
+                    crate::legacy_wire::validate_original_v7_record(&wrong_slot)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("journal-cut precondition")
+                );
+            }
+        }
+        let original_intents = snapshot.tables.intents.clone();
+        let original_intent_receipts = snapshot.tables.intent_receipts.clone();
         assert!(original_version.content_durability.is_some());
+        if let Some(job_id) = placement.as_ref() {
+            let id = format!("placement:{job_id}:{}:{}", object.object_id, object.version);
+            let actual = snapshot
+                .tables
+                .intents
+                .iter()
+                .find(|row| row.intent_id == id)
+                .unwrap();
+            assert_eq!(actual.status, sinomo_dfs::DfsWriteIntentStatus::Committed);
+            assert_eq!(actual.base_version.as_ref(), Some(&object.version));
+            assert_eq!(actual.target_version, object.version);
+            assert!(actual.operation_id.is_none());
+            assert_eq!(actual.desired_replica_node_ids, vec![node.clone()]);
+            assert_eq!(actual.policy.desired_replicas, 1);
+            let publication = snapshot
+                .tables
+                .intent_receipts
+                .iter()
+                .find(|row| {
+                    row.object_id == object.object_id
+                        && row.target_version == object.version
+                        && row.base_version.as_ref() != Some(&object.version)
+                        && row.status == sinomo_dfs::DfsWriteIntentStatus::Committed
+                })
+                .unwrap();
+            assert_eq!(publication.policy.desired_replicas, 2);
+            assert_eq!(
+                original_version
+                    .content_durability
+                    .as_ref()
+                    .unwrap()
+                    .policy
+                    .desired_replicas,
+                2
+            );
+            assert_ne!(actual.policy, publication.policy);
+        }
         assert!(!original_receipts.is_empty());
         drop(observed);
         drop(entered);
@@ -2321,6 +2552,30 @@ mod provider_lifecycle_tests {
         let source_path = root.join("records/tables/snapshot.sobj");
         std::fs::create_dir_all(source_path.parent().unwrap()).unwrap();
         std::fs::write(&source_path, &source_bytes).unwrap();
+        if same_version_placement {
+            // Keep the actual original frame chain. A replica may have promised
+            // an earlier floor than the captured snapshot; its ancestry must
+            // reach this cut through real bytes, not a checkpoint/height claim.
+            fn copy_original_journal(source: &Path, target: &Path) {
+                std::fs::create_dir_all(target).unwrap();
+                for entry in std::fs::read_dir(source).unwrap() {
+                    let entry = entry.unwrap();
+                    let path = target.join(entry.file_name());
+                    let kind = entry.file_type().unwrap();
+                    if kind.is_dir() {
+                        copy_original_journal(&entry.path(), &path);
+                    } else {
+                        assert!(kind.is_file());
+                        std::fs::copy(entry.path(), &path).unwrap();
+                        assert_eq!(
+                            std::fs::read(entry.path()).unwrap(),
+                            std::fs::read(path).unwrap()
+                        );
+                    }
+                }
+            }
+            copy_original_journal(&baseline.join("journal"), &root.join("journal"));
+        }
         assert!(!crate::metadata::current_root(&root).unwrap());
         native
             .reopen_node(node.clone())
@@ -2361,6 +2616,51 @@ mod provider_lifecycle_tests {
                 .unwrap()
                 .export_table_snapshot()
                 .unwrap();
+            if same_version_placement {
+                assert_eq!(snapshot.tables.intents, original_intents);
+                assert_eq!(snapshot.tables.intent_receipts, original_intent_receipts);
+                for original in &original_fenced {
+                    let current = snapshot
+                        .tables
+                        .prepared_operations_v7
+                        .iter()
+                        .find(|row| row.digest.operation_id == original.digest.operation_id)
+                        .unwrap();
+                    current.validate().unwrap();
+                    assert_eq!(
+                        current.payload.expected_journal_sequence.unwrap() + 1,
+                        current.digest.prepare_sequence
+                    );
+                    assert_ne!(
+                        current.payload.expected_journal_sequence,
+                        original.payload.expected_journal_sequence
+                    );
+                    let mapping = marker["source_cut"]["pending_operations"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|row| {
+                            row["source_operation_digest"] == original.digest.payload_digest
+                        })
+                        .unwrap();
+                    assert_eq!(
+                        mapping["source_prepare_sequence"],
+                        original.digest.prepare_sequence
+                    );
+                    assert_eq!(
+                        mapping["source_payload"],
+                        serde_json::to_value(original.payload.as_ref()).unwrap()
+                    );
+                    assert_eq!(
+                        mapping["payload"],
+                        serde_json::to_value(current.payload.as_ref()).unwrap()
+                    );
+                    assert_eq!(
+                        mapping["current_digest"],
+                        serde_json::to_value(&current.digest).unwrap()
+                    );
+                }
+            }
             let version = snapshot
                 .tables
                 .versions
@@ -2390,7 +2690,25 @@ mod provider_lifecycle_tests {
         let mut client = native.client(&node).unwrap();
         assert_eq!(client.posix_read_file_distributed(path).unwrap(), first);
         let after = b"normal native writer after released-source admission";
-        client.posix_write_file(path, after, options).unwrap();
+        let after_options = if same_version_placement {
+            let (_, _, policy) = client
+                .managed_replication_policy_for_path(
+                    path,
+                    sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+                    nodes.len(),
+                )
+                .unwrap();
+            assert_eq!(policy.desired_replicas, 1);
+            sinomo_dfs::DfsWriteOptions {
+                replica_candidates: nodes.clone(),
+                policy,
+                wait_for_commit: true,
+                foreground_replica_repair: true,
+            }
+        } else {
+            options
+        };
+        client.posix_write_file(path, after, after_options).unwrap();
         assert_eq!(client.posix_read_file_distributed(path).unwrap(), after);
         drop(client);
         native.stop_node(&node).unwrap();

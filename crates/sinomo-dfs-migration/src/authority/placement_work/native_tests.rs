@@ -399,12 +399,11 @@ fn received_uncommitted_v1_custody_data_never_becomes_its_first_native_effect() 
             .unwrap()
             .remove(field);
     }
-    for rule in original["accepted_config"]["subtree_policies"]
-        .as_array_mut()
-        .unwrap()
-    {
-        rule.as_object_mut().unwrap().remove("min_commit_replicas");
-        rule.as_object_mut().unwrap().remove("desired_replicas");
+    if let Some(rules) = original["accepted_config"].get_mut("subtree_policies") {
+        for rule in rules.as_array_mut().expect("actual accepted policy list") {
+            rule.as_object_mut().unwrap().remove("min_commit_replicas");
+            rule.as_object_mut().unwrap().remove("desired_replicas");
+        }
     }
     let key = sinomo_dfs::placement_reconciliation_key(&fs, &current.job_id);
     let input = runtime

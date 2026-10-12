@@ -1524,6 +1524,57 @@ mod tests {
             .join("verification-plan-context-source");
         let source_root = stage.join("source");
         let current_image = stage.join("current-image");
+        // A snapshot is the captured cut, not evidence of the frames between
+        // a replica's earlier floor and that cut. Retain the actual native
+        // length-prefixed SOBJ frames unchanged for the normal ancestry route.
+        let journal = context
+            .data_dir()
+            .dfs_dir()
+            .join("metadata")
+            .join(&shard.0)
+            .join("journal/segments");
+        let mut source_frames = std::collections::BTreeMap::new();
+        for segment in std::fs::read_dir(&journal).unwrap() {
+            let segment = segment.unwrap();
+            if segment.path().extension().and_then(|value| value.to_str()) != Some("slog") {
+                continue;
+            }
+            assert!(segment.file_type().unwrap().is_file());
+            let mut reader = std::fs::File::open(segment.path()).unwrap();
+            while let Some(frame) = sinomo_core::storage::durable_file::read_length_prefixed_record(
+                &mut reader,
+                &segment.path(),
+                sinomo_core::storage::durable_file::DurableRecordReadOptions::new(
+                    sinomo_core::storage::durable_file::DurableLengthEndian::Little,
+                ),
+            )
+            .unwrap()
+            {
+                let entry: sinomo_dfs::DfsMetadataJournalEntry =
+                    sinomo_core::object::serde_ext::from_bytes(&frame.bytes).unwrap();
+                assert_eq!(entry.shard_id, shard);
+                if entry.sequence <= snapshot.materialized_through_sequence {
+                    if let Some(old) = source_frames.insert(entry.sequence, frame.bytes.clone()) {
+                        assert_eq!(old, frame.bytes, "actual source frame must not fork");
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            source_frames.len() as u64,
+            snapshot.materialized_through_sequence
+        );
+        let evidence = stage.join("journal-evidence");
+        std::fs::create_dir_all(&evidence).unwrap();
+        for sequence in 1..=snapshot.materialized_through_sequence {
+            let bytes = source_frames
+                .get(&sequence)
+                .expect("actual dense source frame chain");
+            let path = evidence.join(format!("{sequence:020}.sobj"));
+            assert!(!path.exists());
+            std::fs::write(&path, bytes).unwrap();
+            assert_eq!(std::fs::read(path).unwrap(), *bytes);
+        }
         let source_image =
             sinomo_dfs::write_metadata_candidate_image(&source_root, &image, &fs).unwrap();
         let target =

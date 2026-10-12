@@ -437,7 +437,16 @@ impl NativeImportAuthority {
         cut: &MetadataSourceCut,
         shard: &sinomo_dfs::DfsMetadataShardId,
     ) -> Result<bool> {
-        if cut.source_format_version != Some(6) || cut.scope_shard != *shard {
+        if cut.source_format_version != Some(6) {
+            return Ok(false);
+        }
+        Self::source_has_physical_shard_clock(cut, shard)
+    }
+    fn source_has_physical_shard_clock(
+        cut: &MetadataSourceCut,
+        shard: &sinomo_dfs::DfsMetadataShardId,
+    ) -> Result<bool> {
+        if cut.scope_shard != *shard {
             return Ok(false);
         }
         // Compare PRIMARY's captured source and image roles with each other,
@@ -517,7 +526,15 @@ impl NativeImportAuthority {
         // conversion DATA. A combined root serving another logical shard does
         // not qualify: its actual source-root role differs from that shard.
         let legacy_shard_clock = Self::legacy_source_has_shard_clock(cut, shard)?;
-        if !crate::metadata::native_source_format(cut.source_format_version) && !legacy_shard_clock
+        let local_current = crate::metadata::current_root(root)?;
+        let native_prefix = cut.source_exact_prefix.as_ref().is_some_and(|prefix| {
+            prefix.version == 2 && prefix.journal_sequence == cut.source_journal_sequence
+        });
+        if !crate::metadata::native_source_format(cut.source_format_version)
+            && !legacy_shard_clock
+            && !(local_current
+                && native_prefix
+                && Self::source_has_physical_shard_clock(cut, shard)?)
         {
             return Ok(false);
         }
@@ -538,11 +555,13 @@ impl NativeImportAuthority {
         if root.canonicalize().map_err(error)? != expected.canonicalize().map_err(error)? {
             return Ok(false);
         }
-        // The source cut's PRIMARY header fact selects semantics, while this
-        // actual LOCAL header must independently match that native generation.
-        // Physical identity and prefix cuts may differ per member; exact floor
-        // ancestry decides.
-        let actual_header = if legacy_shard_clock {
+        // Select the decoder from this LOCAL generation. A current peer may
+        // retain the primary's exact native clock under another table encoding;
+        // this qualification gives no ACK. Captured nonempty local floors and
+        // the existing exact ancestry exchange must prove the shared cut.
+        let actual_header = if local_current {
+            true
+        } else if legacy_shard_clock {
             crate::metadata::metadata_root_at_format(root, 6)?
         } else {
             crate::metadata::native_source_root(root, cut.source_format_version)?
@@ -610,14 +629,29 @@ impl NativeImportAuthority {
             } else {
                 crate::metadata::retain_source_fence(&source)?
             };
+            let local_current = current_source && crate::metadata::current_root(&source)?;
+            let local_format = if local_current {
+                Some(sinomo_dfs::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION)
+            } else {
+                current_source
+                    .then_some(plan.source_cut.source_format_version)
+                    .flatten()
+            };
             let actual = crate::metadata::ack_floor::acknowledged_source_floors_for_root(
                 &source,
                 fs,
-                current_source
-                    .then_some(plan.source_cut.source_format_version)
-                    .flatten(),
+                local_format,
                 shard,
             )?;
+            if local_current
+                && plan.source_cut.source_format_version
+                    != Some(sinomo_dfs::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION)
+                && actual.is_empty()
+            {
+                return Err(error(
+                    "current source has no independently retained native ACK floor",
+                ));
+            }
             if current_source
                 && actual.iter().any(|floor| {
                     floor.shard_id != *shard
@@ -916,6 +950,7 @@ impl NativeImportAuthority {
         plan: &MetadataImportPlan,
         provenance_plan_root: &Path,
         actual_source_root: &Path,
+        original_local_source_root: &Path,
     ) -> Result<Vec<Arc<std::fs::File>>> {
         let request_id: String = serde_json::from_slice(
             &std::fs::read(provenance_plan_root.join("source-ancestry-request.json"))
@@ -932,23 +967,64 @@ impl NativeImportAuthority {
             ));
         }
         let source_fence = crate::metadata::retain_source_fence(actual_source_root)?;
+        let local_current = crate::metadata::current_root(actual_source_root)?;
+        if local_current {
+            let retiring = &plan.expected_handoff.retiring_shard;
+            let local_parent = original_local_source_root
+                .parent()
+                .ok_or_else(|| error("recovered current receiver source has no physical owner"))?;
+            if local_parent.canonicalize().map_err(error)?
+                != self.metadata_root.canonicalize().map_err(error)?
+                || original_local_source_root
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    != Some(plan.source_cut.scope_shard.0.as_str())
+                || retiring.shard_id != plan.source_cut.scope_shard.0
+                || !plan
+                    .source_cut
+                    .file_system_ids
+                    .contains(&retiring.file_system_id)
+                || !plan
+                    .source_cut
+                    .projection_assignments
+                    .iter()
+                    .any(|cfg| cfg == retiring)
+                || !crate::metadata::native_source_format(plan.source_cut.source_format_version)
+                    && !Self::source_has_physical_shard_clock(
+                        &plan.source_cut,
+                        &plan.source_cut.scope_shard,
+                    )?
+            {
+                return Err(error(
+                    "recovered current receiver changes its original local shard/source role",
+                ));
+            }
+        }
+        let local_format = if local_current {
+            Some(sinomo_dfs::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION)
+        } else {
+            plan.source_cut.source_format_version
+        };
         let actual = crate::metadata::ack_floor::acknowledged_source_floors_for_root(
             actual_source_root,
             &plan.expected_handoff.retiring_shard.file_system_id,
-            plan.source_cut.source_format_version,
+            local_format,
             &plan.source_cut.scope_shard,
         )?;
-        if crate::metadata::native_source_format(plan.source_cut.source_format_version) {
-            if !crate::metadata::native_source_root(
-                actual_source_root,
-                plan.source_cut.source_format_version,
-            )? || actual.iter().any(|floor| {
-                floor.shard_id != plan.source_cut.scope_shard
-                    || floor
-                        .durable_prefix_proof
-                        .as_ref()
-                        .is_some_and(|proof| proof.version != 2)
-            }) {
+        if local_current || crate::metadata::native_source_format(local_format) {
+            if local_current
+                && plan.source_cut.source_format_version
+                    != Some(sinomo_dfs::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION)
+                && actual.is_empty()
+                || !crate::metadata::native_source_root(actual_source_root, local_format)?
+                || actual.iter().any(|floor| {
+                    floor.shard_id != plan.source_cut.scope_shard
+                        || floor
+                            .durable_prefix_proof
+                            .as_ref()
+                            .is_some_and(|proof| proof.version != 2)
+                })
+            {
                 return Err(error(
                     "recovered native source has foreign/retired/unanchored ACK clocks",
                 ));
@@ -1497,6 +1573,28 @@ mod ancestry_ledger_tests {
         assert!(
             NativeImportAuthority::legacy_source_has_shard_clock(&cut, &cut.scope_shard).unwrap()
         );
+        // The shared physical role is DATA independent of table generation;
+        // only the old wrapper additionally requires format 6. Neither call
+        // supplies a prefix, ACK, configuration, native receipt or Ready.
+        for format in [2, 6, 9] {
+            let mut cross_format = cut.clone();
+            cross_format.source_format_version = Some(format);
+            assert!(
+                NativeImportAuthority::source_has_physical_shard_clock(
+                    &cross_format,
+                    &cross_format.scope_shard
+                )
+                .unwrap()
+            );
+            assert_eq!(
+                NativeImportAuthority::legacy_source_has_shard_clock(
+                    &cross_format,
+                    &cross_format.scope_shard
+                )
+                .unwrap(),
+                format == 6
+            );
+        }
         // Hash-only DATA controls do not create a placement reservation,
         // RPC, receipt or authority. The common pipeline validates those bodies.
         cut.pending_operations =
@@ -1517,8 +1615,17 @@ mod ancestry_ledger_tests {
         assert!(
             NativeImportAuthority::legacy_source_has_shard_clock(&cut, &cut.scope_shard).unwrap()
         );
+        let mut cross_format_goal = cut.clone();
+        cross_format_goal.source_format_version = Some(2);
+        assert!(
+            NativeImportAuthority::source_has_physical_shard_clock(
+                &cross_format_goal,
+                &cross_format_goal.scope_shard
+            )
+            .unwrap()
+        );
         let valid = cut.clone();
-        for change in 0..8 {
+        for change in 0..9 {
             let mut changed = valid.clone();
             match change {
                 0 => changed.pending_operations[0]["opaque-DATA"] = serde_json::json!("changed"),
@@ -1562,15 +1669,32 @@ mod ancestry_ledger_tests {
                     changed.pending_operations[0]["current_effects_authored"] =
                         serde_json::Value::Null
                 }
-                _ => {
+                7 => {
                     changed.pending_operations[0]
                         .as_object_mut()
                         .unwrap()
                         .remove("current_effects_authored");
                 }
+                _ => {
+                    changed.staged_root = root
+                        .path()
+                        .join("other-owner/dfs/metadata/.metadata-conversion")
+                        .join(&key)
+                        .join("target-format-9/data-goals")
+                        .join(&goal)
+                        .join("current-image");
+                }
             }
             assert!(
                 !NativeImportAuthority::legacy_source_has_shard_clock(
+                    &changed,
+                    &changed.scope_shard
+                )
+                .unwrap()
+            );
+            changed.source_format_version = Some(2);
+            assert!(
+                !NativeImportAuthority::source_has_physical_shard_clock(
                     &changed,
                     &changed.scope_shard
                 )
@@ -1584,6 +1708,19 @@ mod ancestry_ledger_tests {
             .join("target-format-9/current-image");
         // A combined ROOT source for USERS keeps ROOT floors and source fences.
         cut.source_root = primary_metadata.join("root");
+        // Even a correctly hashed owned stage cannot give a combined ROOT
+        // stream the independent USERS role.
+        let key = blake3::hash(&serde_json::to_vec(&(&cut.source_root, &cut.scope_shard)).unwrap())
+            .to_hex()
+            .to_string();
+        cut.staged_root = primary_metadata
+            .join(".metadata-conversion")
+            .join(&key)
+            .join("target-format-9/current-image");
+        assert!(
+            !NativeImportAuthority::source_has_physical_shard_clock(&cut, &cut.scope_shard)
+                .unwrap()
+        );
         assert!(
             !NativeImportAuthority::legacy_source_has_shard_clock(&cut, &cut.scope_shard).unwrap()
         );

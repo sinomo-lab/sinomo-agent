@@ -391,6 +391,14 @@ pub trait MetadataImportAuthority: Send + Sync {
         Vec<sinomo_core::node::NodeId>,
     )>;
     fn local_node_id(&self) -> Result<sinomo_core::node::NodeId>;
+    /// Local staged DATA hint only. It cannot establish activation or readiness.
+    fn current_receiver_stage_pending(
+        &self,
+        _destination: &Path,
+        _shard: &DfsMetadataShardId,
+    ) -> Result<bool> {
+        Ok(false)
+    }
     fn received(
         &self,
         source: &MetadataSourceContentWorkScope,
@@ -821,13 +829,23 @@ impl MetadataConverter {
                 .as_ref()
                 .ok_or_else(|| error("prior installation requires actual native authority"))?;
             warm_session.take();
-            let session = open_session_at_stage(
-                destination,
-                &interrupted.actual_source,
-                shard,
-                previous,
-                original_goal.cloned(),
-            )?;
+            let session = if current_root(&interrupted.actual_source)? {
+                open_session_shell(
+                    destination,
+                    &interrupted.actual_source,
+                    shard,
+                    previous,
+                    original_goal.cloned(),
+                )?
+            } else {
+                open_session_at_stage(
+                    destination,
+                    &interrupted.actual_source,
+                    shard,
+                    previous,
+                    original_goal.cloned(),
+                )?
+            };
             validate_retained_source_identity(
                 &interrupted.actual_source,
                 &interrupted.source_identity,
@@ -880,13 +898,23 @@ impl MetadataConverter {
                 .as_ref()
                 .ok_or_else(|| error("interrupted import requires actual native authority"))?;
             warm_session.take();
-            let session = open_session_at_stage(
-                destination,
-                &interrupted.actual_source,
-                shard,
-                conversion_stage.clone(),
-                data_goal.cloned(),
-            )?;
+            let session = if current_root(&interrupted.actual_source)? {
+                open_session_shell(
+                    destination,
+                    &interrupted.actual_source,
+                    shard,
+                    conversion_stage.clone(),
+                    data_goal.cloned(),
+                )?
+            } else {
+                open_session_at_stage(
+                    destination,
+                    &interrupted.actual_source,
+                    shard,
+                    conversion_stage.clone(),
+                    data_goal.cloned(),
+                )?
+            };
             validate_retained_source_identity(
                 &interrupted.actual_source,
                 &interrupted.source_identity,
@@ -935,6 +963,99 @@ impl MetadataConverter {
             && (goal_capsules.is_empty()
                 || published_data_goal_matches(destination, shard, goal_capsules)?)
         {
+            if let Some(authority) = self.authority.as_ref() {
+                if authority.current_receiver_stage_pending(destination, shard)? {
+                    // Representation readiness does not install an activated peer image.
+                    // Retain the actual local source before recovering its native seal.
+                    let session = open_session_shell(
+                        destination,
+                        destination,
+                        shard,
+                        conversion_stage.clone(),
+                        data_goal.cloned(),
+                    )?;
+                    let local = sinomo_dfs::LocalSobjMetadataBackend::open_for_inspection(
+                        shard.clone(),
+                        destination,
+                    )?;
+                    let prefix =
+                        sinomo_dfs::DfsMetadataBackend::metadata_prefix_proof(&local, shard)?
+                            .ok_or_else(|| {
+                                error("current receiver has no actual materialized prefix")
+                            })?;
+                    let snapshot = local.export_table_snapshot();
+                    let mut ids = std::collections::BTreeSet::new();
+                    ids.extend(
+                        snapshot
+                            .tables
+                            .file_systems
+                            .iter()
+                            .map(|row| row.file_system_id.clone()),
+                    );
+                    ids.extend(
+                        snapshot
+                            .tables
+                            .objects
+                            .iter()
+                            .map(|row| row.file_system_id.clone()),
+                    );
+                    ids.extend(
+                        snapshot
+                            .tables
+                            .versions
+                            .iter()
+                            .map(|row| row.file_system_id.clone()),
+                    );
+                    ids.extend(
+                        snapshot
+                            .tables
+                            .prepared_operations_v7
+                            .iter()
+                            .map(|row| row.digest.file_system_id.clone()),
+                    );
+                    let ids = ids.into_iter().collect::<Vec<_>>();
+                    if ids.is_empty() {
+                        return Err(error(
+                            "current receiver materialization has no actual filesystem scope",
+                        ));
+                    }
+                    let scope = MetadataSourceContentWorkScope {
+                        source_root: destination.to_owned(),
+                        source_identity: session.inventory.fingerprint.clone(),
+                        source_snapshot_fingerprint: session
+                            .inventory
+                            .snapshot_fingerprint()
+                            .unwrap_or(&session.inventory.fingerprint)
+                            .to_owned(),
+                        // This is the actual materialized cut, never an inferred full journal head.
+                        source_journal_sequence: snapshot.materialized_through_sequence,
+                        file_system_ids: ids.clone(),
+                        scope_shard: shard.clone(),
+                        projection_assignments: authority.assignments(&ids)?,
+                        original_handoff: None,
+                    };
+                    drop(local);
+                    if let Some((proposal, certificate)) =
+                        authority.received(&scope, Some(&prefix))?
+                    {
+                        validate_certificate(&proposal, &certificate)?;
+                        require_placement_goal_refs(&proposal.source_cut, goal_capsules)?;
+                        session.inventory.verify(&session.source_root)?;
+                        install_certified_stage(
+                            &session,
+                            &proposal,
+                            &certificate,
+                            authority.as_ref(),
+                        )?;
+                        *completion = Some(InstalledCompletion::Certified(
+                            proposal.source_cut.clone(),
+                            certificate,
+                            destination.to_owned(),
+                        ));
+                        return Ok(DfsStoragePreparation::Ready);
+                    }
+                }
+            }
             let marker = destination.join("metadata-import-v7.json");
             if marker.is_file() {
                 let raw: Value = read_json(&marker)?;
@@ -1845,10 +1966,31 @@ fn open_session_at_stage(
     staged_root: PathBuf,
     goal: Option<DataGoalStage>,
 ) -> Result<Session> {
+    let mut session = open_session_shell(destination, source, shard, staged_root, goal)?;
+    let progress_path = session.staged_root.join("progress.json");
+    if progress_path.exists() {
+        let progress =
+            progress_for_data_goal(read_json(&progress_path)?, session.data_goal.as_ref())?;
+        if progress.source.inventory.as_ref() != Some(&session.inventory) {
+            return Err(error("resumed conversion names a different source cut"));
+        }
+        session.progress = progress;
+    }
+    save_progress(&session)?;
+    Ok(session)
+}
+/// Fresh fenced context for replay or certified installation. Installation
+/// callers never read or overwrite an earlier conversion's progress/ledger.
+fn open_session_shell(
+    destination: &Path,
+    source: &Path,
+    shard: &DfsMetadataShardId,
+    staged_root: PathBuf,
+    goal: Option<DataGoalStage>,
+) -> Result<Session> {
     let lock = retain_source_fence(source)?;
     let inventory = source::discover(source)?;
     fs::create_dir_all(&staged_root).map_err(error)?;
-    let progress_path = staged_root.join("progress.json");
     if let Some(goal) = goal.as_ref() {
         if goal.destination != destination
             || goal.shard != *shard
@@ -1862,24 +2004,16 @@ fn open_session_at_stage(
             return Err(error("conversion cursor path names another DATA goal"));
         }
     }
-    let progress = if progress_path.exists() {
-        let progress = progress_for_data_goal(read_json(&progress_path)?, goal.as_ref())?;
-        if progress.source.inventory.as_ref() != Some(&inventory) {
-            return Err(error("resumed conversion names a different source cut"));
-        }
-        progress
-    } else {
-        Progress {
-            source: source::SourceCursor::new(inventory.clone()),
-            events: Default::default(),
-            phase: Phase::Source,
-            tail_after: 0,
-            current_import_candidate_count: None,
-            data_goal_digest: goal.as_ref().map(|goal| goal.digest.clone()),
-        }
+    let progress = Progress {
+        source: source::SourceCursor::new(inventory.clone()),
+        events: Default::default(),
+        phase: Phase::Source,
+        tail_after: 0,
+        current_import_candidate_count: None,
+        data_goal_digest: goal.as_ref().map(|goal| goal.digest.clone()),
     };
     let replay_source = source::SourceCursor::new(inventory.clone());
-    let session = Session {
+    Ok(Session {
         _source_lock: lock,
         source_root: source.to_owned(),
         destination_root: destination.to_owned(),
@@ -1907,9 +2041,7 @@ fn open_session_at_stage(
         confirmed_source_content_bindings: Default::default(),
         journal_sequences: Default::default(),
         journal_frame_digests: BTreeMap::new(),
-    };
-    save_progress(&session)?;
-    Ok(session)
+    })
 }
 fn unversioned_conversion_stage_base_path(
     destination: &Path,
@@ -2077,6 +2209,19 @@ fn require_placement_goal_refs(cut: &MetadataSourceCut, capsules: &[Value]) -> R
     }
     Ok(())
 }
+/// Local source custody for an earned current-peer receiver exchange. This is
+/// installation DATA written only after native certificate validation.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReceiverLocalSourceBinding {
+    source_root: PathBuf,
+    source_identity: String,
+    source_snapshot_fingerprint: String,
+    source_exact_prefix: DfsMetadataPrefixProof,
+    retained_source_root: PathBuf,
+    authority_binding: String,
+    proposal_fingerprint: String,
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MetadataImportMarker {
@@ -2087,6 +2232,11 @@ struct MetadataImportMarker {
     authority_binding: String,
     source_cut: MetadataSourceCut,
     native_image: sinomo_dfs::DfsMetadataCandidateIdentity,
+    /// DATA from the validated native seal; only a local plan-scan hint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    installed_native_assignment: Option<DfsMetadataShardConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    receiver_local_source: Option<ReceiverLocalSourceBinding>,
     /// A physical installation fact, written only after native certification,
     /// exact destination-image verification and imported-work registration.
     #[serde(default)]
@@ -2105,28 +2255,69 @@ fn read_import_marker(
     let marker: MetadataImportMarker = read_json(&path)?;
     let cut = &marker.source_cut;
     source_proof::validate(&marker.native_image.prefix_proof)?;
+    let expected_parent = destination
+        .parent()
+        .ok_or_else(|| error("installed DATA destination has no owner"))?
+        .join(".metadata-retained");
     if marker.format_version != 7
         || cut.scope_shard != *shard
         || marker.authority_binding.is_empty()
         || marker.native_image.prefix_proof != cut.target_exact_prefix
         || marker.native_image.state_fingerprint != cut.current_image_fingerprint
-        || marker.source_identity != cut.source_identity
-        || marker.source_snapshot_fingerprint != cut.source_snapshot_fingerprint
     {
         return Err(error(
             "installed marker changes its complete native cut/image/source binding",
         ));
     }
-    let expected_parent = destination
-        .parent()
-        .ok_or_else(|| error("installed DATA destination has no owner"))?
-        .join(".metadata-retained");
-    if cut.source_root == destination
-        && marker.retained_source_root.parent() != Some(expected_parent.as_path())
+    if marker
+        .installed_native_assignment
+        .as_ref()
+        .is_some_and(|assignment| {
+            assignment.shard_id != shard.0
+                || !cut.file_system_ids.contains(&assignment.file_system_id)
+                || !cut.projection_assignments.iter().any(|retiring| {
+                    retiring.file_system_id == assignment.file_system_id
+                        && retiring.shard_id == assignment.shard_id
+                        && retiring.epoch < assignment.epoch
+                })
+        })
+    {
+        return Err(error(
+            "installed marker changes its native assignment scope/epoch",
+        ));
+    }
+    if let Some(local) = marker.receiver_local_source.as_ref() {
+        source_proof::validate(&local.source_exact_prefix)?;
+        let archive_key = blake3::hash(
+            &serde_json::to_vec(&(&destination, &local.proposal_fingerprint)).map_err(error)?,
+        )
+        .to_hex()
+        .to_string();
+        if local.source_root != destination
+            || cut.source_root == destination
+            || local.source_identity != marker.source_identity
+            || local.source_snapshot_fingerprint != marker.source_snapshot_fingerprint
+            || local.authority_binding != marker.authority_binding
+            || local.proposal_fingerprint.is_empty()
+            || local.retained_source_root != marker.retained_source_root
+            || local.retained_source_root != expected_parent.join(archive_key)
+            || local.source_exact_prefix.version != 2
+            || local.source_exact_prefix.journal_sequence > cut.source_journal_sequence
+            || local.source_exact_prefix.journal_sequence == cut.source_journal_sequence
+                && cut.source_exact_prefix.as_ref() != Some(&local.source_exact_prefix)
+        {
+            return Err(error(
+                "installed receiver marker changes its exact local source/archive binding",
+            ));
+        }
+    } else if marker.source_identity != cut.source_identity
+        || marker.source_snapshot_fingerprint != cut.source_snapshot_fingerprint
+        || cut.source_root == destination
+            && marker.retained_source_root.parent() != Some(expected_parent.as_path())
         || cut.source_root != destination && marker.retained_source_root != cut.source_root
     {
         return Err(error(
-            "installed marker changes its actual retained source role",
+            "installed marker changes its actual retained source role or identity",
         ));
     }
     Ok(Some(marker))
@@ -2243,6 +2434,12 @@ fn complete_installed_import_marker(
         || marker.native_image != *identity
         || serde_json::to_value(&marker.source_cut).map_err(error)?
             != serde_json::to_value(&proposal.source_cut).map_err(error)?
+        || marker.receiver_local_source.as_ref().is_some_and(|local| {
+            local.source_root != proposal.source_root
+                || local.source_identity != proposal.source_identity
+                || local.source_snapshot_fingerprint != proposal.source_snapshot_fingerprint
+                || proposal.source_exact_prefix.as_ref() != Some(&local.source_exact_prefix)
+        })
     {
         return Err(error(
             "verified installation marker changed before completion",
@@ -2879,6 +3076,48 @@ struct BuiltImage {
     identity: sinomo_dfs::DfsMetadataCandidateIdentity,
     pending_mapping: Vec<Value>,
 }
+fn validate_native_source_slot(source: &Value, original_cut: u64) -> Result<()> {
+    let original_prepare = original_cut
+        .checked_add(1)
+        .ok_or_else(|| error("native sequence mapping original journal cut overflows"))?;
+    if source["source_payload"]["expected_journal_sequence"].as_u64() != Some(original_cut)
+        || source["source_prepare_sequence"].as_u64() != Some(original_prepare)
+    {
+        return Err(error("native sequence mapping changes the original slot"));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod native_sequence_mapping_tests {
+    use super::*;
+
+    #[test]
+    fn overflow_missing_and_mismatched_original_slots_are_rejected() {
+        for (cut, slot) in [
+            (u64::MAX, None),
+            (u64::MAX, Some(u64::MAX)),
+            (10, None),
+            (10, Some(12)),
+        ] {
+            let mut source =
+                serde_json::json!({"source_payload":{"expected_journal_sequence":cut}});
+            if let Some(slot) = slot {
+                source["source_prepare_sequence"] = serde_json::json!(slot);
+            }
+            let original = source.clone();
+            assert!(validate_native_source_slot(&source, cut).is_err());
+            assert_eq!(source, original);
+            source["source_prepare_sequence"] = Value::Null;
+            assert!(validate_native_source_slot(&source, cut).is_err());
+        }
+        let mut source = serde_json::json!({"source_payload":{"expected_journal_sequence":10},"source_prepare_sequence":11});
+        validate_native_source_slot(&source, 10).unwrap();
+        source["source_payload"]["expected_journal_sequence"] = serde_json::json!(9);
+        assert!(validate_native_source_slot(&source, 10).is_err());
+    }
+}
+
 fn build_native_image(
     session: &Session,
     shard: &DfsMetadataShardId,
@@ -2955,7 +3194,7 @@ fn build_native_image(
             continue;
         }
 
-        let payload: sinomo_dfs::DfsPreparedOperationPayload = serde_json::from_value(
+        let mut payload: sinomo_dfs::DfsPreparedOperationPayload = serde_json::from_value(
             source
                 .get("payload")
                 .cloned()
@@ -2993,6 +3232,26 @@ fn build_native_image(
             })
             .transpose()?
             .unwrap_or(payload.transaction.created_at);
+        if source
+            .get("requires_native_sequence_mapping")
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            let original_cut = payload.expected_journal_sequence.ok_or_else(|| {
+                error("native sequence mapping lost its original journal-cut clause")
+            })?;
+            validate_native_source_slot(&source, original_cut).map_err(|cause| {
+                error(format!(
+                    "native sequence mapping: filesystem {} shard {} operation {}: {cause}",
+                    payload.file_system_id, payload.shard_id.0, payload.operation_id,
+                ))
+            })?;
+            // Source payload, digest and slot stay archival. The current body
+            // binds the exact preceding prefix of this exclusively owned image,
+            // and CandidateWriter hashes that body and its actual new slot.
+            payload.expected_journal_sequence = Some(proof.journal_sequence);
+            source["payload"] = serde_json::to_value(&payload).map_err(error)?;
+        }
         let (mut record, after_prepare) = writer.prepare(payload, &proof)?;
         proof = after_prepare;
         if retired {
@@ -3312,13 +3571,53 @@ fn install_certified_stage(
         }
         _ => return Err(error("import certificate uses a different authority mode")),
     };
+    let certified_current_receiver = match (proposal, certificate) {
+        (MetadataImportProposal::Native(native), MetadataImportCertificate::Native(seal)) => {
+            proposal.source_root == session.destination_root
+                && proposal.source_cut.source_root != proposal.source_root
+                && current_root(&session.source_root)?
+                && matches!(
+                    seal.joint_handoff_proof.cause,
+                    sinomo_dfs::DfsMetadataShardHandoffCause::StorageImport { .. }
+                )
+                && seal.joint_handoff_proof.handoff_id == native.expected_handoff.handoff_id
+                && seal.joint_handoff_proof.retiring_shard == native.expected_handoff.retiring_shard
+                && seal.joint_handoff_proof.desired_shard == native.expected_handoff.desired_shard
+                && seal
+                    .joint_handoff_proof
+                    .acknowledged_node_ids
+                    .contains(&authority.local_node_id()?)
+                && proposal.source_identity == session.inventory.fingerprint
+                && proposal.source_snapshot_fingerprint
+                    == session
+                        .inventory
+                        .snapshot_fingerprint()
+                        .unwrap_or(&session.inventory.fingerprint)
+                && proposal.source_exact_prefix.is_some()
+        }
+        _ => false,
+    };
     for fs in &proposal.file_system_ids {
+        let local_format = if certified_current_receiver {
+            Some(sinomo_dfs::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION)
+        } else {
+            proposal.source_cut.source_format_version
+        };
         let floors = ack_floor::acknowledged_source_floors_for_root(
             &session.source_root,
             fs,
-            proposal.source_cut.source_format_version,
+            local_format,
             &proposal.source_cut.scope_shard,
         )?;
+        if certified_current_receiver
+            && proposal.source_cut.source_format_version
+                != Some(sinomo_dfs::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION)
+            && floors.is_empty()
+        {
+            return Err(error(
+                "certified current receiver has no actual local native floor",
+            ));
+        }
         // The native seal follows authenticated receiver-ledger verification.
         // Recheck these immutable LOCAL files; primary evidence paths do not
         // identify receiver-local files.
@@ -3428,9 +3727,47 @@ fn install_certified_stage(
             "completed-original-candidate-stamp-v8.json",
         )?;
     }
+    let receiver_local_source = if certified_current_receiver
+        && proposal.source_cut.source_root != session.destination_root
+    {
+        Some(ReceiverLocalSourceBinding {
+            source_root: proposal.source_root.clone(),
+            source_identity: proposal.source_identity.clone(),
+            source_snapshot_fingerprint: proposal.source_snapshot_fingerprint.clone(),
+            source_exact_prefix: proposal
+                .source_exact_prefix
+                .clone()
+                .ok_or_else(|| error("certified current receiver omits its exact local prefix"))?,
+            retained_source_root: source_retained.clone(),
+            authority_binding: installation_binding.clone(),
+            proposal_fingerprint: certificate.proposal_fingerprint.clone(),
+        })
+    } else {
+        None
+    };
     write_json(
         &candidate_marker,
-        &serde_json::json!({"format_version":7,"retained_source_root":source_retained,"source_identity":session.inventory.fingerprint,"source_snapshot_fingerprint":session.inventory.snapshot_fingerprint().unwrap_or(&session.inventory.fingerprint),"authority_binding":installation_binding,"source_cut":proposal.source_cut,"native_image":identity}),
+        &MetadataImportMarker {
+            format_version: 7,
+            retained_source_root: source_retained,
+            source_identity: session.inventory.fingerprint.clone(),
+            source_snapshot_fingerprint: session
+                .inventory
+                .snapshot_fingerprint()
+                .unwrap_or(&session.inventory.fingerprint)
+                .to_owned(),
+            authority_binding: installation_binding.clone(),
+            source_cut: proposal.source_cut.clone(),
+            native_image: identity.clone(),
+            installed_native_assignment: match certificate {
+                MetadataImportCertificate::Native(seal) => {
+                    Some(seal.joint_handoff_proof.desired_shard.clone())
+                }
+                MetadataImportCertificate::Standalone(_) => None,
+            },
+            receiver_local_source,
+            installation_complete: false,
+        },
     )?;
     sinomo_core::storage::durable_file::remove_file_if_exists_and_sync_parent(
         &proposal.staged_root.join("metadata-candidate-v7.json"),
@@ -3458,6 +3795,7 @@ fn install_certified_stage(
             && !(proposal.source_cut.original_handoff.is_some()
                 && session.source_root == session.destination_root)
             && !qualified_data_exchange
+            && !certified_current_receiver
         {
             return Err(error(
                 "current destination was published by a different import",
