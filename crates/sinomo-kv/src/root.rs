@@ -43,6 +43,8 @@ pub const CLUSTER_KV_AUTHORITATIVE_ENTRY_ROUTE: &str = "/cluster/kv/authoritativ
 pub const CLUSTER_KV_AUTHORITATIVE_ENTRIES_ROUTE: &str = "/cluster/kv/authoritative/entries";
 pub const CLUSTER_KV_AUTHORITATIVE_RANGE_PREFIX_ROUTE: &str =
     "/cluster/kv/authoritative/range-prefix";
+pub const CLUSTER_KV_AUTHORITATIVE_COMPLETE_RANGE_PREFIX_ROUTE: &str =
+    "/cluster/kv/authoritative/complete-range-prefix";
 pub const CLUSTER_KV_AUTHORITATIVE_WATCH_START_ROUTE: &str =
     "/cluster/kv/authoritative/watch-start";
 pub const CLUSTER_KV_TXN_ROUTE: &str = "/cluster/kv/txn";
@@ -72,6 +74,7 @@ pub const CLUSTER_KV_RPC_ROUTES: &[&str] = &[
     CLUSTER_KV_AUTHORITATIVE_ENTRY_ROUTE,
     CLUSTER_KV_AUTHORITATIVE_ENTRIES_ROUTE,
     CLUSTER_KV_AUTHORITATIVE_RANGE_PREFIX_ROUTE,
+    CLUSTER_KV_AUTHORITATIVE_COMPLETE_RANGE_PREFIX_ROUTE,
     CLUSTER_KV_AUTHORITATIVE_WATCH_START_ROUTE,
     CLUSTER_KV_TXN_ROUTE,
     CLUSTER_KV_REQUEST_OUTCOME_ROUTE,
@@ -99,6 +102,10 @@ pub const CLUSTER_KV_RPC_ROUTE_METADATA: &[(&str, &str)] = &[
     ),
     (
         CLUSTER_KV_AUTHORITATIVE_RANGE_PREFIX_ROUTE,
+        CLUSTER_KV_RPC_CATEGORY,
+    ),
+    (
+        CLUSTER_KV_AUTHORITATIVE_COMPLETE_RANGE_PREFIX_ROUTE,
         CLUSTER_KV_RPC_CATEGORY,
     ),
     (
@@ -178,6 +185,12 @@ pub const CLUSTER_KV_RPC_ROUTE_POLICIES: &[ClusterKvRpcRoutePolicy] = &[
     },
     ClusterKvRpcRoutePolicy {
         route: CLUSTER_KV_AUTHORITATIVE_RANGE_PREFIX_ROUTE,
+        category: CLUSTER_KV_RPC_CATEGORY,
+        auth: ClusterKvRouteAuth::LocalOrClusterMember,
+        required_capabilities: &[CLUSTER_KV_READ_CAPABILITY],
+    },
+    ClusterKvRpcRoutePolicy {
+        route: CLUSTER_KV_AUTHORITATIVE_COMPLETE_RANGE_PREFIX_ROUTE,
         category: CLUSTER_KV_RPC_CATEGORY,
         auth: ClusterKvRouteAuth::LocalOrClusterMember,
         required_capabilities: &[CLUSTER_KV_READ_CAPABILITY],
@@ -274,6 +287,11 @@ pub const MAX_CLUSTER_KV_MATERIALIZED_EVENTS: usize = 64;
 pub const CLUSTER_KV_DEFERRED_MATERIALIZED_MAX_REVISION_LAG: u64 = 64;
 pub const CLUSTER_KV_DEFERRED_MATERIALIZED_MIN_INTERVAL: Duration = Duration::from_secs(300);
 pub const MAX_CLUSTER_KV_RAFT_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024;
+/// Explicit bootstrap/recovery projection, admitted from one native authoritative
+/// snapshot. Ordinary prefix reads and command/write budgets remain independent.
+pub const CLUSTER_KV_COMPLETE_RANGE_PREFIX_MAX_PAYLOAD_BYTES: usize =
+    MAX_CLUSTER_KV_RAFT_SNAPSHOT_BYTES as usize;
+pub const CLUSTER_KV_COMPLETE_RANGE_PREFIX_MAX_ENTRIES: usize = 65_536;
 pub const MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS: usize = 64;
 /// Committed log entries kept in memory after a local snapshot compaction. A
 /// follower that has fallen at most this many entries behind can be caught up
@@ -476,9 +494,11 @@ pub use rpc::{
     decode_cluster_raft_vote_rpc_response_body, handle_cluster_kv_local_read_watch_request,
     handle_cluster_kv_local_read_watch_rpc_payload, handle_cluster_kv_request_outcome_rpc_payload,
     handle_cluster_kv_watch_events, handle_cluster_raft_rpc_payload,
-    pack_cluster_kv_authoritative_entries_response, project_cluster_kv_authoritative_entries,
-    project_cluster_kv_authoritative_range_prefix,
+    pack_cluster_kv_authoritative_entries_response,
+    project_cluster_kv_authoritative_complete_range_prefix,
+    project_cluster_kv_authoritative_entries, project_cluster_kv_authoritative_range_prefix,
     unpack_cluster_kv_authoritative_entries_response,
+    validate_cluster_kv_authoritative_complete_range_prefix_read,
     validate_cluster_kv_authoritative_entries_read,
     validate_cluster_kv_authoritative_entries_request_keys,
     validate_cluster_kv_authoritative_entry_read, validate_cluster_kv_authoritative_snapshot_read,

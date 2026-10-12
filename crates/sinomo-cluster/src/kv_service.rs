@@ -7,12 +7,13 @@
 
 use crate::ClusterKvPathsExt;
 use sinomo_kv::{
-    CLUSTER_KV_AUTHORITATIVE_ENTRIES_ROUTE, CLUSTER_KV_AUTHORITATIVE_ENTRY_ROUTE,
-    CLUSTER_KV_AUTHORITATIVE_RANGE_PREFIX_ROUTE, CLUSTER_KV_AUTHORITATIVE_SNAPSHOT_ROUTE,
-    CLUSTER_KV_AUTHORITATIVE_WATCH_START_ROUTE, CLUSTER_KV_LOCAL_ENTRY_ROUTE,
-    CLUSTER_KV_LOCAL_READ_WATCH_ROUTES, CLUSTER_KV_LOCAL_SNAPSHOT_ROUTE,
-    CLUSTER_KV_REQUEST_OUTCOME_ROUTE, CLUSTER_KV_RPC_ROUTE_POLICIES, CLUSTER_KV_RPC_ROUTES,
-    CLUSTER_KV_TXN_ROUTE, CLUSTER_KV_WATCH_EVENTS_ROUTE, ClusterKvAuthoritativeEntriesRequest,
+    CLUSTER_KV_AUTHORITATIVE_COMPLETE_RANGE_PREFIX_ROUTE, CLUSTER_KV_AUTHORITATIVE_ENTRIES_ROUTE,
+    CLUSTER_KV_AUTHORITATIVE_ENTRY_ROUTE, CLUSTER_KV_AUTHORITATIVE_RANGE_PREFIX_ROUTE,
+    CLUSTER_KV_AUTHORITATIVE_SNAPSHOT_ROUTE, CLUSTER_KV_AUTHORITATIVE_WATCH_START_ROUTE,
+    CLUSTER_KV_LOCAL_ENTRY_ROUTE, CLUSTER_KV_LOCAL_READ_WATCH_ROUTES,
+    CLUSTER_KV_LOCAL_SNAPSHOT_ROUTE, CLUSTER_KV_REQUEST_OUTCOME_ROUTE,
+    CLUSTER_KV_RPC_ROUTE_POLICIES, CLUSTER_KV_RPC_ROUTES, CLUSTER_KV_TXN_ROUTE,
+    CLUSTER_KV_WATCH_EVENTS_ROUTE, ClusterKvAuthoritativeEntriesRequest,
     ClusterKvAuthoritativeEntriesResponse, ClusterKvAuthoritativeRangePrefixRequest,
     ClusterKvAuthoritativeSnapshotRequest, ClusterKvAuthoritativeWatchStartRequest,
     ClusterKvEntryRequest, ClusterKvLocalReadWatchHost, ClusterKvLocalReadWatchRequest,
@@ -67,6 +68,20 @@ pub trait ClusterKvServiceHost: Send + Sync + 'static {
         prefix: String,
         allow_forwarding: bool,
     ) -> ClusterKvServiceFuture<'a, KvAuthoritativeRead<Vec<KvEntry>>>;
+
+    /// Rare bootstrap/recovery reads borrow the SAME native snapshot authority
+    /// operation rather than building a prefix from separately observed pages.
+    fn authoritative_complete_range_prefix<'a>(
+        &'a self,
+        prefix: String,
+        allow_forwarding: bool,
+    ) -> ClusterKvServiceFuture<'a, KvAuthoritativeRead<Vec<KvEntry>>> {
+        Box::pin(async move {
+            let snapshot = self.authoritative_snapshot(allow_forwarding).await?;
+            sinomo_kv::project_cluster_kv_authoritative_complete_range_prefix(&snapshot, &prefix)
+                .map_err(ServiceError::from)
+        })
+    }
 
     fn request_outcome<'a>(
         &'a self,
@@ -153,6 +168,7 @@ enum ClusterKvServiceResponse {
     AuthoritativeEntries(ClusterKvAuthoritativeEntriesResponse),
     AuthoritativeSnapshot(KvAuthoritativeRead<KvSnapshot>),
     AuthoritativeRange(KvAuthoritativeRead<Vec<KvEntry>>),
+    AuthoritativeCompleteRange(KvAuthoritativeRead<Vec<KvEntry>>),
     AuthoritativeWatch(KvAuthoritativeRead<ClusterKvWatchRegistration>),
     RequestOutcome(ClusterKvRequestOutcomeRead),
     Transaction(ClusterKvTxnRpcResponse),
@@ -192,6 +208,10 @@ impl ClusterKvServiceResponse {
             Self::AuthoritativeRange(response) => {
                 ctx.respond_value(CLUSTER_KV_AUTHORITATIVE_RANGE_PREFIX_ROUTE, response)
             }
+            Self::AuthoritativeCompleteRange(response) => ctx.respond_value(
+                CLUSTER_KV_AUTHORITATIVE_COMPLETE_RANGE_PREFIX_ROUTE,
+                response,
+            ),
             Self::AuthoritativeWatch(response) => {
                 ctx.respond_value(CLUSTER_KV_AUTHORITATIVE_WATCH_START_ROUTE, response)
             }
@@ -516,6 +536,14 @@ impl Service for HostedClusterKvService {
                             .await?,
                     )
                 }
+                CLUSTER_KV_AUTHORITATIVE_COMPLETE_RANGE_PREFIX_ROUTE => {
+                    let request: ClusterKvAuthoritativeRangePrefixRequest =
+                        ctx.decode_request_body(&request).await?;
+                    ClusterKvServiceResponse::AuthoritativeCompleteRange(
+                        host.authoritative_complete_range_prefix(request.prefix, allow_forwarding)
+                            .await?,
+                    )
+                }
                 CLUSTER_KV_AUTHORITATIVE_WATCH_START_ROUTE => {
                     let request: ClusterKvAuthoritativeWatchStartRequest =
                         ctx.decode_request_body(&request).await?;
@@ -622,14 +650,24 @@ pub fn register_cluster_kv_service(
 mod tests {
     use super::*;
 
-    struct TestHost;
+    #[derive(Default)]
+    struct TestHost {
+        snapshot: Option<KvAuthoritativeRead<KvSnapshot>>,
+        snapshot_calls: std::sync::atomic::AtomicUsize,
+    }
 
     impl ClusterKvServiceHost for TestHost {
         fn authoritative_snapshot<'a>(
             &'a self,
             _allow_forwarding: bool,
         ) -> ClusterKvServiceFuture<'a, KvAuthoritativeRead<KvSnapshot>> {
-            Box::pin(async { Err(ServiceError::Service("unused".to_string())) })
+            Box::pin(async {
+                self.snapshot_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.snapshot
+                    .clone()
+                    .ok_or_else(|| ServiceError::Service("native snapshot unavailable".into()))
+            })
         }
 
         fn authoritative_entry<'a>(
@@ -675,7 +713,7 @@ mod tests {
 
     #[test]
     fn service_routes_follow_kv_policies() {
-        let service = HostedClusterKvService::new(Arc::new(TestHost));
+        let service = HostedClusterKvService::new(Arc::new(TestHost::default()));
         assert_eq!(service.routes(), CLUSTER_KV_RPC_ROUTES);
         assert_eq!(
             service.route_categories(),
@@ -688,6 +726,61 @@ mod tests {
                     policy.required_capabilities.iter().copied(),
                 ))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_prefix_service_captures_once_and_preserves_native_authority_failure() {
+        let unavailable = TestHost::default();
+        assert!(
+            unavailable
+                .authoritative_complete_range_prefix("/scope/".into(), true)
+                .await
+                .is_err()
+        );
+        let revision = sinomo_kv::KvRevision(7);
+        let host = TestHost {
+            snapshot: Some(KvAuthoritativeRead {
+                value: KvSnapshot {
+                    revision,
+                    compacted_revision: sinomo_kv::KvRevision::ZERO,
+                    entries: (0..3)
+                        .map(|index| KvEntry {
+                            key: format!("/scope/{index}"),
+                            value: vec![index as u8; 3 * 1024 * 1024],
+                            create_revision: revision,
+                            modify_revision: revision,
+                            version: sinomo_kv::KvVersion(1),
+                            lease_id: None,
+                        })
+                        .collect(),
+                    leases: vec![],
+                    events: vec![],
+                    committed_requests: vec![],
+                    expired_requests: vec![],
+                },
+                authority: sinomo_kv::KvAuthorityProof {
+                    term: 4,
+                    commit_index: 12,
+                    revision,
+                    basis: sinomo_kv::KvAuthorityBasis::CurrentTermQuorum {
+                        voter_acks: 2,
+                        required_quorum: 2,
+                    },
+                },
+            }),
+            ..TestHost::default()
+        };
+        let result = host
+            .authoritative_complete_range_prefix("/scope/".into(), true)
+            .await
+            .unwrap();
+        assert_eq!(result.value.len(), 3);
+        assert_eq!(result.authority, host.snapshot.as_ref().unwrap().authority);
+        assert_eq!(
+            host.snapshot_calls
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
         );
     }
 }

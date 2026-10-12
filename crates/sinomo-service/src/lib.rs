@@ -175,6 +175,25 @@ pub trait ClusterAccess: Send + Sync {
             )))
         })
     }
+    /// Explicit bootstrap/recovery read of a complete prefix from one native
+    /// authoritative snapshot, under the snapshot resource budget. Unsupported
+    /// hosts fail closed; ordinary prefix reads retain their smaller bounds.
+    fn kv_range_prefix_complete_authoritative_async<'a>(
+        &'a self,
+        prefix: String,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<KvAuthoritativeRead<Vec<KvEntry>>, ServiceError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            Err(ServiceError::Service(format!(
+                "complete authoritative prefix reads are unavailable for this service host ({prefix:?})"
+            )))
+        })
+    }
     /// Read retained request history through the SAME normal current-term
     /// authoritative boundary. This never executes the supplied request ID.
     /// Received request DATA cannot become an effect/receipt on an unsupported host.

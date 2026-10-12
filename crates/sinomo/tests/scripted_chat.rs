@@ -309,19 +309,13 @@ fn crash_during_slow_job(name: &str, detached: bool, after_crash: ModelScript) -
     );
     daemon.wait_for_agent_catalog();
     let chat = daemon.chat("crash-1");
-    let (first_session, _) = chat.ready();
-    // Switching the open session's agent breaks its identity, so the coding
-    // agent gets a new session.
+    let (session_id, _) = chat.ready();
     chat.command(ChatSessionCommand::SetAgent {
-        session_id: first_session,
+        session_id: session_id.clone(),
         key: "coding-agent".to_string(),
         history: Vec::new(),
     });
-    let session_id = sinomo_runtime::events::SessionId::generate().to_string();
-    chat.command(ChatSessionCommand::NewSession {
-        session_id: session_id.clone(),
-    });
-    chat.drain(Duration::from_secs(2));
+    chat.drain(Duration::from_secs(1));
     let workspace = root.join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
     chat.command(ChatSessionCommand::SetWorkspace {
@@ -422,96 +416,46 @@ impl Daemon {
         }
     }
 
-    /// Opens a chat and waits until it is ready. A chat opened while the
-    /// daemon is still publishing cluster services reports itself
-    /// unavailable; it is reopened, as a reconnecting client would.
+    /// Opens a chat and waits until it is ready.
     fn chat(&self, client_id: &str) -> Chat {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        for attempt in 0.. {
-            let client = sinomo_client::ChatDaemonClient::at_address(
-                self.address.clone(),
-                format!("{client_id}-{}-{attempt}", std::process::id()),
-            )
-            .with_timeout(Duration::from_secs(10));
-            let mut next_sequence = client
-                .open()
-                .expect("open daemon-hosted chat")
-                .next_event_sequence;
-            let mut unavailable = None;
-            while unavailable.is_none() && Instant::now() < deadline {
-                let response = client
-                    .events(next_sequence, 64, Duration::from_millis(500))
-                    .expect("poll chat events");
-                next_sequence = response.next_sequence;
-                for record in response.events {
-                    match record.event {
-                        ChatEvent::Ready { session_id, info } => {
-                            return Chat {
-                                client,
-                                next_sequence: std::cell::Cell::new(next_sequence),
-                                ready: (session_id, info),
-                            };
-                        }
-                        ChatEvent::Error { error, .. } if error.contains("chat unavailable") => {
-                            unavailable = Some(error);
-                        }
-                        _ => {}
-                    }
-                }
+        let client = sinomo_client::ChatDaemonClient::at_address(
+            self.address.clone(),
+            format!("{client_id}-{}", std::process::id()),
+        )
+        .with_timeout(Duration::from_secs(10));
+        let opened = client.open().expect("open daemon-hosted chat");
+        let mut chat = Chat {
+            client,
+            next_sequence: std::cell::Cell::new(opened.next_event_sequence),
+            ready: None,
+        };
+        let mut ready = None;
+        chat.poll_until(|event| {
+            if let ChatEvent::Ready { session_id, info } = event {
+                ready = Some((session_id.clone(), info.clone()));
+                true
+            } else {
+                false
             }
-            let _ = client.close();
-            assert!(
-                Instant::now() < deadline,
-                "chat did not become ready: {unavailable:?}"
-            );
-            std::thread::sleep(Duration::from_millis(500));
-        }
-        unreachable!("chat attempts are unbounded until the deadline")
+        });
+        chat.ready = ready;
+        chat
     }
 
     /// Opens a chat and resumes `session_id` with its stored history, as the
-    /// app does after a restart. Resuming needs cluster services the daemon
-    /// may still be publishing; an unavailable resume is retried.
+    /// app does after a restart.
     fn resume(&self, client_id: &str, session_id: &str) -> Chat {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        for attempt in 0.. {
-            let chat = self.chat(&format!("{client_id}-resume-{attempt}"));
-            chat.command(ChatSessionCommand::Resume {
-                session_id: session_id.to_string(),
-                history: self.history(session_id),
-            });
-            let mut failure = None;
-            let mut seen = Vec::new();
-            while failure.is_none() && Instant::now() < deadline {
-                let response = chat
-                    .client
-                    .events(chat.next_sequence.get(), 64, Duration::from_millis(500))
-                    .expect("poll chat events");
-                for record in response.events {
-                    chat.next_sequence.set(record.sequence + 1);
-                    match record.event {
-                        // Sent once the session is restored and attached.
-                        ChatEvent::ToolRuntime(selection)
-                            if selection.workspace_session_id.as_deref() == Some(session_id) =>
-                        {
-                            return chat;
-                        }
-                        ChatEvent::Error { error, .. } => {
-                            failure = Some(error);
-                            break;
-                        }
-                        other => seen.push(other),
-                    }
-                }
-            }
-            let _ = chat.client.close();
-            assert!(
-                Instant::now() < deadline,
-                "resume did not succeed: {failure:?}; events: {seen:?}"
-            );
-            std::thread::sleep(Duration::from_millis(500));
-        }
-        unreachable!("resume attempts are unbounded until the deadline")
+        let chat = self.chat(client_id);
+        chat.command(ChatSessionCommand::Resume {
+            session_id: session_id.to_string(),
+            history: self.history(session_id),
+        });
+        // Sent once the session is restored and attached.
+        chat.poll_until(|event| {
+            matches!(event, ChatEvent::ToolRuntime(selection)
+                if selection.workspace_session_id.as_deref() == Some(session_id))
+        });
+        chat
     }
 
     fn history(&self, session_id: &str) -> Vec<ChatHistoryMessage> {
@@ -569,7 +513,7 @@ impl Drop for Daemon {
 struct Chat {
     client: sinomo_client::ChatDaemonClient,
     next_sequence: std::cell::Cell<u64>,
-    ready: (String, sinomo_client::chat_contract::RuntimeInfo),
+    ready: Option<(String, sinomo_client::chat_contract::RuntimeInfo)>,
 }
 
 impl Chat {
@@ -579,7 +523,7 @@ impl Chat {
 
     /// The chat's session and runtime once it was ready.
     fn ready(&self) -> (String, sinomo_client::chat_contract::RuntimeInfo) {
-        self.ready.clone()
+        self.ready.clone().expect("the chat was ready")
     }
 
     /// Sends `text` and returns the events up to the end of its turn.
@@ -666,12 +610,12 @@ fn daemon_command(data_dir: &SinomoDataDir, port: u16, launch_id: &str) -> Comma
         .env("SINOMO_DATA_DIR", data_dir.root())
         .env(SINOMO_APP_DAEMON_LAUNCH_ID_ENV, launch_id)
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
+        .stdout(daemon_log(data_dir, &format!("{launch_id}.out")))
         .stderr(daemon_log(data_dir, launch_id));
     command
 }
 
-/// The daemon's stderr, kept in the test's data dir for diagnosis.
+/// A file in the test's data dir for the daemon's output, kept for diagnosis.
 fn daemon_log(data_dir: &SinomoDataDir, launch_id: &str) -> Stdio {
     std::fs::File::create(data_dir.root().join(format!("daemon-{launch_id}.log")))
         .map(Stdio::from)
@@ -709,7 +653,11 @@ fn wait_for_owned_status(
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if let Some(exit) = child.try_wait().expect("inspect daemon") {
-            panic!("daemon exited before readiness: {exit}");
+            let log = std::fs::read_to_string(
+                data_dir.root().join(format!("daemon-{launch_id}.log")),
+            )
+            .unwrap_or_default();
+            panic!("daemon exited before readiness: {exit}\n{log}");
         }
         if let DaemonProbeStatus::Running(status) = probe_daemon_status(&paths, PROBE_TIMEOUT)
             && status.pid == child.id()

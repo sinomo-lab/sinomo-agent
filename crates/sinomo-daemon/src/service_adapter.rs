@@ -479,6 +479,38 @@ impl ClusterAccess for DaemonClusterAccess {
         })
     }
 
+    fn kv_range_prefix_complete_authoritative_async<'a>(
+        &'a self,
+        prefix: String,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        sinomo_core::kv::KvAuthoritativeRead<Vec<KvEntry>>,
+                        ServiceError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let payload = sinomo_core::kv::cluster_kv_authoritative_snapshot_rpc_payload()?;
+            let snapshot =
+                handle_daemon_cluster_kv_authoritative_snapshot_request_async_on_runtime(
+                    &self.paths,
+                    &payload.body,
+                    true,
+                    self.runtime()?,
+                )
+                .await
+                .map_err(daemon_error)?;
+            sinomo_core::kv::project_cluster_kv_authoritative_complete_range_prefix(
+                &snapshot, &prefix,
+            )
+            .map_err(ServiceError::from)
+        })
+    }
+
     fn kv_request_outcome_authoritative_async<'a>(
         &'a self,
         request_id: sinomo_core::kv::KvRequestId,

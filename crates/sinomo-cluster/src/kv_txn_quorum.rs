@@ -4636,6 +4636,28 @@ where
 /// existing snapshot/barrier path, preserving forwarding and election
 /// semantics while avoiding an `O(total keyspace)` snapshot on normal prefix
 /// reads.
+/// Explicit bootstrap/recovery projection from one existing native authoritative
+/// snapshot operation. The same quorum, higher-term, admission, cancellation and
+/// forwarding fences govern both the capture and its exact prefix projection.
+pub async fn read_cluster_kv_authoritative_complete_range_prefix_async_with_host<H>(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    state: &mut ClusterBootstrapState,
+    prefix: String,
+    options: ClusterKvTxnQuorumOptions,
+    host: &mut H,
+) -> Result<KvAuthoritativeRead<Vec<sinomo_kv::KvEntry>>, NetworkError>
+where
+    H: ClusterKvTxnQuorumAsyncHost,
+{
+    let snapshot = read_cluster_kv_authoritative_snapshot_async_with_host(
+        runtime, paths, state, options, host,
+    )
+    .await?;
+    sinomo_kv::project_cluster_kv_authoritative_complete_range_prefix(&snapshot, &prefix)
+        .map_err(kv_err)
+}
+
 pub async fn read_cluster_kv_authoritative_range_prefix_async_with_host<H>(
     runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
@@ -7705,6 +7727,68 @@ mod tests {
                 && prefix_elapsed < Duration::from_millis(500),
             "75ms quorum latency expanded into {prefix_elapsed:?} of a five-second authority budget"
         );
+    }
+
+    #[test]
+    fn complete_prefix_native_read_index_preserves_large_captured_generation() {
+        let fixture = cold_barrier_fixture("complete_prefix_native_read_index");
+        let mut storage =
+            LocalClusterRaftCommandStorage::new(&fixture.paths, fixture.local.clone());
+        for index in 0..3 {
+            let command = KvCommandRequest::generated(KvCommand::Op(sinomo_kv::KvOp::Put {
+                key: format!("/large-prefix/{index}"),
+                value: vec![index as u8; 3 * 1024 * 1024],
+                lease_id: None,
+            }));
+            let appended = storage
+                .append_uncommitted(command)
+                .expect("append bounded value");
+            storage
+                .commit_index_compact(appended.index)
+                .expect("commit bounded value");
+        }
+        drop(storage);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut state = fixture.state.clone();
+        let mut host = ExactSetReadIndexHost::default();
+        let options = crate::ClusterControlPlaneTimeouts::default_daemon_transport()
+            .kv_txn_quorum_options(true);
+        let complete = runtime
+            .block_on(
+                read_cluster_kv_authoritative_complete_range_prefix_async_with_host(
+                    runtime.handle(),
+                    &fixture.paths,
+                    &mut state,
+                    "/large-prefix/".into(),
+                    options,
+                    &mut host,
+                ),
+            )
+            .expect("native current-term complete prefix");
+        assert_eq!(host.quorum_waves, 1, "one exact ReadIndex capture");
+        assert_eq!(complete.value.len(), 3);
+        assert_eq!(complete.authority.revision.0, state.kv_revision);
+        for (index, entry) in complete.value.iter().enumerate() {
+            assert_eq!(entry.value, vec![index as u8; 3 * 1024 * 1024]);
+        }
+        // A newer real committed store generation cannot mutate the captured read.
+        let mut storage =
+            LocalClusterRaftCommandStorage::new(&fixture.paths, fixture.local.clone());
+        let appended = storage
+            .append_uncommitted(KvCommandRequest::generated(KvCommand::Op(
+                sinomo_kv::KvOp::Put {
+                    key: "/large-prefix/0".into(),
+                    value: b"newer".to_vec(),
+                    lease_id: None,
+                },
+            )))
+            .unwrap();
+        storage.commit_index_compact(appended.index).unwrap();
+        assert_eq!(complete.value[0].value.len(), 3 * 1024 * 1024);
+        assert!(complete.value[0].value.iter().all(|byte| *byte == 0));
     }
 
     #[test]

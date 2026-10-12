@@ -482,7 +482,9 @@ is blocked in a model turn. Chat-session routes are local-command-only; cluster
 members use the separately authorized agent session APIs rather than guessing
 an app client identity. Accepted commands are journaled before acknowledgement.
 Daemon startup restores canonical session bindings and executes commands that
-were durably pending. It does not replay completed commands, workspace grants,
+were durably pending. A chat host opened while the daemon is still publishing
+cluster services, or while its Raft node is still held by the process it
+replaces, waits for them (bounded) instead of reporting the chat unavailable. It does not replay completed commands, workspace grants,
 or ambiguous effects from a command already running at an unexpected crash.
 Planned daemon activation drains leased chat work before publishing its restart
 marker; pending commands wait for that marker to clear on the replacement host.

@@ -221,6 +221,7 @@ pub use kv_txn_quorum::{
     handle_cluster_kv_txn_request_async_with_host,
     handle_cluster_kv_txn_request_compact_async_with_host,
     handle_forwarded_cluster_kv_txn_rpc_request_compact_async_with_host,
+    read_cluster_kv_authoritative_complete_range_prefix_async_with_host,
     read_cluster_kv_authoritative_entries_async_with_host,
     read_cluster_kv_authoritative_entry_async_with_host,
     read_cluster_kv_authoritative_range_prefix_async_with_host,
