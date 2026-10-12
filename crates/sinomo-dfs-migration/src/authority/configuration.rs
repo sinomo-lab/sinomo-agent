@@ -57,6 +57,7 @@ fn module_payload_paths(value: &serde_json::Value) -> Vec<String> {
 fn normalized_file_system(
     entry: &KvEntry,
     current_defaults: Option<&[sinomo_dfs::DfsSubtreePolicy]>,
+    current_import_candidate_count: Option<usize>,
 ) -> Result<DfsFileSystemConfig> {
     let mut value = decode_original_document(&entry.value)?;
     let context = SourceDocumentContext::new(&entry.value, "")?;
@@ -85,17 +86,13 @@ fn normalized_file_system(
             }
         }
     }
-    let count = current_defaults.and_then(|defaults| {
-        defaults
-            .iter()
-            .find(|default| default.policy == sinomo_core::DfsObjectPolicy::ReplicatedEventual)
-            .map(|default| default.desired_replicas)
-    });
     // These are NEW current bootstrap defaults from actual native membership;
     // no historical grant/receipt W is inferred or altered here.
-    let value =
-        crate::legacy_wire::convert_file_system_wire_with_current_import_defaults(value, count)
-            .map_err(error)?;
+    let value = crate::legacy_wire::convert_file_system_wire_with_current_import_defaults(
+        value,
+        current_import_candidate_count,
+    )
+    .map_err(error)?;
     let config: DfsFileSystemConfig = serde_json::from_value(value).map_err(error)?;
     if sinomo_dfs::file_system_config_key(&config.file_system_id) != entry.key {
         return Err(error(
@@ -630,11 +627,14 @@ impl NativeImportAuthority {
         }
         state.members = members;
         let defaults = sinomo_dfs::default_cluster_sifs_subtree_policies(&state);
+        let candidates = sinomo_dfs::stable_dfs_service_node_ids(&state);
+        let current_import_candidate_count = (!candidates.is_empty()).then_some(candidates.len());
         let policy_binding = digest(&(
             &member_rows,
             &native.authority,
             &state.local_node_id,
             &defaults,
+            &candidates,
         ))?;
         let mut entries = native
             .value
@@ -677,11 +677,13 @@ impl NativeImportAuthority {
                             &native.authority,
                             &state.local_node_id,
                             &defaults,
+                            &candidates,
                         ),
                     )?;
                     sinomo_core::kv::encode_kv_value(&normalized_file_system(
                         &entry,
                         Some(&defaults),
+                        current_import_candidate_count,
                     )?)
                 }
                 .map(Some)
@@ -884,7 +886,7 @@ mod tests {
             sinomo_core::kv::encode_kv_value(&source).unwrap(),
         );
         let captured = original.clone();
-        let normalized = normalized_file_system(&original, None).unwrap();
+        let normalized = normalized_file_system(&original, None, None).unwrap();
         assert_eq!(normalized.subtree_policies, current.subtree_policies);
         assert_eq!(normalized.owner_node_id, current.owner_node_id);
         assert_eq!(
@@ -906,7 +908,7 @@ mod tests {
             "a JSON numeric list is not current SOBJ Bytes even if typed decoding accepts its shape"
         );
         assert_eq!(
-            normalized_file_system(&no_format_hint, None)
+            normalized_file_system(&no_format_hint, None, None)
                 .unwrap()
                 .module_metadata["owner.opaque"]
                 .payload,
@@ -953,7 +955,7 @@ mod tests {
             sinomo_core::kv::encode_kv_value(&source).unwrap(),
         );
         assert_eq!(
-            normalized_file_system(&encoded, None)
+            normalized_file_system(&encoded, None, None)
                 .unwrap()
                 .module_metadata["vendor.opaque"]
                 .payload,
@@ -967,7 +969,7 @@ mod tests {
             sinomo_dfs::file_system_config_key(&current.file_system_id),
             sinomo_core::kv::encode_kv_value(&missing).unwrap(),
         );
-        assert!(normalized_file_system(&encoded, None).is_err());
+        assert!(normalized_file_system(&encoded, None, None).is_err());
     }
 
     #[test]
@@ -982,21 +984,14 @@ mod tests {
             sinomo_dfs::file_system_config_key(&current.file_system_id),
             sinomo_core::kv::encode_kv_value(&source).unwrap(),
         );
-        let defaults = vec![
-            sinomo_dfs::DfsSubtreePolicy::new(
-                "/users",
-                sinomo_core::DfsObjectPolicy::ReplicatedEventual,
-                1,
-                2,
-            ),
-            sinomo_dfs::DfsSubtreePolicy::new(
-                "/services",
-                sinomo_core::DfsObjectPolicy::ReplicatedEventual,
-                1,
-                2,
-            ),
-        ];
-        let normalized = normalized_file_system(&original, Some(&defaults)).unwrap();
+        let defaults = vec![sinomo_dfs::DfsSubtreePolicy::new(
+            "/nodes/test/files",
+            sinomo_core::DfsObjectPolicy::LocalOwned,
+            1,
+            1,
+        )];
+        assert!(normalized_file_system(&original, Some(&defaults), None).is_err());
+        let normalized = normalized_file_system(&original, Some(&defaults), Some(2)).unwrap();
         assert_eq!(
             (
                 normalized.subtree_policies[0].min_commit_replicas,
@@ -1017,6 +1012,93 @@ mod tests {
         );
         assert_eq!(normalized.subtree_policies[1].min_distinct_zones, 2);
         assert_eq!(decode_original_document(&original.value).unwrap(), source);
+    }
+
+    #[test]
+    fn exact_production_filesystem_bytes_keep_recorded_placement_and_retention() {
+        // Unaltered supplied production SOURCE; no current authority is made here.
+        let bytes = include_bytes!("fixtures/production-filesystem-policy-2201.sobj");
+        assert_eq!(bytes.len(), 2201);
+        let original = KvEntry {
+            key: "/dfs/filesystems/3m3x1ehfwt2cca4jkz8r1jwq9g/config".into(),
+            value: bytes.to_vec(),
+            create_revision: KvRevision(246263),
+            modify_revision: KvRevision(1740566),
+            version: KvVersion(75),
+            lease_id: None,
+        };
+        let captured = original.clone();
+        let source = decode_original_document(&original.value).unwrap();
+        assert!(!current_record(&original, RecordKind::FileSystem).unwrap());
+        assert!(
+            normalized_file_system(&original, None, None)
+                .unwrap_err()
+                .to_string()
+                .contains("candidate-count evidence")
+        );
+        // Primitive supplied-current-count case. The separate cold native test
+        // establishes that production obtains this evidence from real members.
+        let current = normalized_file_system(&original, None, Some(4)).unwrap();
+        assert_eq!(
+            current.file_system_id.as_str(),
+            "3m3x1ehfwt2cca4jkz8r1jwq9g"
+        );
+        assert_eq!(current.owner_node_id.as_str(), "01kr3d54d45zkm0p0xgps8k7mt");
+        assert_eq!(current.display_name, "sifs");
+        assert!(current.module_metadata.is_empty());
+        let recorded = source["subtree_policies"].as_array().unwrap();
+        assert_eq!(current.subtree_policies.len(), 9);
+        let mut explicit = 0;
+        for (rule, old) in current.subtree_policies.iter().zip(recorded) {
+            let policy = serde_json::from_value(old["policy"].clone()).unwrap();
+            let n = if old.get("desired_replicas").is_some() {
+                explicit += 1;
+                assert_eq!(old["desired_replicas"], 3);
+                assert_eq!(old["min_commit_replicas"], 1);
+                3
+            } else if policy == sinomo_core::DfsObjectPolicy::LocalOwned {
+                1
+            } else {
+                2
+            };
+            let mut expected = sinomo_dfs::DfsSubtreePolicy::new(
+                old["path_prefix"].as_str().unwrap(),
+                policy,
+                1,
+                n,
+            );
+            if let Some(ids) = old.get("required_node_ids") {
+                expected.required_node_ids = serde_json::from_value(ids.clone()).unwrap();
+            }
+            if let Some(ids) = old.get("forbidden_node_ids") {
+                expected.forbidden_node_ids = serde_json::from_value(ids.clone()).unwrap();
+            }
+            assert_eq!(
+                rule, &expected,
+                "every recorded placement field stays exact"
+            );
+        }
+        assert_eq!(explicit, 3);
+        assert_eq!(current.retention_policies.len(), 1);
+        let retention =
+            &current.retention_policies[crate::legacy_wire::DFS_HISTORY_METADATA_NAMESPACE];
+        let old_history = source["file_history"]["rules"].as_array().unwrap();
+        assert_eq!(retention.rules.len(), 3);
+        for (rule, old) in retention.rules.iter().zip(old_history) {
+            assert_eq!(rule.path, old["path"].as_str().unwrap());
+            assert_eq!(
+                u64::from(rule.minimum.keep_last),
+                old["retention"]["keep_last"].as_u64().unwrap()
+            );
+            assert_eq!(
+                rule.minimum.keep_for_seconds,
+                old["retention"]["keep_for_seconds"].as_u64().unwrap()
+            );
+        }
+        assert_eq!(
+            original, captured,
+            "full original entry and bytes are preserved"
+        );
     }
 
     #[test]

@@ -101,8 +101,20 @@ fn work(value: &mut Value) -> Result<()> {
             item.key = "semantic_changes".into();
         }
     }
-    // Pinned released producer serialized ALL six bits unconditionally.
-    // A permissive old reader default is not evidence of a produced omission.
+    // The producer before 0666847e serialized exactly these five obligations.
+    // It had no attachment/semantic work bit. Preserve every produced bit;
+    // initialize only the later obligation, without fabricating a receipt.
+    if row.fields.len() == WORK_FIELDS.len() - 1
+        && WORK_FIELDS
+            .iter()
+            .filter(|name| **name != "semantic_changes")
+            .all(|name| row.fields.iter().any(|field| field.key == *name))
+    {
+        row.fields
+            .push(Field::new("semantic_changes", Value::Boolean(false)));
+    }
+    // All other missing obligations remain invalid, including incomplete
+    // five-field producers. The original bytes are archived before conversion.
     if row.fields.len() != WORK_FIELDS.len()
         || WORK_FIELDS
             .iter()
@@ -486,6 +498,219 @@ mod tests {
         assert_eq!(std::fs::read(retained).unwrap(), original);
         assert!(convert(dir.path(), &path, Role::Latch).unwrap());
     }
+    #[test]
+    fn original_five_field_latch_preserves_all_producer_obligations() {
+        use sinomo_dfs::test_support::DfsTestRuntime;
+        const ORIGINAL: &[u8] =
+            include_bytes!("../../tests/fixtures/original-oracle-mounted-latch-v1.sobj");
+        let original: OriginalFiveLatch = serde_ext::from_bytes(ORIGINAL).unwrap();
+        assert_eq!(original.generation, 0);
+        assert_eq!(original.updated_at_unix_nanos, 0);
+        let name = "native-original-five-field-mounted-latch";
+        let node = DfsTestRuntime::ordered_node_ids(name, 1).remove(0);
+        let mut native = DfsTestRuntime::new(name, node.clone()).unwrap();
+        native
+            .configure_component_factories(vec![
+                std::sync::Arc::new(
+                    sinomo_dfs::component_factory_with_storage_preparation(std::sync::Arc::new(
+                        crate::authority::storage_preparation_provider,
+                    ))
+                    .unwrap(),
+                ),
+                std::sync::Arc::new(crate::authority::staged_import_component_factory().unwrap()),
+            ])
+            .unwrap();
+        let dfs = native.data_dir(&node).dfs_dir();
+        let outbox = dfs.join("mounted-mutation-outbox");
+        std::fs::create_dir_all(&outbox).unwrap();
+        std::fs::write(outbox.join("outbox.lock"), []).unwrap();
+        let latch = outbox.join("daemon-committed-work-latch.sobj");
+        std::fs::write(&latch, ORIGINAL).unwrap();
+        native
+            .start_nodes()
+            .expect("actual old five-field producer prepares through the normal component");
+        let current: sinomo_dfs::MountedSifsMutationCommittedWorkLatch =
+            serde_ext::from_bytes(&std::fs::read(&latch).unwrap()).unwrap();
+        assert_eq!(current.generation, original.generation);
+        assert_eq!(
+            current.updated_at_unix_nanos,
+            original.updated_at_unix_nanos
+        );
+        assert_eq!(
+            current.committed_work,
+            sinomo_dfs::DfsCommittedWork::default()
+        );
+        let retained = dfs
+            .join("migration-retained/local-state")
+            .join(blake3::hash(ORIGINAL).to_hex().as_str())
+            .join("mounted-mutation-outbox/daemon-committed-work-latch.sobj");
+        assert_eq!(std::fs::read(&retained).unwrap(), ORIGINAL);
+        let mut client = native.client(&node).unwrap();
+        client
+            .posix_write_file(
+                "/services/five-field-producer-ready",
+                b"normal owned bytes",
+                sinomo_dfs::DfsWriteOptions::replicated_eventual(vec![node.clone()]),
+            )
+            .unwrap();
+        drop(client);
+        native.stop_node(&node).unwrap();
+        native.reopen_node(node.clone()).unwrap();
+        let mut client = native.client(&node).unwrap();
+        assert_eq!(
+            client
+                .posix_read_file_distributed("/services/five-field-producer-ready")
+                .unwrap(),
+            b"normal owned bytes"
+        );
+        assert_eq!(std::fs::read(retained).unwrap(), ORIGINAL);
+        drop(client);
+        native.close().unwrap();
+    }
+
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct OriginalFiveWork {
+        publish_metadata: bool,
+        repair_maintenance: bool,
+        namespace_maintenance: bool,
+        metadata_replica_progress: bool,
+        metadata_materialization: bool,
+    }
+    #[derive(serde::Deserialize)]
+    struct OriginalFiveLatch {
+        generation: u64,
+        committed_work: OriginalFiveWork,
+        updated_at_unix_nanos: u64,
+    }
+
+    #[test]
+    fn five_field_true_bits_stay_owned_and_other_omissions_reject() {
+        for mask in 0..32_u8 {
+            let original = OriginalFiveWork {
+                publish_metadata: mask & 1 != 0,
+                repair_maintenance: mask & 2 != 0,
+                namespace_maintenance: mask & 4 != 0,
+                metadata_replica_progress: mask & 8 != 0,
+                metadata_materialization: mask & 16 != 0,
+            };
+            let bytes = serde_ext::to_bytes(&original, 1, LengthMode::U32).unwrap();
+            let view = DocumentView::parse(&bytes).unwrap();
+            let PayloadView::Dynamic(value) = &view.payload else {
+                panic!("actual dynamic work");
+            };
+            let mut value = own(value);
+            work(&mut value).unwrap();
+            let current: sinomo_dfs::DfsCommittedWork = serde_ext::from_bytes(
+                &Document::dynamic(1, LengthMode::U32, value.clone())
+                    .to_bytes()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(current.publish_metadata, original.publish_metadata);
+            assert_eq!(current.repair_maintenance, original.repair_maintenance);
+            assert_eq!(
+                current.namespace_maintenance,
+                original.namespace_maintenance
+            );
+            assert_eq!(
+                current.metadata_replica_progress,
+                original.metadata_replica_progress
+            );
+            assert_eq!(
+                current.metadata_materialization,
+                original.metadata_materialization
+            );
+            assert!(!current.semantic_changes);
+            let row = object(&mut value).unwrap();
+            row.fields
+                .retain(|field| field.key != "metadata_replica_progress");
+            assert!(work(&mut value).is_err());
+        }
+    }
+
+    #[test]
+    fn provided_mounted_latches_preserve_work_counters_and_source_archives() {
+        let cases = [
+            (
+                "sodium",
+                include_bytes!("../../tests/fixtures/original-sodium-mounted-latch-v1.sobj")
+                    as &[u8],
+                2813_u64,
+                1790995018796855462_u64,
+                false,
+            ),
+            (
+                "oracle",
+                include_bytes!("../../tests/fixtures/original-oracle-mounted-latch-v1.sobj")
+                    as &[u8],
+                0,
+                0,
+                true,
+            ),
+            (
+                "carbon",
+                include_bytes!("../../tests/fixtures/original-carbon-mounted-latch-v1.sobj")
+                    as &[u8],
+                235,
+                1790994957029143984,
+                false,
+            ),
+            (
+                "windows",
+                include_bytes!("../../tests/fixtures/original-windows-mounted-latch-v1.sobj")
+                    as &[u8],
+                119149,
+                1790994986698045000,
+                false,
+            ),
+        ];
+        let all_work = sinomo_dfs::DfsCommittedWork {
+            publish_metadata: true,
+            repair_maintenance: true,
+            namespace_maintenance: true,
+            metadata_replica_progress: true,
+            metadata_materialization: true,
+            semantic_changes: true,
+        };
+        for (name, original, generation, updated_at, five_fields) in cases {
+            let normalized = normalize(original, Role::Latch).unwrap();
+            let current: sinomo_dfs::MountedSifsMutationCommittedWorkLatch =
+                serde_ext::from_bytes(&normalized).unwrap();
+            assert_eq!(current.schema_version, 1, "{name}");
+            assert_eq!(current.generation, generation, "{name}");
+            assert_eq!(current.updated_at_unix_nanos, updated_at, "{name}");
+            assert_eq!(
+                current.committed_work,
+                if five_fields {
+                    sinomo_dfs::DfsCommittedWork::default()
+                } else {
+                    all_work
+                },
+                "all produced obligations stay exact: {name}"
+            );
+            if !five_fields {
+                assert_eq!(
+                    normalized, original,
+                    "current six-field bytes stay exact: {name}"
+                );
+            }
+            let dir = sinomo_testdir::TestDir::new(&format!("provided-mounted-latch-{name}"));
+            let outbox = dir.path().join("mounted-mutation-outbox");
+            std::fs::create_dir_all(&outbox).unwrap();
+            std::fs::write(outbox.join("outbox.lock"), []).unwrap();
+            let path = outbox.join("daemon-committed-work-latch.sobj");
+            std::fs::write(&path, original).unwrap();
+            assert!(convert(dir.path(), &path, Role::Latch).unwrap());
+            assert_eq!(std::fs::read(path).unwrap(), normalized, "{name}");
+            let retained = dir
+                .path()
+                .join("migration-retained/local-state")
+                .join(blake3::hash(original).to_hex().as_str())
+                .join("mounted-mutation-outbox/daemon-committed-work-latch.sobj");
+            assert_eq!(std::fs::read(retained).unwrap(), original, "{name}");
+        }
+    }
+
     #[test]
     fn original_adapter_and_unrelated_raw_leaf_types_are_distinct() {
         let session = Document::dynamic(

@@ -1863,49 +1863,93 @@ mod provider_lifecycle_tests {
 
     #[test]
     fn native_retired_root_codec_is_normalized_before_cold_current_authority() {
-        use sinomo_dfs::test_support::DfsTestRuntime;
+        use sinomo_dfs::{DfsFileSystemConfig, test_support::DfsTestRuntime};
         use std::sync::atomic::{AtomicBool, Ordering};
         let name = "native-retired-root-codec-admission";
         let node = DfsTestRuntime::ordered_node_ids(name, 1).remove(0);
         let mut native = DfsTestRuntime::new(name, node.clone()).unwrap();
         let inject = Arc::new(AtomicBool::new(false));
-        let captured = Arc::new(Mutex::new(None::<KvEntry>));
+        let captured = Arc::new(Mutex::new(None::<(Vec<KvEntry>, DfsFileSystemConfig)>));
         let mount_inject = Arc::clone(&inject);
         let mount_capture = Arc::clone(&captured);
         let builder: sinomo_dfs::DfsStoragePreparationProviderBuilder =
             Arc::new(move |context, lifecycle| {
-                // Seed one real original native row before the cold DFS host exists.
+                // Seed actual original native rows before the cold DFS host exists.
                 // Normal live refresh cannot consume it before its source is captured.
                 if mount_inject.swap(false, Ordering::SeqCst) {
                     let cluster = context.cluster_access().unwrap();
                     let runtime = context.runtime().unwrap();
-                    let key =
-                        sinomo_dfs::metadata_shard_key(&sinomo_dfs::sifs_file_system_id(), "root");
+                    let fs = sinomo_dfs::sifs_file_system_id();
+                    let keys = vec![
+                        sinomo_dfs::metadata_shard_key(&fs, "root"),
+                        sinomo_dfs::file_system_config_key(&fs),
+                    ];
                     let before = block_native(
                         runtime,
-                        cluster.kv_get_authoritative_exact_set_async(vec![key.clone()]),
+                        cluster.kv_get_authoritative_exact_set_async(keys.clone()),
                     )
                     .unwrap();
                     sinomo_core::kv::validate_cluster_kv_current_term_authority_proof(
                         &before.authority,
                     )
                     .unwrap();
-                    let before = before.value[0].clone().unwrap();
-                    assert_eq!(before.key, key);
-                    let expected = before.decode::<DfsMetadataShardConfig>().unwrap();
-                    let mut source = serde_json::to_value(&expected).unwrap();
-                    source["namespace_prepare_codec"] = serde_json::json!("packed-v6");
-                    let source_bytes = sinomo_core::kv::encode_kv_value(&source).unwrap();
+                    let before = before
+                        .value
+                        .into_iter()
+                        .map(Option::unwrap)
+                        .collect::<Vec<_>>();
+                    for (entry, key) in before.iter().zip(&keys) {
+                        assert_eq!(&entry.key, key);
+                    }
+                    let assignment = before[0].decode::<DfsMetadataShardConfig>().unwrap();
+                    let mut expected_fs = before[1].decode::<DfsFileSystemConfig>().unwrap();
+                    let mut assignment_source = serde_json::to_value(&assignment).unwrap();
+                    assignment_source["namespace_prepare_codec"] = serde_json::json!("packed-v6");
+                    let mut fs_source = serde_json::to_value(&expected_fs).unwrap();
+                    // Released schema omits counts or records them as null. Current
+                    // import grants must come from actual native membership, not a
+                    // replicated rule which current bootstrap no longer persists.
+                    let rules = fs_source["subtree_policies"].as_array_mut().unwrap();
+                    rules.push(serde_json::json!({
+                        "path_prefix":"/users", "policy":"replicated-eventual"
+                    }));
+                    rules.push(serde_json::json!({
+                        "path_prefix":"/services", "policy":"replicated-eventual",
+                        "desired_replicas":null, "min_commit_replicas":null
+                    }));
+                    for path in ["/users", "/services"] {
+                        expected_fs
+                            .subtree_policies
+                            .push(sinomo_dfs::DfsSubtreePolicy::new(
+                                path,
+                                sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+                                1,
+                                1,
+                            ));
+                    }
+                    let source_bytes = [assignment_source, fs_source]
+                        .iter()
+                        .map(sinomo_core::kv::encode_kv_value)
+                        .collect::<std::result::Result<Vec<_>, _>>()
+                        .unwrap();
+                    let captured_before = before
+                        .iter()
+                        .map(|entry| MetadataCapturedKvEntry {
+                            key: entry.key.clone(),
+                            entry: Some(entry.clone()),
+                        })
+                        .collect::<Vec<_>>();
                     let request = KvTxnRequest::generated(KvTxn {
-                        compares: captured_compares(&[MetadataCapturedKvEntry {
-                            key: key.clone(),
-                            entry: Some(before.clone()),
-                        }]),
-                        success: vec![KvOp::Put {
-                            key: key.clone(),
-                            value: source_bytes.clone(),
-                            lease_id: before.lease_id,
-                        }],
+                        compares: captured_compares(&captured_before),
+                        success: before
+                            .iter()
+                            .zip(&source_bytes)
+                            .map(|(entry, value)| KvOp::Put {
+                                key: entry.key.clone(),
+                                value: value.clone(),
+                                lease_id: entry.lease_id,
+                            })
+                            .collect(),
                         failure: Vec::new(),
                     });
                     let command_digest =
@@ -1917,26 +1961,32 @@ mod provider_lifecycle_tests {
                     assert_eq!(committed.request_id, request_id);
                     assert_eq!(committed.submitted_command_digest, Some(command_digest));
                     assert!(committed.txn_response.unwrap().succeeded);
-                    let original = block_native(
-                        runtime,
-                        cluster.kv_get_authoritative_exact_set_async(vec![key]),
-                    )
-                    .unwrap();
+                    let original =
+                        block_native(runtime, cluster.kv_get_authoritative_exact_set_async(keys))
+                            .unwrap();
                     sinomo_core::kv::validate_cluster_kv_current_term_authority_proof(
                         &original.authority,
                     )
                     .unwrap();
-                    let original = original.value[0].clone().unwrap();
-                    assert_eq!(original.value, source_bytes);
-                    assert_eq!(original.lease_id, before.lease_id);
+                    let original = original
+                        .value
+                        .into_iter()
+                        .map(Option::unwrap)
+                        .collect::<Vec<_>>();
+                    for ((entry, value), prior) in original.iter().zip(source_bytes).zip(&before) {
+                        assert_eq!(entry.key, prior.key);
+                        assert_eq!(entry.value, value);
+                        assert_eq!(entry.lease_id, prior.lease_id);
+                    }
                     assert!(
-                        original
+                        original[0]
                             .decode::<DfsMetadataShardConfig>()
                             .unwrap_err()
                             .to_string()
                             .contains("namespace_prepare_codec")
                     );
-                    *mount_capture.lock().unwrap() = Some(original);
+                    assert!(original[1].decode::<DfsFileSystemConfig>().is_err());
+                    *mount_capture.lock().unwrap() = Some((original, expected_fs));
                 }
                 storage_preparation_provider(context, lifecycle)
             });
@@ -1968,15 +2018,31 @@ mod provider_lifecycle_tests {
             "normal cold startup prepares known original authority before strict current decoding",
         );
         assert!(!inject.load(Ordering::SeqCst));
-        let original = captured.lock().unwrap().clone().unwrap();
+        let (originals, expected_fs) = captured.lock().unwrap().clone().unwrap();
+        let original = &originals[0];
         let context = native.component_context(&node).unwrap();
         let cluster = context.cluster_access().unwrap();
         let runtime = native.runtime_handle();
         let current = runtime
-            .block_on(cluster.kv_get_authoritative_exact_set_async(vec![original.key.clone()]))
+            .block_on(cluster.kv_get_authoritative_exact_set_async(
+                originals.iter().map(|entry| entry.key.clone()).collect(),
+            ))
             .unwrap();
         sinomo_core::kv::validate_cluster_kv_current_term_authority_proof(&current.authority)
             .unwrap();
+        let current_fs = current.value[1].as_ref().unwrap();
+        assert_eq!(current_fs.key, originals[1].key);
+        assert_eq!(
+            current_fs.decode::<DfsFileSystemConfig>().unwrap(),
+            expected_fs
+        );
+        assert_eq!(
+            current_fs.value,
+            sinomo_core::kv::encode_kv_value(&expected_fs).unwrap()
+        );
+        assert_eq!(current_fs.lease_id, originals[1].lease_id);
+        assert_eq!(current_fs.create_revision, originals[1].create_revision);
+        assert!(current_fs.modify_revision > originals[1].modify_revision);
         let current = current.value[0].clone().unwrap();
         assert_eq!(current.key, original.key);
         assert_eq!(
@@ -1995,10 +2061,19 @@ mod provider_lifecycle_tests {
             .authority
             .receiver_root
             .join("configuration-v7")
-            .join(format!("original-{}.json", digest(&original).unwrap()));
+            .join(format!("original-{}.json", digest(original).unwrap()));
         assert_eq!(
             std::fs::read(&archive).unwrap(),
-            serde_json::to_vec(&original).unwrap()
+            serde_json::to_vec(original).unwrap()
+        );
+        let fs_archive = migration
+            .authority
+            .receiver_root
+            .join("configuration-v7")
+            .join(format!("original-{}.json", digest(&originals[1]).unwrap()));
+        assert_eq!(
+            std::fs::read(&fs_archive).unwrap(),
+            serde_json::to_vec(&originals[1]).unwrap()
         );
         drop(migration);
         let mut client = native.client(&node).unwrap();
@@ -2018,6 +2093,18 @@ mod provider_lifecycle_tests {
             client.posix_read_file_distributed(path).unwrap(),
             final_bytes
         );
+        let shared_path = "/services/native-missing-policy-counts";
+        client
+            .posix_write_file(
+                shared_path,
+                final_bytes,
+                sinomo_dfs::DfsWriteOptions::replicated_eventual(vec![node.clone()]),
+            )
+            .unwrap();
+        assert_eq!(
+            client.posix_read_file_distributed(shared_path).unwrap(),
+            final_bytes
+        );
         drop(client);
         drop(cluster);
         drop(context);
@@ -2029,8 +2116,16 @@ mod provider_lifecycle_tests {
             final_bytes
         );
         assert_eq!(
+            client.posix_read_file_distributed(shared_path).unwrap(),
+            final_bytes
+        );
+        assert_eq!(
             std::fs::read(archive).unwrap(),
-            serde_json::to_vec(&original).unwrap()
+            serde_json::to_vec(original).unwrap()
+        );
+        assert_eq!(
+            std::fs::read(fs_archive).unwrap(),
+            serde_json::to_vec(&originals[1]).unwrap()
         );
         drop(client);
         native.close().unwrap();
