@@ -774,7 +774,7 @@ fn prepare_native_mount_projection(
             });
         }
         let bwrap_program = find_host_program("bwrap").ok_or_else(|| SandboxWasiError::Runtime {
-            detail: "simple-native manifest declares mounts, but `bwrap` is unavailable; live mounts cannot be represented without copying"
+            detail: "simple-native manifest declares mounts, but `bwrap` is unavailable or not executable; live mounts cannot be represented without copying"
                 .to_string(),
         })?;
         let mut projected = Vec::with_capacity(mounts.len());
@@ -839,11 +839,32 @@ fn normalized_sifs_relative_path(path: &str) -> Result<PathBuf, SandboxWasiError
 
 #[cfg(target_os = "linux")]
 fn find_host_program(name: &str) -> Option<PathBuf> {
-    env::var_os("PATH")
-        .into_iter()
-        .flat_map(|path| env::split_paths(&path).collect::<Vec<_>>())
+    env::var_os("PATH").and_then(|path| find_host_program_in_path(name, &path))
+}
+
+#[cfg(target_os = "linux")]
+fn find_host_program_in_path(name: &str, path: &std::ffi::OsStr) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+
+    env::split_paths(path)
         .map(|directory| directory.join(name))
-        .find(|candidate| candidate.is_file())
+        // The mount launcher starts in `/`, so a relative PATH entry must keep
+        // referring to the location inspected in the caller's working directory.
+        .filter_map(|candidate| std::path::absolute(candidate).ok())
+        .find(|candidate| {
+            if !candidate.is_file() {
+                return false;
+            }
+            let Ok(path) = std::ffi::CString::new(candidate.as_os_str().as_bytes()) else {
+                return false;
+            };
+            // SAFETY: path is a valid NUL-terminated pathname. This read-only
+            // prerequisite check uses the launcher credentials, changes no
+            // permissions, and does not prove that bubblewrap can run.
+            unsafe {
+                libc::faccessat(libc::AT_FDCWD, path.as_ptr(), libc::X_OK, libc::AT_EACCESS) == 0
+            }
+        })
 }
 
 #[derive(Debug)]
@@ -3211,6 +3232,273 @@ mod tests {
         .expect_err("declared mounts must never fall back to copied data");
         assert!(matches!(error, SandboxWasiError::InvalidRequest { .. }));
         assert!(error.to_string().contains("SIFS/FUSE root"));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn simple_native_bwrap_search_skips_non_executable_path_entries() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = sinomo_testdir::TestDir::new("simple-native-bwrap-search");
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        fs::create_dir_all(&first).expect("first PATH directory");
+        fs::create_dir_all(&second).expect("second PATH directory");
+        let non_executable = first.join("bwrap");
+        let executable = second.join("bwrap");
+        fs::write(&non_executable, b"non-executable fixture").expect("non-executable fixture");
+        fs::set_permissions(&non_executable, fs::Permissions::from_mode(0o600))
+            .expect("non-executable permissions");
+        fs::write(&executable, b"executable fixture; never launched").expect("executable fixture");
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
+            .expect("executable permissions");
+
+        assert_eq!(find_host_program_in_path("bwrap", first.as_os_str()), None);
+        let path = env::join_paths([&first, &second]).expect("fixture PATH");
+        assert_eq!(find_host_program_in_path("bwrap", &path), Some(executable));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn simple_native_bwrap_search_rejects_missing_and_directory_candidates() {
+        let dir = sinomo_testdir::TestDir::new("simple-native-bwrap-search-missing");
+        let path = dir.path().join("bin");
+        assert_eq!(find_host_program_in_path("bwrap", path.as_os_str()), None);
+        fs::create_dir_all(path.join("bwrap")).expect("directory named bwrap");
+        assert_eq!(find_host_program_in_path("bwrap", path.as_os_str()), None);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn simple_native_bwrap_search_binds_relative_path_to_inspected_location() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const CHILD_ENV: &str = "SINOMO_SIMPLE_RELATIVE_BWRAP_TEST_CHILD";
+        if env::var_os(CHILD_ENV).is_some() {
+            let expected = env::current_dir().expect("fixture cwd").join("bin/bwrap");
+            let selected = find_host_program_in_path("bwrap", std::ffi::OsStr::new("bin"))
+                .expect("executable relative PATH fixture");
+            assert!(
+                selected.is_absolute(),
+                "bind the executable before launch changes cwd"
+            );
+            assert_eq!(selected, expected);
+            return;
+        }
+
+        let dir = sinomo_testdir::TestDir::new("simple-native-bwrap-relative-path");
+        let bin = dir.path().join("bin");
+        fs::create_dir_all(&bin).expect("relative PATH directory");
+        let bwrap = bin.join("bwrap");
+        fs::write(&bwrap, b"executable fixture; never launched").expect("executable fixture");
+        fs::set_permissions(&bwrap, fs::Permissions::from_mode(0o700))
+            .expect("executable permissions");
+        let output = Command::new(env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "tests::simple_native_bwrap_search_binds_relative_path_to_inspected_location",
+                "--nocapture",
+            ])
+            .current_dir(dir.path())
+            .env(CHILD_ENV, "1")
+            .env("PATH", "bin")
+            .output()
+            .expect("run isolated relative PATH case");
+        assert!(
+            output.status.success(),
+            "relative PATH case failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn simple_native_empty_mounts_do_not_require_projection_prerequisites() {
+        let dir = sinomo_testdir::TestDir::new("simple-native-empty-mount-prerequisites");
+        for host_sifs_root in [None, Some(dir.path().join("missing-live-root"))] {
+            let projection = prepare_native_mount_projection(
+                &[],
+                &SandboxSimpleNativeConfig {
+                    host_sifs_root,
+                    ..SandboxSimpleNativeConfig::default()
+                },
+            )
+            .expect("empty mounts keep the optional native path");
+            assert!(projection.is_none());
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn simple_native_mount_prerequisites_fail_before_guest_launch() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        const CASE_ENV: &str = "SINOMO_SIMPLE_MOUNT_PREREQUISITE_TEST_CASE";
+        if let Some(case) = env::var_os(CASE_ENV) {
+            assert_mount_prerequisite_failure_has_no_guest(
+                case.to_str().expect("fixture case is UTF-8"),
+            );
+            return;
+        }
+
+        let dir = sinomo_testdir::TestDir::new("simple-native-mount-prerequisite-paths");
+        for case in [
+            "unconfigured-root",
+            "missing-root",
+            "missing-source",
+            "missing-bwrap",
+            "non-executable-bwrap",
+        ] {
+            let path = dir.path().join(case).join("bin");
+            fs::create_dir_all(&path).expect("isolated PATH directory");
+            // Make the real shell resolvable so the old non-executable-bwrap
+            // bug would reach its native launch handshake, not fail on `sh`.
+            symlink("/bin/sh", path.join("sh")).expect("fixture shell");
+            if case == "non-executable-bwrap" {
+                let bwrap = path.join("bwrap");
+                fs::write(&bwrap, b"non-executable bubblewrap fixture")
+                    .expect("non-executable bubblewrap fixture");
+                fs::set_permissions(&bwrap, fs::Permissions::from_mode(0o600))
+                    .expect("non-executable bubblewrap permissions");
+            } else if case != "missing-bwrap" {
+                // Only presence is needed: prerequisite rejection must occur
+                // before this executable fixture could ever be launched.
+                symlink("/bin/sh", path.join("bwrap")).expect("fixture bubblewrap");
+            }
+
+            // The child is a test-harness process, not a sandbox guest. PATH is
+            // changed only for it, without mutating this process's environment.
+            let output = Command::new(env::current_exe().expect("test executable"))
+                .args([
+                    "--exact",
+                    "tests::simple_native_mount_prerequisites_fail_before_guest_launch",
+                    "--nocapture",
+                ])
+                .env(CASE_ENV, case)
+                .env("PATH", &path)
+                .output()
+                .expect("run isolated prerequisite case");
+            assert!(
+                output.status.success(),
+                "prerequisite case {case} failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_mount_prerequisite_failure_has_no_guest(case: &str) {
+        let (dir, store, sandbox_id) = create_store();
+        let host_sifs_root = dir.path().join("live-sifs");
+        let source = host_sifs_root.join("services/sandbox-shared/prerequisite");
+        if case != "unconfigured-root" && case != "missing-root" {
+            fs::create_dir_all(&host_sifs_root).expect("live root fixture");
+            if case != "missing-source" {
+                fs::create_dir_all(&source).expect("declared mount source fixture");
+            }
+        }
+        let (mut manifest, layout) = store.load(&sandbox_id).expect("load sandbox");
+        manifest.mounts = vec![SandboxMount {
+            source_sifs_path: "/services/sandbox-shared/prerequisite".to_string(),
+            mount_path: SandboxPath::new("/mnt/prerequisite").expect("guest mount path"),
+            mode: SandboxMountMode::ReadOnly,
+        }];
+        store.save_manifest(&manifest).expect("save declared mount");
+        let runner = SandboxSimpleNativeCommandRunner::new(SandboxSimpleNativeConfig {
+            host_sifs_root: (case != "unconfigured-root").then_some(host_sifs_root),
+            ..SandboxSimpleNativeConfig::default()
+        });
+        let lease = try_acquire_sandbox_local_execution_lease(&store, &sandbox_id)
+            .expect("execution lease");
+        assert!(
+            sinomo_sandbox::read_sandbox_local_execution_journal(&store, &sandbox_id)
+                .expect("read journal before rejection")
+                .is_none()
+        );
+        let marker = layout.work.join("guest-launched");
+        let output_chunks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sink_chunks = Arc::clone(&output_chunks);
+        let sink: Arc<dyn SandboxOutputSink> = Arc::new(move |_chunk| {
+            sink_chunks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        let error = runner
+            .run_native_command(
+                &store,
+                &manifest,
+                &layout,
+                SandboxCommandRequest {
+                    sandbox_id: sandbox_id.clone(),
+                    argv: vec![
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        "printf guest-launched > \"$1\"".to_string(),
+                        "fixture-shell".to_string(),
+                        marker.display().to_string(),
+                    ],
+                    cwd: manifest.cwd.clone(),
+                    stdin: None,
+                    env: std::collections::BTreeMap::from([(
+                        "PATH".to_string(),
+                        env::var("PATH").expect("isolated fixture PATH"),
+                    )]),
+                    timeout_ms: 5_000,
+                },
+                Some(sink),
+                &SandboxCancellationToken::new(),
+                &lease,
+            )
+            .expect_err("mount prerequisites reject before native launch");
+        match (&error, case) {
+            (
+                SandboxCommandExecutionError::Wasi(SandboxWasiError::InvalidRequest { detail }),
+                "unconfigured-root",
+            ) => {
+                assert!(detail.contains("no live host SIFS/FUSE root is configured"));
+            }
+            (SandboxCommandExecutionError::Wasi(SandboxWasiError::Runtime { detail }), _) => {
+                let expected = match case {
+                    "missing-root" => "failed to resolve live host SIFS/FUSE root",
+                    "missing-source" => "failed to resolve declared SIFS mount source",
+                    "missing-bwrap" | "non-executable-bwrap" => {
+                        "`bwrap` is unavailable or not executable"
+                    }
+                    _ => panic!("unknown prerequisite case {case}"),
+                };
+                assert!(detail.contains(expected), "unexpected error: {detail}");
+            }
+            _ => panic!("unexpected prerequisite error for {case}: {error}"),
+        };
+        assert!(!marker.exists(), "the guest marker command must not run");
+        assert_eq!(output_chunks.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(
+            sinomo_sandbox::read_sandbox_local_execution_journal(&store, &sandbox_id)
+                .expect("read journal after rejection")
+                .is_none(),
+            "rejection must not create a preparing/active journal or external owner"
+        );
+        let (after, _) = store
+            .load(&sandbox_id)
+            .expect("load rejected command audit");
+        assert!(after.active_processes.is_empty());
+        assert_eq!(
+            after.generation,
+            manifest.generation + 1,
+            "the retained failed-command audit advances the existing generation once"
+        );
+        assert_eq!(after.mounts, manifest.mounts);
+        assert_eq!(
+            after.command_history.len(),
+            1,
+            "keep the failed attempt audit"
+        );
+        let mut fs = LocalSandboxFileSystem::new(layout);
+        let record = sinomo_sandbox::load_command_record(&mut fs, &after.command_history[0])
+            .expect("load failed attempt audit");
+        assert_eq!(record.status, SandboxCommandRecordStatus::Failed);
+        assert!(record.response.is_none());
+        assert_eq!(record.error.as_deref(), Some(error.to_string().as_str()));
+        assert!(record.completed_at.is_some());
     }
 
     #[test]
