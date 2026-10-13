@@ -439,14 +439,14 @@ fn background<T: Send + 'static>(
 
 pub(crate) fn banner(shared: Shared) -> impl sui::Widget {
     use sui::{Button, Flex, Label, RebuildOnChange, WidgetPod};
-    RebuildOnChange::new_observable(shared.signals().theme.clone(), move |theme| {
+    RebuildOnChange::key_from(shared.signals().theme.clone(), move |theme| {
         let shared = shared.clone();
         let theme = *theme;
-        WidgetPod::new(RebuildOnChange::new_observable(
+        WidgetPod::new(RebuildOnChange::key_from(
             shared.signals().app_update.clone(),
             move |view| {
                 let label = |text: &str| {
-                    Label::new(text.to_owned()).style(theme.text_style(theme.palette.text))
+                    Label::new(text.to_owned()).text_style(theme.text_style(theme.palette.text))
                 };
                 let mut row = Flex::horizontal()
                     .main_gap(8.0)

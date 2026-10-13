@@ -1209,7 +1209,7 @@ fn cluster_metric_catalog(shared: &Shared, reader: &ThemeReader) -> Surface {
                 .position(|kind| *kind == selected_shared.cluster().explorer.kind_filter)
         })
         .theme_when(clone_reader(reader))
-        .on_change_with_ctx(move |index, _label, ctx| {
+        .on_change_with_ctx(move |ctx, index, _label| {
             if let Some(kind) = ExplorerKindFilter::ALL.get(index).copied() {
                 kind_shared.cluster_mut().set_explorer_kind_filter(kind);
                 request_metric_explorer_relayout(ctx);
@@ -1264,7 +1264,7 @@ fn cluster_metric_detail_host(shared: &Shared, reader: &ThemeReader) -> impl Wid
         });
     let shared = shared.clone();
     let reader = reader.clone();
-    RebuildOnChange::new_observable(source, move |_| {
+    RebuildOnChange::key_from(source, move |_| {
         build_cluster_metric_detail(&shared, &reader)
     })
 }
@@ -1314,7 +1314,7 @@ fn build_cluster_metric_detail(shared: &Shared, reader: &ThemeReader) -> WidgetP
     let live_shared = shared.clone();
     let live_reader = reader.clone();
     let hover = Rc::new(Cell::new(None));
-    let live = RebuildOnChange::new_observable(source, move |_| {
+    let live = RebuildOnChange::key_from(source, move |_| {
         build_metric_live_details(&live_shared, &live_reader, hover.clone())
     });
     WidgetPod::new(
@@ -1485,7 +1485,7 @@ fn build_metric_detail_header(
         .align_items(Alignment::Stretch)
         .gap(3.0)
         .with_child(
-            Label::new(entry.descriptor.name.clone()).style(pal.text_style(
+            Label::new(entry.descriptor.name.clone()).text_style(pal.text_style(
                 &theme,
                 if compact {
                     theme.text.base.size
@@ -1497,7 +1497,7 @@ fn build_metric_detail_header(
             )),
         )
         .with_child(
-            Label::new(entry.descriptor.help.clone()).style(pal.text_style(
+            Label::new(entry.descriptor.help.clone()).text_style(pal.text_style(
                 &theme,
                 theme.text.sm.size,
                 FontWeight::NORMAL,
@@ -1629,13 +1629,13 @@ fn build_metric_current_summary(
         Flex::vertical()
             .align_items(Alignment::Stretch)
             .gap(2.0)
-            .with_child(Label::new(value).style(pal.text_style(
+            .with_child(Label::new(value).text_style(pal.text_style(
                 &theme,
                 theme.text.lg.size,
                 FontWeight::SEMIBOLD,
                 pal.text,
             )))
-            .with_child(Label::new(coverage).style(pal.text_style(
+            .with_child(Label::new(coverage).text_style(pal.text_style(
                 &theme,
                 theme.text.sm.size,
                 FontWeight::NORMAL,
@@ -1650,7 +1650,7 @@ fn build_metric_current_summary(
         top: 10.0,
         bottom: 10.0,
     })
-    .fill_width()
+    .fill_width(true)
     .theme_when(clone_reader(reader))
 }
 
@@ -1838,13 +1838,13 @@ fn build_metric_chart_panel(
     let mut body = Flex::vertical()
         .align_items(Alignment::Stretch)
         .gap(6.0)
-        .with_child(Label::new("Live history").style(pal.text_style(
+        .with_child(Label::new("Live history").text_style(pal.text_style(
             &theme,
             theme.text.base.size,
             FontWeight::SEMIBOLD,
             pal.text,
         )))
-        .with_child(Label::new(subtitle).style(pal.text_style(
+        .with_child(Label::new(subtitle).text_style(pal.text_style(
             &theme,
             theme.text.sm.size,
             FontWeight::NORMAL,
@@ -1867,7 +1867,7 @@ fn build_metric_chart_panel(
                     entry.descriptor.kind,
                 )
             );
-            legend.push(Label::new(label).style(pal.text_style(
+            legend.push(Label::new(label).text_style(pal.text_style(
                 &theme,
                 theme.text.xs.size,
                 FontWeight::MEDIUM,
@@ -1878,7 +1878,7 @@ fn build_metric_chart_panel(
     }
     if query.value_conflict {
         body.push(
-            SizedBox::new().height(EXPLORER_CHART_H).with_child(
+            SizedBox::new().height(EXPLORER_CHART_H).child(
                 EmptyState::new(
                     "Conflicting metric descriptors",
                     "Nodes disagree on this metric's kind or unit, so Sinomo will not combine or transform its series",
@@ -1891,7 +1891,7 @@ fn build_metric_chart_panel(
         );
     } else if chart_series.is_empty() {
         body.push(
-            SizedBox::new().height(EXPLORER_CHART_H).with_child(
+            SizedBox::new().height(EXPLORER_CHART_H).child(
                 EmptyState::new(
                     "Collecting live history",
                     "The current value appears after a matching sample; rates and quantiles need two process-stable samples",
@@ -1904,7 +1904,7 @@ fn build_metric_chart_panel(
         );
     } else {
         body.push(
-            SizedBox::new().height(EXPLORER_CHART_H).with_child(
+            SizedBox::new().height(EXPLORER_CHART_H).child(
                 MetricChart::new(
                     entry.descriptor.name.clone(),
                     chart_series,
@@ -1940,7 +1940,7 @@ fn build_metric_chart_panel(
         .appearance(SurfaceAppearance::Raised)
         .elevation(SurfaceElevation::Small)
         .padding(Insets::all(14.0))
-        .fill_width()
+        .fill_width(true)
         .theme_when(clone_reader(reader))
 }
 
@@ -2002,13 +2002,13 @@ fn build_metric_series_table(
                     Flex::vertical()
                         .align_items(Alignment::Stretch)
                         .gap(2.0)
-                        .with_child(Label::new(identity).style(pal.text_style(
+                        .with_child(Label::new(identity).text_style(pal.text_style(
                             &theme,
                             theme.text.sm.size,
                             FontWeight::SEMIBOLD,
                             identity_color,
                         )))
-                        .with_child(Label::new(value).style(pal.text_style(
+                        .with_child(Label::new(value).text_style(pal.text_style(
                             &theme,
                             theme.text.sm.size,
                             FontWeight::NORMAL,
@@ -2022,7 +2022,7 @@ fn build_metric_series_table(
                     top: 4.0,
                     bottom: 6.0,
                 })
-                .fill_width()
+                .fill_width(true)
                 .theme_when(clone_reader(reader)),
             );
         }
@@ -2430,7 +2430,7 @@ fn cluster_activity_host(
             });
     let build_shared = shared.clone();
     let reader = Rc::clone(reader);
-    RebuildOnChange::new_observable(source, move |_key| {
+    RebuildOnChange::key_from(source, move |_key| {
         build_cluster_activity(&build_shared, &reader)
     })
 }
@@ -2660,7 +2660,7 @@ fn cluster_header_host(shared: &Shared, reader: &ThemeReader) -> RebuildOnChange
             });
     let build_shared = shared.clone();
     let reader = Rc::clone(reader);
-    RebuildOnChange::new_observable(source, move |_key| {
+    RebuildOnChange::key_from(source, move |_key| {
         build_cluster_header(&build_shared, &reader)
     })
 }
@@ -2676,14 +2676,14 @@ fn build_cluster_header(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     let summary = Flex::vertical()
         .align_items(Alignment::Stretch)
         .gap(2.0)
-        .with_child(Label::new("Cluster").style(pal.text_style(
+        .with_child(Label::new("Cluster").text_style(pal.text_style(
             &theme,
             theme.text.xl.size,
             FontWeight::SEMIBOLD,
             pal.text,
         )))
         .with_child(
-            Label::new(cluster_header_summary(&snapshot, &topology)).style(pal.text_style(
+            Label::new(cluster_header_summary(&snapshot, &topology)).text_style(pal.text_style(
                 &theme,
                 theme.text.sm.size,
                 FontWeight::NORMAL,
@@ -2733,7 +2733,7 @@ fn cluster_empty_host(shared: &Shared, reader: &ThemeReader) -> RebuildOnChange<
             });
     let build_shared = shared.clone();
     let reader = Rc::clone(reader);
-    RebuildOnChange::new_observable(source, move |_key| {
+    RebuildOnChange::key_from(source, move |_key| {
         build_cluster_empty(&build_shared, &reader)
     })
 }
@@ -3004,7 +3004,7 @@ fn cluster_detail_host(shared: &Shared, reader: &ThemeReader) -> RebuildOnChange
             });
     let build_shared = shared.clone();
     let reader = Rc::clone(reader);
-    RebuildOnChange::new_observable(source, move |_key| {
+    RebuildOnChange::key_from(source, move |_key| {
         build_cluster_detail(&build_shared, &reader)
     })
 }

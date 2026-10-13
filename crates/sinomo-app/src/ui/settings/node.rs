@@ -149,7 +149,7 @@ pub(super) fn node_settings_page<W: Widget + 'static>(
         });
     let s = shared.clone();
     let r = Rc::clone(reader);
-    let picker = RebuildOnChange::new_observable(source, move |_| {
+    let picker = RebuildOnChange::key_from(source, move |_| {
         let nodes = s.settings().module_snapshot.nodes.clone();
         let s_change = s.clone();
         let select = Select::new("settings-node-selector")
@@ -185,7 +185,7 @@ pub(super) fn node_settings_page<W: Widget + 'static>(
             });
     let s = shared.clone();
     let r = Rc::clone(reader);
-    let unavailable = RebuildOnChange::new_observable(state_source, move |_| {
+    let unavailable = RebuildOnChange::key_from(state_source, move |_| {
         let (loading, error, node_id) = {
             let settings = s.settings();
             (
@@ -204,7 +204,7 @@ pub(super) fn node_settings_page<W: Widget + 'static>(
             FormSection::new(
                 "Node settings",
                 Stack::vertical()
-                    .spacing(8.0)
+                    .gap(8.0)
                     .with_child(muted_label(&s, &message))
                     .with_child(
                         sui::Button::new("Refresh node")
@@ -220,7 +220,7 @@ pub(super) fn node_settings_page<W: Widget + 'static>(
         )
     });
     Stack::vertical()
-        .spacing(14.0)
+        .gap(14.0)
         .alignment(Alignment::Stretch)
         .with_child(picker)
         .with_child(
@@ -266,7 +266,7 @@ pub(super) fn remote_host_access_panel(
             );
         },
     );
-    let mut body = FieldGroup::new().spacing(8.0)
+    let mut body = FieldGroup::new().gap(8.0)
         .with_child(muted_label(shared, "Host-access consent must be changed locally on this node. Ordinary Sinomo settings do not require remote-management permission."))
         .with_child(copyable_text_row(reader, "selected-node-host-consent-command", "Run on the selected node", REMOTE_MANAGEMENT_ALLOW_COMMAND.to_string()))
         .with_child(copyable_text_row(reader, "selected-node-integrations-consent-command", "Allow integrations on the selected node", EXTERNAL_INTEGRATIONS_ALLOW_COMMAND.to_string()))

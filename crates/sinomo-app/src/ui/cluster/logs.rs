@@ -291,7 +291,7 @@ pub(super) fn view(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<>
     let controls_shared = shared.clone();
     let controls_reader = reader.clone();
     // Sample changes cannot replace focused filter controls.
-    let controls = RebuildOnChange::new_observable(
+    let controls = RebuildOnChange::key_from(
         source.select_named("log scope controls", |key| {
             (
                 key.theme,
@@ -469,7 +469,7 @@ pub(super) fn view(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<>
         move |model, state| {
             VirtualList::new("Collected logs", model, move |_, data| {
                 let reader = row_reader.clone();
-                RebuildOnChange::new_observable(data, move |(_, row, node_name)| {
+                RebuildOnChange::key_from(data, move |(_, row, node_name)| {
                     WidgetPod::new(row_view(&reader, row, node_name))
                 })
             })
@@ -479,7 +479,7 @@ pub(super) fn view(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<>
             .overscan_viewports(0.5)
             .cache_capacity(24)
             .padding(Insets::all(12.0))
-            .spacing(8.0)
+            .gap(8.0)
             .chrome(VirtualListChrome::Transparent)
             .theme_when(clone_reader(&list_reader))
             .row_name(|key, _| format!("Log {key}"))
@@ -759,5 +759,5 @@ mod tests {
 
 fn log_label(text: impl Into<String>, reader: &ThemeReader) -> Label {
     let reader = reader.clone();
-    Label::new(text).style_when(move || reader().body_text_style())
+    Label::new(text).text_style_when(move || reader().body_text_style())
 }

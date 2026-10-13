@@ -5780,7 +5780,7 @@ fn padded_virtual_list_row<W>(reader: &ThemeReader, child: W) -> WidgetPadding
 where
     W: Widget + 'static,
 {
-    WidgetPadding::new(reader().metrics.data_row_padding, child).fill_child_width()
+    WidgetPadding::new(reader().metrics.data_row_padding, child).fill_child_width(true)
 }
 
 fn provider_model_label(form: &ProviderForm) -> String {
@@ -6007,7 +6007,7 @@ fn settings_text_style(shared: &Shared, token: ThemeTextToken) -> sui::TextStyle
 }
 
 fn settings_label(shared: &Shared, text: impl Into<String>, token: ThemeTextToken) -> Label {
-    Label::new(text).style(settings_text_style(shared, token))
+    Label::new(text).text_style(settings_text_style(shared, token))
 }
 
 fn muted_label_with_token(
@@ -6061,7 +6061,7 @@ fn value_row(
         }
         document
     };
-    let value = RichText::dynamic(document(), document);
+    let value = RichText::new(document()).document_when(document);
     inline_row(label, value).theme_when(clone_reader(reader))
 }
 
@@ -6091,7 +6091,7 @@ where
         style.color = palette(shared).danger_text;
         style
     };
-    let error_text = RichText::dynamic(TextDocument::from_plain_text("", error_style), {
+    let error_text = RichText::new(TextDocument::from_plain_text("", error_style)).document_when({
         let error = Rc::clone(&error);
         let s = shared.clone();
         move || {
@@ -6105,11 +6105,11 @@ where
     .copy_to_clipboard(true);
     let error_text =
         read_only_text_menu(reader, "settings-error", error_text, error_selection, true);
-    let status_label = Label::dynamic("Settings status", {
+    let status_label = Label::new("Settings status").text_when({
         let status = Rc::clone(&status);
         move || status().unwrap_or_default()
     })
-    .style(settings_text_style(shared, shared.theme().text.base))
+    .text_style(settings_text_style(shared, shared.theme().text.base))
     .color_when({
         let s = shared.clone();
         move || palette(&s).text_muted
@@ -6394,7 +6394,7 @@ fn copyable_area_row(
     let value = value.into();
     let area = SizedBox::new()
         .height(72.0)
-        .with_child(selectable_read_only_area(reader, name, value.clone()));
+        .child(selectable_read_only_area(reader, name, value.clone()));
     let copy_value = value;
     let copy = sui::Button::new("Copy")
         .semantic_name(format!("Copy {label}"))
@@ -6407,7 +6407,7 @@ fn copyable_area_row(
     FormRow::new(
         label,
         Stack::vertical()
-            .spacing(8.0)
+            .gap(8.0)
             .alignment(Alignment::Stretch)
             .with_child(area)
             .with_child(
@@ -6426,7 +6426,7 @@ fn selectable_read_only_input(reader: &ThemeReader, name: &str, value: String) -
     let selection = SelectionScope::new();
     let field = TextInput::new(name)
         .value(value)
-        .read_only()
+        .read_only(true)
         .selection_scope(selection.clone())
         .copy_to_clipboard(true)
         .theme_when(clone_reader(reader));
@@ -6439,7 +6439,7 @@ fn selectable_read_only_area(reader: &ThemeReader, name: &str, value: String) ->
     let selection = SelectionScope::new();
     let field = TextArea::new(name)
         .value(value)
-        .read_only()
+        .read_only(true)
         .selection_scope(selection.clone())
         .copy_to_clipboard(true)
         .theme_when(clone_reader(reader));
@@ -6470,13 +6470,13 @@ where
         let copy = MenuItem::new("Copy").shortcut("Ctrl+C");
         let select_all = MenuItem::new("Select All")
             .shortcut("Ctrl+A")
-            .separator_before();
+            .separator_before(true);
         vec![
-            if has_selection { copy } else { copy.disabled() },
+            if has_selection { copy } else { copy.enabled(false) },
             if has_text {
                 select_all
             } else {
-                select_all.disabled()
+                select_all.enabled(false)
             },
         ]
     })
@@ -6498,9 +6498,9 @@ where
     F: FnMut(bool) + 'static,
 {
     let switch = Switch::new("")
-        .on(on)
+        .checked(on)
         .theme_when(clone_reader(reader))
-        .on_toggle(on_toggle);
+        .on_change(on_toggle);
     inline_row(label, switch).theme_when(clone_reader(reader))
 }
 
@@ -6756,20 +6756,20 @@ fn section_appearance(shared: &Shared, reader: &ThemeReader) -> impl Widget + us
             })
     };
     let theme_body = FieldGroup::new()
-        .spacing(6.0)
+        .gap(6.0)
         .with_child(inline_row("Theme", tab_bar).theme_when(clone_reader(reader)));
     let theme_section = FormSection::new("Appearance", theme_body)
         .description("Choose the app theme used by every tab.")
         .theme_when(clone_reader(reader));
 
     let scale_body = FieldGroup::new()
-        .spacing(8.0)
+        .gap(8.0)
         .with_child(inline_row("Text size", text_scale_select).theme_when(clone_reader(reader)))
         .with_child(
             FormRow::new(
                 "Preview",
                 Stack::vertical()
-                    .spacing(4.0)
+                    .gap(4.0)
                     .alignment(Alignment::Stretch)
                     .with_child(settings_label(
                         shared,
@@ -6796,7 +6796,7 @@ fn section_appearance(shared: &Shared, reader: &ThemeReader) -> impl Widget + us
 
     let current_render_mode = shared.render_mode();
     let render_body = FieldGroup::new()
-        .spacing(8.0)
+        .gap(8.0)
         .with_child(value_row(
             shared,
             reader,
@@ -6817,7 +6817,7 @@ fn section_appearance(shared: &Shared, reader: &ThemeReader) -> impl Widget + us
         .theme_when(clone_reader(reader));
 
     Stack::vertical()
-        .spacing(12.0)
+        .gap(12.0)
         .alignment(Alignment::Stretch)
         .with_child(theme_section)
         .with_child(scale_section)
@@ -6833,7 +6833,7 @@ fn section_connection(shared: &Shared, reader: &ThemeReader) -> impl Widget + us
         });
     let s = shared.clone();
     let r = Rc::clone(reader);
-    RebuildOnChange::new_observable(source, move |_key| {
+    RebuildOnChange::key_from(source, move |_key| {
         WidgetPod::new(section_connection_body(&s, &r))
     })
 }
@@ -6844,13 +6844,13 @@ fn section_connection_body(shared: &Shared, reader: &ThemeReader) -> impl Widget
         (s.mode_label.clone(), s.status_detail.clone())
     };
     let body = FieldGroup::new()
-        .spacing(6.0)
+        .gap(6.0)
         .with_child(value_row(shared, reader, "Mode", mode_label))
         .with_child(value_row(shared, reader, "Status", status_detail));
     let connection = FormSection::new("Connection", body).theme_when(clone_reader(reader));
 
     Stack::vertical()
-        .spacing(12.0)
+        .gap(12.0)
         .alignment(Alignment::Stretch)
         .with_child(connection)
         .with_child(connection_attention_section(shared, reader))
@@ -6858,7 +6858,7 @@ fn section_connection_body(shared: &Shared, reader: &ThemeReader) -> impl Widget
 
 fn connection_attention_section(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let issues = connection_issues(shared);
-    let mut body = FieldGroup::new().spacing(8.0);
+    let mut body = FieldGroup::new().gap(8.0);
     if issues.is_empty() {
         body.push(value_row(
             shared,
@@ -6907,7 +6907,7 @@ fn connection_issue_row(shared: &Shared, reader: &ThemeReader, issue: Connection
         };
         SizedBox::new()
             .height(68.0)
-            .with_child(selectable_read_only_area(reader, name, detail))
+            .child(selectable_read_only_area(reader, name, detail))
     };
     let button = {
         let s = shared.clone();
@@ -6941,7 +6941,7 @@ fn connection_issue_row(shared: &Shared, reader: &ThemeReader, issue: Connection
         .on_press(move || s.settings_mut().toggle_connection_detail(tab))
     };
     let header = Stack::vertical()
-        .spacing(3.0)
+        .gap(3.0)
         .alignment(Alignment::Stretch)
         .with_child(status)
         .with_child(summary);
@@ -6955,12 +6955,12 @@ fn connection_issue_row(shared: &Shared, reader: &ThemeReader, issue: Connection
     }
     controls = controls.with_child(detail_button);
     let action_row = Stack::vertical()
-        .spacing(5.0)
+        .gap(5.0)
         .alignment(Alignment::Start)
         .with_child(controls)
         .with_child(recovery);
     let mut stack = Stack::vertical()
-        .spacing(8.0)
+        .gap(8.0)
         .alignment(Alignment::Stretch)
         .with_child(header)
         .with_child(action_row);
@@ -6985,7 +6985,7 @@ fn section_node(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
             });
     let s = shared.clone();
     let r = Rc::clone(reader);
-    RebuildOnChange::new_observable(source, move |_sig| {
+    RebuildOnChange::key_from(source, move |_sig| {
         WidgetPod::new(section_node_body(&s, &r))
     })
 }
@@ -7001,7 +7001,7 @@ fn section_node_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + use
     })
     .theme_when(clone_reader(reader))
     .on_press(move || s.settings_mut().toggle_node_detail());
-    let mut fields = FieldGroup::new().spacing(8.0).with_child(detail);
+    let mut fields = FieldGroup::new().gap(8.0).with_child(detail);
     if let Some(node) = node {
         fields = fields
             .with_child(value_row(shared, reader, "Name", node.summary.display_name))
@@ -7021,7 +7021,7 @@ fn section_node_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + use
         }
     }
     Stack::vertical()
-        .spacing(14.0)
+        .gap(14.0)
         .alignment(Alignment::Stretch)
         .with_child(FormSection::new("Selected node", fields).theme_when(clone_reader(reader)))
         .with_child(section_configuration(shared, reader, true))
@@ -7039,7 +7039,7 @@ fn section_sifs_mount(shared: &Shared, reader: &ThemeReader) -> impl Widget + us
             });
     let s = shared.clone();
     let r = Rc::clone(reader);
-    RebuildOnChange::new_observable(source, move |_key| {
+    RebuildOnChange::key_from(source, move |_key| {
         WidgetPod::new(section_sifs_mount_body(&s, &r))
     })
 }
@@ -7054,7 +7054,7 @@ fn sifs_mount_runtime_status(shared: &Shared, reader: &ThemeReader) -> impl Widg
     let key_shared = shared.clone();
     let build_shared = shared.clone();
     let build_reader = Rc::clone(reader);
-    let status = RebuildOnChange::new(
+    let status = RebuildOnChange::key_when(
         move || {
             let snapshot = key_shared.settings().sifs_mount_snapshot.clone();
             let presentation =
@@ -7112,7 +7112,7 @@ fn build_sifs_mount_runtime_status(
             })
     };
     let mut runtime_rows = FieldGroup::new()
-        .spacing(8.0)
+        .gap(8.0)
         .with_child(
             FormRow::new("Observed state", observed)
                 .stacked()
@@ -7480,7 +7480,7 @@ fn section_sifs_mount_body(shared: &Shared, reader: &ThemeReader) -> impl Widget
         },
     );
     let mut config_rows = FieldGroup::new()
-        .spacing(8.0)
+        .gap(8.0)
         .with_child(enabled)
         .with_child(mount_point)
         .with_child(root_path);
@@ -7610,7 +7610,7 @@ fn section_sifs_mount_body(shared: &Shared, reader: &ThemeReader) -> impl Widget
         ));
 
     Stack::vertical()
-        .spacing(14.0)
+        .gap(14.0)
         .alignment(Alignment::Stretch)
         .with_child(
             runtime_status,
@@ -7905,7 +7905,7 @@ fn section_remote_management(shared: &Shared, reader: &ThemeReader) -> impl Widg
     );
     let s = shared.clone();
     let r = Rc::clone(reader);
-    RebuildOnChange::new_observable(source, move |_key| {
+    RebuildOnChange::key_from(source, move |_key| {
         if !s.settings().selected_settings_node_is_local() {
             return WidgetPod::new(remote_host_access_panel(&s, &r));
         }
@@ -7976,7 +7976,7 @@ fn section_remote_management_body(shared: &Shared, reader: &ThemeReader) -> impl
             inline_row(
                 "Allow remote management",
                 Stack::horizontal()
-                    .spacing(8.0)
+                    .gap(8.0)
                     .with_child(
                         Spinner::new("remote-management-permission-pending")
                             .theme_when(clone_reader(reader)),
@@ -8008,9 +8008,9 @@ fn section_remote_management_body(shared: &Shared, reader: &ThemeReader) -> impl
     } else if snapshot.permission_enabled {
         let s = shared.clone();
         let control = Switch::new("Allow remote management")
-            .on(true)
+            .checked(true)
             .theme_when(clone_reader(reader))
-            .on_toggle(move |enabled| {
+            .on_change(move |enabled| {
                 if !enabled {
                     queue_settings_operation(
                         &s,
@@ -8035,7 +8035,7 @@ fn section_remote_management_body(shared: &Shared, reader: &ThemeReader) -> impl
     };
 
     let mut permission_body = FieldGroup::new()
-        .spacing(8.0)
+        .gap(8.0)
         .with_child(
             FormRow::new("Local permission", permission_status)
                 .stacked()
@@ -8069,7 +8069,7 @@ fn section_remote_management_body(shared: &Shared, reader: &ThemeReader) -> impl
                 .on_press(move || s.settings_mut().cancel_remote_management_enable())
         };
         let confirmation_body = Stack::vertical()
-            .spacing(7.0)
+            .gap(7.0)
             .alignment(Alignment::Stretch)
             .with_child(muted_label(
                 shared,
@@ -8163,7 +8163,7 @@ fn section_remote_management_body(shared: &Shared, reader: &ThemeReader) -> impl
             inline_row(
                 "Node override",
                 Stack::horizontal()
-                    .spacing(8.0)
+                    .gap(8.0)
                     .with_child(
                         Spinner::new("remote-management-module-pending")
                             .theme_when(clone_reader(reader)),
@@ -8175,7 +8175,7 @@ fn section_remote_management_body(shared: &Shared, reader: &ThemeReader) -> impl
     } else if snapshot.module_loading || snapshot.module_node_id.is_none() {
         let content = if snapshot.module_loading {
             Stack::horizontal()
-                .spacing(8.0)
+                .gap(8.0)
                 .with_child(
                     Spinner::new("remote-management-module-loading")
                         .theme_when(clone_reader(reader)),
@@ -8184,7 +8184,7 @@ fn section_remote_management_body(shared: &Shared, reader: &ThemeReader) -> impl
         } else {
             let s = shared.clone();
             Stack::horizontal()
-                .spacing(8.0)
+                .gap(8.0)
                 .with_child(muted_label(shared, "Local node configuration unavailable"))
                 .with_child(
                     sui::Button::new("Refresh")
@@ -8241,7 +8241,7 @@ fn section_remote_management_body(shared: &Shared, reader: &ThemeReader) -> impl
             .tone(SemanticTone::Neutral)
             .on_press(move || s.settings_mut().open(SettingsSection::Modules))
     };
-    let mut module_body = FieldGroup::new().spacing(8.0);
+    let mut module_body = FieldGroup::new().gap(8.0);
     if !snapshot.module_loading {
         module_body = module_body
             .with_child(value_row(
@@ -8306,7 +8306,7 @@ fn section_remote_management_body(shared: &Shared, reader: &ThemeReader) -> impl
         .theme_when(clone_reader(reader));
 
     let commands = FieldGroup::new()
-        .spacing(8.0)
+        .gap(8.0)
         .with_child(copyable_text_row(
             reader,
             "remote-management-allow-command",
@@ -8332,7 +8332,7 @@ fn section_remote_management_body(shared: &Shared, reader: &ThemeReader) -> impl
         .theme_when(clone_reader(reader));
 
     Stack::vertical()
-        .spacing(14.0)
+        .gap(14.0)
         .alignment(Alignment::Stretch)
         .with_child(permission_section)
         .with_child(module_section)
@@ -8377,7 +8377,7 @@ fn section_cluster(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<>
         });
     let s = shared.clone();
     let r = Rc::clone(reader);
-    RebuildOnChange::new_observable(source, move |_key| {
+    RebuildOnChange::key_from(source, move |_key| {
         WidgetPod::new(section_cluster_body(&s, &r))
     })
 }
@@ -8396,7 +8396,7 @@ fn section_cluster_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
         )
     };
 
-    let mut body = FieldGroup::new().spacing(8.0);
+    let mut body = FieldGroup::new().gap(8.0);
     if clustered {
         body = body.with_child(value_row(shared, reader, "Cluster", cluster_summary));
 
@@ -8480,7 +8480,7 @@ fn section_cluster_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
                     })
             };
             let controls = Stack::vertical()
-                .spacing(8.0)
+                .gap(8.0)
                 .alignment(Alignment::Stretch)
                 .with_child(muted_label(
                     shared,
@@ -8557,7 +8557,7 @@ fn cluster_join_controls(shared: &Shared, reader: &ThemeReader, clustered: bool)
             move |value| s.settings_mut().set_join_invite(value)
         });
     let mut controls = Stack::vertical()
-        .spacing(8.0)
+        .gap(8.0)
         .alignment(Alignment::Stretch)
         .with_child(input);
 
@@ -8730,7 +8730,7 @@ fn section_about(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     };
     let platform = format!("{} · {}", std::env::consts::OS, std::env::consts::ARCH);
     let build = FieldGroup::new()
-        .spacing(6.0)
+        .gap(6.0)
         .with_child(value_row(
             shared,
             reader,
@@ -8740,7 +8740,7 @@ fn section_about(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
         .with_child(value_row(shared, reader, "Toolkit", "SUI"))
         .with_child(value_row(shared, reader, "Platform", platform.clone()));
     let mut runtime = FieldGroup::new()
-        .spacing(6.0)
+        .gap(6.0)
         .with_child(value_row(shared, reader, "Mode", mode_label.clone()))
         .with_child(value_row(shared, reader, "Status", status_detail.clone()))
         .with_child(copyable_text_row(
@@ -8768,7 +8768,7 @@ fn section_about(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
         "Sinomo App v{version}\nPlatform: {platform}\nMode: {mode_label}\nStatus: {status_detail}\nApp surface: {app_surface_id}\nSurface role: {surface_role}\nData directory: {data_directory}"
     );
     let diagnostics = FieldGroup::new()
-        .spacing(6.0)
+        .gap(6.0)
         .with_child(copyable_text_row(
             reader,
             "about-data-directory",
@@ -8782,7 +8782,7 @@ fn section_about(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
             diagnostic_summary,
         ));
     Stack::vertical()
-        .spacing(14.0)
+        .gap(14.0)
         .alignment(Alignment::Stretch)
         .with_child(
             FormSection::new("About", build)
@@ -8824,9 +8824,9 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
         let provider = form.provider.clone();
         let account = form.account.clone();
         Switch::new("Enabled")
-            .on(form.enabled)
+            .checked(form.enabled)
             .theme_when(clone_reader(reader))
-            .on_toggle(move |enabled| {
+            .on_change(move |enabled| {
                 queue_settings_operation(
                     &s,
                     SettingsOperationScope::Providers,
@@ -8844,12 +8844,12 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
         .tone(health_presentation.tone)
         .theme_when(clone_reader(reader));
     let header_actions = Stack::horizontal()
-        .spacing(8.0)
+        .gap(8.0)
         .alignment(Alignment::Center)
         .with_child(health_badge)
         .with_child(enable_switch);
 
-    let mut body = FieldGroup::new().spacing(10.0).fill_width();
+    let mut body = FieldGroup::new().gap(10.0).fill_width(true);
     let test_button = {
         let s = shared.clone();
         let provider = form.provider.clone();
@@ -8905,7 +8905,7 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
             ),
         ));
     let mut connection_detail = Stack::vertical()
-        .spacing(4.0)
+        .gap(4.0)
         .alignment(Alignment::Stretch)
         .with_child(connection_summary);
     if let Some(error) = health.error.clone() {
@@ -9091,7 +9091,7 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
                     })
             };
             let auth = Stack::vertical()
-                .spacing(6.0)
+                .gap(6.0)
                 .alignment(Alignment::Stretch)
                 .with_child(status_reflector(shared, index, reader))
                 .with_child(Stack::horizontal().with_child(button));
@@ -9587,12 +9587,12 @@ fn provider_subsection_heading(shared: &Shared, reader: &ThemeReader, title: &st
     let mut style = settings_text_style(shared, shared.theme().text.xs);
     style.weight = FontWeight::SEMIBOLD;
     Stack::vertical()
-        .spacing(8.0)
+        .gap(8.0)
         .alignment(Alignment::Stretch)
         .with_child(Separator::horizontal().theme_when(clone_reader(reader)))
         .with_child(
             Label::new(title.to_ascii_uppercase())
-                .style(style)
+                .text_style(style)
                 .color_when({
                     let s = shared.clone();
                     move || palette(&s).text_faint
@@ -9651,7 +9651,7 @@ where
     let save = provider_save_button(shared, reader, label, draft_key, on_save);
     inline_row(
         label,
-        SizedBox::new().height(28.0).with_child(
+        SizedBox::new().height(28.0).child(
             TrailingSlotRow::new(input, save)
                 .trailing_width(28.0)
                 .trailing_height(28.0)
@@ -9684,7 +9684,7 @@ where
     let save = provider_save_button(shared, reader, label, draft_key, on_save);
     inline_row(
         label,
-        SizedBox::new().height(28.0).with_child(
+        SizedBox::new().height(28.0).child(
             TrailingSlotRow::new(input, save)
                 .trailing_width(28.0)
                 .trailing_height(28.0)
@@ -9860,9 +9860,9 @@ fn provider_usage_row(
     reader: &ThemeReader,
     usage: &sinomo_runtime::api::lm::LanguageModelProviderUsage,
 ) -> FormRow {
-    let mut stack = Stack::vertical().spacing(8.0).alignment(Alignment::Stretch);
+    let mut stack = Stack::vertical().gap(8.0).alignment(Alignment::Stretch);
     let mut metadata = Stack::horizontal()
-        .spacing(8.0)
+        .gap(8.0)
         .alignment(Alignment::Center);
     if let Some(plan) = usage.plan.as_deref() {
         metadata = metadata.with_child(
@@ -9906,7 +9906,7 @@ fn provider_usage_limit_view(
     let name = limit.name.as_deref().unwrap_or(&limit.id);
     if limit.unlimited == Some(true) {
         return Stack::horizontal()
-            .spacing(8.0)
+            .gap(8.0)
             .alignment(Alignment::Center)
             .with_child(primary_label(shared, name.to_string()))
             .with_child(
@@ -9919,7 +9919,7 @@ fn provider_usage_limit_view(
 
     let Some(used_percent) = provider_usage_used_percent(limit) else {
         return Stack::vertical()
-            .spacing(3.0)
+            .gap(3.0)
             .alignment(Alignment::Stretch)
             .with_child(primary_label(shared, name.to_string()))
             .with_child(muted_label(
@@ -9929,14 +9929,14 @@ fn provider_usage_limit_view(
     };
     let tone = provider_usage_tone(limit, used_percent);
     Stack::vertical()
-        .spacing(4.0)
+        .gap(4.0)
         .alignment(Alignment::Stretch)
         .with_child(primary_label(
             shared,
             format!("{name} · {used_percent:.0}% used"),
         ))
         .with_child(
-            SizedBox::new().height(8.0).with_child(
+            SizedBox::new().height(8.0).child(
                 ProgressBar::new(format!("{name} usage"))
                     .range(0.0, 100.0)
                     .value(used_percent)
@@ -10064,12 +10064,12 @@ fn provider_management_row(
                 })
         };
         let controls = Stack::horizontal()
-            .spacing(8.0)
+            .gap(8.0)
             .alignment(Alignment::Start)
             .with_child(cancel)
             .with_child(remove);
         let mut stack = Stack::vertical()
-            .spacing(6.0)
+            .gap(6.0)
             .alignment(Alignment::Start)
             .with_child(muted_label(
                 shared,
@@ -10111,7 +10111,7 @@ fn section_providers(shared: &Shared, reader: &ThemeReader) -> impl Widget + use
         });
     let s = shared.clone();
     let r = Rc::clone(reader);
-    RebuildOnChange::new_observable(source, move |_sig| provider_section_body(&s, &r))
+    RebuildOnChange::key_from(source, move |_sig| provider_section_body(&s, &r))
 }
 
 fn provider_section_body(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
@@ -10161,7 +10161,7 @@ fn provider_section_signature(shared: &Shared) -> String {
 
 fn provider_list_view(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let mut stack = Stack::vertical()
-        .spacing(14.0)
+        .gap(14.0)
         .alignment(Alignment::Stretch);
     let add = {
         let s = shared.clone();
@@ -10193,8 +10193,8 @@ fn provider_list_view(shared: &Shared, reader: &ThemeReader) -> impl Widget + us
             .on_press(move || s.settings_mut().toggle_provider_storage_detail())
         };
         let mut group = FieldGroup::new()
-            .fill_width()
-            .spacing(8.0)
+            .fill_width(true)
+            .gap(8.0)
             .with_child(value_row(
                 shared,
                 reader,
@@ -10229,8 +10229,8 @@ fn provider_list_view(shared: &Shared, reader: &ThemeReader) -> impl Widget + us
         group
     } else {
         FieldGroup::new()
-            .fill_width()
-            .spacing(8.0)
+            .fill_width(true)
+            .gap(8.0)
             .with_child(value_row(
                 shared,
                 reader,
@@ -10306,8 +10306,8 @@ fn provider_add_view(shared: &Shared, reader: &ThemeReader) -> impl Widget + use
     };
 
     let mut body = FieldGroup::new()
-        .fill_width()
-        .spacing(8.0)
+        .fill_width(true)
+        .gap(8.0)
         .with_child(inline_row("Provider", provider_select).theme_when(clone_reader(reader)))
         .with_child(text_row(
             reader,
@@ -10475,7 +10475,7 @@ fn agent_details_host(
         });
     let s = shared.clone();
     let r = Rc::clone(reader);
-    RebuildOnChange::new_observable(source, move |_key| {
+    RebuildOnChange::key_from(source, move |_key| {
         WidgetPod::new(agent_detail_panel(&s, &r))
     })
 }
@@ -10528,7 +10528,7 @@ fn section_agents_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
             .on_press(move || shared.settings_mut().back_to_agent_list())
     };
     let detail = Stack::vertical()
-        .spacing(10.0)
+        .gap(10.0)
         .alignment(Alignment::Stretch)
         .with_child(Stack::horizontal().with_child(back))
         .with_child(agent_details_host(shared, reader));
@@ -10576,7 +10576,7 @@ fn agent_catalog_section(shared: &Shared, reader: &ThemeReader) -> FormSection {
             VirtualList::new("agent-config-list", model, move |_id, agent| {
                 let shared = row_shared.clone();
                 let reader = Rc::clone(&row_reader);
-                RebuildOnChange::new_observable(agent, move |row| {
+                RebuildOnChange::key_from(agent, move |row| {
                     WidgetPod::new(padded_virtual_list_row(
                         &reader,
                         agent_catalog_row(&shared, &row.agent),
@@ -10645,14 +10645,14 @@ fn agent_catalog_section(shared: &Shared, reader: &ThemeReader) -> FormSection {
     };
 
     let summary_body = FieldGroup::new()
-        .spacing(8.0)
+        .gap(8.0)
         .with_child(agent_catalog_summary_host(shared, reader))
         .with_child(
             FormRow::new(
                 "Agents",
                 SizedBox::new()
                     .height(AGENT_LIST_ROW_H * 5.0)
-                    .with_child(list),
+                    .child(list),
             )
             .stacked()
             .theme_when(clone_reader(reader)),
@@ -10693,7 +10693,7 @@ fn agent_catalog_summary_host(
             });
     let s = shared.clone();
     let r = Rc::clone(reader);
-    RebuildOnChange::new_observable(source, move |snapshot| {
+    RebuildOnChange::key_from(source, move |snapshot| {
         let (agents, error) = snapshot.clone().unwrap_or_default();
         let catalog = AgentConfigSnapshot {
             agents,
@@ -10702,7 +10702,7 @@ fn agent_catalog_summary_host(
             error,
         };
         let mut rows = FieldGroup::new()
-            .spacing(8.0)
+            .gap(8.0)
             .with_child(value_row(
                 &s,
                 &r,
@@ -10724,7 +10724,7 @@ fn agent_catalog_summary_host(
 
 fn agent_detail_panel(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let mut stack = Stack::vertical()
-        .spacing(14.0)
+        .gap(14.0)
         .alignment(Alignment::Stretch)
         .with_child(feedback_slot(
             shared,
@@ -10845,13 +10845,13 @@ fn agent_package_management_section(shared: &Shared, reader: &ThemeReader) -> im
     let test = agent_lifecycle_action_button(shared, reader, true);
 
     let body = FieldGroup::new()
-        .fill_width()
-        .spacing(8.0)
+        .fill_width(true)
+        .gap(8.0)
         .with_child(
             FormRow::new(
                 "Import",
                 Stack::vertical()
-                    .spacing(8.0)
+                    .gap(8.0)
                     .alignment(Alignment::Stretch)
                     .with_child(import_input)
                     .with_child(
@@ -10867,7 +10867,7 @@ fn agent_package_management_section(shared: &Shared, reader: &ThemeReader) -> im
             FormRow::new(
                 "Export",
                 Stack::vertical()
-                    .spacing(8.0)
+                    .gap(8.0)
                     .alignment(Alignment::Stretch)
                     .with_child(export_input)
                     .with_child(
@@ -10953,8 +10953,8 @@ fn agent_editor_section(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
     };
 
     let profile = FieldGroup::new()
-        .fill_width()
-        .spacing(8.0)
+        .fill_width(true)
+        .gap(8.0)
         .with_child(agent_text_row(
             shared,
             reader,
@@ -10996,8 +10996,8 @@ fn agent_editor_section(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
         .with_child(agent_actions_row(shared, reader));
 
     let model = FieldGroup::new()
-        .fill_width()
-        .spacing(8.0)
+        .fill_width(true)
+        .gap(8.0)
         .with_child(agent_text_row(
             shared,
             reader,
@@ -11036,7 +11036,7 @@ fn agent_editor_section(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
         ))
         .with_child(inline_row("Output", output_format_select).theme_when(clone_reader(reader)));
 
-    let mut tools = FieldGroup::new().fill_width().spacing(8.0);
+    let mut tools = FieldGroup::new().fill_width(true).gap(8.0);
     if form.definition.tools.is_empty() {
         tools = tools.with_child(value_row(
             shared,
@@ -11146,8 +11146,8 @@ fn agent_editor_section(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
         ));
 
     let runtime = FieldGroup::new()
-        .fill_width()
-        .spacing(8.0)
+        .fill_width(true)
+        .gap(8.0)
         .with_child(agent_text_row(
             shared,
             reader,
@@ -11200,7 +11200,7 @@ fn agent_editor_section(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
             form.previous_id.is_some(),
         ));
 
-    let mut package = FieldGroup::new().fill_width().spacing(8.0);
+    let mut package = FieldGroup::new().fill_width(true).gap(8.0);
     if let Some(summary) = selected_agent_config_summary(shared) {
         package = package
             .with_child(agent_readiness_row(shared, reader, summary.readiness))
@@ -11226,7 +11226,7 @@ fn agent_editor_section(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
         package = package.with_child(value_row(shared, reader, "Provenance", summary.provenance));
     }
     Stack::vertical()
-        .spacing(14.0)
+        .gap(14.0)
         .alignment(Alignment::Stretch)
         .with_child(
             FormSection::new(
@@ -11337,7 +11337,7 @@ fn node_external_integrations_permission_section(
             inline_row(
                 "Allow external integrations",
                 Stack::horizontal()
-                    .spacing(8.0)
+                    .gap(8.0)
                     .with_child(
                         Spinner::new("external-integrations-permission-pending")
                             .theme_when(clone_reader(reader)),
@@ -11367,9 +11367,9 @@ fn node_external_integrations_permission_section(
     } else if permission_enabled {
         let s = shared.clone();
         let control = Switch::new("Allow external integrations")
-            .on(true)
+            .checked(true)
             .theme_when(clone_reader(reader))
-            .on_toggle(move |enabled| {
+            .on_change(move |enabled| {
                 if !enabled {
                     queue_settings_operation(
                         &s,
@@ -11394,7 +11394,7 @@ fn node_external_integrations_permission_section(
     };
 
     let mut permission_body = FieldGroup::new()
-        .spacing(8.0)
+        .gap(8.0)
         .with_child(
             FormRow::new("Node-local authority", permission_status)
                 .stacked()
@@ -11427,7 +11427,7 @@ fn node_external_integrations_permission_section(
                 .on_press(move || s.settings_mut().cancel_external_integrations_enable())
         };
         let confirmation = Stack::vertical()
-            .spacing(7.0)
+            .gap(7.0)
             .alignment(Alignment::Stretch)
             .with_child(muted_label(
                 shared,
@@ -11493,7 +11493,7 @@ fn agent_external_integrations_sections(
     form: &AgentForm,
 ) -> impl Widget + use<> {
     let s = shared.clone();
-    let permission_section = FormSection::new("Host authorization", FieldGroup::new().spacing(8.0)
+    let permission_section = FormSection::new("Host authorization", FieldGroup::new().gap(8.0)
         .with_child(muted_label(shared, "MCP server definitions are shared with the cluster. Execution requires consent on the node that runs them."))
         .with_child(sui::Button::new("Host access settings").theme_when(clone_reader(reader))
             .on_press(move || s.settings_mut().open(SettingsSection::RemoteManagement))))
@@ -11524,7 +11524,7 @@ fn agent_external_integrations_sections(
     let overview = FormSection::new(
         "MCP servers",
         FieldGroup::new()
-            .spacing(8.0)
+            .gap(8.0)
             .with_child(value_row(
                 shared,
                 reader,
@@ -11543,7 +11543,7 @@ fn agent_external_integrations_sections(
     .theme_when(clone_reader(reader));
 
     let mut sections = Stack::vertical()
-        .spacing(14.0)
+        .gap(14.0)
         .alignment(Alignment::Stretch)
         .with_child(permission_section)
         .with_child(overview);
@@ -11589,8 +11589,8 @@ fn agent_mcp_server_section(
             .on_press(move || s.settings_mut().remove_agent_mcp_server(ui_id))
     };
     let mut body = FieldGroup::new()
-        .fill_width()
-        .spacing(8.0)
+        .fill_width(true)
+        .gap(8.0)
         .with_child(agent_text_row(
             shared,
             reader,
@@ -11801,7 +11801,7 @@ fn agent_home_folder_row(
     FormRow::new(
         "Agent home",
         Stack::vertical()
-            .spacing(6.0)
+            .gap(6.0)
             .alignment(Alignment::Stretch)
             .with_child(
                 TrailingSlotRow::new(
@@ -11950,8 +11950,8 @@ fn agent_readonly_section(
             .on_press(move || s.settings_mut().duplicate_selected_agent())
     };
     let mut body = FieldGroup::new()
-        .fill_width()
-        .spacing(8.0)
+        .fill_width(true)
+        .gap(8.0)
         .with_child(agent_readiness_row(
             shared,
             reader,
@@ -12081,7 +12081,7 @@ fn agent_readiness_row(
     FormRow::new(
         "Readiness",
         Stack::vertical()
-            .spacing(4.0)
+            .gap(4.0)
             .alignment(Alignment::Start)
             .with_child(
                 Stack::horizontal().with_child(
@@ -12105,7 +12105,7 @@ fn agent_validation_report_section(
     let ready = report.is_ready();
     let title = format!("Validation report · {}", report.agent_id);
     let summary = report.summary();
-    let mut body = FieldGroup::new().spacing(8.0).with_child(
+    let mut body = FieldGroup::new().gap(8.0).with_child(
         inline_row(
             "Result",
             Stack::horizontal().with_child(
@@ -12130,7 +12130,7 @@ fn agent_validation_report_section(
             FormRow::new(
                 check.name,
                 Stack::vertical()
-                    .spacing(4.0)
+                    .gap(4.0)
                     .alignment(Alignment::Start)
                     .with_child(
                         Stack::horizontal().with_child(
@@ -12197,7 +12197,7 @@ where
     F: FnMut(&mut SettingsState, String) + 'static,
 {
     let s = shared.clone();
-    let area = SizedBox::new().height(height).with_child(
+    let area = SizedBox::new().height(height).child(
         TextArea::new(name)
             .value(value)
             .placeholder(placeholder)
@@ -12299,7 +12299,7 @@ fn section_modules(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<>
         });
     let s = shared.clone();
     let r = Rc::clone(reader);
-    RebuildOnChange::new_observable(source, move |_key| {
+    RebuildOnChange::key_from(source, move |_key| {
         WidgetPod::new(section_modules_body(&s, &r))
     })
 }
@@ -12405,7 +12405,7 @@ fn section_modules_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
     };
 
     let mut summary_body = FieldGroup::new()
-        .spacing(8.0)
+        .gap(8.0)
         .with_child(value_row(
             shared,
             reader,
@@ -12454,7 +12454,7 @@ fn section_modules_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
     }
 
     let mut stack = Stack::vertical()
-        .spacing(14.0)
+        .gap(14.0)
         .alignment(Alignment::Stretch)
         .with_child(
             FormSection::new("Modules", summary_body)
@@ -12475,7 +12475,7 @@ fn section_modules_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
     };
     let mut rendered_config_indices = HashSet::new();
     if snapshot.modules.is_empty() {
-        let empty = FieldGroup::new().spacing(8.0).with_child(value_row(
+        let empty = FieldGroup::new().gap(8.0).with_child(value_row(
             shared,
             reader,
             "Status",
@@ -12503,7 +12503,7 @@ fn section_modules_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
         .filter(|(index, _)| !rendered_config_indices.contains(index))
         .collect::<Vec<_>>();
     if !unmatched.is_empty() {
-        let mut body = FieldGroup::new().spacing(8.0);
+        let mut body = FieldGroup::new().gap(8.0);
         for (index, item) in unmatched {
             body = body.with_child(PodHost::new(module_config_editor_row(
                 shared, reader, index, &item,
@@ -12633,7 +12633,7 @@ fn module_config_section(
     );
 
     let mut body = FieldGroup::new()
-        .spacing(8.0)
+        .gap(8.0)
         .with_child(
             FormRow::new("Desired", desired)
                 .stacked()
@@ -12705,7 +12705,7 @@ fn module_config_editor_row(
         WidgetPod::new(config_detail_editor(shared, reader, index, item))
     };
     let mut settings_body = Stack::vertical()
-        .spacing(5.0)
+        .gap(5.0)
         .alignment(Alignment::Stretch)
         .with_child(muted_meta_label(shared, config_metadata_line(item)));
     if !item.description.trim().is_empty() {
@@ -12859,7 +12859,7 @@ fn module_lifecycle_value(
     detail: impl Into<String>,
 ) -> Stack {
     Stack::vertical()
-        .spacing(4.0)
+        .gap(4.0)
         .alignment(Alignment::Start)
         .with_child(
             Stack::horizontal().with_child(
@@ -12886,7 +12886,7 @@ fn module_display_id(module_id: &str) -> String {
 
 fn section_skills(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     Stack::vertical()
-        .spacing(14.0)
+        .gap(14.0)
         .alignment(Alignment::Stretch)
         .with_child(skills_summary_section(shared, reader))
         .with_child(skills_catalog_host(shared, reader))
@@ -12903,7 +12903,7 @@ fn skills_summary_section(shared: &Shared, reader: &ThemeReader) -> FormSection 
     };
 
     let mut summary_body = FieldGroup::new()
-        .spacing(8.0)
+        .gap(8.0)
         .with_child(skills_summary_preview_host(shared, reader))
         .with_child(switch_row(reader, "Show all versions", include_all, {
             let s = shared.clone();
@@ -13025,7 +13025,7 @@ fn skills_summary_preview_host(
     );
     let s = shared.clone();
     let r = Rc::clone(reader);
-    RebuildOnChange::new_observable(source, move |skills| {
+    RebuildOnChange::key_from(source, move |skills| {
         WidgetPod::new(value_row(&s, &r, "Catalog", skills_sidebar_preview(skills)))
     })
 }
@@ -13041,10 +13041,10 @@ fn skills_catalog_host(shared: &Shared, reader: &ThemeReader) -> RebuildOnChange
     );
     let s = shared.clone();
     let r = Rc::clone(reader);
-    RebuildOnChange::new_observable(source, move |empty| {
+    RebuildOnChange::key_from(source, move |empty| {
         if *empty {
             let body = FieldGroup::new()
-                .spacing(8.0)
+                .gap(8.0)
                 .with_child(value_row(
                     &s,
                     &r,
@@ -13099,7 +13099,7 @@ fn skill_virtual_catalog(shared: &Shared, reader: &ThemeReader) -> FormSection {
             VirtualList::new("skill-catalog", model, move |_key, skill| {
                 let shared = row_shared.clone();
                 let reader = Rc::clone(&row_reader);
-                RebuildOnChange::new_observable(skill, move |row| {
+                RebuildOnChange::key_from(skill, move |row| {
                     WidgetPod::new(padded_virtual_list_row(
                         &reader,
                         skill_catalog_row(&shared, &row.skill),
@@ -13156,7 +13156,7 @@ fn skill_detail_host(
         });
     let s = shared.clone();
     let r = Rc::clone(reader);
-    RebuildOnChange::new_observable(source, move |_key| {
+    RebuildOnChange::key_from(source, move |_key| {
         let (detail, export_path, text_expanded) = {
             let settings = s.settings();
             (
@@ -13201,7 +13201,7 @@ fn skill_detail_section(
 ) -> impl Widget + use<> {
     let summary = detail.summary.clone();
     let mut body = FieldGroup::new()
-        .spacing(8.0)
+        .gap(8.0)
         .with_child(value_row(
             shared,
             reader,
@@ -13391,10 +13391,10 @@ fn skill_detail_section(
         body = body.with_child(
             FormRow::new(
                 "SKILL.md",
-                SizedBox::new().height(220.0).with_child(
+                SizedBox::new().height(220.0).child(
                     TextArea::new("skill-markdown")
                         .value(detail.text)
-                        .read_only()
+                        .read_only(true)
                         .theme_when(clone_reader(reader)),
                 ),
             )
@@ -13427,7 +13427,7 @@ fn configuration_controls(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
         let checkbox = Checkbox::new("Show only local or cluster overrides")
             .checked(on)
             .theme_when(clone_reader(reader))
-            .on_toggle(move |on| s.settings_mut().set_advanced_overrides_only(on));
+            .on_change(move |on| s.settings_mut().set_advanced_overrides_only(on));
         let s = shared.clone();
         SyncedCheckbox::new(checkbox, move || s.settings().advanced_overrides_only)
     };
@@ -13435,7 +13435,7 @@ fn configuration_controls(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
         FormSection::new(
             "Browse configuration",
             FieldGroup::new()
-                .spacing(8.0)
+                .gap(8.0)
                 .with_child(
                     FormRow::new("Search", search)
                         .stacked()
@@ -13472,7 +13472,7 @@ fn section_configuration(
     );
     let s = shared.clone();
     let r = Rc::clone(reader);
-    let controls = RebuildOnChange::new_observable(controls_source, move |_revision| {
+    let controls = RebuildOnChange::key_from(controls_source, move |_revision| {
         configuration_controls(&s, &r)
     });
 
@@ -13486,11 +13486,11 @@ fn section_configuration(
     );
     let s = shared.clone();
     let r = Rc::clone(reader);
-    let results = RebuildOnChange::new_observable(source, move |_key| {
+    let results = RebuildOnChange::key_from(source, move |_key| {
         configuration_results(&s, &r, node_scoped)
     });
     Stack::vertical()
-        .spacing(14.0)
+        .gap(14.0)
         .alignment(Alignment::Stretch)
         .with_child(controls)
         .with_child(results)
@@ -13563,7 +13563,7 @@ fn configuration_results(shared: &Shared, reader: &ThemeReader, node_scoped: boo
                 s.settings_mut().clear_advanced_filters();
             });
         let body = Stack::vertical()
-            .spacing(8.0)
+            .gap(8.0)
             .alignment(Alignment::Stretch)
             .with_child(muted_label(shared, message))
             .with_child(Stack::horizontal().with_child(clear));
@@ -13575,7 +13575,7 @@ fn configuration_results(shared: &Shared, reader: &ThemeReader, node_scoped: boo
     }
 
     let mut stack = Stack::vertical()
-        .spacing(14.0)
+        .gap(14.0)
         .alignment(Alignment::Stretch)
         .with_child(
             FormSection::new(
@@ -13593,7 +13593,7 @@ fn configuration_results(shared: &Shared, reader: &ThemeReader, node_scoped: boo
             .theme_when(clone_reader(reader)),
         );
     for (owner, indices) in groups {
-        let mut rows = FieldGroup::new().spacing(8.0);
+        let mut rows = FieldGroup::new().gap(8.0);
         for index in &indices {
             // Preserve the catalog index: all save/toggle operations address the original item.
             rows = rows.with_child(config_row(shared, reader, *index));
@@ -13761,13 +13761,13 @@ fn config_row(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Widge
             }
         };
         let mut details = Stack::vertical()
-            .spacing(5.0)
+            .gap(5.0)
             .alignment(Alignment::Stretch)
             .with_child(
                 Switch::new("Applies immediately")
-                    .on(on)
+                    .checked(on)
                     .theme_when(clone_reader(reader))
-                    .on_toggle(on_toggle),
+                    .on_change(on_toggle),
             )
             .with_child(muted_label_with_token(
                 shared,
@@ -13851,7 +13851,7 @@ fn config_row(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Widge
             .on_press(move || s.settings_mut().toggle_advanced_detail(&key))
     };
     let mut details = Stack::vertical()
-        .spacing(6.0)
+        .gap(6.0)
         .alignment(Alignment::Stretch)
         .with_child(summary_label)
         .with_child(meta_label);
@@ -13902,10 +13902,10 @@ fn config_detail_editor(
             s.settings_mut().set_config_value_draft(index, value);
         });
     } else {
-        editor = editor.read_only();
+        editor = editor.read_only(true);
     }
     let mut stack = Stack::vertical()
-        .spacing(5.0)
+        .gap(5.0)
         .alignment(Alignment::Stretch)
         .with_child(
             Stack::horizontal().with_child(
@@ -13928,7 +13928,7 @@ fn config_detail_editor(
             ),
         )
         .with_child(muted_meta_label(shared, note))
-        .with_child(SizedBox::new().height(112.0).with_child(editor));
+        .with_child(SizedBox::new().height(112.0).child(editor));
     if editable {
         let save = {
             let s = shared.clone();
@@ -13968,7 +13968,7 @@ fn config_schema_editor(
             item.read_only,
         )
     };
-    let mut stack = Stack::vertical().spacing(8.0).alignment(Alignment::Stretch);
+    let mut stack = Stack::vertical().gap(8.0).alignment(Alignment::Stretch);
     if !schema.description.trim().is_empty() {
         stack = stack.with_child(muted_meta_label(shared, schema.description.clone()));
     }
@@ -14179,7 +14179,7 @@ fn config_schema_object_editor(
     description: &str,
     read_only: bool,
 ) -> WidgetPod {
-    let mut group = FieldGroup::new().spacing(8.0);
+    let mut group = FieldGroup::new().gap(8.0);
     if !description.trim().is_empty() {
         group = group.with_child(value_row(shared, reader, label, description));
     }
@@ -14203,7 +14203,7 @@ fn config_schema_object_editor(
                 .get(index)
                 .map(|item| config_schema_field_key(&item.key, &field_path));
             let mut body = Stack::vertical()
-                .spacing(4.0)
+                .gap(4.0)
                 .alignment(Alignment::Stretch)
                 .with_child(config_schema_feedback_label(
                     shared,
@@ -14305,7 +14305,7 @@ fn config_schema_map_editor(
     description: &str,
     read_only: bool,
 ) -> WidgetPod {
-    let mut group = FieldGroup::new().spacing(8.0);
+    let mut group = FieldGroup::new().gap(8.0);
     let entries = value
         .as_object()
         .map(|map| {
@@ -14315,7 +14315,7 @@ fn config_schema_map_editor(
         })
         .unwrap_or_default();
     let mut summary_body = Stack::vertical()
-        .spacing(4.0)
+        .gap(4.0)
         .alignment(Alignment::Stretch)
         .with_child(muted_meta_label(
             shared,
@@ -14417,7 +14417,7 @@ fn config_schema_map_editor(
                     })
             };
             let add_body = Stack::vertical()
-                .spacing(4.0)
+                .gap(4.0)
                 .alignment(Alignment::Stretch)
                 .with_child(input)
                 .with_child(Stack::horizontal().with_child(add))
@@ -14449,13 +14449,13 @@ fn config_schema_list_editor(
 ) -> WidgetPod {
     let items = value.as_array().cloned().unwrap_or_default();
     let mut summary = Stack::vertical()
-        .spacing(4.0)
+        .gap(4.0)
         .alignment(Alignment::Stretch)
         .with_child(muted_meta_label(shared, format!("{} items", items.len())));
     if !description.trim().is_empty() {
         summary = summary.with_child(muted_meta_label(shared, description.to_string()));
     }
-    let mut group = FieldGroup::new().spacing(8.0).with_child(
+    let mut group = FieldGroup::new().gap(8.0).with_child(
         FormRow::new(label, summary)
             .stacked()
             .theme_when(clone_reader(reader)),
@@ -14556,7 +14556,7 @@ fn config_schema_primitive_row(
             })
             .stacked();
             let mut body = Stack::vertical()
-                .spacing(4.0)
+                .gap(4.0)
                 .alignment(Alignment::Stretch)
                 .with_child(row);
             if !description.trim().is_empty() {
@@ -14609,7 +14609,7 @@ fn config_schema_primitive_row(
                     }
                 });
             let mut body = Stack::vertical()
-                .spacing(4.0)
+                .gap(4.0)
                 .alignment(Alignment::Stretch)
                 .with_child(select);
             if !description.trim().is_empty() {
@@ -14650,7 +14650,7 @@ fn config_schema_primitive_row(
                     }
                 });
             let body = Stack::vertical()
-                .spacing(4.0)
+                .gap(4.0)
                 .alignment(Alignment::Stretch)
                 .with_child(muted_meta_label(
                     shared,
@@ -14701,7 +14701,7 @@ fn config_schema_primitive_row(
                     }
                 });
             let mut body = Stack::vertical()
-                .spacing(4.0)
+                .gap(4.0)
                 .alignment(Alignment::Stretch)
                 .with_child(input);
             let fallback = schema_field_detail(schema, description);
@@ -14748,7 +14748,7 @@ fn config_schema_primitive_row(
                     }
                 });
             let mut body = Stack::vertical()
-                .spacing(4.0)
+                .gap(4.0)
                 .alignment(Alignment::Stretch)
                 .with_child(number);
             let detail = schema_field_detail(schema, description);
@@ -14795,7 +14795,7 @@ fn config_schema_primitive_row(
                     }
                 });
             let mut body = Stack::vertical()
-                .spacing(4.0)
+                .gap(4.0)
                 .alignment(Alignment::Stretch)
                 .with_child(input);
             let fallback = schema_field_detail(schema, description);
@@ -14879,7 +14879,7 @@ fn config_schema_json_row(
             }
         });
     let mut body = Stack::vertical()
-        .spacing(4.0)
+        .gap(4.0)
         .alignment(Alignment::Stretch)
         .with_child(
             Stack::horizontal().with_child(
@@ -14893,7 +14893,7 @@ fn config_schema_json_row(
             shared,
             "This schema explicitly permits arbitrary data. JSON is only the human editing projection; the config service transports the typed value as SOBJ.",
         ))
-        .with_child(SizedBox::new().height(92.0).with_child(editor));
+        .with_child(SizedBox::new().height(92.0).child(editor));
     let fallback = schema_field_detail(schema, description);
     if let Some(error_key) = error_key {
         body = body.with_child(config_schema_feedback_label(shared, error_key, fallback));
@@ -15438,7 +15438,7 @@ where
     W: Widget + 'static,
 {
     let inset = Stack::vertical()
-        .spacing(0.0)
+        .gap(0.0)
         .alignment(Alignment::Stretch)
         .with_child(SizedBox::new().height(CONTENT_PAD))
         .with_child(horizontal_inset(
@@ -15474,7 +15474,7 @@ fn section_header(
     };
     let header = TrailingSlotRow::new(
         summary,
-        StatusBadge::dynamic(section_preview(shared, section), badge_label)
+        StatusBadge::new(section_preview(shared, section)).label_when(badge_label)
             .tone_when(badge_tone)
             .theme_when(clone_reader(reader)),
     )
@@ -15633,7 +15633,7 @@ fn section_group_list(
     };
     SizedBox::new()
         .height(row_height * sections.len() as f32 + viewport_padding.top + viewport_padding.bottom)
-        .with_child(list)
+        .child(list)
 }
 
 fn section_group(
@@ -15647,7 +15647,7 @@ fn section_group(
     row_height: f32,
 ) -> impl Widget + use<> {
     Stack::vertical()
-        .spacing(5.0)
+        .gap(5.0)
         .alignment(Alignment::Stretch)
         .with_child(horizontal_inset(
             SectionLabel::new(label).theme_when(clone_reader(reader)),
@@ -15693,7 +15693,7 @@ fn section_group_host(
         });
     let s = shared.clone();
     let r = Rc::clone(reader);
-    RebuildOnChange::new_observable(source, move |_previews| {
+    RebuildOnChange::key_from(source, move |_previews| {
         WidgetPod::new(section_group(
             &s,
             &r,
@@ -15716,7 +15716,7 @@ fn primary_section_groups_host(
     row_height: f32,
 ) -> impl Widget + use<> {
     let mut groups = Stack::vertical()
-        .spacing(12.0)
+        .gap(12.0)
         .alignment(Alignment::Stretch);
     for (index, (title, id, sections)) in [
         ("App", "settings-app", APP_SETTINGS),
@@ -15743,7 +15743,7 @@ fn primary_section_groups_host(
 
 fn sidebar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let primary = Stack::vertical()
-        .spacing(6.0)
+        .gap(6.0)
         .alignment(Alignment::Stretch)
         .with_child(SizedBox::new().height(14.0))
         .with_child(horizontal_inset(
@@ -15768,7 +15768,7 @@ fn sidebar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
 
 fn menu(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let groups = Stack::vertical()
-        .spacing(0.0)
+        .gap(0.0)
         .alignment(Alignment::Stretch)
         .with_child(SizedBox::new().height(CONTENT_PAD))
         .with_child(horizontal_inset(
@@ -15800,14 +15800,14 @@ fn wide_pod(
     Stack::horizontal()
         .alignment(Alignment::Stretch)
         .with_child(
-            SizedBox::new().width(SIDEBAR_W).with_child(
+            SizedBox::new().width(SIDEBAR_W).child(
                 Surface::new(SurfaceRole::Sidebar, sidebar(shared, reader))
                     .fill()
                     .theme_when(clone_reader(reader)),
             ),
         )
         .with_child(Separator::vertical().theme_when(clone_reader(reader)))
-        .with_child(SizedBox::new().with_child(detail))
+        .with_child(SizedBox::new().child(detail))
 }
 
 fn narrow_pod(
@@ -15827,14 +15827,14 @@ fn narrow_pod(
     };
     let current_section = {
         let s = shared.clone();
-        Label::dynamic("Current settings section", move || {
+        Label::new("Current settings section").text_when(move || {
             s.settings()
                 .selected
                 .unwrap_or(SettingsSection::Appearance)
                 .title()
                 .to_string()
         })
-        .style(settings_text_style(shared, shared.theme().text.base))
+        .text_style(settings_text_style(shared, shared.theme().text.base))
     };
     let backbar = TrailingSlotRow::new(
         Align::new(Alignment::Start, Alignment::Center, back_button),
@@ -15844,17 +15844,17 @@ fn narrow_pod(
     .trailing_height(32.0)
     .gap(12.0);
     let detail_with_backbar = Stack::vertical()
-        .spacing(0.0)
+        .gap(0.0)
         .alignment(Alignment::Stretch)
         .with_child(horizontal_inset(
             Stack::vertical()
                 .with_child(SizedBox::new().height(8.0))
-                .with_child(SizedBox::new().height(40.0).with_child(backbar))
+                .with_child(SizedBox::new().height(40.0).child(backbar))
                 .with_child(SizedBox::new().height(8.0)),
             12.0,
         ))
         .with_child(Separator::horizontal().theme_when(clone_reader(reader)))
-        .with_child(SizedBox::new().with_child(section_body(shared, reader, scroll_states)));
+        .with_child(SizedBox::new().child(section_body(shared, reader, scroll_states)));
 
     let selected =
         shared
@@ -16029,7 +16029,7 @@ fn horizontal_inset<W>(child: W, pad: f32) -> WidgetPadding
 where
     W: Widget + 'static,
 {
-    WidgetPadding::horizontal(pad, child).fill_child_width()
+    WidgetPadding::horizontal(pad, child).fill_child_width(true)
 }
 
 // ---------------------------------------------------------------------------
@@ -16047,7 +16047,7 @@ fn status_reflector(shared: &Shared, index: usize, reader: &ThemeReader) -> impl
     );
     let build_shared = shared.clone();
     let build_reader = Rc::clone(reader);
-    RebuildOnChange::new_observable(source, move |_| {
+    RebuildOnChange::key_from(source, move |_| {
         let theme = build_reader();
         let pal = palette(&build_shared);
         let (primary, prompt_url) = device_login_lines(&build_shared, index);
@@ -16066,7 +16066,7 @@ fn status_reflector(shared: &Shared, index: usize, reader: &ThemeReader) -> impl
             } else {
                 primary.as_str()
             })
-            .style(primary_style),
+            .text_style(primary_style),
         );
         if let Some(code) = prompt_code {
             body = body.with_child(device_login_code_control(&build_reader, &theme, &pal, code));
@@ -16099,7 +16099,7 @@ fn device_login_code_control(
     let code_style = device_login_code_text_style(theme, pal);
     let field = TextInput::new("provider-device-login-code")
         .value(code.clone())
-        .read_only()
+        .read_only(true)
         .selection_scope(selection.clone())
         .copy_to_clipboard(true)
         .text_style(code_style)
@@ -18662,7 +18662,7 @@ mod tests {
                     .root(
                         SizedBox::new()
                             .size(Size::new(760.0, 720.0))
-                            .with_child(view(shared.clone())),
+                            .child(view(shared.clone())),
                     ),
             )
             .build()?;
@@ -19262,7 +19262,7 @@ mod tests {
                     .root(
                         SizedBox::new()
                             .size(Size::new(320.0, 120.0))
-                            .with_child(PodHost::new(row)),
+                            .child(PodHost::new(row)),
                     ),
             )
             .build()?;
@@ -19382,7 +19382,7 @@ mod tests {
                 sui::WindowBuilder::new()
                     .title("Remote management settings")
                     .root(
-                        SizedBox::new().size(Size::new(1000.0, 720.0)).with_child(
+                        SizedBox::new().size(Size::new(1000.0, 720.0)).child(
                             ScrollView::vertical(section_remote_management_body(&shared, &reader))
                                 .name("remote-management-settings-scroll")
                                 .state(ScrollState::new())
@@ -21015,7 +21015,7 @@ mod tests {
                     .root(
                         SizedBox::new()
                             .size(Size::new(1280.0, 420.0))
-                            .with_child(view(shared.clone())),
+                            .child(view(shared.clone())),
                     ),
             )
             .build()?;
@@ -21746,7 +21746,7 @@ mod tests {
                         SizedBox::new()
                             .width(520.0)
                             .height(160.0)
-                            .with_child(status_reflector(&shared, 0, &reader)),
+                            .child(status_reflector(&shared, 0, &reader)),
                     ),
             )
             .build()?;

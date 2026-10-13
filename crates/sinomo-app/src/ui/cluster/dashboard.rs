@@ -645,7 +645,7 @@ fn text(
     weight: FontWeight,
     color: Color,
 ) -> Label {
-    Label::new(value).style(
+    Label::new(value).text_style(
         Palette::from_theme(theme, theme.surfaces.dark).text_style(theme, size, weight, color),
     )
 }
@@ -656,7 +656,7 @@ fn live_content<F: Fn(&Shared, DefaultTheme) -> WidgetPod + 'static>(
 ) -> impl Widget + use<F> {
     let source = shared.signals().cluster_structure.clone();
     let shared = shared.clone();
-    RebuildOnChange::new_observable(source, move |_| build(&shared, shared.theme()))
+    RebuildOnChange::key_from(source, move |_| build(&shared, shared.theme()))
 }
 
 fn current(shared: &Shared, metric: DashboardMetric) -> (Option<f64>, usize, usize) {
@@ -767,7 +767,7 @@ fn metric_panel(shared: &Shared, metric: DashboardMetric) -> impl Widget + use<>
             theme.palette.text_muted,
         ))
     });
-    SizedBox::new().height(270.0 * scale.max(1.0)).with_child(
+    SizedBox::new().height(270.0 * scale.max(1.0)).child(
         Surface::panel(
             Dock::new(DashboardChart::new(shared.clone(), metric))
                 .top(98.0 * scale, info)
@@ -914,7 +914,7 @@ fn stat_tile(
             )
             .name(format!("Summary: {title}"))
             .padding(Insets::all(12.0))
-            .fill_width()
+            .fill_width(true)
             .theme(theme),
         )
     })
@@ -1138,7 +1138,7 @@ fn page(shared: &Shared) -> WidgetPod {
             key.dashboard_diagnostics
         });
     let action = shared.clone();
-    let toggle = RebuildOnChange::new_observable(source.clone(), move |open| {
+    let toggle = RebuildOnChange::key_from(source.clone(), move |open| {
         let action = action.clone();
         WidgetPod::new(
             Button::new(if *open {
@@ -1196,7 +1196,7 @@ fn page(shared: &Shared) -> WidgetPod {
 pub(super) fn view(shared: Shared) -> impl Widget {
     let theme = shared.signals().theme.clone();
     let content_shared = shared.clone();
-    let content = RebuildOnChange::new_observable(theme, move |_| page(&content_shared));
+    let content = RebuildOnChange::key_from(theme, move |_| page(&content_shared));
     let scroll = ScrollState::new();
     Surface::window(
         ScrollView::vertical(content)
@@ -1219,7 +1219,7 @@ pub(super) fn live_toggle(shared: &Shared) -> impl Widget + use<> {
         .cluster_structure
         .select_named("dashboard live mode", |key| key.observation_live);
     let action = shared.clone();
-    RebuildOnChange::new_observable(source, move |live| {
+    RebuildOnChange::key_from(source, move |live| {
         let change = action.clone();
         let live = *live;
         WidgetPod::new(

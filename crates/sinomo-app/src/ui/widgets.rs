@@ -7,7 +7,7 @@ use sui::prelude::Padding;
 use sui::{
     ArrangeCtx, Color, Constraints, MeasureCtx, Observable, PaintCtx, Path, Point, Rect,
     SemanticsCtx, SingleChild, Size, TextStyle, VirtualCollectionModel, VirtualListState, Widget,
-    WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor, paint_single_line_aligned_text,
+    WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor, paint_text_line,
 };
 
 use crate::state::Shared;
@@ -155,12 +155,14 @@ pub fn draw_centered(ctx: &mut PaintCtx, text: &str, style: TextStyle, cx: f32, 
         width + 2.0,
         line_height,
     );
-    paint_single_line_aligned_text(ctx, rect, text, &style, line_height, 0.5);
+    let mut style = style;
+    style.line_height = line_height;
+    paint_text_line(ctx, rect, text, &style, sui::TextAlign::Center);
 }
 
 /// Draw left-aligned, vertically-centered text within `row`.
 pub fn draw_text_in(ctx: &mut PaintCtx, row: Rect, text: &str, style: TextStyle) {
-    paint_single_line_aligned_text(ctx, row, text, &style, style.line_height, 0.0);
+    paint_text_line(ctx, row, text, &style, sui::TextAlign::Left);
 }
 
 /// Fill a rounded rectangle (proper path fill — safe with translucent colors).

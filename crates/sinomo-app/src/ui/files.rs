@@ -12682,7 +12682,7 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
             FlexItem::new().no_shrink(),
         )
         .with_item(
-            SizedBox::new().width(120.0).with_child(source),
+            SizedBox::new().width(120.0).child(source),
             FlexItem::fixed(120.0),
         )
         .with_item(breadcrumb, FlexItem::fill().min_width(160.0))
@@ -12816,7 +12816,7 @@ fn picker_first_header(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
         .with_item(forward, FlexItem::new().no_shrink())
         .with_item(up, FlexItem::new().no_shrink())
         .with_item(
-            SizedBox::new().width(120.0).with_child(source),
+            SizedBox::new().width(120.0).child(source),
             FlexItem::fixed(120.0),
         )
         .with_item(breadcrumb, FlexItem::fill().min_width(96.0))
@@ -12890,7 +12890,7 @@ fn compact_header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> 
                 files.source.label(),
                 files.path
             ))
-            .style(pal.text_style(&theme, 12.0, FontWeight::MEDIUM, pal.text))
+            .text_style(pal.text_style(&theme, 12.0, FontWeight::MEDIUM, pal.text))
     };
     let commands = {
         let s = shared.clone();
@@ -13140,7 +13140,7 @@ fn files_action_bar_content(
         Stack::vertical()
             .alignment(Alignment::Stretch)
             .with_child(
-                SizedBox::new().height(FILE_ACTION_BAR_H - 1.0).with_child(
+                SizedBox::new().height(FILE_ACTION_BAR_H - 1.0).child(
                     WidgetPadding::horizontal(
                         10.0,
                         Flex::horizontal()
@@ -13150,12 +13150,12 @@ fn files_action_bar_content(
                             .with_item(
                                 SizedBox::new()
                                     .width(view_commands_width)
-                                    .with_child(view_commands),
+                                    .child(view_commands),
                                 FlexItem::fixed(view_commands_width),
                             ),
                     )
-                    .fill_child_width()
-                    .fill_child_height(),
+                    .fill_child_width(true)
+                    .fill_child_height(true),
                 ),
             )
             .with_child(Separator::horizontal().theme_when(clone_reader(reader))),
@@ -13212,7 +13212,7 @@ fn files_action_bar(
         });
     let s = shared.clone();
     let r = Rc::clone(reader);
-    RebuildOnChange::new_observable(source, move |_key| {
+    RebuildOnChange::key_from(source, move |_key| {
         files_action_bar_content(&s, &r, contextual_selection)
     })
 }
@@ -13295,7 +13295,7 @@ fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) ->
         }
         let mut action_height = 72.0;
         let mut actions = Stack::vertical()
-            .spacing(8.0)
+            .gap(8.0)
             .alignment(Alignment::Center)
             .with_child(primary_actions);
         if let Some(browse_local) = browse_local {
@@ -13303,7 +13303,7 @@ fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) ->
                 SizedBox::new()
                     .width(200.0)
                     .height(32.0)
-                    .with_child(browse_local),
+                    .child(browse_local),
             );
             action_height = 112.0;
         }
@@ -13376,7 +13376,7 @@ fn files_list_body_rebuild(
     let ss = scroll_state.clone();
     let table_state = VirtualTableState::new();
     let thumbnail_registration = Rc::new(RefCell::new(ThumbnailRegistrationPool::default()));
-    RebuildOnChange::new_observable(source, move |_key| {
+    RebuildOnChange::key_from(source, move |_key| {
         files_list_body(&s, &r, &ss, &table_state, &thumbnail_registration)
     })
 }
@@ -15886,7 +15886,7 @@ fn files_task_popover(shared: &Shared, reader: &ThemeReader) -> impl Widget + us
         .select_named("files task popover theme", |key| key.theme);
     let s = shared.clone();
     let r = Rc::clone(reader);
-    RebuildOnChange::new_observable(source, move |_theme| {
+    RebuildOnChange::key_from(source, move |_theme| {
         let badge_label = {
             let s = s.clone();
             move || files_task_badge_label(&s.files())
@@ -15898,15 +15898,15 @@ fn files_task_popover(shared: &Shared, reader: &ThemeReader) -> impl Widget + us
         WidgetPod::new(
             Popover::new(
                 "File tasks",
-                SizedBox::new().width(FILES_TASK_BADGE_W).with_child(
-                    StatusBadge::dynamic("SIFS unknown", badge_label)
+                SizedBox::new().width(FILES_TASK_BADGE_W).child(
+                    StatusBadge::new("SIFS unknown").label_when(badge_label)
                         .tone_when(badge_tone)
                         .icon(IconGlyph::Storage)
                         .theme_when(clone_reader(&r)),
                 ),
                 SizedBox::new()
                     .width(FILES_TASK_POPOVER_W)
-                    .with_child(FilesTaskQueue::new(s.clone(), &r)),
+                    .child(FilesTaskQueue::new(s.clone(), &r)),
             )
             .alignment(PopoverAlignment::Start)
             .theme(r()),
@@ -15940,7 +15940,7 @@ fn files_status_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<
             .alignment(Alignment::Stretch)
             .with_child(Separator::horizontal().theme_when(clone_reader(reader)))
             .with_child(
-                SizedBox::new().height(FILES_STATUS_H - 1.0).with_child(
+                SizedBox::new().height(FILES_STATUS_H - 1.0).child(
                     Flex::horizontal()
                         .gap(8.0)
                         .align_items(Alignment::Center)
@@ -15952,7 +15952,7 @@ fn files_status_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<
                                 .height(FILES_STATUS_H - 1.0)
                                 .theme_when(status_theme)
                                 .segment(
-                                    StatusBarSegment::dynamic("Path /", path_summary).expand(true),
+                                    StatusBarSegment::new("Path /").text_when(path_summary).expand(true),
                                 ),
                             FlexItem::flex(1.0).min_width(0.0),
                         ),
@@ -15964,7 +15964,7 @@ fn files_status_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<
         move || palette(&s).sidebar
     });
 
-    SizedBox::new().height(FILES_STATUS_H).with_child(body)
+    SizedBox::new().height(FILES_STATUS_H).child(body)
 }
 
 fn files_places_content_height(sifs_count: usize, local_count: usize) -> f32 {
@@ -15984,7 +15984,7 @@ fn files_places_rail(shared: &Shared, reader: &ThemeReader) -> impl Widget + use
         });
     let s = shared.clone();
     let r = Rc::clone(reader);
-    RebuildOnChange::new_observable(source, move |_key| files_places_rail_rebuild(&s, &r))
+    RebuildOnChange::key_from(source, move |_key| files_places_rail_rebuild(&s, &r))
 }
 
 fn files_places_rail_rebuild(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
@@ -16006,14 +16006,14 @@ fn files_places_rail_rebuild(shared: &Shared, reader: &ThemeReader) -> WidgetPod
     let sifs_list = files_place_list(shared, reader, "SIFS locations", sifs_places);
     let local_list = files_place_list(shared, reader, "Device locations", local_places);
 
-    let heading = SizedBox::new().height(PLACES_HEADER_H).with_child(
+    let heading = SizedBox::new().height(PLACES_HEADER_H).child(
         WidgetPadding::horizontal(
             14.0,
             Flex::horizontal()
                 .align_items(Alignment::Center)
                 .with_child(SectionLabel::new("Locations").theme_when(clone_reader(reader))),
         )
-        .fill_child_height(),
+        .fill_child_height(true),
     );
     let sifs_heading = files_place_section_heading("SIFS", reader);
     let local_heading = files_place_section_heading("This device", reader);
@@ -16022,14 +16022,14 @@ fn files_places_rail_rebuild(shared: &Shared, reader: &ThemeReader) -> WidgetPod
         .alignment(Alignment::Stretch)
         .with_child(heading)
         .with_child(sifs_heading)
-        .with_child(WidgetPadding::horizontal(8.0, sifs_list).fill_child_width())
+        .with_child(WidgetPadding::horizontal(8.0, sifs_list).fill_child_width(true))
         .with_child(SizedBox::new().height(PLACE_SECTION_GAP))
         .with_child(local_heading)
-        .with_child(WidgetPadding::horizontal(8.0, local_list).fill_child_width())
+        .with_child(WidgetPadding::horizontal(8.0, local_list).fill_child_width(true))
         .with_child(SizedBox::new().height(PLACE_RAIL_BOTTOM_PAD));
 
     WidgetPod::new(
-        SizedBox::new().height(content_height).with_child(
+        SizedBox::new().height(content_height).child(
             Surface::new(SurfaceRole::Sidebar, content)
                 .theme_when(clone_reader(reader))
                 .fill(),
@@ -16038,14 +16038,14 @@ fn files_places_rail_rebuild(shared: &Shared, reader: &ThemeReader) -> WidgetPod
 }
 
 fn files_place_section_heading(label: &'static str, reader: &ThemeReader) -> impl Widget + use<> {
-    SizedBox::new().height(PLACE_SECTION_HEADER_H).with_child(
+    SizedBox::new().height(PLACE_SECTION_HEADER_H).child(
         WidgetPadding::horizontal(
             14.0,
             Flex::horizontal()
                 .align_items(Alignment::Center)
                 .with_child(SectionLabel::new(label).theme_when(clone_reader(reader))),
         )
-        .fill_child_height(),
+        .fill_child_height(true),
     )
 }
 
@@ -16087,7 +16087,7 @@ fn files_place_list(
             let files = selection_shared.files();
             file_place_active_index(&files, &selection_places)
         })
-        .on_change_with_ctx(move |index, _label, ctx| {
+        .on_change_with_ctx(move |ctx, index, _label| {
             if let Some(place) = action_places.get(index).cloned() {
                 open_file_place(&action_shared, place, ctx);
             }
@@ -16231,7 +16231,7 @@ fn file_task_progress_indicator(reader: &ThemeReader, task: &FilesTask) -> impl 
     SizedBox::new()
         .width(INDICATOR_W)
         .height(INDICATOR_H)
-        .with_child(Dock::new(track).bottom(fill_h, fill))
+        .child(Dock::new(track).bottom(fill_h, fill))
 }
 
 fn file_task_row(shared: &Shared, reader: &ThemeReader, task: &FilesTask) -> impl Widget + use<> {
@@ -16255,8 +16255,8 @@ fn file_task_row(shared: &Shared, reader: &ThemeReader, task: &FilesTask) -> imp
     let text = Flex::vertical()
         .main_gap(1.0)
         .align_items(Alignment::Stretch)
-        .with_child(Label::new(title).style(title_style))
-        .with_child(Label::new(detail).style(detail_style));
+        .with_child(Label::new(title).text_style(title_style))
+        .with_child(Label::new(detail).text_style(detail_style));
     let body = Flex::horizontal()
         .main_gap(8.0)
         .align_items(Alignment::Center)
@@ -16285,7 +16285,7 @@ impl FilesTaskQueue {
             },
             VirtualFileTaskContent::new(shared, reader),
         )
-        .fill_child_width();
+        .fill_child_width(true);
         Self {
             child: WidgetPod::new(
                 SemanticRegion::new("File task queue", content)
@@ -16308,7 +16308,7 @@ fn file_task_queue_header(shared: &Shared, reader: &ThemeReader, tasks: &[FilesT
         .main_gap(1.0)
         .align_items(Alignment::Stretch)
         .with_child(SectionLabel::new("File tasks").theme_when(clone_reader(reader)))
-        .with_child(Label::new(files_task_queue_summary(tasks)).style(summary_style));
+        .with_child(Label::new(files_task_queue_summary(tasks)).text_style(summary_style));
     let clear_slot = SwitchView::new()
         .selected(if has_finished { 1 } else { 0 })
         .with_child(SizedBox::new())
@@ -16328,7 +16328,7 @@ fn file_task_queue_empty(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
             .main_gap(8.0)
             .align_items(Alignment::Stretch)
             .with_child(
-                SizedBox::new().height(24.0).with_child(
+                SizedBox::new().height(24.0).child(
                     StatusBadge::new("Idle")
                         .tone(SemanticTone::Success)
                         .min_width(68.0)
@@ -16336,14 +16336,14 @@ fn file_task_queue_empty(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
                 ),
             )
             .with_child(
-                Label::new("No active file operations").style(pal.text_style(
+                Label::new("No active file operations").text_style(pal.text_style(
                     &theme,
                     12.0,
                     FontWeight::MEDIUM,
                     pal.text,
                 )),
             )
-            .with_child(Label::new("Worker queue empty").style(pal.text_style(
+            .with_child(Label::new("Worker queue empty").text_style(pal.text_style(
                 &theme,
                 11.0,
                 FontWeight::NORMAL,
@@ -16397,16 +16397,16 @@ impl VirtualFileTaskContent {
         let list = VirtualList::new("File task queue", model.clone(), move |_id, task| {
             let shared = row_shared.clone();
             let reader = Rc::clone(&row_reader);
-            RebuildOnChange::new_observable(task, move |task| {
+            RebuildOnChange::key_from(task, move |task| {
                 WidgetPod::new(
                     SizedBox::new()
                         .height(Self::ROW_HEIGHT)
-                        .with_child(file_task_row(&shared, &reader, task)),
+                        .child(file_task_row(&shared, &reader, task)),
                 )
             })
         })
         .estimated_row_height(Self::ROW_HEIGHT)
-        .spacing(Self::GAP)
+        .gap(Self::GAP)
         .selection_mode(VirtualListSelectionMode::None)
         .chrome(VirtualListChrome::Transparent)
         .scroll_bars(false)
@@ -16783,13 +16783,13 @@ impl FileContextMenuEntry {
     ) -> FileContextMenuEntry {
         let mut item = MenuItem::new(action.label(files.source));
         if separator_before {
-            item = item.separator_before();
+            item = item.separator_before(true);
         }
         if !action.enabled(files) {
-            item = item.disabled();
+            item = item.enabled(false);
         }
         if action.destructive() {
-            item = item.destructive();
+            item = item.destructive(true);
         }
         FileContextMenuEntry {
             action: Some(action),
@@ -16810,7 +16810,7 @@ impl FileContextMenuEntry {
                 .collect::<Vec<_>>(),
         );
         if separator_before {
-            item = item.separator_before();
+            item = item.separator_before(true);
         }
         FileContextMenuEntry {
             action: None,
@@ -17344,7 +17344,7 @@ impl InspectorView {
             .select_named("files inspector structure", |key| key.inspector.clone());
         let build_shared = shared.clone();
         let build_reader = Rc::clone(&reader);
-        let child = RebuildOnChange::new_observable(source, move |_key| {
+        let child = RebuildOnChange::key_from(source, move |_key| {
             composed_inspector_content(&build_shared, &build_reader)
         });
         Self {
@@ -17441,7 +17441,7 @@ fn detail_rows_widget(
     rows: impl IntoIterator<Item = (&'static str, String)>,
     reader: &ThemeReader,
 ) -> Stack {
-    let mut body = Stack::vertical().alignment(Alignment::Stretch).spacing(4.0);
+    let mut body = Stack::vertical().alignment(Alignment::Stretch).gap(4.0);
     for (label, value) in rows {
         body = body.with_child(
             DetailRow::new(label, value)
@@ -17484,7 +17484,7 @@ where
             right: 12.0,
             bottom: 12.0,
         })
-        .fill_width()
+        .fill_width(true)
 }
 
 fn inspector_details_button(
@@ -17705,7 +17705,7 @@ fn preview_card(
     reader: &ThemeReader,
 ) -> Surface {
     let theme = reader();
-    let mut body = Stack::vertical().alignment(Alignment::Stretch).spacing(8.0);
+    let mut body = Stack::vertical().alignment(Alignment::Stretch).gap(8.0);
     if !loading
         && error.is_none()
         && let Some(custom) = custom_preview
@@ -17719,7 +17719,7 @@ fn preview_card(
             .with_child(
                 SizedBox::new()
                     .height(custom.sizing.preferred_height.clamp(160, 420) as f32)
-                    .with_child(ModuleWidget::new(
+                    .child(ModuleWidget::new(
                         custom.session.clone(),
                         custom.sizing,
                         reader.clone(),
@@ -17876,7 +17876,7 @@ fn selected_item_actions(
     secondary = secondary.with_child(more);
     let mut actions = Stack::vertical()
         .alignment(Alignment::Stretch)
-        .spacing(4.0)
+        .gap(4.0)
         .with_child(primary)
         .with_child(secondary);
     if source == FilesSourceKind::Sifs {
@@ -17947,7 +17947,7 @@ fn current_location_overview(shared: &Shared, reader: &ThemeReader) -> impl Widg
     hint_style.line_height = theme.text.sm.line_height;
     let mut content = Stack::vertical()
         .alignment(Alignment::Stretch)
-        .spacing(10.0)
+        .gap(10.0)
         .with_child(
             StatusBadge::new(status)
                 .icon(IconGlyph::Storage)
@@ -17955,7 +17955,7 @@ fn current_location_overview(shared: &Shared, reader: &ThemeReader) -> impl Widg
                 .theme_when(clone_reader(reader)),
         )
         .with_child(detail_rows_widget(rows, reader))
-        .with_child(Label::new(hint).style(hint_style));
+        .with_child(Label::new(hint).text_style(hint_style));
 
     if shared.files().source == FilesSourceKind::Sifs {
         let storage = file_action_button(
@@ -18053,12 +18053,12 @@ fn composed_inspector_content(shared: &Shared, reader: &ThemeReader) -> WidgetPo
         ];
         let selected_body = Stack::vertical()
             .alignment(Alignment::Stretch)
-            .spacing(10.0)
-            .with_child(Label::new(summary_line).style(summary_style))
+            .gap(10.0)
+            .with_child(Label::new(summary_line).text_style(summary_style))
             .with_child(detail_rows_widget(overview_rows, reader));
         let mut content = Stack::vertical()
             .alignment(Alignment::Stretch)
-            .spacing(12.0)
+            .gap(12.0)
             .with_child(inspector_card(
                 marked_entries_label(selection.count),
                 selected_body,
@@ -18113,7 +18113,7 @@ fn composed_inspector_content(shared: &Shared, reader: &ThemeReader) -> WidgetPo
             ];
             let body = Stack::vertical()
                 .alignment(Alignment::Stretch)
-                .spacing(8.0)
+                .gap(8.0)
                 .with_child(
                     StatusBadge::new(status)
                         .tone(tone)
@@ -18176,8 +18176,8 @@ fn composed_inspector_content(shared: &Shared, reader: &ThemeReader) -> WidgetPo
     kind_style.line_height = theme.text.sm.line_height;
     let mut selected_body = Stack::vertical()
         .alignment(Alignment::Stretch)
-        .spacing(10.0)
-        .with_child(Label::new(kind_line).style(kind_style))
+        .gap(10.0)
+        .with_child(Label::new(kind_line).text_style(kind_style))
         .with_child(
             DetailRow::new("Path", entry.path.clone())
                 .theme_when(clone_reader(reader))
@@ -18211,7 +18211,7 @@ fn composed_inspector_content(shared: &Shared, reader: &ThemeReader) -> WidgetPo
         );
     } else if let Some(error) = files.attachment_error.as_deref() {
         selected_body = selected_body.with_child(
-            Label::new(error.to_string()).style(theme.text_style(theme.palette.danger)),
+            Label::new(error.to_string()).text_style(theme.text_style(theme.palette.danger)),
         );
     }
     let selected_card = inspector_card(
@@ -18224,7 +18224,7 @@ fn composed_inspector_content(shared: &Shared, reader: &ThemeReader) -> WidgetPo
 
     let mut content = Stack::vertical()
         .alignment(Alignment::Stretch)
-        .spacing(12.0)
+        .gap(12.0)
         .with_child(selected_card);
 
     if !entry.is_dir {
@@ -18272,7 +18272,7 @@ fn composed_inspector_content(shared: &Shared, reader: &ThemeReader) -> WidgetPo
         }
         let body = Stack::vertical()
             .alignment(Alignment::Stretch)
-            .spacing(8.0)
+            .gap(8.0)
             .with_child(
                 StatusBadge::new(status_label)
                     .tone(status_tone)
@@ -18337,7 +18337,7 @@ fn composed_inspector_content(shared: &Shared, reader: &ThemeReader) -> WidgetPo
         };
         let placement_body = Stack::vertical()
             .alignment(Alignment::Stretch)
-            .spacing(8.0)
+            .gap(8.0)
             .with_child(
                 StatusBadge::new(short_node_label(&files.node_id))
                     .icon(IconGlyph::Storage)
@@ -18528,7 +18528,7 @@ fn composed_inspector_content(shared: &Shared, reader: &ThemeReader) -> WidgetPo
                     right: 12.0,
                     bottom: 10.0,
                 })
-                .fill_width(),
+                .fill_width(true),
             );
         }
     }
@@ -18544,13 +18544,13 @@ fn inspector(
 ) -> impl Widget + use<> {
     let header = WidgetPadding::horizontal(
         CONTENT_PAD,
-        SizedBox::new().height(18.0).with_child(
+        SizedBox::new().height(18.0).child(
             SectionLabel::new("Selection info")
                 .semantic_name("Selection info")
                 .theme_when(clone_reader(reader)),
         ),
     )
-    .fill_child_height();
+    .fill_child_height(true);
     let body = WidgetPadding::new(
         sui::Insets {
             left: 0.0,
@@ -18560,11 +18560,11 @@ fn inspector(
         },
         Stack::vertical()
             .alignment(Alignment::Stretch)
-            .spacing(12.0)
+            .gap(12.0)
             .with_child(header)
             .with_child(InspectorView::new(shared.clone())),
     )
-    .fill_child_width();
+    .fill_child_width(true);
     Surface::new(
         SurfaceRole::Sidebar,
         ScrollView::vertical(body)
@@ -18592,14 +18592,14 @@ fn header_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let s = shared.clone();
     let r = Rc::clone(reader);
     let rebuilt =
-        RebuildOnChange::new_observable(source, move |_key| WidgetPod::new(header(&s, &r)));
+        RebuildOnChange::key_from(source, move |_key| WidgetPod::new(header(&s, &r)));
     Surface::window(
         WidgetPadding::horizontal(CONTENT_PAD, rebuilt)
-            .fill_child_width()
-            .fill_child_height(),
+            .fill_child_width(true)
+            .fill_child_height(true),
     )
     .theme_when(clone_reader(reader))
-    .fill_width()
+    .fill_width(true)
 }
 
 fn picker_first_header_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
@@ -18609,16 +18609,16 @@ fn picker_first_header_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget
         .select_named("files picker header structure", |key| key.header.clone());
     let s = shared.clone();
     let r = Rc::clone(reader);
-    let rebuilt = RebuildOnChange::new_observable(source, move |_key| {
+    let rebuilt = RebuildOnChange::key_from(source, move |_key| {
         WidgetPod::new(picker_first_header(&s, &r))
     });
     Surface::window(
         WidgetPadding::horizontal(CONTENT_PAD, rebuilt)
-            .fill_child_width()
-            .fill_child_height(),
+            .fill_child_width(true)
+            .fill_child_height(true),
     )
     .theme_when(clone_reader(reader))
-    .fill_width()
+    .fill_width(true)
 }
 
 /// Chooses only the desktop command-row density; the surrounding wide Files body and inspector
@@ -18639,7 +18639,7 @@ fn compact_header_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget + us
     let s = shared.clone();
     let r = Rc::clone(reader);
     let rebuilt =
-        RebuildOnChange::new_observable(source, move |_key| WidgetPod::new(compact_header(&s, &r)));
+        RebuildOnChange::key_from(source, move |_key| WidgetPod::new(compact_header(&s, &r)));
     Surface::window(
         WidgetPadding::new(
             Insets {
@@ -18650,11 +18650,11 @@ fn compact_header_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget + us
             },
             rebuilt,
         )
-        .fill_child_width()
-        .fill_child_height(),
+        .fill_child_width(true)
+        .fill_child_height(true),
     )
     .theme_when(clone_reader(reader))
-    .fill_width()
+    .fill_width(true)
 }
 
 /// The file-list column switches between loading, error, empty, and populated presentations. A shared
@@ -18682,7 +18682,7 @@ fn list_column(
     let s = shared.clone();
     let r = Rc::clone(reader);
     let ss = scroll_state.clone();
-    let listing = RebuildOnChange::new_observable(source, move |_key| listing(&s, &r, &ss));
+    let listing = RebuildOnChange::key_from(source, move |_key| listing(&s, &r, &ss));
     let dock = Dock::new(listing);
     if contextual_selection {
         dock.top(FILE_ACTION_BAR_H, files_action_bar(shared, reader, true))
@@ -18743,7 +18743,7 @@ fn wide_pod(
         .with_child(
             SizedBox::new()
                 .height(HEADER_H)
-                .with_child(desktop_header(shared, reader)),
+                .child(desktop_header(shared, reader)),
         )
         .with_child(Separator::horizontal().theme_when(clone_reader(reader)));
     Dock::new(body)
@@ -18763,7 +18763,7 @@ fn narrow_pod(
         .with_child(
             SizedBox::new()
                 .height(HEADER_H)
-                .with_child(compact_header_bar(shared, reader)),
+                .child(compact_header_bar(shared, reader)),
         )
         .with_child(Separator::horizontal().theme_when(clone_reader(reader)));
     Dock::new(list_column(shared, reader, scroll_state, true))
@@ -18984,7 +18984,7 @@ fn compact_files_commands(shared: &Shared, reader: &ThemeReader) -> impl Widget 
     };
     let content = Stack::vertical()
         .alignment(Alignment::Stretch)
-        .spacing(6.0)
+        .gap(6.0)
         .with_child(forward)
         .with_child(refresh)
         .with_child(browse_sifs)
@@ -19085,8 +19085,8 @@ fn destination_chooser_controls(
     hint_style.line_height = theme.text.sm.line_height;
     let mut content = Stack::vertical()
         .alignment(Alignment::Stretch)
-        .spacing(7.0)
-        .with_child(Label::new("Choose a destination").style(theme.text_style(theme.palette.text)));
+        .gap(7.0)
+        .with_child(Label::new("Choose a destination").text_style(theme.text_style(theme.palette.text)));
     if destination == FilesSourceKind::Local {
         let enabled = shared.clone();
         let action = shared.clone();
@@ -19111,7 +19111,7 @@ fn destination_chooser_controls(
                 Label::new(
                     "The selected folder is combined with the original name. You can edit the exact path below before starting.",
                 )
-                .style(hint_style),
+                .text_style(hint_style),
             );
     } else {
         let choice = |label: &'static str, path: &'static str| {
@@ -19140,7 +19140,7 @@ fn destination_chooser_controls(
                 Label::new(
                     "Choose a common Sinomo space, then edit the exact folder or name below if needed.",
                 )
-                .style(hint_style),
+                .text_style(hint_style),
             );
     }
     Some(content)
@@ -19351,7 +19351,7 @@ fn placement_impact_widget(preview: &SifsPlacementPreview, reader: &ThemeReader)
                 )
                 .padding(Insets::all(10.0))
                 .theme_when(clone_reader(reader))
-                .fill_width(),
+                .fill_width(true),
                 FlexItem::flex(1.0)
                     .basis_gap_aware_fraction(0.5)
                     .min_width(150.0),
@@ -19360,7 +19360,7 @@ fn placement_impact_widget(preview: &SifsPlacementPreview, reader: &ThemeReader)
     );
     let mut content = Stack::vertical()
         .alignment(Alignment::Stretch)
-        .spacing(8.0)
+        .gap(8.0)
         .with_child(cards);
     if !impact.complete {
         content = content.with_child(
@@ -19438,7 +19438,7 @@ fn placement_node_row(
         let checkbox = Checkbox::new("Required")
             .checked(node.required)
             .theme_when(clone_reader(reader))
-            .on_toggle(move |on| {
+            .on_change(move |on| {
                 let waker = { changed.borrow().waker.clone() };
                 changed
                     .files_mut()
@@ -19468,7 +19468,7 @@ fn placement_node_row(
         let checkbox = Checkbox::new("Forbidden")
             .checked(node.forbidden)
             .theme_when(clone_reader(reader))
-            .on_toggle(move |on| {
+            .on_change(move |on| {
                 let waker = { changed.borrow().waker.clone() };
                 changed
                     .files_mut()
@@ -19507,7 +19507,7 @@ fn placement_node_row(
         .align_items(Alignment::Center)
         .with_item(
             Stack::vertical()
-                .spacing(2.0)
+                .gap(2.0)
                 .with_child(Label::new(short_node_label(&node_id_text)).theme(reader()))
                 .with_child(
                     Label::new(if node.accepts_content {
@@ -19580,7 +19580,7 @@ fn placement_node_row(
         format!("Placement node {node_id_text}"),
         Surface::panel(WidgetPadding::new(Insets::all(8.0), row))
             .theme_when(clone_reader(reader))
-            .fill_width(),
+            .fill_width(true),
     )
     .role(SemanticsRole::ListItem)
     .description(description)
@@ -19641,7 +19641,7 @@ fn placement_node_table(
     );
     let mut rows = Stack::vertical()
         .alignment(Alignment::Stretch)
-        .spacing(4.0)
+        .gap(4.0)
         .with_child(header);
     for node in &editor_nodes {
         rows = rows.with_child(placement_node_row(shared, reader, node));
@@ -19730,7 +19730,7 @@ fn placement_diagnostics_widget(
     if !legacy_preview && preview.blocking_diagnostics.is_empty() && preview.warnings.is_empty() {
         return None;
     }
-    let mut rows = Stack::vertical().alignment(Alignment::Stretch).spacing(6.0);
+    let mut rows = Stack::vertical().alignment(Alignment::Stretch).gap(6.0);
     if legacy_preview {
         let message = "This daemon returned a legacy preview without reachability, policy-diagnostic, and impact safety data. Upgrade or restart the daemon before applying placement.";
         rows = rows.with_child(
@@ -19825,7 +19825,7 @@ fn placement_scope_control(
             .description(
                 "Exact self-only values were not returned by this daemon; refresh after upgrading the daemon",
             )
-            .disabled();
+            .enabled(false);
     }
     let subtree = if target_is_dir && subtree_known {
         SegmentedControlItem::new("This folder + descendants")
@@ -19837,12 +19837,12 @@ fn placement_scope_control(
             .description(
                 "Exact subtree values were not returned by this daemon; refresh after upgrading the daemon",
             )
-            .disabled()
+            .enabled(false)
     } else {
         SegmentedControlItem::new("This folder + descendants")
             .semantic_name("Subtree placement scope")
             .description("Subtree scope is available only for folders")
-            .disabled()
+            .enabled(false)
     };
     SegmentedControl::new("Placement scope")
         .items([self_item, subtree])
@@ -19858,7 +19858,7 @@ fn placement_scope_control(
             )
         })
         .theme_when(clone_reader(reader))
-        .on_change_with_ctx(move |index, _label, ctx| {
+        .on_change_with_ctx(move |ctx, index, _label| {
             changed.files_mut().set_placement_scope(if index == 1 {
                 SifsPlacementScope::Subtree
             } else {
@@ -19917,7 +19917,7 @@ fn placement_goal_control(shared: &Shared, reader: &ThemeReader) -> Stack {
         let item = SegmentedControlItem::new(label)
             .semantic_name(name)
             .description(description);
-        if editable { item } else { item.disabled() }
+        if editable { item } else { item.enabled(false) }
     };
     let selected = shared.clone();
     let changed = shared.clone();
@@ -19958,7 +19958,7 @@ fn placement_goal_control(shared: &Shared, reader: &ThemeReader) -> Stack {
             )
         })
         .theme_when(clone_reader(reader))
-        .on_change_with_ctx(move |index, _label, ctx| {
+        .on_change_with_ctx(move |ctx, index, _label| {
             changed.files_mut().set_placement_goal(index);
             request_files_overlay_rebuild(ctx);
         });
@@ -19968,13 +19968,13 @@ fn placement_goal_control(shared: &Shared, reader: &ThemeReader) -> Stack {
     hint_style.line_height = theme.text.sm.line_height;
     Stack::vertical()
         .alignment(Alignment::Stretch)
-        .spacing(7.0)
+        .gap(7.0)
         .with_child(control)
         .with_child(
             Label::new(
                 "Across devices favors responsiveness; Confirmed copies waits for the complete copy set before publishing a write.",
             )
-            .style(hint_style),
+            .text_style(hint_style),
         )
 }
 
@@ -20012,7 +20012,7 @@ fn placement_policy_controls(shared: &Shared, reader: &ThemeReader, _target_is_d
             .unwrap_or_default();
         return Stack::vertical()
             .alignment(Alignment::Stretch)
-            .spacing(8.0)
+            .gap(8.0)
             .with_child(
                 StatusBadge::new(if applying {
                     "Policy controls are locked until Apply finishes"
@@ -20034,7 +20034,7 @@ fn placement_policy_controls(shared: &Shared, reader: &ThemeReader, _target_is_d
     {
         return Stack::vertical()
             .alignment(Alignment::Stretch)
-            .spacing(8.0)
+            .gap(8.0)
             .with_child(
                 StatusBadge::new(reason)
                     .icon(IconGlyph::Alert)
@@ -20076,7 +20076,7 @@ fn placement_policy_controls(shared: &Shared, reader: &ThemeReader, _target_is_d
                 )
             })
             .theme_when(clone_reader(reader))
-            .on_change_with_ctx(move |index, _label, ctx| {
+            .on_change_with_ctx(move |ctx, index, _label| {
                 changed
                     .files_mut()
                     .set_placement_consistency(if index == 1 {
@@ -20186,10 +20186,10 @@ fn placement_policy_controls(shared: &Shared, reader: &ThemeReader, _target_is_d
     };
     let write_threshold = if confirmed {
         Stack::vertical()
-            .spacing(4.0)
+            .gap(4.0)
             .with_child(Label::new("Write threshold (W)").theme(reader()))
             .with_child(
-                SizedBox::new().width(152.0).with_child(
+                SizedBox::new().width(152.0).child(
                     StatusBadge::new(format!("W = {desired_limit}"))
                         .tone(SemanticTone::Accent)
                         .theme_when(clone_reader(reader)),
@@ -20198,9 +20198,9 @@ fn placement_policy_controls(shared: &Shared, reader: &ThemeReader, _target_is_d
             .with_child(Label::new("Confirmed keeps W equal to N").theme(reader()))
     } else {
         Stack::vertical()
-            .spacing(4.0)
+            .gap(4.0)
             .with_child(Label::new("Write threshold (W)").theme(reader()))
-            .with_child(SizedBox::new().width(152.0).with_child(min_commit))
+            .with_child(SizedBox::new().width(152.0).child(min_commit))
             .with_child(Label::new("Copies required before visibility").theme(reader()))
     };
     let counts = Flex::horizontal()
@@ -20210,22 +20210,22 @@ fn placement_policy_controls(shared: &Shared, reader: &ThemeReader, _target_is_d
         .with_item(write_threshold, FlexItem::fixed(230.0))
         .with_item(
             Stack::vertical()
-                .spacing(4.0)
+                .gap(4.0)
                 .with_child(Label::new("Desired copies (N)").theme(reader()))
-                .with_child(SizedBox::new().width(152.0).with_child(desired))
+                .with_child(SizedBox::new().width(152.0).child(desired))
                 .with_child(Label::new("Durable target after repair").theme(reader())),
             FlexItem::fixed(230.0),
         )
         .with_item(
             Stack::vertical()
-                .spacing(4.0)
+                .gap(4.0)
                 .with_child(Label::new("Zone diversity").theme(reader()))
-                .with_child(SizedBox::new().width(152.0).with_child(zones))
+                .with_child(SizedBox::new().width(152.0).child(zones))
                 .with_child(Label::new("0 disables the zone constraint").theme(reader())),
             FlexItem::fixed(230.0),
         );
 
-    let inheritance = StatusBadge::dynamic("Explicit override", {
+    let inheritance = StatusBadge::new("Explicit override").label_when({
         let shared = shared.clone();
         move || {
             let files = shared.files();
@@ -20265,14 +20265,14 @@ fn placement_policy_controls(shared: &Shared, reader: &ThemeReader, _target_is_d
 
     Stack::vertical()
         .alignment(Alignment::Stretch)
-        .spacing(10.0)
+        .gap(10.0)
         .with_child(consistency)
         .with_child(counts)
         .with_child(inheritance)
 }
 
 fn placement_preview_status(shared: &Shared, reader: &ThemeReader) -> StatusBadge {
-    StatusBadge::dynamic("Preview required", {
+    StatusBadge::new("Preview required").label_when({
         let shared = shared.clone();
         move || {
             let files = shared.files();
@@ -20396,7 +20396,7 @@ fn files_placement_dialog(
     };
     let mut content = Stack::vertical()
         .alignment(Alignment::Stretch)
-        .spacing(12.0)
+        .gap(12.0)
         .with_child(
             Label::new(format!(
                 "Choose how {target} stays available. Nothing changes until you preview the plan and apply it."
@@ -20515,7 +20515,7 @@ fn files_placement_dialog(
                         },
                         Stack::vertical()
                             .alignment(Alignment::Stretch)
-                            .spacing(6.0)
+                            .gap(6.0)
                             .with_child(
                                 Label::new(if files
                                     .placement_draft
@@ -20645,9 +20645,9 @@ fn files_placement_dialog(
 
     let body = Stack::vertical()
         .alignment(Alignment::Stretch)
-        .spacing(12.0)
+        .gap(12.0)
         .with_child(
-            SizedBox::new().height(480.0).with_child(
+            SizedBox::new().height(480.0).child(
                 ScrollView::vertical(WidgetPadding::new(
                     Insets {
                         left: 2.0,
@@ -20848,7 +20848,7 @@ fn files_action_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
 
     let dialog_theme = shared.theme();
     let mut body = Stack::vertical()
-        .spacing(10.0)
+        .gap(10.0)
         .alignment(Alignment::Stretch)
         .with_child(sui::Label::new(description).theme(dialog_theme));
     if let Some(chooser) = destination_chooser_controls(shared, reader, prompt.kind, source) {
@@ -20857,7 +20857,7 @@ fn files_action_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
                 .appearance(sui::SurfaceAppearance::Soft)
                 .padding(Insets::all(10.0))
                 .theme_when(clone_reader(reader))
-                .fill_width(),
+                .fill_width(true),
         );
     }
     if let Some(input) = input {
@@ -21018,23 +21018,23 @@ fn files_document_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetP
         .value(document.text.clone())
         .on_change(move |value| editor_shared.files_mut().set_document_text(value));
     if !document.editable() {
-        editor = editor.read_only();
+        editor = editor.read_only(true);
     }
     let status_shared = shared.clone();
     let detail_shared = shared.clone();
     let status = Surface::panel(
         Stack::vertical()
             .alignment(Alignment::Stretch)
-            .spacing(3.0)
+            .gap(3.0)
             .with_child(
-                Label::dynamic("Document", move || document_status_text(&status_shared))
-                    .style(theme.text_style(theme.palette.text)),
+                Label::new("Document").text_when(move || document_status_text(&status_shared))
+                    .text_style(theme.text_style(theme.palette.text)),
             )
             .with_child(
-                Label::dynamic("Document path", move || {
+                Label::new("Document path").text_when(move || {
                     document_detail_text(&detail_shared)
                 })
-                .style(theme.text_style(theme.palette.text_muted)),
+                .text_style(theme.text_style(theme.palette.text_muted)),
             ),
     )
     .theme_when(clone_reader(reader))
@@ -21044,11 +21044,11 @@ fn files_document_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetP
         right: 12.0,
         bottom: 8.0,
     })
-    .fill_width();
+    .fill_width(true);
     let editor_body = Dock::new(
         Surface::field(editor)
             .theme_when(clone_reader(reader))
-            .fill_width(),
+            .fill_width(true),
     )
     .bottom(
         74.0,
@@ -21227,7 +21227,7 @@ fn files_document_close_dialog(shared: &Shared, reader: &ThemeReader) -> Option<
         );
     let body = Stack::vertical()
         .alignment(Alignment::Stretch)
-        .spacing(12.0)
+        .gap(12.0)
         .with_child(
             Label::new(format!(
                 "{title} has unsaved changes. Discarding closes the current snapshot without writing it."
@@ -21374,7 +21374,7 @@ fn placement_activity_row(
     let header = TrailingSlotRow::new(
         Stack::vertical()
             .alignment(Alignment::Stretch)
-            .spacing(5.0)
+            .gap(5.0)
             .with_child(
                 Flex::horizontal()
                     .wrap(FlexWrap::Wrap)
@@ -21383,7 +21383,7 @@ fn placement_activity_row(
                     .with_child(status)
                     .with_child(phase),
             )
-            .with_child(Label::new(activity.path.clone()).style(title_style)),
+            .with_child(Label::new(activity.path.clone()).text_style(title_style)),
         reveal,
     )
     .trailing_width(108.0)
@@ -21391,7 +21391,7 @@ fn placement_activity_row(
     .gap(12.0);
     let mut content = Stack::vertical()
         .alignment(Alignment::Stretch)
-        .spacing(7.0)
+        .gap(7.0)
         .with_child(header)
         .with_child(
             Label::new(format!(
@@ -21401,10 +21401,10 @@ fn placement_activity_row(
                 activity.matched_object_count,
                 activity.updated_object_count,
             ))
-            .style(detail_style.clone()),
+            .text_style(detail_style.clone()),
         )
         .with_child(
-            SizedBox::new().height(5.0).with_child(
+            SizedBox::new().height(5.0).child(
                 sui::ProgressBar::new(format!("Reconciliation progress for {}", activity.path))
                     .value(progress)
                     .tone(placement_activity_status_tone(activity.status))
@@ -21419,7 +21419,7 @@ fn placement_activity_row(
                 activity.completed_repair_count,
                 activity.pending_repair_count,
             ))
-            .style(detail_style.clone()),
+            .text_style(detail_style.clone()),
         );
     if let Some(error) = activity.last_error.as_deref() {
         let superseded = activity.status
@@ -21437,7 +21437,7 @@ fn placement_activity_row(
             Surface::panel(
                 Stack::vertical()
                     .alignment(Alignment::Stretch)
-                    .spacing(5.0)
+                    .gap(5.0)
                     .with_child(
                         StatusBadge::new(if superseded {
                             "Replacement"
@@ -21452,7 +21452,7 @@ fn placement_activity_row(
                         .tone(tone)
                         .theme_when(clone_reader(reader)),
                     )
-                    .with_child(Label::new(error.to_string()).style(detail_style.clone())),
+                    .with_child(Label::new(error.to_string()).text_style(detail_style.clone())),
             )
             .appearance(sui::SurfaceAppearance::Soft)
             .padding(Insets::all(9.0))
@@ -21470,7 +21470,7 @@ fn placement_activity_row(
             placement_activity_relative_time(activity.updated_at_unix_nanos),
             middle_short(&activity.job_id, 28),
         ))
-        .style(detail_style)
+        .text_style(detail_style)
     });
     WidgetPod::new(
         Surface::panel(content)
@@ -21482,7 +21482,7 @@ fn placement_activity_row(
                 bottom: 12.0,
             })
             .theme_when(clone_reader(reader))
-            .fill_width(),
+            .fill_width(true),
     )
 }
 
@@ -21515,14 +21515,14 @@ fn placement_activity_virtual_list(shared: &Shared, reader: &ThemeReader) -> imp
                 move |_job_id, activity| {
                     let shared = shared.clone();
                     let reader = Rc::clone(&reader);
-                    RebuildOnChange::new_observable(activity, move |activity| {
+                    RebuildOnChange::key_from(activity, move |activity| {
                         placement_activity_row(&shared, &reader, activity)
                     })
                 },
             )
             .state(state)
             .estimated_row_height(154.0)
-            .spacing(10.0)
+            .gap(10.0)
             .padding(Insets {
                 left: 2.0,
                 top: 2.0,
@@ -21555,7 +21555,7 @@ fn placement_activity_count_badge(
     status: sinomo_runtime::dfs::DfsPlacementReconciliationActivityStatus,
 ) -> StatusBadge {
     let shared = shared.clone();
-    StatusBadge::dynamic(placement_activity_status_label(status), move || {
+    StatusBadge::new(placement_activity_status_label(status)).label_when(move || {
         format!(
             "{} {} loaded",
             placement_activity_count(&shared.files(), status),
@@ -21590,7 +21590,7 @@ fn placement_activity_error_notice(shared: &Shared, reader: &ThemeReader) -> imp
         Surface::panel(
             Stack::vertical()
                 .alignment(Alignment::Stretch)
-                .spacing(7.0)
+                .gap(7.0)
                 .with_child(
                     Flex::horizontal()
                         .wrap(FlexWrap::Wrap)
@@ -21605,7 +21605,7 @@ fn placement_activity_error_notice(shared: &Shared, reader: &ThemeReader) -> imp
                         .with_child(retry),
                 )
                 .with_child(
-                    Label::dynamic("Activity read failed", move || {
+                    Label::new("Activity read failed").text_when(move || {
                         detail
                             .files()
                             .placement_activity_error
@@ -21618,7 +21618,7 @@ fn placement_activity_error_notice(shared: &Shared, reader: &ThemeReader) -> imp
         .appearance(sui::SurfaceAppearance::Soft)
         .padding(Insets::all(10.0))
         .theme_when(clone_reader(reader))
-        .fill_width(),
+        .fill_width(true),
     )
     .role(SemanticsRole::Status)
     .description_when(move || {
@@ -21643,7 +21643,7 @@ fn placement_activity_stream_notice(shared: &Shared, reader: &ThemeReader) -> im
         Surface::panel(
             Stack::vertical()
                 .alignment(Alignment::Stretch)
-                .spacing(6.0)
+                .gap(6.0)
                 .with_child(
                     StatusBadge::new("Live updates disconnected")
                         .icon(IconGlyph::Alert)
@@ -21651,7 +21651,7 @@ fn placement_activity_stream_notice(shared: &Shared, reader: &ThemeReader) -> im
                         .theme_when(clone_reader(reader)),
                 )
                 .with_child(
-                    Label::dynamic("Snapshot polling remains active", move || {
+                    Label::new("Snapshot polling remains active").text_when(move || {
                         let files = detail.files();
                         let error = files
                             .live_updates_error
@@ -21667,7 +21667,7 @@ fn placement_activity_stream_notice(shared: &Shared, reader: &ThemeReader) -> im
         .appearance(sui::SurfaceAppearance::Soft)
         .padding(Insets::all(10.0))
         .theme_when(clone_reader(reader))
-        .fill_width(),
+        .fill_width(true),
     )
     .role(SemanticsRole::Status)
     .description_when(move || {
@@ -21693,7 +21693,7 @@ fn placement_activity_completeness_notice(
         Surface::panel(
             Stack::vertical()
                 .alignment(Alignment::Stretch)
-                .spacing(6.0)
+                .gap(6.0)
                 .with_child(
                     StatusBadge::new("Retained operational history")
                         .icon(IconGlyph::History)
@@ -21708,7 +21708,7 @@ fn placement_activity_completeness_notice(
         .appearance(sui::SurfaceAppearance::Soft)
         .padding(Insets::all(10.0))
         .theme_when(clone_reader(reader))
-        .fill_width(),
+        .fill_width(true),
     )
     .role(SemanticsRole::Status)
     .description(
@@ -21719,7 +21719,7 @@ fn placement_activity_completeness_notice(
         Surface::panel(
             Stack::vertical()
                 .alignment(Alignment::Stretch)
-                .spacing(6.0)
+                .gap(6.0)
                 .with_child(
                     StatusBadge::new("Retained history truncated")
                         .icon(IconGlyph::Alert)
@@ -21734,7 +21734,7 @@ fn placement_activity_completeness_notice(
         .appearance(sui::SurfaceAppearance::Soft)
         .padding(Insets::all(10.0))
         .theme_when(clone_reader(reader))
-        .fill_width(),
+        .fill_width(true),
     )
     .role(SemanticsRole::Status)
     .description("Older terminal reconciliation activity has fallen outside retained history");
@@ -21798,11 +21798,17 @@ fn placement_activity_filter_radio(
     label: &'static str,
 ) -> RadioButton {
     let changed = shared.clone();
+    let current = shared.clone();
     RadioButton::new(label)
         .framed()
-        .selected(selected == filter)
+        .checked(selected == filter)
+        .checked_when(move || current.files().placement_activity_filter == filter)
         .theme_when(clone_reader(reader))
-        .on_select(move || apply_placement_activity_filter(&changed, filter))
+        .on_change(move |checked| {
+            if checked {
+                apply_placement_activity_filter(&changed, filter);
+            }
+        })
 }
 
 fn placement_activity_filter_control(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
@@ -21814,7 +21820,7 @@ fn placement_activity_filter_control(shared: &Shared, reader: &ThemeReader) -> i
         });
     let filter_shared = shared.clone();
     let filter_reader = Rc::clone(reader);
-    RebuildOnChange::new_observable(source, move |selected| {
+    RebuildOnChange::key_from(source, move |selected| {
         WidgetPod::new(
             SemanticRegion::new(
                 "Reconciliation activity filter",
@@ -21905,7 +21911,7 @@ fn files_placement_activity_sheet(shared: &Shared, reader: &ThemeReader) -> Widg
     let connection = {
         let label_shared = shared.clone();
         let tone_shared = shared.clone();
-        StatusBadge::dynamic("Reading cluster activity", move || {
+        StatusBadge::new("Reading cluster activity").label_when(move || {
             let files = label_shared.files();
             if files.placement_activity_loading {
                 "Refreshing cluster activity".to_string()
@@ -21944,7 +21950,7 @@ fn files_placement_activity_sheet(shared: &Shared, reader: &ThemeReader) -> Widg
     };
     let refreshed = {
         let shared = shared.clone();
-        Label::dynamic("Waiting for the first cluster snapshot", move || {
+        Label::new("Waiting for the first cluster snapshot").text_when(move || {
             let files = shared.files();
             files
                 .placement_activity_refreshed_at_unix_nanos
@@ -21971,7 +21977,7 @@ fn files_placement_activity_sheet(shared: &Shared, reader: &ThemeReader) -> Widg
     };
     let header = Stack::vertical()
         .alignment(Alignment::Stretch)
-        .spacing(8.0)
+        .gap(8.0)
         .with_child(placement_activity_error_notice(shared, reader))
         .with_child(placement_activity_stream_notice(shared, reader))
         .with_child(placement_activity_completeness_notice(shared, reader))
@@ -22044,7 +22050,7 @@ fn files_placement_activity_sheet(shared: &Shared, reader: &ThemeReader) -> Widg
             },
             header,
         )
-        .fill_child_width(),
+        .fill_child_width(true),
     )
     .state(summary_scroll_state.clone())
     .theme_when(clone_gray_scrollbar_reader(reader))
@@ -22073,7 +22079,7 @@ fn files_placement_activity_sheet(shared: &Shared, reader: &ThemeReader) -> Widg
         .with_item(
             Stack::vertical()
                 .alignment(Alignment::Center)
-                .spacing(6.0)
+                .gap(6.0)
                 .with_child(previous_summary)
                 .with_child(next_summary),
             FlexItem::new().no_shrink(),
@@ -22089,7 +22095,7 @@ fn files_placement_activity_sheet(shared: &Shared, reader: &ThemeReader) -> Widg
             },
             filter,
         )
-        .fill_child_width(),
+        .fill_child_width(true),
     );
     let body = Dock::new(content)
         .top(204.0, header_with_filter)
@@ -22174,9 +22180,9 @@ fn storage_conflict_row(
     let body = TrailingSlotRow::new(
         Stack::vertical()
             .alignment(Alignment::Stretch)
-            .spacing(5.0)
+            .gap(5.0)
             .with_child(
-                Label::new(conflict.path.clone()).style(reader().text_style(reader().palette.text)),
+                Label::new(conflict.path.clone()).text_style(reader().text_style(reader().palette.text)),
             )
             .with_child(
                 Label::new(format!(
@@ -22199,7 +22205,7 @@ fn storage_conflict_row(
         .tone(SemanticTone::Warning)
         .padding(Insets::all(10.0))
         .theme_when(clone_reader(reader))
-        .fill_width()
+        .fill_width(true)
 }
 
 fn storage_repair_row(reader: &ThemeReader, repair: &DfsOperatorRepairView) -> Surface {
@@ -22216,7 +22222,7 @@ fn storage_repair_row(reader: &ThemeReader, repair: &DfsOperatorRepairView) -> S
         .tone(SemanticTone::Warning)
         .padding(Insets::all(10.0))
         .theme_when(clone_reader(reader))
-        .fill_width()
+        .fill_width(true)
 }
 
 fn files_storage_center_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPod> {
@@ -22231,7 +22237,7 @@ fn files_storage_center_sheet(shared: &Shared, reader: &ThemeReader) -> Option<W
 
     let mut content = Stack::vertical()
         .alignment(Alignment::Stretch)
-        .spacing(12.0);
+        .gap(12.0);
     if let Some(overview) = overview.as_ref() {
         let status = &overview.status;
         let attention = status.open_conflict_count > 0
@@ -22242,7 +22248,7 @@ fn files_storage_center_sheet(shared: &Shared, reader: &ThemeReader) -> Option<W
             "Overview",
             Stack::vertical()
                 .alignment(Alignment::Stretch)
-                .spacing(9.0)
+                .gap(9.0)
                 .with_child(
                     StatusBadge::new(if attention {
                         "Storage needs attention"
@@ -22285,7 +22291,7 @@ fn files_storage_center_sheet(shared: &Shared, reader: &ThemeReader) -> Option<W
             );
         }
 
-        let mut conflict_rows = Stack::vertical().alignment(Alignment::Stretch).spacing(8.0);
+        let mut conflict_rows = Stack::vertical().alignment(Alignment::Stretch).gap(8.0);
         for conflict in overview.conflicts.iter().take(20) {
             conflict_rows =
                 conflict_rows.with_child(storage_conflict_row(shared, reader, conflict));
@@ -22316,7 +22322,7 @@ fn files_storage_center_sheet(shared: &Shared, reader: &ThemeReader) -> Option<W
                 .gap(8.0),
         );
 
-        let mut repair_rows = Stack::vertical().alignment(Alignment::Stretch).spacing(8.0);
+        let mut repair_rows = Stack::vertical().alignment(Alignment::Stretch).gap(8.0);
         for repair in overview.repairs.iter().take(20) {
             repair_rows = repair_rows.with_child(storage_repair_row(reader, repair));
         }
@@ -22411,7 +22417,7 @@ fn files_storage_center_sheet(shared: &Shared, reader: &ThemeReader) -> Option<W
             },
             content,
         )
-        .fill_child_width(),
+        .fill_child_width(true),
     )
     .name("Storage health overview")
     .theme_when(clone_gray_scrollbar_reader(reader))
@@ -22489,7 +22495,7 @@ fn history_note(reader: &ThemeReader, text: impl Into<String>) -> Label {
     let mut style = theme.text_style(theme.palette.text_muted);
     style.font_size = theme.text.sm.size;
     style.line_height = theme.text.sm.line_height;
-    Label::new(text).style(style)
+    Label::new(text).text_style(style)
 }
 
 fn history_saved_label(nanos: u64) -> String {
@@ -22542,7 +22548,7 @@ fn history_card_button(
 
 fn history_preview_panel(reader: &ThemeReader, preview: &FilesHistoryPreview) -> Surface {
     let theme = reader();
-    let mut body = Stack::vertical().alignment(Alignment::Stretch).spacing(6.0);
+    let mut body = Stack::vertical().alignment(Alignment::Stretch).gap(6.0);
     let (badge, tone, text, note) = match preview.result.as_ref() {
         None => (
             "Reading version",
@@ -22594,7 +22600,7 @@ fn history_preview_panel(reader: &ThemeReader, preview: &FilesHistoryPreview) ->
         .appearance(sui::SurfaceAppearance::Soft)
         .padding(Insets::all(10.0))
         .theme_when(clone_reader(reader))
-        .fill_width()
+        .fill_width(true)
 }
 
 fn history_entry_card(
@@ -22639,7 +22645,7 @@ fn history_entry_card(
     let saved_path = normalize_path(&entry.captured.object.path);
     let mut body = Stack::vertical()
         .alignment(Alignment::Stretch)
-        .spacing(6.0)
+        .gap(6.0)
         .with_child(badges)
         .with_child(
             Label::new(format!(
@@ -22647,7 +22653,7 @@ fn history_entry_card(
                 history_saved_label(entry.captured.captured_at_unix_nanos),
                 human_size(Some(entry.size_bytes))
             ))
-            .style(meta_style),
+            .text_style(meta_style),
         )
         .with_child(history_note(
             reader,
@@ -22833,7 +22839,7 @@ fn history_capture_card(
 ) -> Surface {
     let mut body = Stack::vertical()
         .alignment(Alignment::Stretch)
-        .spacing(8.0)
+        .gap(8.0)
         .with_child(history_note(
             reader,
             "Keep the current content so you can restore or recover it later. The name says why you saved it.",
@@ -22935,7 +22941,7 @@ fn history_decision_panel(
     };
     let mut panel = Stack::vertical()
         .alignment(Alignment::Stretch)
-        .spacing(8.0)
+        .gap(8.0)
         .with_child(
             StatusBadge::new(title)
                 .icon(IconGlyph::Alert)
@@ -23036,7 +23042,7 @@ fn history_decision_panel(
         .tone(tone)
         .padding(Insets::all(12.0))
         .theme_when(clone_reader(reader))
-        .fill_width()
+        .fill_width(true)
 }
 
 fn history_issues_card(
@@ -23081,7 +23087,7 @@ fn history_issues_card(
     explanation_style.line_height = theme.text.sm.line_height;
     let mut body = Stack::vertical()
         .alignment(Alignment::Stretch)
-        .spacing(9.0)
+        .gap(9.0)
         .with_child(
             StatusBadge::new(headline)
                 .icon(if conflicts + repairs > 0 {
@@ -23092,7 +23098,7 @@ fn history_issues_card(
                 .tone(tone)
                 .theme_when(clone_reader(reader)),
         )
-        .with_child(Label::new(explanation).style(explanation_style));
+        .with_child(Label::new(explanation).text_style(explanation_style));
     let mut issue_rows = Vec::new();
     for conflict in object
         .conflicts
@@ -23192,7 +23198,7 @@ fn files_history_sheet(
 
     let mut content = Stack::vertical()
         .alignment(Alignment::Stretch)
-        .spacing(12.0)
+        .gap(12.0)
         .with_child(history_note(
             reader,
             if folder_mode {
@@ -23243,7 +23249,7 @@ fn files_history_sheet(
 
     let mut version_stack = Stack::vertical()
         .alignment(Alignment::Stretch)
-        .spacing(10.0);
+        .gap(10.0);
     if folder_mode {
         version_stack = version_stack.with_child(history_note(
             reader,
@@ -23329,7 +23335,7 @@ fn files_history_sheet(
             },
             content,
         )
-        .fill_child_width(),
+        .fill_child_width(true),
     )
     .state(scroll_state.clone())
     .name("File history and issues")
@@ -23403,7 +23409,7 @@ fn compact_file_selection_actions(shared: &Shared, reader: &ThemeReader) -> impl
     let source = shared.files().source;
     let actions_for_selection = selection_context_actions(&shared.files());
     let mut previous_group = None;
-    let mut actions = Stack::vertical().alignment(Alignment::Stretch).spacing(6.0);
+    let mut actions = Stack::vertical().alignment(Alignment::Stretch).gap(6.0);
 
     for action in actions_for_selection {
         let group = action.group();
@@ -23734,7 +23740,7 @@ pub(crate) fn document_view(shared: Shared) -> impl Widget {
                 _ => None,
             }
         });
-    let body = RebuildOnChange::new_observable(source, move |_| {
+    let body = RebuildOnChange::key_from(source, move |_| {
         files_document_sheet(&content_shared, &content_reader)
             .unwrap_or_else(|| WidgetPod::new(SizedBox::new()))
     });
@@ -24285,7 +24291,7 @@ mod tests {
                     .root(
                         SizedBox::new()
                             .width(800.0)
-                            .with_child(picker_first_header(&shared, &reader)),
+                            .child(picker_first_header(&shared, &reader)),
                     ),
             )
             .build()?;
@@ -26246,6 +26252,197 @@ mod tests {
     }
 
     #[test]
+    fn placement_activity_radios_follow_domain_across_retained_frames() -> sui::Result<()> {
+        use sui::{Event, PointerButton, PointerButtons, PointerEvent, PointerEventKind};
+
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        let (tx, rx) = mpsc::channel();
+        shared.files_mut().worker_tx = Some(tx);
+        let reader: ThemeReader = {
+            let shared = shared.clone();
+            Rc::new(move || shared.theme())
+        };
+        let initial_filter = shared.files().placement_activity_filter;
+        let choices = [
+            (PlacementActivityFilter::All, "All"),
+            (PlacementActivityFilter::Active, "Active"),
+            (PlacementActivityFilter::Failed, "Failed"),
+            (PlacementActivityFilter::Completed, "Done"),
+        ];
+        // Retain the production radios so parent rebuilding cannot repair stale selection.
+        let radios =
+            choices
+                .into_iter()
+                .fold(Flex::horizontal().gap(6.0), |row, (filter, label)| {
+                    row.with_child(placement_activity_filter_radio(
+                        &shared,
+                        &reader,
+                        initial_filter,
+                        filter,
+                        label,
+                    ))
+                });
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .root(SizedBox::new().width(520.0).height(120.0).child(radios)),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        let initial = window.snapshot()?;
+        let initial_ids: Vec<_> = initial
+            .accessibility
+            .nodes
+            .iter()
+            .filter(|node| node.role == sui::SemanticsRole::RadioButton)
+            .map(|node| node.id)
+            .collect();
+        assert_eq!(initial_ids.len(), 4);
+        let point = |name: &str| {
+            let bounds = initial
+                .accessibility
+                .nodes
+                .iter()
+                .find(|node| {
+                    node.role == sui::SemanticsRole::RadioButton
+                        && node.name.as_deref() == Some(name)
+                })
+                .expect("visible filter radio")
+                .bounds;
+            sui::Point::new(
+                bounds.x() + bounds.width() * 0.5,
+                bounds.y() + bounds.height() * 0.5,
+            )
+        };
+        let activate_now = |point: sui::Point| -> sui::Result<()> {
+            window.dispatch_event_now(Event::Pointer(PointerEvent::new(
+                PointerEventKind::Move,
+                point,
+            )))?;
+            let mut down = PointerEvent::new(PointerEventKind::Down, point);
+            down.button = Some(PointerButton::Primary);
+            down.buttons = PointerButtons::new(1);
+            window.dispatch_event_now(Event::Pointer(down))?;
+            let mut up = PointerEvent::new(PointerEventKind::Up, point);
+            up.button = Some(PointerButton::Primary);
+            window.dispatch_event_now(Event::Pointer(up))
+        };
+        let expect_request = |expected| match rx.try_recv().expect("one filter query") {
+            FilesWorkerCommand::PlacementActivity {
+                filter,
+                cursor,
+                append,
+                ..
+            } => {
+                assert_eq!(filter, expected);
+                assert!(cursor.is_none());
+                assert!(!append);
+            }
+            _ => panic!("expected placement activity query"),
+        };
+        let assert_visible = |expected: &str| -> sui::Result<()> {
+            window.run_until_idle()?;
+            let snapshot = window.snapshot_now()?;
+            let radios: Vec<_> = snapshot
+                .accessibility
+                .nodes
+                .iter()
+                .filter(|node| node.role == sui::SemanticsRole::RadioButton)
+                .collect();
+            assert_eq!(
+                radios.iter().map(|node| node.id).collect::<Vec<_>>(),
+                initial_ids
+            );
+            assert!(radios.iter().all(|node| !node.state.disabled));
+            let checked: Vec<_> = radios
+                .iter()
+                .filter(|node| node.state.selected)
+                .map(|node| node.name.clone().expect("radio name"))
+                .collect();
+            assert_eq!(checked, vec![expected.to_string()]);
+            Ok(())
+        };
+        assert_eq!(initial_filter, PlacementActivityFilter::All);
+        assert_visible("All")?;
+
+        // X then the previously selected Y, with no frame or parent rebuild between inputs.
+        activate_now(point("Active"))?;
+        activate_now(point("All"))?;
+        // dispatch_event_now queues input; pumping delivers both activations before redraw.
+        window.run_until_idle()?;
+        assert_eq!(
+            shared.files().placement_activity_filter,
+            PlacementActivityFilter::All
+        );
+        expect_request(PlacementActivityFilter::Active);
+        expect_request(PlacementActivityFilter::All);
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+        assert_visible("All")?;
+
+        // The same retained controls also switch correctly across rendered frames.
+        activate_now(point("Active"))?;
+        window.run_until_idle()?;
+        assert_eq!(
+            shared.files().placement_activity_filter,
+            PlacementActivityFilter::Active
+        );
+        expect_request(PlacementActivityFilter::Active);
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+        assert_visible("Active")?;
+        activate_now(point("All"))?;
+        window.run_until_idle()?;
+        assert_eq!(
+            shared.files().placement_activity_filter,
+            PlacementActivityFilter::All
+        );
+        expect_request(PlacementActivityFilter::All);
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+        assert_visible("All")?;
+
+        // A repeated selection must preserve the query/poll state.
+        let generation = shared
+            .files()
+            .placement_activity_poll_generation
+            .load(Ordering::Acquire);
+        activate_now(point("All"))?;
+        window.run_until_idle()?;
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+        assert_eq!(
+            shared
+                .files()
+                .placement_activity_poll_generation
+                .load(Ordering::Acquire),
+            generation
+        );
+        assert_visible("All")?;
+
+        // An external domain change must reach retained check states and remain selectable.
+        assert!(
+            shared
+                .files_mut()
+                .set_placement_activity_filter(PlacementActivityFilter::Failed)
+        );
+        window.dispatch_event_now(Event::Pointer(PointerEvent::new(
+            PointerEventKind::Move,
+            point("Failed"),
+        )))?;
+        window.pump_frames(1)?;
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+        assert_visible("Failed")?;
+        activate_now(point("All"))?;
+        window.run_until_idle()?;
+        assert_eq!(
+            shared.files().placement_activity_filter,
+            PlacementActivityFilter::All
+        );
+        expect_request(PlacementActivityFilter::All);
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+        assert_visible("All")?;
+        Ok(())
+    }
+
+    #[test]
     fn reconciliation_activity_filter_groups_running_and_retrying_as_active() {
         use sinomo_runtime::dfs::DfsPlacementReconciliationActivityStatus as Status;
 
@@ -27880,7 +28077,7 @@ mod tests {
         };
         let body = SizedBox::new()
             .height(HEADER_H)
-            .with_child(compact_header_bar(&shared, &reader));
+            .child(compact_header_bar(&shared, &reader));
         let runtime = sui::Application::new()
             .window(
                 sui::WindowBuilder::new()
@@ -27928,7 +28125,7 @@ mod tests {
         };
         let body = SizedBox::new()
             .height(HEADER_H)
-            .with_child(compact_header_bar(&shared, &reader));
+            .child(compact_header_bar(&shared, &reader));
         let runtime = sui::Application::new()
             .window(
                 sui::WindowBuilder::new()
@@ -28389,7 +28586,7 @@ mod tests {
                         SizedBox::new()
                             .width(1120.0)
                             .height(720.0)
-                            .with_child(view(shared.clone())),
+                            .child(view(shared.clone())),
                     ),
             )
             .build()?;
@@ -28475,7 +28672,7 @@ mod tests {
                     SizedBox::new()
                         .width(1120.0)
                         .height(720.0)
-                        .with_child(view(shared.clone())),
+                        .child(view(shared.clone())),
                 ),
             )
             .build()?;
@@ -28570,7 +28767,7 @@ mod tests {
                         SizedBox::new()
                             .width(1_200.0)
                             .height(480.0)
-                            .with_child(view(shared.clone())),
+                            .child(view(shared.clone())),
                     ),
             )
             .build()?;
@@ -29489,7 +29686,7 @@ mod tests {
                     SizedBox::new()
                         .width(INSPECTOR_W)
                         .height(720.0)
-                        .with_child(InspectorView::new(shared.clone())),
+                        .child(InspectorView::new(shared.clone())),
                 ),
             )
             .build()?;
@@ -31185,7 +31382,7 @@ mod tests {
                         SizedBox::new()
                             .width(340.0)
                             .height(420.0)
-                            .with_child(preview_card(
+                            .child(preview_card(
                                 FilesSourceKind::Sifs,
                                 false,
                                 None,
@@ -32654,7 +32851,7 @@ mod tests {
                         SizedBox::new()
                             .width(720.0)
                             .height(520.0)
-                            .with_child(view(shared)),
+                            .child(view(shared)),
                     ),
                 )
                 .build()?;
@@ -32726,7 +32923,7 @@ mod tests {
                     SizedBox::new()
                         .width(720.0)
                         .height(520.0)
-                        .with_child(view(shared.clone())),
+                        .child(view(shared.clone())),
                 ),
             )
             .build()?;
@@ -32771,7 +32968,7 @@ mod tests {
                     SizedBox::new()
                         .width(720.0)
                         .height(520.0)
-                        .with_child(view(shared.clone())),
+                        .child(view(shared.clone())),
                 ),
             )
             .build()?;
@@ -33013,7 +33210,7 @@ mod tests {
                         SizedBox::new()
                             .width(720.0)
                             .height(520.0)
-                            .with_child(view(shared.clone())),
+                            .child(view(shared.clone())),
                     ),
                 )
                 .build()?;
@@ -33106,7 +33303,7 @@ mod tests {
         };
         let table_shared = shared.clone();
         let table_state = state.clone();
-        let table = RebuildOnChange::new_observable(sui::Signal::new(()), move |_| {
+        let table = RebuildOnChange::key_from(sui::Signal::new(()), move |_| {
             files_list_body_table(
                 &table_shared,
                 &reader,
@@ -33118,7 +33315,7 @@ mod tests {
         let runtime = sui::Application::new()
             .window(
                 sui::WindowBuilder::new()
-                    .root(SizedBox::new().width(720.0).height(520.0).with_child(table)),
+                    .root(SizedBox::new().width(720.0).height(520.0).child(table)),
             )
             .build()?;
         let app = sui_testing::TestApp::from_runtime(runtime)?;
@@ -33279,7 +33476,7 @@ mod tests {
                     SizedBox::new()
                         .width(720.0)
                         .height(520.0)
-                        .with_child(view(shared.clone())),
+                        .child(view(shared.clone())),
                 ),
             )
             .build()?;
@@ -33497,7 +33694,7 @@ mod tests {
                     SizedBox::new()
                         .width(760.0)
                         .height(640.0)
-                        .with_child(view(shared.clone())),
+                        .child(view(shared.clone())),
                 ),
             )
             .build()?;
@@ -33726,7 +33923,7 @@ mod tests {
                     SizedBox::new()
                         .width(1280.0)
                         .height(720.0)
-                        .with_child(view(shared.clone())),
+                        .child(view(shared.clone())),
                 ),
             )
             .build()?;
@@ -33957,7 +34154,7 @@ mod tests {
                         SizedBox::new()
                             .width(1280.0)
                             .height(720.0)
-                            .with_child(view(shared.clone())),
+                            .child(view(shared.clone())),
                     ),
             )
             .build()?;
@@ -34041,7 +34238,7 @@ mod tests {
                     SizedBox::new()
                         .width(760.0)
                         .height(720.0)
-                        .with_child(view(shared.clone())),
+                        .child(view(shared.clone())),
                 ),
             )
             .build()?;
@@ -34120,7 +34317,7 @@ mod tests {
                     SizedBox::new()
                         .width(760.0)
                         .height(720.0)
-                        .with_child(view(shared.clone())),
+                        .child(view(shared.clone())),
                 ),
             )
             .build()?;
@@ -34275,7 +34472,7 @@ mod tests {
                     SizedBox::new()
                         .width(520.0)
                         .height(720.0)
-                        .with_child(view(shared.clone())),
+                        .child(view(shared.clone())),
                 ),
             )
             .build()?;
@@ -34329,7 +34526,7 @@ mod tests {
                         SizedBox::new()
                             .width(1_200.0)
                             .height(720.0)
-                            .with_child(view(shared.clone())),
+                            .child(view(shared.clone())),
                     ),
             )
             .build()?;
@@ -34437,7 +34634,7 @@ mod tests {
                         SizedBox::new()
                             .width(520.0)
                             .height(720.0)
-                            .with_child(view(shared.clone())),
+                            .child(view(shared.clone())),
                     ),
             )
             .build()?;
@@ -34558,7 +34755,7 @@ mod tests {
                     SizedBox::new()
                         .width(520.0)
                         .height(720.0)
-                        .with_child(view(shared.clone())),
+                        .child(view(shared.clone())),
                 ),
             )
             .build()?;
@@ -34619,7 +34816,7 @@ mod tests {
                         SizedBox::new()
                             .width(520.0)
                             .height(720.0)
-                            .with_child(view(shared.clone())),
+                            .child(view(shared.clone())),
                     ),
             )
             .build()?;
@@ -34793,7 +34990,7 @@ mod tests {
                         SizedBox::new()
                             .width(720.0)
                             .height(720.0)
-                            .with_child(view(shared.clone())),
+                            .child(view(shared.clone())),
                     ),
             )
             .build()?;
@@ -34854,7 +35051,7 @@ mod tests {
                         SizedBox::new()
                             .width(FILES_TASK_POPOVER_W)
                             .height(240.0)
-                            .with_child(FilesTaskQueue::new(shared.clone(), &reader)),
+                            .child(FilesTaskQueue::new(shared.clone(), &reader)),
                     ),
             )
             .build()?;
@@ -34923,7 +35120,7 @@ mod tests {
                     SizedBox::new()
                         .width(520.0)
                         .height(720.0)
-                        .with_child(view(shared.clone())),
+                        .child(view(shared.clone())),
                 ),
             )
             .build()?;
@@ -34977,7 +35174,7 @@ mod tests {
                         SizedBox::new()
                             .width(760.0)
                             .height(720.0)
-                            .with_child(view(shared.clone())),
+                            .child(view(shared.clone())),
                     ),
             )
             .build()?;
@@ -35633,7 +35830,7 @@ mod tests {
                     .root(
                         SizedBox::new()
                             .size(Size::new(320.0, 640.0))
-                            .with_child(InspectorView::new(shared)),
+                            .child(InspectorView::new(shared)),
                     ),
             )
             .build()?;
@@ -35716,7 +35913,7 @@ mod tests {
                         SizedBox::new()
                             .width(INSPECTOR_W)
                             .height(280.0)
-                            .with_child(inspector(&shared, &reader, &scroll_state)),
+                            .child(inspector(&shared, &reader, &scroll_state)),
                     ),
             )
             .build()?;
