@@ -37,7 +37,7 @@
 #
 # Usage:
 #   docker/test-cluster.sh                  # build current binary, up, test, down -v
-#   SINOMO_TEST_REUSE=1 docker/test-cluster.sh   # reuse the running test project
+#   SINOMO_TEST_BUILD=0 SINOMO_TEST_REUSE=1 docker/test-cluster.sh   # reuse the running test project
 #   SINOMO_TEST_KEEP=1  docker/test-cluster.sh   # leave the cluster up afterwards
 #   SINOMO_TEST_TIMING_HELPERS_SELF_TEST=1 docker/test-cluster.sh  # no-Docker helper test
 #
@@ -166,7 +166,7 @@
 #   SINOMO_TEST_FORMATION_OBSERVE_DURATION_SECONDS capture watchdog seconds (default 12)
 #   SINOMO_TEST_FORMATION_OBSERVE_FREQUENCY_HZ CPU samples/second (default 49)
 #   SINOMO_TEST_FORMATION_OBSERVE_CPU_NODES comma-separated nodes profiled in-process
-#                                           (default node1; use all explicitly)
+#                                           (default all)
 #   SINOMO_TEST_FORMATION_OBSERVE_MAX_EVENTS bounded RPC-timeline records/node (default 32768)
 #
 # Exits non-zero if any scenario fails; failure evidence (probe JSON, compose ps,

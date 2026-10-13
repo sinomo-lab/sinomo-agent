@@ -1,7 +1,7 @@
 [package]
 name = "sinomo-device"
 version.workspace = true
-description = "Sinomo device profile, permission, and capability metadata"
+description = "Sinomo device profiles, permissions, capabilities, and node-local resource conditions"
 authors = ["Infinity_X <Infinity_X@sinomo.net>"]
 edition.workspace = true
 rust-version.workspace = true

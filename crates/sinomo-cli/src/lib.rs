@@ -1,4 +1,4 @@
-//! Shared Sinomo command-line handlers.
+//! Sinomo command-line interface, TUI, and daemon-hosted product services.
 
 #[cfg(test)]
 use sinomo_agent::cli::AgentSessionInspectOptions;

@@ -1,7 +1,7 @@
 [package]
 name = "sinomo-cli"
 version.workspace = true
-description = "Shared Sinomo command-line handlers"
+description = "Sinomo command-line interface, TUI, and daemon-hosted product services"
 authors = ["Infinity_X <Infinity_X@sinomo.net>"]
 edition.workspace = true
 rust-version.workspace = true

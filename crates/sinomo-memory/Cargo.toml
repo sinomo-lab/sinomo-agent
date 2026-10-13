@@ -1,7 +1,7 @@
 [package]
 name = "sinomo-memory"
 version.workspace = true
-description = "Sinomo hot and warm memory policy skeleton"
+description = "Sinomo indexed-file memory and memory record stores"
 authors = ["Infinity_X <Infinity_X@sinomo.net>"]
 edition.workspace = true
 rust-version.workspace = true

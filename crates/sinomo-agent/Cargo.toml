@@ -1,7 +1,7 @@
 [package]
 name = "sinomo-agent"
 version.workspace = true
-description = "Sinomo bounded interactive controller skeleton"
+description = "Sinomo agent runtime: sessions, context assembly, tools, skills, channels, and compaction"
 authors = ["Infinity_X <Infinity_X@sinomo.net>"]
 edition.workspace = true
 rust-version.workspace = true

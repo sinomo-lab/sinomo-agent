@@ -2853,7 +2853,7 @@ pub trait RoutedConnector: Send + Sync {
     fn availability(&self, destination_node_id: &NodeId) -> RoutedAvailability;
 }
 
-/// Stage-C routed connector for one-edge paths.
+/// Routed connector for one-edge paths.
 ///
 /// It replaces endpoint selection plus raw stream opening as one atomic
 /// operation: snapshots authorize and plan the path, the link provider proves

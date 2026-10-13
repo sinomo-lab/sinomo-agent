@@ -1,4 +1,5 @@
-//! Bounded interactive controller skeleton.
+//! Agent runtime: sessions, context assembly, tools, skills, channels, and
+//! compaction.
 
 // Direct filesystem access is denied module-by-module where workspace content
 // is handled (see clippy.toml); the rest of the crate manages its own state.

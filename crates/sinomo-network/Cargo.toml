@@ -1,7 +1,7 @@
 [package]
 name = "sinomo-network"
 version.workspace = true
-description = "In-process Sinomo peer registry and event routing skeleton"
+description = "Sinomo direct links, connectivity, routed streams, and stream-native object RPC"
 authors = ["Infinity_X <Infinity_X@sinomo.net>"]
 edition.workspace = true
 rust-version.workspace = true

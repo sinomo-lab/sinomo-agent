@@ -8,7 +8,7 @@
 # Usage:
 #   docker/benchmark-cluster-kv.sh
 #   SINOMO_TEST_BUILD=0 docker/benchmark-cluster-kv.sh
-#   SINOMO_TEST_REUSE=1 SINOMO_TEST_KEEP=1 docker/benchmark-cluster-kv.sh
+#   SINOMO_TEST_BUILD=0 SINOMO_TEST_REUSE=1 SINOMO_TEST_KEEP=1 docker/benchmark-cluster-kv.sh
 set -uo pipefail
 
 SINOMO_DOCKER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

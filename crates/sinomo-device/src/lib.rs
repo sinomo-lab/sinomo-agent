@@ -1,4 +1,5 @@
-//! Device profile, permission, and capability metadata.
+//! Device profile, permission, and capability metadata, plus the process-local
+//! resource conditions published by native application hosts.
 
 mod native;
 mod runtime_resources;

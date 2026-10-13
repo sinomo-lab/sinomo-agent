@@ -13,8 +13,8 @@ ring = "r1"
 
 [features]
 default = []
-# Enable daemon-managed sandbox lifecycle recovery and its focused tests.
-# Command execution uses direct-SIFS WASIX or the live DFS/FUSE simple runner.
+# Forwarded by `sinomo-runtime/sandbox`. It currently enables no daemon code:
+# sandbox lifecycle recovery is owned by the Sandbox component.
 sandbox = []
 
 [dependencies]
