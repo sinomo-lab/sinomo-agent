@@ -34,7 +34,7 @@ The vision loop can use the same wrapper instead of importing MineStudio on the 
 
 ```sh
 SINOMO_MINESTUDIO_ENV_URL=http://127.0.0.1:18080 \
-SINOMO_PYTORCH_ENDPOINT=http://10.14.5.15:32153 \
+SINOMO_PYTORCH_ENDPOINT='http://<minicpm-host>:32153' \
 python3 modules/benchmark/sinomo-benchmarks/minestudio/minestudio_vision_action_loop.py
 ```
 
@@ -42,7 +42,7 @@ For the live-style duplex workflow, keep the same wrapper running and use:
 
 ```sh
 SINOMO_MINESTUDIO_ENV_URL=http://127.0.0.1:18080 \
-SINOMO_PYTORCH_ENDPOINT=http://10.14.5.15:32153 \
+SINOMO_PYTORCH_ENDPOINT='http://<minicpm-host>:32153' \
 python3 modules/benchmark/sinomo-benchmarks/minestudio/minestudio_live_duplex_loop.py
 ```
 
@@ -53,6 +53,7 @@ The HTTP API exposes:
 - `GET /health`
 - `POST /reset`
 - `GET /observe`
+- `POST /inspect` (benchmark-only state snapshot and optional command probes)
 - `POST /step`
 - `POST /close`
 

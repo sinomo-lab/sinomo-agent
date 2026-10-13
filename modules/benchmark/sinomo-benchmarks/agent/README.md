@@ -11,6 +11,11 @@ The agent benchmark package contains complementary memory evaluations:
 LongMemEval-S is an external dataset and is not vendored in this repository.
 Benchmark outputs belong under the gitignored `benchmark-results/` directory.
 
+The same directory also holds model-facing harnesses outside this README's
+scope: `run_channel_discussion_eval.py` (channel and multi-agent discussion),
+`run_compaction_eval.py` (compaction quality), and `run_skill_eval.py` (skill
+disclosure and evolution). Each documents its modes in its module docstring.
+
 ## LongMemEval-S
 
 The default LongMemEval-S run is retrieval-only. It does not call a model or

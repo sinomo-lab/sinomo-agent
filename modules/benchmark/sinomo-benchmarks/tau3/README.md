@@ -45,7 +45,7 @@ A smoke run executes the first pinned base task in each domain. It makes paid re
 ```bash
 cd /tmp/tau3-bench
 uv run python \
-  /path/to/sinomo-agent-app/modules/benchmark/sinomo-benchmarks/tau3/run_tau3_voice.py \
+  /path/to/sinomo-agent/modules/benchmark/sinomo-benchmarks/tau3/run_tau3_voice.py \
   --mode smoke \
   --tau3-root /tmp/tau3-bench
 ```

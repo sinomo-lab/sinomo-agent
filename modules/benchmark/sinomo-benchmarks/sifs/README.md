@@ -75,8 +75,8 @@ target/release/sinomo-sifs-fuse-bench \
 - `--root <SIFS_PATH>` selects the existing SIFS subtree to mount. It must be absolute and writable by the invoking uid and gid.
 - `--suite <full|correctness|performance>` chooses which workloads run.
 - `--json-out <PATH>` writes the machine-readable report, creating parent directories as needed.
-- `SINOMO_DATA_DIR` selects the local Sinomo data directory and daemon connection state.
-- `SINOMO_SIFS_FUSE_BENCH_ROOT` is a convenience used by the catalog plan; passing `--root` remains explicit at the runner boundary.
+- `--data-dir <PATH>` selects the local Sinomo data directory and daemon connection state; it defaults to `SINOMO_DATA_DIR`.
+- `SINOMO_SIFS_FUSE_BENCH_ROOT` supplies the default for `--root` and is used by the catalog plan; an explicit `--root` takes precedence.
 - `--min-sequential-read-mib-s` fails a run whose hot sequential FUSE read is below the configured throughput floor. The catalog plan sources it from `SINOMO_SIFS_FUSE_MIN_SEQUENTIAL_READ_MIB_S`.
 - `--min-parallel-create-speedup` fails a run whose parallel-create throughput divided by the sequential baseline is below the configured scaling floor. The catalog plan sources it from `SINOMO_SIFS_FUSE_MIN_PARALLEL_CREATE_SPEEDUP`.
 

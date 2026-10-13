@@ -96,9 +96,6 @@ The sandbox has its own [architecture document](../crates/sinomo-sandbox/docs/ar
   inspection of local data-directory paths.
 - [Network data-path reference](developer/network-data-path.md) records the
   current migration-state object-RPC carrier formats and flow-control bounds.
-- [Network layer separation](plans/network-layer-separation.md) tracks the
-  replacement of the combined carrier with layered contracts inside the single
-  `sinomo-network` crate.
 - [Cluster formal verification](formal/cluster-verification.md) documents the
   executable Quint specifications and their evidence boundaries.
 - Crate-specific operational or protocol references live with the owning crate,

@@ -7,9 +7,7 @@ crate. The separation is architectural and internal; it does not create new
 workspace crates.
 
 The current implementation map and resource bounds are recorded in the
-developer [network data-path reference](developer/network-data-path.md). The
-completed migration stages and deletion criteria are recorded in the
-[network layer separation plan](plans/network-layer-separation.md).
+developer [network data-path reference](developer/network-data-path.md).
 
 ## Purpose
 
@@ -612,6 +610,4 @@ dependency on one another, and `sinomo-cluster` is their only bridge.
 
 The [clustering architecture](clustering-architecture.md) defines directory
 authority. The [Sinomo Object format](sinomo-object-format.md) defines the
-binary object representation. The completed implementation stages and deletion
-gates are recorded in the
-[network layer separation plan](plans/network-layer-separation.md).
+binary object representation.
