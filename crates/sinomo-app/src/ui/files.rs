@@ -21885,15 +21885,29 @@ fn placement_activity_filter_control(shared: &Shared, reader: &ThemeReader) -> i
     })
 }
 
-fn scroll_placement_activity_summary(state: &ScrollState, delta: f32, ctx: &mut EventCtx) {
+fn scroll_placement_activity_summary(
+    state: &ScrollState,
+    viewport: sui::WidgetId,
+    delta: f32,
+    ctx: &mut EventCtx,
+) {
     let current = state.current_offset();
     let max = state.max_offset();
     let next = sui::Vector::new(current.x, (current.y + delta).clamp(0.0, max.y));
     if state.set_offset(next) {
-        ctx.request_measure();
-        ctx.request_arrange();
-        ctx.request_paint();
-        ctx.request_semantics();
+        // The arrow is a sibling of the retained viewport. Invalidating only the
+        // arrow leaves the viewport's cached layout and content transform unchanged.
+        use sui::{InvalidationKind, InvalidationRequest, InvalidationTarget};
+        let target = InvalidationTarget::Widget(viewport);
+        for kind in [
+            InvalidationKind::Measure,
+            InvalidationKind::Arrange,
+            InvalidationKind::Paint,
+            InvalidationKind::HitTest,
+            InvalidationKind::Semantics,
+        ] {
+            ctx.request(InvalidationRequest::new(target, kind));
+        }
     }
 }
 
@@ -22064,21 +22078,25 @@ fn files_placement_activity_sheet(shared: &Shared, reader: &ThemeReader) -> Widg
             .on_press(move || action.files_mut().load_older_placement_activity())
     };
     let summary_scroll_state = ScrollState::new();
-    let summary_scroll = ScrollView::vertical(
-        WidgetPadding::new(
-            Insets {
-                left: 2.0,
-                top: 2.0,
-                right: 10.0,
-                bottom: 12.0,
-            },
-            header,
+    let summary_scroll = WidgetPadding::new(
+        Insets::ZERO,
+        ScrollView::vertical(
+            WidgetPadding::new(
+                Insets {
+                    left: 2.0,
+                    top: 2.0,
+                    right: 10.0,
+                    bottom: 12.0,
+                },
+                header,
+            )
+            .fill_child_width(true),
         )
-        .fill_child_width(true),
-    )
-    .state(summary_scroll_state.clone())
-    .theme_when(clone_gray_scrollbar_reader(reader))
-    .name("Reconciliation activity summary");
+        .state(summary_scroll_state.clone())
+        .theme_when(clone_gray_scrollbar_reader(reader))
+        .name("Reconciliation activity summary"),
+    );
+    let summary_viewport = summary_scroll.child_pod().id();
     let previous_summary = {
         let enabled = summary_scroll_state.clone();
         let action = summary_scroll_state.clone();
@@ -22086,7 +22104,9 @@ fn files_placement_activity_sheet(shared: &Shared, reader: &ThemeReader) -> Widg
             .size(30.0)
             .theme_when(clone_reader(reader))
             .enabled_when(move || enabled.current_offset().y > 0.5)
-            .on_press_with_ctx(move |ctx| scroll_placement_activity_summary(&action, -140.0, ctx))
+            .on_press_with_ctx(move |ctx| {
+                scroll_placement_activity_summary(&action, summary_viewport, -140.0, ctx)
+            })
     };
     let next_summary = {
         let enabled = summary_scroll_state.clone();
@@ -22095,7 +22115,9 @@ fn files_placement_activity_sheet(shared: &Shared, reader: &ThemeReader) -> Widg
             .size(30.0)
             .theme_when(clone_reader(reader))
             .enabled_when(move || enabled.current_offset().y + 0.5 < enabled.max_offset().y)
-            .on_press_with_ctx(move |ctx| scroll_placement_activity_summary(&action, 140.0, ctx))
+            .on_press_with_ctx(move |ctx| {
+                scroll_placement_activity_summary(&action, summary_viewport, 140.0, ctx)
+            })
     };
     let summary = Flex::horizontal()
         .align_items(Alignment::Stretch)
@@ -25989,7 +26011,12 @@ mod tests {
     fn reconciliation_activity_uses_an_independent_request_lane_and_preserves_history() {
         use sinomo_runtime::dfs::DfsPlacementReconciliationActivityStatus as Status;
 
-        let backend = Backend::local_fallback();
+        let fixture = sinomo_testdir::TestDir::new(
+            "app-ui-reconciliation-activity-uses-an-independent-request-lane-and-preserves-history",
+        );
+        let backend = Backend::local_fallback_for_data_dir(
+            sinomo_runtime::local::SinomoDataDir::new(fixture.path()),
+        );
         let mut state = FilesState::new(&backend);
         let (tx, rx) = mpsc::channel();
         state.worker_tx = Some(tx);
@@ -26060,7 +26087,12 @@ mod tests {
     fn reconciliation_activity_append_deduplicates_by_job_revision() {
         use sinomo_runtime::dfs::DfsPlacementReconciliationActivityStatus as Status;
 
-        let backend = Backend::local_fallback();
+        let fixture = sinomo_testdir::TestDir::new(
+            "app-ui-reconciliation-activity-append-deduplicates-by-job-revision",
+        );
+        let backend = Backend::local_fallback_for_data_dir(
+            sinomo_runtime::local::SinomoDataDir::new(fixture.path()),
+        );
         let mut state = FilesState::new(&backend);
         let mut current = placement_activity_summary("same-job", Status::Completed, 10);
         current.revision = 8;
@@ -26308,7 +26340,12 @@ mod tests {
     fn reconciliation_activity_filter_queries_the_server_and_evicts_finished_active_jobs() {
         use sinomo_runtime::dfs::DfsPlacementReconciliationActivityStatus as Status;
 
-        let backend = Backend::local_fallback();
+        let fixture = sinomo_testdir::TestDir::new(
+            "app-ui-reconciliation-activity-filter-queries-the-server-and-evicts-finished-active-jobs",
+        );
+        let backend = Backend::local_fallback_for_data_dir(
+            sinomo_runtime::local::SinomoDataDir::new(fixture.path()),
+        );
         let mut state = FilesState::new(&backend);
         let (tx, rx) = mpsc::channel();
         state.worker_tx = Some(tx);
@@ -26387,7 +26424,12 @@ mod tests {
             DfsPlacementReconciliationActivityStatus as Status,
         };
 
-        let backend = Backend::local_fallback();
+        let fixture = sinomo_testdir::TestDir::new(
+            "app-ui-reconciliation-activity-active-head-refresh-evicts-stale-paginated-rows",
+        );
+        let backend = Backend::local_fallback_for_data_dir(
+            sinomo_runtime::local::SinomoDataDir::new(fixture.path()),
+        );
         let mut state = FilesState::new(&backend);
         state.placement_activity_open = true;
         state.placement_activity_filter = PlacementActivityFilter::Active;
@@ -26439,7 +26481,12 @@ mod tests {
             DfsPlacementReconciliationActivityStatus as Status,
         };
 
-        let backend = Backend::local_fallback();
+        let fixture = sinomo_testdir::TestDir::new(
+            "app-ui-reconciliation-activity-all-head-refresh-drops-only-stale-paginated-active-rows",
+        );
+        let backend = Backend::local_fallback_for_data_dir(
+            sinomo_runtime::local::SinomoDataDir::new(fixture.path()),
+        );
         let mut state = FilesState::new(&backend);
         state.placement_activity_open = true;
         let old_head = placement_activity_summary("old-terminal-head", Status::Completed, 40);
@@ -26496,7 +26543,12 @@ mod tests {
             DfsPlacementReconciliationActivityStatus as Status,
         };
 
-        let backend = Backend::local_fallback();
+        let fixture = sinomo_testdir::TestDir::new(
+            "app-ui-reconciliation-activity-terminal-head-shift-preserves-rows-and-loaded-tail-cursor",
+        );
+        let backend = Backend::local_fallback_for_data_dir(
+            sinomo_runtime::local::SinomoDataDir::new(fixture.path()),
+        );
         let mut state = FilesState::new(&backend);
         state.placement_activity_open = true;
         state.placement_activity_filter = PlacementActivityFilter::Completed;
@@ -26542,7 +26594,12 @@ mod tests {
 
     #[test]
     fn reconciliation_activity_open_and_ready_coalesce_to_one_follow_up_read() {
-        let backend = Backend::local_fallback();
+        let fixture = sinomo_testdir::TestDir::new(
+            "app-ui-reconciliation-activity-open-and-ready-coalesce-to-one-follow-up-read",
+        );
+        let backend = Backend::local_fallback_for_data_dir(
+            sinomo_runtime::local::SinomoDataDir::new(fixture.path()),
+        );
         let mut state = FilesState::new(&backend);
         let (tx, rx) = mpsc::channel();
         state.worker_tx = Some(tx);
@@ -26592,7 +26649,12 @@ mod tests {
     fn reconciliation_activity_load_older_preempts_a_background_poll() {
         use sinomo_runtime::dfs::DfsPlacementReconciliationActivityCursor as Cursor;
 
-        let backend = Backend::local_fallback();
+        let fixture = sinomo_testdir::TestDir::new(
+            "app-ui-reconciliation-activity-load-older-preempts-a-background-poll",
+        );
+        let backend = Backend::local_fallback_for_data_dir(
+            sinomo_runtime::local::SinomoDataDir::new(fixture.path()),
+        );
         let mut state = FilesState::new(&backend);
         let (tx, rx) = mpsc::channel();
         state.worker_tx = Some(tx);
@@ -26652,8 +26714,13 @@ mod tests {
         use sinomo_runtime::api::{DaemonPaths, DaemonRunOptions, DaemonStatus};
         use sinomo_runtime::dfs::DfsPlacementReconciliationActivityStatus as Status;
 
-        fn daemon_backend(port: u16) -> Backend {
-            let mut backend = Backend::local_fallback();
+        fn daemon_backend(port: u16) -> (Backend, sinomo_testdir::TestDir) {
+            let fixture = sinomo_testdir::TestDir::new(
+                "app-ui-reconciliation-activity-cache-survives-same-endpoint-rebind-but-not-a-new-endpoint",
+            );
+            let mut backend = Backend::local_fallback_for_data_dir(
+                sinomo_runtime::local::SinomoDataDir::new(fixture.path()),
+            );
             let options = DaemonRunOptions {
                 host: "127.0.0.1".to_string(),
                 port,
@@ -26662,10 +26729,10 @@ mod tests {
             let paths = DaemonPaths::new(backend.data_dir.as_ref());
             backend.connection =
                 Connection::Daemon(Box::new(DaemonStatus::new(&options, &paths, None)));
-            backend
+            (backend, fixture)
         }
 
-        let first_backend = daemon_backend(31_353);
+        let (first_backend, _first_fixture) = daemon_backend(31_353);
         let mut state = FilesState::new(&first_backend);
         let retained = placement_activity_summary("retained-job", Status::Failed, 20);
         state.placement_activity_open = true;
@@ -26692,7 +26759,7 @@ mod tests {
         assert_eq!(state.placement_activity_refreshed_at_unix_nanos, Some(20));
 
         state.close_placement_activity();
-        let second_backend = daemon_backend(31_354);
+        let (second_backend, _second_fixture) = daemon_backend(31_354);
         assert!(state.rebind_backend(&second_backend, None));
         assert!(state.placement_activity.is_empty());
         assert!(state.placement_activity_error.is_none());
@@ -27387,7 +27454,12 @@ mod tests {
     -> sui::Result<()> {
         use sinomo_runtime::dfs::DfsPlacementReconciliationActivityStatus as Status;
 
-        let backend = Backend::local_fallback();
+        let fixture = sinomo_testdir::TestDir::new(
+            "app-ui-reconciliation-activity-sheet-exposes-cluster-statuses-and-virtual-filtering",
+        );
+        let backend = Backend::local_fallback_for_data_dir(
+            sinomo_runtime::local::SinomoDataDir::new(fixture.path()),
+        );
         let shared = Shared::new(AppState::ready(backend));
         {
             let mut files = shared.files_mut();
@@ -27475,7 +27547,12 @@ mod tests {
         let full_error = "The cluster control plane rejected this activity read because the retained projection is temporarily unavailable on node oracle-eu-west-very-long-name.";
         let live_error =
             "The daemon event stream disconnected while waiting for DFS placement updates.";
-        let backend = Backend::local_fallback();
+        let fixture = sinomo_testdir::TestDir::new(
+            "app-ui-reconciliation-activity-compact-extra-large-keeps-offline-error-and-history-reachable",
+        );
+        let backend = Backend::local_fallback_for_data_dir(
+            sinomo_runtime::local::SinomoDataDir::new(fixture.path()),
+        );
         let mut app_state = AppState::ready(backend);
         app_state.text_scale = AppTextScale::ExtraLarge;
         let shared = Shared::new(app_state);
@@ -27580,8 +27657,35 @@ mod tests {
             .get_by_role(SemanticsRole::Button)
             .with_name("Next activity summary");
         next_summary.expect().to_be_visible()?;
-        next_summary.click()?;
-        app.run_until_idle()?;
+        // Native font metrics change wrapping and the number of scroll steps needed.
+        // Verify reachability through the production controls instead of a fixed click count.
+        let reveal_summary_status = |button: &str, status: &str| -> sui::Result<()> {
+            for _ in 0..12 {
+                let snapshot = window.snapshot()?;
+                let bounds = snapshot
+                    .accessibility
+                    .nodes
+                    .iter()
+                    .find(|node| {
+                        node.role == SemanticsRole::Status && node.name.as_deref() == Some(status)
+                    })
+                    .expect("activity summary status")
+                    .bounds;
+                if bounds.y() < header_bounds.max_y() && bounds.max_y() > header_bounds.y() {
+                    return Ok(());
+                }
+                window
+                    .get_by_role(SemanticsRole::Button)
+                    .with_name(button)
+                    .click()?;
+                app.run_until_idle()?;
+            }
+            panic!("{status} was not reachable through {button} within 12 scroll steps");
+        };
+        reveal_summary_status(
+            "Next activity summary",
+            "Live reconciliation updates disconnected",
+        )?;
         let live_snapshot = window.snapshot()?;
         let live_status = live_snapshot
             .accessibility
@@ -27601,8 +27705,7 @@ mod tests {
             header_bounds
         );
 
-        next_summary.click()?;
-        app.run_until_idle()?;
+        reveal_summary_status("Next activity summary", "Retained operational history")?;
         let retained_snapshot = window.snapshot()?;
         let retained_status = retained_snapshot
             .accessibility
@@ -27636,12 +27739,7 @@ mod tests {
         );
 
         // Navigating the summary never dismisses or clears the durable read error.
-        let previous_summary = window
-            .get_by_role(SemanticsRole::Button)
-            .with_name("Previous activity summary");
-        previous_summary.click()?;
-        previous_summary.click()?;
-        app.run_until_idle()?;
+        reveal_summary_status("Previous activity summary", "Reconciliation activity read failed")?;
         let restored_snapshot = window.snapshot()?;
         let restored_error = restored_snapshot
             .accessibility
@@ -27672,13 +27770,49 @@ mod tests {
             list_items, realized_rows,
             "each virtual row owns one list-item semantic node"
         );
-        assert!(restored_snapshot.accessibility.nodes.iter().any(|node| {
-            node.name.as_deref() == Some("Replaced")
-                || node
-                    .description
-                    .as_deref()
-                    .is_some_and(|text| text.contains("Replaced"))
-        }));
+        // Native font metrics can make the first card fill the virtual viewport.
+        // Reach the second row through its own scroll control, independently of
+        // the summary, rather than assuming both rows are initially realized.
+        let activity_list = window
+            .get_by_role(SemanticsRole::List)
+            .with_name("Reconciliation activity");
+        let list_bounds = restored_snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::List
+                    && node.name.as_deref() == Some("Reconciliation activity")
+            })
+            .expect("virtual activity list")
+            .bounds;
+        let mut replaced_reachable = false;
+        for _ in 0..12 {
+            let snapshot = window.snapshot()?;
+            replaced_reachable = snapshot.accessibility.nodes.iter().any(|node| {
+                (node.name.as_deref() == Some("Replaced")
+                    || node
+                        .description
+                        .as_deref()
+                        .is_some_and(|text| text.contains("Replaced")))
+                    && node.bounds.y() < list_bounds.max_y()
+                    && node.bounds.max_y() > list_bounds.y()
+            });
+            if replaced_reachable {
+                break;
+            }
+            activity_list.scroll_pixels(Vector::new(0.0, -140.0))?;
+            app.run_until_idle()?;
+        }
+        assert!(
+            replaced_reachable,
+            "Replaced row must be reachable through the virtual list"
+        );
+        assert_eq!(
+            shared.files().placement_activity_error.as_deref(),
+            Some(full_error),
+            "scrolling the job list preserves the durable activity read error"
+        );
         Ok(())
     }
 
