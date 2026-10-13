@@ -27079,7 +27079,10 @@ mod tests {
 
     #[test]
     fn device_selection_index_does_not_replace_the_media_panel_tree() {
-        let backend = Backend::local_fallback();
+        let fixture = sinomo_testdir::TestDir::new("app-ui-device-selection-index-does-not-replace-the-media-panel-tree");
+        let backend = Backend::local_fallback_for_data_dir(
+            sinomo_runtime::local::SinomoDataDir::new(fixture.path()),
+        );
         let shared = Shared::new(AppState::ready(backend));
         shared
             .chat_mut()
@@ -30990,7 +30993,10 @@ mod tests {
 
     #[test]
     fn provider_list_load_applies_async_result() {
-        let backend = Backend::local_fallback();
+        let fixture = sinomo_testdir::TestDir::new("app-ui-provider-list-load-applies-async-result");
+        let backend = Backend::local_fallback_for_data_dir(
+            sinomo_runtime::local::SinomoDataDir::new(fixture.path()),
+        );
         let mut state = ChatState::new(&backend);
         state.providers.clear();
         state.providers_loading = true;

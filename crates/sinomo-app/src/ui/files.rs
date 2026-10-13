@@ -21820,9 +21820,11 @@ fn placement_activity_filter_radio(
     label: &'static str,
 ) -> RadioButton {
     let changed = shared.clone();
+    let current = shared.clone();
     RadioButton::new(label)
         .framed()
         .checked(selected == filter)
+        .checked_when(move || current.files().placement_activity_filter == filter)
         .theme_when(clone_reader(reader))
         .on_change(move |checked| {
             if checked {
@@ -25921,7 +25923,16 @@ mod tests {
             adaptive: false,
             adaptive_budget: None,
             processed_content_bytes: 0,
-            accepted_config: None,
+            accepted_config: sinomo_runtime::dfs::DfsFileSystemConfig {
+                file_system_id: sinomo_runtime::dfs::DfsFileSystemId::from_legacy_named("sifs")
+                    .expect("filesystem"),
+                display_name: "SIFS".to_string(),
+                owner_node_id: sinomo_runtime::node::NodeId::from_legacy_named("node-a")
+                    .expect("node"),
+                subtree_policies: Vec::new(),
+                retention_policies: Default::default(),
+                module_metadata: Default::default(),
+            },
             revision: 2,
             created_at_unix_nanos: 1,
             updated_at_unix_nanos: 2,
@@ -26081,6 +26092,201 @@ mod tests {
         assert_eq!(state.placement_activity[0], current);
         assert_eq!(state.placement_activity[1], older);
         assert_eq!(state.placement_activity[0].updated_object_count, 1);
+    }
+
+    #[test]
+    fn placement_activity_radios_follow_domain_across_retained_frames() -> sui::Result<()> {
+        use sui::{Event, PointerButton, PointerButtons, PointerEvent, PointerEventKind};
+
+        let fixture = sinomo_testdir::TestDir::new("app-ui-placement-activity-radios-follow-domain-across-retained-frames");
+        let backend = Backend::local_fallback_for_data_dir(
+            sinomo_runtime::local::SinomoDataDir::new(fixture.path()),
+        );
+        let shared = Shared::new(AppState::ready(backend));
+        let (tx, rx) = mpsc::channel();
+        shared.files_mut().worker_tx = Some(tx);
+        let reader: ThemeReader = {
+            let shared = shared.clone();
+            Rc::new(move || shared.theme())
+        };
+        let initial_filter = shared.files().placement_activity_filter;
+        let choices = [
+            (PlacementActivityFilter::All, "All"),
+            (PlacementActivityFilter::Active, "Active"),
+            (PlacementActivityFilter::Failed, "Failed"),
+            (PlacementActivityFilter::Completed, "Done"),
+        ];
+        // Retain the production radios so parent rebuilding cannot repair stale selection.
+        let radios =
+            choices
+                .into_iter()
+                .fold(Flex::horizontal().gap(6.0), |row, (filter, label)| {
+                    row.with_child(placement_activity_filter_radio(
+                        &shared,
+                        &reader,
+                        initial_filter,
+                        filter,
+                        label,
+                    ))
+                });
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .root(SizedBox::new().width(520.0).height(120.0).child(radios)),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        let initial = window.snapshot()?;
+        let initial_ids: Vec<_> = initial
+            .accessibility
+            .nodes
+            .iter()
+            .filter(|node| node.role == sui::SemanticsRole::RadioButton)
+            .map(|node| node.id)
+            .collect();
+        assert_eq!(initial_ids.len(), 4);
+        let point = |name: &str| {
+            let bounds = initial
+                .accessibility
+                .nodes
+                .iter()
+                .find(|node| {
+                    node.role == sui::SemanticsRole::RadioButton
+                        && node.name.as_deref() == Some(name)
+                })
+                .expect("visible filter radio")
+                .bounds;
+            sui::Point::new(
+                bounds.x() + bounds.width() * 0.5,
+                bounds.y() + bounds.height() * 0.5,
+            )
+        };
+        let activate_now = |point: sui::Point| -> sui::Result<()> {
+            window.dispatch_event_now(Event::Pointer(PointerEvent::new(
+                PointerEventKind::Move,
+                point,
+            )))?;
+            let mut down = PointerEvent::new(PointerEventKind::Down, point);
+            down.button = Some(PointerButton::Primary);
+            down.buttons = PointerButtons::new(1);
+            window.dispatch_event_now(Event::Pointer(down))?;
+            let mut up = PointerEvent::new(PointerEventKind::Up, point);
+            up.button = Some(PointerButton::Primary);
+            window.dispatch_event_now(Event::Pointer(up))
+        };
+        let expect_request = |expected| match rx.try_recv().expect("one filter query") {
+            FilesWorkerCommand::PlacementActivity {
+                filter,
+                cursor,
+                append,
+                ..
+            } => {
+                assert_eq!(filter, expected);
+                assert!(cursor.is_none());
+                assert!(!append);
+            }
+            _ => panic!("expected placement activity query"),
+        };
+        let assert_visible = |expected: &str| -> sui::Result<()> {
+            window.run_until_idle()?;
+            let snapshot = window.snapshot_now()?;
+            let radios: Vec<_> = snapshot
+                .accessibility
+                .nodes
+                .iter()
+                .filter(|node| node.role == sui::SemanticsRole::RadioButton)
+                .collect();
+            assert_eq!(
+                radios.iter().map(|node| node.id).collect::<Vec<_>>(),
+                initial_ids
+            );
+            assert!(radios.iter().all(|node| !node.state.disabled));
+            let checked: Vec<_> = radios
+                .iter()
+                .filter(|node| node.state.selected)
+                .map(|node| node.name.clone().expect("radio name"))
+                .collect();
+            assert_eq!(checked, vec![expected.to_string()]);
+            Ok(())
+        };
+        assert_eq!(initial_filter, PlacementActivityFilter::All);
+        assert_visible("All")?;
+
+        // X then the previously selected Y, with no frame or parent rebuild between inputs.
+        activate_now(point("Active"))?;
+        activate_now(point("All"))?;
+        // dispatch_event_now queues input; pumping delivers both activations before redraw.
+        window.run_until_idle()?;
+        assert_eq!(
+            shared.files().placement_activity_filter,
+            PlacementActivityFilter::All
+        );
+        expect_request(PlacementActivityFilter::Active);
+        expect_request(PlacementActivityFilter::All);
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+        assert_visible("All")?;
+
+        // The same retained controls also switch correctly across rendered frames.
+        activate_now(point("Active"))?;
+        window.run_until_idle()?;
+        assert_eq!(
+            shared.files().placement_activity_filter,
+            PlacementActivityFilter::Active
+        );
+        expect_request(PlacementActivityFilter::Active);
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+        assert_visible("Active")?;
+        activate_now(point("All"))?;
+        window.run_until_idle()?;
+        assert_eq!(
+            shared.files().placement_activity_filter,
+            PlacementActivityFilter::All
+        );
+        expect_request(PlacementActivityFilter::All);
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+        assert_visible("All")?;
+
+        // A repeated selection must preserve the query/poll state.
+        let generation = shared
+            .files()
+            .placement_activity_poll_generation
+            .load(Ordering::Acquire);
+        activate_now(point("All"))?;
+        window.run_until_idle()?;
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+        assert_eq!(
+            shared
+                .files()
+                .placement_activity_poll_generation
+                .load(Ordering::Acquire),
+            generation
+        );
+        assert_visible("All")?;
+
+        // An external domain change must reach retained check states and remain selectable.
+        assert!(
+            shared
+                .files_mut()
+                .set_placement_activity_filter(PlacementActivityFilter::Failed)
+        );
+        window.dispatch_event_now(Event::Pointer(PointerEvent::new(
+            PointerEventKind::Move,
+            point("Failed"),
+        )))?;
+        window.pump_frames(1)?;
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+        assert_visible("Failed")?;
+        activate_now(point("All"))?;
+        window.run_until_idle()?;
+        assert_eq!(
+            shared.files().placement_activity_filter,
+            PlacementActivityFilter::All
+        );
+        expect_request(PlacementActivityFilter::All);
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+        assert_visible("All")?;
+        Ok(())
     }
 
     #[test]
