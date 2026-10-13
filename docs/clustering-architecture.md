@@ -32,7 +32,7 @@ The cluster stack is split across independent R0 crates:
 | Crate | Responsibility |
 |---|---|
 | `sinomo-kv` | KV semantics, Raft state, transactions, revisions, watches, leases, WAL, and snapshots. It is transport-free. |
-| `sinomo-network` | Typed communication, endpoint selection, route planning, relays, retries, and transport modules. It does not read KV or apply cluster policy. |
+| `sinomo-network` | Direct links, connectivity evidence, endpoint selection, route planning, routed streams and relays, object RPC, and transport modules. It does not read KV or apply cluster policy. |
 | `sinomo-cluster` | Identity, membership, invitations, lifecycle, health projection, and the drivers that carry KV/Raft traffic over network routes. |
 | `sinomo-service` | Service registration, discovery, and target selection above cluster membership. |
 
@@ -228,13 +228,14 @@ ordinary appends may share an active or queued send only when the transmitted
 history covers their exact entries under the same membership, term, leader, and
 commit fences. Advancing observational KV cursors and publication timestamps do
 not split an otherwise identical membership fence. Each peer has one active send
-and at most 256 waiting callers;
-pending payload is bounded. Completed acknowledgements are never cached for new
-requests. ReadIndex probes, snapshots, and oversized appends retain their dedicated paths. A caller
-finishing at quorum does not cancel shared work; its send owner retains the
-remaining deadline and publishes any observed higher term even if all callers
-have stopped waiting. Empty proposal and peer queues exit without idle polling.
-These scheduling changes retain the existing WAL and RPC formats.
+and at most 256 waiting callers, with at most 8 MiB of pending payload.
+Completed acknowledgements are never cached for new requests. ReadIndex probes,
+snapshots, and oversized appends use dedicated paths. A caller finishing at
+quorum does not cancel shared work; its send owner retains the remaining
+deadline and publishes any observed higher term even if all callers have
+stopped waiting. Empty proposal and peer queues exit without idle polling.
+Proposal batching and shared follower sends do not change the WAL or RPC
+formats.
 
 Public reads use one of two explicit consistency contracts:
 
@@ -337,9 +338,13 @@ selection, fallback, and retry rules.
 ## Security Boundary
 
 Every node has a stable signing identity. Sensitive daemon and cluster requests
-carry authenticated identity, freshness, and replay protection even on
-loopback. The receiver verifies the signer against local identity or current
-cluster membership before executing the request.
+must be bound to an authenticated identity even on loopback. Direct transports
+authenticate the adjacent peer once per link, and routed RPC takes the caller
+from that established transport context instead of signing each call; see
+[network architecture](network-architecture.md#peer-identity-and-authorization).
+Bootstrap handshakes that precede an authenticated link carry signed identity,
+freshness, and replay protection. The receiver maps the authenticated identity
+to local identity or current cluster membership before executing the request.
 
 Baseline rules:
 

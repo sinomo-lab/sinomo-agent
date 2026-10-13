@@ -14,6 +14,6 @@ KV comparisons. Original reservations, jobs and proofs remain data until the
 current authority path establishes their replacements. Standalone conversion
 uses explicit local ownership evidence.
 
-Current metadata snapshots use schema 8; their operation journal uses the V7
+Current metadata snapshots use schema 9; their operation journal uses the V7
 prepare/commit family. Older formats are handled here, and incompatible daemon
 versions must be upgraded.

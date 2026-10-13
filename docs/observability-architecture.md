@@ -12,12 +12,10 @@ DFS background work exposes bounded-label `sinomo.dfs.background` counters for
 wakes, started/completed passes, outcomes and hydrated objects/receipts/intents,
 plus duration histograms. Default-cluster lifecycle passes use the same counters
 with a distinct worker label. `dfs.background`, `dfs.background.lifecycle`,
-`dfs.background.probe` and
-`dfs.metadata.hydration` spans connect those passes to their storage and RPC
-children. Counters survive trace-ring eviction; durations include waiting and
-are not CPU time. An unfinished pass is not reported as successful.
-`dfs.metadata.migration` separately reports catalog scan/migration counts,
-completion, bounded continuation and waits for replica-prefix certification.
+`dfs.background.probe` and `dfs.metadata.hydration` spans connect those passes
+to their storage and RPC children. Counters survive trace-ring eviction;
+durations include waiting and are not CPU time. An unfinished pass is not
+reported as successful.
 `dfs.placement.page` records the job scope, phase, scanned objects and content
 bytes. `dfs.metadata.ack_floor.read` and `dfs.metadata.ack_floor.write` separate
 floor-log replay from the acknowledgement's complete durability operation;
@@ -94,11 +92,17 @@ Observation is exposed as ordinary object RPC:
   exporters.
 - `/observe/traces` reads the bounded trace ring.
 - `/observe/control` reads or updates the active tracing filter.
+- `/observe/profile/cpu` starts, inspects, or stops one bounded node-local CPU
+  profile and reports its pprof artifact path. Sampling requires Linux x86-64
+  or AArch64 and a build with the `sinomo-observe/cpu-profiler` feature; other
+  builds report it as unsupported.
+- `/observe/timeline/network` captures one fixed-memory, node-local RPC
+  timeline; stopping it returns Perfetto-convertible JSON.
 
-Read routes are available to the local process and cluster members. Control is an
-admin operation. The `sinomo observe` CLI uses the same routed object RPC path as
-normal cluster traffic, so observing another node also exercises the production
-network routing layer.
+Read routes are available to the local process and cluster members. Control,
+CPU profiles and network timelines are admin operations. The `sinomo observe`
+CLI uses the same routed object RPC path as normal cluster traffic, so
+observing another node also exercises the production network routing layer.
 
 `sinomo observe ... --target <node-id>` reads one node. `--all` fans out over the
 authorized cluster members known to the local node and prints per-node results.
@@ -228,10 +232,13 @@ There are two metric sources:
 
 Snapshot exporters are pull-based. They run only when `/observe/metrics` is
 queried, which keeps durable state scans out of runtime hot paths. Exporters
-declare the metric prefixes they own, and successful DFS/KV results are cached
-for five seconds (agent snapshots for fifteen seconds). Filtered requests skip
-unrelated exporters. Exporters return normal `ObserveMetricRecord` values and
-may report exporter failures as `sinomo.observe.metric_exporter.errors`.
+declare the metric prefixes they own, and filtered requests skip unrelated
+exporters. Each exporter declares how a successful result may be reused: KV
+inventory for up to two minutes, node resources for five seconds, and agent
+snapshots until the agent storage watcher reports a change. The DFS component
+exporter instead projects its bounded resident status on each read. Exporters
+return normal `ObserveMetricRecord` values and may report exporter failures as
+`sinomo.observe.metric_exporter.errors`.
 
 Metric responses carry observation time, process incarnation, process role,
 node identity, partial/exporter status, and descriptors for the returned metric
@@ -252,7 +259,8 @@ derive interval rates and approximate percentiles from consecutive reads.
 `--samples <n>` for a bounded capture. Streaming JSON emits one compact object
 per interval so it can be redirected to a JSONL artifact.
 
-The daemon registers built-in DFS, KV, and node-resource exporters:
+Observe registers built-in KV and node-resource exporters; DFS registers its
+own component exporter:
 
 - `sinomo.dfs.*` reports DFS object, version, receipt, intent, conflict, repair,
   namespace job, and metadata shard gauges. Runtime operation counters and
@@ -457,7 +465,9 @@ script captures the exact appended byte range of both
 `/data/daemon/main.stdout.log` and `main.stderr.log`. It extracts only existing
 `sinomo.dfs.perf` numeric records into `dfs-perf-timing-records.tsv` and writes
 cluster percentiles to `dfs-perf-timing-summary.tsv`. The companion
-`dfs-perf-timing-coverage.tsv` is explicit about the instrumentation boundary:
+`dfs-perf-timing-coverage.tsv` is explicit about the instrumentation boundary;
+the catalog in `docker/measure-dfs-shards.sh` names each record, timing field
+and boundary note:
 
 - `metadata-journal-segment` exposes authoritative journal encode, durable
   file append/sync, first-segment directory sync, bytes, and entry counts;
@@ -466,22 +476,24 @@ cluster percentiles to `dfs-perf-timing-summary.tsv`. The companion
 - `posix-bulk-local-write` and `posix-bulk-authority-commit` split content
   publication, prepare construction, per-authority commit, and final stat
   projection;
+- replica records separate exact frame decoding, durable ingest before
+  acknowledgement, authority-context lookup, routed journal source validation,
+  and handoff prefix verification;
 - `metadata-authority-confirmation` distinguishes replica-probe, assignment
   revalidation, and cluster-quorum permit time;
 - `content-root-catalog-shard-refresh` and `content-root-catalog-refresh`
   expose exact-cut page/entry counts and shard/installed-generation latency;
-- `packed-blob-lock` exposes packed-content lock wait and hold duration, while
-  content ingest records expose loose/streamed write timing when those paths
-  run;
+- content ingest records expose loose, streamed, and content-addressed blob
+  write timing when those paths run;
 - `metadata-publish-plan` exposes replication planning only.
 
-There is currently no successful packed-blob append/sync duration record and no
-successful metadata-journal transport latency record. The coverage artifact
-marks those as `not-instrumented`; it never turns an absent record into a zero
-duration. A supported record with no samples is `not-observed`, which can also
-mean the workload missed that path or `SINOMO_DFS_PERF_TRACE` was not active in
-the already-running daemon. Raw captured logs remain authoritative. Timing
-summaries can be rebuilt without contacting Docker:
+There is currently no successful metadata-journal transport latency record.
+The coverage artifact marks such boundaries `not-instrumented`; it never turns
+an absent record into a zero duration. A supported record with no samples is
+`not-observed`, which can also mean the workload missed that path or
+`SINOMO_DFS_PERF_TRACE` was not active in the already-running daemon. Raw
+captured logs remain authoritative. Timing summaries can be rebuilt without
+contacting Docker:
 
 ```sh
 docker/measure-dfs-shards.sh --summarize-traces target/dfs-shard-perf/<run>
@@ -510,7 +522,7 @@ root after collecting its JSONL output.
 
 Use two separate Docker projects or fully tear down the first project between
 the durability and algorithm measurements. Docker formation has a fixed,
-non-configurable ten-second acceptance gate. Both performance projects must be
+non-configurable 60-second acceptance gate. Both performance projects must be
 formed fresh with formation observation disabled; an observation-enabled
 project is diagnostic evidence, not a benchmark environment. The disk-backed
 suite remains the correctness, restart, damage, and convergence gate:
@@ -598,9 +610,10 @@ and individual stream-record read/write waits. Existing RPC request IDs identify
 client/server exchange pairs without changing the wire contract. Observation
 RPCs are excluded from workload-stage summaries; their traffic remains in node
 window counters.
-The existing network timeline supplies finer routing, encoding, authentication
-and dispatch phases when separately enabled. Existing `sinomo.dfs.perf` event
-records now retain their admission/maintenance ancestor context as well.
+The network timeline (`/observe/timeline/network`) supplies finer routing,
+encoding, authentication and dispatch phases when separately enabled.
+`sinomo.dfs.perf` event records retain their admission/maintenance ancestor
+context.
 
 The batched metadata commit exposes `dfs.commit.phase` spans for receipt readiness,
 history/configuration refresh, planning, hidden-prepare persistence, operation

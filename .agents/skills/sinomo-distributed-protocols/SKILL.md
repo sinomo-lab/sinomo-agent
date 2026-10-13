@@ -65,6 +65,9 @@ Use the [testing matrix](../../../docs/developer/testing.md) and
 [formal guide](../../../docs/formal/cluster-verification.md). Exercise the relevant
 failure edges: duplicate or lost replies, stale authority, partitions, partial
 persistence, restart, cancellation after commit, and mixed-version decoding.
+For DFS changes, also run `bash scripts/ci/check-dfs-kv-boundary.sh`; the
+[lint README](../../../lints/sinomo-architecture/README.md) defines the narrow
+KV boundary markers. Do not duplicate consensus or connectivity logic to avoid it.
 
 For formal work, find the actual case ID in
 [check-quint.sh](../../../scripts/formal/check-quint.sh); its model, contract,

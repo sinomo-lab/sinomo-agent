@@ -6,10 +6,12 @@ with one-way dependencies, all implemented inside the single `sinomo-network`
 crate. The separation is architectural and internal; it does not create new
 workspace crates.
 
-The current implementation map and resource bounds are recorded in the
-developer [network data-path reference](developer/network-data-path.md). The
-completed migration stages and deletion criteria are recorded in the
-[network layer separation plan](plans/network-layer-separation.md).
+The layer separation is the current production design: there is one
+routed-stream executor, one stream-native object-RPC protocol, and one
+service-method registry, and no payload-size or fallback branch selects another
+carrier. The implementation map, resource bounds, and probe timing contract are
+recorded in the developer
+[network data-path reference](developer/network-data-path.md).
 
 ## Purpose
 
@@ -74,7 +76,10 @@ transport modules implement the same logical contract:
 
 ```rust,ignore
 trait LinkProvider {
-    async fn connect(&self, endpoint: &Endpoint) -> Result<AuthenticatedLink>;
+    async fn connect(
+        &self,
+        endpoint: &ClusterEndpointRecord,
+    ) -> Result<AuthenticatedLink>;
     async fn accept(&self) -> Result<AuthenticatedLink>;
 }
 ```
@@ -203,21 +208,30 @@ trait RoutedConnector {
         &self,
         destination: NodeId,
         options: ConnectOptions,
-    ) -> Result<PeerStream, ConnectError>;
+    ) -> Result<PeerStream, NetworkError>;
+
+    fn availability(&self, destination: &NodeId) -> RoutedAvailability;
 }
 
 struct PeerStream {
-    io: Box<dyn AsyncReadWrite>,
-    local: NodeId,
-    peer: NodeId,
-    session_id: SessionId,
+    io: BoxedNetworkStream,
+    local_node_id: NodeId,
+    peer_node_id: NodeId,
+    session_id: Id,
     channel_binding: [u8; 32],
+    protection: RoutedSessionProtection,
     route_trace: RouteTrace,
 }
 ```
 
 `route_trace` is diagnostic evidence. It cannot be used by an application to
 grant authority or select a different service behavior.
+
+Main and shadow daemons share one node identity. A caller that needs the main
+daemon selects `MainDaemon` destination process affinity, which admits only
+endpoints owned by that node's main daemon; ordinary callers use `Any`.
+Affinity constrains endpoint selection and carrier reuse. It is routing
+metadata, never a service permission.
 
 The connector may cache an established routed connection and open cheap logical
 streams over it. Each returned `PeerStream` nevertheless has ordinary
@@ -271,8 +285,8 @@ Route planning is a pure operation over immutable inputs:
 fn plan_routes(
     directory: &DirectorySnapshot,
     connectivity: &ConnectivitySnapshot,
-    source: NodeId,
-    destination: NodeId,
+    source: &NodeId,
+    destination: &NodeId,
     constraints: RouteConstraints,
 ) -> Vec<CandidatePath>;
 ```
@@ -313,9 +327,9 @@ For any source and destination in one routable component, all transitive
 establishment is performed by the routing system:
 
 1. The source selects an ordered candidate path from a current snapshot.
-2. The source creates an `OpenSession` containing the source, destination,
-   unique session ID, ordered path, hop limit, connection deadline, and selected
-   record protection.
+2. The source sends a routed-session open descriptor containing the source,
+   destination, unique session ID, ordered node path and endpoint IDs, hop
+   limit, connection deadline, and selected record protection.
 3. Every intermediate relay validates membership, path position, loop freedom,
    deadline, and hop limit. It may reject the session but cannot change either
    endpoint or the session identity.
@@ -537,8 +551,8 @@ contracts evolve independently:
 
 Capabilities, limits, and optional fields are negotiated as capabilities when
 backward-compatible. A version changes only for an incompatible contract
-change, not for an implementation refactor or tuning adjustment. This
-replacement retains no adapter between superseded internal protocols. A wire
+change, not for an implementation refactor or tuning adjustment. The
+implementation retains no adapter between superseded internal protocols. A wire
 contract change migrates every producer and consumer as one coordinated change,
 then deletes the old parser, negotiation branch, framing, tests, and
 documentation. Routing never chooses an RPC protocol based on payload shape.
@@ -633,47 +647,7 @@ dependency on one another, and `sinomo-cluster` is their only bridge.
 
 The [clustering architecture](clustering-architecture.md) defines directory
 authority. The [Sinomo Object format](sinomo-object-format.md) defines the
-binary object representation. The completed implementation stages and deletion
-gates are recorded in the
-[network layer separation plan](plans/network-layer-separation.md).
-
-
-## Network probe process and timing contract
-
-The maintained embedded-value ping and semantic-attachment probes select
-`MainDaemon` destination affinity through the fail-closed `/daemon/object-rpc/forward-main`
-route. A shadow sharing the same node identity cannot satisfy their remote-main
-contract. Probe diagnostics include `destination_process_affinity=main-daemon`.
-Ordinary API callers retain their existing `Any` affinity unless they explicitly
-select a process contract.
-
-Latency gates use the source daemon's measured inner forwarding interval, which
-includes route preparation, target RPC execution and response forwarding.
-The full test-client proxy round trip is reported separately. Neither interval
-subtracts tracing or profiling overhead. Active diagnostics must capture the
-processes selected by the same affinity as the workload.
-
-The Docker `debug+cpu-profiler` build keeps debugging, tracing and CPU profiling
-enabled. Its dev package overrides use optimization level 2 for the network,
-DFS, daemon, SOBJ codec, Observe and tracing dispatch crates (`tracing`,
-`tracing-core`, `tracing-subscriber`). Record the exact binary hash, source patch
-and Cargo profile configuration with performance artifacts; a build made before
-these overrides is a different build identity. All measured observation work
-remains charged to the unchanged acceptance thresholds.
-
-### Owned request sender scheduling
-
-The canonical request sender first polls in its caller using the caller's waker.
-A ready result needs no sender task. A suspended sender moves its existing
-future, source and writer into the same abort-on-drop task owner; early streaming
-responses retain the existing detachment rules. Known immediate errors use the
-same delivery classifier as inline and suspended sends, while pending response
-selection is unchanged. Each body-frame production charges Tokio cooperative
-budget before obtaining the next chunk. This bounds ready production by the
-runtime's frame budget without changing record framing, FIN, byte credit,
-progress or payload-copy semantics. It is not a wall-time bound.
-
-Timeline request-task queue/poll points describe the suspended remainder;
-request HEAD/DATA staging may precede them. Naturally ready senders legitimately
-have no task points. Transport readiness-to-consumption intervals can include
-application waits and are not proof of executor or one-way network latency.
+binary object representation. The
+[network data-path reference](developer/network-data-path.md) maps these
+contracts to the current modules, resource bounds, sender scheduling, and probe
+timing contract.

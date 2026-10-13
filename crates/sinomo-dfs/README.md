@@ -83,7 +83,10 @@ automatically recovering state rather than an operator action.
 
 Metadata journal replication is bounded by both entry count and encoded batch size. Oversized single entries still advance by themselves so a large namespace operation cannot stall a follower cursor forever. Daemon maintenance drains multiple bounded batches per publish call, with a cap that keeps each maintenance pass finite while avoiding one-batch-per-interval convergence for large metadata backlogs.
 
-The table tail log is compacted into a streamed snapshot using storage schema 8, bounding reopen cost by the latest checkpoint and recent writes. Its storage version is independent of the V7 operation family. `sinomo-dfs` accepts only current storage and wire formats.
+The table tail log is compacted into a streamed snapshot using storage schema
+9, bounding reopen cost by the latest checkpoint and recent writes. Its storage
+version is independent of the V7 operation family. `sinomo-dfs` accepts only
+current storage and wire formats.
 
 `sinomo-dfs-migration` owns incremental, on-demand conversion of retained storage. The Main or Embedded component supplies its cold-open provider; original source digests, archived bytes, restart progress and native installation authority remain explicit. Incompatible peer versions must be upgraded.
 
@@ -170,6 +173,7 @@ retries. DFS does not expose transport chunk indexes, windows, or resume routes.
 - old-version collection with retention,
 - orphan blob GC,
 - metadata tombstone compaction,
+- bounded metadata-history GC of terminal records and receipts,
 - metadata-backed namespace-job maintenance through daemon ticks.
 
 `LocalContentStore` can enforce blob, logical-object, manifest, and staging-byte quotas and reports content footprint through operational metrics.
@@ -186,23 +190,33 @@ The policy is attached to objects and inherited by higher-level path APIs. DFS d
 
 ## Storage Layout
 
-The crate registers these data-directory areas through `register_storage_paths`:
+`register_storage_paths` declares the crate's data-directory areas. The main
+ones are:
 
 ```text
 dfs/content/blobs
+dfs/content/inline-bindings
 dfs/content/objects
+dfs/content/catalog
 dfs/content/staging
+dfs/metadata
 dfs/metadata/records
-dfs/metadata/records/tables
 dfs/metadata/journal
 dfs/metadata/root
 dfs/metadata/shard-index
 dfs/metadata-replication-cursors
-dfs/metadata
+dfs/anti-entropy-cursors
+dfs/maintenance
+dfs/mounted-mutation-outbox
+dfs/imports
 dfs/operator
 dfs/pins
 files
 ```
+
+The same function registers the content-store observation, counter and lock
+files. Retained-format areas such as `dfs/content/blob-packs` are registered by
+`sinomo-dfs-migration`, and the attachment component registers its own state.
 
 The exact storage format is intentionally hidden behind crate APIs and metadata backend traits. Other crates should use the DFS interfaces instead of reading these files directly.
 

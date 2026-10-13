@@ -58,10 +58,14 @@ authority should continue to use FUSE.
 
 ## Module settings and errors
 
-`module.dfs.nfs` registers its own schema-driven Settings UI. Under
-**Settings > Modules > NFS Mount**, an operator can configure enablement, the
-Linux directory or Windows drive target, the loopback endpoint and export
-name, the exported SIFS root, and read-only behavior.
+The NFS module (an R1 native Rust module whose ID derives from the legacy name
+`module.dfs.nfs`) registers its own schema-driven Settings UI for the editable,
+node-local `storage.sifs-nfs-mount` setting. The app shows that module card,
+with its settings, under **Settings > Storage** beside the SIFS mount; the
+**Modules** page lists it as managed in Storage. There an operator can
+configure enablement, the Linux directory or Windows drive target, the
+loopback endpoint and export name, the exported SIFS root, and read-only
+behavior.
 
 The module also registers a read-only `storage.sifs-nfs-mount-status`
 operational document. Its presentation metadata identifies `last_error` and

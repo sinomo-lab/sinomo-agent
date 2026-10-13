@@ -5,11 +5,13 @@
 The crate provides:
 
 - owned construction types such as `Document`, `Value`, `Object`, `List`, and `Array`;
-- binary encoding and borrowed parsing for `SOBJ` documents;
+- binary encoding, borrowed `DocumentView` parsing, and lazy `DocumentCursor` navigation for `SOBJ` documents;
+- `BorrowedDocumentBuilder`, which emits a small prefix plus a borrowed bytes, array, or schema payload for scatter/gather output;
+- caller-selected decode bounds through `DecodeOptions` and `DecodeLimits`;
 - ordered object fields with duplicate-key rejection;
 - typed lists, fixed-size arrays, optional values, and schema metadata;
 - a dependency-free plain-text representation in `text`;
-- optional serde integration behind the `serde` feature.
+- optional serde integration behind the `serde` feature, including decoding from non-contiguous chunks with `serde_ext::from_chunk_iter_with_options`.
 
 The format is specified in [`../../docs/sinomo-object-format.md`](../../docs/sinomo-object-format.md).
 

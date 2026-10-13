@@ -1,6 +1,13 @@
 # POSIX Test Suite Coverage
 
-This document tracks high-level Sinomo WASIX coverage against [`emscripten-core/posixtestsuite`](https://github.com/emscripten-core/posixtestsuite). Detailed verifier output belongs under `target/sinomo-posixtestsuite-results/` and should not be committed.
+This document tracks high-level Sinomo WASIX coverage against
+[`emscripten-core/posixtestsuite`](https://github.com/emscripten-core/posixtestsuite).
+The verifier is
+[`toolchains/build-tools/verify-posixtestsuite-wasix.sh`](../toolchains/build-tools/verify-posixtestsuite-wasix.sh).
+Detailed verifier output belongs under
+`target/sinomo-posixtestsuite-results/` and should not be committed. The
+results below were last refreshed in May 2026, before the WASIX engine moved
+into the `modules/sandbox/wasix` native module.
 
 ## Status Key
 

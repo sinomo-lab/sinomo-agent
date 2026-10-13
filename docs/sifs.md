@@ -24,7 +24,8 @@ The baseline SIFS layout is:
 /services
 ```
 
-`/sinomo` is reserved for cluster-operational state. Node-local filesystem exposure lives under `/sinomo/nodes/<node_id>/files`.
+`/sinomo` is reserved for cluster-operational state. Each node's local-owned
+files live under `/sinomo/nodes/<node_id>/files`.
 
 `/users` is reserved for cluster-level user data and user-facing shared workspaces.
 
@@ -45,13 +46,16 @@ Current predefined policy model:
 
 | Path | Policy | Meaning |
 |---|---|---|
-| `/sinomo/nodes/<node_id>/files` | `local-owned` | The node exposes its local `$SINOMO_DATA_DIR/files` directory into SIFS. The owner node is the write authority. |
+| `/sinomo/nodes/<node_id>/files` | `local-owned` | Node-owned files. The owner node is the write authority; other nodes route reads and writes to it. |
 | `/users` | `replicated-eventual` | Cluster-distributed user data. Writes commit according to distributed DFS policy and repair toward the desired replica set. |
 | `/services` | `replicated-eventual` | Cluster-distributed service data suitable for services such as web servers. |
 
-The parent directories `/`, `/sinomo`, `/sinomo/nodes`, and `/sinomo/nodes/<node_id>` are namespace anchors. They make the cluster layout inspectable and routable, while the policy boundary for local host-file exposure is the `files` subtree itself.
-
-The default local exposure config lives at `$SINOMO_DATA_DIR/configs/dfs/expose.json` as a shared `sinomo-config` document. Existing `$SINOMO_DATA_DIR/config/dfs-expose.sobj` and `dfs-expose.json` files are read for migration, and explicit `.sobj` or `.json` paths remain supported for compatibility.
+The parent directories `/`, `/sinomo`, `/sinomo/nodes`, and
+`/sinomo/nodes/<node_id>` are namespace anchors. They make the cluster layout
+inspectable and routable, while the local-owned policy boundary is the `files`
+subtree itself. These files are ordinary DFS objects in the owner's content
+store, not a mirror of a host directory; use a mount to present SIFS on the
+host.
 
 ## KV Boundary
 
@@ -64,7 +68,9 @@ SIFS configuration and DFS service discovery are compact cluster control-plane r
 /dfs/services/content/<node_id>
 ```
 
-Per-path metadata, object metadata, object versions, write intents, replica receipts, conflicts, and content manifests do not live in KV. They are managed by DFS metadata shards and node-local DFS content stores.
+Per-path metadata, object metadata, object versions, write intents, replica
+receipts, and content manifests do not live in KV. They are managed by DFS
+metadata shards and node-local DFS content stores.
 
 ## Access and Compatibility
 
@@ -88,11 +94,11 @@ On Windows Pro or Server with Client for NFS installed,
 `sinomo dfs nfs mount S:` starts the foreground server and maps the export to a
 drive letter without materializing a second host-side file tree. On Linux,
 `sinomo dfs nfs mount /mnt/sinomo` provides an explicit kernel-NFS alternative
-while `sinomo dfs mount /mnt/sinomo` continues to select FUSE by default. The
-NFS module also registers daemon-supervised controls and actionable status
-under **Settings > Modules > NFS Mount**. See the [SIFS NFSv3
-architecture](nfs-architecture.md) for its durability, confinement,
-compatibility, and lifecycle contracts.
+while `sinomo dfs mount /mnt/sinomo` selects FUSE by default. The NFS Mount
+module's daemon-supervised controls and actionable status appear under
+**Settings > Storage** beside the mount settings; its Modules entry links
+there. See the [SIFS NFSv3 architecture](nfs-architecture.md) for its
+durability, confinement, compatibility, and lifecycle contracts.
 
 The [Windows Cloud Files architecture](cloud-files-architecture.md) defines
 the provider's placeholder identities, hydration, durable local writeback,
@@ -125,8 +131,9 @@ SIFS is POSIX-like, with deliberate distributed-system differences:
   callers.
 - Read-triggered access-time updates may be skipped on replicas to preserve
   journal authority.
-- Reading an object with an open recovery conflict fails with `ESTALE` until
-  the conflict is resolved.
+- An operation whose observed parent, object, or path changed before it could
+  publish fails with a conflict; FUSE reports it as `ESTALE`. Re-resolve the
+  path and retry. Normal operation keeps no conflict records.
 - A path locked by an in-progress cross-shard move returns a retryable error.
 - Unix FUSE mounts support distributed whole-file shared and exclusive POSIX
   advisory locks. Partial byte ranges are rejected with `EOPNOTSUPP`; a lock

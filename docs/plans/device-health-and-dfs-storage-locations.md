@@ -1,6 +1,9 @@
 # Node Health, Device Monitoring, and DFS Storage Locations
 
-Status: proposed follow-up work. Last reviewed 2026-07-17.
+Status: partially implemented. DFS storage-health sampling, the aggregate node
+advertisement, and host resource evidence have landed; general node health,
+additional content locations, storage management, and the app surfaces remain
+proposed. Last reviewed 2026-10-13.
 
 This plan adds cached node and device health observation plus safe management of
 additional node-local DFS content locations. It extends the current
@@ -44,8 +47,9 @@ not the multi-location content-store abstraction.
 - `sinomo-cluster` publishes node liveness, process identity, version, and
   endpoint observations. These records are not a resource-telemetry stream.
 - `sinomo-device` models profiles, capabilities, inventory, and coarse
-  availability. It does not model sampled health, freshness, severity, or
-  recovery state.
+  availability. It does not model sampled device health, freshness, severity,
+  or recovery state. Its process-local `NodeResourceMonitor` carries only
+  advisory resource mode and network metering supplied by the host.
 - the native remote-management module can observe CPU, load, memory, disks,
   network interfaces, and processes. Its collector is request-scoped and must
   not become the app's polling implementation.
@@ -57,10 +61,63 @@ not the multi-location content-store abstraction.
 - DFS constructs one concrete `LocalContentStore`, normally at
   `$SINOMO_DATA_DIR/dfs/content`.
 - DFS advertisements and placement receipts are keyed by `NodeId`; placement
-  policy selects nodes using replica counts, reachability, and zones.
+  policy selects nodes using replica counts, reachability, zones, and the
+  cached storage, path, and resource evidence described below.
 - the placement preview, reconciliation jobs, retry state, and activity history
   provide the right foundation for inter-node repair and for presenting
   node-local relocation activity.
+
+## Implementation Status
+
+Landed with network-aware DFS placement and mobile resource evidence
+(2026-08):
+
+- `sinomo-api` defines the DFS observation vocabulary: `DfsHealthState`
+  (`Healthy`, `Degraded`, `Critical`, `Unknown`) and a separate
+  `DfsObservationFreshness` (`Fresh`, `Stale`, `Offline`, `Unauthorized`,
+  `Unsupported`, `NeverSampled`).
+- `sinomo-dfs` defines `DfsContentLocationConfig` (string `location_id`,
+  label, root, `Active`/`Draining`/`Detached` lifecycle, reserved free bytes
+  defaulting to 5 GiB, optional DFS byte cap, allocation weight, and
+  configuration generation), per-location observations, and
+  `DfsNodeHealthSnapshot`.
+- Each DFS daemon host owns one `DfsDeviceHealthMonitor` per data directory and
+  serves immutable cached snapshots. It samples capacity on a five-minute
+  safety interval or an explicit storage-environment dirty signal, never in a
+  request handler, and applies reserve-recovery hysteresis.
+- The monitor derives one aggregate `DfsNodeAdvertisement` per node: content
+  admission, a quantized capacity weight, storage health and freshness, usable
+  capacity, reserve, location count, network metering, and resource pressure.
+  Admission stops immediately on an unsafe transition; recovery and weight
+  changes need two consecutive matching samples.
+- Placement and source ranking use a cached `DfsPlacementSnapshot`. Fresh
+  evidence of a critical or non-admitting node, or of an unreachable path,
+  makes a candidate ineligible; candidates then rank by health, path safety,
+  resource pressure, and path performance. Placement previews show this
+  evidence per node.
+- The Android mobile runtime publishes a `NodeResourceSnapshot` (resource mode
+  and network metering derived from battery, power-saver, thermal, and network
+  state); Linux and Windows DFS hosts sample OS network metering. DFS uses this
+  advisory evidence to rank placement and to defer or bound background repair,
+  placement reconciliation, and metadata catch-up.
+
+Not implemented; the names used for these in the rest of this plan are
+proposals:
+
+- only the implicit `default` location at `$SINOMO_DATA_DIR/dfs/content` is
+  configured. There is no surface for additional locations, ownership marker,
+  stable volume identity, or `ContentStoreSet`, and DFS still constructs one
+  `LocalContentStore`;
+- the host-wide `NodeHealthSnapshot` (CPU, memory, devices), its
+  `DeviceHealthMonitor`, an observation exporter, and health transition events;
+- a distinct `DfsContentLocationId`, the `dfs.content-locations.v1` capability,
+  `NodeManagementClient` and its routes, preview/apply, and drain and
+  relocation jobs; and
+- the Settings node-management page and storage-location UI.
+
+Of the delivery phases below, Phase 0 and Phase 1 are delivered only for the
+DFS storage subset, and Phase 2 only for the aggregate advertisement. Phases 3
+to 5 have not started.
 
 ## Load-Bearing Invariants
 
@@ -126,7 +183,9 @@ available only after retained objects are verified at safe destinations.
 
 Keep host health in an R1 contract, close to `sinomo-device` and
 `sinomo-observe`, rather than expanding the compact R0 cluster status record
-with volatile metrics. A representative snapshot is:
+with volatile metrics. A representative snapshot (proposed; the landed
+`DfsNodeHealthSnapshot` covers only DFS content locations, metering, and
+resource pressure) is:
 
 ```text
 NodeHealthSnapshot
@@ -157,9 +216,10 @@ from cluster liveness.
 ### Daemon-owned sampler
 
 Factor the existing native system observer into a persistent daemon-owned
-`DeviceHealthMonitor`. It retains platform collector state across samples and
-publishes immutable cached snapshots through an `RwLock`, `ArcSwap`, or an
-equivalent bounded mechanism.
+host monitor (proposed `DeviceHealthMonitor`). It retains platform collector
+state across samples and publishes immutable cached snapshots through an
+`RwLock`, `ArcSwap`, or an equivalent bounded mechanism, as the landed
+DFS-only `DfsDeviceHealthMonitor` already does.
 
 Initial sampling cadence:
 
@@ -186,7 +246,8 @@ Publish only the sanitized fields needed for ordinary cluster views. Detailed
 processes, network interfaces, raw paths, and device evidence remain available
 through the existing privileged remote-management boundary.
 
-Emit debounced transition events rather than one event per sample:
+Emit debounced transition events rather than one event per sample (none are
+emitted yet):
 
 - `node.health.changed`;
 - `device.inventory.changed`;
@@ -201,8 +262,11 @@ transition.
 
 ## DFS Content-Location Model
 
-Add a node-local `DfsContentLocationId` and a desired configuration record with
-at least:
+Add a node-local location identity (proposed `DfsContentLocationId`) and a
+desired configuration record with at least the fields below.
+`DfsContentLocationConfig` already carries the ID string, label, root,
+lifecycle, quota, reserve, weight, and generation; volume identity and tags
+remain to be added.
 
 - stable ID and operator-visible label;
 - canonical root path;
@@ -237,7 +301,7 @@ fsync, rename, and readback behavior before the location accepts content. A
 different disk later appearing at the same mount path is not automatically
 adopted.
 
-### `ContentStoreSet`
+### `ContentStoreSet` (proposed)
 
 Replace the service's concrete single-store field with a multi-location facade
 while retaining a one-location constructor for compatibility and focused test
@@ -275,9 +339,10 @@ cannot open.
 
 ## Management API and Workflow
 
-The app should use a focused `NodeManagementClient`, not add host administration
-to `SifsBrowser`. The implementation can use the existing target-aware daemon
-object RPC path while keeping transport-selected target identity authoritative.
+The app should use a focused node-management client (proposed
+`NodeManagementClient`), not add host administration to `SifsBrowser`. The
+implementation can use the existing target-aware daemon object RPC path while
+keeping transport-selected target identity authoritative.
 
 Suggested route families:
 

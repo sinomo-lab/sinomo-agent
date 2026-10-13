@@ -122,18 +122,18 @@ icon until a later listing/viewport retry or namespace refresh.
 Large uploads also obtain a durable upload claim before raw object creation.
 Each lease has a fresh payload path; catalog CAS fences superseded uploads.
 Background maintenance checkpoints namespace change cursors and bounded source
-tasks in DFS-owned local state. Primaries refresh the owned shard's durable view
-before checking its bounded change feed, so commits from sibling handles are
-visible. They check every ten seconds so missed notifications do not wait for an
-hourly directory rescan.
-Idle feed checks do not rewrite the checkpoint. Periodic managed-directory
-reconciliation covers feed gaps and late abandoned uploads. It never scans the
-ordinary user namespace. Each production pass processes at most eight sources, with
-bounded directory pages; incomplete work resumes from checkpoints.
-Compact namespace commits can resolve their prepare bodies from the retained
-journal, including across a poll boundary, with bounded lookback. A true gap
-reconciles all managed attachment namespaces because source and catalog placement
-can belong to different shards.
+tasks in DFS-owned local state. It is reactive: namespace events, cleanup
+notifications from committed mutations, and authority or cluster changes wake
+it. Startup, authority changes and a lagged event stream request a
+managed-directory reconciliation, which pages only the managed attachment roots
+and never scans the ordinary user namespace. Productive passes continue
+immediately; once caught up the worker parks with no feed poll or periodic
+rescan. Only payload grace or lease expiry and a ten-second retry after an
+error set deadlines. Each pass processes at most eight sources with bounded
+directory pages, and incomplete work resumes from checkpoints. A true feed gap
+reconciles all managed attachment namespaces because source and catalog
+placement can belong to different shards. Only nodes that are primary for a
+SIFS metadata shard run the cleanup pass.
 
 Cleanup reclaims replaced payloads and abandoned uploads through exact generation
 checks. Foreground publication records garbage durably but leaves reclamation to
@@ -265,12 +265,9 @@ records separate policy reads, admission, source/catalog lookup, and publication
 Disable tracing on every node before acceptance measurements, and preserve both
 baseline and candidate executable identities.
 
-Metadata authority still requires the same fresh full-shard proof or the existing
-operation-bound recovery permit. Sender progress cursors can checkpoint in parallel;
-they remain scheduling hints. Replica journal-head files are atomically visible
-reconstructible hints, so they do not add separate durability barriers after an
-already-synced journal append. Startup verifies the durable tail and repairs stale,
-missing, or malformed head hints. Journal records and acknowledgement floors remain
-synced. Internal catalog updates return only after canonical commit; their subsequent
-lookups go to the authority instead of requiring synchronous reconstruction of the
-requester's namespace mirror.
+Attachment writes use the ordinary metadata authority path, including its
+fresh full-shard proof or operation-bound recovery permit; see
+[Metadata Authority](../dfs-architecture.md#metadata-authority) for its
+recovery hints and durability barriers. Internal catalog updates return only
+after canonical commit; their subsequent lookups go to the authority instead of
+requiring synchronous reconstruction of the requester's namespace mirror.

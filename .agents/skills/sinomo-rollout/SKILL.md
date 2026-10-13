@@ -7,9 +7,11 @@ description: Prepare, perform, verify, or recover Sinomo daemon and native-modul
 
 Read the [rollout guide](../../../docs/user/rollout-operations.md) and use the
 actual invoking binary's `sinomo rollout help` before execution. The current
-[CLI implementation](../../../crates/sinomo-cli/src/commands/rollout.rs) is the
-source reference; an installed older binary may expose a different interface.
-Use the [runbook](references/runbook.md) for workflow-specific command forms.
+[command grammar](../../../crates/sinomo-rollout-host/src/cli.rs) and
+[CLI execution adapter](../../../crates/sinomo-cli/src/commands/rollout.rs) are
+the source reference; an installed older binary may expose a different
+interface. Use the [runbook](references/runbook.md) for workflow-specific
+command forms.
 
 ## Establish source, artifact and target scope
 

@@ -163,7 +163,7 @@ Validation status:
 
 ## Performance Snapshot
 
-The measurements below were captured on this server with a 12th Gen Intel Core i9-12900H, CPU-only execution, and `float32` weights. Rust uses the `target/release/sinomo-models-minicpm-v46` binary with Candle 0.10.2. PyTorch uses `torch 2.11.0+cu130` and `transformers 5.8.0` on CPU; CUDA was not available. Transformers reported that the MiniCPM fast path was unavailable because `flash-linear-attention` and `causal-conv1d` were not installed, so the PyTorch numbers are from its torch fallback implementation.
+The measurements below were captured on this server with a 12th Gen Intel Core i9-12900H, CPU-only execution, and `float32` weights. Rust uses the `target/release/sinomo-models-minicpm-v46` binary with Candle 0.10.2; these figures predate the crate's move to Candle 0.11.0. PyTorch uses `torch 2.11.0+cu130` and `transformers 5.8.0` on CPU; CUDA was not available. Transformers reported that the MiniCPM fast path was unavailable because `flash-linear-attention` and `causal-conv1d` were not installed, so the PyTorch numbers are from its torch fallback implementation.
 
 | Check | Rust Candle | PyTorch/Transformers |
 | --- | ---: | ---: |

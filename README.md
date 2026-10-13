@@ -128,7 +128,10 @@ literature notes are indexed in [docs/README.md](docs/README.md).
 | `docs/` | Audience guides, architecture, references, plans, evaluation guidance, and research notes |
 | `specs/quint/` | Executable protocol models, contracts, checks, and scenarios |
 | `docker/` | Container images and multi-node validation harnesses |
+| `lints/` | Dylint architecture lints, including the DFS/KV access boundary |
+| `distribution/` | Distribution profile that enumerates the default external modules |
 | `scripts/` | CI, formal, debugging, and platform helpers |
+| `skills/`, `.agents/skills/` | Contributor workflow skills for performance analysis, components, protocols, Docker verification, and rollout |
 
 Every crate declares a trust ring in its manifest. The workspace boundary test
 enforces dependency direction and the separation between networking, KV, and

@@ -7,6 +7,15 @@ Compose layout:
   seed/joiner service.
 - `docker/docker-compose.dev.yml` — **6-node segmented dev cluster** (this
   README): network-hardening test bed running the **host-built binary**.
+- `docker/docker-compose.routing-scenario.yml` — three-node manual-endpoint
+  and routed-LAN topology for `test-routing-scenario.sh`.
+- `docker/docker-compose.migration.yml` — inert `target`/`source` pair for
+  `test-cluster-migration.sh`.
+- Overlays for the dev cluster: `docker-compose.profile.yml` (opt-in `perf`
+  sidecar), `docker-compose.pjdfstest.yml` (FUSE-enabled `node5` for
+  `test-pjdfstest.sh`), and `docker-compose.dfs-tmpfs.yml` (measurement-only
+  tmpfs data volumes; never durability evidence).
+- `docker/docker-compose.android.yml` — Android APK builder container.
 - `docker/docker-compose.single-node.yml` — minimal one-node cluster for local
   DFS and self-evolution smoke testing (full image; the smoke path needs the
   in-container toolchain):
@@ -334,7 +343,7 @@ The `ready` and `bridge` cases do not run DFS acceptance or benchmarks. Performa
 cases keep their existing DFS convergence/quietness prerequisites, and restart
 cases retain the current/historical DFS byte assertions with three crash cycles.
 
-Network readiness now requires three consecutive complete sweeps of all 30
+Network readiness requires three consecutive complete sweeps of all 30
 ordered pairs within the same 120-second default deadline. Each attempt uses
 zero warmup and verifies 1 KiB request/response payloads through the production
 RPC path. Every origin is rechecked; earlier success is not permanent acceptance.
@@ -598,6 +607,12 @@ restart, or relay bug even though benchmark work need not stop to optimize forma
   composes.
 - `docker/docker-compose.dev.yml` — 6 services + 3 bridge networks (`seg_a`,
   `seg_ab`, `seg_b`).
+- `docker/single-node-entrypoint.sh` — single-node bootstrap and smoke runner.
+- `docker/Dockerfile.profiler`, `docker/Dockerfile.pjdfstest`, and
+  `docker/Dockerfile.android` — images for the profiling sidecar, the pjdfstest
+  `node5` overlay, and the Android builder.
+- `docker/lib/network_checks.py` — shared traffic/evidence checks for the
+  focused network cases and `test-bridge-recovery.sh`.
 
 Each node: main daemon `0.0.0.0:21353`, shadow `0.0.0.0:21354`, own `/data` volume, and a
 shared `/shared` volume that carries the per-segment invite files. `restart:
@@ -628,7 +643,7 @@ cluster, so they work from any directory; plain `docker compose` commands need
 `-f docker/docker-compose.dev.yml` (shown as `-f …dev.yml` below):
 
 ```bash
-cargo build -p sinomo
+cargo build -p sinomo -p sinomo-observe --features sinomo-observe/cpu-profiler
 
 # Build the runtime image and start all 6 nodes.
 docker compose -f docker/docker-compose.dev.yml up --build -d
@@ -660,9 +675,13 @@ test cases from different nodes:
 ```bash
 docker/test-cluster.sh                       # build current binary, up, test, down -v
 SINOMO_TEST_BUILD=0 docker/test-cluster.sh   # reuse an existing host binary
-SINOMO_TEST_REUSE=1 docker/test-cluster.sh   # reuse the running test project
+SINOMO_TEST_BUILD=0 SINOMO_TEST_REUSE=1 \
+  docker/test-cluster.sh                     # reuse the running test project
 SINOMO_TEST_KEEP=1  docker/test-cluster.sh   # leave the cluster up afterwards
 ```
+
+Reuse refuses to rebuild: it requires `SINOMO_TEST_BUILD=0` and the verified,
+profiler-enabled binary that the running project already mounts.
 
 To diagnose formation without extending or weakening its 60-second gate, enable the
 bounded observation mode and stop after formation:
@@ -855,16 +874,19 @@ and authority contracts outside pjdfstest's syscall scope.
 ## Cluster KV benchmark suite
 
 `docker/benchmark-cluster-kv.sh` builds and forms the same segmented six-node
-debug cluster, waits for routing, DFS background work, and whole-container CPU
-to stabilize, then runs only the daemon-mediated cluster-KV benchmark suite.
-It does not benchmark an in-process store or read snapshot files from the CLI.
+debug cluster (project `sinomo-kv-benchmark` by default), waits for routing,
+DFS background work, and whole-container CPU to stabilize, then runs only the
+daemon-mediated cluster-KV benchmark suite (`SINOMO_TEST_CLUSTER_KV_ONLY=1` in
+`test-cluster.sh`). It does not benchmark an in-process store or read snapshot
+files from the CLI.
 
 ```bash
 docker/benchmark-cluster-kv.sh
 
 # Reuse the current host binary or an already-running benchmark project.
 SINOMO_TEST_BUILD=0 docker/benchmark-cluster-kv.sh
-SINOMO_TEST_REUSE=1 SINOMO_TEST_KEEP=1 docker/benchmark-cluster-kv.sh
+SINOMO_TEST_BUILD=0 SINOMO_TEST_REUSE=1 SINOMO_TEST_KEEP=1 \
+  docker/benchmark-cluster-kv.sh
 ```
 
 The default matrix runs from `node1` and the deeper segmented `node5` path:
@@ -928,8 +950,11 @@ or gate it with
 ## Automated routing scenario
 
 `docker/test-routing-scenario.sh` runs the three-node segmented/forwarded-endpoint
-gate, including endpoint-error handling, stale direct-endpoint demotion, routed
-payload throughput, cross-segment DFS, one-node outage, and restart recovery:
+gate in its own project (`sinomo-routing-scenario` by default, from
+`docker/docker-compose.routing-scenario.yml`). A separate single-node `foreign`
+cluster supplies a reachable wrong-cluster endpoint. The gate covers
+endpoint-error handling, stale direct-endpoint demotion, routed payload
+throughput, cross-segment DFS, one-node outage, and restart recovery:
 
 ```bash
 docker/test-routing-scenario.sh
@@ -973,9 +998,11 @@ bounded by `SINOMO_MIGRATION_TEST_COMMAND_TIMEOUT` and
 ## Validation gates
 
 The hardening harnesses are designed to fail with useful evidence instead of only printing
-diagnostics. They target the `sinomo-dfs-test` dev-cluster project automatically
-(override with `SINOMO_GATE_PROJECT`/`SINOMO_IDLE_PROJECT`, `COMPOSE_PROJECT_NAME`,
-or `COMPOSE_FILE`):
+diagnostics. They target the `sinomo-dfs-test` dev-cluster project automatically.
+`COMPOSE_PROJECT_NAME` takes precedence over each script's project variable
+(`SINOMO_GATE_PROJECT`, `SINOMO_IDLE_PROJECT`, `SINOMO_MOBILE_IDLE_PROJECT`,
+`SINOMO_BRIDGE_PROJECT`); `measure-final.sh` exports its choice to the scripts it
+calls. `COMPOSE_FILE` overrides the dev Compose file:
 
 ```bash
 # Full production gate: build/start the 6-node cluster, wait for clean formation,
@@ -1003,8 +1030,11 @@ docker/measure-idle.sh 60
 # SINOMO_MOBILE_IDLE_ROLES="node5=mobile node6=sensor".
 docker/test-mobile-idle.sh 60
 
-# Disconnects node4 from the node3<->node4 bridge network, verifies the outage is
-# observed, reconnects the bridge, and waits for health/doctor to return clean.
+# Requires three complete traffic sweeps, disconnects node4 from the
+# node3<->node4 bridge network, requires within-component traffic to succeed and
+# cross-cut traffic to fail, reconnects the bridge, and requires three complete
+# sweeps again within the recovery budget. The selected binary must match the
+# running main/shadow processes (see "Focused local network checks").
 docker/test-bridge-recovery.sh 90
 ```
 
@@ -1014,18 +1044,18 @@ already-running containers while iterating on the gate scripts themselves, or
 `SINOMO_GATE_RESET_VOLUMES=0` to rebuild the image while intentionally preserving
 existing `/data` volumes. Set `SINOMO_GATE_CYCLES` above `1` for repeated soak
 runs. Set `SINOMO_GATE_SKIP_MOBILE=1` for a shorter bridge/idle run while debugging
-unrelated failures. `docker/measure-final.sh` uses `SINOMO_GATE_QUIESCE_WAIT`
-(default `10`) as the hard stabilization deadline after the preceding operation
-reports ready, then requires zero daemon block writes for
-`SINOMO_GATE_QUIESCE_WINDOW` (default `75`) before each idle measurement. The
-Docker cluster is expected to have the connectivity graph stored and stabilized
-within 10 seconds; any daemon block write after that deadline is treated as a
-bug. Quiescence failures include per-node write deltas for the sampled window.
+unrelated failures. Before each cycle's idle measurement, `docker/measure-final.sh`
+waits `SINOMO_GATE_QUIESCE_WAIT` (default `10`) seconds after readiness, then
+requires one complete `SINOMO_GATE_QUIESCE_WINDOW` (default `135`) with zero
+daemon block writes. It retries complete windows until
+`SINOMO_GATE_QUIESCE_TIMEOUT` (default `600`) is exhausted, so finite recovery
+can settle while recurring churn still fails. A main/shadow process change
+during a window fails immediately. Quiescence failures include per-node write
+deltas for the sampled window.
 `docker/test-mobile-idle.sh` uses `SINOMO_MOBILE_IDLE_QUIESCE_WAIT` (default
-`10`) and `SINOMO_MOBILE_IDLE_QUIESCE_WINDOW` (default `75`) to apply the same
-hard stabilization requirement after role changes. When launched by
-`docker/measure-final.sh`, these values inherit the top-level gate quiescence
-settings.
+`10`) and `SINOMO_MOBILE_IDLE_QUIESCE_WINDOW` (default `75`) after role changes.
+When launched by `docker/measure-final.sh`, these values inherit the top-level
+gate wait and window settings.
 
 ## Notes
 

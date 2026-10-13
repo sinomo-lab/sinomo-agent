@@ -1,6 +1,6 @@
 # Formal Verification Roadmap
 
-Status: active backlog. Last reviewed 2026-07-15.
+Status: active backlog. Last reviewed 2026-10-13.
 
 This plan tracks the next bounded verification slices. Current models,
 properties, and execution instructions live in the
@@ -25,31 +25,29 @@ state-machine replay, higher-term stepdown, and durable term/vote/log restart.
 
 ## Network
 
-Completed 2026-07-10: the focused route-cache slice now covers directory
-versions, local-connectivity file/content generations, transport-module
-snapshots, table identities, expiry, membership removal, identity mismatch, and
-before/after build races.
+Retired 2026-07-22: the route-cache slice (completed 2026-07-10) and the
+object-RPC body direct-delivery slice (completed 2026-07-15), together with the
+route-planning, delivery-retry, attempt-budget, timed delivery-retry, and
+tunnel-backpressure models, refined the delivery executor and carriers that
+were removed with the legacy transport stack (commit `0c98c19e`). They were
+deleted rather than kept as misleading evidence. The remaining network specs
+are the base network, endpoint selection, and timed transport models; current
+routing behavior is covered by Rust tests in `sinomo-network`.
 
-Completed 2026-07-15: the bounded object-RPC body direct-delivery slice models
-one decoded frame at a saturated two-slot application queue. It proves that a
-finite grace retains the frame in memory, consumer progress delivers it without
-spooling, expiry falls back to the existing spool escape hatch, and consumer
-close ends the wait without disk I/O. All five registered witnesses were
-reached in the 5,000-sample coverage gate, and the depth-5 Apalache check found
-no violation. Concrete Rust tests cover the direct, progress, timeout, close,
-and known-length collection-bound paths; the live DFS large-read gate remains
-the performance-refinement obligation.
-
-1. **Timed retry conformance.** Add deterministic virtual-time Rust scenarios
-   for late responses, fallback after a primary timeout, delivery duplicates,
-   packet loss, and identity-mismatch suppression.
+1. **Routing refinement.** Model the current deterministic planner and
+   multi-hop realization by refining `plan_routes` and
+   `MultiHopRoutedConnector` directly, including candidate ordering, loop
+   prevention, capability filtering, identity checks, and bounded attempts.
 2. **Purpose-specific endpoint selection.** Refine selection for rollout, Raft,
    member status, and data traffic while preserving the common authorization
    and reachability rules.
-3. **Session retry budgets.** Extend delivery models with body replayability,
-   progress, and finish-attestation constraints. Prove that fallback cannot
-   expand the caller's deadline, replay a one-pass source, or select an
-   incompatible transport.
+3. **Timed retry and session budgets.** The former timed delivery-retry and
+   attempt-budget models no longer have an implementation to refine. Rebuild
+   late-response, timeout fallback, duplicate, loss, and identity-mismatch
+   cases, plus body replayability, progress, and finish-attestation limits,
+   against the current routed connector and object-RPC session. Prove that
+   fallback cannot expand the caller's deadline, replay a one-pass source, or
+   select an incompatible transport.
 
 ## Integrated System
 
@@ -158,12 +156,14 @@ profiles cover object-only overlap, path-only overlap, full overlap, same-
 filesystem separation, and identical keys in different filesystems. Arbitrary-
 width footprint sets and persistence-failure cuts remain follow-up proof work.
 
-The corresponding Rust fast path now derives filesystem-scoped, set-valued
-object/path owners from every `PutNamespacePrepare`, including structured
+The corresponding Rust fast path derives filesystem-scoped, set-valued
+object/path owners from every prepared-operation record, including structured
 snapshot and table-log replay, and rebuilds them after preapplied rollback.
-Focused reference-equivalence and reopen regressions cover wider concrete
-footprints, exact retry, both terminal releases, and cross-filesystem isolation;
-the production admission path records zero test-oracle history scans.
+The record was `PutNamespacePrepare` when this landed; since the V7
+publication consolidation (merge `c8c8ab71`, 2026-10-12) it is
+`PutPreparedOperationV7`. That merge removed the focused reference-equivalence
+and reopen regressions, so Rust differential coverage must be restored (DFS
+item 9 below).
 
 Completed 2026-07-14: a bounded mkdir transaction-identity slice preserves the
 same stable directory object and path across create, cross-shard move with a
@@ -408,3 +408,18 @@ snapshot mutation APIs remain author-fenced.
    dependency graphs, cross-shard branches, hardlinks and symlinks, branch
    gossip, and explicit service-produced merge candidates before Rust
    implementation claims conformance.
+9. **Restore Rust conformance after V7 consolidation.** Merge `c8c8ab71`
+   (2026-10-12) moved metadata publication onto
+   `PrepareOperationV7`/`CommitPreparedOperationV7` and removed regressions
+   the guide cited as Rust evidence. Re-establish focused tests for routed
+   authority-redirect corroboration and live-hit fallback, the
+   namespace-prepare footprint index against its history-scan oracle, the
+   sharded-namespace target-failure and source-tombstone-failure cuts,
+   stored-intent repair authorization, automatic interrupted-`Pending`
+   namespace-request recovery, and repaired current-location updates. Until
+   then, treat those slices as target refinements without a Rust gate.
+10. **Native whole-shard conformance.** The whole-shard model, deterministic
+    scenarios, negative controls, and native trace verifier exist, but no
+    complete native Rust capture has passed the replay boundary. Accept a
+    captured trace for the exact build, source, schema, and model before
+    describing the whole-shard contract as implementation conformance.

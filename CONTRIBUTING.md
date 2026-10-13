@@ -83,11 +83,19 @@ cargo build -p sinomo
 
 Format touched Rust code with `cargo fmt --all`. Run Clippy, formal checks,
 real-cluster harnesses, WASIX verifiers, or benchmarks when the affected
-boundary requires them. The [testing guide](docs/developer/testing.md) maps
-changes to those gates.
+boundary requires them. A change to DFS code paths also runs the Dylint DFS/KV
+access boundary, which needs `cargo-dylint` and `dylint-link` as described in
+[the lint README](lints/sinomo-architecture/README.md):
 
-Current GitLab CI builds locked cross-platform CLI release artifacts on `main`.
-It does not replace local tests, formatting, linting, formal verification, or
+```sh
+bash scripts/ci/check-dfs-kv-boundary.sh
+```
+
+The [testing guide](docs/developer/testing.md) maps changes to those gates.
+
+Current GitLab CI runs on `main` only. It checks the DFS/KV access boundary and
+builds locked cross-platform CLI and Linux desktop release artifacts. It does
+not replace local tests, formatting, Clippy, formal verification, or
 real-cluster validation.
 
 Finish every contribution with:

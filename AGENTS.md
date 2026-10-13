@@ -32,7 +32,7 @@ cargo run -p sinomo -- <args>
 cargo test -p <crate> <test-name>
 cargo test -p sinomo-core --test workspace_ring_boundaries
 bash scripts/ci/check-dfs-kv-boundary.sh
-cargo check -p sinomo-sandbox --features wasix-runtime
+cargo check -p sinomo-sandbox-wasix-module --features wasix-runtime
 cargo fmt --all
 cargo clippy --workspace --all-targets
 ```

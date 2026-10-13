@@ -14,8 +14,12 @@ agent context, and collaborative maintenance by conventional software and a
 specialized memory agent.
 
 This replaces the record-first target described by earlier versions of this
-document. The current Rust implementation includes the first local
-file-to-evidence slice; the old record subsystem remains isolated and is not a
+document. Most of this page is **target design**: only the first local
+file-to-evidence slice exists today.
+[Current Implementation](#current-implementation) lists what that slice
+covers and which Rust types implement it; a mechanism described elsewhere on
+this page should not be assumed to exist unless that section or an inline
+"Current" note says so. The old record subsystem remains isolated and is not a
 serving or write-compatibility layer. Delivery order and readiness gates live
 in the
 [indexed-file memory implementation plan](plans/indexed-file-memory-implementation.md).
@@ -47,6 +51,66 @@ An index hit is never authority to read a file, perform an action, infer an
 access grant, or claim that a relation is true. Source policy is rechecked when
 candidates are generated and when evidence is materialized.
 
+## Current Implementation
+
+R2 `sinomo-memory` implements one bounded, node-local slice behind
+`IndexedFileMemoryStore`, reachable through `sinomo memory root add|list`,
+`sinomo memory index <root-id>`, and `sinomo memory query`:
+
+- **Sources.** `register_local_root` registers one explicit local directory as
+  an `IndexRoot` with the `sinomo.memory.local/v1` connector and `current-only`
+  retention, and rejects roots that overlap the memory store. The
+  `LocalSourceConnector` walks the root with capability-rooted, no-follow,
+  paged scans (symbolic links are skipped) and admits configured text
+  extensions below a per-root size limit. `acquire_snapshot` reads a whole file
+  into a `VerifiedSourceSnapshot`, hashing it and checking identity and
+  metadata before and after the read.
+- **Indexing.** `index_root` is an explicit reconciliation pass over one root.
+  The built-in text pipeline emits one `TextRange` anchor with lexical terms
+  per non-empty line and no facts. Each source file is its own partition: an
+  immutable `LexicalPartitionGeneration` selected by an atomically replaced
+  `PartitionManifest`, with a persistent copy-on-write lexical router from
+  terms to partitions. A pending router-update record makes publication
+  crash-recoverable, and deletions are tombstoned only after a complete scan.
+- **Retrieval.** `MemoryRetriever::retrieve_evidence` plans one exact-lexical
+  or authorized-enumeration operator, admits router postings only when the
+  current root authorization epoch, root policy, and `MemoryAccessContext`
+  allow them, ranks line anchors by term overlap, and rereads and
+  hash-verifies the current source to materialize text. It returns a
+  byte-bounded `MemoryEvidenceBundle` with `complete`, `approximate`, or
+  `budget-truncated` coverage and an authenticated continuation pinned to the
+  router snapshot, and appends a `MemoryRetrievalTrace` to the audit log.
+- **Context.** `sinomo-agent` calls the retriever during context assembly; see
+  [Automatic Context Injection](#automatic-context-injection).
+- **Contracts without behavior.** `MemoryAnchorSelector` defines every selector
+  family listed under [Anchors](#anchors), but only `TextRange` is produced.
+  `IndexFact`, `MemoryRelation`, `MemoryNodeRef`, `AnchorLineageMapping`, and
+  `PolicyDerivation` are validated data types with no extractor, serving
+  index, or retrieval path. Overlays (`OverlayOperation`,
+  `MemoryOverlayStore`) are one node-local, append-ordered stream of
+  immutable, content-addressed operations with paged, snapshot-pinned replay;
+  no agent tool, CLI command, or retrieval step reads or writes them yet.
+- **Extension ABI.** Modules can declare generic `ModuleInterfaceExport`
+  operations from `sinomo-module-api`, and module registration validates their
+  targets and bounds, but `sinomo-memory` neither discovers nor invokes
+  extensions.
+- **Attachments.** `extract_attachment_index_page` extracts bounded tag and
+  transcript entries from DFS file attachments
+  ([file attachments](developer/file-attachments.md#indexing)); no indexing job
+  calls it yet.
+
+Not implemented: SIFS and other non-local connectors; change feeds and
+watchers; durable jobs and scheduling; workspace detection; structured, code,
+media, and model extractors; embeddings and vector serving; relation and graph
+indexes; overlay materialization and the curator; contextual priors and
+fusion; placement projections; federation; memory events; and the
+evidence-bundle tool surface. The `memory_search`, `memory_read`, and
+`memory_write` agent tools that exist today operate on Markdown notes in the
+agent's SIFS home, not on this index; see
+[agent system architecture](agent-system-architecture.md#historical-recall-and-markdown-notes).
+The old record subsystem (`DurableMemoryStore`) is still compiled into
+`sinomo-memory` but has no callers outside the crate.
+
 ## Goals
 
 - Scale to namespaces whose source and index state cannot fit in memory.
@@ -72,17 +136,22 @@ candidates are generated and when evidence is materialized.
 
 | Term | Meaning |
 |---|---|
-| `IndexRoot` | An explicitly configured local, VFS, SIFS, or file-like namespace eligible for discovery and indexing. |
-| `MemoryFile` | A stable source object inside an index root. A path is a locator, not its identity. |
-| `MemoryFileVersion` | An immutable snapshot of a memory file, identified by source-native version and content identity. |
+| `IndexRoot` | An explicitly configured local, VFS, SIFS, or file-like namespace eligible for discovery and indexing. Only local roots exist today. |
+| Memory file (`MemoryFileRef`) | A stable source object inside an index root. A path is a locator, not its identity. |
+| File version (`MemoryFileVersionRef`) | An immutable snapshot of a memory file, identified by source-native version and content identity. |
 | `MemoryAnchor` | A typed, bounded selector into one exact file version. |
 | `IndexFact` | A provenance-carrying derived statement about a file, anchor, entity, time range, or relation. |
-| `IndexGeneration` | An atomically published set of automatic facts produced for a source version and pipeline fingerprint. |
+| Index generation | An atomically published set of automatic facts produced for a source version and pipeline fingerprint. Today an `IndexGenerationManifest` inside a per-file `LexicalPartitionGeneration`. |
 | `MemoryRelation` | An evidence-backed, typed edge between files, anchors, entities, runtime objects, or other addressable nodes. |
-| `MemoryOverlay` | A scoped append-only set of model, user, or agent assertions composed over automatic generations. |
-| `IndexPartition` | The bounded physical and query-serving unit for a root, policy domain, and shard. |
-| `Workspace` | A detected project or corpus that contributes membership, dependency, ignore, and retrieval-prior information. |
+| Overlay | A scoped append-only set of model, user, or agent assertions, stored as `OverlayOperation`s and composed over automatic generations. |
+| Index partition | The bounded physical and query-serving unit for a root, policy domain, and shard. Today each source file is one partition (`IndexPartitionId`, `PartitionManifest`). |
+| Workspace | A detected project or corpus that contributes membership, dependency, ignore, and retrieval-prior information. Target; no workspace detection exists yet. |
 | `MemoryEvidenceBundle` | A bounded retrieval result containing source handles, anchors, relation paths, projections, scores, freshness, and provenance. |
+
+Code-formatted names are Rust types in `sinomo-memory`; the other terms are
+concepts. The `Type { ... }` blocks on this page are logical target contracts.
+Where a Rust type of the same name exists, it currently carries only a subset
+of those fields, as the "Current" notes below record.
 
 ## Source Identity
 
@@ -115,7 +184,9 @@ while a local file is catalog-only so an initial namespace crawl does not need
 to read every byte. It becomes mandatory for content-derived facts and evidence
 materialization. A verified extraction snapshot computes it while streaming and
 checks that source identity/version metadata did not change. SIFS normally
-provides the authoritative hash before extraction.
+provides the authoritative hash before extraction. Current: the local connector
+has no catalog-only state; it hashes each file before recording its descriptor,
+so `MemoryFileVersionRef::content_hash` is always present.
 
 For SIFS, `root_id`, `object_id`, and `version_id` map to the DFS filesystem,
 object, and visible immutable version. The DFS content hash and object metadata
@@ -193,6 +264,10 @@ selector. `logical_key` is an optional extractor-owned identity such as a code
 symbol or transcript utterance that may survive revisions. It does not weaken
 the exact-version evidence reference.
 
+Current: `MemoryAnchor` carries `anchor_id`, `source_version`, a closed
+`MemoryAnchorSelector`, and `media_type`. `kind_id`, `schema_ref`,
+`logical_key`, and extension-defined anchor kinds are target.
+
 Built-in anchor families are deliberately small:
 
 | Anchor kind | Selector examples |
@@ -228,14 +303,19 @@ service-owned managed memory.
 Local-only root definitions live in the owning node's configuration. Compact
 shared desired-root definitions may live in cluster configuration, but their
 per-file catalog, coverage, cursors, and index contents do not enter cluster
-KV.
+KV. Current: roots are registered with `sinomo memory root add` and stored in
+the node-local memory catalog with the local cluster policy; there are no
+shared root definitions, resource budgets, or ignore rules beyond extension and
+size filters.
 
 Symlinks, mounts, and references do not silently expand a root. Crossing a root
 or policy boundary requires an explicit eligible root.
 
 ### Tiered Coverage
 
-Large roots are indexed progressively:
+Coverage tiers are target design; the current slice lexically indexes every
+admitted file during an explicit pass and has no catalog-only state. Large
+roots are indexed progressively:
 
 1. **Cataloged**: identity, version, path, type, size, time, scope, policy, and
    workspace facts are known.
@@ -252,8 +332,8 @@ filesystem.
 
 ### Workspace Detection
 
-Workspace detectors consume bounded directory metadata and small marker-file
-probes. They emit:
+Workspace detection is target design. Detectors consume bounded directory
+metadata and small marker-file probes. They emit:
 
 - workspace id, kind, root, and nested-workspace boundaries;
 - marker evidence and detector version;
@@ -269,11 +349,12 @@ project, scientific corpus, or other workspace type.
 
 ### Partitions
 
-The serving unit is an `IndexPartition`, normally derived from root, policy
-domain, and a stable shard key. A large root can have many partitions. Scope,
-workspace, time, and explicit source selectors often choose a small set
-directly, but an unconstrained corpus query requires a scalable routing index;
-it cannot assume a fixed bounded subset without admitting lost recall.
+The serving unit is an index partition, normally derived from root, policy
+domain, and a stable shard key (today, one partition per source file). A large
+root can have many partitions. Scope, workspace, time, and explicit source
+selectors often choose a small set directly, but an unconstrained corpus query
+requires a scalable routing index; it cannot assume a fixed bounded subset
+without admitting lost recall.
 
 Routing is itself derived, versioned, disk-backed index state. Lexical routing
 maps terms to partition ids, metadata/time routing uses ordered ranges, graph
@@ -360,6 +441,11 @@ does not require a hosted model to return identical tokens forever; it requires
 Sinomo to know exactly which derivation produced the stored generation and to
 replace it safely.
 
+Current: `IndexFact` is a reduced form (`fact_id`, `anchor_id`, `predicate`,
+`value`, `ExtractionProvenance`, and `PolicyDerivation`), and the built-in text
+pipeline publishes no facts. `PipelineFingerprint` records only detector,
+extractor, extractor version, and options.
+
 ### Index Families
 
 | Family | Examples |
@@ -431,6 +517,12 @@ extension; users may install policy-approved descriptors in the managed memory
 namespace. A model can propose a new descriptor only into an overlay and it
 remains `proposed` until validated.
 
+Current: `MemoryRelation` has one `subject`, `predicate`, and `object`
+(`MemoryNodeRef`), evidence anchor ids, `confidence_millis`, `valid_at`,
+`observed_at`, and at most one `disputes` and one `supersedes` id. It is stored
+only inside overlay operations; there are no relation schemas or relation
+index.
+
 Contradiction, correction, and supersession are explicit relations or overlay
 operations. A new file version makes old current-version facts stale; it does
 not by itself assert that the older content was false. Conflicting assertions
@@ -454,9 +546,10 @@ after it was first observed.
 ### Placement
 
 SIFS placement remains DFS metadata, not memory authority. The memory catalog
-may cache a `PlacementProjection` containing current locations, owner, policy
+may cache a placement projection containing current locations, owner, policy
 reference, and the DFS metadata sequence or epoch from which it was read.
 Placement-only changes update this projection without re-extracting content.
+This is target design; the current catalog records no placement.
 
 Retrieval uses placement for locality, availability, cost, and raw-data egress
 planning. It revalidates the source version and policy at the node that serves
@@ -465,7 +558,7 @@ the evidence.
 ## Model and Agent Overlays
 
 Automatic generations are read-only to models. A model changes the logical
-index through a `MemoryOverlay`, whose authoritative operations are themselves
+index through an overlay, whose authoritative operations are themselves
 stored as immutable one-operation objects or per-writer operation streams with
 deterministic operation ids. No correctness path assumes that multiple writers
 can append safely to one shared DFS file.
@@ -516,7 +609,20 @@ idempotently by operation id into a deterministic scope view. Storage uses
 normal DFS namespace/version commits and does not depend on the reserved DFS
 append-only object policy being implemented.
 
+Current: overlays are one node-local stream under `memory/overlays` with
+content-addressed operation ids and paged replay. `OverlayOperationKind` covers
+relation assertion, relation dispute, supersession, and annotation, and
+`OverlayValidationState` uses `unverified`, `validated`, `rejected`, and
+`superseded` rather than the states above. Operations do not yet record author
+or model/tool provenance, append does not authorize scope, and there is no
+materializer, per-writer DFS stream, or revalidation.
+
 ## Automatic Maintenance
+
+This section is target design. Today maintenance is the explicit,
+operator-invoked `index_root` pass described in
+[Current Implementation](#current-implementation); there are no change feeds,
+watchers, jobs, or scheduler.
 
 ### Change Sources
 
@@ -529,7 +635,7 @@ Maintenance consumes durable or checkpointed change streams where available:
 - extractor, model, prompt, and relation-schema activation changes;
 - explicit reindex, pin, repair, or query-time indexing requests.
 
-For SIFS, memory consumes a read-only logical `DfsCatalog`/`DfsChangeFeed`
+For SIFS, memory consumes a read-only logical DFS catalog and change-feed
 facade rather than treating a physical shard-replication subscription as a
 file event stream. The facade provides paged current objects, opaque
 generation-aware checkpoints, bounded logical changes, and exact revision
@@ -537,6 +643,13 @@ range reads. It resolves cross-shard moves and stale shard copies before it
 emits an upsert or delete. A sequence gap, snapshot replacement, or unknown
 checkpoint requires a bounded full reconciliation; the memory service does not
 guess across the gap.
+
+That facade does not exist yet. DFS currently exposes a shard-local semantic
+namespace feed (`poll_dfs_namespace_changes` with a
+`DfsNamespaceChangeCursor` fenced to one filesystem, shard, and authority
+epoch). It reports `RescanRequired` after an authority, shard, or journal gap
+and when it cannot correlate a cross-shard rename, so it is a building block
+for the facade, not a cross-shard catalog.
 
 Initial enumeration has an atomic scan/feed handoff. `begin_scan` returns a
 catalog generation, a stable paged-scan token, and per-shard change watermarks.
@@ -623,6 +736,10 @@ Every candidate and evidence bundle reports one of these source/index states:
   were not retained;
 - `unavailable` or `policy-blocked`: bytes cannot currently be served.
 
+Current: `SourceFreshness` has only `current`, `stale`, `deleted`, and
+`unavailable`. Retrieval skips a changed or unavailable current-only source and
+reports `approximate` coverage instead of per-item freshness.
+
 A query selects an explicit freshness policy. The normal policy may use stale
 facts as labeled hints while materializing only authorized current bytes. A
 strict-current query may wait to a deadline, request bounded on-demand
@@ -636,6 +753,10 @@ handles. Current-view queries exclude tombstoned versions even if an old
 partition segment still contains their postings.
 
 ## Extension Architecture
+
+Extension roles, descriptors, and invocation are target design. Today only the
+generic module-side binding exists; `sinomo-memory` runs its built-in text
+pipeline and does not discover or invoke extensions.
 
 ### Extension Roles
 
@@ -658,17 +779,20 @@ types, probe limits, output schemas, relation and anchor schemas, incremental
 capabilities, determinism, required models and hardware, capability grants,
 resource ceilings, invocation route, and compatibility range.
 
-Each logical operation has a validated binding, not only a string name:
+Each logical operation has a validated binding, not only a string name. The
+binding is the generic `ModuleInterfaceOperationExport` from
+`sinomo-module-api`, carried in a `ModuleInterfaceExport`:
 
 ```text
-MemoryExtensionOperationBinding {
+ModuleInterfaceOperationExport {
   logical_operation,
-  target,                 # native invoke, object-RPC method/op, or sandbox entry
+  target,                 # native invoke, object-RPC route/op, or sandbox entry
   request_schema_id,
   response_schema_id,
   max_request_bytes,
   max_response_bytes,
   max_facts_per_batch,
+  max_deadline_ms,
   supports_cancellation,
   continuation_schema_id?,
 }
@@ -676,20 +800,23 @@ MemoryExtensionOperationBinding {
 
 The active extension identity includes module id, interface export/version,
 artifact id and content hash, descriptor hash, and invocation lane. Those
-values enter the pipeline fingerprint. Registry validation rejects an operation
-whose target is not exported/routable or whose schemas and hard bounds are not
-compatible with the host.
+values enter the pipeline fingerprint. Module registration already rejects an
+operation whose object-RPC or native target is not exported or whose hard
+bounds are missing; checking schema compatibility with the memory host is
+target.
 
 ### Module Integration
 
-Trusted built-ins can register Rust implementations directly with
-`sinomo-memory`. Dynamic, sandboxed, Wasm, declarative, and future backends use
-the normal module lifecycle and a versioned SOBJ request/response protocol.
+Trusted built-ins register Rust implementations directly with `sinomo-memory`;
+today the only one is the built-in text pipeline. Dynamic, sandboxed, Wasm,
+declarative, and future backends use the normal module lifecycle and a
+versioned SOBJ request/response protocol.
 
 The R1 module system carries generic `ModuleInterfaceExport` metadata with
 typed operation targets and an opaque SOBJ descriptor; it does not learn memory
-semantics and does not depend on the R2 memory crate. Memory roles use
-versioned `sinomo.memory.<role>/v1` interface ids through `sinomo-runtime`. This
+semantics and does not depend on the R2 memory crate. Memory roles are to use
+versioned `sinomo.memory.<role>/v1` interface ids reached through
+`sinomo-runtime`; no memory interface id or schema is published yet. This
 preserves the trust-ring direction while allowing modules to add formats and
 workspace detectors.
 
@@ -727,29 +854,36 @@ The base implementation is embedded and log/segment structured. It does not
 require PostgreSQL, a message broker, a distributed cache, a graph server, a
 vector database, or external object storage.
 
-The local data directory has this logical ownership shape:
+The current local data directory has this ownership shape:
 
 ```text
 memory/
-  catalog/                 # root, source, workspace, and partition catalogs
-  routing/                 # versioned term/range/endpoint routing indexes
-  jobs/                    # durable change cursors and indexing job state
+  catalog/roots/           # registered index roots
+  catalog/sources/<root>/  # one source descriptor per file
   partitions/<id>/
     manifest.sobj          # atomic serving view
-    generations/<id>/      # immutable fact/index segments
-    staging/<job_id>/      # unpublished bounded job output
-  traces/                  # append-oriented retrieval and maintenance audit
+    generations/<id>.sobj  # immutable per-file generation
+  routing/lexical/         # router manifest, pinned manifests, shard pages
+  transactions/router/     # pending router updates replayed on recovery
+  overlays/                # immutable overlay operations and replay index
+  traces/                  # append-oriented retrieval audit
+  private/                 # store-local continuation authentication key
   records/...              # old subsystem data; ignored by indexed serving
   index.sobj               # old subsystem index; ignored by indexed serving
 ```
 
+The target adds durable change cursors and job state under `jobs/`, bounded
+unpublished job output under per-partition `staging/<job_id>/`, workspace and
+partition catalogs, and range and endpoint routing.
+
 Exact paths and schemas are registered by `sinomo-memory` through the storage
-registry. Startup reads bounded manifests and catalog pages. Immutable
-segments, compact term dictionaries/postings, metadata columns, relation
-adjacency, tombstones, and periodic compaction provide the baseline serving
-shape. SOBJ is the portable metadata and segment envelope; an implementation
-may use a specialized embedded lexical, graph, or vector provider behind the
-same contracts.
+registry. Startup reads bounded manifests and catalog pages. In the target
+baseline serving shape, immutable multi-file segments, compact term
+dictionaries/postings, metadata columns, relation adjacency, tombstones, and
+periodic compaction replace the current per-file generations. SOBJ is the
+portable metadata and segment envelope; an implementation may use a
+specialized embedded lexical, graph, or vector provider behind the same
+contracts.
 
 Generated partitions, staging files, traces, previews, and snapshot exports
 are excluded from source roots by identity and storage ownership. A memory
@@ -769,9 +903,14 @@ consumed by their dedicated stores and are not recursively treated as generic
 content. They use the scope's DFS policy rather than inheriting one global
 replication mode. Derived partition snapshots may be exported as
 content-addressed artifacts for warm start or remote serving, but the source
-files and overlay operation files remain authoritative.
+files and overlay operation files remain authoritative. These scope paths are
+target design: overlays are currently node-local, and the Markdown notes that
+agents write today live in each agent's SIFS home and are not indexed.
 
 ## Distributed Indexing and Retrieval
+
+This section is target design. The current store is node-local, and memory
+publishes nothing to cluster KV or service discovery.
 
 Each node may index readable source versions for which it has the required
 extension and resources. Indexing normally runs near an existing content copy.
@@ -831,6 +970,12 @@ carry:
 The query planner uses registered partition and extension capabilities. It does
 not invoke every provider for every query.
 
+Current: `MemoryQuery` carries session, agent, chat, channel, task, workspace,
+user, and team ids, free text (`task_hint`), record, byte, and partition
+budgets, and a continuation. Those ids do not grant access; the caller's
+`MemoryAccessContext` does. `MemoryRetrievalPlan` has two operators, exact
+lexical and authorized enumeration.
+
 ### Query Snapshot and Completeness
 
 Planning creates a query snapshot that pins the authorized catalog/router
@@ -847,6 +992,11 @@ when more eligible partitions remain. Lexical or metadata search may be exact
 when its routing generation is complete. Coarse vector routing is approximate
 unless an exhaustive paged search completes. A timeout or fanout budget cannot
 be represented as “no matching memory.”
+
+Current: `MemoryQuerySnapshot` pins the lexical router manifest and the
+partition generations searched; continuations reopen that pinned manifest.
+Policy is checked against the current root authorization epoch rather than
+pinned, and there are no overlay watermarks or compaction leases yet.
 
 ### Retrieval Stages
 
@@ -870,6 +1020,10 @@ be represented as “no matching memory.”
    result.
 9. **Pack and trace.** Produce deterministic evidence bundles within byte and
    token budgets and record included, omitted, stale, failed, and denied paths.
+
+Current: retrieval implements stages 1 through 3, 8, and 9 for exact lexical
+terms only, ranking by term-overlap count. Fusion, contextual priors, relation
+expansion, and reranking are target.
 
 Candidate and audit traces are bounded too. They retain selected candidates,
 the highest-ranked or decision-relevant omissions, aggregate counts/reason
@@ -901,6 +1055,11 @@ MemoryEvidenceBundle {
 }
 ```
 
+Current: `MemoryEvidenceBundle` carries `plan`, `snapshot`, `files` (source
+descriptor plus anchor ids), `evidence` (anchor, text, score, reason),
+`relations` (always empty), `coverage`, `continuation`, and a
+`QueryFeatureTrace`.
+
 `projections` may contain bounded text, OCR, captions, thumbnails, clips,
 waveforms, key frames, or scene views. Large or sensitive content is represented
 by an authorized handle. Relation paths include the evidence that justified
@@ -921,17 +1080,21 @@ lexical search, structured graph queries, or auditability.
 
 ### Automatic Context Injection
 
-`sinomo-agent` asks the memory context provider for bounded evidence using the
-current turn, active task, workspace, open files, participants, and budget. The
-memory service retrieves; the agent context assembler decides what becomes a
-model-visible `ContextBlock`.
+`sinomo-agent` asks its `MemoryRetriever` for bounded evidence during context
+assembly. The memory service retrieves; the agent context assembler decides
+what becomes a model-visible `ContextBlock`. Today the query carries the
+session, agent, task, and workspace ids, a text hint taken from the latest
+event, and the remaining memory byte budget, and access covers the local
+cluster scope plus the agent, task, and workspace scopes. Open files,
+participants, and other focus are target inputs.
 
-Stable bundle ids and source hashes support prompt-cache reuse. Current-task
-evidence normally appears before the transcript item it informs. Volatile
-scores, freshness, and omission details remain in the trace or volatile tail.
-The context assembly report records why each block was included and how many
-bytes/tokens it consumed. Memory never injects hidden context outside this
-path.
+Exact anchor ids and source versions support prompt-cache reuse: cluster,
+user, and workspace evidence uses the stable-prefix cache policy and narrower
+scopes are append-only. Evidence blocks are placed before the first transcript
+item and contain only the anchor and its content; scores, coverage, and the
+query trace stay in the retained bundle. The context assembly report records
+included evidence bytes, coverage gaps, packing omissions, and retrieval
+failures. Memory never injects hidden context outside this path.
 
 ## Workload Memory Views
 
@@ -959,7 +1122,13 @@ An agent that wants to remember new content has two explicit choices:
 - append a scoped annotation/relation to an overlay when the source file should
   remain unchanged.
 
+Neither path is wired yet. Today an agent remembers content only through the
+`memory_write` Markdown notes in its SIFS home, which this index does not yet
+ingest.
+
 ## Collaborative Maintenance
+
+Collaborative maintenance, including the curator, is target design.
 
 Conventional indexing handles the common path:
 
@@ -994,7 +1163,7 @@ relations; one agent cannot silently overwrite another's evidence.
 
 ## Tool Surface
 
-The agent-facing concepts should be small and progressive:
+The target agent-facing concepts should be small and progressive:
 
 - `memory_search`: return bounded evidence bundles and trace handles;
 - `memory_explain`: explain scores, paths, freshness, omissions, and policy
@@ -1011,6 +1180,15 @@ Tool availability does not grant the source, overlay, model, filesystem,
 network, or policy capabilities required to execute it. Full tool inputs and
 results remain durable evidence even when the model sees only a compact
 projection.
+
+None of these evidence-bundle tools exists yet. The `memory_search`,
+`memory_read`, and `memory_write` tools that agents have today search, page,
+and write Markdown notes in the agent's SIFS home behind a note-backend
+contract; see
+[agent system architecture](agent-system-architecture.md#historical-recall-and-markdown-notes).
+The names above therefore collide with shipped tools; reconciling the two
+surfaces is open work in the
+[implementation plan](plans/indexed-file-memory-implementation.md).
 
 ## Governance and Security
 
@@ -1049,7 +1227,8 @@ Rules:
 
 ## Events and Observability
 
-The memory service emits typed events such as:
+The memory service is to emit typed events such as the following; the current
+slice emits none:
 
 - `memory.source.observed` and `memory.source.fenced`;
 - `memory.index.scheduled`, `memory.index.published`, and
@@ -1073,27 +1252,31 @@ and provider/model cost.
 The architecture requires narrow interfaces rather than one storage-shaped
 API:
 
-| Interface | Responsibility |
-|---|---|
-| `MemorySourceConnector` | Roots, source descriptors, change cursors, immutable snapshots, bounded reads |
-| `MemoryExtensionRegistry` | Active workspace, format, extraction, embedding, query, and preview capabilities |
-| `MemoryIndexScheduler` | Durable idempotent planning, prioritization, backpressure, cancellation, and recovery |
-| `MemoryIndexStore` | Staging, atomic generation publication, partition queries, compaction, and rebuild |
-| `MemoryOverlayStore` | Append, validate, scope, replay, and materialize authoritative overlay operations |
-| `MemoryRetriever` | Plan, authorize, fuse, expand, materialize, pack, and trace evidence bundles |
+| Interface | Responsibility | Current |
+|---|---|---|
+| `MemorySourceConnector` | Roots, source descriptors, change cursors, immutable snapshots, bounded reads | Trait with `scan_page` and whole-file `acquire_snapshot`; local connector only |
+| `MemorySourceCatalog` | Root registration and paged root and source descriptors | Trait |
+| Extension registry | Active workspace, format, extraction, embedding, query, and preview capabilities | Target |
+| Index scheduler | Durable idempotent planning, prioritization, backpressure, cancellation, and recovery | Target |
+| `MemoryIndexStore` | Staging, atomic generation publication, partition queries, compaction, and rebuild | Trait with `publish_source` and `pin_query_snapshot`; no staging or compaction |
+| `MemoryOverlayStore` | Append, validate, scope, replay, and materialize authoritative overlay operations | Trait with append and paged replay |
+| `MemoryTraceStore` | Paged retrieval-trace reads | Trait |
+| `MemoryRetriever` | Plan, authorize, fuse, expand, materialize, pack, and trace evidence bundles | Trait with `retrieve_evidence`; lexical only |
 
-Storage engines, parsers, vector providers, graph providers, and models remain
-behind these boundaries. `sinomo-agent` consumes `MemoryRetriever` directly and
-must not depend on their internals or on the old record-serving interface.
+`LocalSourceConnector` implements the connector trait and
+`IndexedFileMemoryStore` implements the others. Storage engines,
+parsers, vector providers, graph providers, and models remain behind these
+boundaries. `sinomo-agent` consumes `MemoryRetriever` directly and must not
+depend on their internals or on the old record-serving interface.
 
 ## Crate and Trust-Ring Ownership
 
 | Owner | Responsibility |
 |---|---|
 | R0 files/events/storage contracts through `sinomo-runtime` | Base ids, event envelopes, VFS primitives, and local storage ownership vocabulary |
-| `sinomo-dfs` (R1) | SIFS object/version authority, paged logical catalog/change-feed and exact revision-read facade, content reads, placement, replication, and policy enforcement |
+| `sinomo-dfs` (R1) | SIFS object/version authority, the namespace change feed and the target logical catalog/change-feed and exact revision-read facade, content reads, placement, replication, and policy enforcement |
 | `sinomo-module` and daemon registry (R1) | Generic lifecycle, opaque extension descriptors, routes, capabilities, activation, and runtime binding; no memory semantics |
-| Memory extension data/ABI package (R1) | Versioned descriptors, operation bindings, source leases, and normalized SOBJ request/result values; no memory behavior |
+| `sinomo-module-api` (R1) | Generic `ModuleInterfaceExport` operation bindings and SOBJ invocation values; there is no memory-specific ABI crate, and memory schemas ship with external components |
 | `sinomo-policy` and sandbox crates (R1) | Authorization decisions and contained extension execution |
 | `sinomo-memory` (R2) | Memory domain types, root/source catalogs, schedulers, partitions, overlays, retrieval, traces, and built-in extractors |
 | `sinomo-agent` (R2) | Query focus, context assembly, memory tools, agent-written managed documents, and curator orchestration |
@@ -1140,7 +1323,9 @@ not expanded into the new R2 index schema.
 The indexed-file serving path ignores existing `memory/records/...` and
 `memory/index.sobj` files. There is no reader, importer, migration shim, or
 preservation guarantee for that data. Deployments discard it and rebuild the
-new indexes from their source files.
+new indexes from their source files. The old subsystem's code and storage-path
+registrations still live in `sinomo-memory` until the plan's final phase
+removes them.
 
 ## Failure Modes
 

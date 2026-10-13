@@ -101,14 +101,14 @@ battery and bandwidth, data residency, current node health, and action
 authority. A remote node may propose an action, but the node that owns the
 affected device or data performs the final authorization.
 
-### Node-local resource conditions
+### Node-Local Resource Conditions
 
 Native application hosts publish battery, thermal, metering, and OS data-policy
 conditions through the process-local `sinomo-device` resource monitor. These
 observations are advisory scheduling inputs: they are not persisted, written to
-cluster KV, or accepted as authority for a distributed mutation. Embedded
-mobile daemons subscribe to the same monitor, so a condition change is an exact
-wake edge rather than another filesystem or control-plane polling loop.
+cluster KV, or accepted as authority for a distributed mutation. A condition
+change is a wake edge for its subscribers; equal observations are deduplicated
+so a native sampler cannot become another runtime polling loop.
 
 Resource restrictions may defer passive discovery, observation, DFS placement,
 repair, and replica catch-up. Foreground requests, local recovery, explicit
@@ -116,20 +116,16 @@ operator recovery, pins, W/N replication requirements, and final authority
 checks retain their normal typed paths. DFS publishes only coarse metering and
 resource-pressure evidence; exact battery and thermal readings remain local.
 Every daemon samples physical DFS capacity at startup and after coalesced,
-committed storage-dirty edges. Lease expiry, idle time, and resource callbacks
-consume cached evidence and never become filesystem polling triggers; request,
-maintenance, and reconciliation lanes consume the same cached projection.
-The mobile embedded product profile also omits native build and host-filesystem
+committed storage-dirty edges. Request, maintenance, and reconciliation lanes
+consume that cached projection; lease expiry, idle time, and resource callbacks
+never become filesystem polling triggers.
+
+The mobile embedded product profile omits native build and host-filesystem
 projection workers; those capabilities remain discoverable from suitable remote
-nodes instead of creating idle toolchain, watcher, lease, or mount state on the
-phone.
-Android lifecycle, window-inset, network-capability, Data Saver, battery,
-power-saver, and thermal changes arrive through framework callbacks registered
-only while the Activity is resumed. The app therefore retains no visible-state
-JNI polling timer for those signals, and a background Activity retains no
-condition listeners. Hiding the Activity immediately projects Restricted mode
-to its embedded daemon; a fresh framework-driven condition sample is required
-to lift that restriction after the Activity returns.
+nodes. On Android, lifecycle, network, Data Saver, battery, power-saver, and
+thermal signals arrive through framework callbacks registered only while the
+Activity is resumed. Hiding the Activity immediately restricts its embedded
+daemon, and only a fresh framework-driven sample lifts that restriction.
 
 ## Distributed Foundation
 
@@ -160,6 +156,16 @@ and signed identity establish trust. A node without cluster state is in a
 bootstrap or recovery condition and may perform only local setup, credentials,
 help, and cluster lifecycle operations.
 
+The timeout, shutdown, wake, inhibition, and external-change loop for cluster
+network maintenance is the generic `sinomo-cluster` maintenance reactor. The
+daemon implements only the host operations that touch its listener, process
+identity, and transport-specific maintenance work.
+
+See [clustering architecture](clustering-architecture.md) for membership,
+consensus, identity, and failure semantics.
+
+### Node-Local Consent and Configuration Authority
+
 Host and device exposure is separate node-local consent. Each node keeps its
 own fail-closed permission document outside cluster KV and the remotely writable
 configuration service. Module installation, activation, and route discovery do
@@ -178,60 +184,6 @@ host-system settings, such as filesystem mounts, with
 the target node's consent on every remote write to those settings. Reading
 configuration or changing a module's enablement never grants host access.
 
-One installation contributes one normal cluster member. The main daemon owns
-cluster participation. The shadow daemon is a supervision and recovery endpoint
-and does not vote, own DFS data, or accept normal workload placement. A desktop
-graphical app attaches to that main daemon when it already exists; otherwise it
-starts the same full product with the sibling `sinomo daemon run --app-owned`
-CLI executable. `sinomo app supervise` owns desktop supervision. The desktop
-launcher keeps the inherited lifetime lease and exact child handle across GUI
-restarts. It stops only its own daemon when the desktop session finally closes;
-an installed daemon remains independent. The GUI process never hosts the daemon
-control loop or product component catalog.
-
-Installed desktop entry points select and verify the active managed release.
-Development and external executables retain desktop daemon supervision while
-running the exact requested GUI. They do not receive an installed-update launch
-token or mutate desktop release activation state; a source build cannot be
-silently replaced by an installed release.
-
-Desktop restoration acknowledgement owns its scheduling: the first ready frame
-wakes the application controller, and the stability window and retry deadlines
-each schedule a bounded one-shot wake. Idle workspaces cannot depend on chat
-traffic, navigation, or unrelated background probes to finish activation. Loss
-of restoration readiness cancels the pending acknowledgement deadline.
-
-Desktop clients use the runtime facade's client profile. Shared app commands,
-DFS browser and placement values, model settings, module projections, and app
-observation requests live in the `app`, `dfs`, `lm`, `module`, and `observe`
-modules of `sinomo-api`. `sinomo-client` owns the frontend callers. The daemon
-and domain implementations re-export the same values rather than defining
-parallel wire types.
-
-`sinomo-api` has no dependency on the daemon, DFS implementation, module host,
-or observation recorder. Server adapters live in `sinomo-daemon`; mounted DFS
-transports live in `sinomo-dfs`; module persistence stays in `sinomo-module`.
-Frontend module changes go through daemon RPC. `sinomo-module-api` remains the
-small native ABI package and owns the data-only metric exporter vocabulary in
-its `observe` module. App-local media and sign-in remain client capabilities;
-Android explicitly selects the embedded host profile.
-
-Crates mark dependency, trust-ring, ABI, or independent artifact boundaries.
-Related shared protocol definitions use modules within the common API package.
-Dependency gates inspect desktop targets separately so host test fixtures and
-workspace feature unification cannot hide a client dependency leak.
-
-Daemon ports are preferences unless an operator supplies an explicit CLI or
-environment port. An automatic bind conflict selects and holds an OS-assigned
-listener before status, component, or cluster registration is constructed.
-The actual address is then the single source for local client discovery and
-endpoint advertisement. A node may still establish cluster reachability by
-initiating connections to known peers when its fallback listener is not
-directly reachable; discovery changes reachability, never authority.
-
-See [clustering architecture](clustering-architecture.md) for membership,
-consensus, identity, and failure semantics.
-
 ### Network Boundary
 
 Cluster communication is composed from independent contracts. Direct transports
@@ -247,19 +199,33 @@ idempotency, and side effects.
 
 Connectivity contains direct observed edges only. Routing owns transitive
 reachability and must realize an authorized graph path as a direct or relayed
-stream with established endpoint identity; graph reachability is not a substitute for a usable
-data path. Every authorized node pair in the same current routable connected
-component must be able to communicate through routing.
+stream with established endpoint identity; graph reachability is not a
+substitute for a usable data path. Every authorized node pair in the same
+current routable connected component must be able to communicate through
+routing.
 
-Direct-link, connectivity, routing, and object-RPC mechanisms remain internal
+Direct-link, connectivity, routing, and object-RPC mechanisms are internal
 layers of the single R0 `sinomo-network` crate. Their separation does not change
 the workspace crate structure.
 
-The network and KV cores have no production dependency on one another.
-`sinomo-cluster` bridges them by moving consensus and membership traffic over
-network-selected routes and by projecting committed cluster facts through the
-network directory interface. This separation is enforced by workspace boundary
-tests.
+Finite RPC bodies drain and validate their terminal framing if an application
+abandons them. Indefinitely lived event subscriptions instead opt into
+cancel-on-drop: owner cancellation resets only that logical mux stream and
+releases its server producer, without closing the shared carrier or leaving a
+background keepalive drain.
+
+`sinomo-cluster` bridges networking and KV: it moves consensus and membership
+traffic over network-selected routes and projects committed cluster facts
+through the network directory interface. Neither core depends on the other; see
+[trust rings and crate boundaries](#trust-rings-and-crate-boundaries).
+
+Daemon ports are preferences unless an operator supplies an explicit CLI or
+environment port. An automatic bind conflict selects and holds an OS-assigned
+listener before status, component, or cluster registration is constructed.
+The actual address is then the single source for local client discovery and
+endpoint advertisement. A node may still establish cluster reachability by
+initiating connections to known peers when its fallback listener is not
+directly reachable; discovery changes reachability, never authority.
 
 See [network architecture](network-architecture.md) for the layer contracts,
 routed-stream guarantees, and transport behavior, and
@@ -312,9 +278,10 @@ safety. Feature disablement withdraws the feature's routes and workers when the
 node next constructs its registry; it preserves committed grants, pins,
 retention policies and attachment objects. The core continues honoring stored
 rules on ordinary commits and evaluating their recorded expiry and reference
-release. A feature toggle does not revoke a durable storage promise. Disabling
-both feature components leaves ordinary namespace and content operations available. Disabling DFS leaves
-both dependent components pending. Shadow hosts mount none of these components.
+release, so a feature toggle does not revoke a durable storage promise.
+Disabling both feature components leaves ordinary namespace and content
+operations available. Disabling DFS leaves both dependent components pending.
+Shadow hosts mount none of these components.
 
 The cluster KV stores compact filesystem configuration and shard placement.
 DFS metadata shards own paths, versions, intents, receipts, namespace
@@ -362,7 +329,7 @@ State is separated by authority, durability, and replication cost:
 | Hot interaction state | Owning process or node | Local, with bounded handoff summaries. |
 | Cluster configuration | Raft-backed cluster KV | Replicated to control-plane participants. |
 | Events and traces | Append-oriented durable stores | Routed by scope, privacy, and retention policy. |
-| Long-horizon memory | Versioned source/overlay files plus rebuildable indexes | Source and overlay files follow scope policy; derived indexes replicate by usefulness. |
+| Long-horizon memory | Versioned source/overlay files plus rebuildable indexes | Source and overlay files follow scope policy; derived indexes are node-local today and are intended to replicate by usefulness. |
 | Workspace metadata | DFS metadata authority | Sharded and replicated by filesystem policy. |
 | Workspace content | Node-local content stores | Copied or cached according to object policy. |
 | Build requests and job coordination | Cluster build service with compact control-plane records | Queued, coalesced, leased, and observed by build identity. |
@@ -401,12 +368,6 @@ receive derived observations, summaries, embeddings, commands, or evidence
 handles. Blocked actions and policy incidents are events too, which keeps audit
 and replay on the same path as successful work.
 
-Finite RPC bodies drain and validate their terminal framing if an application
-abandons them. Indefinitely lived event subscriptions instead opt into
-cancel-on-drop: owner cancellation resets only that logical mux stream and
-releases its server producer, without closing the shared carrier or leaving a
-background keepalive drain.
-
 ## Agent and Memory Boundary
 
 The agent runtime owns provider-neutral model requests, context assembly, tool
@@ -423,7 +384,9 @@ Memory is explicit context, not invisible mutable model state. Versioned source
 files and append-only overlay files preserve evidence and scope. Derived
 indexes and summaries are rebuildable. Retrieval records why each evidence
 block was selected and context assembly applies a bounded budget for the
-current turn.
+current turn. The implemented slice indexes local Markdown and text sources;
+the [memory architecture](memory-architecture.md) marks which parts remain
+target design.
 
 See [agent system architecture](agent-system-architecture.md) and
 [memory architecture](memory-architecture.md).
@@ -448,46 +411,128 @@ codec. New R1 code should use `sinomo_core::...`; R2 code uses
 services directly but must also use `sinomo_runtime::...` for R0 and R1
 surfaces.
 
+Crates mark dependency, trust-ring, ABI, or independent artifact boundaries.
+Related shared protocol definitions use modules within a common API package
+rather than additional crates.
+
+The network/KV split is load-bearing: `sinomo-network` has no production
+dependency on `sinomo-kv` or `sinomo-cluster`, and `sinomo-kv` has no production
+dependency on networking or cluster policy. `sinomo-cluster` is the only R0
+bridge between them. The workspace boundary test enforces this split;
+dev-only test-support dependencies do not change that production boundary.
+
+Self-evolution also uses an extended `TrustRing` risk classification through R5
+for candidate artifacts, disposable workspaces, and model providers. Those
+runtime risk classes are not Cargo dependency-ring metadata; R0 through R2 are
+the only conceptual overlap. See
+[self-evolution architecture](self-evolution-architecture.md#evolution-risk-rings).
+
+## Hosts, Clients, and Applications
+
+### Daemon Processes
+
+One installation contributes one normal cluster member. The main daemon owns
+cluster participation. The shadow daemon is a supervision and recovery endpoint
+and does not vote, own DFS data, or accept normal workload placement.
+
+A desktop graphical app attaches to the main daemon when it already exists;
+otherwise it starts the same full product with the sibling
+`sinomo daemon run --app-owned` CLI executable. `sinomo app supervise` owns
+desktop supervision. The desktop launcher keeps the inherited lifetime lease and
+exact child handle across GUI restarts. It stops only its own daemon when the
+desktop session finally closes; an installed daemon remains independent. The
+GUI process never hosts the daemon control loop or product component catalog.
+Android is the exception: it deliberately embeds the daemon through the
+embedded host profile.
+
+Installed desktop entry points select and verify the active managed release.
+Development and external executables retain desktop daemon supervision while
+running the exact requested GUI. They do not receive an installed-update launch
+token or mutate desktop release activation state; a source build cannot be
+silently replaced by an installed release.
+
+### Client Contracts
+
+Desktop clients use the runtime facade's client profile. Shared app commands,
+DFS browser and placement values, model settings, module projections, and app
+observation requests live in the `app`, `dfs`, `lm`, `module`, and `observe`
+modules of `sinomo-api`. The `sinomo-api::app` module namespaces agent, chat,
+evolution, skill, and update commands and projections by domain. These
+app-private protocols share a release boundary and deliberately remain one
+package; independently versioned module interfaces remain owned by
+`sinomo-module-api` and their domain contract owners. The daemon and domain
+implementations re-export the same values rather than defining parallel wire
+types.
+
+`sinomo-api` has no dependency on the daemon, DFS implementation, module host,
+or observation recorder. Server adapters live in `sinomo-daemon`; mounted DFS
+transports live in `sinomo-dfs`; module persistence stays in `sinomo-module`.
+Frontend module changes go through daemon RPC. `sinomo-module-api` remains the
+small native ABI package and owns the data-only metric exporter vocabulary in
+its `observe` module. App-local media and sign-in remain client capabilities.
+
 Graphical application code reaches client-safe runtime surfaces through the R2
-`sinomo-client` facade. Its normal dependency closure must not contain daemon,
-agent, model, rollout, sandbox, build, or product-composition implementations.
-Feature unification while building a multi-binary installer may compile the
-host graph for the sibling daemon artifact; it must not expose host types
-through `sinomo-client` or `sinomo-app` public APIs.
+`sinomo-client` facade, which owns the typed frontend clients for agent
+definitions, chat/channel history, SIFS/DFS browsing, skills, evolution,
+updates, and daemon lifecycle. Agent, skill, and evolution stores and mutations
+execute in daemon services; the GUI never opens their authority stores or
+invokes CLI handlers on a normal desktop build.
+
+Desktop `sinomo-app` uses the runtime `client` profile plus the narrowly named
+device, module, and observation client profiles. Its normal dependency closure
+must not contain daemon, DFS, module-host, observation-recorder, agent, CLI,
+product-composition, build, rollout, sandbox, or VFS-host implementations. The
+workspace ring-boundary test checks the desktop graph per target for those
+packages without constraining its transitive package count, so host test
+fixtures and workspace feature unification cannot hide a client dependency
+leak. Feature unification while building a multi-binary installer may compile
+the host graph for the sibling daemon artifact; it must not expose host types
+through `sinomo-client` or `sinomo-app` public APIs. Android adds the complete
+host profile and implementation crates in its target-specific dependency table
+because it embeds the daemon; test-only dependencies retain local stores as
+deterministic fixtures without changing the desktop production graph.
+
+### Interactive Chat
 
 Interactive chat follows the same process boundary. The
 `sinomo-api::app::chat` module owns the serializable commands,
 cursor-sequenced events, attachment snapshots, and UI projections.
-`sinomo-client::ChatDaemonClient` is the thin transport;
-the graphical `ChatHandle` is only a client actor that pumps those events into
-the UI. The agent session's activity log records a turn's reasoning,
-intermediate output, and tool calls, each record naming its operation and,
-for tool work, its stable tool call id. A channel message refers to the
-operation that produced it (`produced_by`) instead of copying that activity;
-clients read it as a `ChatWorkTrace` projection (`sinomo-api::app::chat::trace`)
-through `/chat/session/activity`, and fold live events into the same shape. `AgentChat`, model provider access, tool registries,
-session control, and stable-history projection are instantiated by the daemon
-host. Desktop UI
-code must not retain an `AgentChat` or an executable tool context. Realtime
-media may hand a request to the regular agent through the chat RPC, but it does
-not execute ordinary agent tools in the app process.
+`sinomo-client::ChatDaemonClient` is the thin transport; the graphical
+`ChatHandle` is only a client actor that pumps those events into the UI.
+`AgentChat`, model provider access, tool registries, session control, and
+stable-history projection are instantiated by the daemon host. Desktop UI code
+must not retain an `AgentChat` or an executable tool context. Realtime media may
+hand a request to the regular agent through the chat RPC, but it does not
+execute ordinary agent tools in the app process.
+
+The agent session's activity log records a turn's reasoning, intermediate
+output, and tool calls, each record naming its operation and, for tool work,
+its stable tool call id. A channel message refers to the operation that
+produced it (`produced_by`) instead of copying that activity; clients read it
+as a `ChatWorkTrace` projection (`sinomo-api::app::chat::trace`) through
+`/chat/session/activity`, and fold live events into the same shape.
 
 Each app surface attaches a transport client identity to a durable execution
 host, submits commands with persistent request IDs, and long-polls an exclusive
 event cursor. Closing the subscription detaches presentation without cancelling
 execution. The daemon retains a bounded per-host event tail with an explicit
-generation and retention boundary, and routes steering, follow-up, removal, interruption, and control
-snapshots through its live runtime-control registry even while the chat worker
-is blocked in a model turn. Chat-session routes are local-command-only; cluster
-members use the separately authorized agent session APIs rather than guessing
-an app client identity. Accepted commands are journaled before acknowledgement.
-Daemon startup restores canonical session bindings and executes commands that
-were durably pending. A chat host opened while the daemon is still publishing
-cluster services, or while its Raft node is still held by the process it
-replaces, waits for them (bounded) instead of reporting the chat unavailable. It does not replay completed commands, workspace grants,
-or ambiguous effects from a command already running at an unexpected crash.
-Planned daemon activation drains leased chat work before publishing its restart
-marker; pending commands wait for that marker to clear on the replacement host.
+generation and retention boundary, and routes steering, follow-up, removal,
+interruption, and control snapshots through its live runtime-control registry
+even while the chat worker is blocked in a model turn. Chat-session routes are
+local-command-only; cluster members use the separately authorized agent session
+APIs rather than guessing an app client identity.
+
+Accepted commands are journaled before acknowledgement. Daemon startup restores
+canonical session bindings and executes commands that were durably pending. A
+chat host opened while the daemon is still publishing cluster services, or
+while its Raft node is still held by the process it replaces, waits for them
+(bounded) instead of reporting the chat unavailable. Startup does not replay
+completed commands, workspace grants, or ambiguous effects from a command
+already running at an unexpected crash. Planned daemon activation drains leased
+chat work before publishing its restart marker; pending commands wait for that
+marker to clear on the replacement host.
+
+### Desktop Updates and Restoration
 
 Desktop bundles are immutable rollout artifacts. Their manifests bind file
 digests, source revision, platform, daemon protocol, and restoration schema.
@@ -498,76 +543,24 @@ versioned local presentation snapshot, and requests a supervised restart.
 Only a matching launch token's readiness acknowledgement promotes the candidate.
 Failed startup retains the previous bundle and the pre-update presentation
 snapshot, so an unsuccessful UI migration cannot overwrite the recovery state.
-UI snapshots restore drafts and event cursors; canonical conversations, tool authority, and execution receipts
-remain runtime-owned. Desktop updates do not replace the mobile embedded host.
+UI snapshots restore drafts and event cursors; canonical conversations, tool
+authority, and execution receipts remain runtime-owned. Desktop updates do not
+replace the mobile embedded host.
 
-The same boundary applies to the rest of the desktop surface. The shared
-`sinomo-api::app` module namespaces agent, chat, evolution, and skill
-commands and projections by domain. These app-private protocols share a
-release boundary and deliberately remain one package; independently versioned
-module interfaces remain owned by `sinomo-module-api` and their domain contract
-owners. `sinomo-client` owns the typed clients for agent definitions,
-chat/channel history, SIFS/DFS browsing, skills, evolution, and daemon lifecycle.
-Agent/skill/evolution stores and mutations execute in daemon services; the GUI
-never opens their authority stores or invokes CLI handlers on a normal desktop
-build.
+Restoration acknowledgement owns its scheduling: the first ready frame wakes
+the application controller, and the stability window and retry deadlines each
+schedule a bounded one-shot wake, so an idle workspace does not depend on chat
+traffic or unrelated probes to finish activation. Loss of restoration readiness
+cancels the pending acknowledgement deadline.
 
-Desktop `sinomo-app` uses the runtime `client` profile plus narrowly named
-device, module-inspection, observation, and NFS client profiles. Those
-profiles do not enable the daemon, build, rollout, sandbox, product profile,
-agent, CLI, evolution engine, VFS host, or supervision implementations. A
-dependency-boundary test checks this normal graph for forbidden implementations
-without constraining its transitive package count. Android deliberately adds the
-complete host profile and implementation crates in its target-specific table
-because it still embeds the daemon; test-only dependencies retain local stores
-as deterministic fixtures without changing the desktop production graph.
-
-Self-evolution also uses an extended `TrustRing` risk classification through R5
-for candidate artifacts, disposable workspaces, and model providers. Those
-runtime risk classes are not Cargo dependency-ring metadata; R0 through R2 are
-the only conceptual overlap. See
-[self-evolution architecture](self-evolution-architecture.md#evolution-risk-rings).
-
-The network/KV split is load-bearing: `sinomo-network` has no production
-dependency on `sinomo-kv` or `sinomo-cluster`, and `sinomo-kv` has no production
-dependency on networking or cluster policy. `sinomo-cluster` is the only R0
-bridge between them. Dev-only test-support dependencies do not change that
-production boundary.
-
-## Modules and Controlled Evolution
+## Modules and Components
 
 A module is a lifecycle unit, independent of whether its backend is static
 Rust, a native library, a declarative resource, a sandboxed process, or a Wasm
 component. The lifecycle covers identity, compatibility, evaluation,
 activation, observation, replacement, and rollback.
 
-Self-evolution is delivered as the default-enabled `module.evolution` native
-dynamic-library module. Its implementation lives under
-`modules/evolution/sinomo-evolution`, owns its settings, storage identity,
-object-RPC routes, CLI execution, lifecycle descriptor, `evolution-agent`
-package, standard tool manifest, and embedded evolution skills, and is built
-and rolled out as a separate artifact. The main binary, daemon host, CLI, and
-app do not link the implementation; they retain only the data contract and
-generic module/client machinery. Module agent packages are projected through
-the catalog with their module ID and version, which the app presents as package
-provenance. If the module is unavailable, evolution surfaces and its agent
-package fail closed without affecting ordinary agent chat or daemon startup.
-
-Module-owned CLI namespaces use the versioned `sinomo.cli.commands` extension
-point. The CLI composes local handlers with a fresh daemon catalog and forwards
-module argument tokens to the selected owner's `cli.invoke` service. Evolution
-owns its registration, parser, help, and completion; the CLI contains no
-Evolution-specific proxy. Catalog incarnation and generation checks fence
-stale calls, and native invocation leases survive caller cancellation until
-blocking work finishes. The `sinomo-runtime/cli-client` profile exposes the CLI
-framework without enabling daemon implementations. All domain parsers live
-with their owners: agent/skill in `sinomo-agent`, memory in `sinomo-memory`, DFS
-in `sinomo-dfs`, rollout in `sinomo-rollout-host`, tests in `sinomo-test`, and
-models/providers/usage/voice in `sinomo-lm` behind its optional `cli` feature.
-The CLI composes owner registrations and supplies terminal and execution
-adapters. Bootstrap commands and R0 adapters remain CLI-owned. Linked modules
-still register locally; external modules use daemon discovery. Local media and
-sign-in remain client capabilities. No additional crates are needed.
+### Component Composition
 
 Runtime activation is component-based. Every implementation supplies a
 `ComponentDescriptor` with versioned service offers and requirements and is
@@ -577,14 +570,53 @@ reconciler keeps components pending until dependencies exist, preserves
 unchanged scopes across atomic service-registry generations, and removes a
 component's routes before unwinding its effects.
 
-`ComponentCatalog` is the single composition input for factories, module
-registrations, config definitions, and storage contributions. A host must not
-maintain separate per-surface built-in lists. The shared product profile builds
-the common catalog used by standalone CLI daemons, app-owned desktop daemon
-processes, and embedded mobile hosts; each may add process-specific component
-overlays before handing the catalog to the daemon. The daemon supplies only host
-infrastructure components and adapters. `sinomo-app` is a client surface on
-desktop and must not import daemon implementation or product-composition code.
+`ComponentCatalog` is the sole product-composition input. Besides module
+registrations, factories, and config definitions, it carries storage
+contributions and storage-only fallbacks for disabled components, startup
+recovery hooks, daemon-status projections, cluster maintenance inhibitors, and
+migration quarantine contributions. A host must not maintain separate
+per-surface built-in lists. The shared product profile
+(`sinomo-product-profile`) builds the common catalog used by standalone CLI
+daemons, app-owned desktop daemon processes, and embedded mobile hosts; each
+may add process-specific component overlays before handing the catalog to the
+daemon. The daemon supplies only host infrastructure components and adapters
+and executes these generic contracts; it does not rediscover built-ins, append
+fallback factories, or maintain parallel config/storage/module lists.
+`sinomo-app` is a client surface on desktop and must not import daemon
+implementation or product-composition code.
+
+### Component Services and Events
+
+Inter-component commands and queries resolve through the live service registry
+by service interface and version. `ServiceRequirement` declares the caller
+capabilities and exact operations a component may exercise; each `ServiceOffer`
+maps operations to concrete routes and their authority. The component service
+client intersects those declarations with live route policy before dispatch.
+Providers may expose a `component`-scope route which is callable only through
+this host path and is denied to every daemon signer. Local fan-out preserves
+provider failures independently so aggregators can return useful partial data.
+Cluster calls remain ordinary discovered object RPC and require an explicit
+host transport; local resolution never silently implies remote delivery.
+
+Inter-component facts use declared, typed event publications and subscriptions,
+not middleware-style callback chains. The host overwrites publisher provenance,
+uses bounded best-effort delivery with explicit lag, and ties receivers to the
+owning component scope. Local transient delivery is built in. Durable append
+and cluster forwarding require explicit host adapters and fail closed when no
+adapter exists; the event API does not promise global order, waterfall mutation,
+or bail semantics across nodes. Component events use host-installed durable
+storage and an authenticated cluster ingress route; the original event id and
+publisher metadata survive retries, and the receiving node verifies the signed
+origin.
+
+Observation extensions use the same service rule. Independently built modules
+use `sinomo-module-api::observe` and expose the versioned
+`sinomo.observe.metric-exporter` pull interface. `sinomo-observe` calls every
+matching local provider, validates bounded batches, injects trusted component
+identity labels, and returns partial-success status. External modules never link
+the recorder, exporter registry, or any process-global `sinomo-observe` state.
+
+### Extension Points
 
 Modules may extend existing presentation and behavior only through typed,
 versioned extension points declared by the subsystem that owns the affected
@@ -633,6 +665,27 @@ last complete frame without waiting for extension code on its UI thread.
 Android preserves host-rendered fallback content until an isolated-service
 backend implements the same UI component protocol.
 
+Module-owned CLI namespaces use the versioned `sinomo.cli.commands` extension
+point. The CLI composes local handlers with a fresh daemon catalog and forwards
+module argument tokens to the selected owner's `cli.invoke` service. Catalog
+incarnation and generation checks fence stale calls, and native invocation
+leases survive caller cancellation until blocking work finishes. The
+`sinomo-runtime/cli-client` profile exposes the CLI framework without enabling
+daemon implementations. Linked domain parsers live with their owners: agent and
+skill in `sinomo-agent`, memory in `sinomo-memory`, DFS in `sinomo-dfs` with its
+history and attachment children in their feature crates, module in
+`sinomo-module`, observe in `sinomo-observe`, remote and node permissions in
+`sinomo-remote-management`, sandbox in `sinomo-sandbox`, rollout in
+`sinomo-rollout-host`, tests in `sinomo-test`, and models, providers, usage, and
+voice in `sinomo-lm` behind its optional `cli` feature. The CLI composes owner
+registrations and supplies terminal and execution adapters; bootstrap commands
+such as `install`, `cluster`, `daemon`, and `app`, and R0 adapters remain
+CLI-owned. See the [extension guide](developer/extension-points.md) for the
+parser owner table. Linked modules still register locally; external modules use
+daemon discovery.
+
+### Native and External Providers
+
 External providers are selected by interface offer, never by provider crate or
 hardcoded module ID in the main runtime. WASIX implements the generic sandbox
 executor interface; Cloud Files implements the generic host-filesystem provider
@@ -640,80 +693,11 @@ interface and keeps its private protocol and durable recovery state inside its
 external package. Default external artifacts are enumerated only by verified
 signed distribution profiles, not by scanning a source checkout.
 
-Inter-component commands and queries resolve through the live service registry
-by service interface and version. `ServiceRequirement` declares the caller
-capabilities and exact operations a component may exercise; each `ServiceOffer`
-maps operations to concrete routes and their authority. The component service
-client intersects those declarations with live route policy before dispatch.
-Providers may expose a `component`-scope route which is callable only through
-this host path and is denied to every daemon signer. Local fan-out preserves
-provider failures independently so aggregators can return useful partial data.
-Cluster calls remain ordinary discovered object RPC and require an explicit
-host transport; local resolution never silently implies remote delivery.
-
-Inter-component facts use declared, typed event publications and subscriptions,
-not middleware-style callback chains. The host overwrites publisher provenance,
-uses bounded best-effort delivery with explicit lag, and ties receivers to the
-owning component scope. Local transient delivery is built in. Durable append
-and cluster forwarding require explicit host adapters and fail closed when no
-adapter exists; the event API does not promise global order, waterfall mutation,
-or bail semantics across nodes.
-
-Observation extensions use the same service rule. Independently built modules
-use `sinomo-module-api::observe` and expose the versioned
-`sinomo.observe.metric-exporter` pull interface. `sinomo-observe` calls every
-matching local provider, validates bounded batches, injects trusted component
-identity labels, and returns partial-success status. External modules never link
-the recorder, exporter registry, or any process-global `sinomo-observe` state.
-
 Native-dylib route materialization belongs to `sinomo-module`. It owns request
 staging, cancellation, content-addressed loading, permission callbacks, ABI
 invocation, response validation, and route metadata. The daemon contributes a
 narrow request-authority preparer for host-owned fields; it does not implement
 the native invocation engine.
-
-Service-catalog publication is a lifecycle-owned component which observes the
-live registry generation and independently retries cluster-KV reconciliation.
-Generic daemon connectivity maintenance has no service-registry field or
-publication branch. Component events use host-installed durable storage and an
-authenticated cluster ingress route; the original event id and publisher
-metadata survive retries, and the receiving node verifies the signed origin.
-
-Sandbox and DFS control services are component-owned. DFS bulk data, metadata
-authority, and placement-sensitive operations retain their typed host and peer
-transport contracts; generic component events are never substituted for these
-correctness- or throughput-critical paths.
-
-The Sandbox component owns local/clustered backend selection, SIFS lifecycle
-leases, toolchain mutations, mediated HTTP, framed execution streams, and the
-durable recovery worker. The daemon does not decode Sandbox requests, enumerate
-Sandbox routes, or schedule Sandbox maintenance; it supplies the same generic
-cluster/runtime context used by other components.
-
-`ComponentCatalog` is the sole product-composition input. Besides module
-registrations and factories, it carries storage-only fallbacks for disabled
-components, startup recovery hooks, daemon-status projections, cluster
-maintenance inhibitors, and migration quarantine contributions. The daemon
-executes these generic contracts; it does not rediscover built-ins, append
-fallback factories, or maintain parallel config/storage/module lists.
-
-Rollout routes, telemetry, desired-state watching, shadow finalization, process
-activation/recovery, and status projection live in the `sinomo-rollout` crate
-family. `sinomo-rollout-host` is the trusted daemon-process adapter selected by
-the product profile, while `sinomo-rollout-client` and `sinomo-build-client`
-contain caller-side typed clients. `sinomo-daemon::client` retains only generic
-daemon and foundational cluster transport.
-
-Observe owns runtime initialization, metric-exporter registration, component
-event recording, and timeline shutdown persistence in its component scope.
-Daemon-originated operational records flow through the component event bus;
-the daemon never writes Observe-owned files directly. Process idle counters
-are lightweight daemon API mechanism and do not require linking Observe.
-
-The timeout, shutdown, wake, inhibition, and external-change loop for cluster
-network maintenance is the generic `sinomo-cluster` maintenance reactor. The
-daemon implements only the host operations that touch its listener, process
-identity, and transport-specific maintenance work.
 
 `sinomo-module::ActiveNativeComponent` owns the common native-provider binding:
 it resolves exactly one active component from a `ServiceRequirement`, verifies
@@ -722,17 +706,62 @@ Domain-owned clients in `sinomo-sandbox` and `sinomo-dfs` translate their own
 interfaces onto that binding. Parallel per-interface host-loader crates and
 runtime-facade re-exports are forbidden.
 
+### Component-Owned Subsystems
+
+The daemon hosts components; it does not implement their domains:
+
+- **DFS** owns its resident runtime as described under
+  [filesystem and content](#filesystem-and-content).
+- **Sandbox** owns local/clustered backend selection, SIFS lifecycle leases,
+  toolchain mutations, mediated HTTP, framed execution streams, and the
+  durable recovery worker. The daemon does not decode Sandbox requests,
+  enumerate Sandbox routes, or schedule Sandbox maintenance.
+- **Rollout** routes, telemetry, desired-state watching, shadow finalization,
+  process activation/recovery, and status projection live in the
+  `sinomo-rollout` crate family. `sinomo-rollout-host` is the trusted
+  daemon-process adapter selected by the product profile, while
+  `sinomo-rollout-client` and `sinomo-build-client` contain caller-side typed
+  clients. `sinomo-daemon::client` retains only generic daemon and foundational
+  cluster transport.
+- **Observe** owns runtime initialization, metric-exporter registration,
+  component event recording, and timeline shutdown persistence in its component
+  scope. Daemon-originated operational records flow through the component event
+  bus; the daemon never writes Observe-owned files directly. Process idle
+  counters are a lightweight daemon API mechanism and do not require linking
+  Observe.
+- **Service-catalog publication** is a lifecycle-owned component which observes
+  the live registry generation and independently retries cluster-KV
+  reconciliation. Generic daemon connectivity maintenance has no
+  service-registry field or publication branch.
+
+DFS bulk data, metadata authority, and placement-sensitive operations retain
+their typed host and peer transport contracts; generic component events are
+never substituted for these correctness- or throughput-critical paths.
+
+## Controlled Evolution
+
+Self-evolution is delivered as the default-enabled `module.evolution` native
+dynamic-library module. Its implementation lives under
+`modules/evolution/sinomo-evolution`, owns its settings, storage identity,
+object-RPC routes, CLI registration, parser, help, completion and execution,
+lifecycle descriptor, `evolution-agent` package, standard tool manifest, and
+embedded evolution skills, and is built and rolled out as a separate artifact.
+The main binary, daemon host, CLI, and app do not link the implementation; they
+retain only the data contract and generic module/client machinery, and the CLI
+contains no Evolution-specific proxy. Module agent packages are projected
+through the catalog with their module ID and version, which the app presents as
+package provenance. If the module is unavailable, evolution surfaces and its
+agent package fail closed without affecting ordinary agent chat or daemon
+startup.
+
 Candidate changes move through isolated workspaces, tests and replay,
 machine-readable scorecards, trusted policy, immutable artifact registration,
 shadow or canary execution, and rollback. Candidate code cannot approve itself,
 change trust policy, bypass the sandbox host, or replace recovery logic.
 
 Build services turn approved source inputs into immutable, target-compatible
-binary and module artifacts. They are supply services, not rollout authorities:
-an artifact is preferably built once per build identity and compatible target
-group, cached, and distributed to eligible nodes. Producing an artifact cannot
-make it desired state or authorize activation.
-
+artifacts (see [build and artifact distribution](#build-and-artifact-distribution));
+producing an artifact cannot make it desired state or authorize activation.
 Each node independently verifies compatibility, signature, capability grants,
 resource limits, and local policy before activation. A disconnected node keeps
 its last approved version until it can reconcile desired state safely.
@@ -770,9 +799,10 @@ forwarding, storage commits, policy checks, or cancellation.
 At minimum, operators and developers need visibility into ingestion lag,
 response latency, routing attempts, quorum and replication state, DFS repair,
 tool and action outcomes, policy blocks, model usage, rollout state, and
-artifact provenance. Cluster builds additionally expose queue pressure, cache
-resolution, worker selection evidence, resource snapshots, retries, and build
-outcomes. See [observability architecture](observability-architecture.md).
+artifact provenance. Cluster builds additionally expose queue depth, cache
+resolution, worker selection evidence, resource snapshots, and build outcomes
+through their capability, status, and log routes; they do not yet export build
+metrics. See [observability architecture](observability-architecture.md).
 
 ## Architectural Invariants
 

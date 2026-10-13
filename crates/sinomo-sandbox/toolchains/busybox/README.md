@@ -42,12 +42,6 @@ Or run it directly on a Linux host with curl, make, gcc, and tar available:
 crates/sinomo-sandbox/toolchains/busybox/build-busybox-wasi.sh
 ```
 
-Build the WASIX variant directly with:
-
-```text
-crates/sinomo-sandbox/toolchains/busybox/build-busybox-wasi.sh
-```
-
 The generated package manifest is imported with `sinomo sandbox toolchain import-package`. Operators should then create a sandbox, import the package, and run:
 
 ```text
@@ -68,8 +62,8 @@ The current recipes build a deliberately narrow profile. They register these cor
 
 ```text
 awk cat chmod cp cmp date diff dirname echo env false find grep gzip head ln ls
-mkdir mv patch printf pwd rm rmdir sed sha256sum sh sort tail tar test touch true
-tr uname uniq wc
+mkdir mv patch printf pwd rm rmdir sed sha256sum sh sleep sort tail tar test
+touch true tr uname uniq wc
 ```
 
 `sh` is the upstream BusyBox ash applet in the WASIX package. The recipe must not patch ash command execution, pipeline, here-doc, or redirection semantics to hide runtime gaps. The runtime must not substitute a fake shell or a mostly-compatible command.
@@ -97,7 +91,9 @@ Run the current fidelity suite against a sandbox whose manifest pins the BusyBox
 sinomo sandbox toolchain verify-busybox <sandbox-id> [--daemon] [--allow-unsigned]
 ```
 
-Use `--daemon` to run the same fidelity cases against a daemon-backed SIFS sandbox instance.
+`--daemon` sends the same fidelity cases to the daemon-hosted Sandbox component.
+Daemon-hosted `/sandbox/run/*` execution has been removed, so the clustered
+backend currently rejects those cases; use the local mode for recipe gates.
 
 Cluster-wide sandbox policy is represented by `SandboxClusterPolicyConfig` at:
 

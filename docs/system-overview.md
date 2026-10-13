@@ -130,7 +130,8 @@ competing canonical versions.
 
 A module is a behavior lifecycle unit. Current implementations include built-in
 Rust, native libraries, declarative packages, sandboxed processes, and a WASIX
-runtime module. A component-model Wasm module backend remains future work.
+runtime module. Wasm components currently run only as isolated UI-extension
+surfaces; a general component-model Wasm module backend remains future work.
 Producing an artifact does not activate it.
 
 Build services create immutable, target-compatible artifacts and provenance.

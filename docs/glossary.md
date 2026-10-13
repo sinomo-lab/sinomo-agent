@@ -14,6 +14,10 @@ context policy, and durable session state.
 Immutable, identified output such as a binary or module library. An artifact's
 existence does not imply that it is approved or active.
 
+**Authoritative read**
+A read performed with current quorum/leadership evidence. Failure does not
+silently fall back to a possibly stale local value.
+
 **Authority member**
 A cluster member that participates in replicated-state consensus. This is
 separate from the descriptive node role and from device or host permissions.
@@ -42,9 +46,10 @@ facts. It is not a general content or filesystem-metadata database.
 A local view that has applied a known committed log prefix. It can be useful
 while disconnected but may be older than the current cluster authority.
 
-**Authoritative read**
-A read performed with current quorum/leadership evidence. Failure does not
-silently fall back to a possibly stale local value.
+**Component**
+The runtime activation unit behind a module. A component declares versioned
+service offers and requirements; its mounted scope owns the services, workers,
+and compensations that are removed together when it is unloaded.
 
 **Content store**
 A node-local store for immutable file bytes and manifests used by DFS.
@@ -83,6 +88,11 @@ Endpoints are observations; identity checks establish which node answered.
 **Event**
 A typed, timestamped statement about something that happened, with provenance,
 causality, evidence, scope, and routing metadata as applicable.
+
+**Extension point**
+A typed, versioned seam declared by the subsystem that owns a surface. Modules
+contribute bounded data or logical operations to it; the owner composes them
+deterministically and keeps final authority.
 
 **Evidence**
 Durable material that supports an event, model response, evaluation, policy

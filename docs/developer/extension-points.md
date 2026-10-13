@@ -37,13 +37,18 @@ clients must not reconstruct it from an ID or library filename.
 
 The executable in `crates/sinomo` only installs build information and calls the
 CLI library. The domain owner supplies its parser, help, completion, and runner.
-For linked commands, expose a registration function using `CliCommandHandler`
-or `DeclarativeCommandHandler` from `sinomo-cli-registry`. R2 owners import these
-through `sinomo-runtime` with `default-features = false, features = ["cli-client"]`.
-Each owner exposes `cli::register_cli_commands`, accepting execution callbacks
-from the host. The owner controls typed arguments, validation, command policy,
-help, completion, and aliases. The CLI supplies terminal, transport, and process
-adapters; it does not maintain a second copy of the domain grammar.
+For linked commands, implement `CliCommandHandler` or use
+`DeclarativeCommandHandler` from `sinomo-cli-registry`. R1 owners depend on
+`sinomo-cli-registry` directly; R2 owners import it as
+`sinomo_runtime::cli_registry`, which the `cli-client` feature provides (the
+default `host` profile includes it, and a client-only crate such as `sinomo-lm`
+enables `sinomo-runtime/cli-client` behind its own `cli` feature). The owner
+exposes either `cli::register_cli_commands`, accepting execution callbacks from
+the host, or a `*_cli_command_handler` constructor that the CLI registers in
+`default_cli_command_registry` (`crates/sinomo-cli/src/lib.rs`). The owner
+controls typed arguments, validation, command policy, help, completion, and
+aliases. The CLI supplies terminal, transport, and process adapters; it does not
+maintain a second copy of the domain grammar.
 
 | Commands | Parser and registration owner |
 |---|---|
@@ -53,13 +58,17 @@ adapters; it does not maintain a second copy of the domain grammar.
 | `dfs` | Core grammar in `sinomo-dfs::cli`; `history` and `attachment` children in their owning feature crates, composed by the CLI host. |
 | `rollout`, including recovery and build-log options | `sinomo-rollout-host::cli` |
 | `test` | `sinomo-test::cli` |
+| `module` | `sinomo_module::module_cli_command_handler` (`src/cli.rs`) |
+| `observe` | `sinomo_observe::observe_cli_command_handler_with_cluster_rpc` (`src/cli.rs`) |
+| `remote`, `node` | `sinomo_remote_management::{remote_cli_command_handler, node_permissions_cli_command_handler}` (`src/cli.rs`) |
+| `sandbox` | `sinomo_sandbox::sandbox_cli_command_handler` (`src/cli.rs`) |
 
 Realtime call syntax belongs with the LM realtime contracts, while media
 devices and sign-in continue to execute locally. The `test` grammar uses the
 shared provider data contract rather than depending on the LM implementation.
-Bootstrap/recovery commands (`help`, `daemon`, `cluster`, `install`,
-`uninstall`, and `debug`) remain CLI-owned and available without dynamic
-modules. R0 commands keep their CLI adapters above R0.
+Bootstrap, recovery, and desktop-launch commands (`help`, `app`, `daemon`,
+`cluster`, `install`, `uninstall`, and `debug`) remain CLI-owned and available
+without dynamic modules. R0 commands keep their CLI adapters above R0.
 
 Parser ownership is separate from discovery: these linked modules register
 locally, and external modules use the daemon catalog below. Moving a grammar
@@ -183,8 +192,9 @@ changing its ABI, durable state, lifecycle callbacks, or provider selection.
 Use the generic extension registry when several modules participate in a join
 point owned by an existing subsystem. The owner declares an
 `ExtensionPointDefinition`; contributors add `ExtensionContribution` records
-to either `ModuleSurfaces` or `NativeModuleSurfaces`. Both new fields default to
-empty when older JSON or SOBJ surfaces are decoded.
+to either `ModuleSurfaces` or `NativeModuleSurfaces`. Their `extension_points`
+and `extension_contributions` fields default to empty when older JSON or SOBJ
+surfaces are decoded.
 
 Definitions own the versioned input, contribution, and output schema IDs,
 locality, accepted contribution kinds, composition and failure policies,

@@ -4,9 +4,11 @@ DFS keeps one current filesystem view. By default, overwriting or deleting a
 file does not retain its previous content. Save a checkpoint explicitly, or
 enable a retention rule before the change you want to protect.
 
-These commands use the main daemon. History captures require history-capable
-metadata shards; an unsupported shard returns an error instead of accepting a
-capture it cannot preserve. See `sinomo dfs help` for the installed syntax.
+These commands use the main daemon and the default-enabled
+`module.dfs.history` component. A capture that cannot be preserved returns an
+error instead of being accepted. Disabling the component removes these commands'
+service but keeps existing captures, pins and retention rules. See
+`sinomo dfs help` for the installed syntax.
 
 For legacy content whose original replication guarantee cannot be recovered,
 capture establishes durability under the current filesystem policy. It succeeds
@@ -85,14 +87,6 @@ Interrupting the command does not undo an admitted restore or recovery. DFS
 keeps its source protected and can resume the operation after interruption or
 restart. Retry with the same operation ID and inputs to retrieve its result.
 
-The legacy `dfs conflicts use-version` command now performs this same
-conditional restore. It accepts `--object`, `--path`, `--version`,
-`--expected-version`, and `--operation-id`; use all five for an exact retry that
-does not need to rediscover the destination. It requires explicitly retained
-content and a main daemon. Metadata-only version rewrites and automatic conflict
-record removal are no longer supported by that command. Use
-`dfs conflicts resolve` when you explicitly want to clear diagnostic records.
-
 ## Configure Automatic Capture
 
 Inspect the effective policy, or set a rule for a subtree:
@@ -167,7 +161,6 @@ bounded steps; use **Search older versions** to continue.
 
 Confirmations keep the observation and operation identity shown when you made
 the choice. If a restore or recovery fails, confirming it again retries that
-same operation; changing a recovery destination starts a new one. Restoring
-content does not clear diagnostic conflict records; review and resolve those
-separately. The sheet shows automatic retention rules but does not change them;
-use `sinomo dfs history retention` for that.
+same operation; changing a recovery destination starts a new one. The sheet
+shows automatic retention rules but does not change them; use
+`sinomo dfs history retention` for that.

@@ -1,12 +1,20 @@
 # Agent Session Activity and Unified Channels
 
 Status: Active implementation plan (phases 1–5 implemented; follow-ups open)
-Last reviewed: 2026-10-06
+Last reviewed: 2026-10-13
 
 This plan makes the agent session the owner of everything an agent does
 (reasoning, tool calls, async work) and makes a chat a channel with one agent.
 A channel then differs from a chat only in its participant set and in the
 policy that decides who acts on a message.
+
+The durable decisions of phases 1–5 are recorded in the
+[agent system architecture](../agent-system-architecture.md) and the chat
+boundary paragraph of the [architecture overview](../architecture.md). The
+sections after [Implementation progress](#implementation-progress) keep the
+original design: "Starting state" describes the code before phase 1, and the
+proposed names in later sections differ from the implemented ones where noted.
+Open follow-ups are the gaps listed under each phase.
 
 ## Implementation progress
 
@@ -58,9 +66,13 @@ policy that decides who acts on a message.
   background thread. The turn records an immediate result
   (`{"detached": true, "task_id", "tool_call_id"}`) and moves on. The
   completion becomes an `AsyncTaskUpdate` with the call's `tool_call_id`,
-  queued on the session runtime; detached work and queued completions count
-  as running work, so the host is not released. An idle chat host polls for
-  completions (every 250 ms) and runs `AgentChat::continue_async_updates`:
+  held for its session in the process rather than on the runtime that started
+  the call, so a runtime rebuilt for a model, agent, or workspace change
+  collects it; a continuation consumes its completion when accepted, so a
+  rebuild cannot continue the session twice. Detached work and queued
+  completions count as running work, so the host is not released. An idle
+  chat host polls for completions (every 250 ms) and runs
+  `AgentChat::continue_async_updates`:
   the participant takes a turn with the update as input
   (`AgentChannelRuntime::continue_with_async_update`, gated by
   `AgentChannelPolicy::may_publish_unprompted`), the turn journals the update,
@@ -117,9 +129,11 @@ policy that decides who acts on a message.
 - Cross-user access control for shared channels beyond the audience field
   described below.
 
-## Current state
+## Starting state
 
-The engine is already shared; the drivers are not.
+This section records the code before phase 1; see
+[Implementation progress](#implementation-progress) for the current state.
+The engine was already shared; the drivers were not.
 
 - Both paths run turns through `AgentSessionRuntime`
   (`crates/sinomo-agent/src/agent/control.rs`). It owns turn operations,
@@ -279,6 +293,11 @@ behavior:
 | `addressed_to` | Participants the message is directed at. Advisory; consumed by policy. |
 | `reply_to` | Message id this message answers. |
 
+Implemented on `AgentChannelMessage`: `produced_by` (`AgentActivityRef`),
+`audience` (`AgentChannelAudience`: `everyone`, or `participants` with
+`participant_ids`; an empty list is a users-only notice), and `reply_to`.
+`addressed_to` is not implemented.
+
 The "work above this reply" view is the activity of `produced_by.op_id`,
 read from the producing session. A tool call that started in that range and
 finished later is shown with its latest state, found by `tool_call_id`, so
@@ -310,6 +329,14 @@ struct ActRequest {
     silence_allowed: bool,
 }
 ```
+
+The block above is the original proposal. The implemented trait is
+`AgentChannelPolicy` in `crates/sinomo-agent/src/channel.rs`: `on_message`
+takes the `AgentChannel` and returns `AgentChannelActRequest`s, each a
+participant id plus an `AgentChannelActMode` (`Answer` replaces the proposed
+`trigger` and `silence_allowed = false`; `Observe` allows silence).
+`may_publish_unprompted` takes the participant record, and the trait also
+supplies the audience and text of the channel's turn-handling notices.
 
 - **Single agent.** Every user message produces one `ActRequest` for the agent,
   with silence not allowed; unprompted publishing is allowed. This is today's
@@ -343,6 +370,13 @@ which assigns the sequence, applies `audience`, and records `produced_by`.
   participants cannot amplify loops.
 
 ## Events and client API
+
+Not implemented as proposed (see the phase 4 gaps): the dotted events below
+are not published, clients receive `SpeakerStarted` instead of a `source` on
+every event, and `/chat/session/activity` takes `{ participant_id,
+session_id, op_id }` references and returns one `ChatWorkTrace` per operation
+rather than records by `seq` range. It reads the chat host's local session
+store.
 
 Event names follow the dotted event contract. Every event carries
 `channel_id`, `participant_id`, `session_id`, `op_id` (when applicable), the

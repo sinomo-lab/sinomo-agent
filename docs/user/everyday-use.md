@@ -9,7 +9,7 @@ use `sinomo <command> help` for the installed version.
 | Surface | Best for | Start command |
 |---|---|---|
 | Terminal UI | Conversation plus occasional CLI commands | `sinomo` |
-| Graphical app | Chat, SIFS files, cluster state, and settings | `cargo run -p sinomo-app` |
+| Graphical app | Chat, SIFS files, cluster state, and settings | `sinomo-app` or `cargo run -p sinomo-app` |
 | One-shot agent | Scripts, focused tasks, and reproducible prompts | `sinomo agent run --prompt <text>` |
 | Direct CLI | Configuration, inspection, automation, and operations | `sinomo <command>` |
 
@@ -19,23 +19,31 @@ is a CLI command while text without `/` is a user message.
 Use F1–F4 or click the tabs to switch between Chat, Files, Sessions, and
 Settings. Tabs shorten automatically in narrow terminals. The chat footer shows
 shortcuts for the current action: Enter sends a message, Tab or Enter accepts a
-completion, and Ctrl+C interrupts active work. Use Page Up/Page Down to scroll
-and Alt+S to select transcript text. Esc clears a chat selection or cancels an
-edit first; otherwise it exits chat or returns from another view to chat.
+completion, and Ctrl+C interrupts (pauses) active work. Use Page Up/Page Down
+to scroll and Alt+S to select transcript text. Esc clears a chat selection or
+cancels an edit first; otherwise it exits chat or returns from another view to
+chat.
 
-The bare `sinomo-app` command is available only when the graphical binary was
-separately built and installed; `sinomo install` installs the main `sinomo`
-client/daemon binary, not the graphical app.
+The `sinomo-app` launcher comes from a desktop release: `sinomo install` run
+from that release, or with `--desktop --app-bundle`, places it in
+`$SINOMO_DATA_DIR/bin`. A source-checkout or runtime-only install is headless.
+See [desktop app rollout](rollout-operations.md#desktop-app-rollout).
 
 ## Settings
 
-Graphical Settings is organized by ownership:
+Graphical Settings groups its pages by task:
 
-- **App**: appearance, connectivity, and application information.
-- **Node**: node configuration, modules, SIFS mounts, and host access. Use the
-  **Node** dropdown on any of these pages to choose the node being managed.
-- **Cluster**: membership, providers, agents, skills, and shared configuration,
-  including module defaults.
+- **General**: **Appearance** and **System** (connection status, app version,
+  and diagnostics).
+- **AI**: **Providers**, **Agents**, and **Skills**.
+- **This device**: **Storage** (SIFS host mounts, natively or over NFS) and
+  **Host access**.
+- **Cluster**: **Membership** and **Modules**.
+- **Advanced**: **Configuration**, a browser for every setting key with a
+  **Cluster** or **This device** scope.
+
+Storage, Host access, Modules, and device-scoped Configuration have a **Node**
+selector that chooses the node being managed.
 
 Ordinary remote configuration requires cluster configuration authority, without
 granting remote control of the host system. Host filesystem mount changes still
@@ -136,20 +144,24 @@ detecting whether the endpoint speaks the stateless MCP revision (2026-07-28) or
 the older `initialize` handshake, and can be pinned to either when an endpoint
 mishandles the probe. MCP credentials are environment-variable references rather
 than stored secret values. Granting or revoking the required node-local
-permission is an explicit, confirmed action in the same area; after saving an
-agent, **Test readiness** connects to enabled servers and reports the negotiated
-protocol version, the server that answered, and the discovered tool names. Realtime voice can also hand coding, research, or longer work to the
-same regular agent and bring the result back into the live conversation.
+`external-integrations` permission is an explicit, confirmed action in the same
+area; after saving an agent, **Test readiness** connects to enabled servers and
+reports the negotiated protocol version, the server that answered, and the
+discovered tool names. Realtime voice can also hand coding, research, or longer
+work to the same regular agent and bring the result back into the live
+conversation.
 
 For a coding task in **Chat**, the default **main-agent** can use the complete
 coding toolset; **coding-agent** remains available as a dedicated workspace
-persona. Open the folder-shaped **Workspace** control in the composer and choose
-the project directory. The selection replaces the conversation's complete
-workspace grant; **Remove access** revokes it. Choose a model, then describe the
-implementation and validation outcome you want. File reads, edits, patches,
-and audited command execution use that folder as their root, while tool calls
-and captured command output appear in the conversation's **Tool activity**
-expander.
+persona. Open the **Workspace** control in the composer and use **Add folder**
+to grant the conversation a project directory. A conversation can hold several
+folders: commands start in the default (first) folder, **Make default** changes
+it, each folder's close button removes it, and **Remove all** revokes every
+grant. Workspaces cannot change while a turn is active. Choose a model, then
+describe the implementation and validation outcome you want. File reads,
+edits, patches, and audited command execution use the granted folders as their
+roots, while tool calls and captured command output appear in the
+conversation's **Tool activity** expander.
 
 The main agent can also inspect and update registered Sinomo configuration,
 read cluster health, and use available module, integration, and remote-node
@@ -163,6 +175,16 @@ or checkpoint phase. Dependency directories such as `node_modules` and Python
 virtual environments therefore stay local unless the workspace itself is a
 SIFS-mounted directory.
 
+An agent can start temporary subagents for parallel or focused subtasks. They
+inherit the parent's model, tools, workspace, and permissions, cannot be given
+more, are cancelled with their parent, and do not survive a process restart.
+
+A chat runs on one node at a time. Other windows and nodes that open it share
+the same conversation and turn; if the hosting node stops, another node takes
+the chat over after about 45 seconds and resumes from the last saved session.
+Deleting a chat cancels its live work and releases its automatic sandbox; its
+stored content is purged 30 days later.
+
 Live sessions expose explicit control commands:
 
 ```sh
@@ -170,11 +192,18 @@ SESSION_ID=your-session-id
 sinomo agent session inspect "$SESSION_ID"
 sinomo agent session progress "$SESSION_ID"
 sinomo agent session steer "$SESSION_ID" "Recheck the failing test first"
-sinomo agent session interrupt "$SESSION_ID" "The task is no longer needed"
+sinomo agent session interrupt "$SESSION_ID" "Wait for my review"
+sinomo agent session unpause "$SESSION_ID"
+sinomo agent session cancel "$SESSION_ID" "The task is no longer needed"
 ```
 
-Steering and follow-up queue input for a live runtime. Interrupt requests
-cancellation; it does not erase already committed files or external effects.
+Steering and follow-up queue input for a live runtime. Interrupt pauses the
+session: no new model request starts, running tools and subagents finish and
+keep their results, and the next message (or `unpause`) continues the work.
+Cancel stops the turn now, including running tools and processes, and may lose
+unfinished work. In the app, Esc or **Interrupt** pauses and **Cancel
+response** stops immediately. Neither erases already committed files or
+external effects.
 
 ## Indexed-File Memory
 
@@ -238,22 +267,22 @@ change still requires a fresh preview before it can be applied.
 
 For a selected file, **History & issues** saves named versions of its content
 and lists the versions it keeps. From there you can preview, restore, or save a
-version as a new file, add or release names, and review conflict and
-missing-copy records. For a folder, the same sheet, or **Saved versions** in the
-folder overview, lists versions saved from files in that folder, including
-deleted files that can be recovered. Internal commit generations are not saved
-versions. See [file content history](file-history.md#use-the-app) for details
-and the equivalent commands; automatic retention rules are configured with the
-CLI. **Run maintenance and refresh** requests ordinary DFS maintenance; it does
-not claim that the client performed a path-scoped repair.
+version as a new file, add or release names, and review missing-copy records.
+For a folder, the same sheet, or **Saved versions** in the folder overview,
+lists versions saved from files in that folder, including deleted files that
+can be recovered; **Show file** opens a listed file's current location.
+Internal commit generations are not saved versions. See
+[file content history](file-history.md#use-the-app) for details and the
+equivalent commands; automatic retention rules are configured with the CLI.
+**Run maintenance and refresh** requests ordinary DFS maintenance; it does not
+claim that the client performed a path-scoped repair.
 
 Use **Storage health** for the cluster-wide view. It keeps object/version
-counts, pending writes, bounded conflict and missing-copy lists, Cluster
-diagnostics, mount configuration, and reconciliation activity out of the
-everyday file list. Select **Show file** on a conflict to return to its folder
-before opening that item's guided history flow. Disaster-recovery operations
-such as rebuilding a lost repair queue or clearing fenced placement authority
-remain explicit operator commands; they are not ordinary Files actions.
+counts, pending writes, a bounded missing-copy list, and links to the Cluster
+view, mount settings, and reconciliation activity out of the everyday file
+list. Disaster-recovery operations such as rebuilding a lost repair queue or
+clearing fenced placement authority remain explicit operator commands; they
+are not ordinary Files actions.
 
 On supported desktop platforms, an operator can also mount a subtree through
 the host filesystem:
@@ -265,8 +294,8 @@ sinomo dfs mount /path/to/mount-point --root /sinomo
 The mount command stays attached while mounted. Use `--read-only` when write
 access is unnecessary, and choose a narrower SIFS root for everyday use. The
 [SIFS reference](../sifs.md) explains the namespace and placement policies;
-`sinomo dfs help` lists inspection, pinning, conflict, and repair
-commands.
+`sinomo dfs help` lists inspection, pinning, history, attachment, mount, and
+repair commands.
 
 On Windows, Cloud Files mounts are supervised by the main daemon and writable
 synchronization must be explicit:
@@ -277,11 +306,11 @@ sinomo dfs mount --status --json
 ```
 
 The same node-local mapping is available in the graphical app under
-**Settings > Modules > Cloud Files**. Set **Mount location** to the
+**Settings > Storage**. In **Mount settings**, set **Sync root** to the
 absolute host directory (for example `D:\sinomo`) and **SIFS root** to the DFS
-subtree to project (for example `/`). Enable local synchronization for a
-writable mount. The current supervisor supports one such mapping per node, and
-the read-only live mount status appears on the same module card.
+subtree to project (for example `/`). Enable **Durable writable cloud sync**
+for a writable mount. The current supervisor supports one such mapping per
+node, and the read-only live mount status appears on the same page.
 
 File Explorer continues to show Windows' standard Cloud Files availability and
 in-sync badges. For writable mounts it also shows **Waiting to upload**,

@@ -13,7 +13,7 @@ subsystem specifications.
 | Add a command, service, tool, provider, module, transport, backend, or test | [Extension points](extension-points.md) |
 | Configure model providers and understand their protocols, tools, and compatibility limits | [Model provider compatibility](provider-compatibility.md) |
 | Understand direct-link, connectivity, routed-stream, and object-RPC contracts | [Network architecture](../network-architecture.md) |
-| Understand the current migration-state object-RPC carriers and protocol v1 | [Network data-path reference](network-data-path.md) |
+| Understand the stream-native object-RPC data path, carriers, and flow-control bounds | [Network data-path reference](network-data-path.md) |
 | Integrate explicit file retention, content preservation, and restore | [DFS file history](dfs-file-history.md) |
 | Add resumable storage upgrades with old readers and current writers | [Durable storage migrations](storage-migrations.md) |
 | Choose unit, integration, formal, cluster, sandbox, and benchmark checks | [Testing and validation](testing.md) |
@@ -38,12 +38,13 @@ before a change that crosses crates or changes state ownership.
 | `modules/` | Leaf native modules and opt-in benchmark adapters. |
 | `specs/quint/` | Executable formal models, contracts, checks, and scenarios. |
 | `docker/` | Multi-node development and validation environments. |
+| `lints/` | Dylint architecture lints such as the DFS/KV access boundary. |
 | `scripts/` | CI, formal, debugging, and Android helpers. |
 | `docs/` | User guides, architecture, developer material, references, plans, evaluation guidance, and research notes. |
 
-The workspace currently has 68 members. Sixty-one default members build with
-plain `cargo build`; platform-specific applications, native module artifacts,
-and benchmark packages are opt-in.
+The workspace currently has 68 members. Sixty default members build with plain
+`cargo build`; the Android application, the FUSE mount, native module
+artifacts, and benchmark packages are opt-in.
 
 ## How to Read the Code
 
