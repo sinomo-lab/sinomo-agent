@@ -14,7 +14,7 @@ TARGET_DIR="${TARGET_DIR:-"${REPO_ROOT}/target"}"
 WORKDIR="${WORKDIR:-"${TARGET_DIR}/sinomo-build-tools-wasix-sysroot-work"}"
 SYSROOT_OUTDIR="${SYSROOT_OUTDIR:-"${TARGET_DIR}/sinomo-build-tools-wasix-sysroot/sysroot"}"
 HOST_ENV_OUT="${HOST_ENV_OUT:-}"
-SINOMO_WASIX_LIBC_SOURCE="${SINOMO_WASIX_LIBC_SOURCE:-"${REPO_ROOT}/crates/sinomo-sandbox/vendor/wasix-libc"}"
+SINOMO_WASIX_LIBC_SOURCE="${SINOMO_WASIX_LIBC_SOURCE:-"${REPO_ROOT}/modules/sandbox/wasix/vendor/wasix-libc"}"
 
 WASI_SDK_TARBALL="wasi-sdk-${WASI_SDK_VERSION_FULL}-${WASI_SDK_ARCH}-${WASI_SDK_OS}.tar.gz"
 WASI_SDK_URL="https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${WASI_SDK_VERSION}/${WASI_SDK_TARBALL}"
