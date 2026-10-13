@@ -46,10 +46,12 @@ the shared `ActiveNativeComponent` binding rather than another host-loader crate
    module, or UI action does not edit node-local consent. A component-only route
    must remain inaccessible through an ordinary daemon signer.
 3. Let `ComponentScope` own services and workers. Use its shutdown receiver,
-   `own_task`, and `defer` for process-local lifetime. Use `on_host_prepare` for
-   recovery that must complete before serving; choose start/ready edges according
-   to the dependency being established. Durable effects need durable compensation
-   or recovery, not just a destructor.
+   `own_task`, and `defer` for process-local lifetime, and `on_task_drain` to
+   join component-owned child registries before disposers release storage. Use
+   `on_host_prepare` for recovery that must complete before serving; choose
+   `on_host_start`/`on_host_ready` edges according to the dependency being
+   established. Durable effects need durable compensation or recovery, not just
+   a destructor.
 4. Preserve native invocation leases and cancellation through unload. Withdraw
    routes before draining work; distinguish logical unload, completed teardown,
    physical library release, and a quarantined instance requiring restart.

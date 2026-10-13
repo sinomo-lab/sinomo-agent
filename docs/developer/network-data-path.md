@@ -22,8 +22,15 @@ direct_link.rs and transport modules
 No payload-size branch selects another carrier. Relayed and direct calls use the
 same object-RPC protocol, and relays forward opaque routed-stream bytes.
 Persistent local `SLC1` carriers and every routed call use the owned-record
-path. Byte-stream adapters remain library compatibility and test boundaries;
-the daemon does not expose a second local RPC protocol.
+path.
+
+The daemon listener distinguishes three stream preludes: an authenticated
+direct-transport stream, a persistent local `SLC1` carrier accepted only from a
+loopback peer address, and one-call raw frames reserved for the pre-membership
+join challenge and signed join registration. Local-carrier calls carry an
+unauthenticated-local peer context and dispatch as local-node requests. Any
+other raw frame is rejected, so byte-stream adapters remain library
+compatibility and test boundaries rather than a second local RPC protocol.
 
 ## Call and Body Contracts
 
@@ -90,13 +97,13 @@ stream carries exactly one request and one response. The current resource
 bounds are:
 
 - 16 KiB maximum request or response control head;
-- 8 KiB inline-body allowance;
-- 256 KiB maximum data frame; and
-- 256 KiB receive window.
+- 8 KiB inline-body allowance; and
+- 256 KiB maximum data frame.
 
-These are resident-resource bounds, not total payload limits. Receive credit
-and bounded ownership rings apply backpressure across direct and relayed calls. The
-network layer does not spool application bodies to temporary files.
+These are resident-resource bounds, not total payload limits. Per-stream and
+per-carrier mux receive credit (below) and bounded ownership rings apply
+backpressure across direct and relayed calls. The network layer does not spool
+application bodies to temporary files.
 
 Record capacities are derived from the inside out. A 256 KiB body frame plus
 its nine-byte object prefix fits one mux record; that record plus its 17-byte
@@ -133,16 +140,20 @@ A small typed call is therefore a request head plus one owned data record, and
 likewise for its response; it does not add a redundant object-level finish
 record. Unknown-length producers send a finish record carrying the observed
 length. Object RPC does not compute or transmit a content digest. Inline byte
-bodies remain the explicit byte-compatibility form.
+bodies remain the explicit byte-compatibility form. When a sender knows a record
+is its last, the mux carries stream FINISH, and for a stream not yet opened its
+OPEN, in that same record rather than in separate control records.
 
 Data and control slabs use separate pools, per-connection and process byte
-limits, and bounded retained free lists. The owned mux has one persistent RX
-task and one TX task, stream slots backed by chunk rings, and deficit
-round-robin transmission across active streams. Receive credit is attached to
-the delivered chunk lease and returns only when the downstream consumer drops
-or transfers the chunk. Aggregated window returns, RESET, ready stream FINISH,
-and front-of-stream object-RPC control records are prioritized over body data
-without reordering records inside a stream.
+limits, and bounded retained free lists. The default limits are 32 MiB of data
+and 2 MiB of control slabs per connection, and 256 MiB of data and 32 MiB of
+control slabs per process. The owned mux has one persistent RX task and one TX
+task, stream slots backed by chunk rings, and deficit round-robin transmission
+across active streams. Receive credit is attached to the delivered chunk lease
+and returns only when the downstream consumer drops or transfers the chunk.
+Aggregated window returns, RESET, ready stream FINISH, and front-of-stream
+object-RPC control records are prioritized over body data without reordering
+records inside a stream.
 
 Current mux credit permits 64 MiB per stream and 512 MiB per carrier.
 Receivers aggregate ordinary stream and connection credit returns to 8 MiB and
@@ -183,12 +194,52 @@ to another protocol. Request and response completion use ordered framing and
 declared or observed lengths. Control payloads are canonical SOBJ bytes without
 an RPC authentication tag, signature, or checksum.
 
+## Request Sender Scheduling
+
+The canonical request sender first polls in its caller with the caller's waker;
+a ready result needs no sender task. A suspended sender moves its existing
+future, source, and writer into one abort-on-drop task owner, and early
+streaming responses keep their detachment rules. Immediate errors use the same
+delivery classifier as inline and suspended sends. Each body-frame production
+charges Tokio cooperative budget before obtaining the next chunk. That bounds
+ready production by the runtime's budget, not by wall time, and leaves record
+framing, FINISH, byte credit, progress, and payload-copy semantics unchanged.
+
+Network timeline request-task queue and poll points describe only the suspended
+remainder; request HEAD/DATA staging may precede them, and naturally ready
+senders have no task points. Transport readiness-to-consumption intervals can
+include application waits and do not prove executor or one-way network latency.
+
 ## Retry Boundary
 
-Object RPC reports whether an attempt was definitely not sent, completed, or
-possibly applied. Route selection may try another path only before returning a
-stream. A domain may retry a possibly applied operation only when it owns a
-stable operation identity and an idempotency or outcome contract.
+Object RPC reports whether an attempt was definitely not sent, rejected,
+completed, or possibly applied. Route selection may try another path only before
+returning a stream. A domain may retry a possibly applied operation only when it
+owns a stable operation identity and an idempotency or outcome contract.
+
+## Probe Process and Timing Contract
+
+The maintained `cluster.network.ping-benchmark` and
+`cluster.network.semantic-attachment-benchmark` probes select `MainDaemon`
+destination affinity through the fail-closed `/daemon/object-rpc/forward-main`
+route, so a shadow sharing the node identity cannot satisfy them. Their
+diagnostics record `destination_process_affinity=main-daemon`. Ordinary API
+callers keep `Any` affinity unless they explicitly select a process contract.
+
+Latency gates use the source daemon's measured inner forwarding interval, which
+covers route preparation, target RPC execution, and response forwarding. The
+full test-client proxy round trip is reported separately. Neither interval
+subtracts tracing or profiling overhead, and active diagnostics must capture the
+processes selected by the workload's affinity.
+
+Docker gates run the `debug+cpu-profiler` build with debugging, tracing, and CPU
+profiling enabled at unchanged thresholds, as required by the
+[performance analysis skill](../../skills/sinomo-performance-analysis/SKILL.md).
+The workspace dev profile builds the network, DFS, daemon, SOBJ codec, Observe,
+`tracing`, `tracing-core`, and `tracing-subscriber` packages at optimization
+level 2. Record the binary hash, source patch, and Cargo profile configuration
+with performance artifacts; a build without those overrides is a different build
+identity.
 
 ## Implementation Boundaries
 

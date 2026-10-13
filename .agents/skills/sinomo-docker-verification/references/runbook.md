@@ -55,6 +55,9 @@ These are narrower evidence, not substitutes for the full harness:
 | Formation only | `SINOMO_TEST_FORMATION_ONLY=1` with `docker/test-cluster.sh` |
 | Formation diagnostics | Enabled by default (`SINOMO_TEST_FORMATION_OBSERVE=1`); CPU capture defaults to all nodes |
 | DFS readiness/mutation/convergence | `SINOMO_TEST_DFS_READY_ONLY=1` |
+| Readiness plus the standard quiet gate, no mutation workloads | `SINOMO_TEST_QUIET_ONLY=1`, normally with reuse and build disabled |
+| Normal/history/restart/handoff/core-only correctness and history benchmarks | `SINOMO_TEST_DFS_ONLY=1`; standalone cases via [test-file-history.py](../../../../docker/test-file-history.py) `--case` |
+| Network readiness, bridge, restart and throughput cases | `SINOMO_TEST_NETWORK_CASES=<cases or smoke/recovery/performance>`; list with `SINOMO_TEST_NETWORK_LIST=1`; no build by default |
 | Ordinary committed writes, W=1/N=2 and W=2/N=3 | [measure-dfs-write-latency.py](../../../../docker/measure-dfs-write-latency.py), `--project`, `--binary`, `--profile`, `--artifacts`; runs both policies by default |
 | Network/KV baselines plus DFS readiness | `SINOMO_TEST_NETWORK_ONLY=1` |
 | Cluster KV measurements | [benchmark-cluster-kv.sh](../../../../docker/benchmark-cluster-kv.sh), `SINOMO_TEST_PROJECT`; writes `benchmark-results/cluster-kv/` |

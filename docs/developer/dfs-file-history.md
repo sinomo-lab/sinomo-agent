@@ -51,30 +51,24 @@ offset, total length, and returned range length on every response. Bytes are not
 rehashed on ordinary reads. Scrub verifies stored bytes; ingestion establishes
 their content address.
 
-The legacy SIFS `read_object_version` client call collects a complete result,
-but its service now resolves the current authority before reading. Only an
-exact current or explicitly retained version is admitted. Cached metadata,
-leftover manifests, and a supplied hash are not read authority. Internal
-content-store helpers remain available to typed repair and transfer paths;
-they are not public history interfaces.
+The older SIFS `read_object_version` client call collects a complete result,
+and its service resolves the current authority before reading. Only an exact
+current or explicitly retained version is admitted. Cached metadata, leftover
+manifests, and a supplied hash are not read authority. Internal content-store
+helpers remain available to typed repair and transfer paths; they are not
+public history interfaces.
 
-Explicit version reads use the resolved immutable descriptor without asking
-legacy conflict records to select its content. This applies to an exact current
-version as well as an explicitly retained version. The ordinary namespace read
-path retains its conflict handling. Both paths share the same local range reader
-and bounded remote transfer loop; immutable reads disable stale fallback and
-retain identity, hash-metadata, bounds, and length validation. Reading or restoring
-retained bytes does not itself clear legacy conflict records. Existing conflict
-maintenance can mark a record superseded after a new canonical restore commit.
+Explicit version reads use the resolved immutable descriptor, for an exact
+current version as well as an explicitly retained version. They share the
+ordinary read path's local range reader and bounded remote transfer loop;
+immutable reads disable stale fallback and retain identity, hash-metadata,
+bounds, and length validation.
 
-Operator clients (`sinomo-client::DfsOperatorClient` and the CLI's `app_api`
-test double) also expose `list_file_history`, `read_file_history`,
+Operator clients (`DfsOperatorClient` in `sinomo-client` and in the CLI's
+`app_api`) also expose `list_file_history`, `read_file_history`,
 `file_history_pin`, `file_history_policy`, and `restore_file_history` on the
-same browser history routes. The former `UseConflictVersion` inspection request
-is retained only to return a migration error: a metadata backend cannot
-implement content durability, conditional publication, or exact restore replay.
-CLI and app version selection use the durable restore API. Diagnostic
-conflict-record cleanup remains a separate explicit operation.
+same browser history routes. CLI and app version selection use the durable
+restore API; DFS has no separate conflict-record or version-selection path.
 
 The app's Files history sheet runs on the Files worker lane. For a file it
 inspects the current object, lists captures with an object filter, and reads
@@ -102,8 +96,9 @@ ordering, object snapshots and independent named pin roots.
 `DfsRetainedRevisionDescriptor` is the core's bounded, owner-checked descriptor
 for a revision, current object and live pins. History queries decode their
 module payload after that core authorization. Unknown module metadata remains
-preserved. Legacy typed history fields are migrated on decode; PackedV6 writers
-persist the generic representation. No separate content database is introduced.
+preserved. `sinomo-dfs-migration` converts legacy typed history fields into
+this generic representation; current DFS reads and writes only the generic
+form. No separate content database is introduced.
 
 The default policy is empty. An enabled subtree rule atomically captures
 outgoing content during successful content replacement or deletion. A stored
@@ -149,9 +144,9 @@ using history as a consistency fallback.
 
 ## Content Durability
 
-On PackedV3 shards, new data writes record `content_durability` alongside the
-immutable version: its data-write generation, coordinator provenance, desired
-replicas, and complete replication policy. Local single-replica batches record
+New data writes record `content_durability` alongside the immutable version:
+its data-write generation, coordinator provenance, desired replicas, and
+complete replication policy. Local single-replica batches record
 their validated receipt contract; these have no write-intent epoch and use zero.
 This field does not retain content or create a history entry. Metadata-only
 changes preserve it when content identity and its modification event are
@@ -164,45 +159,31 @@ GC keeps an unfinished data-write obligation while a current metadata successor
 still uses its content. Restoring that intent preserves the successor's current
 CAS head; it cannot rewind the namespace to the data-write generation.
 
-### Legacy Content
+### Content Without a Recorded Plan
 
-Explicit capture and re-pin can backfill a legacy version's plan from surviving
-committed writes, compact retry receipts, or an existing maintenance owner.
-An exact target version is valid evidence; a different metadata generation
-additionally requires matching immutable content and a shared nonempty
-modification event. Equal bytes or replica locations alone are insufficient,
-and conflicting recorded plans reject the capture. The recovered plan is part
-of the new capture/pin transaction; replay of older journal entries does not
-invent durability fields.
+Current DFS never infers a durability plan from surviving locations or older
+records. `sinomo-dfs-migration` converts retained legacy durability evidence;
+its import grants follow actual source membership and fresh durable copies. A
+historical or already retained version without a complete plan is rejected
+until storage conversion supplies one.
 
-Before preparing a rule-based overwrite, bulk replacement, or deletion, the
-metadata author can record the same recovered plan in a new version-only
-namespace transaction. It changes neither the current head nor the existing
-retention descriptor. The write prepare includes that journal prefix, and
-namespace prepares follow it, so publication authority requires the enriched
-prefix. The successful content mutation then captures the outgoing generation
-and its repair owner together. Disabled history policies do not scan legacy
-families, and assigned older codecs do not emit this enrichment.
-Every publication path, including batched single-replica writes, refreshes the
-current retention policy before preparing its mutation.
+A current visible file head without a recorded plan can still be captured.
+Explicit capture and rule capture establish a fresh grant under the current
+filesystem placement policy: the authority verifies the exact source bytes
+through bounded ingestion and obtains fresh durable acknowledgements from W
+selected replicas before recording the grant. Before preparing a rule-based
+overwrite, bulk replacement, or deletion, the author records that plan in a
+version-only metadata effect that changes neither the current head nor its
+retention descriptor; the successful content mutation then captures the
+outgoing generation and its repair owner together. Every publication path,
+including batched single-replica writes, refreshes the current retention
+policy before preparing its mutation.
 
-If no original plan can be recovered, explicit capture/re-pin and rule capture
-establish a fresh grant under the current filesystem placement policy. The
-authority verifies the exact source bytes through bounded ingestion and obtains
-fresh durable acknowledgements from W selected replicas before recording the
-grant. `current_policy_granted_at_unix_nanos` distinguishes this grant from
-recovered original-write evidence; it is audit metadata, not an authority flag.
-The V3 plan codec carries this optional field and the existing retained
-blob transfer authenticates copies. Replicas ignoring the audit field still
-enforce the same replica set and W/N.
-
-Failed copying cannot publish a capture or advance the namespace. Rule
-preparation may enrich an existing generation with durability evidence, but
-only successful replacement/deletion adds retention provenance. After capture,
-the ordinary retained repair owner preserves responsibility for N-W replicas.
-Partial transfers before capture can be repeated without creating a generation
-or a second filesystem head. Original conflicting evidence remains an error;
-fresh policy does not override a known guarantee.
+Failed copying cannot publish a capture or advance the namespace; only
+successful replacement or deletion adds retention provenance. Partial
+transfers before capture can be repeated without creating a generation or a
+second filesystem head. After capture, the ordinary retained repair owner
+preserves responsibility for N-W replicas.
 
 ## Repair Ownership and Garbage Collection
 
@@ -229,10 +210,9 @@ already-read filesystem policy when deciding whether this work is needed.
 For a capture of an intent's target generation, GC journals a separate committed
 `RetainedRepair` owner before compacting the full intent or evicting its retry
 receipt. Re-pinning can also create this owner from a still-available receipt.
-It prefers the version's recorded durability plan and can use an exact legacy
-write witness when that field is absent. It never infers N from current
-locations. Owner creation consumes the GC mutation budget; a budget of
-one publishes the prerequisite and leaves compaction for a later pass.
+The owner requires the version's recorded durability plan and never infers N
+from current locations. Owner creation consumes the GC mutation budget; a budget
+of one publishes the prerequisite and leaves compaction for a later pass.
 
 The owner cannot enter a write-publication route or become a user retry receipt.
 GC keeps its durability plan while retained version metadata exists without
@@ -250,9 +230,9 @@ execution without request admission uses the timestamp in a generated ordered
 operation ID. Expired identities never acquire a new wall-clock timestamp to
 escape a GC fence; legacy opaque identities retain conservative expiry.
 Each DFS component startup or activation requests authoritative reconciliation
-of metadata-owned obligations with the node-local queue. The old one-time
-queue migration marker no longer suppresses this recovery. Reconciliation
-generations are not reused after completion, and a queue-persistence failure
+of metadata-owned obligations with the node-local queue; no completion marker
+suppresses this recovery. Reconciliation generations are not reused after
+completion, and a queue-persistence failure
 requests reconciliation while the process is still running. These are startup,
 activation, and failure edges; ordinary reads and idle wakes do not scan history.
 
@@ -311,53 +291,30 @@ operation evidence fails closed rather than repeating an uncertain write.
 
 ## Compatibility and Verification
 
-History mutations require PackedV6 metadata prepares and the advertised
-`dfs.metadata.namespace-prepare.packed.v6` capability before any pin publication or
-local-content consumption. Retained publication has distinct
-wire variants that older peers cannot silently interpret as canonical writes.
-Codec and publication-purpose checks apply before durable authoring and replay.
-An authoritative current-object query may run on earlier shard codecs without
-enabling retention authoring there. PackedV3/V4/V5 history and durability records
-remain readable through the generic migration layer. New prepares containing
-namespaced retention or module metadata require PackedV6 capability on every
-assigned metadata peer; persisted codec selection never downgrades a shard's
-contract. Ordinary operations retain the admission rules of their negotiated
-codec and cannot silently emit unsupported extension records.
+History mutations use the current V7 prepare/commit family. Metadata-shard
+configuration admission requires the `dfs.metadata.prepared-operation.v7`
+capability on every assigned peer, so incompatible daemons must be upgraded
+before they participate. Retained publication has distinct wire variants that
+cannot be interpreted as canonical writes, and publication-purpose checks apply
+before durable authoring and replay.
 
-The original PackedV3 increment introduced captures, transactional pins,
-retained repair owners and durability plans. PackedV6 replaces the feature-typed
-retention columns with generic namespace maps and opaque module metadata.
-Legacy, V1 and V2 stores retain their read/replay support. Complete the normal
-capability-validated upgrade before admitting new retention mutations; a stored
-capture or an earlier history capability alone is not authoring authority.
+Retained storage formats, including earlier typed history columns, durability
+plans and snapshot containers, are converted by `sinomo-dfs-migration` through
+the shared [durable migration framework](storage-migrations.md). The DFS runtime
+opens only current storage. Conversion requires no filesystem reset or
+file-content rewrite; it preserves captured versions, pins, restore receipts
+and repair ownership, and never invents history or changes the canonical file
+head. A stored capture alone is not authoring authority.
 
-Physical metadata snapshot migration is handled by the shared
-[durable migration framework](storage-migrations.md). It converts old local
-snapshots while readers accept old formats and foreground writes continue in
-the active journal suffix. No filesystem reset or file-content rewrite is
-required. Migration preserves captured versions, pins, restore receipts and
-repair ownership; it never invents history or changes the canonical file head.
-Before admitting a new namespaced retention or metadata effect, the local
-metadata owner durably requests and installs snapshot reader floor six. The
-checksummed record-stream container remains `SMIGLOG1`; its inner format and
-generation bind the new reader requirement. Older readers reject that header
-before reading tables. Large snapshots use the existing bounded migration
-driver, and extension authoring waits for installation while compatible
-ordinary writes continue through the active suffix. The maintained migration
-verifier checks the inner header and generation on every node before and after
-process restart, validates observed local migration jobs, and requires a
-completed bounded floor-six migration somewhere in the cluster. Authenticated
-snapshot repair can install a checked floor-six snapshot directly without a
-second local migration.
-
-Focused regressions live in
+Focused regressions live in the history crate's
 [`core_integration_tests.rs`](../../crates/sinomo-dfs-history/src/core_integration_tests.rs)
-and
-[`src/metadata_backend/tests/file_history.rs`](../../crates/sinomo-dfs/src/metadata_backend/tests/file_history.rs).
-They cover capture ordering and expiry, W rejection and N-W repair, original
-plan recovery and fresh legacy grants, restore cancellation and reopen, exact
-replay, GC, and compatibility. Related protocol and retention tests cover
-authority transfer, promoted mutation lanes, and repair-owner collection.
+and [`tests.rs`](../../crates/sinomo-dfs-history/src/tests.rs), with core
+retention and collection planning in
+[`metadata_history_gc.rs`](../../crates/sinomo-dfs/src/metadata_history_gc.rs).
+They cover capture ordering and expiry, W rejection and N-W repair, fresh
+current-policy grants, restore cancellation and reopen, exact replay, GC, and
+authority handoff. Retained-format conversion is tested in
+`sinomo-dfs-migration`.
 
 Run the affected crate suites and trust-boundary checks:
 

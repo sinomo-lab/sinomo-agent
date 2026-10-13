@@ -3,8 +3,9 @@
 This reference covers Sinomo's model providers, configuration, wire protocols,
 tools, and compatibility boundaries. The general provider review dates to
 2026-09-18; Codex tools, DeepSeek, Gemini, Grok, and Kimi were updated on
-2026-09-26. Provider-specific source revisions and dates appear below. Hosted
-media interfaces retain their existing APIs.
+2026-09-26, and GPT-6 and Claude 5.5 support on 2026-09-30. Provider-specific
+source revisions and dates appear below. Hosted media interfaces retain their
+existing APIs.
 
 - [Provider coverage](#provider-coverage)
 - [Protocol ownership and continuation](#protocol-ownership-and-continuation)
@@ -35,6 +36,11 @@ media interfaces retain their existing APIs.
 | Ollama / LM Studio | Existing installed/local model discovery and defaults retained | Both Responses paths preserve native calls and continuation state. |
 | Claude Code | CLI-owned model selection retained; current Claude context inference shared | Existing effort flags and host-permission checks retained. |
 
+Builds with the off-by-default `scripted-provider` feature also accept the
+`scripted` provider id, which replays a JSON model script for deterministic
+agent and daemon tests; see
+[Agent tests without a model](testing.md#agent-tests-without-a-model).
+
 Live discovery determines availability. Built-in lists are configuration
 suggestions, and an explicitly configured custom model stays selectable.
 Discovery errors are surfaced instead of returning an invented one-model
@@ -60,7 +66,9 @@ ordinary conversation and tool evidence.
 Messages, GenerateContent, Responses and Chat Completions streams require their
 terminal event. A connection ending after partial text or tool arguments returns
 a provider failure, preventing the runtime from treating that response as a
-completed turn.
+completed turn. Providers that stream through the shared server-sent-events
+reader check the request's cancellation before each line; a cancelled request
+drops the HTTP response and fails rather than completing.
 
 ## Controls
 

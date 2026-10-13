@@ -15,12 +15,14 @@ The Quint tree is organized by role instead of a flat list of executable
 modules:
 
 - `specs/quint/lib/` contains shared finite vocabulary such as nodes, quorum
-  helpers, `Option`, membership roles, and membership projection helpers.
+  helpers, `Option`, membership roles, membership projection helpers, and
+  bounded logical network time.
 - `specs/quint/models/` contains algorithm transition systems. Model modules
   own state variables, helper projections, `init`, `step`, and domain actions.
   They intentionally do not define the executable `safety` invariant.
 - `specs/quint/contracts/` contains reusable guarantee predicates consumed by
-  higher layers. This includes timed delivery predicates and the full-system
+  higher layers. This includes timed delivery predicates, the local-first
+  canonical projection and typed reconciliation permit, and the full-system
   integration guarantees over the shared system model.
 - `specs/quint/checks/` contains invariant suites. Each check imports one model
   plus the shared vocabulary it needs, defines the invariant predicates, and
@@ -53,38 +55,62 @@ The model inventory is split by subsystem:
   `contracts/system/guarantees.qnt` defines the layered guarantee predicates,
   and `scenarios/system/smoke.qnt` composes them for randomized whole-system
   exploration.
-- `models/dfs/` contains the DFS slices: metadata authority, ordinary canonical
-  write eligibility across partitions and shard reconfiguration, immutable
-  per-attempt authority/daemon snapshot reuse, exact-union
-  membership-handoff sync and prompt maintenance triggering, authority routing,
-  read freshness, routed namespace freshness, POSIX namespace/link/cross-shard
-  behavior, whole-file advisory locks, file and directory sync barriers,
-  lock-holding operation recovery across partitions, opt-in local-first file
-  branches and same-shard namespace reconciliation, a local directory
-  durability companion, a typed one-shard reconciliation publication gateway,
-  direct file/namespace terminal-action compositions with that gateway, local
-  failover-target selection,
-  namespace transaction publication, two-object parent/child namespace-planner
-  equivalence, immutable namespace-expectation snapshot validation, active
-  namespace-prepare footprint-index equivalence, same-instance metadata
-  journal-tail recovery, crash/reopen repair
-  of a stale persisted journal head, completed-handoff lane rebinding across
-  marker-equal and contiguous post-activation prefixes, exact-prefix authority-
-  acknowledgement admission and repair, purpose-separated direct/routed
-  handoff probe backend selection, directory-tombstone sparse-overlay
-  equivalence, coordinator intent-index and receipt-bucket equivalence, sharded
-  namespace routing,
-  namespace-command replay and cancellation, metadata journal source
-  validation, repair authorization, replication policy, no-conflict
-  serialization, pending request lifecycle, repair content validation,
-  quorum-aware stage/repair/promotion scheduling across the `W` response
-  boundary, lost-authority repair suppression, and local content anti-entropy.
-  Matching invariant entrypoints live under `checks/dfs/`; deterministic
-  advisory-lock fencing, file-sync recovery, directory-generation barriers,
-  complete-holder/quorum-repair partitions, local-first reconciliation,
+- `models/dfs/` contains the DFS slices, named here by file stem:
+  - metadata authority, publication, and routing: `metadata`,
+    `canonical_write_eligibility`, `whole_shard`,
+    `operation_authority_snapshot_reuse`, `authority_routing`,
+    `read_freshness`, `routed_namespace_freshness`,
+    `metadata_primary_failover` (local failover-target selection), and
+    `no_conflict`;
+  - metadata journal and storage: `metadata_journal_source`,
+    `metadata_journal_tail_recovery`, `metadata_stale_head_reopen`,
+    `metadata_ack_floor_log`, `authored_journal_batch`,
+    `initial_prepare_batch`, `metadata_routing_hint_recovery`,
+    `packed_index_append_batching`, and `metadata_checkpoint_fanout`;
+  - shard handoff and replica catch-up: `metadata_handoff_union_sync`,
+    `metadata_handoff_desired_catchup`, `metadata_handoff_maintenance_trigger`,
+    `metadata_handoff_lane_rebind`, `metadata_handoff_probe_backend_selection`,
+    `metadata_authority_ack_prefix_validation`,
+    `metadata_retiring_lane_replica_ingest`,
+    `metadata_primary_handoff_activation`,
+    `metadata_primary_handoff_cursor_preflight`,
+    `replication_plan_freshness`, and `replica_projection_refresh`;
+  - namespace transactions: `namespace_transaction`,
+    `namespace_transaction_body_transport`, `namespace_planner_equivalence`,
+    `namespace_expectation_snapshot_validation`,
+    `namespace_prepare_footprint_index_equivalence`,
+    `namespace_tombstone_overlay_equivalence`,
+    `namespace_create_transaction_identity`, `namespace_command_replay`, and
+    `sharded_namespace_transaction`;
+  - POSIX facade: `posix_namespace`, `posix_links`,
+    `posix_cross_shard_namespace`, `posix_read_write_visibility`,
+    `posix_advisory_locks`, `posix_fsync`, and `posix_partitioned_operation`;
+  - opt-in local-first branches: `local_first_file_branch`,
+    `local_first_namespace`, `local_first_namespace_durability`,
+    `local_first_reconcile_gateway`, `local_first_file_gateway_composition`,
+    and `local_first_namespace_gateway_composition`;
+  - coordinator, content, and repair: `intent_index_equivalence`,
+    `receipt_bucket_equivalence`, `replication_policy`,
+    `requester_prestage_binding`, `content_binding_publication`,
+    `content_binding_lifecycle`, `content_accounting_derived_stats`,
+    `content_catalog_causal_cut`, `pending_request_lifecycle`,
+    `repair_authorization`, `repair_content_validation`,
+    `replica_quorum_fanout`, `replica_promotion_outbox`,
+    `repair_lost_authority`, `repair_queue_refresh`, `bounded_intent_scan`,
+    and `anti_entropy`;
+  - daemon scheduling: `metadata_shard_concurrent_dispatch` and
+    `daemon_read_blocking_admission`.
+
+  Each model has a matching `checks/dfs/<stem>_safety.qnt` invariant suite.
+  `scenarios/dfs/` holds deterministic canonical-write handoff and
+  quorum-fallback traces, the nine registered whole-shard scenarios,
+  pending-read identity, advisory-lock fencing, file-sync and
+  directory-generation recovery, complete-holder/quorum-repair partitions,
+  cross-shard retry exhaustion, local-first file/namespace reconciliation,
   local directory-durability recovery, reconciliation-gateway crash/fencing,
-  composed branch/gateway crash and outcome traces, and retry-exhaustion traces
-  live under `scenarios/dfs/`.
+  and composed branch/gateway traces. `whole_shard_metadata_content.qnt` is
+  not registered with the harness; `scripts/formal/test-shard-trace.py` uses
+  it as a model-sensitivity witness.
 
 This maps to the repository boundary documented in
 `docs/clustering-architecture.md` and `docs/network-architecture.md`:
@@ -211,9 +237,10 @@ protocol slice:
 - crash/restart preserves durable term, vote, and log state.
 
 This maps to `RaftRequestVoteRequest`, `RaftAppendEntriesRequest`,
-`ClusterKvRaftStore::request_vote`, the AppendEntries preparation/application
-path, `build_append_entries_request_from_next_index`, quorum replication and
-commit helpers, and the persisted hard-state/log load path in `sinomo-kv`.
+`ClusterKvRaftStore::apply_vote`, `DurableRaftKvNode::request_vote`, the
+AppendEntries preparation/application path,
+`build_append_entries_request_from_next_index`, quorum replication and commit
+helpers, and the persisted hard-state/log load path in `sinomo-kv`.
 Three documented reachable protocol cuts expose divergent suffix repair and
 leader-change safety without requiring every setup transition in the same
 trace. All ten branch witnesses are exercised by deterministic randomized
@@ -545,17 +572,23 @@ sequence subtraction. Complete transaction visibility must be checked from
 actual rows, not inferred from a commit label. Missing, dropped, discontinuous,
 truncated, unsupported or unresolved observations fail availability; only
 observed transitions proven irrelevant to every modeled field may stutter.
-The shared verifier `scripts/formal/check-shard-trace.py` validates the versioned
-`scripts/formal/shard-trace-v1.schema.json` envelope and checks a complete finite
-boundary with actual enabled Quint actions and `.expect` on independently
-observed post-state. It requires the complete terminal cursor, so a safe
-but disabled prefix fails. Both the transition model and its invariant suite
-are included in the `model_sha256` binding. Native u64 values use checked
-canonical decimal strings. `scripts/formal/test-shard-trace.py` exercises this
-boundary and explicitly labels its generated inputs as synthetic sensitivity
-tests. The native held-table/initial-cut/atomic-footprint projector remains
-unavailable until the actual Rust hooks supply that complete semantic evidence;
-the verifier therefore cannot currently return native conformance success.
+The shared verifier `scripts/formal/check-shard-trace.py` validates the
+versioned `scripts/formal/shard-trace-v1.schema.json` envelope and checks a
+complete finite boundary with actual enabled Quint actions and `.expect` on
+independently observed post-state. It requires the complete terminal cursor,
+so a safe but disabled prefix fails. Both the transition model and its
+invariant suite are included in the `model_sha256` binding. Native u64 values
+use checked canonical decimal strings. The verifier requires artifact and
+source manifests (checked by `native-artifact-binding.py`) and derives every
+state through `shard-native-projector.py` from held native tables, certified
+cuts and retained observations; it rejects externally supplied finite states.
+The capture side (`collect-shard-native-inputs.py`,
+`build-shard-native-skeleton.py`, `assemble-shard-native-trace.py`, and the
+`shard-native-*.py` and `native-json-subtree.py` adapters) packages output
+of the Rust `native_shard_trace` hooks and never constructs model state.
+Missing held-table, initial-cut or atomic-footprint evidence is reported
+unavailable. `scripts/formal/test-shard-trace.py` exercises this boundary and
+explicitly labels its generated inputs as synthetic sensitivity tests.
 
 Model-generated traces establish checker sensitivity only. Until a complete
 native Rust trace passes that replay boundary, this remains a target contract.
@@ -613,6 +646,18 @@ the daemon-side discovery rule that schedules that reconcile:
 
 This trigger model changes only scheduling. It reuses the exact-union and
 canonical fence assumptions above and does not assert transport fairness.
+
+The `dfs_metadata_handoff_desired_catchup_safety.safety` invariant
+(`dfs-metadata-handoff-desired-catchup`) covers a desired-only member that
+starts behind the frozen retiring prefix. The old receiver admitted an exact
+prefix probe but rejected the contiguous journal suffix needed to make that
+probe eligible, so the handoff could stay frozen. The hardened rule treats the
+exact pending handoff as a scoped replica-ingest permit: only the retiring
+primary's contiguous frozen suffix for that filesystem, epoch, shard, and
+desired member is accepted, and missing-handoff, other-member, forged-source,
+stale-epoch, foreign-filesystem, and noncontiguous batches reject. The permit
+binds no author authority; activation still needs the exact-prefix
+acknowledgement and handoff proof.
 
 The `dfs_metadata_handoff_lane_rebind_safety.safety` invariant isolates the
 process-local reopen boundary after a completed handoff. Cluster activation and
@@ -736,6 +781,30 @@ snapshot record family must also belong to that permit's filesystem. Object-RPC
 signer identity, in-service transport identity, wire filesystem/epoch identity,
 and routed response dispatch/current assignment equality are checked before
 that permit is constructed.
+
+Two small target-hardening slices cover background replica maintenance.
+`dfs-replication-plan-freshness` races background replication with
+foreground authority acknowledgements: a delivery hint may retire obsolete
+work but never acknowledges a probe, a rejected plan retries without a
+snapshot when the primary has advanced, and unchanged divergence still
+reaches snapshot repair. `dfs-replica-projection-refresh` lets a requester
+observe replica progress written by another local handle; the notice is only
+a hint, and dispatch requires the cursor and namespace guards to be replaced
+together from exact durable history under the current authority epoch.
+Transport, disk failure, payload replay, and concurrent threads remain Rust
+test obligations.
+
+The complementary content-binding slices are target refinements for small
+content bindings. `dfs-content-binding-publication` publishes one complete
+frame containing payload, exact manifest, and causal reservation with one
+sync: a visible record after a failed sync is not certified, reopen validates
+and synchronizes the surviving complete prefix, a torn tail truncates while a
+complete malformed record fails closed, and index loss is rebuilt from
+durable records. `dfs-content-binding-lifecycle` owns generations: layout
+activation waits for admitted legacy writers and GC to drain, stale handles
+cannot write the new layout, compaction keeps held readers on their old
+generation until release, and new acknowledgements wait for directory
+durability. Domain GC permission, freshness, and grace are explicit inputs.
 
 The `dfs_content_accounting_derived_stats_safety.safety` invariant separates
 authoritative quota admission from rebuildable observability counters. A status
@@ -926,9 +995,16 @@ The `dfs_authority_routing_safety.safety` invariant combines these properties:
 - self-routes stay disabled;
 - late or mismatched responses are observations only.
 
-This maps to routed namespace response settlement, refreshed dispatch-shard
-corroboration, `lookup_sifs_path_distributed_synced`, and the
-`sifs_routed_*_authority_redirect` integration tests. The foreign affected
+This maps to routed namespace response settlement
+(`validate_routed_namespace_authority_redirect`), refreshed dispatch-shard
+corroboration (`refreshed_primary_after_authority_redirect`), and
+`lookup_sifs_path_distributed_synced`. The former
+`sifs_routed_*_authority_redirect` integration tests were removed in the
+October 2026 publication consolidation (merge `c8c8ab71`). The remaining
+redirect regression is
+`native_stale_authority_redirect_keeps_original_identity_after_lost_reply`;
+no current focused test covers grouped-shard corroboration or the live-hit
+fallback. The foreign affected
 shard abstracts the destination half of a coordinated multi-shard operation;
 it does not bypass that coordinator's own protocol. The model does not prove
 progress: a route may time out, hit the redirect limit, or fail because the
@@ -946,12 +1022,14 @@ The `dfs_namespace_transaction_safety.safety` invariant combines these propertie
 - first-publication transactions are unique per object;
 - recovery/replay observations refer only to recorded transactions.
 
-This maps to `NetworkedDfsService::commit_visible_version_in_metadata_backend`
-for the `backend.get_object(...).is_none()` path, the
-`DfsNamespaceTransaction { objects, versions }` record shape, and the namespace
-transaction table planners used by normal apply and recovery. It intentionally
-models a single shard-local transaction; the sharded backend's routing of
-objects and versions to per-shard transactions is a separate layer.
+This maps to the first-visible-create branch of
+`NetworkedDfsService::apply_committed_intent` (the
+`backend.get_object(...).is_none()` test), which publishes through
+`commit_ready_intent_batched` and the backend's V7 `commit_prepared_operation`;
+the `DfsNamespaceTransaction { objects, versions }` record shape; and the
+namespace transaction table planners used by normal apply and recovery. It
+intentionally models a single shard-local transaction; the sharded backend's
+routing of objects and versions to per-shard transactions is a separate layer.
 
 The `dfs_namespace_planner_equivalence_safety.safety` invariant is a bounded
 target-hardening proof for removing a metadata hot-path clone and replay:
@@ -990,11 +1068,11 @@ expectations from one immutable shard-table snapshot:
 - an exact relevant projection cannot be falsely rejected.
 
 This maps to `namespace_prepare_expectations` and the
-`validate_namespace_prepare_expectations` call under the shard write lock in
-`commit_prepared_namespace_transaction`. The bounded slice covers one object,
-one path, and distinct non-restored conflicting values. It does not model ABA,
-wider transaction footprints, overlapping prepares, owner-epoch fencing,
-journal durability, or namespace materialization.
+`validate_namespace_prepare_expectations` call under the consumed publication
+guard's metadata lock in `commit_prepared_operation_owned`. The bounded slice
+covers one object, one path, and distinct non-restored conflicting values. It
+does not model ABA, wider transaction footprints, overlapping prepares,
+owner-epoch fencing, journal durability, or namespace materialization.
 
 The `dfs_namespace_prepare_footprint_index_equivalence_safety.safety`
 invariant is a bounded refinement proof for replacing the retained prepare-
@@ -1022,16 +1100,19 @@ direct owner lookups. Wider footprint sets, normalization conformance, payload
 equality, persistence rollback, expectation validation, and epoch fencing are
 unchanged prerequisites or follow-up refinements.
 
-The Rust refinement maintains set-valued object/path owners incrementally on
-`PutNamespacePrepare`, removes the prior state before exact-id replacement, and
-rebuilds the derived maps after preapplied table rollback. Both structured
-snapshot loading and table-log replay already hydrate through the same table-op
-application path. Focused regressions compare indexed decisions with a test-
-only history-scan oracle across object/path conflict, disjoint acceptance,
-same-operation retry, cross-filesystem isolation, commit/abort release, and
-rollback; a separate counter asserts that ordinary backend admission never
-calls the oracle. A snapshot-then-log-replay reopen regression checks active
-reconstruction followed by terminal release.
+The Rust refinement maintains set-valued object/path owners incrementally when
+a `PutPreparedOperationV7` table operation installs a prepared record
+(`put_prepared_operation_indexed`), releases them when a record leaves
+`Prepared` or is evicted, removes the prior state before exact-id replacement,
+and rebuilds the derived maps after snapshot loading and preapplied table
+rollback. `PutPreparedOperationV7` replaced the earlier `PutNamespacePrepare`
+mutation when metadata publication collapsed onto
+`PrepareOperationV7`/`CommitPreparedOperationV7` (merge `c8c8ab71`). The
+tables still carry a test-only history-scan oracle
+(`namespace_prepare_footprint_indexes_match_history`) and admission counter,
+but the focused reference-equivalence and snapshot-then-log-replay reopen
+regressions that used them were removed in that merge, so this index
+currently has no Rust differential test.
 
 The `dfs_metadata_journal_tail_recovery_safety.safety` invariant isolates
 same-instance recovery after that durable-journal/table-materialization cut:
@@ -1109,9 +1190,10 @@ sparse intent indexes:
   filesystems, and each target-claim set equals the retained
   awaiting-or-committed history;
 - reference scan results and indexed lookup results agree for every bounded
-  full key and target, and the filesystem-agnostic `has_open` and
-  `has_awaiting_target` helpers agree for every object id and target after
-  start, commit, abort, and failed-start rollback;
+  full key and target, and the filesystem-agnostic
+  `has_open_intent_for_object` and `has_awaiting_intent_targeting` helpers
+  agree for every object id and target after start, commit, abort, and
+  failed-start rollback;
 - commit removes the awaiting-object lookup but retains the target claim, since
   the current implementation rejects exact duplicates of historical committed
   intents;
@@ -1197,20 +1279,28 @@ properties:
   states;
 - idempotent target replay does not create a second visible path.
 
-This maps to `LocalShardedMetadataBackend::apply_namespace_transaction`,
-`write_transaction_object_shard_indexes`, `put_cross_shard_tombstone`,
-`object_is_visible_from_shard`, `get_object_by_path`, the service-level
-`lookup_metadata_path_raw` overlay, and routed namespace redirect settlement,
-plus regression tests
-`sharded_backend_keeps_source_namespace_when_cross_shard_target_transaction_fails`
-and `sharded_backend_hides_stale_source_path_when_cross_shard_tombstone_fails`.
-The model deliberately tracks an implementation nuance that is not covered by
-the current Rust tests: if the target shard transaction succeeds but the
-object-shard index write fails, the API reports failure and sharded lookup still
-resolves to the old source object while the target row remains hidden until an
-explicit retry writes the index. This is not modeled as a safety violation, but
-it is a recovery/operability gap to revisit if we want automatic convergence
-after router-local index write failures.
+This maps to `LocalShardedMetadataBackend::commit_prepared_operation`, which
+publishes the shard-local V7 operation and then runs
+`reconcile_object_shard_indexes`; `object_is_visible_from_shard`;
+`get_object_by_path`; the service-level `lookup_metadata_path_raw` overlay;
+the cross-shard job's `publish_cross_shard_source_eviction`; and routed
+namespace redirect settlement. The regression
+`routed_mkdir_all_prefers_live_path_shard_over_late_source_tombstone`
+covers a retired-source tombstone losing to the live path-selected row after a
+move and mkdir-all. The earlier backend helpers
+(`apply_namespace_transaction`, `write_transaction_object_shard_indexes`,
+`put_cross_shard_tombstone`) and their target-failure and tombstone-failure
+regressions were removed in the October 2026 publication consolidation (merge
+`c8c8ab71`), so those failure cuts currently have no focused Rust test.
+
+The model deliberately tracks a nuance of the former implementation: if the
+target shard transaction succeeded but the object-shard index write failed,
+the API reported failure and sharded lookup still resolved to the old source
+object while the target row stayed hidden until an explicit retry wrote the
+index. Whether the V7 publish-then-reconcile path retains that window has not
+been re-verified. It is not modeled as a safety violation, but it is a
+recovery/operability gap to revisit if we want automatic convergence after
+router-local index write failures.
 
 The replica extension is bounded to one moved object, the root/services shard
 pair, and one mkdir-all observation. It proves visibility precedence and safe
@@ -1275,12 +1365,16 @@ The `dfs_repair_authorization_safety.safety` invariant combines these properties
 - missing local object metadata and missing command metadata is rejected.
 
 This maps to `NetworkedDfsService::ensure_replica_command_authorized_with_metadata`
-and the regression tests `repair_command_accepts_current_replica_after_metadata_primary_moves`,
-`repair_command_accepts_metadata_primary_for_stored_intent`,
+and the regression tests
+`repair_command_accepts_current_replica_after_metadata_primary_moves`,
 `repair_command_accepts_newer_authority_shard_when_receiver_view_is_stale`, and
-`repair_command_rejects_unknown_object_from_non_primary_metadata_source`. It
-does not model the later content-hash check, conflicting pending-write check, or
-lost-authority retry suppression after a repair response.
+`repair_command_rejects_unknown_object_from_non_primary_metadata_source`. The
+former stored-intent regression
+(`repair_command_accepts_metadata_primary_for_stored_intent`) was removed in
+merge `c8c8ab71`, so the stored-intent metadata-primary branch currently has
+no focused Rust test. The model does not cover the later content-hash check,
+conflicting pending-write check, or lost-authority retry suppression after a
+repair response.
 
 The `dfs_replication_policy_safety.safety` invariant combines these properties:
 
@@ -1300,11 +1394,11 @@ This maps to `DfsReplicationPolicy::new`, `validate_replication_plan`,
 `DistributedEventualCoordinator::record_durable_receipt`,
 `DistributedEventualCoordinator::commit_intent`, and
 `DistributedEventualCoordinator::rebuild_repair_jobs`. It also reflects the
-service-level checks in
-`NetworkedDfsService::apply_committed_intent_with_repair_mode` and
-`NetworkedDfsService::stage_missing_desired_replicas_for_intent`. The model does
-not prove repair progress, placement ranking, owner-inclusion normalization,
-transport delivery, content-hash validation, or retry timing.
+service-level checks in `NetworkedDfsService::apply_committed_intent`, which
+retains the pending write's effective repair mode, and
+`NetworkedDfsService::stage_missing_desired_replicas_for_intent`. The model
+does not prove repair progress, placement ranking, owner-inclusion
+normalization, transport delivery, content-hash validation, or retry timing.
 
 The `dfs_no_conflict_safety.safety` invariant combines these properties:
 
@@ -1321,12 +1415,13 @@ The `dfs_no_conflict_safety.safety` invariant combines these properties:
 
 This maps to `DistributedEventualCoordinator::validate_new_intent`,
 `NetworkedDfsService::ensure_no_backend_pending_write_intent`,
-`NetworkedDfsService::commit_visible_version_in_metadata_backend`, and
+the visible commit in `NetworkedDfsService::apply_committed_intent` and
+`commit_stored_prepared_operation`, and
 `NetworkedDfsService::reconcile_stale_write_intents_bounded`. It also reflects
-the architecture rule in `docs/dfs-architecture.md` that conflict records are
-reserved for future split-cluster recovery. The model does not cover the future
-split-recovery action, path-level POSIX conflict surfacing, or request-map
-cleanup.
+the rule in `docs/dfs-architecture.md` that the canonical DFS has no
+conflict-record path; conflict classification belongs only to the
+unimplemented local-first extension. The model does not cover that extension,
+path-level POSIX conflict surfacing, or request-map cleanup.
 
 The `dfs_posix_advisory_locks_safety.safety` invariant is a target-hardening
 contract for a bounded whole-file advisory-lock manager:
@@ -1748,10 +1843,15 @@ This maps to `NetworkedDfsService::handle_namespace_request`,
 metadata backend's namespace-request table, process restart, and fresh
 request-id allocation. Named witnesses cover exact completed replay,
 changed-payload rejection, cancellation, completed replay after restart, and
-automatic interrupted-`Pending` recovery. The Rust regressions
+automatic interrupted-`Pending` recovery. The Rust regression
 `durable_namespace_exact_retry_replays_completed_rename_and_rejects_id_reuse`
-and `durable_pending_namespace_request_recovers_automatically_after_restart` cover
-the two restart-sensitive paths.
+covers exact replay and id-reuse rejection, and
+`native_namespace_request_replay_survives_actual_primary_restart` covers
+completed replay across a primary restart. Startup and maintenance recovery
+runs through `recover_pending_namespace_requests_bounded`, but the former
+interrupted-`Pending` regression
+(`durable_pending_namespace_request_recovers_automatically_after_restart`) was
+removed in merge `c8c8ab71` and has no current replacement.
 
 The `dfs_repair_content_validation_safety.safety` invariant combines these properties:
 
@@ -1780,15 +1880,17 @@ The `dfs_repair_content_validation_safety.safety` invariant combines these prope
 
 The pre-existing receipt-validation portion maps to
 `NetworkedDfsService::put_metadata_receipt`,
-`NetworkedDfsService::mark_repaired_location`,
 `NetworkedDfsService::record_local_pending_write_receipt_if_desired`,
 `NetworkedDfsService::handle_stage_blob_response`,
 `NetworkedDfsService::ensure_stage_response_matches_pending`,
 `NetworkedDfsService::handle_repair_replica_response`,
 `NetworkedDfsService::ensure_repair_response_matches_pending`, and
-`NetworkedDfsService::handle_fetch_blob_response`. The model includes the
-implementation nuance that a restored repair response may be accepted without a
-tracked in-flight request when a matching repair job still exists. It also
+`NetworkedDfsService::handle_fetch_blob_response`. The current-location
+updates were mapped to `NetworkedDfsService::mark_repaired_location`, which
+was removed in merge `c8c8ab71`; that property has no re-established Rust
+mapping. The model includes the implementation nuance that a restored repair
+response may be accepted without a tracked in-flight request when a matching
+repair job still exists. It also
 models stale wrong-hash metadata receipts as backend state that must not become
 durable repair evidence. Body framing, end-to-end finish attestation, flow
 control, and replay-safe retry are now `sinomo-network` obligations and are not
@@ -1894,7 +1996,10 @@ cooled retry settlement, and settled replacement witnesses in 623, 646, 646,
 traces respectively. It found no violation in 3,245 ms at 1,541 traces/s. A
 separate nondeterministic `step` run found no violation across 5,000 traces of
 at most 20 steps in 3,698 ms at 1,352 traces/s. The registered depth-8
-Apalache check also found no violation. This is a bounded four-identity
+Apalache check also found no violation. Two later witnesses, a not-desired
+rejection that retires without commit and a repair-pending rejection that
+retires after a durable prune, bring the registry to 20; the recorded run
+predates them. This is a bounded four-identity
 safety/refinement slice: retry cooling is an abstract delay transition, and it
 does not prove transport fairness, recovery-worker liveness, wall-clock
 timing, or unbounded queue throughput.
@@ -1950,13 +2055,15 @@ The `dfs_anti_entropy_safety.safety` invariant combines these properties:
 This maps to `NetworkedDfsService::run_local_content_anti_entropy`,
 `NetworkedDfsService::local_content_anti_entropy_issue_reason`,
 `record_anti_entropy_issue`,
-`NetworkedDfsService::mark_remote_read_location_missing`, and
-`NetworkedDfsService::should_persist_remote_read_location_prune`. The model is
-deliberately precise about an implementation nuance: `repaired_location_count`
-and issue `repaired = true` mean the service ran the repair path, but durable
-metadata is pruned only if the local node can write the metadata shard. It does
-not prove distributed repair scheduling, network fairness, cursor persistence,
-or that repeated lifecycle maintenance will eventually revisit every page.
+`NetworkedDfsService::mark_remote_read_location_missing`, and its durable-prune
+gate `NetworkedDfsService::metadata_effect_scope_for_object`, which admits a
+metadata effect only on the shard primary or without a control plane. The
+model is deliberately precise about an implementation nuance:
+`repaired_location_count` and issue `repaired = true` mean the service ran the
+repair path, but durable metadata is pruned only if the local node can write
+the metadata shard. It does not prove distributed repair scheduling, network
+fairness, cursor persistence, or that repeated lifecycle maintenance will
+eventually revisit every page.
 
 ## Running
 
@@ -1995,7 +2102,7 @@ witness predicates; coverage mode raises the sample count and fails if any
 registered witness is not reached:
 
 ```bash
-QUINT_CASE_FILTER=raft-kv,raft-protocol,network-endpoint,network-timed-transport,membership-raft-config,dfs-posix-cross-shard,dfs-posix-advisory-locks,dfs-posix-fsync,dfs-posix-partitioned-operation,dfs-local-first-file-gateway-composition,dfs-local-first-namespace-gateway-composition,dfs-pending-requests,dfs-namespace-command-replay \
+QUINT_CASE_FILTER=raft-kv,raft-protocol,membership-raft-config,dfs-posix-cross-shard,dfs-posix-advisory-locks,dfs-posix-fsync,dfs-posix-partitioned-operation,dfs-local-first-file-gateway-composition,dfs-local-first-namespace-gateway-composition,dfs-pending-requests,dfs-namespace-command-replay \
   QUINT_COVERAGE_MAX_SAMPLES=5000 \
   bash scripts/formal/check-quint.sh coverage
 ```
@@ -2082,26 +2189,16 @@ The deeper per-node Raft slice uses `QUINT_RAFT_PROTOCOL_VERIFY_MAX_STEPS`,
 defaulting to 1 for routine initialization-state proof while fixed-seed witness
 coverage exercises ten-step protocol traces. Its 1-step Apalache check passed in
 about 53 seconds; a 3-step attempt was interrupted after about 230 seconds and
-is not claimed as a pass. Scheduled CI raises this slice to 2 steps under a
-900-second per-command timeout. The network endpoint
-selection spec uses `QUINT_NETWORK_ENDPOINT_VERIFY_MAX_STEPS`, defaulting to 4;
-its 4-step symbolic check passed in about 10 seconds. The network route
-planning spec uses `QUINT_NETWORK_ROUTE_VERIFY_MAX_STEPS`, defaulting to 4; its
-4-step symbolic check passed in about 5 seconds. The network route-cache spec
-uses `QUINT_NETWORK_ROUTE_CACHE_VERIFY_MAX_STEPS`, defaulting to 4; its 4-step
-symbolic check passed in about 14 seconds. The network delivery retry spec
-uses `QUINT_NETWORK_DELIVERY_VERIFY_MAX_STEPS`, defaulting to 5; its isolated
-6-step symbolic check passed in about 6 seconds. The network attempt-budget spec
-uses `QUINT_NETWORK_ATTEMPT_BUDGET_VERIFY_MAX_STEPS`, defaulting to 3. The
-timed transport and timed delivery-retry specs use
-`QUINT_NETWORK_TIMED_TRANSPORT_VERIFY_MAX_STEPS` and
-`QUINT_NETWORK_TIMED_DELIVERY_VERIFY_MAX_STEPS`, defaulting to 5 and 7,
-respectively. These bounds reach packet delivery and fallback paths; named
-witnesses independently guard randomized reachability. The
-timed network smoke scenario uses `QUINT_NETWORK_TIMED_SMOKE_RUN_MAX_STEPS` and
-`QUINT_NETWORK_TIMED_SMOKE_RUN_MAX_SAMPLES`, defaulting to 80 and 500. The
-read-freshness, routed namespace-freshness, and metadata-primary failover specs
-use `QUINT_DFS_READ_FRESHNESS_VERIFY_MAX_STEPS`,
+is not claimed as a pass. Deeper local audits may raise it to 2 steps with a
+longer `QUINT_CASE_TIMEOUT_SECONDS`. The network endpoint selection spec uses
+`QUINT_NETWORK_ENDPOINT_VERIFY_MAX_STEPS`, defaulting to 4; its 4-step symbolic
+check passed in about 10 seconds. The timed transport spec uses
+`QUINT_NETWORK_TIMED_TRANSPORT_VERIFY_MAX_STEPS`, defaulting to 5. Neither
+network case registers coverage witnesses. The route-planning, route-cache,
+delivery-retry, attempt-budget, timed delivery-retry, and timed network smoke
+cases and their step variables were removed with the legacy transport stack.
+The read-freshness, routed namespace-freshness, and metadata-primary failover
+specs use `QUINT_DFS_READ_FRESHNESS_VERIFY_MAX_STEPS`,
 `QUINT_DFS_ROUTED_NAMESPACE_VERIFY_MAX_STEPS`, and
 `QUINT_DFS_PRIMARY_FAILOVER_VERIFY_MAX_STEPS`, respectively; each defaults to 3
 because they are compact decision/protocol-slice models. The POSIX namespace,
@@ -2233,22 +2330,27 @@ calls the same individual actions while symbolic verification retains the
 ordinary `step` relation. The registered depth-8 Apalache check passed in about
 5.2 seconds.
 The completed-handoff lane-rebind slice uses
-`QUINT_DFS_METADATA_HANDOFF_LANE_REBIND_VERIFY_MAX_STEPS`, defaulting to 7. It
-accepts a freshly opened lane only when the current durable prefix equals the
-activated marker or is its proven contiguous extension; the same successor
-height with divergent ancestry remains fenced. Its fixed-seed 5,000-trace run
-reached all thirteen completed/fresh/stale lane, mismatched-evidence,
-divergence-rejection, post-activation append, fresh-rebind, and bootstrap
-witnesses. The registered depth-7 Apalache check passed in about 13 seconds.
+`QUINT_DFS_METADATA_HANDOFF_LANE_REBIND_VERIFY_MAX_STEPS`, defaulting to 4,
+and runs coverage through `coverageStep`. It accepts a freshly opened lane only
+when the current durable prefix equals the activated marker or is its proven
+contiguous extension; the same successor height with divergent ancestry
+remains fenced. The case registers 23 witnesses: completed/fresh/stale lane,
+mismatched-evidence, divergence-rejection, post-activation append,
+fresh-rebind, and bootstrap cases, plus ten cached-lane generation cases. The
+recorded fixed-seed 5,000-trace run reported thirteen witnesses and a depth-7
+Apalache check passed in about 13 seconds; that evidence does not match the
+current 23-witness, depth-4 registration and has not been re-recorded.
 The exact-prefix authority-acknowledgement slice uses
 `QUINT_DFS_METADATA_AUTHORITY_ACK_PREFIX_VERIFY_MAX_STEPS`, defaulting to 4. It
 separates re-reading the named operation from equality of the receiver's
 complete resulting prefix. A divergent predecessor reaches the same sequence
 but rejects without persisting the authority floor, remains eligible for an
 authoritative snapshot, and may acknowledge only after exact repair. A fixed-
-seed 5,000-trace run reached all four healthy ACK, divergent rejection,
-snapshot-repair, and repaired-ACK witnesses. The registered depth-4 Apalache
-check passed in about 5.2 seconds.
+seed 5,000-trace run reached the four healthy ACK, divergent rejection,
+snapshot-repair, and repaired-ACK witnesses, and the depth-4 Apalache check
+passed in about 5.2 seconds. Two stale-catch-up witnesses (snapshot request
+and floor preservation) were registered later, on 2026-09-28; the run has not
+been re-recorded with all six.
 The handoff probe backend-selection slice uses
 `QUINT_DFS_METADATA_HANDOFF_PROBE_BACKEND_VERIFY_MAX_STEPS`, defaulting to 4.
 It retains the bounded old-path counterexample where a stale pre-opened routed
@@ -2261,11 +2363,13 @@ stale-marker witnesses. The registered depth-4 Apalache check passed in about
 5.9 seconds.
 The retiring-lane replica-ingest slice uses
 `QUINT_DFS_METADATA_RETIRING_LANE_REPLICA_INGEST_VERIFY_MAX_STEPS`, defaulting
-to 4. Its fixed-seed 5,000-trace run reached all twelve author-rejection,
-forged/stale-source, foreign-permit, and mixed-filesystem-batch rejection, exact
-contiguous-batch acceptance, convergence, arbitrary/forged/foreign-permit/mixed-
-filesystem-snapshot rejection, and exact-snapshot acceptance witnesses.
-The registered depth-4 Apalache check passed in about 9.9 seconds. Accepted
+to 4. It registers 24 witnesses: author rejection; pending-marker,
+removed-replica, foreign-shard, forged/stale/rollback/future-epoch,
+noncontiguous, foreign-permit, and mixed-filesystem rejection for both batches
+and snapshots; exact contiguous-batch and exact-snapshot acceptance; and
+convergence. The recorded fixed-seed 5,000-trace run reported twelve
+witnesses and the depth-4 Apalache check passed in about 9.9 seconds; that run
+has not been re-recorded for the current registry. Accepted
 replica maintenance never binds the retiring author generation. In the Rust
 refinement, only a validated filesystem/shard/source/epoch permit reaches that
 maintenance gate, and the backend rejects any batch or snapshot containing a
@@ -2315,9 +2419,9 @@ The fixed-seed 5,000-trace run found no violation in 6,066 ms at 824 traces/s,
 and its depth-6 Apalache check found no violation in 150,166 ms. The quorum-
 aware replica fan-out spec can be overridden with
 `QUINT_DFS_REPLICA_QUORUM_FANOUT_VERIFY_MAX_STEPS`; its registered default is
-6. Its latest 5,000-trace run reached all eleven registered witnesses, and its
-depth-6 Apalache check found no violation in 19,919 ms. The repair lost-
-authority spec can be overridden with
+6. Its latest 5,000-trace run reached all thirteen registered witnesses, and
+its depth-6 Apalache check found no violation in 36,968 ms (see above). The
+repair lost-authority spec can be overridden with
 `QUINT_DFS_REPAIR_LOST_AUTHORITY_VERIFY_MAX_STEPS`; its default is 4 because
 the 5-step symbolic check passed but took about 135 seconds. The anti-entropy
 spec can be overridden with `QUINT_DFS_ANTI_ENTROPY_VERIFY_MAX_STEPS`; its
@@ -2331,13 +2435,13 @@ broader random exploration and seed-based replay.
 The namespace-command replay slice uses
 `QUINT_DFS_NAMESPACE_REPLAY_VERIFY_MAX_STEPS`, defaulting to 5. Its six named
 witnesses cover durable completed replay, changed-payload rejection,
-cancellation, interrupted-pending rejection, replay after restart, and a fresh
-request identity after cancellation.
+cancellation, automatic interrupted-pending recovery, replay after restart,
+and a fresh request identity after cancellation.
 
 Use larger bounds for local audit runs, not as a routine CI gate:
 
 ```bash
-QUINT_VERIFY_MAX_STEPS=8 QUINT_RAFT_PROTOCOL_VERIFY_MAX_STEPS=2 QUINT_NETWORK_ENDPOINT_VERIFY_MAX_STEPS=5 QUINT_NETWORK_ROUTE_VERIFY_MAX_STEPS=5 QUINT_NETWORK_ROUTE_CACHE_VERIFY_MAX_STEPS=5 QUINT_NETWORK_DELIVERY_VERIFY_MAX_STEPS=6 QUINT_NETWORK_ATTEMPT_BUDGET_VERIFY_MAX_STEPS=4 QUINT_NETWORK_TIMED_TRANSPORT_VERIFY_MAX_STEPS=6 QUINT_NETWORK_TIMED_DELIVERY_VERIFY_MAX_STEPS=8 QUINT_NETWORK_TIMED_SMOKE_RUN_MAX_STEPS=160 QUINT_NETWORK_TIMED_SMOKE_RUN_MAX_SAMPLES=5000 QUINT_SYSTEM_SMOKE_RUN_MAX_STEPS=240 QUINT_SYSTEM_SMOKE_RUN_MAX_SAMPLES=10000 QUINT_DFS_ROUTING_VERIFY_MAX_STEPS=6 QUINT_DFS_READ_FRESHNESS_VERIFY_MAX_STEPS=4 QUINT_DFS_ROUTED_NAMESPACE_VERIFY_MAX_STEPS=4 QUINT_DFS_POSIX_NAMESPACE_VERIFY_MAX_STEPS=2 QUINT_DFS_POSIX_LINKS_VERIFY_MAX_STEPS=2 QUINT_DFS_POSIX_CROSS_SHARD_VERIFY_MAX_STEPS=3 QUINT_DFS_POSIX_READ_WRITE_VERIFY_MAX_STEPS=2 QUINT_DFS_POSIX_ADVISORY_LOCKS_VERIFY_MAX_STEPS=4 QUINT_DFS_POSIX_FSYNC_VERIFY_MAX_STEPS=4 QUINT_DFS_POSIX_PARTITIONED_OPERATION_VERIFY_MAX_STEPS=10 QUINT_DFS_LOCAL_FIRST_FILE_VERIFY_MAX_STEPS=6 QUINT_DFS_LOCAL_FIRST_NAMESPACE_VERIFY_MAX_STEPS=6 QUINT_DFS_LOCAL_FIRST_NAMESPACE_DURABILITY_VERIFY_MAX_STEPS=8 QUINT_DFS_LOCAL_FIRST_RECONCILE_GATEWAY_VERIFY_MAX_STEPS=6 QUINT_DFS_PRIMARY_FAILOVER_VERIFY_MAX_STEPS=4 QUINT_DFS_NAMESPACE_REPLAY_VERIFY_MAX_STEPS=6 QUINT_DFS_NAMESPACE_VERIFY_MAX_STEPS=6 QUINT_DFS_SHARDED_NAMESPACE_VERIFY_MAX_STEPS=6 QUINT_DFS_JOURNAL_VERIFY_MAX_STEPS=6 QUINT_DFS_REPAIR_VERIFY_MAX_STEPS=6 QUINT_DFS_REPLICATION_VERIFY_MAX_STEPS=6 QUINT_DFS_NO_CONFLICT_VERIFY_MAX_STEPS=6 QUINT_DFS_PENDING_VERIFY_MAX_STEPS=4 QUINT_DFS_REPAIR_CONTENT_VERIFY_MAX_STEPS=6 QUINT_DFS_REPLICA_QUORUM_FANOUT_VERIFY_MAX_STEPS=8 QUINT_DFS_REPAIR_LOST_AUTHORITY_VERIFY_MAX_STEPS=5 QUINT_DFS_ANTI_ENTROPY_VERIFY_MAX_STEPS=6 QUINT_MEMBERSHIP_VERIFY_MAX_STEPS=5 QUINT_MEMBERSHIP_KV_VERIFY_MAX_STEPS=5 QUINT_MEMBERSHIP_RAFT_CONFIG_VERIFY_MAX_STEPS=5 bash scripts/formal/check-quint.sh all
+QUINT_VERIFY_MAX_STEPS=8 QUINT_RAFT_PROTOCOL_VERIFY_MAX_STEPS=2 QUINT_NETWORK_ENDPOINT_VERIFY_MAX_STEPS=5 QUINT_NETWORK_TIMED_TRANSPORT_VERIFY_MAX_STEPS=6 QUINT_SYSTEM_SMOKE_RUN_MAX_STEPS=240 QUINT_SYSTEM_SMOKE_RUN_MAX_SAMPLES=10000 QUINT_DFS_ROUTING_VERIFY_MAX_STEPS=6 QUINT_DFS_READ_FRESHNESS_VERIFY_MAX_STEPS=4 QUINT_DFS_ROUTED_NAMESPACE_VERIFY_MAX_STEPS=4 QUINT_DFS_POSIX_NAMESPACE_VERIFY_MAX_STEPS=2 QUINT_DFS_POSIX_LINKS_VERIFY_MAX_STEPS=2 QUINT_DFS_POSIX_CROSS_SHARD_VERIFY_MAX_STEPS=3 QUINT_DFS_POSIX_READ_WRITE_VERIFY_MAX_STEPS=2 QUINT_DFS_POSIX_ADVISORY_LOCKS_VERIFY_MAX_STEPS=4 QUINT_DFS_POSIX_FSYNC_VERIFY_MAX_STEPS=4 QUINT_DFS_POSIX_PARTITIONED_OPERATION_VERIFY_MAX_STEPS=10 QUINT_DFS_LOCAL_FIRST_FILE_VERIFY_MAX_STEPS=6 QUINT_DFS_LOCAL_FIRST_NAMESPACE_VERIFY_MAX_STEPS=6 QUINT_DFS_LOCAL_FIRST_NAMESPACE_DURABILITY_VERIFY_MAX_STEPS=8 QUINT_DFS_LOCAL_FIRST_RECONCILE_GATEWAY_VERIFY_MAX_STEPS=6 QUINT_DFS_PRIMARY_FAILOVER_VERIFY_MAX_STEPS=4 QUINT_DFS_NAMESPACE_REPLAY_VERIFY_MAX_STEPS=6 QUINT_DFS_NAMESPACE_VERIFY_MAX_STEPS=6 QUINT_DFS_SHARDED_NAMESPACE_VERIFY_MAX_STEPS=6 QUINT_DFS_JOURNAL_VERIFY_MAX_STEPS=6 QUINT_DFS_REPAIR_VERIFY_MAX_STEPS=6 QUINT_DFS_REPLICATION_VERIFY_MAX_STEPS=6 QUINT_DFS_NO_CONFLICT_VERIFY_MAX_STEPS=6 QUINT_DFS_PENDING_VERIFY_MAX_STEPS=4 QUINT_DFS_REPAIR_CONTENT_VERIFY_MAX_STEPS=6 QUINT_DFS_REPLICA_QUORUM_FANOUT_VERIFY_MAX_STEPS=8 QUINT_DFS_REPAIR_LOST_AUTHORITY_VERIFY_MAX_STEPS=5 QUINT_DFS_ANTI_ENTROPY_VERIFY_MAX_STEPS=6 QUINT_MEMBERSHIP_VERIFY_MAX_STEPS=5 QUINT_MEMBERSHIP_KV_VERIFY_MAX_STEPS=5 QUINT_MEMBERSHIP_RAFT_CONFIG_VERIFY_MAX_STEPS=5 bash scripts/formal/check-quint.sh all
 ```
 
 ## Current Abstractions
@@ -2353,7 +2457,7 @@ This slice does not yet model:
 - concrete Raft config-change RPCs over the network abstraction;
 - cluster leave and migration quarantine/import behavior;
 - full-system smoke internals beyond the current abstract integration surface:
-  real directory snapshots, composition with the focused route-cache model, raw
+  real directory snapshots, composition with a route-cache model, raw
   transport frames, stream payloads, full KV log replay, and concrete DFS
   object-store contents;
 - live `ClusterDirectory` read failures during an in-flight delivery,

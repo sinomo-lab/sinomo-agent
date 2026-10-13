@@ -24,6 +24,9 @@ The crate that creates or interprets durable state registers its own paths.
 Lower-ring layout is composed first, then trusted runtime and application
 layers add their contracts through the appropriate facade. This preserves the
 trust-ring dependency direction while producing one inspectable layout.
+Product components register their paths through their component factories; a
+component that is disabled in a host profile still contributes its paths
+through a storage-only contributor, so its retained state stays covered.
 
 Registration stays next to the owning subsystem. A central crate must not need
 to understand every daemon, DFS, agent, provider, or evolution file in order to
@@ -88,11 +91,14 @@ and each batch must be idempotent across the output/checkpoint crash window.
 Source generation and algorithm identities fence retries. Cancellation leaves
 durable progress available for the next executor.
 
-DFS uses this mechanism for local physical metadata snapshots while preserving
-its immutable content and authenticated journal history. Other modules reuse
-the mechanism through the trust-ring facades and their own lifecycle hooks.
-See the [migration integration guide](developer/storage-migrations.md) for the
-contracts, status surface, and interruption tests.
+DFS uses the job store for bounded compaction of its inline content-binding
+logs and the checksummed stream codec for current metadata snapshots.
+Conversion of retained older DFS formats belongs to `sinomo-dfs-migration`,
+which DFS calls as a bounded storage-preparation provider at cold open; see
+[DFS metadata authority](dfs-architecture.md#metadata-authority). Other modules
+reuse the mechanism through the trust-ring facades and their own lifecycle
+hooks. See the [migration integration guide](developer/storage-migrations.md)
+for the contracts and interruption tests.
 
 ## Layout Categories
 
@@ -139,17 +145,17 @@ Temporary workspaces are recoverable or safely disposable after a worker
 failure; durable job state and published artifacts remain independently
 inspectable.
 
-Windows Cloud Files state is split deliberately between the SIFS mount
-supervisor and the native provider. The supervisor owns mount consent, the
-process-wide lease, staged registration and pending unregister records, the
-pinned provider bundle, and host recovery authority. The provider owns its
-registration journal and receipt, local mutation queue and immutable blobs,
-namespace manifest and cursors, and native recovery authority. These are
-registered owner paths, not user-editable configuration. Their exact
-cross-owner lifecycle is defined in the
-[Windows Cloud Files architecture](cloud-files-architecture.md); unknown or
-apparently stale files are evidence to inspect, never cleanup candidates for a
-generic storage walker.
+Windows Cloud Files state is split deliberately between the generic SIFS mount
+supervisor and the native provider. The supervisor owns mount consent,
+provider-neutral status, and the process-wide lease (`daemon/sifs-mount.lock`,
+registered by `sinomo-daemon`). The provider owns its registration journal and
+receipt, local mutation queue and immutable blobs, namespace manifest and
+cursors, and recovery authority under `module/runtime/module.dfs.cloud-files/`,
+inside the `module/runtime` escape path registered by `sinomo-module`. None of
+this is user-editable configuration. The ownership and lifecycle rules are
+defined in the [Windows Cloud Files architecture](cloud-files-architecture.md);
+unknown or apparently stale files are evidence to inspect, never cleanup
+candidates for a generic storage walker.
 
 ## Verification
 

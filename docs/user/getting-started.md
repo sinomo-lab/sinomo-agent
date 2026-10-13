@@ -53,7 +53,9 @@ daemons, replace binaries, advance managed source from the current checkout,
 rewrite boot entries, and then restart. Verify the data directory, current
 repository and commit, and expected outage before running it. `--no-start`
 suppresses the final start; it does not make the preceding deployment steps a
-dry run.
+dry run. Installing from a source build is headless; running `install` from a
+desktop release also installs the graphical app (see
+[desktop app rollout](rollout-operations.md#desktop-app-rollout)).
 
 If `sinomo` is not immediately on `PATH`, start a new shell or continue with
 `cargo run -p sinomo -- <command>` from the repository.
@@ -86,11 +88,12 @@ cluster. To join another installation, follow the
 
 ## 5. Configure a Model Provider
 
-List supported providers and authenticate the one you intend to use:
+`sinomo models help` lists the model provider IDs. Authenticate the one you
+intend to use; local Ollama and LM Studio runtimes need no credentials:
 
 ```sh
 PROVIDER=your-provider-id
-sinomo providers help
+sinomo models help
 sinomo providers auth "$PROVIDER"
 sinomo providers test "$PROVIDER"
 ```
@@ -144,9 +147,9 @@ cargo run -p sinomo-app
 
 The app and CLI use the same selected data directory and daemon state. If no
 daemon is running, the desktop launcher starts the sibling CLI with
-`sinomo daemon run --app-owned` and holds its lifetime lease across app updates.
-An already-running daemon is merely attached and is not stopped when the window closes.
-Custom module previews additionally use the sibling
+`sinomo daemon run --app-owned` and holds its lifetime lease across app
+updates. An already-running daemon is merely attached and is not stopped when
+the window closes. Custom module previews additionally use the sibling
 `sinomo-ui-extension-host`; it is started only for a selected custom surface
 and is terminated with that surface or the app.
 

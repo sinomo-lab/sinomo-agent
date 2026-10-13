@@ -7,6 +7,9 @@ Main and Embedded hosts register the migration provider before opening DFS
 storage. The provider advances bounded work when a retained root is touched;
 Shadow hosts do not convert or publish. Progress, original source bytes and
 source digests survive restart. Source adaptation follows original validation.
+Preparation that is still pending when the component mounts resumes in the
+initial startup-recovery generation under the same data owner; it does not
+fail the mount.
 
 Conversion builds a hidden current candidate. Native installation binds the
 actual source cut, current configuration, physical storage ownership and exact
@@ -14,6 +17,6 @@ KV comparisons. Original reservations, jobs and proofs remain data until the
 current authority path establishes their replacements. Standalone conversion
 uses explicit local ownership evidence.
 
-Current metadata snapshots use schema 8; their operation journal uses the V7
+Current metadata snapshots use schema 9; their operation journal uses the V7
 prepare/commit family. Older formats are handled here, and incompatible daemon
 versions must be upgraded.

@@ -2,8 +2,9 @@
 
 Status: recommended first implementation slice completed 2026-07-19; the
 generic maintenance design was removed in favor of action-owned convergence on
-2026-07-20. Remaining P1-P3 follow-up work is identified below. Last reviewed
-2026-07-20.
+2026-07-20. Bounded group commit and shared follower replication landed on
+2026-09-19. Remaining P1-P3 follow-up work is identified below. Last reviewed
+2026-10-13.
 
 ## Context
 
@@ -32,10 +33,10 @@ guided the refactor. Their current status is:
 |---|---|
 | P0.1-P0.4 consistency, barriers, request identity, config lifecycle | Completed. |
 | P1.5 action-owned reactive convergence | Completed; this replaces the withdrawn generic maintenance-tick design. |
-| P1.6 intermittent-node leader recovery | Partial: bounded recovery and structured failure evidence exist; proactive freshest-voter preference and complete CLI/app recommendations remain follow-up work. |
+| P1.6 intermittent-node leader recovery | Partial: bounded recovery, structured failure evidence, campaign suppression while a live remote leader is observed, and transient route-exhaustion evidence for replacing an unreachable stale leader exist; proactive freshest-voter preference and complete CLI/app recommendations remain follow-up work. |
 | P1.7 peer replication progress hints | Completed; hints are persisted, consumed, term-validated, and safe to discard. |
 | P1.8 uncertain-write recovery | Completed through the authoritative request-outcome route. |
-| P2.9 noisy-write batching | Planned; semantic no-op suppression and source-change coalescing do not constitute general short-window transaction batching. |
+| P2.9 noisy-write batching | Partial: concurrent ordinary proposals share bounded short-window WAL and ledger flushes and follower appends while each keeps its own log entry and result, and membership changes and election barriers keep individual admission (see [clustering architecture](../clustering-architecture.md#control-plane-kv)). Merging redundant high-churn updates into fewer commits remains planned; semantic no-op suppression and source-change coalescing are not that batching. |
 | P2.10 keyspace read/projection behavior | Completed for explicit keyspace classification, critical-read authority defaults, and deferred materialized projections; broader retention tuning remains operational follow-up. |
 | P2.11 resumable snapshots | Planned. |
 | P2.12 diagnostics | Partial: structured authority/quorum evidence exists; complete last-success timestamps and CLI/app recovery presentation remain follow-up work. |

@@ -30,8 +30,8 @@ COMMAND=cluster
 sinomo "$COMMAND" help
 ```
 
-Some commands expose nested help, such as `sinomo agent session` or
-`sinomo sandbox toolchain`. Use the help shown by the exact installed version
+Some commands expose nested help, such as `sinomo agent session help` or
+`sinomo dfs history help`. Use the help shown by the exact installed version
 before a destructive, cluster-wide, or permission-changing operation.
 
 Shell examples use uppercase variables for values that you must choose. Values

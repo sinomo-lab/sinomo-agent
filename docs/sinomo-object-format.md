@@ -386,11 +386,13 @@ Implementations should support a builder mode that reserves space for `document_
 For network transmission, implementations should expose scatter/gather output where possible. A sender can emit the small document header, metadata, schema, and container descriptors as one or more buffers, followed by existing tensor or file buffers as additional slices. If the transport requires a single contiguous region, implementations can still build the final document in a memory-mapped or preallocated buffer and copy only the small descriptors around the large payload.
 
 Canonical SOBJ documents retain their up-front document and container lengths.
-An unknown-length or resumable network producer is therefore represented as a
-typed SOBJ descriptor value plus a network-managed semantic attachment, not as
-an indefinite-length SOBJ value. The canonical transfer layer must
-incrementally authenticate and hash that attachment and bind its final length
-and digest to the RPC before exposing a committed result.
+An unknown-length network producer is therefore represented as a typed SOBJ
+value plus an object-RPC semantic attachment, not as an indefinite-length SOBJ
+value. Object RPC streams that attachment incrementally; when its length is not
+known in advance, the body's finish record supplies the observed final length.
+Object RPC adds no content digest or per-call authentication; applications that
+need content identity carry and verify their own digest, as described in the
+[network architecture](network-architecture.md#payload-invariants).
 Known-length contiguous values may still use the scatter/gather document path
 above when doing so avoids a payload copy.
 

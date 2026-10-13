@@ -14,9 +14,10 @@ rustup override set 1.96.0
 rustc --version
 ```
 
-There is no repository `rust-toolchain` file. If you use a newer
-compiler, keep the declared minimum in mind when adopting language or standard
-library features.
+The workspace has no `rust-toolchain` file. If you use a newer compiler, keep
+the declared minimum in mind when adopting language or standard library
+features. Only the separate DFS/KV architecture lint workspace pins its own
+nightly; see the [lint README](../../lints/sinomo-architecture/README.md).
 
 Fetch locked dependencies and build the CLI/TUI baseline:
 
@@ -108,6 +109,7 @@ platform, runtime, or explicit benchmark choice:
 - `sinomo-app-android`;
 - `sinomo-sandbox-wasix-module`;
 - `sinomo-benchmarks`;
+- `sinomo-evolution`;
 - `sinomo-dfs-cloud-files`;
 - `sinomo-network-iroh-module`;
 - `sinomo-remote-management-module`.
@@ -124,10 +126,11 @@ not build the native module itself.
 
 ## Docker and Android
 
-The disposable development cluster uses the host-built debug binary:
+The disposable development cluster uses the host-built debug binary. Its nodes
+start bounded CPU profiles by default, so build with profiler support:
 
 ```sh
-cargo build -p sinomo
+cargo build -p sinomo -p sinomo-observe --features sinomo-observe/cpu-profiler
 docker compose -f docker/docker-compose.dev.yml up --build -d
 docker compose -f docker/docker-compose.dev.yml exec node1 sinomo cluster health
 docker compose -f docker/docker-compose.dev.yml down -v

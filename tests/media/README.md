@@ -37,7 +37,8 @@ The test verifies:
 - native microphone chunks reach the realtime WebSocket endpoint,
 - native camera frames reach the endpoint,
 - synthetic model output is written to the CLI output sidecar,
-- native speaker playback is opened and receives the synthetic output audio.
+- the call exits successfully with native speaker playback enabled on the
+  selected device (the test does not inspect what the speaker sink received).
 
 If your CPAL device names differ, run `sinomo voice devices` and export the
 matching selectors before running the ignored test.

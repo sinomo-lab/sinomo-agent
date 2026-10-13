@@ -48,7 +48,10 @@ The verifier builds or imports BusyBox WASIX external commands, imports the Bash
 - `sh -c` compatibility,
 - sandbox-local WASM exec from a Bash command.
 
-Use the daemon-backed SIFS gate before treating the package as cluster-ready:
+The daemon-backed SIFS mode still exists, but daemon-hosted `/sandbox/run/*`
+execution has been removed, so its `verify-bash --daemon` step is rejected by
+the clustered Sandbox backend and cannot currently establish cluster
+readiness:
 
 ```text
 VERIFY_BACKEND=daemon-local crates/sinomo-sandbox/toolchains/verify-bash-wasix.sh

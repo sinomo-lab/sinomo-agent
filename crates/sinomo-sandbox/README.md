@@ -1,6 +1,11 @@
 # sinomo-sandbox
 
-`sinomo-sandbox` is Sinomo's Rust-native sandbox subsystem for agent tool execution. It owns sandbox manifests, policy validation, runtime adapters, toolchain packages, virtual filesystem wiring, durable command records, and operator diagnostics.
+`sinomo-sandbox` is Sinomo's Rust-native sandbox subsystem for agent tool
+execution. It owns sandbox manifests, policy validation, the Sandbox component,
+runtime contracts, toolchain packages, virtual filesystem wiring, durable
+command records, and operator diagnostics. The WASIX engine is the external
+module in `modules/sandbox/wasix`, and simple-native host execution lives in
+`crates/sinomo-sandbox-simple`.
 
 The target environment is a real POSIX command workspace for coding tasks: `sh`/`bash`, Python with pip, file/search/archive tools, and build tools run inside the sandbox contract. Commands are only exposed when they are genuine sandbox commands.
 
@@ -15,8 +20,13 @@ The target environment is a real POSIX command workspace for coding tasks: `sh`/
 This crate owns the sandbox-facing contracts and implementation pieces:
 
 - manifest, policy, mount, command, event, and resource-limit data models,
-- local and daemon-backed sandbox stores,
-- runtime contracts for WASIX-backed execution,
+- the Sandbox component: service routes, local/clustered backend selection,
+  SIFS lifecycle leases, mediated HTTP, execution streams, and lifecycle
+  recovery,
+- local and SIFS-backed sandbox stores,
+- runtime capability contracts and the client for the
+  `sinomo.sandbox-executor/v1` interface that the WASIX module implements,
+- the Docker/Podman local container backend,
 - virtual filesystem integration,
 - toolchain package metadata and import helpers,
 - durable command records, output logs, checkpoints, and artifacts,
@@ -26,9 +36,19 @@ It does not define global cluster storage layout outside the sandbox service pre
 
 ## Runtime Model
 
-WASIX is the only maintained sandbox runtime because shell, Python, compiler, package manager, subprocess, pipe, threading, and filesystem workflows need process-oriented semantics. WASI Preview1 support has been removed rather than kept as a compatibility runner.
+WASIX is the only maintained Wasm sandbox runtime because shell, Python,
+compiler, package manager, subprocess, pipe, threading, and filesystem
+workflows need process-oriented semantics. WASI Preview1 support has been
+removed rather than kept as a compatibility runner. The CLI loads the active
+`module.sandbox.wasix` native module for WASIX execution; the default `sinomo`
+build does not link the engine. Docker/Podman and simple-native are host
+backends for local and agent workflows; see the
+[architecture](docs/architecture.md#execution-backend-model).
 
-Filesystem behavior should go through the sandbox virtual filesystem layer. Local host-backed storage is useful for development, but production sandbox state is expected to be backed by SIFS. SIFS-backed WASIX runs use direct virtual preopens backed by the sandbox filesystem.
+Filesystem behavior should go through the sandbox virtual filesystem layer.
+Local host-backed storage is useful for development, but production sandbox
+state is expected to be backed by SIFS. SIFS-backed WASIX runs use direct
+virtual preopens backed by the sandbox filesystem.
 
 ## Common Commands
 
@@ -44,19 +64,24 @@ Create a daemon-backed SIFS sandbox:
 sinomo sandbox create --daemon
 ```
 
-Run a pinned command:
+Run a pinned command, or select a host backend explicitly:
 
 ```sh
 sinomo sandbox run <sandbox-id> grep -- -R TODO /work
-sinomo sandbox run <sandbox-id> --daemon find -- /work -type f
+sinomo sandbox run <sandbox-id> --simple-native sh -- -c 'echo hello'
+sinomo sandbox run <sandbox-id> --docker <image> sh -- -c 'echo hello'
 ```
 
 Start a shell when the sandbox toolchain includes a real `sh`:
 
 ```sh
 sinomo sandbox shell <sandbox-id>
-sinomo sandbox shell <sandbox-id> --daemon
 ```
+
+`--daemon` still selects the daemon-hosted Sandbox component for lifecycle,
+file, fetch, log, and toolchain commands. Daemon-hosted `run`, `shell`, and
+`process-plan` against clustered SIFS sandboxes are rejected; see the
+[current execution boundary](docs/architecture.md#component-and-crate-ownership).
 
 Inspect state and logs:
 
@@ -117,7 +142,8 @@ Keep this README as an entry point; do not use it as a detailed changelog or gap
 
 ## Source Notes
 
-- Keep runtime implementation under `src/runtime/`, split by ABI.
+- Keep runtime contracts and capability reporting under `src/runtime/`; the
+  Wasmer/WASIX engine belongs in `modules/sandbox/wasix`.
 - Keep filesystem behavior behind the virtual filesystem traits in `src/filesystem/`.
 - Keep SIFS persistence and command-record behavior in `src/store/` and `src/execution/`.
 - Keep policy, event, and mediated HTTP contracts in `src/policy/`, `src/events/`, and `src/http/`.

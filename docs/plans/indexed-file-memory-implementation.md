@@ -1,24 +1,58 @@
 # Indexed-File Memory Implementation Plan
 
-Status: in progress. Last reviewed 2026-07-18.
+Status: active. Phase 0 and the Phase 1 Markdown/text first slice are
+implemented; the rest of Phase 1, all scale hardening, and Phases 2 through 6
+remain. Last reviewed 2026-10-13.
 
-The foundational Phase 0 contracts needed by the Recommended First Slice and
-the slice itself are implemented: local Markdown/text roots can be registered,
-scanned through capability-rooted no-follow traversal with bounded cursors,
-read through verified current-only snapshots, and published through a
-recoverable journal into immutable per-file generations and a persistent paged
-lexical router. Queries use authenticated snapshot-pinned continuations,
-recheck current policy epochs, return byte-bounded exact evidence and durable
-traces, and inject that evidence into agent context. Overlay append/replay is
-immutable, recoverable, authenticated, and snapshot-pinned. The cross-ring
-extension ABI is available. Legacy record compatibility is deliberately
-excluded: the indexed-file system neither reads nor dual-writes the old record
-store. The scale-hardening requirements below define the storage and serving
-shape used by Phases 2 through 5. Phases 2 through 6 remain the ordered
-follow-up for automatic maintenance, richer formats and relations, optional
-providers, federation, and file-first writes. Extension invocation and
-host-side resource enforcement are not active in this slice; declarations
-whose route cannot already be proven are rejected at registration.
+Implemented (`crates/sinomo-memory/src/indexed/`, exercised by
+`crates/sinomo-memory/tests/indexed_file_memory.rs`):
+
+- Phase 0 contracts: roots, file and version references, retention
+  capabilities, typed anchors and anchor lineage, facts, pipeline
+  fingerprints, generation manifests, policy derivation, relations, overlay
+  operations, retrieval plans and snapshots, coverage, evidence bundles, and
+  the paged connector, catalog, index, overlay, trace, and retriever traits.
+  Their fixtures exist except the competing-relation and relation-leakage
+  cases, which wait for relation serving.
+- The [Recommended First Slice](#recommended-first-slice) for local
+  Markdown/text roots: capability-rooted no-follow paged scans, verified
+  current-only whole-file snapshots, immutable per-file generations behind a
+  recoverable pending-router journal, a persistent paged lexical router,
+  authenticated snapshot-pinned and ranked continuations, current-policy
+  rechecks, byte-bounded exact evidence, durable retrieval traces, and agent
+  context injection through `MemoryRetriever`. The `sinomo memory` CLI and the
+  LongMemEval-S benchmark drive it.
+- Immutable, recoverable, snapshot-pinned overlay append and replay, as a store
+  API only.
+- The generic cross-ring extension ABI (`ModuleInterfaceExport` in
+  `sinomo-module-api`) with registration-time target and bound validation.
+- Coverage gaps and retrieval failures appear in the agent context report, and
+  the agent no longer reads or writes the old record store.
+
+Remaining:
+
+- Phase 1: JSON/YAML/TOML extractors, VFS roots, and metadata facts.
+- Every step of
+  [Scale-Efficient Storage and Serving Shape](#scale-efficient-storage-and-serving-shape);
+  its first-slice gap table is still accurate.
+- Phase 2, apart from context-report visibility. DFS now has a shard-local
+  namespace change feed and `sinomo-memory` has a bounded attachment
+  extraction helper with no caller, but there is no logical catalog facade,
+  watcher, job store, or scheduler.
+- Phase 3: relation storage and serving, overlay scope authorization,
+  provenance, and materialization, the evidence-bundle tools, and the curator.
+  `OverlayValidationState` (`unverified`, `validated`, `rejected`,
+  `superseded`) still differs from the architecture's validation states, and
+  the `memory_search` and `memory_read` names are already taken by the
+  agent's Markdown-note tools.
+- Phases 4 and 5 entirely, plus memory-side extension discovery, invocation,
+  and host-side resource enforcement.
+- Phase 6: indexing managed memory documents, including the agent's Markdown
+  notes, and deleting the record subsystem, which is still compiled and
+  registered in `sinomo-memory`.
+
+Legacy record compatibility is deliberately excluded: the indexed-file system
+neither reads nor dual-writes the old record store.
 
 The target design is defined by the
 [memory architecture](../memory-architecture.md). This plan sequences delivery
@@ -45,25 +79,28 @@ The implementation is complete when:
 - placement-aware local and federated retrieval preserve source policy;
 - new memory writes are file-first and do not depend on the old record store.
 
-## Current Baseline
+## Starting Baseline
 
-The existing record-first prototype is a useful correctness and provenance
-reference:
+This section records the record-first prototype as it stood when the plan
+started (July 2026). It remains a useful correctness and provenance reference.
+Since then the agent has stopped using it, and the indexed-file slice supplies
+the roots, versions, anchors, tombstones, partitions, evidence bundles, and
+overlays listed as missing below.
 
 - base `MemoryScope`, `MemoryTier`, `MemorySourceRef`, and `MemoryRecord` are in
   `crates/sinomo-base/src/domain.rs`;
-- almost all memory behavior is in `crates/sinomo-memory/src/lib.rs`;
+- the record subsystem is in `crates/sinomo-memory/src/lib.rs`;
 - `DurableMemoryStore` appends length-prefixed SOBJ records and maintains a
   snapshot plus one global `memory/index.sobj`;
-- `MemoryContextProvider` and `MemoryRecordStore` connect the store to
+- `MemoryContextProvider` and `MemoryRecordStore` connected the store to
   `sinomo-agent`;
-- the agent writes a warm summary after a completed turn and retrieves at most
+- the agent wrote a warm summary after a completed turn and retrieved at most
   eight records/16 KiB using a text task hint;
 - link, supersession, consolidation, embedding-snapshot, graph-snapshot,
   replication-plan, evaluation, and audit types already establish useful
   append-only and provenance patterns.
 
-It is not yet a filesystem index:
+It was not a filesystem index:
 
 - `DurableMemoryStore::retrieve_records` replays the complete store, scans and
   sorts all visible records, then writes a retrieval access record;
@@ -73,11 +110,11 @@ It is not yet a filesystem index:
   on the normal serving path;
 - no root, source file, immutable source version, anchor, workspace detector,
   change cursor, tombstone, partition, maintenance scheduler, relation path,
-  evidence bundle, or overlay exists;
-- agent queries do not currently provide chat, channel, task, workspace, user,
-  or team focus;
-- scope matching does not constitute a full authorization check, and promoted
-  events currently lose important routing/privacy detail.
+  evidence bundle, or overlay existed;
+- agent queries did not provide chat, channel, task, workspace, user, or team
+  focus;
+- scope matching did not constitute a full authorization check, and promoted
+  events lost important routing/privacy detail.
 
 The indexed-file implementation is a clean serving boundary. It does not reuse
 the isolated record-first subsystem, and that subsystem is not a compatibility
@@ -119,6 +156,7 @@ ModuleInterfaceExport {
       max_request_bytes,
       max_response_bytes,
       max_facts_per_batch,
+      max_deadline_ms,
       supports_cancellation,
       continuation_schema_id?,
     }
@@ -127,9 +165,11 @@ ModuleInterfaceExport {
 }
 ```
 
-Add a defaulted `interface_exports` field to `ModuleSurfaces` and
-`NativeModuleSurfaces`, with compatibility tests for older manifests and native
-descriptors. Memory interface ids include:
+This contract is implemented in R1 `sinomo-module-api`
+(`ModuleInterfaceExport`, `ModuleInterfaceOperationExport`) with a defaulted
+`interface_exports` field on `ModuleSurfaces` and `NativeModuleSurfaces` and
+compatibility tests for older manifests. The proposed memory interface ids
+are:
 
 - `sinomo.memory.source-connector/v1`;
 - `sinomo.memory.workspace-detector/v1`;
@@ -143,24 +183,22 @@ descriptors. Memory interface ids include:
 - `sinomo.memory.preview-renderer/v1`.
 
 Publish the versioned descriptor and schemas with external memory components.
-Do not create or re-export a provider API crate. `IndexedContentRef`, extraction
-requests, continuations, normalized anchors, facts, relations,
-vector/artifact references, diagnostics, and `DerivedFactBatch` are identified
-by standardized schema IDs and transported through the generic module
-invocation contract. R2 memory owns validation and interpretation; the generic
-module runtime owns no scheduler, storage, retrieval, or policy behavior.
+Do not create or re-export a provider API crate. The proposed payloads (an
+indexed-content reference, extraction requests, continuations, normalized
+anchors, facts, relations, vector/artifact references, diagnostics, and a
+derived-fact batch) are schemas identified by standardized schema IDs and
+transported through the generic module invocation contract, not Rust types;
+none is published yet. R2 memory owns validation and interpretation; the
+generic module runtime owns no scheduler, storage, retrieval, or policy
+behavior.
 
 The active identity includes module/export/interface version, artifact id and
 content hash, descriptor hash, and invocation lane; all enter the pipeline
-fingerprint. Registration validates every operation target against exported
-native/object-RPC/sandbox routes and enforces hard payload, batch,
-continuation, deadline, and cancellation contracts.
-
-Adding the R1 ABI crate also requires updating the workspace membership/default
-member declarations and `workspace_ring_boundaries.rs`, including
-`ABI_OBJECT_EXEMPT` only if the narrow object-codec exception is actually
-needed. Prefer crossing R0 through `sinomo-core` when the ABI can do so without
-compromising its boundary.
+fingerprint. Registration already validates object-RPC targets against
+exported routes and native targets against supported operations, rejects
+sandbox targets for native dylibs, and requires non-zero payload, batch, and
+deadline bounds. Enforcing those bounds, continuation budgets, and
+cancellation at invocation remains memory-host work.
 
 Native dylibs reuse `NativeModuleRequest::Invoke` and SOBJ payloads. Static R2
 implementations use memory-owned trait adapters. Object-RPC and sandbox/Wasm
@@ -169,11 +207,11 @@ extractors require a read-only source-lease/preopen adapter in
 `sinomo-sandbox`; the current ambient command runner is not an acceptable
 containment boundary.
 
-`ModuleDeclarativeResourceKind::Config` plus an activation tag can carry an
-interim descriptor during development, but it is migration scaffolding rather
-than the permanent discovery contract.
-
 ## Phase 0: Contracts, Fixtures, and Clean Boundary
+
+Status: implemented, except the competing-relation and relation-leakage
+fixtures. Some vocabularies are narrower than the architecture: freshness,
+overlay validation states, and anchor kind/schema identity.
 
 Introduce the logical types before replacing storage:
 
@@ -206,6 +244,11 @@ Expected outcome: new APIs compile and can be tested independently of the old
 record store.
 
 ## Phase 1: First File-to-Evidence Vertical Slice
+
+Status: implemented for local Markdown/text roots (the
+[Recommended First Slice](#recommended-first-slice)). Steps 1, 4, and 5 are
+partial: VFS roots, JSON/YAML/TOML extraction, and metadata facts remain, and
+lexical output is a per-file generation rather than a multi-file segment.
 
 Build the smallest useful serving path before graph or model work:
 
@@ -251,6 +294,8 @@ correctness path, not final large-root efficiency.
 
 ## Scale-Efficient Storage and Serving Shape
 
+Status: not started.
+
 Phase 1 is a correctness baseline, not the intended storage shape for roots
 with very large files or millions of files. Its bounded APIs, immutable
 generations, policy checks, authenticated continuations, and evidence contracts
@@ -270,7 +315,8 @@ The owning architecture sections remain
 Scale hardening keeps the architecture's authority model unchanged:
 
 - files and overlay operations remain authoritative;
-- `MemoryFileVersion` and `MemoryAnchor` remain the evidence identities;
+- exact file versions (`MemoryFileVersionRef`) and `MemoryAnchor` remain the
+  evidence identities;
 - chunks, catalogs, jobs, segments, routers, and provider databases are
   rebuildable node-local derived state;
 - policy gates candidate generation and is rechecked before materialization;
@@ -364,8 +410,8 @@ same-time mutations that weak local metadata could miss.
 
 ### Bounded Source Readers and Chunk Manifests
 
-Whole-file ownership should be replaced by a private connector interface with
-the semantics of:
+Whole-file ownership (today's `VerifiedSourceSnapshot`) should be replaced by
+a proposed private connector interface with the semantics of:
 
 ```text
 VerifiedSourceReader {
@@ -399,12 +445,12 @@ derived chunk outputs; indexing does not automatically retain a copy of all
 source bytes. Reusable content-only extraction is keyed by chunk content hash
 and pipeline fingerprint. Any reuse across source versions or aliases is
 rebound to new exact-version anchors and facts and reauthorized for that
-`MemoryFileVersion`. Path, scope, workspace, policy, and placement projections
+exact file version. Path, scope, workspace, policy, and placement projections
 remain per file even when two files contain identical bytes.
 
 Chunks are derived processing units, not source identities. Exact evidence
-still cites the `MemoryFileVersion` and bounded source anchor. Long records or
-lines must be split into bounded anchors so one pathological record cannot
+still cites the `MemoryFileVersionRef` and bounded source anchor. Long records
+or lines must be split into bounded anchors so one pathological record cannot
 make a continuation permanently unable to deliver progress.
 
 An edit affecting a small portion of a file should cause approximately that
@@ -418,7 +464,7 @@ alone does not discover new chunk boundaries.
 
 ### Multi-File Immutable Serving Segments
 
-An `IndexPartition` remains derived from root, policy domain, and a stable
+An index partition remains derived from root, policy domain, and a stable
 shard key. Workspace may influence routing and placement, but mutable
 workspace membership must not destabilize content identity. A partition owns
 many source or chunk documents rather than exactly one file.
@@ -439,7 +485,7 @@ bytes. Segment sizes and compaction thresholds belong in versioned benchmark
 presets, not architecture constants.
 
 A physical segment may pack facts from many logical per-source and
-per-pipeline `IndexGeneration`s. Publication and query selection still expose
+per-pipeline index generations. Publication and query selection still expose
 exactly one complete successful generation for every active pipeline; segment
 packing and compaction cannot weaken generation atomicity.
 
@@ -664,6 +710,9 @@ The workload matrix and measured counters live in
 
 ## Phase 2: Automatic Maintenance and Workspaces
 
+Status: not started, apart from reporting coverage gaps and retrieval failures
+in the agent context report.
+
 Add a durable maintenance service owned by `sinomo-memory`:
 
 - checkpointed source changes and reconciliation cursors;
@@ -671,10 +720,10 @@ Add a durable maintenance service owned by `sinomo-memory`:
 - priorities, per-root and per-extension budgets, retry/backoff, cancellation,
   leases, and crash recovery;
 - local watcher hints plus periodic bounded reconciliation;
-- an R1 read-only `DfsCatalog`/`DfsChangeFeed` facade, re-exported through
-  `sinomo_runtime::dfs`, with paged logical objects, opaque per-shard/generation
-  checkpoints, stable scan tokens, bounded logical changes, and exact revision
-  range reads;
+- an R1 read-only DFS catalog and change-feed facade (proposed names
+  `DfsCatalog`/`DfsChangeFeed`), re-exported through `sinomo_runtime::dfs`,
+  with paged logical objects, opaque per-shard/generation checkpoints, stable
+  scan tokens, bounded logical changes, and exact revision range reads;
 - SIFS indexing through that logical facade, including visible-version,
   namespace, tombstone, policy, and placement changes;
 - atomic policy/deletion fences independent of background cleanup;
@@ -685,17 +734,21 @@ The DFS facade must use paged enumeration and bounded journal batches across
 every metadata shard, resolve cross-shard moves through authoritative object
 placement, and force mark-and-sweep reconciliation after a cursor gap or
 snapshot generation change. Do not expose the current first-shard/unbounded
-backend subscription as the memory correctness contract. Host-exposed
-local-owned files still need a scoped native/VFS watcher plus reconciliation.
-Checkpoint advancement must be durably coupled to catalog application or
-idempotent job enqueue so a crash cannot acknowledge and lose a change.
+backend subscription as the memory correctness contract. The existing
+shard-local namespace feed (`poll_dfs_namespace_changes`,
+`DfsNamespaceChangeCursor`, `RescanRequired`) is the per-shard building block;
+the facade still has to add paged catalog scans, scan/feed handoff, and
+cross-shard move resolution. Host-exposed local-owned files still need a
+scoped native/VFS watcher plus reconciliation. Checkpoint advancement must be
+durably coupled to catalog application or idempotent job enqueue so a crash
+cannot acknowledge and lose a change.
 
-`begin_scan` must return one catalog generation, a stable paged-scan token, and
-per-shard feed watermarks. Changes after those watermarks remain replayable
-until the completed scan and feed checkpoints commit together. A connector
-without a stable snapshot starts/buffers its watcher before scanning and repeats
-reconciliation until convergence; a single racy walk cannot mark coverage
-current.
+The proposed `begin_scan` must return one catalog generation, a stable
+paged-scan token, and per-shard feed watermarks. Changes after those
+watermarks remain replayable until the completed scan and feed checkpoints
+commit together. A connector without a stable snapshot starts/buffers its
+watcher before scanning and repeats reconciliation until convergence; a single
+racy walk cannot mark coverage current.
 
 Generated memory partitions, staging output, traces, and exported snapshots
 must be excluded from source roots so maintenance cannot recursively index its
@@ -728,6 +781,9 @@ after local or SIFS changes.
 
 ## Phase 3: Structural Graph, Overlays, and Curator
 
+Status: not started beyond the Phase 0 relation and overlay types and the
+node-local overlay append/replay store.
+
 Add normalized entity/relation storage and serving adjacency:
 
 - namespaced open relation types and versioned relation descriptors;
@@ -749,7 +805,11 @@ file. A proposed dispute/supersession may rank or explain a conflict but cannot
 suppress an automatic fact.
 Expose bounded `memory_search`, `memory_explain`, `memory_read`,
 `memory_annotate`, `memory_link`, `memory_dispute`, and `memory_reindex` tools.
-Model writes default to proposed and cannot hide base facts globally.
+`memory_search`, `memory_read`, and `memory_write` already exist as the
+agent's SIFS Markdown-note tools (see
+[agent system architecture](../agent-system-architecture.md#historical-recall-and-markdown-notes)),
+so this phase must either back those contracts compatibly or choose distinct
+names. Model writes default to proposed and cannot hide base facts globally.
 
 Introduce a specialized curator package/job loop only after deterministic
 overlay tests exist. Initial triggers should be task/session completion,
@@ -769,6 +829,8 @@ Expected outcome: code/workspace memory and agent-maintained high-level
 relations work without making the graph or model an authority.
 
 ## Phase 4: Optional Vector and Multimodal Providers
+
+Status: not started.
 
 Separate embedding generation from vector serving. A named vector-space
 descriptor records modality, model, dimensions, normalization, metric, version,
@@ -798,6 +860,8 @@ Expected outcome: the same query/evidence API supports multimodal sources and
 cross-modal retrieval without flattening every source to text.
 
 ## Phase 5: Placement and Federation
+
+Status: not started.
 
 Advertise compact memory-service capabilities and partition summaries through
 service discovery/cluster control. Keep per-file and per-index state out of KV.
@@ -829,6 +893,11 @@ index and retrieve near data without centralizing raw files.
 
 ## Phase 6: File-First Writes and Old-Store Removal
 
+Status: partly done. The agent no longer writes completed-turn summaries to,
+or reads from, the record store; its explicit memory writes are SIFS Markdown
+notes that are not yet indexed. The record subsystem code and its storage
+registrations remain in `sinomo-memory`.
+
 Change completed-turn and explicit memory writes to create scope-appropriate
 managed memory documents or overlay operations. Preserve full session/tool
 evidence in its owning files; do not reduce every turn to a mandatory warm
@@ -854,6 +923,9 @@ Expected outcome: all new memory is file-first, with no live dependency on the
 old record subsystem.
 
 ## Recommended First Slice
+
+Status: implemented; the `sinomo memory` CLI and
+`crates/sinomo-memory/tests/indexed_file_memory.rs` exercise this flow.
 
 Implement Phase 0 plus the Phase 1 vertical slice for one local root and
 Markdown/text only:
@@ -911,7 +983,9 @@ Rust gates.
 The first external baseline is implemented by
 `modules/benchmark/sinomo-benchmarks/agent/run_longmemeval_s.py`. It streams the
 pinned cleaned LongMemEval-S dataset, builds and queries the real indexed-file
-store, and can optionally run the Sinomo reader. Every question receives a
+store, and can optionally run the Sinomo reader. Its `--retriever memory-tools`
+mode instead exercises the agent's `session_history_search` and
+`memory_search` note tools over an in-memory VFS. Every question receives a
 fresh disposable data directory, corpus, workspace, home, and environment; no
 cluster, DFS, permission, activity, session, or operational memory state is
 copied. Retrieval-only results and optional reader hypotheses remain separate,

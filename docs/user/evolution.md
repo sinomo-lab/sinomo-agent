@@ -83,8 +83,10 @@ explicit BLAKE3 digest.
 
 ## Repository Evolution
 
-The existing repository workflow now also projects its candidates into goal
-revision graphs:
+The repository workflow also projects its candidates into goal revision
+graphs. Without `--repo` or a repository in the evolution settings, `propose`
+targets the Sinomo source checkout managed for rollout rather than the current
+working directory:
 
 ```sh
 sinomo evolve propose "Reduce parser latency" --repo PATH \
@@ -106,10 +108,10 @@ sinomo evolve goal complete GOAL_ID --note "targets met"
 sinomo evolve goal cancel GOAL_ID --note "objective superseded"
 ```
 
-The Evolution tab provides the same pause/resume and cancel controls. For a
-campaign-backed goal, pause, resume, and cancel also update campaign scheduling
-state. These controls do not bypass a running operation's cancellation or
-rollout authority.
+The Evolution tab provides the same pause/resume, complete, and cancel
+controls. For a campaign-backed goal, each control also updates the campaign's
+scheduling state. These controls do not bypass a running operation's
+cancellation or rollout authority.
 
 The `evolution-agent` is the governor. It owns planning, task assignment,
 evidence review, and next-step recommendations. The separately attributable

@@ -43,9 +43,11 @@ inference, and provider error categories.
 |---|---|
 | `sinomo-agent` | Packages, sessions, context assembly, tool orchestration, compaction, cancellation, and live control. |
 | `sinomo-lm` | Provider adapters, protocol rendering, stream normalization, context-window inference, and provider error classification. |
-| `sinomo-daemon` | Hosting agent service routes through application-supplied hooks without depending on R2 behavior. |
+| `sinomo-daemon` | Hosting agent and chat service routes through an application-supplied component factory without depending on R2 behavior. |
+| `sinomo-cli` | CLI and TUI clients, and the daemon-hosted agent and chat component (`hosted_agent_chat_component_factory`): chat hosts, channel orchestration, chat ownership, and peer routing. |
+| `sinomo-api` and `sinomo-client` | Serializable agent and chat contracts (`sinomo-api::app`) and the client-side daemon transport. |
 | Network and sandbox crates | Routed execution and cancellable isolation used by tools. |
-| `sinomo-cli` and `sinomo-app` | User interaction and runtime-control clients. |
+| `sinomo-app` | Desktop user interaction and runtime-control client. |
 | Benchmark modules | Optional model-quality and compaction evaluation. |
 
 Public Rust types are documented in source and Rustdoc. This document focuses
@@ -353,12 +355,12 @@ successful final decision. Continuation therefore sees completed operations even
 when the following model request failed.
 
 Control edits are prepared on a staged session and control state. Persistence
-errors leave the live session, input queues, revision, and published control events
-unchanged. In the session runtime the snapshot save is the edit's commit point
-and runs last, after the control result is persisted, so an edit reported as
-failed is also not resumed after a restart. Worker cancellation is signalled only after its control result has been
-persisted. Executed turn effects follow the partial-progress rule above rather
-than being rolled back as control edits.
+errors leave the live session, input queues, revision, and published control
+events unchanged. In the session runtime the snapshot save is the edit's commit
+point and runs last, after the control result is persisted, so an edit reported
+as failed is also not resumed after a restart. Worker cancellation is signalled
+only after its control result has been persisted. Executed turn effects follow
+the partial-progress rule above rather than being rolled back as control edits.
 
 Agent homes are outside the session evidence subtree and are keyed by agent id.
 They use SIFS so a newly placed or explicitly migrated session sees the same
@@ -508,10 +510,11 @@ are replaced atomically with their permissions preserved, and moves rename the
 source. Owned runtime paths such as evidence, generated artifacts, and sandbox
 instance directories use the local VFS.
 
-The crate's `clippy.toml` denies direct `std::fs` and `Path` filesystem calls in
-these modules, and `tests/workspace_io_boundary.rs` enforces the same rule
-without Clippy. Host probes (installed programs, enclosing Git repository) live
-in `local_workspace/host_probe.rs`, the only declared exception.
+`crates/sinomo-agent/clippy.toml` denies direct `std::fs` and `Path` filesystem
+calls in these modules, and `crates/sinomo-agent/tests/workspace_io_boundary.rs`
+enforces the same rule without Clippy. Host probes (installed programs,
+enclosing Git repository) live in `tools/local_workspace/host_probe.rs`, the
+only declared exception.
 
 The workspace surface covers bounded file discovery and reads, targeted and
 whole-file editing, structured patching, version-control inspection, command
@@ -608,18 +611,28 @@ discovery can run.
 
 ## Runtime Services and Live Control
 
-An active agent session has one authoritative session server. New sessions use
-the agent's optional home-server preference; without one, the daemon processing
-the creation request becomes the session server. Message ingress from another
-device is routed to the active server and never moves the session implicitly.
-Consequently, agents in one channel may have sessions hosted on different
-servers.
+An active agent session has one authoritative session server, and the session
+records its active server and placement generation. The placement model prefers
+the agent's optional home server for a new session and otherwise uses the
+daemon processing the creation request. Production hosting does not resolve
+remote placement yet: a chat's sessions, including every participant of a
+channel, run on the chat's host (see
+[Chats across windows and nodes](#chats-across-windows-and-nodes)), and a
+package whose home server or sandbox node names another node is rejected.
+Message ingress from another device is routed to the active host and never
+moves the session implicitly; only failover from a host presumed gone moves a
+chat. Once remote placement exists, agents in one channel may have sessions
+hosted on different servers.
 
-Session migration is an explicit control operation. It moves session ownership
-and resumable session state, not arbitrary local resources. Host-local files
-that are not in SIFS become unavailable after migration, and Sinomo does not
-attempt local-resource transfer. The placement generation changes atomically so
-routers can reject stale ownership information.
+Session migration is an explicit operation. It moves session ownership and
+resumable session state, not arbitrary local resources. Host-local files that
+are not in SIFS become unavailable after migration, and Sinomo does not attempt
+local-resource transfer. The placement generation changes atomically so routers
+can reject stale ownership information. The session model implements this
+transition (`AgentSession::migrate_to_server`), but no control route performs
+a migration handoff yet; the
+[placement plan](plans/agent-session-placement-and-workspaces.md) tracks the
+remaining work.
 
 The sandbox is a persistent VM-like resource with its own filesystem, process
 runtime, placement, lifecycle, and portability. It is architecturally
@@ -649,10 +662,10 @@ sandbox service, and with it tool execution on a sandbox hosted by another
 node, is not available yet.
 
 Migrating a session does not implicitly migrate, recreate, or destroy its
-sandbox. A session may invoke a sandbox hosted on another server; in that
-arrangement every tool operation executes on the sandbox server. A non-portable
-sandbox remains bound to its server until explicitly replaced or reattached
-through sandbox-specific control.
+sandbox. Once remote execution exists, a session that attaches a sandbox hosted
+on another server executes every tool operation on the sandbox server. A
+non-portable sandbox remains bound to its server until explicitly replaced or
+reattached through sandbox-specific control.
 
 The control plane exposes read-only inspection separately from live steering,
 follow-up, interrupt, and resume operations. A daemon may always expose durable
@@ -758,12 +771,11 @@ and completion belong to its session rather than to the runtime that started
 it: a host can rebuild a session's runtime (for a model, agent, or workspace
 change) while calls run, and the rebuilt runtime restores the session's
 records. A continuation consumes its completion, so a restored copy does not
-continue the session twice. When a session is
-attached, a completion it has not continued with is queued again, and a call
-whose process stopped before it finished completes as interrupted ("it may or
-may not have taken effect"), so the agent can tell the user. Delivery is
-recorded only once the continuation's session is saved. A paused session
-holds its completions until it resumes.
+continue the session twice. When a session is attached, a completion it has not
+continued with is queued again, and a call whose process stopped before it
+finished completes as interrupted ("it may or may not have taken effect"), so
+the agent can tell the user. Delivery is recorded only once the continuation's
+session is saved. A paused session holds its completions until it resumes.
 
 ## Subagents
 
@@ -793,11 +805,13 @@ concurrent writes to shared resources.
 
 Child handles belong to exactly one parent session. Cancellation and deadlines
 flow to descendants, while child cancellation leaves parents and siblings
-running. Aborting or interrupting a parent cancels its children. Releasing the last parent
-runtime handle cancels and removes its children; child completion also releases
-that child's descendants. Cancellation is cooperative: a running handle stays
-`running` until its worker exits, and `cancel_requested` distinguishes the
-request from confirmed termination.
+running. Aborting a parent or cancelling its turn cancels its children;
+interrupting it pauses them (see
+[Interrupt (pause) versus cancel](#interrupt-pause-versus-cancel)). Releasing
+the last parent runtime handle cancels and removes its children; child
+completion also releases that child's descendants. Cancellation is cooperative: a running
+handle stays `running` until its worker exits, and `cancel_requested`
+distinguishes the request from confirmed termination.
 
 Children do not create agent packages, background activities, durable session
 checkpoints, or new sandboxes. Inherited evidence and trace stores may retain
@@ -814,13 +828,14 @@ subprocesses, sandboxes, gateways, object RPC, and cancel-aware modules. A
 caller can cancel before execution or while work is active. Turn-operation
 timeouts set a monotonic deadline on the same cancellation token observed by
 model, tool, and process execution. Deadline expiry requests cooperative
-cancellation; it does not pretend that a non-cooperative call has already stopped.
-Both synchronous and worker-driven turns clear their active state after an
-execution failure. Once cancellation is accepted, a later transport or worker error is classified as cancellation
-rather than an unrelated failure. The turn's published cancelled state is
-final: the worker's eventual outcome adds no failed or completed status over
-it. A turn reports a timeout only when its deadline actually cancelled it, not
-when it merely finished after the deadline.
+cancellation; it does not pretend that a non-cooperative call has already
+stopped. Both synchronous and worker-driven turns clear their active state
+after an execution failure. Once cancellation is accepted, a later transport or
+worker error is classified as cancellation rather than an unrelated failure.
+The turn's published cancelled state is final: the worker's eventual outcome
+adds no failed or completed status over it. A turn reports a timeout only when
+its deadline actually cancelled it, not when it merely finished after the
+deadline.
 
 Components that cannot stop active work must report that limitation. They must
 not acknowledge cancellation and continue producing authoritative side effects.
@@ -929,10 +944,8 @@ python3 modules/benchmark/sinomo-benchmarks/agent/run_compaction_eval.py --mode 
 ```
 
 Plan and fixture modes provide deterministic harness validation. Run mode may
-call configured models or a live cluster.
-
-Live/model results are research and eval evidence. Local and CI gates interpret
-them separately: local readiness remains responsible only for deterministic projection and persistence invariants.
+call configured models or a live cluster; local and CI gates interpret its
+results separately.
 
 ## Skills
 
@@ -992,8 +1005,9 @@ marks secret are redacted. A custom package does not gain any of this authority
 by declaring the `main` or `deliberation` role or copying the same tool names.
 `remote_file_get` and `remote_file_put` read or write arbitrary host paths on the
 initiating node, so they also require that node's local `remote-management`
-grant in addition to the receiving node's. Background defaults remain workspace-restricted and do not
-inherit the main agent's workspace mutation or generic command tools.
+grant in addition to the receiving node's. Background defaults remain
+workspace-restricted and do not inherit the main agent's workspace mutation or
+generic command tools.
 
 Background-agent defaults:
 

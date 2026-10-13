@@ -15,15 +15,17 @@ own output. Those decisions remain with rollout policy and the target node.
 The implementation delivers authenticated live capability RPCs, a node-local
 durable queue, exact target-aware Cargo execution, a verified node-local
 artifact cache, build-owned managed-source handling, and CLI
-scheduling/distribution. Local apply and target-local recovery use the same
-planner, executor, cache publisher, and verification path as queued service
-jobs. Supplying `--binary` bypasses binary compilation; unless the operator also
-selects the explicit binary-only bootstrap mode, any requested native modules
-still flow through the build service. Expiring
-advertisements and leases in cluster KV, shared registry/DFS artifact lookup,
-signing, and historical reliability estimates are the next distributed
-coordination layer described by this document; operators should not assume
-those pieces are already active.
+scheduling/distribution. The rollout client queries capabilities directly from
+reachable daemons, ranks the compatible builders, and downloads the verified
+artifacts from the selected builder's cache before staging. Local apply and
+target-local recovery use the same planner, executor, cache publisher, and
+verification path as queued service jobs. Supplying `--binary` bypasses binary
+compilation; unless the operator also selects the explicit binary-only
+bootstrap mode, any requested native modules still flow through the build
+service. Expiring advertisements and leases in cluster KV, shared registry/DFS
+artifact lookup, signing, and historical reliability estimates are the next
+distributed coordination layer described by this document; operators should
+not assume those pieces are already active.
 
 ```text
 authorized source + build requirements
@@ -123,9 +125,9 @@ target directories are reusable but partitioned by concrete target, toolchain,
 and profile and protected by a cross-process lock. Admitted builds use all CPU
 cores available to the build server. Resource pressure affects placement and
 admission rather than reducing compiler concurrency. Known insufficient disk or
-memory blocks a cache miss before source upload, while an already verified exact cache
-hit remains usable. A job is successful only after the published bytes can be
-retrieved and independently verified by content digest.
+memory blocks a cache miss before source upload, while an already verified
+exact cache hit remains usable. A job is successful only after the published
+bytes can be retrieved and independently verified by content digest.
 
 Artifacts are distributed from the best authorized source, not necessarily the
 worker that produced them. Registry, DFS, peer, and node-local caches may all

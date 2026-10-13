@@ -32,11 +32,14 @@ See also:
 
 - Main and shadow daemon lifecycle: `run`, `start`, `status`, `stop`, process
   supervision, pid observation, lock files, and status files.
-- Daemon-local control protocol framing, authentication checks, connection
-  lifetime, response routing, and stream-coupled RPC plumbing.
-- Runtime wiring from daemon state into `sinomo-service::ServiceContext`,
-  including data directory handles, optional cluster clients, signer access,
-  node identity, and response sinks.
+- Daemon-local control protocol framing, authentication checks, replay
+  protection, connection lifetime, response routing, and stream-coupled RPC
+  plumbing, plus the server adapters for the `sinomo-api` daemon contracts.
+- Component hosting: the live service-registry snapshot, the
+  `sinomo_module::ComponentReconciler`, publication of the module runtime
+  generation, the component event bus, and the generic host adapters handed to
+  components (data directory, cluster access, target-addressed object-RPC
+  transport, activity counters, node resources, and host role).
 - Event loop scheduling for timers, peer connections, local sockets, shutdown,
   and service dispatch.
 - Host-specific adapters for filesystem paths, installed binaries, process
@@ -44,6 +47,10 @@ See also:
 
 `sinomo-daemon` does not own domain behavior:
 
+- Product composition. The caller supplies a `ComponentCatalog` (normally built
+  by `sinomo-product-profile`); the daemon executes its factories,
+  registrations, storage contributions, and status/recovery/migration hooks
+  without keeping a built-in list of its own.
 - Cluster membership semantics, route selection, health evaluation, join
   reconciliation, Raft quorum logic, cluster KV rules, or peer graph algorithms.
 - DFS namespace, object storage, metadata, journal, snapshot, maintenance, and
@@ -52,8 +59,8 @@ See also:
   cluster rollout state machines.
 - Sandbox policy, toolchain behavior, filesystem semantics, or execution
   rules.
-- Module lifecycle, registry rules, service manifests, generated registration
-  tables, or activation state semantics.
+- Module lifecycle, registry rules, service manifests, native-dylib loading and
+  invocation, or activation state semantics.
 - Persistent storage layouts for cluster, DFS, rollout, sandbox, registry, or
   other domain crates.
 
@@ -87,19 +94,25 @@ Application and R2 crates should avoid importing daemon internals. Use
 `sinomo-daemon` only for daemon lifecycle, status, local client, and control
 protocol utilities.
 
-Within this crate, prefer importing R0/R1 surfaces through `sinomo-runtime`
-where that matches the workspace ring boundary model. Keep daemon-only types
-private unless they are part of the daemon client/control API.
+Within this crate, import R0 surfaces through `sinomo-core` and name the few R1
+dependencies directly (`sinomo-api`, `sinomo-config`, `sinomo-device`,
+`sinomo-module`). The `sinomo-runtime` host profile re-exports this crate, so
+the daemon must not depend on that facade. Domain crates such as `sinomo-dfs`,
+`sinomo-rollout`, and `sinomo-sandbox` are dev-dependencies only. Keep
+daemon-only types private unless they are part of the daemon client/control API.
 
 ## Storage Boundary
 
-Daemon-owned local state is limited to daemon process state, for example:
+Daemon-owned local state is limited to daemon process state, registered by
+`sinomo_daemon::register_storage_paths`:
 
-- `daemon/daemon.lock`
-- `daemon/status.json`
-- `shadow-daemon/daemon.lock`
-- `shadow-daemon/status.json`
-- daemon-local auth nonce or control protocol files
+- `daemon/status.sobj` and `shadow-daemon/status.sobj`
+- `daemon/daemon.lock`, `daemon/data-owner.lock`, `daemon/sifs-mount.lock`, and
+  `shadow-daemon/daemon.lock`
+- `daemon/auth-nonces.sobj` and `.sobjlog` (and the shadow equivalents) for
+  control-protocol replay protection
+- `daemon/main.stdout.log` and `daemon/main.stderr.log`
+- installed OS boot entries and launch scripts, registered as an escape path
 
 Cluster state, DFS content, rollout build logs, registry state, sandbox
 artifacts, and module state belong to their corresponding crates, even when the
@@ -107,123 +120,59 @@ daemon opens the files or triggers maintenance.
 
 ## Current Network/KV Boundary
 
-Cluster networking and KV storage are separate domains. Their coupling is real
-but narrow: KV replication and KV RPC traffic use the cluster network for data
-transmission, while network routing reads stable cluster facts through a small
-directory surface, including the authoritative connectivity graph published in
-cluster KV by `sinomo-cluster`. The local connectivity file is a bootstrap cache
-used before the directory graph is readable. Those facts do not make either
-crate the owner of the other's domain.
+Cluster networking and KV storage are separate R0 domains. `sinomo-network` and
+`sinomo-kv` have no production dependency on one another, and `sinomo-cluster`
+is the only bridge: it carries KV/Raft traffic over network-selected routes and
+projects committed cluster facts through the read-only network directory. The
+ownership table and invariants live in
+[clustering architecture](../../docs/clustering-architecture.md#ownership-boundaries)
+and [network architecture](../../docs/network-architecture.md); this README
+does not restate them.
 
-The current contract is:
-
-- `sinomo-network` owns the cluster network and routing layer: route choice,
-  endpoint selection, endpoint scoring, relay decisions, peer transport
-  contracts, inbound peer authorization, connectivity graph interpretation,
-  membership routing decisions, join-registration network validation, cluster
-  health probe planning, and network maintenance cadence. Connectivity records
-  are network-domain facts published to cluster KV by the cluster control plane
-  and read by network through the directory interface. Local connectivity files
-  remain only as bootstrap caches. Network must not apply KV commands, manage
-  watches, own Raft leaders/elections, own Raft logs, compact snapshots, or
-  define durable KV storage layout.
-- `sinomo-kv` owns KV storage semantics: keyspace revisions, transactions,
-  range reads, watches, snapshots, leases, Raft participant state,
-  leader/election state, term/vote/log/snapshot behavior, compaction, range
-  limits, and durable KV layout rules. It may use network-owned transport
-  capabilities to replicate or serve KV traffic across nodes. KV decides what
-  bytes and log entries must be replicated and when a node has won KV Raft
-  leadership; network decides which peer route carries the vote/append traffic.
-  KV must not choose peer routes, score endpoints, relay packets, or interpret
-  cluster connectivity topology.
-- `sinomo-cluster` is the only R0 bridge. It owns the transport-coupled Raft
-  and membership drivers, moves KV/Raft traffic over network-selected routes,
-  and projects committed cluster facts through the read-only network directory
-  surface. It does not move routing into KV or KV state-machine semantics into
-  networking.
-- `sinomo-daemon` owns host mechanics for both crates: daemon authentication
-  context, local process probing, local identity/signing, data-directory access,
-  generic daemon RPC transport, response routing, timers, and the small adapter
-  objects needed to let network-owned and KV-owned logic run inside the daemon
-  event loop.
-
-The coupling is represented as explicit interfaces, not shared ownership:
-
-- KV-to-network coupling is a transport capability that sends KV/Raft RPC
-  envelopes over routes selected by `sinomo-network`. The transport capability
-  can be supplied by the daemon or by a network-owned adapter, but KV logic should
-  see it as a send/replicate interface, not as routing internals.
-- Network-to-KV coupling is a read-only directory/connectivity query
-  capability backed by KV state. The query returns network records; it must not
-  expose transaction, watch, compaction, or Raft mechanics to routing code.
-- KV route/category/body payload contracts live in `sinomo-kv`; the
-  network layer may wrap those payloads in its generic object-RPC envelope and
-  choose the peer route, but should not be the source of truth for KV payload
-  semantics.
-- Local KV read/watch route dispatch lives in `sinomo-kv`. Cross-node
-  watch-event fanout may still require network/cluster validation before events
-  are appended locally, but the durable watch storage semantics should not live
-  in the daemon.
-- Shared wire payloads or graph data types live in the owning crate or a
-  focused contract crate. They should not cause `sinomo-network` to become a KV
-  implementation or `sinomo-kv` to become a router. If a Rust crate dependency
-  would imply the wrong ownership direction, introduce explicit traits or a small
-  contract crate instead of hiding the dependency inside a broad module.
-
-The production manifests and workspace boundary test enforce that
-`sinomo-network` and `sinomo-kv` do not depend on one another. Dev-only
-test-support dependencies do not change this ownership boundary.
-
-The daemon still hosts narrow network, cluster, KV, DFS, and membership adapter
-objects because one process runs those services. Keep those adapters limited to
-lifecycle, authentication, scheduling, persistence handles, and response
-routing. New Raft, routing, or membership semantics belong in their owning
-crates rather than expanding daemon glue. The crate root should re-export only
+The daemon implements the host traits those crates declare, for example
+`sinomo_core::cluster::ClusterControlPlaneTransport` and the KV quorum hosts, and
+supplies authentication context, local identity and signing, data-directory
+access, generic daemon RPC transport, response routing, and timers. The
+cluster-network maintenance loop is the generic `sinomo-cluster` reactor; the
+daemon implements only the host operations that touch its listener, process
+identity, and transport. New Raft, routing, or membership semantics belong in
+their owning crates rather than in daemon glue. The crate root re-exports only
 CLI/runtime entry points and stable daemon contracts; control-loop helpers,
-frame codecs, maintenance triggers, and low-level peer sends remain internal
+frame codecs, maintenance triggers, and low-level peer sends stay internal
 unless another crate has a reviewed integration need.
 
-## Current DFS Boundary
+## Component-Owned Domains
 
-DFS route and data-plane behavior belongs to `sinomo-dfs`. The current boundary
-is:
+DFS, Sandbox, Observe, Build, and the DFS history and attachment features are
+components in the product catalog. Each component scope owns its routes,
+workers, storage contributions, and recovery; the daemon does not construct DFS
+adapters, decode Sandbox requests, enumerate their routes, or schedule their
+work. Route-specific checks such as exact-member identity are declared by the
+owning module and enforced from generic service metadata.
 
-- `sinomo-dfs` owns DFS control-plane route constants, control-plane service
-  behavior, data-plane object-RPC message processing for a single inbound
-  message, endpoint peer transport through `DfsEndpointTransport`, metadata
-  replication endpoint transport through `DfsMetadataEndpointTransport`,
-  metadata publish retry scheduling through `DfsMetadataPublishScheduler` and
-  the default scheduler, DFS peer RPC request/response codecs for data-plane
-  messages and metadata replication, the post-mutation metadata publish event
-  gate, cluster data-plane service assembly through `DfsDataPlaneService`,
-  cluster maintenance tick assembly through `run_cluster_dfs_maintenance_tick`,
-  cluster smoke assembly through `run_cluster_dfs_smoke`, metadata shard
-  primary-transfer readiness, metadata backend semantics,
-  content-store semantics, namespace jobs, and lifecycle maintenance algorithms.
-- `sinomo-daemon` owns host adapters: local data-dir setup, local node identity,
-  anti-entropy cursor files, cluster KV client wiring, generic signed daemon RPC
-  transport for peer frames and metadata journal replication, process counters,
-  and publish callbacks for cluster-visible metadata. Its DFS maintenance role
-  is to call DFS-owned APIs, supply daemon senders/adapters, and log or count
-  host-level outcomes.
-- DFS default cluster bootstrap still needs a daemon host adapter for cluster KV
-  commits and daemon endpoint publication; the bootstrap decision logic belongs
-  to `sinomo-dfs`.
+Rollout routes, desired-state watching, shadow finalization, and process
+activation live in the `sinomo-rollout` crate family; `sinomo-rollout-host` is
+the trusted daemon-process adapter selected by the product profile. The daemon
+keeps only generic process mechanics such as spawning the shadow rollout
+recovery helper and requesting a supervised restart. Daemon-originated
+operational records are published on the component event bus; the daemon never
+writes Observe-owned files. See [architecture](../../docs/architecture.md) for
+the component-composition contract.
 
 ## Transitional Areas
 
-The daemon currently contains substantial logic that should move to owning
-crates over time. The largest areas are:
+The daemon still contains substantial logic that should move to owning crates
+over time. The largest areas are:
 
-- `cluster.rs`: remaining Raft driver behavior, relay handling, membership
-  maintenance, and daemon-specific cluster transport adapters.
-- `dfs.rs`: DFS peer transport fan-out, metadata publishing adapters,
-  maintenance adapters, and default bootstrap host adapters.
-- `rollout.rs`: binary rollout process glue mixed with rollout-state behavior.
-- `control.rs`: listener lifecycle, bootstrap handshakes, and daemon process
-  coordination around service-registry dispatch.
-- `service_adapter.rs`: daemon context and process-state adapters for
-  service-owned asynchronous route handlers.
+- `cluster.rs`: Raft append/vote transport and member catch-up, cluster control
+  (init, invite, join, leave, remove, rename, role), connectivity probing,
+  node-status publication, and daemon-specific cluster transport adapters.
+- `control.rs`: listener lifecycle, bootstrap handshakes, KV committed-state
+  observation, and daemon process coordination around service-registry
+  dispatch.
+- `service_adapter.rs`: the component/service-registry host, daemon context and
+  process-state adapters, module hot unload, and asynchronous route handlers.
+- `client.rs`: generic daemon and foundational cluster transport for callers.
 
 Refactors should reduce these files by moving domain logic to the owning crate
 or to a focused R1 crate, while keeping daemon adapters small and mechanical.
@@ -256,23 +205,11 @@ cargo test -p <owning-crate>
 
 ## Migration Priorities
 
-Good first slices are:
+Good next slices are:
 
-- Split cluster KV storage from network routing by moving KV range/watch
-  handling, KV/Raft route codecs, and Raft storage helper orchestration toward
-  `sinomo-kv`.
-- Introduce explicit KV-to-network transport traits for KV/Raft traffic so KV can
-  request replication without owning peer route selection.
-- Keep route interpretation in `sinomo-network` while publishing source-owned
-  connectivity records into cluster KV through the explicit directory/query
-  seam; local connectivity files are bootstrap cache only.
 - Finish moving cluster control-plane and Raft transport decisions out of
   daemon-owned files.
 - Move remaining cluster membership reconciliation and maintenance into the
   owning network/cluster crate.
-- Move DFS protocol, snapshot, journal, and maintenance algorithms behind
-  `sinomo-dfs` APIs or services.
-- Separate rollout binary host actions from rollout planning and state-machine
-  logic.
 - Shrink daemon public exports as callers move to `sinomo-runtime` or owning
   crates.

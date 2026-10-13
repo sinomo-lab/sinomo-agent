@@ -2,6 +2,13 @@
 
 This guide describes the package build and install system for the Sinomo sandbox. The goal is an Arch-inspired package workflow for `wasm32-wasix`, with a real package manager inside the sandbox and automated source rebuilds for suitable official Arch packages.
 
+Status (reviewed 2026-10-13): proposed. The `sinomo sandbox package` commands,
+the `/services/sandbox/packages` repository layout, the bootstrap installer, and
+the build worker below do not exist yet. Implemented pieces are the upstream
+makepkg package recipe (`toolchains/build-tools/build-makepkg-wasix.sh`) and its
+`sinomo sandbox toolchain verify-makepkg` smoke gate; toolchains are still
+installed with `sinomo sandbox toolchain import-package`.
+
 ## Goals
 
 The package system must:
@@ -175,7 +182,17 @@ Missing behavior should be implemented in the runtime, VFS, compiler, sysroot, o
 
 ## Makepkg Base Environment Gap
 
-The first `makepkg` target should bring up source-package workflows before trying to support every Arch packaging feature. Excluding compilers, the current sandbox already has a meaningful base: real WASIX Bash/`sh`, BusyBox applets for common file and text operations, GNU Make, Python/pip, a Clang/LLVM package recipe, and an upstream pacman makepkg package recipe. The current source declarations and package recipes expose BusyBox commands `awk cat chmod cp cmp date diff dirname echo env false find grep gzip head ln ls mkdir mv patch printf pwd rm rmdir sed sha256sum sort tail tar test touch true tr uname uniq wc`, Bash commands `bash sh`, GNU Make as `make`, upstream pacman `makepkg`, Python as `python pip`, and Clang/LLVM commands `clang clang++ cc c++ wasm-ld ld.lld llvm-ar llvm-ranlib llvm-nm`.
+The first `makepkg` target should bring up source-package workflows before
+trying to support every Arch packaging feature. Excluding compilers, the current
+sandbox already has a meaningful base: real WASIX Bash/`sh`, BusyBox applets for
+common file and text operations, GNU Make, Python/pip, a Clang/LLVM package
+recipe, and an upstream pacman makepkg package recipe. The current source
+declarations and package recipes expose BusyBox commands `awk cat chmod cp cmp
+date diff dirname echo env false find grep gzip head ln ls mkdir mv patch printf
+pwd rm rmdir sed sha256sum sh sleep sort tail tar test touch true tr uname uniq
+wc`, Bash commands `bash sh`, GNU Make as `make`, upstream pacman `makepkg`,
+Python as `python pip`, and Clang/LLVM commands `clang clang++ cc c++ wasm-ld
+ld.lld llvm-ar llvm-ranlib llvm-nm`.
 
 The makepkg package recipe renders upstream pacman 7.1.0 scripts and configuration into the sandbox's normal Linux paths:
 

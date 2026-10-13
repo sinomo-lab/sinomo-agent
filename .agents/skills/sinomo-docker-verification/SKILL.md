@@ -46,8 +46,8 @@ Inspect existing projects before bring-up. Use a distinct disposable project, or
 reuse the specific cluster requested by the user. Follow its existing ownership
 and retention instructions. The main harness normally removes the selected
 project's volumes before a fresh run and at teardown; `KEEP=1` affects teardown,
-not the initial reset. `REUSE=1` skips bring-up and currently retains the project
-on exit. It does not refresh the mounted executable.
+not the initial reset. `REUSE=1` skips bring-up and retains the project on exit.
+It requires `SINOMO_TEST_BUILD=0` and does not refresh the mounted executable.
 
 When a host binary or entrypoint was replaced, recreate the affected containers:
 restart can retain the old bind-mounted inode. Also inspect

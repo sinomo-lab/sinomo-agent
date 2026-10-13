@@ -60,7 +60,21 @@ cargo test -p sinomo-core --test workspace_ring_boundaries
 ```
 
 It checks ring metadata, dependency direction, facade shape, ABI exceptions,
-native-module default membership, and the network/KV production split.
+native-module default membership, the network/KV production split, and the
+separation of the app, daemon, and product components.
+
+## DFS/KV Boundary Lint
+
+Run this for DFS, DFS history/attachment, or KV-facing changes:
+
+```sh
+bash scripts/ci/check-dfs-kv-boundary.sh
+```
+
+The Dylint rule rejects implicit KV access from ordinary DFS operations. It
+needs a pinned nightly and `cargo-dylint`; see the
+[lint README](../../lints/sinomo-architecture/README.md) for installation,
+boundary markers, and its limits.
 
 ## Broad Rust Gates
 
@@ -168,8 +182,9 @@ cryptographic, scheduling, or real-network behavior.
 ## Real Multi-Node Validation
 
 The Docker harnesses include a segmented six-node development cluster plus
-separate migration and single-node paths. Together they exercise formation,
-routing, migration, DFS, failure, restart, and idle-resource gates. Start with
+separate routing, migration, and single-node paths. Together they exercise
+formation, routing, migration, DFS, failure, restart, rollout recovery,
+mounted-filesystem compatibility, and idle-resource gates. Start with
 [the Docker guide](../../docker/README.md).
 
 Common harnesses include:
@@ -179,8 +194,12 @@ docker/test-cluster.sh
 docker/benchmark-cluster-kv.sh
 docker/test-routing-scenario.sh
 docker/test-cluster-migration.sh
+docker/test-pjdfstest.sh --smoke --report
 docker/measure-final.sh 60 90
 ```
+
+`docker/test-rollout-recovery.sh` additionally needs compatible baseline and
+candidate Linux binaries; see the Docker guide for its inputs.
 
 These commands can take substantial time and create containers, volumes, and
 artifacts. Read their options, use a distinct Compose project where supported,
@@ -214,8 +233,11 @@ source artifacts and should not be committed.
 ## Benchmarks and Experimental Evaluation
 
 Benchmarks live under `modules/benchmark/sinomo-benchmarks/` and are opt-in.
-Available surfaces include indexed-file memory and LongMemEval-S, SIFS/FUSE,
-SWE-bench, MCU/MineStudio, and environment adapters.
+Available surfaces include indexed-file memory and LongMemEval-S, agent channel,
+compaction, and skill evaluations, SIFS/FUSE, SWE-bench, MCU/MineStudio, tau3
+voice, and environment adapters. The cluster-KV benchmark is a Docker harness.
+For DFS or cluster performance reports, apply the
+[performance analysis skill](../../skills/sinomo-performance-analysis/SKILL.md).
 
 Use [research and evaluation](research-and-evaluation.md) to classify the claim,
 evidence, and current implementation boundary. Use
@@ -230,9 +252,11 @@ immutable result artifact; do not commit an unreviewed output dump.
 
 ## Current CI Boundary
 
-The GitLab pipeline runs on `main` and builds locked release CLI artifacts for
-configured Linux and Windows targets. It does not currently run merge-request
-formatting, Clippy, unit tests, formal checks, real-cluster tests, or benchmarks.
+The GitLab pipeline runs only on `main`. It runs the DFS/KV boundary lint and
+builds locked release CLI artifacts for configured Linux and Windows targets
+plus a Linux x86_64 desktop bundle. It does not currently run merge-request
+formatting, Clippy, unit tests, the trust-ring test, formal checks, real-cluster
+tests, or benchmarks.
 
 Contributors must therefore report local validation explicitly. A future CI
 gate can automate a command, but it does not change which evidence the
@@ -245,11 +269,11 @@ architecture requires.
 | Manifest or facade | Trust-ring test and workspace check |
 | KV/Raft or membership | Crate tests, cluster integration, relevant Quint refinement |
 | Network routing or transport | Network tests, routed multi-node scenario, relevant Quint refinement |
-| DFS metadata/content | DFS integration, restart/repair scenario, relevant formal slice |
+| DFS metadata/content | DFS integration, DFS/KV boundary lint, restart/repair scenario, relevant formal slice |
 | Windows Cloud Files | API and platform-neutral state-machine tests, Windows target `--no-run`, and focused Windows execution for CFAPI, Explorer, notification, idle-I/O, or power behavior |
-| Daemon lifecycle or rollout | Daemon/rollout tests and process-level activation/recovery scenario |
+| Daemon lifecycle or rollout | Daemon/rollout tests and process-level activation/recovery scenario (`docker/test-rollout-recovery.sh`) |
 | Sandbox/toolchain | Actual backend build and matching verifier |
 | Provider or agent protocol | Scripted-provider tests or scenarios; opt-in live smoke only when required |
-| Performance optimization | Correctness gates plus before/after benchmark on a recorded environment |
+| Performance optimization | Correctness gates plus before/after benchmark on a recorded environment; DFS/cluster work uses the performance analysis skill's standard tables |
 | User command | Parser/help tests, domain tests, and updated user guide |
 | Documentation only | `python3 scripts/docs/check_links.py` and `git diff --check` |

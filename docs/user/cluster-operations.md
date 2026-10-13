@@ -97,9 +97,11 @@ membership. Keep an odd number of reliable authority nodes when possible;
 intermittent laptops and mobile devices should normally not be required for
 quorum.
 
-`state-authority` and `promote` execute through the running daemon's cluster-control
-service. The CLI does not open daemon-owned Raft state. Promotion retains the
-existing learner catch-up proof and committed configuration-change checks.
+Membership changes (`invite`, `join`, `rename`, `role`, `state-authority`,
+`promote`, `remove`, and `leave`) execute through the running main daemon's
+cluster-control service. The CLI does not open daemon-owned Raft state.
+Promotion retains the existing learner catch-up proof and committed
+configuration-change checks.
 
 The `state-authority` command uses operator-facing tokens that map to the
 underlying membership roles:
@@ -136,6 +138,9 @@ cluster:
 ```sh
 sinomo cluster leave
 ```
+
+The old cluster state is quarantined locally, and the main daemon stops so its
+supervisor can restart it with the new cluster identity.
 
 Treat migration and leave as state transitions, not cleanup commands. Verify
 the current cluster, node identity, and data directory before running them.

@@ -23,9 +23,9 @@ Cloud Files currently provides:
 - durable local file and namespace writeback to DFS;
 - durable application of committed remote namespace changes to NTFS;
 - reactive per-item writeback and conflict status in File Explorer;
-- restart-safe CFAPI registration, state-preserving disable/re-enable, and
-  cursor-recovery handoff;
-- exact provider pinning across module-loader rollout;
+- restart-safe CFAPI registration and state-preserving disable/re-enable;
+- fail-closed provider selection and native registration-ownership checks
+  across module-loader rollout;
 - live status and bounded attention summaries through the SIFS mount
   supervisor.
 
@@ -58,7 +58,7 @@ Explorer and applications <-> Windows Cloud Files native module
 | Cloud Files private protocol | Versioned provider implementation records live in `modules/dfs/cloud-files/src/protocol.rs` and are not part of the runtime facade. |
 | Generic host interface | `sinomo.host-filesystem-provider/v1` is the only contract known by the main system. |
 | SIFS mount supervisor | Reads node-local mount consent, owns the process-wide mount lease, and calls the DFS-owned typed client. Provider selection and content-addressed loading use `sinomo-module`'s generic active-component binding. It does not decode Cloud Files state. |
-| Native module | Pins its exact artifact, registers and connects CFAPI, validates physical identity, serves callbacks, and owns registration, unregister, compensation, and recovery state. |
+| Native module | Registers and connects CFAPI, validates physical identity, serves callbacks, and owns registration, unregister, compensation, and recovery state. |
 | Writable worker | Converts NTFS notifications and DFS namespace events into bounded, restart-safe work. |
 | Mounted SIFS service | Resolves the configured SIFS root and performs canonical DFS reads and mutations through the normal routed service path. |
 | Windows/NTFS | Owns ordinary local directory behavior, placeholder state, cached hydrated ranges, and change notifications. |
@@ -98,9 +98,10 @@ unregistering the sync root are separate lifecycle operations.
 
 ## Local Changes to DFS
 
-Writable Windows mounts require `--sync-local-changes`. NTFS records the user's
-write first. `ReadDirectoryChangesW` then wakes the worker; it is an accelerator,
-not the sole source of truth. Startup and notification-overflow recovery use
+Windows mounts must be writable and require `--sync-local-changes`; read-only
+and unsynchronized writable modes fail closed. NTFS records the user's write
+first. `ReadDirectoryChangesW` then wakes the worker; it is an accelerator, not
+the sole source of truth. Startup and notification-overflow recovery use
 bounded scans to reconstruct missed changes.
 
 The writeback order is:
@@ -192,40 +193,31 @@ which were persisted after prematurely removing that entry may recover it from
 the checksummed live manifest journal; that replay history is usable only while
 the matching durable conflict remains present.
 
-The preserved-registration rollout includes one explicitly versioned cleanup
-for older verification history. On its first successful startup only, the
-worker collapses terminal conflict records with the same operation kind,
-source, and destination, retaining the newest non-test diagnostic. Terminal
-delete conflicts beneath narrowly recognized test paths are retired without
-replaying the delete. A full authoritative scan follows, and retired records no
-longer protect paths from current projection. Historical test upsert conflicts
-are acknowledged only when the current scan still contains the path and the
-Windows adapter proves the ordinary local entry against the conflict's exact
-type, size, and complete content hash while excluding writers. Any failed
-proof, user path, pending operation, or conflict created after the durable
-one-shot migration fence remains visible and actionable.
+Absence after downtime is never deletion evidence. Live `ReadDirectoryChangesW`
+removals are the only local delete authority; identity-backed startup state can
+still recover creates, replacements, and renames.
 
-The v2 fence adds the previously omitted
-`/services/real-cluster/` verification subtree. It does not widen cleanup to
-`sinomo-agent`, sandbox-instance, service, node, or user paths. A node that
-already completed v1 runs only the v2 delta; a fresh node persists both fences
-with the same complete-scan boundary.
+Older evidence is retired only by explicitly versioned, one-shot cleanup fences
+that each complete against an authoritative scan before the fence is durable:
 
-V4 corrects a separate sparse-projection bug. The old startup audit treated
-prior manifest paths missing from NTFS as local deletes even though absence
-after downtime has no causal deletion evidence. Startup no longer synthesizes
-deletes from absence; live `ReadDirectoryChangesW` removals remain the delete
-authority, while identity-backed startup state can still recover creates,
-replacements, and renames. The v4 migration consumes authoritative scan deltas
-incrementally, retires only deterministic `startup-delete` conflicts already
-durable before the fence, and clears matching legacy
-absence/raced-generation diagnostics. V3 introduced the first fence but could
-see only the terminal bounded scan page; v4 completes the entire pre-fence
-cohort before committing its fence.
-The exact legacy raced-generation/absence diagnostic is also discarded before
-projection because the corrected scanner has no path which can create it; any
-current ordinary or dirty local entry is immediately reclassified with its
-actual evidence by the same scan.
+- the conflict-history fences (v1, with v2 adding the
+  `/services/real-cluster/` verification subtrees) collapse duplicate terminal
+  conflicts, retaining the newest non-test diagnostic, and retire terminal
+  deletes beneath narrowly recognized test paths without replaying them. A
+  historical test upsert conflict is acknowledged only when the current scan
+  still contains the path and the Windows adapter proves the ordinary local
+  entry against the conflict's exact type, size, and complete content hash
+  while excluding writers.
+- the startup-absence fence (v4, which replaced an incomplete v3) retires
+  deterministic `startup-delete` conflicts and matching legacy
+  absence/raced-generation diagnostics across every bounded scan page of the
+  pre-fence cohort. The same scan reclassifies any current ordinary or dirty
+  local entry with its actual evidence.
+
+Outside those recognized verification subtrees, cleanup never touches
+`sinomo-agent`, sandbox-instance, service, node, or user paths. Any failed
+proof, pending operation, or conflict created after a durable fence remains
+visible and actionable.
 
 Authoritative scan deltas also recheck terminal delete conflicts without using
 the historical classifier. They retire one only when an explicit removal delta
@@ -263,32 +255,28 @@ matching readiness receipt proves the `Ready` cut. Recovery classifies exact
 current and deterministic temporary successors; unknown, reordered, or
 noncanonical evidence fails closed.
 
-The host separately owns:
+The generic host owns only the process-wide SIFS mount lease
+(`daemon/sifs-mount.lock`), node-local mount consent in `storage.sifs-mount`,
+and provider-neutral status in `storage.sifs-mount-status`. It keeps no staged
+registration, unregister intent, provider pin, or recovery marker. These are
+separate authorities on purpose: the host reasons only about consent and
+provider selection, while the native module alone interprets its registration,
+queue, namespace, cursor-recovery, and CFAPI evidence.
 
-- the process-wide SIFS mount lease;
-- the staged registration record (`MayBeRegistered` or `RetainedAbsent`);
-- a pending unregister intent;
-- a content-addressed provider bundle; and
-- the host cursor-recovery marker.
+The host does not pin a provider. Each activation resolves the single active
+component offering `sinomo.host-filesystem-provider/v1`; zero or several
+candidates fail closed, and Windows keeps a loaded provider image mapped until
+process exit. A provider adopts an existing registration only after its
+journal and receipt match the observed provider name, sync-root file ID, and
+nonce-bound root identity; a tampered or mismatched journal fails closed.
+Without a valid journal, activation requires an empty sync root and absent
+writable state, so retained state is never reinterpreted as a fresh mount.
 
-These are separate authorities on purpose. The host may reason about provider
-selection and node-local consent, while the native module alone interprets its
-registration, queue, namespace, and CFAPI evidence. An opaque native successor
-fingerprint binds a retained recovery cycle without exposing native namespace
-internals to the host.
-
-A canonical ordinary `MayBeRegistered` stage with no cursor context is durable
-provider-selection authority. On restart it selects its exact pinned provider
-even if the current module loader has moved to another artifact. A missing,
-tampered, or identity-mismatched pin blocks recovery; there is no fallback to a
-different provider for an owned registration.
-
-The generic host owns only its process lease and provider-neutral config/status.
 Provider-owned registration, queue, manifest, compensation, and recovery state
-live under
-`$SINOMO_DATA_DIR/module/runtime/module.dfs.cloud-files/`. Exact filenames and
-schemas stay registered beside their owner. Neither subtree is a user-editable
-configuration surface.
+live under `$SINOMO_DATA_DIR/module/runtime/module.dfs.cloud-files/`, inside
+the `module/runtime` subtree that `sinomo-module` registers as an owned escape
+path. Exact filenames and schemas stay beside their owner. Neither location is
+a user-editable configuration surface.
 
 Routine daemon shutdown, rollout replacement, transient worker failure, and a
 same-root provider restart disconnect the active CFAPI callback connection but
@@ -316,21 +304,28 @@ retry; it must not call unregister as rollback.
 
 ## Disable, Re-enable, and Cursor Recovery
 
-Disabling or replacing a healthy mount is state preserving. The component scope
-signals cancellation, waits for the active invocation to leave routing, and
-then asks the same interface provider for a state-preserving stop. The native
-module records
-`PreserveAuthorized` before CFAPI unregister effects and
-`PreservedStateOwned` only after the new-cycle state-owned journal is durable.
-The provider advances its private staged registration only from that exact
-typed successor. Re-enable durably re-arms provider-owned markers before CFAPI
-registration or writable worker effects.
+Disabling a healthy mount, or changing its mount point or SIFS root, is state
+preserving. The supervisor signals cancellation, joins the active provider
+invocation, and then asks the active provider for a state-preserving stop. The
+native module unregisters the sync root under its registration lease and
+retains exact durable state ownership; it releases ownership only when
+writable state was never established. During a cursor-recovery cycle it
+records `PreserveAuthorized` before CFAPI unregister effects and
+`PreservedStateOwned` only after the new-cycle state-owned journal is durable;
+re-enable re-arms that marker before CFAPI registration or writable worker
+effects.
 
 Cursor recovery exists for one narrow legacy state: valid provider-owned
 namespace cursors with no remaining writable queue or other mutable evidence.
 Inspection is read-only. Adoption requires the exact returned token and an
 explicit acknowledgement that authoritative full reconciliation may rebuild
 the namespace state. It is not a generic repair command.
+
+The native module retains these inspect/apply operations and the commit
+protocol below, but the generic host supplies no cursor-recovery context. The
+supervisor rejects `sinomo dfs mount --recover-cursor-only-state` because
+provider recovery belongs to the external component, and an activation that
+finds a retained native marker without matching context fails closed.
 
 Recovery completion is a provider-owned commit protocol:
 
@@ -339,9 +334,8 @@ Recovery completion is a provider-owned commit protocol:
 | Native `Ready` | Reconciliation is terminal for the authorized cycle. |
 | Native `NamespaceFinalized` | The exact namespace-finalization proof is bound while ordinary writeback remains parked. |
 | Native `CompletionAuthorized` | Completion is irreversible; a concurrent disable must finish forward rather than return to cursor-preserving unregister. |
-| Ordinary registration journal and ordinary staged context | Recovery provenance has been normalized while the exact provider remains pinned. |
-| Native marker absent | Native completion authority was cleared only after normalized registration evidence was durable. |
-| Provider recovery bundle absent | Final recovery authority was released in replayable order. The ordinary staged provider pin remains restart authority. |
+| Ordinary `Ready` registration journal | Cursor-recovery provenance has been cleared from the registration journal; the receipt is unchanged. |
+| Native marker absent | Native completion authority was cleared only after the normalized journal was durable. The ordinary journal is now restart authority. |
 
 Every cross-file transition uses a deterministic successor and validates the
 predecessor/successor pair before effects. A crash may leave either the current
@@ -355,11 +349,13 @@ disable uses `PreserveState` with no stale cursor context.
 
 ## Rollout and Compatibility
 
-The generic host interface and native provider are one compatibility set. A new
-rollout may install and select a candidate provider for fresh state, but a
-durable existing registration continues to select the exact content-addressed
-provider that owns it. The generic supervisor does not unregister owned state merely to
-make loader selection agree with the latest rollout.
+The generic host interface and native provider are one compatibility set. The
+supervisor always invokes the currently active provider component; there is no
+host-side pin to the artifact that created a registration. A successor
+provider adopts durable state only through the native journal, receipt, and
+versioned state readers, which fail closed on mismatch. The generic supervisor
+does not unregister owned state because loader selection changed; a routine
+restart only disconnects.
 
 Older interface and serialized-state readers exist only where the owning code
 defines an explicit migration. They are not permission for an older provider to
@@ -373,10 +369,12 @@ Windows mounts are supervised by the main daemon; foreground Cloud Files mounts
 are intentionally unsupported. The native module declares the editable
 `storage.sifs-mount` setting and read-only `storage.sifs-mount-status` setting
 through the common module settings surface. In the graphical app, open
-**Settings > Modules > Cloud Files** to choose the host mount location,
-the SIFS root to project, enablement, and writable synchronization. The generic
-schema editor writes the same node-local configuration consumed by the mount
-supervisor; it is not a parallel Cloud Files configuration store.
+**Settings > Storage**: its **Mount settings** card sets enablement, the
+**Sync root**, the SIFS root to project, and **Durable writable cloud sync**.
+The **Modules** page lists Cloud Files as managed in Storage rather than
+editing it there. The Storage page writes the same node-local configuration
+consumed by the mount supervisor; it is not a parallel Cloud Files
+configuration store.
 
 The current supervisor owns one mount mapping per node. A mapping associates
 one SIFS subtree with one absolute host filesystem location. The equivalent
@@ -399,7 +397,8 @@ While cooperative reconciliation remains pending, its detail also identifies
 the authoritative namespace scan or local startup audit. Worker readiness
 proves activation contracts and the first durable reconciliation quantum;
 it does not imply that the remaining audit has finished.
-The read-only status document is also shown on the module settings card.
+**Settings > Storage** also shows the supervisor's reported state in its
+**SIFS mount** card.
 
 Disable through the supervisor so registration ownership is preserved:
 
@@ -422,8 +421,8 @@ private evidence.
   authority as if it were a fresh mount.
 - Placeholder hydration is exact-version, not path-latest.
 - Ambiguous DFS mutations reconcile by stable operation identity before retry.
-- Registration replacement cannot silently substitute the current loader for
-  the provider that owns durable state.
+- A provider cannot adopt or replace an existing registration without
+  validating its native journal against the observed sync root.
 - Unknown files, extra deterministic temporaries, changed fingerprints, and
   impossible phase orderings fail closed without cleanup effects.
 - A conflict or failed cleanup retains evidence for review. It is not converted
@@ -435,8 +434,8 @@ private evidence.
 ## Verification Boundary
 
 Pure queue, reconciliation, registration, and protocol cuts are exercised by
-Rust tests. Windows GNU cross-compilation proves the module, generic host, and CLI test
-targets continue to build:
+Rust tests. Windows GNU cross-compilation proves the module, generic host, and
+CLI test targets continue to build:
 
 ```sh
 cargo test -p sinomo-dfs-cloud-files

@@ -163,22 +163,23 @@ provider-selection and recovery contract.
 
 Network transport modules are native dynamic libraries with an additional,
 narrower contract. Besides the generic loader handshake, they implement the
-`sinomo-network` network-module vtable (descriptor, start/stop,
-request/response dial, advertised endpoints) and declare their transports
-through the module surface data, so the daemon loads them from
-content-addressed artifacts like any other native-dylib module and then
-registers them into the runtime network-module registry. Iroh is the first
-module of this kind; serial and LoRa transports are planned. The transport
-contract is described in [network-architecture.md](network-architecture.md).
+`sinomo-network` network-module vtable (descriptor, start/stop, authenticated
+link and stream operations, local endpoints, and destroy) and declare their
+transports through the module surface data. The host loads them from
+content-addressed artifacts like any other native-dylib module and registers
+them into the process network-module registry (`sinomo-module` owns that
+loader). Iroh is the first module of this kind; serial and LoRa transports are
+planned. The transport contract is described in
+[network-architecture.md](network-architecture.md).
 
 They use the same node-local loader states as other native-dylib modules:
 stable, previous, shadow, candidate, and rolled-back versions with
 content-hash verification before load. One lifecycle nuance is load-bearing:
-network modules support runtime enable/disable, and disable stops the module
-and removes its transports from dial dispatch, but it never unloads the
-library. The host keeps the library handle alive for the life of the process
-so no dial path can race a dangling vtable pointer; process restart remains
-the reclamation path, consistent with the general unload contract.
+runtime enable/disable stops the module and removes its transports from dial
+dispatch but keeps the module registered and its library mapped, so no dial
+path can race a dangling vtable pointer. Only hot unload retires the library,
+through the network-specific drain described under
+[Unload And Replacement](#unload-and-replacement).
 
 ### Declarative
 
@@ -453,13 +454,15 @@ declared as dynamic JSON. A catalog may also expose operational documents as
 read-only, in which case interfaces present their structured values without
 offering mutation.
 
+### Runtime Binding
+
 Runtime binding is separate. Every static or external implementation provides a
 `ComponentFactory`. Its `ComponentDescriptor` declares versioned service offers
 and requirements; mounting returns a `ComponentScope` that owns services,
 workers, readiness callbacks, and reverse-order compensations. Static factories
 may additionally contribute storage and configuration schemas. These factories
-are deterministic host assembly and are not shipped as cluster-desired data.
-It is deterministic process assembly for a particular Sinomo binary.
+are deterministic process assembly for a particular Sinomo binary and are not
+shipped as cluster-desired data.
 
 This split keeps module activation auditable:
 
@@ -685,6 +688,9 @@ The architectural contract is:
   callback operations also receive cancellation,
 - component scopes, workers, and reverse-order disposers remain alive until
   their invocation leases reach zero,
+- a retiring scope stops admission, then signals and joins its owned tasks and
+  task-drain hooks before any disposer runs; a join timeout keeps the scope,
+  and the storage it holds, owned for a bounded retry,
 - a drain timeout leaves the routes withdrawn and the component scope
   quarantined, reports `restart_required`, and does not claim physical unload,
 - cleanup hooks and native-library unmapping remain best effort after logical
@@ -793,22 +799,33 @@ The crate boundary follows the trust-ring architecture:
 - The direct-link layer inside `sinomo-network` owns the network-transport
   registry, descriptors, and network-module dylib vtable that transport modules
   implement.
-- `sinomo-daemon` owns the runtime registry that assembles the module table:
-  internal native-rust registrations and bindings, dylib loader adaptation,
-  module-to-method conversion, the composed extension-registry generation, and
-  the composed storage layout.
-  `sinomo-runtime` re-exports that machinery as
-  `sinomo_runtime::{modules, storage}` without adding behavior.
+- `sinomo-product-profile` builds the shared product `ComponentCatalog` for the
+  main, shadow, embedded, and mobile profiles: built-in module registrations,
+  component factories, and configuration and storage contributions. Hosts add
+  only process-specific components to it.
+- `sinomo-module` materializes that catalog: module-to-method conversion,
+  native-dylib and network-module loading, the compiled extension registry,
+  the `ModuleRuntimeGenerationStore`, invocation leases and drain, and the
+  hot-unload request and report contract.
+- `sinomo-daemon` hosts the result. It seeds the module snapshot from the
+  supplied catalog, publishes each module, extension, and service-registry
+  generation together, runs the component reconciler, orchestrates the
+  `/module/hot-unload` transition, and composes the foundation storage layout
+  with catalog storage contributions. `sinomo-runtime` re-exports the module
+  registry types as `sinomo_runtime::modules` and the storage helpers as
+  `sinomo_runtime::storage` without adding behavior.
 - `sinomo-policy` owns policy decisions and policy vocabulary interpretation.
 - `sinomo-build` owns build identity, cache resolution, queued job coordination,
   worker selection, compilation, packaging, and publication. It does not own
   rollout admission or activation state.
 - `sinomo-registry` owns immutable artifact, capsule, provenance, evidence, and
   signer records.
-- `sinomo-rollout` owns cluster rollout transitions, rollout telemetry gates,
-  rollout load admission, promotion decisions, and rollback coordination. It
-  may write node-local module activation state when applying a rollout
-  transition, but the rollout decision model stays outside `sinomo-module`.
+- `sinomo-rollout` (with its daemon-process adapter `sinomo-rollout-host` and
+  caller-side `sinomo-rollout-client`) owns cluster rollout transitions,
+  rollout telemetry gates, rollout load admission, promotion decisions, and
+  rollback coordination. It may write node-local module activation state when
+  applying a rollout transition, but the rollout decision model stays outside
+  `sinomo-module`.
 - `sinomo-sandbox` owns sandbox-process containment and optional sandboxed
   execution backends.
 - `modules/evolution/sinomo-evolution` is the independently built

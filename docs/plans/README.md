@@ -9,15 +9,14 @@ tests for that.
 | Plan | Status |
 |---|---|
 | [Network verification suite](network-verification-suite.md) | First local harness slice implemented; expanded fault scheduling, route evidence, replay, and performance comparisons remain planned. |
-| [Network layer separation](network-layer-separation.md) | Active internal separation of the single `sinomo-network` crate into direct-link, connectivity, routed-stream, and stream-native object-RPC contracts. |
 | [R0/R1 crate boundary refactor](r0-r1-crate-boundary-refactor.md) | Completed implementation record. |
-| [Reactive cluster KV/Raft improvements](reactive-cluster-kv-raft-improvement-plan.md) | First implementation slice completed; retained P1-P3 follow-up work is classified in the plan. |
-| [DFS policy and authority hardening](dfs-policy-and-authority-hardening.md) | Proposed follow-up work. |
-| [Indexed-file memory implementation](indexed-file-memory-implementation.md) | Active; foundational contracts and the first local file-to-evidence slice are implemented. |
-| [Node health, device monitoring, and DFS storage locations](device-health-and-dfs-storage-locations.md) | Proposed follow-up work. |
-| [Agent session placement and workspace projection](agent-session-placement-and-workspaces.md) | Active implementation plan. |
-| [Agent session activity and unified channels](agent-session-activity-and-unified-channels.md) | Active implementation plan; phases 1–5 implemented, follow-ups open. |
-| [Formal verification roadmap](formal-verification-roadmap.md) | Active verification backlog. |
+| [Reactive cluster KV/Raft improvements](reactive-cluster-kv-raft-improvement-plan.md) | First slice completed; bounded group commit landed; P2.9 batching and P1.6 election follow-ups are partial; P2.11 resumable snapshots are planned. |
+| [DFS policy and authority hardening](dfs-policy-and-authority-hardening.md) | Partially implemented: the quorum-loss authority contract is done; reserved object modes, structured policy, and remaining placement inputs are proposed. |
+| [Indexed-file memory implementation](indexed-file-memory-implementation.md) | Active; Phase 0 and the local Markdown/text first slice are implemented; structured formats, scale hardening, and Phases 2–6 remain. |
+| [Node health, device monitoring, and DFS storage locations](device-health-and-dfs-storage-locations.md) | Partially implemented: DFS storage-health sampling, aggregate advertisement, and host resource evidence landed; general node health, additional content locations, storage management, and app surfaces remain proposed. |
+| [Agent session placement and workspace projection](agent-session-placement-and-workspaces.md) | Active; lifecycle client, VFS file I/O, and cluster chat hosting are done; remote placement, migration, sandbox CAS, and grant audit remain. |
+| [Agent session activity and unified channels](agent-session-activity-and-unified-channels.md) | Active; phases 1–5 are implemented and recorded in the agent-system architecture; concurrent participants, participant live control, dotted events, and detached subagents remain. |
+| [Formal verification roadmap](formal-verification-roadmap.md) | Active backlog; network slices retired with the legacy transport; post-V7 Rust test restoration and native whole-shard conformance are open. |
 | [System architecture proposal](system-architecture-proposal.md) | Historical and superseded by the current architecture. |
 
 Keep plan status and review dates in the plan itself. When a plan completes,

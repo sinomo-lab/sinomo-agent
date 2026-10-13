@@ -5,7 +5,7 @@ and modules. Building produces immutable artifacts; rollout distributes,
 activates, observes, and, when necessary, rolls them back. For the service
 boundary, see the [build service architecture](../build-service-architecture.md)
 and the
-[architecture overview](../architecture.md#modules-and-controlled-evolution).
+[architecture overview](../architecture.md#controlled-evolution).
 
 Command syntax can change with the installed binary. Use
 `sinomo rollout help` as the final reference.
@@ -68,10 +68,11 @@ authorizes an automatic GUI restart.
 
 Build uses committed prepared source, compatible builder discovery, immutable
 build keys, and verified artifact downloads. It does not activate either the
-daemon or the app. Without `--target`, staging affects only the local installation: it verifies and copies
-the complete bundle into the data directory, then notifies the running app.
-Daemon/cluster rollout commands keep their existing target scope. App staging
-does not remotely launch a GUI or restart other nodes.
+daemon or the app. Without `--target`, staging affects only the local
+installation: it verifies and copies the complete bundle into the data
+directory, then notifies the running app. Daemon/cluster rollout commands keep
+their existing target scope. App staging does not remotely launch a GUI or
+restart other nodes.
 
 For binaries already produced by a reviewed build, create the manifest with:
 
@@ -181,12 +182,15 @@ sinomo rollout cluster \
 ```
 
 The default command uses the cluster build service. `--remote-build` is retained
-as a compatibility spelling and now selects the same service. For a
-mixed-version recovery that must use a checkout already present on the target,
-combine it with `--remote-repo`; this bypasses cluster placement but still uses
-the same build-owned executor, cache, resource admission, and artifact
-verification. `--force-source` applies only while importing a managed source
-checkout.
+as a compatibility spelling and selects the same service. For a mixed-version
+recovery that must use a checkout already present on the target, combine it
+with `--remote-repo`; this bypasses cluster placement but still uses the same
+build-owned executor, cache, resource admission, and artifact verification.
+`--force-source` allows an import to replace a dirty managed checkout. On
+`rollout cluster` it also selects that compatibility path instead of cluster
+build placement: the CLI builds locally for targets that match its platform and
+asks other targets to import the source bundle into their own managed checkout
+and build it there.
 
 When omitted, `--repo` resolves to the managed source checkout, independently of
 the invoking current directory. An explicit target list is the complete target
@@ -207,6 +211,14 @@ SINOMO_BUILD_TARGETS=aarch64-unknown-linux-gnu,x86_64-unknown-linux-musl \
 Every listed target must already be installed and have the required linker or
 cross-toolchain. An invalid configured target makes that server's build
 capability unavailable instead of advertising a target it cannot compile.
+
+An x86-64 Linux build server also advertises `aarch64-unknown-linux-gnu`
+automatically when the Rust target is installed and a complete
+`aarch64-linux-gnu` GCC toolchain and sysroot are present in
+`$SINOMO_DATA_DIR/build/toolchains/aarch64-linux-gnu/usr/bin`, or in the
+directory named by `SINOMO_BUILD_AARCH64_GNU_BIN`. The cross toolchain's
+identity is part of that target's build key; an unusable toolchain is ignored
+rather than advertised.
 
 ## Local Apply
 

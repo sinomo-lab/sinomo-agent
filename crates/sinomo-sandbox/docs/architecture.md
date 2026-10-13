@@ -1,16 +1,49 @@
 # Sandbox Architecture
 
-`sinomo-sandbox` is layered so the sandbox can start with local development storage but eventually run on SIFS without changing the command contract.
+`sinomo-sandbox` is layered so the sandbox can start with local development
+storage but eventually run on SIFS without changing the command contract.
 
 ```text
 agent or CLI request
-  -> sinomo sandbox command or daemon RPC
+  -> sinomo sandbox command or Sandbox component route
   -> cluster sandbox policy
   -> sandbox instance manifest
-  -> execution backend
+  -> execution backend (WASIX executor module, Docker/Podman, or simple-native)
   -> sandbox virtual filesystem
   -> local development backend or SIFS
 ```
+
+## Component And Crate Ownership
+
+The Sandbox component is materialized by `sinomo_sandbox::component_factory`
+from generic component context. It owns local/clustered backend selection,
+SIFS lifecycle leases, toolchain mutations, mediated HTTP, framed execution
+streams, and the durable lifecycle recovery worker. Without cluster identity
+it serves the local filesystem store at `<data-dir>/sandbox/runtime`; with a
+cluster it serves the SIFS-over-DFS backend, except that lifecycle requests for
+non-portable (node-local) instances use the local store. Lifecycle
+routes (`create`, `status`, `update`, `destroy`) accept local or cluster-member
+callers; execution, file, toolchain, and network routes are local commands. The
+daemon only hosts the component through the product component catalog; see
+the [system architecture](../../../docs/architecture.md).
+
+Execution engines:
+
+- WASIX is the external native-dylib module `module.sandbox.wasix`
+  (`modules/sandbox/wasix`, crate `sinomo-sandbox-wasix-module`, built with its
+  `wasix-runtime` feature). It implements the provider-neutral
+  `sinomo.sandbox-executor/v1` interface, which this crate resolves by
+  service requirement through `sinomo-module`'s active native component
+  binding. The `wasix-runtime` feature on `sinomo-sandbox` itself is only a
+  capability-report marker and links no engine code.
+- Simple-native host execution lives in the `sinomo-sandbox-simple` crate.
+- Docker/Podman orchestration is lightweight host-process code in
+  `sinomo-sandbox`.
+
+Current execution boundary: the clustered backend rejects dynamic
+`/sandbox/run/*` toolchain and process-plan requests, so commands run in the
+invoking process (the CLI's local WASIX, container, or simple-native path, or
+the agent's simple-native path) rather than inside the daemon.
 
 ## Storage Model
 
@@ -20,18 +53,24 @@ Durable sandbox state is rooted in SIFS:
 /services/sandbox
 ```
 
-Instances use:
+Instances use a control root, immutable workspace generations, and a stable
+workspace path:
 
 ```text
-/services/sandbox/instances/<sandbox_id>/manifest.sobj
-/services/sandbox/instances/<sandbox_id>/root/
-/services/sandbox/instances/<sandbox_id>/home/
-/services/sandbox/instances/<sandbox_id>/tmp/
-/services/sandbox/instances/<sandbox_id>/work/
-/services/sandbox/instances/<sandbox_id>/checkpoints/
-/services/sandbox/instances/<sandbox_id>/logs/
-/services/sandbox/instances/<sandbox_id>/artifacts/
+/services/sandbox/control/<sandbox_id>/manifest.sobj
+/services/sandbox/control/<sandbox_id>/checkpoints/
+/services/sandbox/generations/<sandbox_id>/<incarnation_id>/<transaction_id>/
+/services/sandbox/instances/<sandbox_id>
+/services/sandbox/locks/<sandbox_id>.lock
 ```
+
+Each generation contains `root/`, `home/`, `tmp/`, `work/`, `var/`, `logs/`,
+and `artifacts/`. The stable instance path is a symlink that an authoritative
+lifecycle transaction replaces atomically to publish one complete generation.
+The manifest, its reconciliation fence, and the checkpoint catalog stay in the
+control root so publishing a generation cannot orphan them. Lock anchors live
+outside the instance subtree so destroy and recreate cannot evade a live
+lifecycle lease on the previous generation.
 
 Toolchains use:
 
@@ -42,6 +81,7 @@ Toolchains use:
 /services/sandbox/toolchains/<toolchain_id>/share/
 /services/sandbox/toolchains/<toolchain_id>/include/
 /services/sandbox/toolchains/<toolchain_id>/etc/
+/services/sandbox/toolchains/<toolchain_id>/bundles/
 ```
 
 The runtime sees a virtual Unix tree. Typical mounts include:
@@ -52,16 +92,21 @@ The runtime sees a virtual Unix tree. Typical mounts include:
 /share      pinned shared data
 /include    pinned headers
 /etc        generated and packaged config
+/root       durable root home
 /home       durable sandbox home
 /tmp        instance-scoped temporary storage
 /work       working directory
+/var        durable variable state
 /artifacts  outputs intended for the caller
 /logs       command records and raw streams
 /dev        Sinomo-owned virtual devices
 /proc       generated process view
+/sys        generated sysfs view
 ```
 
-`/tmp` belongs to the sandbox instance, not the agent session. Reboot clears it by default, but instance policy can retain it. Destroying the instance deletes the whole instance root.
+`/tmp` belongs to the sandbox instance, not the agent session. Reboot clears it
+by default, but instance policy can retain it. Destroying the instance deletes
+its generations and control root, including `/tmp` and checkpoints.
 
 ## Virtual Filesystem Boundary
 
@@ -69,7 +114,13 @@ WASIX sandbox filesystem operations go through the virtual filesystem layer. The
 host-backed filesystem remains a development backend and must not be used as an implicit
 copy of production SIFS state.
 
-SIFS-backed WASIX execution mounts the sandbox workspace and declared SIFS mounts as virtual preopens backed directly by `SandboxFileSystem`; it must not copy SIFS state into host directories for the actual command run. Toolchain artifacts are provided through read-only virtual preopens built from the SIFS toolchain objects.
+SIFS-backed WASIX execution mounts the sandbox workspace and declared SIFS
+mounts as virtual preopens backed directly by `SandboxFileSystem`; it must not
+copy SIFS state into host directories for the actual command run. Toolchain
+artifacts are provided through read-only virtual preopens built from the SIFS
+toolchain objects. This direct-SIFS runner lives in the WASIX module crate; the
+`sinomo.sandbox-executor/v1` interface currently carries only host-path
+preopens, so no production host invokes it yet.
 
 Docker/Podman execution is a local host-container backend. It binds the local sandbox instance directories to `/root`, `/home`, `/tmp`, `/work`, `/var`, `/logs`, and `/artifacts` inside a selected image. It does not replace the SIFS-backed WASIX path for clustered execution; clustered execution still needs the policy-visible SIFS virtual filesystem and pinned toolchain model.
 
@@ -86,7 +137,11 @@ The virtual filesystem layer owns:
 
 Sinomo supports multiple sandbox execution backends behind the same instance, command, output, and command-record contracts.
 
-WASIX is the production SIFS backend. It is required for policy-visible clustered execution, pinned toolchain packages, direct SIFS mounts, and the long-term self-evolution path. WASI Preview1 support has been removed rather than kept as a compatibility path.
+WASIX is the intended production SIFS backend. It is required for
+policy-visible clustered execution, pinned toolchain packages, direct SIFS
+mounts, and the long-term self-evolution path; see the current execution
+boundary above for what is wired today. WASI Preview1 support has been removed
+rather than kept as a compatibility path.
 
 Docker/Podman is a local backend for development and compatibility workloads. It runs commands from a configured image with network disabled by default, a read-only image root, dropped Linux capabilities, and writable sandbox mounts for the standard sandbox directories. Container mode treats the requested command name as an executable inside the image; it does not use WASIX module artifacts from the sandbox toolchain store.
 
@@ -96,11 +151,13 @@ lease, cancellation, and audit paths, but the admitted process sees the host fil
 normal host command semantics. Simple-native is a permission-boundary hint, not a security
 sandbox intended to contain hostile code or prevent deliberate escape.
 
-On Linux, simple-native can project policy-approved SIFS paths from an already-mounted live
-DFS/FUSE root into the command's filesystem. The mount namespace is used only to express
-those guest paths; it deliberately keeps the host root visible and writable. There is no
-command-time copy-in or copy-back. Native programs therefore use the same POSIX filesystem
-objects as every other cluster client, and remote changes become visible according to the DFS
+On Linux, simple-native can project policy-approved SIFS paths from an
+already-mounted live DFS/FUSE root into the command's filesystem. A bubblewrap
+(`bwrap`) mount namespace is used only to express those guest paths; it
+deliberately keeps the host root visible and writable. Other platforms reject
+manifests that declare mounts. There is no command-time copy-in or copy-back.
+Native programs therefore use the same POSIX filesystem objects as every other
+cluster client, and remote changes become visible according to the DFS
 filesystem's normal consistency rules.
 
 Container mode can be selected explicitly:
@@ -147,10 +204,15 @@ SINOMO_SANDBOX_SIMPLE_HOST_SIFS_ROOT=/path/to/live/sifs/mount
 
 This is a mount source, never a synchronization or staging directory.
 
-WASIX runtime code is split under `src/runtime/`:
+WASIX runtime code is split between the contracts crate and the module crate:
 
-- `src/runtime/wasix/` owns Wasmer/WASIX setup, budget guards, process-tree signaling, virtual preopens, output streaming, memory checks, and metering.
-- `src/runtime/capabilities/` describes runtime capability reporting used by diagnostics.
+- `modules/sandbox/wasix/src/runtime/wasix/` owns Wasmer/WASIX setup, budget
+  guards, process-tree signaling, virtual preopens, output streaming, memory
+  checks, and metering.
+- `modules/sandbox/wasix/src/execution/` owns local and SIFS staged command and
+  process-plan execution.
+- `src/runtime/` in this crate holds the ABI selector and the capability
+  reporting used by diagnostics.
 
 WASIX execution denies ambient HTTP imports. Network access should go through Sinomo-mediated fetch APIs so policy, audit, and cluster routing stay visible.
 
@@ -166,7 +228,9 @@ The sandbox is intended to support normal POSIX-style coding workflows. That req
 - pthread-style threading over shared imported memory,
 - futex, mutex, condition variable, and TLS behavior.
 
-The implementation currently supports part of this surface. The status doc tracks the exact remaining gaps.
+The implementation currently supports part of this surface. The
+[implementation notes](implementation-notes.md#remaining-gaps) track the exact
+remaining gaps.
 
 ## Synchronization And Checkpoints
 
@@ -182,7 +246,8 @@ invoked as lifecycle or migration operations; they are not an execution transpor
 
 ## Policy And Audit
 
-Sandbox policy is stored in cluster KV at:
+Sandbox policy is the `sandbox.policy` configuration definition. The cluster
+value, which overrides the local default, is stored in cluster KV at:
 
 ```text
 /config/sandbox/policy
@@ -190,26 +255,40 @@ Sandbox policy is stored in cluster KV at:
 
 Policy controls:
 
-- allowed mount prefixes and local-owned mount placement,
-- allowed toolchain IDs, hashes, provenance prefixes, and package-cache paths,
+- allowed mount prefixes, read-write SIFS mount opt-in, and local-owned mount
+  placement,
+- allowed toolchain IDs, unsigned-toolchain opt-in, provenance prefixes, and
+  package-cache paths,
 - allowed command capabilities,
 - memory, wall-time, input, output, workspace, write, and file-count budgets,
 - concurrent command and sandbox budgets,
 - HTTP host and byte/timeout budgets.
 
-Daemon-backed state-changing operations validate policy before mutating SIFS. Denied operations produce durable policy-denial events.
+Clustered state-changing operations validate policy before mutating SIFS.
+Denied operations produce durable policy-denial events.
 
 Command records and events capture lifecycle, output chunks, final status, resource exhaustion, mediated HTTP exchanges, toolchain updates, and sandbox configuration changes. Command logs persist under the instance `logs/` directory and can be replayed into the shared event stream.
 
 ## Source Layout
 
 - `src/model.rs` defines IDs, manifests, mounts, resource limits, command records, and shared data structures.
-- `src/runtime/` contains runtime adapters and capability reporting.
+- `src/service.rs`, `src/module.rs`, and `src/storage.rs` define the Sandbox
+  component, its routes, and its storage registration.
+- `src/backend.rs`, `src/clustered_backend.rs`, `src/clustered_lifecycle.rs`,
+  `src/clustered_toolchain.rs`, and `src/lifecycle_recovery.rs` own backend
+  selection, SIFS lifecycle leases and transactions, toolchain mutations, and
+  lifecycle recovery.
+- `src/external_executor.rs` and `src/external_executor/` define the
+  `sinomo.sandbox-executor/v1` protocol and its typed client and runner.
+- `src/runtime/` contains the WASI ABI selector and capability reporting.
 - `src/filesystem/` contains local and SIFS virtual filesystem backends plus path and usage helpers.
 - `src/store/` contains instance stores, command-record persistence, explicit checkpoints,
   and opt-in import/export helpers.
-- `src/execution/` contains local and SIFS staged command execution plus structured process-plan execution.
+- `src/execution/` contains execution contracts, audit and cancellation helpers,
+  process-plan types, and the Docker/Podman backend.
 - `src/toolchain/` contains local/SIFS toolchain stores, manifests, hash verification, package import helpers, and built-in package specs.
 - `src/policy/`, `src/events/`, and `src/http/` own policy validation, event lowering, and mediated HTTP behavior.
 - `toolchains/` contains maintained package recipes and verifiers.
-- `vendor/` contains Sinomo-maintained vendored runtime crates needed for the WASIX path.
+- `modules/sandbox/wasix/` (outside this crate) contains the WASIX executor
+  module; its `vendor/` holds the Sinomo-maintained Wasmer/WASIX crates and
+  the WASIX libc source used by the toolchain sysroot.

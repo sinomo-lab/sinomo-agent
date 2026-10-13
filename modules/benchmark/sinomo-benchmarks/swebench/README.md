@@ -8,8 +8,11 @@ The checked-in `verified_10.json` suite selects 10 representative tasks from SWE
 
 ```sh
 python3 -m pip install mini-swe-agent swebench
-sinomo --local providers test deepseek
+sinomo providers test deepseek
 ```
+
+The provider check uses the running main daemon; the removed `--local` flag is
+rejected.
 
 Docker is required for official SWE-bench evaluation and for the mini-SWE-agent baseline.
 When the system Python is newer than the SWE-bench package supports, use a repo-local Python 3.11 environment:

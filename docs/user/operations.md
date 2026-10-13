@@ -20,11 +20,14 @@ selected a different directory, not that state was deleted.
 
 ## Process Lifecycle
 
-`sinomo install` is a deliberate redeployment transaction. It may stop both
-daemons, replace installed binaries, advance managed source from the invoking
-checkout, build and install native modules, rewrite boot integration, and
-restart. `--no-start` suppresses only the final start. Verify the data
-directory, checkout and commit, desired binary, and expected outage first.
+`sinomo install` is a deliberate redeployment transaction. It first holds new
+agent turns and waits up to five minutes for running turns to finish, failing
+rather than interrupting them. It may then stop both daemons, replace installed
+binaries, advance managed source from the invoking checkout, build and install
+native modules, install the desktop app when run from a desktop release,
+rewrite boot integration, and restart. `--no-start` suppresses only the final
+start. Verify the data directory, checkout and commit, desired binary, and
+expected outage first.
 
 For ordinary process recovery with an already installed known-good binary, use
 `sinomo daemon start` rather than redeploying with `install`.
@@ -216,8 +219,16 @@ sinomo node permissions allow remote-management --json
 sinomo node permissions deny remote-management --json
 ```
 
-An enabled remote shell is equivalent to local administrator access. Device
-and resource exposure is narrower and names the operation:
+An enabled remote shell is equivalent to local administrator access. Agents'
+external MCP servers need the separate `external-integrations` permission on
+the node that runs them:
+
+```sh
+sinomo node permissions allow external-integrations --json
+sinomo node permissions deny external-integrations --json
+```
+
+Device and resource exposure is narrower and names the operation:
 
 ```sh
 RESOURCE=your-resource-id

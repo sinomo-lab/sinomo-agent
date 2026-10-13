@@ -39,7 +39,8 @@ Check both process roles:
 ```sh
 sinomo daemon status
 sinomo daemon shadow status
-sinomo observe logs --component daemon --limit 100
+sinomo observe events --kind daemon. --limit 100
+sinomo observe logs --limit 100
 ```
 
 If no rollout is in progress and the installed binary is known good, a normal
@@ -121,15 +122,14 @@ SIFS_PATH=/sinomo/path/to/file
 sinomo dfs status --cluster --json
 sinomo dfs path "$SIFS_PATH" --json
 sinomo dfs repair --json
-sinomo dfs conflicts --json
 sinomo dfs services --json
 ```
 
-Distinguish a missing replica, lagging metadata, unavailable primary, policy
-violation, and explicit conflict record. The current `dfs repair` command is an
-inspection surface that lists inferred missing-replica work; it does not apply
-repairs. Conflict resolution commands deliberately choose or remove history and
-should be run only after inspecting stored versions.
+Distinguish a missing replica, lagging metadata, an unavailable primary, and a
+policy violation. The current `dfs repair` command is an inspection surface
+that lists inferred missing-replica work; it does not apply repairs. To bring
+back earlier content, inspect retained versions first and follow
+[file content history](file-history.md#restore-or-recover).
 
 If missing replicas remain but no repair attempts are queued, an administrator
 can explicitly reconstruct the work through the running DFS owner:
@@ -177,18 +177,19 @@ Start with the live supervisor and DFS state:
 ```powershell
 sinomo dfs mount --status --json
 sinomo dfs status --cluster --json
-sinomo dfs conflicts --json
 ```
 
-Inspect `worker_ready`, pending/retrying/failed operations, conflicts, attention
-records, provider connection state, and restart count. Startup reconciliation,
-an earlier local write, a committed remote namespace change, or a retry can
-legitimately perform finite work without a new Explorer access. Once those
-obligations settle, the Cloud Files layer has no periodic scan, heartbeat,
-config poll, or scheduled disk I/O. Persistent settled-idle I/O or Explorer
-latency outside the projected tree is a defect; record the exact build,
-`SINOMO_DATA_DIR`, mount status, relevant process I/O counters, and the affected
-paths and timestamps.
+Inspect `worker_ready`, pending/retrying/failed operations, writeback
+conflicts, attention records, provider connection state, and restart count.
+While background reconciliation is pending, the status detail names the
+authoritative namespace scan or local startup audit; `worker_ready` does not
+mean that audit has finished. Startup reconciliation, an earlier local write, a
+committed remote namespace change, or a retry can legitimately perform finite
+work without a new Explorer access. Once those obligations settle, the Cloud
+Files layer has no periodic scan, heartbeat, config poll, or scheduled disk
+I/O. Persistent settled-idle I/O or Explorer latency outside the projected
+tree is a defect; record the exact build, `SINOMO_DATA_DIR`, mount status,
+relevant process I/O counters, and the affected paths and timestamps.
 
 To isolate the provider without losing its durable identity, use:
 

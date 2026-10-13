@@ -19,15 +19,16 @@ Applications -----------------------> R2 services
                   R0 foundation
 ```
 
-| Ring | Current packages | Rule |
-|---|---:|---|
-| R0 | 10 | Depends only on R0. |
-| R0 boundary | 1 | `sinomo-core` aggregates the complete R0 surface. |
-| R1 | 29 | Crosses R0 through `sinomo-core`. |
-| R1 boundary | 1 | `sinomo-runtime` aggregates R0 and R1 surfaces. |
-| R2 | 13 | Crosses R0/R1 through `sinomo-runtime`. |
-| Application | 7 | May use R2 directly; uses R0/R1 through `sinomo-runtime`. |
+| Ring | Crates | Native modules | Rule |
+|---|---:|---:|---|
+| R0 | 10 | 0 | Depends only on R0. |
+| R0 boundary | 1 | 0 | `sinomo-core` aggregates the complete R0 surface. |
+| R1 | 29 | 4 | Crosses R0 through `sinomo-core`. |
+| R1 boundary | 1 | 0 | `sinomo-runtime` aggregates R0 and R1 surfaces. |
+| R2 | 14 | 1 | Crosses R0/R1 through `sinomo-runtime`. |
+| Application | 7 | 1 | May use R2 directly; uses R0/R1 through `sinomo-runtime`. |
 
+Crates live under `crates/`; native module packages live under `modules/*/*`.
 Counts describe the current workspace and can change. The manifest metadata and
 boundary test, not this table, are authoritative.
 
@@ -85,7 +86,8 @@ lower dependency for convenience.
 
 R2 contains agents, models, memory, language-model integration, perception,
 fusion, deliberation, actions, voice, video, audio, gateway behavior, and
-evolution. These services may reason about or propose effects but cannot bypass
+evolution, plus the client-safe `sinomo-client` facade and the shared
+`sinomo-product-profile` component composition. These services may reason about or propose effects but cannot bypass
 R1 policy and host authority.
 
 R2 imports foundation and trusted runtime surfaces through

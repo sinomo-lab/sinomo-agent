@@ -43,7 +43,15 @@ VERIFY_BACKEND=daemon crates/sinomo-sandbox/toolchains/python/verify-python-wasi
 VERIFY_BACKEND=daemon-local crates/sinomo-sandbox/toolchains/python/verify-python-wasix-native.sh
 ```
 
-Daemon mode imports the package through `sinomo sandbox toolchain import-package --daemon`, creates a SIFS-backed sandbox, runs `verify-python --daemon`, checkpoints and resumes through the daemon, and verifies the installed package from `/work/site-packages` after resume. It uses the cluster sandbox policy; set `UPDATE_CLUSTER_POLICY=1` only in a development cluster where the verifier may allow the unsigned Python package, the Python toolchain id, and the package-cache prefix.
+Daemon mode imports the package through `sinomo sandbox toolchain import-package
+--daemon`, creates a SIFS-backed sandbox, runs `verify-python --daemon`,
+checkpoints and resumes through the daemon, and verifies the installed package
+from `/work/site-packages` after resume. Daemon-hosted `/sandbox/run/*`
+execution has since been removed, so the clustered Sandbox backend rejects the
+daemon modes' execution steps; only the local mode exercises execution. Daemon
+mode uses the cluster sandbox policy; set `UPDATE_CLUSTER_POLICY=1` only in a
+development cluster where the verifier may allow the unsigned Python package,
+the Python toolchain id, and the package-cache prefix.
 
 Daemon package import stores the large Python support tree as a SIFS artifact bundle while retaining per-file artifact metadata and hashes in the toolchain manifest. Runtime staging expands the bundle into the local execution cache, so the verifier exercises SIFS persistence without creating thousands of DFS objects for a single language runtime import.
 
@@ -72,6 +80,25 @@ For full pip support, the verifier must keep expanding resolver coverage against
 
 `build-cpython-wasix.sh` produces a real CPython WASIX package. The interpreter probe passes for basic Python execution, `zlib` import, standard-library artifact staging, and the packaged pip entrypoint can report `pip --version`. The package runs on the WASIX runtime so Python and pip can use the same process and dynamic-loading substrate as the shell/build-tool path.
 
-The active `verify-python-wasix-native.sh` gate imports the maintained CPython WASIX package with BusyBox and Bash shell support, verifies Python subprocess execution against sandbox-local WASM commands, checks timeout handling, installs `numpy` and `matplotlib` from a seeded offline WASIX wheelhouse with real pip, and verifies the installed native package tree after checkpoint/resume. The Python package recipe sanitizes CPython build sysconfig so setuptools asks for sandbox paths such as `/bin/clang` and `/include/python3.13`, and the Sinomo subprocess hook now routes non-Python child commands through the pinned sandbox child-process bridge instead of falling back to host-path subprocess behavior. Native-extension package support has moved to the WASIX runtime. The dynamic linker mirrors side-module callback tables into the main module table and applies a generic Binaryen function-pointer cast compatibility transform to dynamically loaded WASIX side modules, which allows unmodified `numpy` and `matplotlib` wheels to import and execute inside the sandbox. When the main module requires that fpcast-compatible ABI, the runtime now fails side-module loading early if the bundled Binaryen `wasm-opt` transformer is missing, instead of silently skipping the transform and trapping later during native-extension execution. The script can run the core gate locally or through the daemon/SIFS path, and both modes verify the installed package after checkpoint/resume.
+The active `verify-python-wasix-native.sh` gate imports the maintained CPython
+WASIX package with BusyBox and Bash shell support, verifies Python subprocess
+execution against sandbox-local WASM commands, checks timeout handling, installs
+`numpy` and `matplotlib` from a seeded offline WASIX wheelhouse with real pip,
+and verifies the installed native package tree after checkpoint/resume. The
+Python package recipe sanitizes CPython build sysconfig so setuptools asks for
+sandbox paths such as `/bin/clang` and `/include/python3.13`, and the Sinomo
+subprocess hook now routes non-Python child commands through the pinned sandbox
+child-process bridge instead of falling back to host-path subprocess behavior.
+Native-extension package support has moved to the WASIX runtime. The dynamic
+linker mirrors side-module callback tables into the main module table and
+applies a generic Binaryen function-pointer cast compatibility transform to
+dynamically loaded WASIX side modules, which allows unmodified `numpy` and
+`matplotlib` wheels to import and execute inside the sandbox. When the main
+module requires that fpcast-compatible ABI, the runtime now fails side-module
+loading early if the bundled Binaryen `wasm-opt` transformer is missing, instead
+of silently skipping the transform and trapping later during native-extension
+execution. The script's local mode verifies the installed package after
+checkpoint/resume; the daemon/SIFS modes are limited by the removed
+daemon-hosted execution path described above.
 
 Full pip ecosystem support is still not complete. The current priority is to keep hardening the WASIX POSIX/process substrate for Python workloads, with `python`, `pip`, `numpy`, and `matplotlib` as the active acceptance gate, before expanding broader resolver coverage.

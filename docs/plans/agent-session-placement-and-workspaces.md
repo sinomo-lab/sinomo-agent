@@ -1,7 +1,7 @@
 # Agent Session Placement and Workspace Projection
 
 Status: Active implementation plan
-Last reviewed: 2026-07-15
+Last reviewed: 2026-10-13
 
 The durable ownership model is now represented in `sinomo-agent`:
 
@@ -13,10 +13,12 @@ The durable ownership model is now represented in `sinomo-agent`:
   yet;
 - sessions record their active server and placement generation, plus a
   reference to one independently managed sandbox resource;
-- manual migration invalidates session-host-local resources without copying
-  them and does not move the sandbox.
-- normal local chat/CLI setup provisions the default persistent sandbox before
-  tools are exposed and persists the automatic attachment on the session;
+- the session model's explicit migration (`AgentSession::migrate_to_server`)
+  invalidates session-host-local resources without copying them and does not
+  move the sandbox; no control operation invokes it yet;
+- normal chat/CLI setup provisions the default persistent sandbox through
+  `SandboxLifecycleClient` before tools are exposed and persists the automatic
+  attachment on the session;
 - the command tool fails with `sandbox_not_attached` when the resource is
   missing and never creates one during tool execution.
 
@@ -69,8 +71,9 @@ The local conversation/runtime boundary now follows the ownership model:
   manifest generation, and emits mount delta events. The local backend uses
   its own execution lease, advances the generation, and performs basic
   environment and cwd validation, but does not perform the daemon's policy or
-  resolved-source validation. For a mount-only update it preserves the
-  host-absolute cwd used by the `simple_sandbox` compatibility runtime.
+  resolved-source validation; it serves only a host running without a daemon.
+  For a mount-only update it preserves the host-absolute cwd used by the
+  `simple_sandbox` compatibility runtime.
   Reconfiguring an automatically attached local sandbox uses this update path
   instead of silently retaining stale mounts.
 - The graphical Chat composer exposes the conversation workspace as a native
@@ -80,10 +83,28 @@ The local conversation/runtime boundary now follows the ownership model:
   opened them. The provider-neutral app contract carries only the selected
   path; daemon-hosted chat execution resolves and persists the authoritative
   `WorkspaceRef` and reconciles the attached sandbox before acknowledging it.
+- Agent orchestration creates, inspects, updates, and destroys sandboxes
+  through `SandboxLifecycleClient`. With a daemon, requests go to the local
+  sandbox service, which serves them or forwards them to the hosting node;
+  only a daemonless host uses `LocalSandboxBackend` in process. Deleting a
+  chat releases each session's automatic, unshared sandbox through the same
+  client.
+- File tools and context assembly reach workspace content through confined
+  VFS handles (`tools::workspace_files`): host-local grants through
+  `ConfinedLocalVfsBackend`, SIFS grants through the SIFS VFS.
+- A chat has one host in the cluster. The hosting node holds a renewed
+  ownership record in cluster KV (`/agent/chat-hosts/<chat-id>`); other nodes
+  forward commands and events to it over the `/chat/peer/*` routes, and take
+  the chat over only after the owner stops renewing for 45 seconds. The first
+  node to open a chat becomes its host; the agent's home-server preference is
+  not consulted, and the takeover does not update the session's placement
+  record.
 
-This is deliberately a foundation, not completion of remote execution: local
-CLI orchestration still provisions through `LocalSandboxBackend`, and the
-current structured file tools still operate on host paths.
+This is deliberately a foundation, not completion of remote execution:
+automatic sandboxes are created non-portable on the hosting node, commands run
+against that node's local sandbox store, and file tools run on the session
+host instead of through the attached sandbox service. Agent packages that name
+another node as home server or sandbox node are rejected.
 
 ## Remaining work
 
@@ -91,9 +112,10 @@ current structured file tools still operate on host paths.
    persisted app/channel/TUI snapshots containing conversation workspace lists
    have aged out.
 2. Replace the current local-backend automatic provisioning adapter with the
-   node/cluster sandbox service route, including remote placement. Explicit
-   attachment must accept an existing, potentially shared sandbox and must
-   never provision a replacement implicitly.
+   node/cluster sandbox service route, including remote placement. Lifecycle
+   calls now use the sandbox service; remote placement and execution remain
+   open. Explicit attachment must accept an existing, potentially shared
+   sandbox and must never provision a replacement implicitly.
 3. Add expected-generation/CAS fencing to every sandbox manifest mutation,
    including automatic reconciliation and explicit/admin updates, and make
    concurrent create/reconcile idempotent. Establish one authoritative mutation
@@ -109,7 +131,8 @@ current structured file tools still operate on host paths.
    active-turn preflight prevents the deterministic partial-update case, but a
    later persistence failure still needs a durable rollback/retry protocol.
 6. Route every agent tool through the attached sandbox service, including file
-   tools; tools must not bypass the sandbox filesystem or process runtime.
+   tools; tools must not bypass the sandbox filesystem or process runtime. File
+   tools now use confined VFS handles but still run on the session host.
 7. Complete ordered-workspace projection behind the sandbox filesystem:
    preserve per-workspace access policy, expose structured file operations for
    every writable grant, and make the first mounted workspace the guest cwd for
@@ -128,9 +151,13 @@ current structured file tools still operate on host paths.
 9. Persist the authoritative session-server record in cluster-visible storage.
    Wire production session startup to resolve the agent's configured home
    server, or fall back to the daemon processing the request, then start and
-   register the session on that server before publishing its placement.
+   register the session on that server before publishing its placement. The
+   cluster KV chat-host record covers the chat, not the session placement,
+   and is claimed by the first node to open the chat.
 10. Route chat/channel ingress and live controls to the active session server.
-   Stale senders refresh placement and retry; they never auto-migrate.
+   Stale senders refresh placement and retry; they never auto-migrate. Chat
+   commands and events already reach the chat's host through the peer routes;
+   failover after a lost host is a separate takeover path.
 11. Implement a real, explicitly requested migration handoff: fence and
    quiesce the source session, checkpoint only portable session state, restore
    and register the target session, and compare-and-swap the authoritative

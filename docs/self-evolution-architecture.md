@@ -454,35 +454,34 @@ bad approval from forcing every node into the same failure mode.
 
 ## Event Families
 
-The event model should remain open, but these families are foundational:
+The event model remains open. Event kinds use typed dotted names and carry
+enough structured evidence to reconstruct why a candidate was created, why it
+was approved or denied, what changed during rollout, and why promotion or
+rollback happened. The module emits these families:
 
-- `evolution.opportunity.detected`
-- `evolution.job.scoped`
-- `evolution.proposal.created`
-- `evolution.candidate.implemented`
-- `evolution.eval.started`
-- `evolution.eval.completed`
-- `evolution.policy.approved`
-- `evolution.policy.denied`
-- `evolution.artifact.registered`
-- `evolution.rollout.started`
-- `evolution.rollout.progressed`
-- `evolution.rollout.promoted`
-- `evolution.rollout.paused`
-- `evolution.rollback.started`
-- `evolution.rollback.completed`
-- `evolution.lesson.recorded`
-- `module.shadow.decision`
-- `module.invocation.decision`
-- `module.user.correction`
-- `module.crash`
-- `module.timeout`
-- `module.policy.blocked`
-- `rollout.transition.completed`
+- goal history: `evolution.goal.created`, `evolution.goal.paused`,
+  `evolution.goal.resumed`, `evolution.goal.completed`, and
+  `evolution.goal.cancelled`;
+- revisions: `evolution.revision.proposed`, `evolution.revision.evaluated`,
+  `evolution.revision.awaiting-decision`, `evolution.revision.selected`,
+  `evolution.revision.failed`, and `evolution.revision.recovered`;
+- orchestration: `evolution.task.updated`, `evolution.agent.updated`, and
+  `evolution.resource.recorded`;
+- opportunity planning: `evolution.job.scoped`, scoped from
+  `evolution.metric.regression`, `evolution.replay.failure`,
+  `evolution.scorecard.stale`, and module signals;
+- tool use: `evolution.tool.executed`.
 
-Events should include enough structured evidence to reconstruct why a candidate
-was created, why it was approved or denied, what changed during rollout, and why
-promotion or rollback happened.
+Module and rollout infrastructure supply the lifecycle facts that evolution
+treats as evidence: `module.shadow.decision`, `module.invocation.decision`,
+`module.user.correction`, `module.crash`, `module.timeout`,
+`module.policy.blocked`, and `rollout.transition.completed`.
+
+Candidate decisions, scorecards, and lessons are stored with the job and in
+lesson memory and surface as revision status events; artifact registration and
+rollout report through the registry and rollout authorities. Dedicated
+evolution stage families added later follow the same
+`evolution.<object>.<transition>` shape.
 
 ## Lessons And Memory
 

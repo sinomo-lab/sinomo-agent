@@ -108,8 +108,8 @@ aggregate score:
 
 | Area | Location | Purpose |
 |---|---|---|
-| Multi-node cluster | `docker/` | Formation, routing, migration, failure, restart, DFS, and idle-resource gates |
-| Agent and memory | `modules/benchmark/sinomo-benchmarks/agent/` | Synthetic memory checks plus comparable pinned LongMemEval-S indexed-file and VFS-backed memory-tools retrieval runs |
+| Multi-node cluster | `docker/` | Formation, routing, migration, failure, restart, DFS, rollout recovery, and idle-resource gates; cluster-KV benchmark; pjdfstest mounted-filesystem compatibility |
+| Agent and memory | `modules/benchmark/sinomo-benchmarks/agent/` | Synthetic memory checks plus comparable pinned LongMemEval-S indexed-file and VFS-backed memory-tools retrieval runs; channel-discussion, compaction, and skill evaluations |
 | SIFS/DFS | `crates/sinomo-dfs/benches/`, `modules/benchmark/sinomo-benchmarks/sifs/` | Algorithm scale plus real mounted correctness/performance |
 | Coding agents | `modules/benchmark/sinomo-benchmarks/swebench/` | Contained SWE-bench execution and official evaluation integration |
 | Realtime embodied tasks | `modules/benchmark/sinomo-benchmarks/mcu/` and `minestudio/` | Vision/action and full-duplex task adapters |
