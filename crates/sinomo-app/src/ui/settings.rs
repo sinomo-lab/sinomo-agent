@@ -16754,7 +16754,10 @@ mod tests {
 
     #[test]
     fn settings_error_text_can_be_selected_and_copied() -> sui::Result<()> {
-        let backend = Backend::local_fallback();
+        let fixture = sinomo_testdir::TestDir::new("app-ui-settings-error-text-can-be-selected-and-copied");
+        let backend = Backend::local_fallback_for_data_dir(
+            sinomo_runtime::local::SinomoDataDir::new(fixture.path()),
+        );
         let shared = Shared::new(AppState::ready(backend));
         let error_message =
             "agent definition store I/O failed at /services/sinomo/agents: metadata unavailable";
@@ -20123,7 +20126,10 @@ mod tests {
 
     #[test]
     fn provider_card_uses_dropdown_for_known_catalog_before_connection_test() -> sui::Result<()> {
-        let backend = Backend::local_fallback();
+        let fixture = sinomo_testdir::TestDir::new("app-ui-provider-card-uses-dropdown-for-known-catalog-before-connection-test");
+        let backend = Backend::local_fallback_for_data_dir(
+            sinomo_runtime::local::SinomoDataDir::new(fixture.path()),
+        );
         let shared = Shared::new(AppState::ready(backend));
         {
             let config = shared.settings().config.clone();

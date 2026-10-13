@@ -245,6 +245,8 @@ pub fn draw_centered(ctx: &mut PaintCtx, text: &str, style: TextStyle, cx: f32, 
         width + 2.0,
         line_height,
     );
+    let mut style = style;
+    style.line_height = line_height;
     paint_text_line(ctx, rect, text, &style, TextAlign::Center);
 }
 

@@ -21820,9 +21820,11 @@ fn placement_activity_filter_radio(
     label: &'static str,
 ) -> RadioButton {
     let changed = shared.clone();
+    let current = shared.clone();
     RadioButton::new(label)
         .framed()
         .checked(selected == filter)
+        .checked_when(move || current.files().placement_activity_filter == filter)
         .theme_when(clone_reader(reader))
         .on_change(move |checked| {
             if checked {
@@ -21883,15 +21885,29 @@ fn placement_activity_filter_control(shared: &Shared, reader: &ThemeReader) -> i
     })
 }
 
-fn scroll_placement_activity_summary(state: &ScrollState, delta: f32, ctx: &mut EventCtx) {
+fn scroll_placement_activity_summary(
+    state: &ScrollState,
+    viewport: sui::WidgetId,
+    delta: f32,
+    ctx: &mut EventCtx,
+) {
     let current = state.current_offset();
     let max = state.max_offset();
     let next = sui::Vector::new(current.x, (current.y + delta).clamp(0.0, max.y));
     if state.set_offset(next) {
-        ctx.request_measure();
-        ctx.request_arrange();
-        ctx.request_paint();
-        ctx.request_semantics();
+        // The arrow is a sibling of the retained viewport. Invalidating only the
+        // arrow leaves the viewport's cached layout and content transform unchanged.
+        use sui::{InvalidationKind, InvalidationRequest, InvalidationTarget};
+        let target = InvalidationTarget::Widget(viewport);
+        for kind in [
+            InvalidationKind::Measure,
+            InvalidationKind::Arrange,
+            InvalidationKind::Paint,
+            InvalidationKind::HitTest,
+            InvalidationKind::Semantics,
+        ] {
+            ctx.request(InvalidationRequest::new(target, kind));
+        }
     }
 }
 
@@ -22062,21 +22078,25 @@ fn files_placement_activity_sheet(shared: &Shared, reader: &ThemeReader) -> Widg
             .on_press(move || action.files_mut().load_older_placement_activity())
     };
     let summary_scroll_state = ScrollState::new();
-    let summary_scroll = ScrollView::vertical(
-        WidgetPadding::new(
-            Insets {
-                left: 2.0,
-                top: 2.0,
-                right: 10.0,
-                bottom: 12.0,
-            },
-            header,
+    let summary_scroll = WidgetPadding::new(
+        Insets::ZERO,
+        ScrollView::vertical(
+            WidgetPadding::new(
+                Insets {
+                    left: 2.0,
+                    top: 2.0,
+                    right: 10.0,
+                    bottom: 12.0,
+                },
+                header,
+            )
+            .fill_child_width(true),
         )
-        .fill_child_width(true),
-    )
-    .state(summary_scroll_state.clone())
-    .theme_when(clone_gray_scrollbar_reader(reader))
-    .name("Reconciliation activity summary");
+        .state(summary_scroll_state.clone())
+        .theme_when(clone_gray_scrollbar_reader(reader))
+        .name("Reconciliation activity summary"),
+    );
+    let summary_viewport = summary_scroll.child_pod().id();
     let previous_summary = {
         let enabled = summary_scroll_state.clone();
         let action = summary_scroll_state.clone();
@@ -22084,7 +22104,9 @@ fn files_placement_activity_sheet(shared: &Shared, reader: &ThemeReader) -> Widg
             .size(30.0)
             .theme_when(clone_reader(reader))
             .enabled_when(move || enabled.current_offset().y > 0.5)
-            .on_press_with_ctx(move |ctx| scroll_placement_activity_summary(&action, -140.0, ctx))
+            .on_press_with_ctx(move |ctx| {
+                scroll_placement_activity_summary(&action, summary_viewport, -140.0, ctx)
+            })
     };
     let next_summary = {
         let enabled = summary_scroll_state.clone();
@@ -22093,7 +22115,9 @@ fn files_placement_activity_sheet(shared: &Shared, reader: &ThemeReader) -> Widg
             .size(30.0)
             .theme_when(clone_reader(reader))
             .enabled_when(move || enabled.current_offset().y + 0.5 < enabled.max_offset().y)
-            .on_press_with_ctx(move |ctx| scroll_placement_activity_summary(&action, 140.0, ctx))
+            .on_press_with_ctx(move |ctx| {
+                scroll_placement_activity_summary(&action, summary_viewport, 140.0, ctx)
+            })
     };
     let summary = Flex::horizontal()
         .align_items(Alignment::Stretch)
@@ -25921,7 +25945,16 @@ mod tests {
             adaptive: false,
             adaptive_budget: None,
             processed_content_bytes: 0,
-            accepted_config: None,
+            accepted_config: sinomo_runtime::dfs::DfsFileSystemConfig {
+                file_system_id: sinomo_runtime::dfs::DfsFileSystemId::from_legacy_named("sifs")
+                    .expect("filesystem"),
+                display_name: "SIFS".to_string(),
+                owner_node_id: sinomo_runtime::node::NodeId::from_legacy_named("node-a")
+                    .expect("node"),
+                subtree_policies: Vec::new(),
+                retention_policies: Default::default(),
+                module_metadata: Default::default(),
+            },
             revision: 2,
             created_at_unix_nanos: 1,
             updated_at_unix_nanos: 2,
@@ -25978,7 +26011,12 @@ mod tests {
     fn reconciliation_activity_uses_an_independent_request_lane_and_preserves_history() {
         use sinomo_runtime::dfs::DfsPlacementReconciliationActivityStatus as Status;
 
-        let backend = Backend::local_fallback();
+        let fixture = sinomo_testdir::TestDir::new(
+            "app-ui-reconciliation-activity-uses-an-independent-request-lane-and-preserves-history",
+        );
+        let backend = Backend::local_fallback_for_data_dir(
+            sinomo_runtime::local::SinomoDataDir::new(fixture.path()),
+        );
         let mut state = FilesState::new(&backend);
         let (tx, rx) = mpsc::channel();
         state.worker_tx = Some(tx);
@@ -26049,7 +26087,12 @@ mod tests {
     fn reconciliation_activity_append_deduplicates_by_job_revision() {
         use sinomo_runtime::dfs::DfsPlacementReconciliationActivityStatus as Status;
 
-        let backend = Backend::local_fallback();
+        let fixture = sinomo_testdir::TestDir::new(
+            "app-ui-reconciliation-activity-append-deduplicates-by-job-revision",
+        );
+        let backend = Backend::local_fallback_for_data_dir(
+            sinomo_runtime::local::SinomoDataDir::new(fixture.path()),
+        );
         let mut state = FilesState::new(&backend);
         let mut current = placement_activity_summary("same-job", Status::Completed, 10);
         current.revision = 8;
@@ -26084,6 +26127,201 @@ mod tests {
     }
 
     #[test]
+    fn placement_activity_radios_follow_domain_across_retained_frames() -> sui::Result<()> {
+        use sui::{Event, PointerButton, PointerButtons, PointerEvent, PointerEventKind};
+
+        let fixture = sinomo_testdir::TestDir::new("app-ui-placement-activity-radios-follow-domain-across-retained-frames");
+        let backend = Backend::local_fallback_for_data_dir(
+            sinomo_runtime::local::SinomoDataDir::new(fixture.path()),
+        );
+        let shared = Shared::new(AppState::ready(backend));
+        let (tx, rx) = mpsc::channel();
+        shared.files_mut().worker_tx = Some(tx);
+        let reader: ThemeReader = {
+            let shared = shared.clone();
+            Rc::new(move || shared.theme())
+        };
+        let initial_filter = shared.files().placement_activity_filter;
+        let choices = [
+            (PlacementActivityFilter::All, "All"),
+            (PlacementActivityFilter::Active, "Active"),
+            (PlacementActivityFilter::Failed, "Failed"),
+            (PlacementActivityFilter::Completed, "Done"),
+        ];
+        // Retain the production radios so parent rebuilding cannot repair stale selection.
+        let radios =
+            choices
+                .into_iter()
+                .fold(Flex::horizontal().gap(6.0), |row, (filter, label)| {
+                    row.with_child(placement_activity_filter_radio(
+                        &shared,
+                        &reader,
+                        initial_filter,
+                        filter,
+                        label,
+                    ))
+                });
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .root(SizedBox::new().width(520.0).height(120.0).child(radios)),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        let initial = window.snapshot()?;
+        let initial_ids: Vec<_> = initial
+            .accessibility
+            .nodes
+            .iter()
+            .filter(|node| node.role == sui::SemanticsRole::RadioButton)
+            .map(|node| node.id)
+            .collect();
+        assert_eq!(initial_ids.len(), 4);
+        let point = |name: &str| {
+            let bounds = initial
+                .accessibility
+                .nodes
+                .iter()
+                .find(|node| {
+                    node.role == sui::SemanticsRole::RadioButton
+                        && node.name.as_deref() == Some(name)
+                })
+                .expect("visible filter radio")
+                .bounds;
+            sui::Point::new(
+                bounds.x() + bounds.width() * 0.5,
+                bounds.y() + bounds.height() * 0.5,
+            )
+        };
+        let activate_now = |point: sui::Point| -> sui::Result<()> {
+            window.dispatch_event_now(Event::Pointer(PointerEvent::new(
+                PointerEventKind::Move,
+                point,
+            )))?;
+            let mut down = PointerEvent::new(PointerEventKind::Down, point);
+            down.button = Some(PointerButton::Primary);
+            down.buttons = PointerButtons::new(1);
+            window.dispatch_event_now(Event::Pointer(down))?;
+            let mut up = PointerEvent::new(PointerEventKind::Up, point);
+            up.button = Some(PointerButton::Primary);
+            window.dispatch_event_now(Event::Pointer(up))
+        };
+        let expect_request = |expected| match rx.try_recv().expect("one filter query") {
+            FilesWorkerCommand::PlacementActivity {
+                filter,
+                cursor,
+                append,
+                ..
+            } => {
+                assert_eq!(filter, expected);
+                assert!(cursor.is_none());
+                assert!(!append);
+            }
+            _ => panic!("expected placement activity query"),
+        };
+        let assert_visible = |expected: &str| -> sui::Result<()> {
+            window.run_until_idle()?;
+            let snapshot = window.snapshot_now()?;
+            let radios: Vec<_> = snapshot
+                .accessibility
+                .nodes
+                .iter()
+                .filter(|node| node.role == sui::SemanticsRole::RadioButton)
+                .collect();
+            assert_eq!(
+                radios.iter().map(|node| node.id).collect::<Vec<_>>(),
+                initial_ids
+            );
+            assert!(radios.iter().all(|node| !node.state.disabled));
+            let checked: Vec<_> = radios
+                .iter()
+                .filter(|node| node.state.selected)
+                .map(|node| node.name.clone().expect("radio name"))
+                .collect();
+            assert_eq!(checked, vec![expected.to_string()]);
+            Ok(())
+        };
+        assert_eq!(initial_filter, PlacementActivityFilter::All);
+        assert_visible("All")?;
+
+        // X then the previously selected Y, with no frame or parent rebuild between inputs.
+        activate_now(point("Active"))?;
+        activate_now(point("All"))?;
+        // dispatch_event_now queues input; pumping delivers both activations before redraw.
+        window.run_until_idle()?;
+        assert_eq!(
+            shared.files().placement_activity_filter,
+            PlacementActivityFilter::All
+        );
+        expect_request(PlacementActivityFilter::Active);
+        expect_request(PlacementActivityFilter::All);
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+        assert_visible("All")?;
+
+        // The same retained controls also switch correctly across rendered frames.
+        activate_now(point("Active"))?;
+        window.run_until_idle()?;
+        assert_eq!(
+            shared.files().placement_activity_filter,
+            PlacementActivityFilter::Active
+        );
+        expect_request(PlacementActivityFilter::Active);
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+        assert_visible("Active")?;
+        activate_now(point("All"))?;
+        window.run_until_idle()?;
+        assert_eq!(
+            shared.files().placement_activity_filter,
+            PlacementActivityFilter::All
+        );
+        expect_request(PlacementActivityFilter::All);
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+        assert_visible("All")?;
+
+        // A repeated selection must preserve the query/poll state.
+        let generation = shared
+            .files()
+            .placement_activity_poll_generation
+            .load(Ordering::Acquire);
+        activate_now(point("All"))?;
+        window.run_until_idle()?;
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+        assert_eq!(
+            shared
+                .files()
+                .placement_activity_poll_generation
+                .load(Ordering::Acquire),
+            generation
+        );
+        assert_visible("All")?;
+
+        // An external domain change must reach retained check states and remain selectable.
+        assert!(
+            shared
+                .files_mut()
+                .set_placement_activity_filter(PlacementActivityFilter::Failed)
+        );
+        window.dispatch_event_now(Event::Pointer(PointerEvent::new(
+            PointerEventKind::Move,
+            point("Failed"),
+        )))?;
+        window.pump_frames(1)?;
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+        assert_visible("Failed")?;
+        activate_now(point("All"))?;
+        window.run_until_idle()?;
+        assert_eq!(
+            shared.files().placement_activity_filter,
+            PlacementActivityFilter::All
+        );
+        expect_request(PlacementActivityFilter::All);
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+        assert_visible("All")?;
+        Ok(())
+    }
+
+    #[test]
     fn reconciliation_activity_filter_groups_running_and_retrying_as_active() {
         use sinomo_runtime::dfs::DfsPlacementReconciliationActivityStatus as Status;
 
@@ -26102,7 +26340,12 @@ mod tests {
     fn reconciliation_activity_filter_queries_the_server_and_evicts_finished_active_jobs() {
         use sinomo_runtime::dfs::DfsPlacementReconciliationActivityStatus as Status;
 
-        let backend = Backend::local_fallback();
+        let fixture = sinomo_testdir::TestDir::new(
+            "app-ui-reconciliation-activity-filter-queries-the-server-and-evicts-finished-active-jobs",
+        );
+        let backend = Backend::local_fallback_for_data_dir(
+            sinomo_runtime::local::SinomoDataDir::new(fixture.path()),
+        );
         let mut state = FilesState::new(&backend);
         let (tx, rx) = mpsc::channel();
         state.worker_tx = Some(tx);
@@ -26181,7 +26424,12 @@ mod tests {
             DfsPlacementReconciliationActivityStatus as Status,
         };
 
-        let backend = Backend::local_fallback();
+        let fixture = sinomo_testdir::TestDir::new(
+            "app-ui-reconciliation-activity-active-head-refresh-evicts-stale-paginated-rows",
+        );
+        let backend = Backend::local_fallback_for_data_dir(
+            sinomo_runtime::local::SinomoDataDir::new(fixture.path()),
+        );
         let mut state = FilesState::new(&backend);
         state.placement_activity_open = true;
         state.placement_activity_filter = PlacementActivityFilter::Active;
@@ -26233,7 +26481,12 @@ mod tests {
             DfsPlacementReconciliationActivityStatus as Status,
         };
 
-        let backend = Backend::local_fallback();
+        let fixture = sinomo_testdir::TestDir::new(
+            "app-ui-reconciliation-activity-all-head-refresh-drops-only-stale-paginated-active-rows",
+        );
+        let backend = Backend::local_fallback_for_data_dir(
+            sinomo_runtime::local::SinomoDataDir::new(fixture.path()),
+        );
         let mut state = FilesState::new(&backend);
         state.placement_activity_open = true;
         let old_head = placement_activity_summary("old-terminal-head", Status::Completed, 40);
@@ -26290,7 +26543,12 @@ mod tests {
             DfsPlacementReconciliationActivityStatus as Status,
         };
 
-        let backend = Backend::local_fallback();
+        let fixture = sinomo_testdir::TestDir::new(
+            "app-ui-reconciliation-activity-terminal-head-shift-preserves-rows-and-loaded-tail-cursor",
+        );
+        let backend = Backend::local_fallback_for_data_dir(
+            sinomo_runtime::local::SinomoDataDir::new(fixture.path()),
+        );
         let mut state = FilesState::new(&backend);
         state.placement_activity_open = true;
         state.placement_activity_filter = PlacementActivityFilter::Completed;
@@ -26336,7 +26594,12 @@ mod tests {
 
     #[test]
     fn reconciliation_activity_open_and_ready_coalesce_to_one_follow_up_read() {
-        let backend = Backend::local_fallback();
+        let fixture = sinomo_testdir::TestDir::new(
+            "app-ui-reconciliation-activity-open-and-ready-coalesce-to-one-follow-up-read",
+        );
+        let backend = Backend::local_fallback_for_data_dir(
+            sinomo_runtime::local::SinomoDataDir::new(fixture.path()),
+        );
         let mut state = FilesState::new(&backend);
         let (tx, rx) = mpsc::channel();
         state.worker_tx = Some(tx);
@@ -26386,7 +26649,12 @@ mod tests {
     fn reconciliation_activity_load_older_preempts_a_background_poll() {
         use sinomo_runtime::dfs::DfsPlacementReconciliationActivityCursor as Cursor;
 
-        let backend = Backend::local_fallback();
+        let fixture = sinomo_testdir::TestDir::new(
+            "app-ui-reconciliation-activity-load-older-preempts-a-background-poll",
+        );
+        let backend = Backend::local_fallback_for_data_dir(
+            sinomo_runtime::local::SinomoDataDir::new(fixture.path()),
+        );
         let mut state = FilesState::new(&backend);
         let (tx, rx) = mpsc::channel();
         state.worker_tx = Some(tx);
@@ -26446,8 +26714,13 @@ mod tests {
         use sinomo_runtime::api::{DaemonPaths, DaemonRunOptions, DaemonStatus};
         use sinomo_runtime::dfs::DfsPlacementReconciliationActivityStatus as Status;
 
-        fn daemon_backend(port: u16) -> Backend {
-            let mut backend = Backend::local_fallback();
+        fn daemon_backend(port: u16) -> (Backend, sinomo_testdir::TestDir) {
+            let fixture = sinomo_testdir::TestDir::new(
+                "app-ui-reconciliation-activity-cache-survives-same-endpoint-rebind-but-not-a-new-endpoint",
+            );
+            let mut backend = Backend::local_fallback_for_data_dir(
+                sinomo_runtime::local::SinomoDataDir::new(fixture.path()),
+            );
             let options = DaemonRunOptions {
                 host: "127.0.0.1".to_string(),
                 port,
@@ -26456,10 +26729,10 @@ mod tests {
             let paths = DaemonPaths::new(backend.data_dir.as_ref());
             backend.connection =
                 Connection::Daemon(Box::new(DaemonStatus::new(&options, &paths, None)));
-            backend
+            (backend, fixture)
         }
 
-        let first_backend = daemon_backend(31_353);
+        let (first_backend, _first_fixture) = daemon_backend(31_353);
         let mut state = FilesState::new(&first_backend);
         let retained = placement_activity_summary("retained-job", Status::Failed, 20);
         state.placement_activity_open = true;
@@ -26486,7 +26759,7 @@ mod tests {
         assert_eq!(state.placement_activity_refreshed_at_unix_nanos, Some(20));
 
         state.close_placement_activity();
-        let second_backend = daemon_backend(31_354);
+        let (second_backend, _second_fixture) = daemon_backend(31_354);
         assert!(state.rebind_backend(&second_backend, None));
         assert!(state.placement_activity.is_empty());
         assert!(state.placement_activity_error.is_none());
@@ -27181,7 +27454,12 @@ mod tests {
     -> sui::Result<()> {
         use sinomo_runtime::dfs::DfsPlacementReconciliationActivityStatus as Status;
 
-        let backend = Backend::local_fallback();
+        let fixture = sinomo_testdir::TestDir::new(
+            "app-ui-reconciliation-activity-sheet-exposes-cluster-statuses-and-virtual-filtering",
+        );
+        let backend = Backend::local_fallback_for_data_dir(
+            sinomo_runtime::local::SinomoDataDir::new(fixture.path()),
+        );
         let shared = Shared::new(AppState::ready(backend));
         {
             let mut files = shared.files_mut();
@@ -27269,7 +27547,12 @@ mod tests {
         let full_error = "The cluster control plane rejected this activity read because the retained projection is temporarily unavailable on node oracle-eu-west-very-long-name.";
         let live_error =
             "The daemon event stream disconnected while waiting for DFS placement updates.";
-        let backend = Backend::local_fallback();
+        let fixture = sinomo_testdir::TestDir::new(
+            "app-ui-reconciliation-activity-compact-extra-large-keeps-offline-error-and-history-reachable",
+        );
+        let backend = Backend::local_fallback_for_data_dir(
+            sinomo_runtime::local::SinomoDataDir::new(fixture.path()),
+        );
         let mut app_state = AppState::ready(backend);
         app_state.text_scale = AppTextScale::ExtraLarge;
         let shared = Shared::new(app_state);
@@ -27374,8 +27657,35 @@ mod tests {
             .get_by_role(SemanticsRole::Button)
             .with_name("Next activity summary");
         next_summary.expect().to_be_visible()?;
-        next_summary.click()?;
-        app.run_until_idle()?;
+        // Native font metrics change wrapping and the number of scroll steps needed.
+        // Verify reachability through the production controls instead of a fixed click count.
+        let reveal_summary_status = |button: &str, status: &str| -> sui::Result<()> {
+            for _ in 0..12 {
+                let snapshot = window.snapshot()?;
+                let bounds = snapshot
+                    .accessibility
+                    .nodes
+                    .iter()
+                    .find(|node| {
+                        node.role == SemanticsRole::Status && node.name.as_deref() == Some(status)
+                    })
+                    .expect("activity summary status")
+                    .bounds;
+                if bounds.y() < header_bounds.max_y() && bounds.max_y() > header_bounds.y() {
+                    return Ok(());
+                }
+                window
+                    .get_by_role(SemanticsRole::Button)
+                    .with_name(button)
+                    .click()?;
+                app.run_until_idle()?;
+            }
+            panic!("{status} was not reachable through {button} within 12 scroll steps");
+        };
+        reveal_summary_status(
+            "Next activity summary",
+            "Live reconciliation updates disconnected",
+        )?;
         let live_snapshot = window.snapshot()?;
         let live_status = live_snapshot
             .accessibility
@@ -27395,8 +27705,7 @@ mod tests {
             header_bounds
         );
 
-        next_summary.click()?;
-        app.run_until_idle()?;
+        reveal_summary_status("Next activity summary", "Retained operational history")?;
         let retained_snapshot = window.snapshot()?;
         let retained_status = retained_snapshot
             .accessibility
@@ -27430,12 +27739,7 @@ mod tests {
         );
 
         // Navigating the summary never dismisses or clears the durable read error.
-        let previous_summary = window
-            .get_by_role(SemanticsRole::Button)
-            .with_name("Previous activity summary");
-        previous_summary.click()?;
-        previous_summary.click()?;
-        app.run_until_idle()?;
+        reveal_summary_status("Previous activity summary", "Reconciliation activity read failed")?;
         let restored_snapshot = window.snapshot()?;
         let restored_error = restored_snapshot
             .accessibility
@@ -27466,13 +27770,49 @@ mod tests {
             list_items, realized_rows,
             "each virtual row owns one list-item semantic node"
         );
-        assert!(restored_snapshot.accessibility.nodes.iter().any(|node| {
-            node.name.as_deref() == Some("Replaced")
-                || node
-                    .description
-                    .as_deref()
-                    .is_some_and(|text| text.contains("Replaced"))
-        }));
+        // Native font metrics can make the first card fill the virtual viewport.
+        // Reach the second row through its own scroll control, independently of
+        // the summary, rather than assuming both rows are initially realized.
+        let activity_list = window
+            .get_by_role(SemanticsRole::List)
+            .with_name("Reconciliation activity");
+        let list_bounds = restored_snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::List
+                    && node.name.as_deref() == Some("Reconciliation activity")
+            })
+            .expect("virtual activity list")
+            .bounds;
+        let mut replaced_reachable = false;
+        for _ in 0..12 {
+            let snapshot = window.snapshot()?;
+            replaced_reachable = snapshot.accessibility.nodes.iter().any(|node| {
+                (node.name.as_deref() == Some("Replaced")
+                    || node
+                        .description
+                        .as_deref()
+                        .is_some_and(|text| text.contains("Replaced")))
+                    && node.bounds.y() < list_bounds.max_y()
+                    && node.bounds.max_y() > list_bounds.y()
+            });
+            if replaced_reachable {
+                break;
+            }
+            activity_list.scroll_pixels(Vector::new(0.0, -140.0))?;
+            app.run_until_idle()?;
+        }
+        assert!(
+            replaced_reachable,
+            "Replaced row must be reachable through the virtual list"
+        );
+        assert_eq!(
+            shared.files().placement_activity_error.as_deref(),
+            Some(full_error),
+            "scrolling the job list preserves the durable activity read error"
+        );
         Ok(())
     }
 

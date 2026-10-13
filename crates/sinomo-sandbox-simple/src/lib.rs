@@ -1416,10 +1416,20 @@ fn resolve_native_program(
         .find_map(|(name, value)| (name == "PATH").then_some(value.as_str()))
         .unwrap_or("/usr/local/bin:/usr/bin:/bin");
     for dir in env::split_paths(path) {
-        let candidate = if dir.as_os_str().is_empty() {
-            cwd.join(argv0)
-        } else {
+        let candidate = if dir.is_absolute() {
             dir.join(argv0)
+        } else {
+            // Relative PATH entries use the command's cwd, not the daemon's cwd.
+            let command_cwd = if cwd.is_absolute() {
+                cwd.to_path_buf()
+            } else {
+                env::current_dir()
+                    .map_err(|source| SandboxWasiError::Runtime {
+                        detail: format!("failed to resolve simple-native command cwd: {source}"),
+                    })?
+                    .join(cwd)
+            };
+            command_cwd.join(dir).join(argv0)
         };
         if candidate.is_file() {
             return Ok(candidate);
@@ -2891,6 +2901,135 @@ mod tests {
             .expect("simple-native host workspace cwd command");
 
         assert_eq!(outcome.response.exit_status, 0);
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn simple_native_relative_path_resolves_from_command_cwd() {
+        let dir = sinomo_testdir::TestDir::new("simple-native-relative-path");
+        let cwd = dir.path().join("workspace");
+        let relative_bin = format!("tools-{}", SandboxId::generate());
+        let bin = cwd.join(&relative_bin).join("bin");
+        fs::create_dir_all(&bin).expect("workspace tool directory");
+        let program = bin.join("workspace-tool");
+        fs::write(&program, b"workspace tool").expect("workspace tool fixture");
+        let envs = vec![("PATH".to_string(), format!("{relative_bin}/bin"))];
+
+        assert_eq!(
+            resolve_native_program("workspace-tool", &envs, &cwd).expect("relative PATH tool"),
+            program
+        );
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn simple_native_relative_path_preserves_empty_absolute_and_missing_entries() {
+        let dir = sinomo_testdir::TestDir::new("simple-native-path-fallbacks");
+        let cwd = dir.path().join("workspace");
+        let absolute_bin = dir.path().join("absolute-bin");
+        fs::create_dir_all(&cwd).expect("workspace");
+        fs::create_dir_all(&absolute_bin).expect("absolute tool directory");
+        let cwd_program = cwd.join("workspace-tool");
+        let absolute_program = absolute_bin.join("workspace-tool");
+        fs::write(&cwd_program, b"cwd tool").expect("cwd tool");
+        fs::write(&absolute_program, b"absolute tool").expect("absolute tool");
+
+        let empty_path = vec![("PATH".to_string(), String::new())];
+        assert_eq!(
+            resolve_native_program("workspace-tool", &empty_path, &cwd).expect("empty PATH entry"),
+            cwd_program
+        );
+        let path = env::join_paths([Path::new("missing-relative-bin"), absolute_bin.as_path()])
+            .expect("mixed PATH");
+        let envs = vec![("PATH".to_string(), path.to_string_lossy().into_owned())];
+        assert_eq!(
+            resolve_native_program("workspace-tool", &envs, &cwd).expect("absolute fallback"),
+            absolute_program
+        );
+        assert!(matches!(
+            resolve_native_program("missing-workspace-tool", &envs, &cwd),
+            Err(SandboxWasiError::Runtime { .. })
+        ));
+        assert_eq!(
+            resolve_native_program("./workspace-tool", &envs, &cwd).expect("explicit argv path"),
+            PathBuf::from("./workspace-tool")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn simple_native_relative_path_anchors_relative_runtime_cwd_before_launch() {
+        let dir = sinomo_testdir::TestDir::new("simple-native-relative-runtime-cwd");
+        let cwd = dir.path().join("workspace");
+        let bin = cwd.join("tools");
+        fs::create_dir_all(&bin).expect("workspace tool directory");
+        fs::write(bin.join("workspace-tool"), b"workspace tool").expect("tool fixture");
+        let daemon_cwd = env::current_dir().expect("daemon cwd");
+        let mut relative_cwd = PathBuf::new();
+        for component in daemon_cwd.components() {
+            if matches!(component, std::path::Component::Normal(_)) {
+                relative_cwd.push("..");
+            }
+        }
+        relative_cwd.push(cwd.strip_prefix("/").expect("absolute Unix fixture cwd"));
+        let envs = vec![("PATH".to_string(), "tools".to_string())];
+
+        let program = resolve_native_program("workspace-tool", &envs, &relative_cwd)
+            .expect("relative runtime cwd tool");
+        assert!(program.is_absolute(), "exec must not apply the child cwd twice");
+        assert_eq!(
+            fs::canonicalize(program).expect("resolved tool"),
+            fs::canonicalize(bin.join("workspace-tool")).expect("workspace tool")
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn simple_native_relative_path_runs_workspace_tool_before_host_fallback() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, store, sandbox_id) = create_store();
+        let (mut manifest, layout) = store.load(&sandbox_id).expect("load sandbox");
+        let relative_bin = format!("native-tools-{}", sandbox_id);
+        let bin = layout.work.join(&relative_bin);
+        fs::create_dir_all(&bin).expect("workspace tool directory");
+        let program = bin.join("true");
+        fs::write(&program, b"#!/bin/sh\nprintf workspace-relative-tool\n")
+            .expect("workspace shell fixture");
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o755))
+            .expect("executable workspace tool");
+        manifest.cwd = SandboxPath::new(layout.work.display().to_string())
+            .expect("native workspace command cwd");
+        manifest.env.insert(
+            "PATH".to_string(),
+            format!("{relative_bin}:/usr/bin:/bin"),
+        );
+        store.save_manifest(&manifest).expect("save command cwd");
+        let node_id = NodeId::from_legacy_named("simple_native_relative_path").expect("node");
+        let toolchain_store =
+            sinomo_sandbox::LocalSandboxToolchainStore::new(dir.path().join("toolchains"));
+        let outcome = runner()
+            .run_toolchain_command_with_stdin_policy_and_output_sink(
+                &store,
+                &toolchain_store,
+                &sandbox_id,
+                "true",
+                vec!["true".to_string()],
+                None,
+                5_000,
+                &node_id,
+                &SandboxPolicy::default(),
+                None,
+            )
+            .expect("execute workspace-relative tool");
+
+        assert_eq!(outcome.response.exit_status, 0);
+        assert_eq!(outcome.stdout.as_slice(), b"workspace-relative-tool");
+        let (after, _) = store.load(&sandbox_id).expect("load command audit");
+        assert_eq!(after.cwd, manifest.cwd);
+        assert_eq!(after.mounts, manifest.mounts);
+        assert!(after.active_processes.is_empty());
+        assert_eq!(after.command_history.len(), 1);
     }
 
     #[test]

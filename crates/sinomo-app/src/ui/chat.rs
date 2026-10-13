@@ -27027,7 +27027,12 @@ mod tests {
 
     #[test]
     fn inactive_preflight_releases_devices_off_tab_and_resumes_on_return() {
-        let backend = Backend::local_fallback();
+        let fixture = sinomo_testdir::TestDir::new(
+            "app-ui-inactive-preflight-releases-devices-off-tab-and-resumes-on-return",
+        );
+        let backend = Backend::local_fallback_for_data_dir(
+            sinomo_runtime::local::SinomoDataDir::new(fixture.path()),
+        );
         let mut state = ChatState::new(&backend);
         state.media_call_details_open = true;
         state.media_call.camera_enabled = true;
@@ -27048,7 +27053,12 @@ mod tests {
 
     #[test]
     fn inactive_preflight_toggles_release_and_explicitly_reopen_capture_devices() {
-        let backend = Backend::local_fallback();
+        let fixture = sinomo_testdir::TestDir::new(
+            "app-ui-inactive-preflight-toggles-release-and-explicitly-reopen-capture-devices",
+        );
+        let backend = Backend::local_fallback_for_data_dir(
+            sinomo_runtime::local::SinomoDataDir::new(fixture.path()),
+        );
         let mut state = ChatState::new(&backend);
         state.media_call_details_open = true;
         state.media_call.camera_enabled = true;
@@ -27079,7 +27089,10 @@ mod tests {
 
     #[test]
     fn device_selection_index_does_not_replace_the_media_panel_tree() {
-        let backend = Backend::local_fallback();
+        let fixture = sinomo_testdir::TestDir::new("app-ui-device-selection-index-does-not-replace-the-media-panel-tree");
+        let backend = Backend::local_fallback_for_data_dir(
+            sinomo_runtime::local::SinomoDataDir::new(fixture.path()),
+        );
         let shared = Shared::new(AppState::ready(backend));
         shared
             .chat_mut()
@@ -27101,7 +27114,13 @@ mod tests {
     fn rendered_media_call_close_stops_call_and_preview_at_all_widths() -> sui::Result<()> {
         for width in [1100.0, 320.0] {
             for active in [false, true] {
-                let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+                let fixture = sinomo_testdir::TestDir::new(
+                    "app-ui-rendered-media-call-close-stops-call-and-preview-at-all-widths",
+                );
+                let backend = Backend::local_fallback_for_data_dir(
+                    sinomo_runtime::local::SinomoDataDir::new(fixture.path()),
+                );
+                let shared = Shared::new(AppState::ready(backend));
                 let (control_tx, control_rx) = mpsc::channel();
                 let (event_tx, event_rx) = mpsc::channel();
                 let cancelled = Arc::new(AtomicBool::new(false));
@@ -30990,7 +31009,10 @@ mod tests {
 
     #[test]
     fn provider_list_load_applies_async_result() {
-        let backend = Backend::local_fallback();
+        let fixture = sinomo_testdir::TestDir::new("app-ui-provider-list-load-applies-async-result");
+        let backend = Backend::local_fallback_for_data_dir(
+            sinomo_runtime::local::SinomoDataDir::new(fixture.path()),
+        );
         let mut state = ChatState::new(&backend);
         state.providers.clear();
         state.providers_loading = true;
@@ -31086,7 +31108,12 @@ mod tests {
 
     #[test]
     fn hidden_runtime_provider_does_not_leak_into_visible_model_selection() {
-        let backend = Backend::local_fallback();
+        let fixture = sinomo_testdir::TestDir::new(
+            "app-ui-hidden-runtime-provider-does-not-leak-into-visible-model-selection",
+        );
+        let backend = Backend::local_fallback_for_data_dir(
+            sinomo_runtime::local::SinomoDataDir::new(fixture.path()),
+        );
         let mut state = ChatState::new(&backend);
         state.providers = vec![ProviderSummary {
             id: "deepseek".to_string(),
@@ -31122,7 +31149,12 @@ mod tests {
 
     #[test]
     fn visible_model_selection_command_ignores_hidden_runtime_provider() {
-        let backend = Backend::local_fallback();
+        let fixture = sinomo_testdir::TestDir::new(
+            "app-ui-visible-model-selection-command-ignores-hidden-runtime-provider",
+        );
+        let backend = Backend::local_fallback_for_data_dir(
+            sinomo_runtime::local::SinomoDataDir::new(fixture.path()),
+        );
         let mut state = ChatState::new(&backend);
         state.providers = vec![ProviderSummary {
             id: "deepseek".to_string(),
