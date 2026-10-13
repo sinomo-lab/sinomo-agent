@@ -251,66 +251,6 @@ impl GitHubCopilotProvider {
         Ok(copilot_usage_from_value(&value, unix_timestamp()))
     }
 
-    #[allow(dead_code)]
-    fn exchange_copilot_api_token(
-        &self,
-        github_token: &str,
-    ) -> Result<CopilotApiToken, LanguageModelError> {
-        let api_host = if self.config.github_host == "github.com" {
-            "api.github.com".to_string()
-        } else {
-            format!("api.{}", self.config.github_host.trim_end_matches('/'))
-        };
-        let urls = [
-            format!("https://{api_host}/copilot_internal/user"),
-            format!("https://{api_host}/copilot_internal/v2/token"),
-        ];
-        let mut errors = Vec::new();
-        for url in urls {
-            match self.try_copilot_token_endpoint(&url, github_token) {
-                Ok(token) => return Ok(token),
-                Err(error) => errors.push(error),
-            }
-        }
-        Err(LanguageModelError::ProviderInvocationFailed {
-            provider: Self::PROVIDER_ID.to_string(),
-            model: self.config.default_model.clone(),
-            detail: format!(
-                "Copilot token exchange failed across known endpoints: {}",
-                errors.join("; ")
-            ),
-        })
-    }
-
-    #[allow(dead_code)]
-    fn try_copilot_token_endpoint(
-        &self,
-        url: &str,
-        github_token: &str,
-    ) -> Result<CopilotApiToken, String> {
-        let response = self
-            .http
-            .get(url)
-            .headers(copilot_exchange_headers(github_token).map_err(|source| source.to_string())?)
-            .send()
-            .map_err(|source| source.to_string())?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().unwrap_or_default();
-            return Err(format!(
-                "{url}: {}",
-                copilot_token_exchange_error_detail(status.as_u16(), &body)
-            ));
-        }
-
-        let value = response
-            .json::<serde_json::Value>()
-            .map_err(|source| format!("{url}: {source}"))?;
-        parse_copilot_api_token(&value)
-            .ok_or_else(|| format!("{url}: response did not include a Copilot API token"))
-    }
-
     fn load_stored_github_token(&self) -> Result<Option<StoredGitHubToken>, LanguageModelError> {
         let value =
             read_provider_credentials_json_value(Self::PROVIDER_ID, &self.config.token_store_path)?;
@@ -540,12 +480,6 @@ struct StoredGitHubToken {
     github_token: String,
     source: String,
     created_at_unix: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct CopilotApiToken {
-    token: String,
-    expires_at: u64,
 }
 
 pub const GITHUB_COPILOT_CLIENT_ID: &str = "Ov23li8tweQw6odWQebz";
@@ -947,49 +881,6 @@ fn validate_github_copilot_token(token: &str) -> Result<(), LanguageModelError> 
     Ok(())
 }
 
-fn copilot_token_exchange_error_detail(status: u16, body: &str) -> String {
-    let base = format!("Copilot token exchange failed: HTTP {status}: {body}");
-    if status == 403 && body.contains("Resource not accessible by integration") {
-        format!(
-            "{base}; this usually means the stored GitHub token came from a GitHub App integration \
-             rather than a Copilot-compatible OAuth/device flow. Re-run `sinomo providers \
-             github-copilot auth` after removing the existing credentials file, or use a \
-             fine-grained PAT with Copilot Requests permission."
-        )
-    } else {
-        base
-    }
-}
-
-fn parse_copilot_api_token(value: &serde_json::Value) -> Option<CopilotApiToken> {
-    let token = value
-        .get("token")
-        .or_else(|| value.get("access_token"))
-        .or_else(|| value.pointer("/copilot/token"))
-        .and_then(serde_json::Value::as_str)?;
-    let expires_at = value
-        .get("expires_at")
-        .or_else(|| value.pointer("/copilot/expires_at"))
-        .and_then(|expires| {
-            expires
-                .as_u64()
-                .or_else(|| expires.as_str().and_then(|value| value.parse().ok()))
-        })
-        .or_else(|| {
-            value
-                .get("expires_in")
-                .or_else(|| value.pointer("/copilot/expires_in"))
-                .and_then(serde_json::Value::as_u64)
-                .map(|expires_in| unix_timestamp() + expires_in)
-        })
-        .unwrap_or_else(|| unix_timestamp() + 25 * 60);
-
-    Some(CopilotApiToken {
-        token: token.to_string(),
-        expires_at,
-    })
-}
-
 fn default_copilot_credentials_path() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("SINOMO_COPILOT_TOKEN_FILE") {
         return Some(PathBuf::from(path));
@@ -1159,17 +1050,36 @@ mod tests {
     }
 
     #[test]
-    fn copilot_token_parser_accepts_common_shapes() {
-        for value in [
-            serde_json::json!({ "token": "copilot-token", "expires_at": 1234 }),
-            serde_json::json!({ "access_token": "copilot-token", "expires_in": 60 }),
-            serde_json::json!({ "copilot": { "token": "copilot-token", "expires_at": "1234" } }),
-        ] {
-            let token = parse_copilot_api_token(&value).expect("token");
-            assert_eq!(token.token, "copilot-token");
-        }
+    fn direct_copilot_uses_stored_github_token_without_exchange() {
+        let root = sinomo_testdir::TestDir::new("copilot-direct-token");
+        let path = root.join("copilot.json");
+        let provider = GitHubCopilotProvider::new(GitHubCopilotConfig {
+            // Token resolution must succeed without contacting either endpoint.
+            github_host: "invalid host".to_string(),
+            api_base_url: "invalid endpoint".to_string(),
+            token_store_path: Some(path.clone()),
+            ..Default::default()
+        });
 
-        assert!(parse_copilot_api_token(&serde_json::json!({ "id": 1 })).is_none());
+        for token in ["gho_fixture", "github_pat_fixture", "ghu_fixture"] {
+            std::fs::write(
+                &path,
+                serde_json::json!({
+                    "github_token": token,
+                    "source": "fixture",
+                    "created_at_unix": 0,
+                })
+                .to_string(),
+            )
+            .expect("write isolated token fixture");
+
+            let resolved = provider.copilot_api_token().expect("direct GitHub token");
+            assert_eq!(resolved, token);
+            let api_headers = copilot_api_headers(&resolved).expect("API headers");
+            assert_eq!(api_headers[AUTHORIZATION], format!("Bearer {token}"));
+            let quota_headers = copilot_exchange_headers(&resolved).expect("quota headers");
+            assert_eq!(quota_headers[AUTHORIZATION], format!("token {token}"));
+        }
     }
 
     #[test]

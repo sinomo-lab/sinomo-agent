@@ -4236,7 +4236,154 @@ pub use sinomo_runtime::api::lm::classify_language_model_error_detail;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
+    use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
+
+    type StreamDropLog = Rc<RefCell<Vec<&'static str>>>;
+
+    struct DropTrackedStreamReader<'a> {
+        bytes: &'a [u8],
+        drops: StreamDropLog,
+    }
+
+    impl Read for DropTrackedStreamReader<'_> {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            self.bytes.read(buffer)
+        }
+    }
+
+    impl Drop for DropTrackedStreamReader<'_> {
+        fn drop(&mut self) {
+            self.drops.borrow_mut().push("reader");
+        }
+    }
+
+    struct StreamCallbackDropProbe(StreamDropLog);
+
+    impl StreamCallbackDropProbe {
+        fn record_event(&self) {
+            assert!(
+                !self.0.borrow().contains(&"reader"),
+                "the reader must remain alive while delivering a stream event"
+            );
+            self.0.borrow_mut().push("event");
+        }
+    }
+
+    impl Drop for StreamCallbackDropProbe {
+        fn drop(&mut self) {
+            self.0.borrow_mut().push("callback");
+        }
+    }
+
+    #[test]
+    fn server_sent_events_drops_reader_before_callback_capture_on_return() {
+        let drops = StreamDropLog::default();
+        let reader = DropTrackedStreamReader {
+            bytes: b"data: fixture event\n\n",
+            drops: Rc::clone(&drops),
+        };
+        let callback = StreamCallbackDropProbe(Rc::clone(&drops));
+
+        read_server_sent_events(reader, "fixture", "fixture", move |event| {
+            callback.record_event();
+            assert_eq!(event.data, "fixture event");
+            Ok(())
+        })
+        .expect("stream completes");
+
+        assert_eq!(*drops.borrow(), ["event", "reader", "callback"]);
+    }
+
+    #[test]
+    fn server_sent_events_drops_reader_before_callback_capture_on_callback_error() {
+        let drops = StreamDropLog::default();
+        let reader = DropTrackedStreamReader {
+            bytes: b"data: fixture event\n\n",
+            drops: Rc::clone(&drops),
+        };
+        let callback = StreamCallbackDropProbe(Rc::clone(&drops));
+
+        let error = read_server_sent_events(reader, "fixture", "fixture", move |_event| {
+            callback.record_event();
+            Err(LanguageModelError::ProviderInvocationFailed {
+                provider: "fixture".to_string(),
+                model: "fixture".to_string(),
+                detail: "fixture callback error".to_string(),
+            })
+        })
+        .expect_err("callback error propagates");
+
+        assert!(matches!(
+            error,
+            LanguageModelError::ProviderInvocationFailed { detail, .. }
+                if detail == "fixture callback error"
+        ));
+        assert_eq!(*drops.borrow(), ["event", "reader", "callback"]);
+    }
+
+    #[test]
+    fn server_sent_events_drops_reader_before_callback_capture_on_callback_unwind() {
+        let drops = StreamDropLog::default();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let reader = DropTrackedStreamReader {
+                bytes: b"data: fixture event\n\n",
+                drops: Rc::clone(&drops),
+            };
+            let callback = StreamCallbackDropProbe(Rc::clone(&drops));
+            read_server_sent_events(reader, "fixture", "fixture", move |_event| {
+                callback.record_event();
+                panic!("fixture callback panic");
+            })
+        }))
+        .expect_err("callback panic unwinds");
+
+        assert_eq!(
+            panic.downcast_ref::<&str>().copied(),
+            Some("fixture callback panic")
+        );
+        assert_eq!(*drops.borrow(), ["event", "reader", "callback"]);
+    }
+
+    #[test]
+    fn chat_completion_stream_releases_reader_before_terminal_callbacks() {
+        let drops = StreamDropLog::default();
+        let reader = DropTrackedStreamReader {
+            bytes: concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],",
+                "\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":4}}\n\n",
+                "data: [DONE]\n\n"
+            )
+            .as_bytes(),
+            drops: Rc::clone(&drops),
+        };
+
+        let response =
+            stream_openai_chat_completion_response(reader, "fixture", "fixture", &mut |event| {
+                match event {
+                    LanguageModelStreamEvent::TextDelta { .. } => {
+                        assert!(
+                            !drops.borrow().contains(&"reader"),
+                            "text deltas must arrive while the reader is alive"
+                        );
+                        drops.borrow_mut().push("text");
+                    }
+                    LanguageModelStreamEvent::Usage { .. } => {
+                        assert_eq!(*drops.borrow(), ["text", "reader"]);
+                        drops.borrow_mut().push("usage");
+                    }
+                    LanguageModelStreamEvent::Finished { .. } => {
+                        assert_eq!(*drops.borrow(), ["text", "reader", "usage"]);
+                        drops.borrow_mut().push("finished");
+                    }
+                    event => panic!("unexpected stream event: {event:?}"),
+                }
+            })
+            .expect("chat completion stream completes");
+
+        assert_eq!(response.content, "hello");
+        assert_eq!(*drops.borrow(), ["text", "reader", "usage", "finished"]);
+    }
 
     #[test]
     fn server_sent_events_stop_reading_once_the_request_is_cancelled() {
