@@ -1609,7 +1609,31 @@ fn committed_remote_manifest_self_repair_fetches_from_durable_requester() {
             .is_err()
     );
     drop(restored);
+    let attempts_before = crate::read_dfs_repair_attempt_snapshot(
+        &crate::default_dfs_repair_attempt_snapshot_path(runtime.data_dir(&primary)),
+    )
+    .unwrap();
     runtime.clear_faults();
+    let retry_at = attempts_before
+        .as_ref()
+        .unwrap()
+        .records
+        .iter()
+        .find(|row| {
+            row.intent_id == native_intent.intent_id && row.missing_replica_node_id == primary
+        })
+        .expect("actual durable self-repair continuation")
+        .next_retry_unix_nanos;
+    let remaining_backoff = Duration::from_nanos(
+        retry_at.saturating_sub(crate::metadata_records::dfs_now_unix_nanos()),
+    );
+    assert!(
+        remaining_backoff <= sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+        "fixture must retain the normal recorded retry bound"
+    );
+    // Clearing a negative transport fault does not expire durable backoff.
+    // Wait on the real clock; do not rewrite queue facts or extend the call budget.
+    std::thread::sleep(remaining_backoff);
     runtime
         .maintenance_tick(&primary, Duration::from_secs(5))
         .unwrap()
@@ -1622,7 +1646,12 @@ fn committed_remote_manifest_self_repair_fetches_from_durable_requester() {
             .any(|event| event.source == primary
                 && event.target == requester
                 && event.route == DFS_DATA_FETCH_BLOB_ROUTE
-                && event.phase == crate::test_support::DfsTestRpcPhase::Completed)
+                && event.phase == crate::test_support::DfsTestRpcPhase::Completed),
+        "actual repair queue before maintenance={attempts_before:#?}; after={:#?}",
+        crate::read_dfs_repair_attempt_snapshot(&crate::default_dfs_repair_attempt_snapshot_path(
+            runtime.data_dir(&primary)
+        ))
+        .unwrap()
     );
     let mut recovered = runtime.client(&primary).unwrap();
     let current = recovered
@@ -1722,7 +1751,31 @@ fn nonforeground_remote_manifest_self_repair_defers_fetch_from_durable_requester
             .is_err()
     );
     drop(restored);
+    let attempts_before = crate::read_dfs_repair_attempt_snapshot(
+        &crate::default_dfs_repair_attempt_snapshot_path(runtime.data_dir(&primary)),
+    )
+    .unwrap();
     runtime.clear_faults();
+    let retry_at = attempts_before
+        .as_ref()
+        .unwrap()
+        .records
+        .iter()
+        .find(|row| {
+            row.intent_id == native_intent.intent_id && row.missing_replica_node_id == primary
+        })
+        .expect("actual durable self-repair continuation")
+        .next_retry_unix_nanos;
+    let remaining_backoff = Duration::from_nanos(
+        retry_at.saturating_sub(crate::metadata_records::dfs_now_unix_nanos()),
+    );
+    assert!(
+        remaining_backoff <= sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+        "fixture must retain the normal recorded retry bound"
+    );
+    // Clearing a negative transport fault does not expire durable backoff.
+    // Wait on the real clock; do not rewrite queue facts or extend the call budget.
+    std::thread::sleep(remaining_backoff);
     runtime
         .maintenance_tick(&primary, Duration::from_secs(5))
         .unwrap()
@@ -1735,7 +1788,12 @@ fn nonforeground_remote_manifest_self_repair_defers_fetch_from_durable_requester
             .any(|event| event.source == primary
                 && event.target == requester
                 && event.route == DFS_DATA_FETCH_BLOB_ROUTE
-                && event.phase == crate::test_support::DfsTestRpcPhase::Completed)
+                && event.phase == crate::test_support::DfsTestRpcPhase::Completed),
+        "actual repair queue before maintenance={attempts_before:#?}; after={:#?}",
+        crate::read_dfs_repair_attempt_snapshot(&crate::default_dfs_repair_attempt_snapshot_path(
+            runtime.data_dir(&primary)
+        ))
+        .unwrap()
     );
     let mut recovered = runtime.client(&primary).unwrap();
     let current = recovered
