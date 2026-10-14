@@ -3,12 +3,37 @@ use super::*;
 use crate::test_runtime::{DfsTestRuntime, FaultAction, FaultRule, RpcPhase};
 use crate::{DfsWriteIntentStatus, DfsWriteOptions};
 
+// Count only attempts made by this fixture's real promotion outbox. The
+// adapter forwards the original owned SOBJ call and response untouched to the
+// same registered native transport; unrelated host RPCs use their own adapter.
+struct ObservedPromotionPeer {
+    inner: Arc<dyn DfsPeerTransport>,
+    attempts: Arc<std::sync::atomic::AtomicUsize>,
+}
+impl DfsPeerTransport for ObservedPromotionPeer {
+    fn response_delivery_owner(&self) -> Option<Arc<crate::DfsRoutedResponseDelivery>> {
+        self.inner.response_delivery_owner()
+    }
+    fn call_object_rpc(
+        &self,
+        target: &NodeId,
+        call: ObjectRpcCall,
+        options: DfsObjectRpcSendOptions,
+    ) -> Result<ObjectRpcResult, DfsPeerTransportError> {
+        assert_eq!(call.request.route, crate::DFS_DATA_COMMIT_VERSION_ROUTE);
+        self.attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.call_object_rpc(target, call, options)
+    }
+}
+
 struct NativePromotions {
     runtime: DfsTestRuntime,
     source: NodeId,
     targets: Vec<NodeId>,
     transport: DfsNodeTransport,
     commands: Vec<crate::DfsCommitVersionCommand>,
+    attempts: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl NativePromotions {
@@ -90,6 +115,11 @@ impl NativePromotions {
             }
         }
         let (sync, asynchronous) = runtime.peer_transports(&source).unwrap();
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sync = Arc::new(ObservedPromotionPeer {
+            inner: sync,
+            attempts: Arc::clone(&attempts),
+        });
         let transport = DfsNodeTransport::with_peer_transports_for_nodes_and_detached_state(
             source.clone(),
             targets.clone(),
@@ -104,6 +134,7 @@ impl NativePromotions {
             targets,
             transport,
             commands,
+            attempts,
         }
     }
     fn enqueue(&mut self, object: usize, target: usize) {
@@ -117,6 +148,9 @@ impl NativePromotions {
         self.transport
             .send_detached_routed_message(&self.targets[target], message)
             .unwrap();
+    }
+    fn promotion_dispatch_count(&self) -> usize {
+        self.attempts.load(std::sync::atomic::Ordering::SeqCst)
     }
     fn fault(&self, target: usize, action: FaultAction) {
         self.runtime.install_fault(FaultRule {
@@ -224,14 +258,32 @@ fn native_failed_promotion_retries_actual_receiver(action: FaultAction, label: &
     );
     assert_eq!(case.transport.pending_commit_promotion_count(), 1);
     assert_eq!(case.transport.settled_commit_promotion_count(), 0);
-    let baseline = case.runtime.rpc_observations().len();
+    let baseline = case.promotion_dispatch_count();
+    assert_eq!(
+        baseline, 1,
+        "the original promotion attempt reached the native transport exactly once"
+    );
+    // An ordinary namespace lookup is independent of the frozen promotion
+    // retry clock. Keep real unrelated traffic in the observation window.
+    let before_lookup = case.runtime.rpc_observations().len();
+    let mut browser = case.runtime.client(&case.source).unwrap();
+    browser.posix_stat_distributed("/").unwrap();
+    drop(browser);
+    assert!(
+        case.runtime.rpc_observations()[before_lookup..]
+            .iter()
+            .any(|event| {
+                event.route == crate::DFS_DATA_NAMESPACE_ROUTE
+                    && event.phase == RpcPhase::BeforeDispatch
+            })
+    );
     case.transport
         .flush_detached_peer_sends_with_now(&|| start)
         .unwrap();
     assert_eq!(
-        case.runtime.rpc_observations().len(),
+        case.promotion_dispatch_count(),
         baseline,
-        "cooling makes no new dispatch"
+        "cooling makes no new dispatch of this actual promotion"
     );
     case.enqueue(0, 0);
     assert_eq!(case.transport.pending_commit_promotion_count(), 1);
@@ -241,6 +293,11 @@ fn native_failed_promotion_retries_actual_receiver(action: FaultAction, label: &
         .unwrap();
     assert_eq!(case.transport.pending_commit_promotion_count(), 0);
     assert_eq!(case.transport.settled_commit_promotion_count(), 1);
+    assert_eq!(
+        case.promotion_dispatch_count(),
+        baseline + 1,
+        "the same captured promotion retries only after its unchanged deadline"
+    );
     case.finish();
 }
 
