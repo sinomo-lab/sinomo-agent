@@ -1,6 +1,42 @@
 //! Real retained native outcome observations; no handcrafted success receipt.
 use super::*;
 
+// This proof test needs an admitted authoritative observation, not a claim
+// about a concurrent local Raft lock. Retry only the explicit fail-closed busy
+// result under the SAME original daemon read deadline. Never execute or replay
+// transaction DATA to obtain an outcome, and never retry other authority errors.
+async fn admitted_native_request_outcome(
+    cluster: &dyn sinomo_core::service::ClusterAccess,
+    request_id: &sinomo_core::kv::KvRequestId,
+) -> Result<sinomo_core::kv::ClusterKvRequestOutcomeRead, sinomo_core::service::ServiceError> {
+    let budget = sinomo_core::cluster::ClusterControlPlaneTimeouts::default_daemon_transport()
+        .kv_txn_quorum_options(true)
+        .raft_append_timeout;
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        let outcome = tokio::time::timeout_at(
+            deadline,
+            cluster.kv_request_outcome_authoritative_async(request_id.clone()),
+        )
+        .await
+        .map_err(|_| {
+            sinomo_core::service::ServiceError::Service(
+                "native request-outcome observation exhausted its original read deadline".into(),
+            )
+        })?;
+        match outcome {
+            Err(sinomo_core::service::ServiceError::Network(
+                sinomo_core::network::NetworkError::ClusterReadOnly { ref detail },
+            )) if detail
+                == "local Raft admission is busy and no authority accepted the forwarded request-outcome read; local election was skipped" =>
+            {
+                tokio::task::yield_now().await;
+            }
+            result => return result,
+        }
+    }
+}
+
 #[test]
 fn authoritative_outcome_does_not_execute_unknown_data_and_matches_actual_commit() {
     let (mut native, nodes) = crate::test_runtime::DfsTestRuntime::start_cluster(
@@ -25,7 +61,10 @@ fn authoritative_outcome_does_not_execute_unknown_data_and_matches_actual_commit
         sinomo_core::kv::kv_command_digest(&sinomo_core::kv::KvCommand::Txn(request.txn.clone()))
             .unwrap();
     let before = runtime
-        .block_on(cluster.kv_request_outcome_authoritative_async(request.request_id.clone()))
+        .block_on(admitted_native_request_outcome(
+            cluster.as_ref(),
+            &request.request_id,
+        ))
         .unwrap();
     sinomo_core::kv::validate_cluster_kv_request_outcome_read(&before).unwrap();
     assert!(!matches!(
@@ -45,7 +84,10 @@ fn authoritative_outcome_does_not_execute_unknown_data_and_matches_actual_commit
         .unwrap();
     assert!(committed.txn_response.as_ref().unwrap().succeeded);
     let read = runtime
-        .block_on(cluster.kv_request_outcome_authoritative_async(request.request_id.clone()))
+        .block_on(admitted_native_request_outcome(
+            cluster.as_ref(),
+            &request.request_id,
+        ))
         .unwrap();
     sinomo_core::kv::validate_cluster_kv_request_outcome_read(&read).unwrap();
     let sinomo_core::kv::KvRequestOutcome::Committed(actual) = read.outcome else {
