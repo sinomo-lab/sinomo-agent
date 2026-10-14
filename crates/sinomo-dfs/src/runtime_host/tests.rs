@@ -4094,96 +4094,66 @@ fn committed_work_emitter_is_quiet_for_noop_and_retains_publish_edge() {
 
 #[test]
 fn metadata_publish_discovery_retains_global_edge_across_planning_failure() {
-    let root = temp_root("metadata-publish-discovery-retry");
-    let data_root = root.join("data");
-    let data_dir = SinomoDataDir::new(&data_root);
-    data_dir.ensure_root_layout().expect("data dir");
+    let (native, nodes) =
+        crate::test_runtime::DfsTestRuntime::start_cluster("native-metadata-discovery-recovery", 1)
+            .unwrap();
+    let data_dir = native.data_dir(&nodes[0]).clone();
     let cluster_paths = ClusterPaths::new(&data_dir);
-    let paths = DaemonPaths::new(&data_dir);
-    let control_owner =
-        Arc::new(DaemonDataOwnerLock::acquire(&paths).expect("control-loop data-owner capability"));
-    register_daemon_dfs_data_owner_lock(&paths, &control_owner)
-        .expect("register data-owner capability");
-    let runtime = daemon_test_runtime("metadata-publish-discovery-retry");
-
-    assert_eq!(
-        schedule_daemon_dfs_metadata_publish_for_data_dir_on_runtime(
-            data_dir.clone(),
-            cluster_paths.clone(),
-            runtime.handle(),
-            None,
-            None,
-        ),
-        DfsMetadataPublishScheduleStart::Started,
-        "the discovery lane must be retained before cluster planning succeeds"
+    let runtime = native.runtime_handle();
+    // Drain only this fixture's startup edge before injecting missing topology.
+    // All subsequent work stays in its actual registered component/task owner.
+    let startup_deadline = Instant::now() + Duration::from_secs(5);
+    while daemon_dfs_metadata_publish_discovery_is_active(&data_dir.root()) {
+        assert!(
+            Instant::now() < startup_deadline,
+            "normal discovery startup must drain"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let initial = daemon_dfs_metadata_publish_discovery_attempts(&data_dir.root());
+    let saved_state = cluster_paths
+        .state
+        .with_extension("discovery-recovery-saved");
+    std::fs::rename(&cluster_paths.state, &saved_state).unwrap();
+    assert!(sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths).is_err());
+    let start = schedule_daemon_dfs_metadata_publish_for_data_dir_on_runtime(
+        data_dir.clone(),
+        cluster_paths.clone(),
+        &runtime,
+        None,
+        None,
     );
     let first_deadline = Instant::now() + Duration::from_secs(2);
-    while daemon_dfs_metadata_publish_discovery_attempts(&data_dir.root()).0 == 0
+    while daemon_dfs_metadata_publish_discovery_attempts(&data_dir.root()).0 == initial.0
         && Instant::now() < first_deadline
     {
         std::thread::sleep(Duration::from_millis(10));
     }
-    let (failed_attempts, successes) =
-        daemon_dfs_metadata_publish_discovery_attempts(&data_dir.root());
-    assert!(failed_attempts > 0);
-    assert_eq!(successes, 0, "cluster state is intentionally absent");
-
-    let local = NodeId::from_legacy_named("node_dfs_discovery_retry").expect("node");
-    write_test_cluster_state(&data_root, &local);
-    let file_system = distributed_sifs(local.clone());
-    let shard = DfsMetadataShardConfig {
-        file_system_id: file_system.file_system_id.clone(),
-        shard_id: "root".to_string(),
-        primary_node_id: local.clone(),
-        replica_node_ids: Vec::new(),
-        epoch: 1,
-        assignment: DfsMetadataShardAssignment::Root,
-
-        default_policy: DfsObjectPolicy::ReplicatedEventual,
-    };
-    append_cluster_raft_command(
-        &cluster_paths,
-        &local,
-        sinomo_core::kv::KvCommand::Txn(sinomo_core::kv::KvTxn {
-            compares: Vec::new(),
-            success: vec![
-                sinomo_core::kv::KvOp::put_serde(
-                    file_system_config_key(&file_system.file_system_id),
-                    &DfsFileSystemConfig::from(&file_system),
-                    None,
-                )
-                .expect("filesystem config op"),
-                sinomo_core::kv::KvOp::put_serde(
-                    metadata_shard_key(&file_system.file_system_id, "root"),
-                    &shard,
-                    None,
-                )
-                .expect("metadata shard op"),
-            ],
-            failure: Vec::new(),
-        }),
-    )
-    .expect("install recovered topology");
-
+    let failed = daemon_dfs_metadata_publish_discovery_attempts(&data_dir.root());
+    // Restore the exact same durable identity before assertions/cleanup; no
+    // new configuration, artificial authority or second schedule wakes it.
+    std::fs::rename(&saved_state, &cluster_paths.state).unwrap();
+    assert_eq!(start, DfsMetadataPublishScheduleStart::Started);
+    assert!(failed.0 > initial.0);
+    assert_eq!(
+        failed.1, initial.1,
+        "absent topology cannot complete discovery"
+    );
     let recovery_deadline = Instant::now() + Duration::from_secs(5);
-    while daemon_dfs_metadata_publish_discovery_attempts(&data_dir.root()).1 == 0
+    while daemon_dfs_metadata_publish_discovery_attempts(&data_dir.root()).1 == initial.1
         && Instant::now() < recovery_deadline
     {
         std::thread::sleep(Duration::from_millis(10));
     }
     let mut settled = daemon_dfs_metadata_publish_discovery_attempts(&data_dir.root());
-    assert!(settled.0 >= 2, "the retained edge must retry planning");
     assert!(
-        settled.1 >= 1,
-        "topology recovery alone must drain the retained discovery edge"
+        settled.0 >= initial.0 + 2,
+        "the retained edge must retry planning"
     );
-
-    // Installing topology can produce another legitimate discovery edge:
-    // the exact lane opened by the retained attempt attaches its resident
-    // authority observer, which then publishes the newly observed semantic
-    // authority generation. Do not require an exact success count. Require
-    // the coalesced lane to become quiet after those bounded wakes instead,
-    // proving recovery does not turn the observer edge into a retry loop.
+    assert!(
+        settled.1 > initial.1,
+        "topology recovery alone must drain the retained edge"
+    );
     let quiet_window = Duration::from_millis(1_250);
     let drain_deadline = Instant::now() + Duration::from_secs(5);
     let mut unchanged_since = Instant::now();
@@ -4202,8 +4172,8 @@ fn metadata_publish_discovery_retains_global_edge_across_planning_failure() {
             "metadata discovery did not drain after topology recovery; last counts: {settled:?}"
         );
     }
+    native.close().expect("drain the actual embedded owner");
 }
-
 #[test]
 fn metadata_publish_missing_route_wakes_on_semantic_route_generation() {
     let root = temp_root("metadata-publish-route-generation");
