@@ -8046,33 +8046,40 @@ fn daemon_dfs_reactive_probe_retains_completed_promoted_primary_rebind_until_mai
     native.start_nodes().unwrap();
     let retiring = native.root_shard().unwrap();
     let control = native.shared_control_plane().unwrap();
-    let configs = control.with_client(|kv| {
-        crate::DfsControlPlaneStore::new(kv.as_mut())
-            .list_metadata_shards(&retiring.file_system_id)
-            .unwrap()
-    });
     let mut source = native.client(&retiring.primary_node_id).unwrap();
     source.posix_mkdir("/native-rebind-source-cut").unwrap();
     let promoted_data = native.data_dir(&nodes[1]).clone();
-    let scheduler = daemon_dfs_mutation_scheduler(&promoted_data).unwrap();
-    let admission = crate::test_runtime::executor()
-        .block_on(scheduler.admit(&crate::DfsMessageExecutionScope::GlobalExclusive))
-        .unwrap();
+    // Hold only local activation. Global admission also blocks the fresh
+    // replica proof required to complete the actual handoff itself.
+    let rebind_hold = install_daemon_dfs_pre_dispatch_test_hook(
+        &promoted_data,
+        Arc::new(|point, _, _| {
+            if matches!(point, DaemonDfsPreDispatchTestPoint::BeforeCompletedPrimaryRebind { shard_id }
+                if shard_id.0 == "root")
+            {
+                return Err(crate::DfsError::Cancelled {
+                    operation: "negative local completed-primary activation interruption",
+                });
+            }
+            Ok(())
+        }),
+    );
     let desired = DfsMetadataShardConfig {
         primary_node_id: nodes[1].clone(),
         replica_node_ids: vec![nodes[0].clone()],
         epoch: retiring.epoch + 1,
         ..retiring.clone()
     };
-    control.with_client(|kv| {
-        crate::DfsControlPlaneStore::new(kv.as_mut())
-            .begin_metadata_shard_membership_handoff(&retiring, &desired)
-            .unwrap()
-            .unwrap()
-    });
-    source
-        .reconcile_pending_metadata_shard_membership_handoffs(&configs, Duration::from_secs(5))
+    drop(source);
+    let installed = native
+        .reassign_metadata_shard(
+            &retiring.file_system_id,
+            "root",
+            desired.primary_node_id.clone(),
+            desired.replica_node_ids.clone(),
+        )
         .unwrap();
+    assert_eq!(installed, desired);
     let actual = control.with_client(|kv| {
         crate::DfsControlPlaneStore::new(kv.as_mut())
             .get_metadata_shard(&desired.file_system_id, "root")
@@ -8081,14 +8088,66 @@ fn daemon_dfs_reactive_probe_retains_completed_promoted_primary_rebind_until_mai
     });
     assert_eq!(actual, desired);
     let paths = DaemonPaths::new(&promoted_data);
-    let pending = daemon_dfs_pending_reactive_maintenance_work(&paths).unwrap();
+    let promoted_cluster = ClusterPaths::new(&promoted_data);
+    let state = sinomo_core::cluster::read_cluster_state_without_kv(&promoted_cluster).unwrap();
+    let runtime = native.runtime_handle();
+    let preflight = runtime
+        .block_on(warm_daemon_dfs_metadata_authority_for_identity_async(
+            &promoted_cluster,
+            &state.cluster_id,
+            &state.local_node_id,
+            &runtime,
+        ))
+        .unwrap();
+    let projection = preflight.authority.current_complete_prefix().unwrap();
+    let projected_shard = projection
+        .entries()
+        .iter()
+        .find(|entry| entry.key == crate::metadata_shard_key(&desired.file_system_id, "root"))
+        .unwrap()
+        .decode::<DfsMetadataShardConfig>()
+        .unwrap();
+    let projected_proof = projection
+        .entries()
+        .iter()
+        .find(|entry| {
+            entry.key
+                == crate::metadata_shard_membership_handoff_proof_key(
+                    &desired.file_system_id,
+                    "root",
+                )
+        })
+        .map(|entry| {
+            entry
+                .decode::<DfsMetadataShardMembershipHandoffProof>()
+                .unwrap()
+        });
+    eprintln!(
+        "promoted={} expected={desired:?} retained={projected_shard:?} proof={projected_proof:?} sorted={}",
+        nodes[1],
+        projection
+            .entries()
+            .windows(2)
+            .all(|pair| pair[0].key < pair[1].key)
+    );
+    let pending =
+        daemon_dfs_pending_reactive_maintenance_work_on_runtime(&paths, &runtime).unwrap();
     assert_eq!(pending.pending_local_membership_handoff_count, 0);
-    assert_eq!(pending.completed_local_primary_handoff_rebind_count, 1);
+    assert_eq!(
+        pending.completed_local_primary_handoff_rebind_count,
+        1,
+        "actual promoted marker: {:?}",
+        read_local_dfs_metadata_shard_write_freeze(
+            &promoted_data,
+            &DfsMetadataShardId::new("root"),
+        )
+        .unwrap()
+    );
     assert!(
         pending.should_trigger_background_maintenance(),
         "the actual unactivated receiver marker retains its completion wake"
     );
-    drop(admission);
+    drop(rebind_hold);
     let observed = native
         .maintenance_tick(&nodes[1], Duration::from_secs(5))
         .unwrap();
@@ -8105,16 +8164,17 @@ fn daemon_dfs_reactive_probe_retains_completed_promoted_primary_rebind_until_mai
     .unwrap();
     assert_eq!(marker.activated_epoch, Some(desired.epoch));
     assert_eq!(
-        daemon_dfs_pending_reactive_maintenance_work(&paths)
+        daemon_dfs_pending_reactive_maintenance_work_on_runtime(&paths, &runtime)
             .unwrap()
             .completed_local_primary_handoff_rebind_count,
         0
     );
+    drop(preflight);
     let mut promoted = native.client(&nodes[1]).unwrap();
     assert!(promoted.posix_stat("/native-rebind-source-cut").is_ok());
     promoted.posix_mkdir("/native-rebind-new-author").unwrap();
     drop(promoted);
-    drop(source);
+    drop(control);
     native.close().unwrap();
 }
 

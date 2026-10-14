@@ -452,6 +452,22 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         };
         #[cfg(any(test, feature = "test-support"))]
         let native_owner = self.native_publication_owner_for_observation();
+        #[cfg(test)]
+        if pending.is_none()
+            && proof.is_some()
+            && let Some((root, _)) = native_owner.as_ref()
+            && let Some(hook) = crate::runtime_host::daemon_dfs_pre_dispatch_test_hook(
+                &sinomo_core::local::SinomoDataDir::new(root),
+            )
+        {
+            hook(
+                crate::runtime_host::DaemonDfsPreDispatchTestPoint::BeforeCompletedPrimaryRebind {
+                    shard_id: &shard_id,
+                },
+                None,
+                None,
+            )?;
+        }
         let rebound = {
             #[cfg(any(test, feature = "test-support"))]
             let _native_context = native_owner.as_ref().map(|(root, owner)| {
@@ -570,6 +586,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         };
         let mut rebound = 0usize;
         for (active, pending, proof) in observed {
+            #[cfg(test)]
+            if pending.is_none()
+                && proof.is_some()
+                && let Some((root, _)) = native_owner.as_ref()
+                && let Some(hook) = crate::runtime_host::daemon_dfs_pre_dispatch_test_hook(
+                    &sinomo_core::local::SinomoDataDir::new(root),
+                )
+            {
+                hook(crate::runtime_host::DaemonDfsPreDispatchTestPoint::BeforeCompletedPrimaryRebind {
+                    shard_id: &DfsMetadataShardId::new(&active.shard_id),
+                }, None, None)?;
+            }
             #[cfg(any(test, feature = "test-support"))]
             let _native_context = native_owner.as_ref().map(|(root, owner)| {
                 crate::native_shard_trace::enter_boundary_context(

@@ -21,6 +21,10 @@ pub(crate) enum DaemonDfsPreDispatchTestPoint<'a> {
         admission_held: bool,
     },
     BeforeResidentPreflight,
+    /// Negative-only local activation cut after observing completed authority.
+    BeforeCompletedPrimaryRebind {
+        shard_id: &'a crate::DfsMetadataShardId,
+    },
     BeforeReplicaContextComparison,
     BeforeResidentBackendOpen,
     /// Whether the captured actual runtime admission owner has been dropped.

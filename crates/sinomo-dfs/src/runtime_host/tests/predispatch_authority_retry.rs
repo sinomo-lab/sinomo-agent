@@ -146,6 +146,7 @@ impl RetryFixture {
                 match point {
                     DaemonDfsPreDispatchTestPoint::PublishPlanningAuthorityCaptured { .. }
                     | DaemonDfsPreDispatchTestPoint::BeforeContentCopyStep { .. }
+                    | DaemonDfsPreDispatchTestPoint::BeforeCompletedPrimaryRebind { .. }
                     | DaemonDfsPreDispatchTestPoint::BeforeReplicaContextComparison
                     | DaemonDfsPreDispatchTestPoint::AfterReport { .. } => {}
                     DaemonDfsPreDispatchTestPoint::ContentStoreCacheAccess
