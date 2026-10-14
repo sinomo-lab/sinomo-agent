@@ -489,16 +489,89 @@ fn sifs_cluster_posix_reverse_direction_move_resolves_by_id_on_replicas() {
     let services_thread =
         std::thread::spawn(move || pump_sifs_service_until_stop(services_primary, services_stop));
 
-    replica
+    // The local-read assertion needs a real content replica. A caller's
+    // candidate hint does not pin the native placement decision.
+    let mut placement = DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 1).unwrap();
+    placement.required_node_ids = vec![replica_node.clone()];
+    _runtime
+        .apply_placement_policy(
+            &services_primary_node,
+            "/services/origin.txt",
+            DfsPlacementScope::Subtree,
+            placement,
+        )
+        .unwrap();
+    // Open the caller after fixture configuration so its retained write
+    // projection contains this policy, then pass those exact constraints.
+    drop(replica);
+    let mut replica = _runtime.client(&replica_node).unwrap();
+    let (_, _, effective_policy) = replica
+        .managed_replication_policy_for_path(
+            "/services/origin.txt",
+            DfsObjectPolicy::ReplicatedEventual,
+            1,
+        )
+        .unwrap();
+    assert_eq!(
+        effective_policy.required_node_ids,
+        vec![replica_node.clone()]
+    );
+    let original = replica
         .posix_write_file(
             "/services/origin.txt",
             &bytes,
-            DfsWriteOptions::replicated_eventual(vec![replica_node.clone()]),
+            DfsWriteOptions {
+                replica_candidates: vec![replica_node.clone()],
+                policy: effective_policy,
+                wait_for_commit: true,
+                foreground_replica_repair: true,
+            },
         )
         .expect("create under services");
+    assert_eq!(original.current_locations, vec![replica_node.clone()]);
+    assert!(
+        replica
+            .content()
+            .has_blob(original.content_hash.as_ref().unwrap())
+            .unwrap()
+    );
+    let source_intents = _runtime
+        .metadata_primary_service("/services")
+        .unwrap()
+        .metadata_backend()
+        .unwrap()
+        .intents_for_object(&original.object_id)
+        .unwrap();
+    let target_epoch = _runtime
+        .metadata_shards()
+        .unwrap()
+        .into_iter()
+        .find(|shard| shard.shard_id == "users")
+        .unwrap()
+        .epoch;
+    assert!(
+        source_intents
+            .iter()
+            .any(|intent| intent.status == DfsWriteIntentStatus::Committed
+                && intent.owner_epoch > target_epoch),
+        "this real move must carry an original receipt from a higher independent source epoch"
+    );
     replica
         .posix_rename("/services/origin.txt", "/users/relocated.txt")
         .expect("reverse-direction cross-primary rename");
+    let target = _runtime.metadata_primary_service("/users").unwrap();
+    for original in &source_intents {
+        assert_eq!(
+            target
+                .metadata_backend()
+                .unwrap()
+                .get_intent(&original.object_id, &original.intent_id)
+                .unwrap(),
+            Some(original.clone()),
+            "adoption preserves the exact original terminal outcome, including its source epoch"
+        );
+    }
+    drop(target);
     assert_eq!(
         replica
             .posix_read_file("/users/relocated.txt")

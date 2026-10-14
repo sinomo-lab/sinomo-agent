@@ -1326,6 +1326,54 @@ fn first_committed_intent_effect_cannot_invent_an_unrecorded_data_generation() {
     runtime.close().unwrap();
 }
 #[test]
+fn committed_intent_effect_cannot_invent_future_epoch_from_existing_content() {
+    let (runtime, mut service, config) = native_case("v7-native-future-terminal", 3);
+    let shard = DfsMetadataShardId::new(config.shard_id.clone());
+    let object = actual_w2_object(&mut service, &config, "/services/v7-future-terminal");
+    let actual = service
+        .metadata_backend()
+        .unwrap()
+        .intents_for_object(&object.object_id)
+        .unwrap()
+        .into_iter()
+        .find(|intent| intent.status == DfsWriteIntentStatus::Committed)
+        .expect("genuine native terminal record");
+    let before = entries(&service, &shard);
+    for (index, change_identity) in [false, true].into_iter().enumerate() {
+        let mut forged = actual.clone();
+        forged.owner_epoch = config.epoch + 1;
+        if change_identity {
+            forged.intent_id.push_str("-invented");
+        }
+        let payload = object_effects(
+            &config,
+            &object,
+            &format!("v7-future-terminal-{index}"),
+            vec![crate::DfsPreparedMetadataEffect::PutIntent { intent: forged }],
+        );
+        assert!(
+            service
+                .metadata_backend_mut()
+                .unwrap()
+                .prepare_operation(payload, None)
+                .is_err(),
+            "neither an altered recorded outcome nor matching content can authorize a future intent"
+        );
+        assert_eq!(entries(&service, &shard), before);
+        assert_eq!(
+            service
+                .metadata_backend()
+                .unwrap()
+                .get_intent(&object.object_id, &actual.intent_id)
+                .unwrap(),
+            Some(actual.clone())
+        );
+    }
+    drop(service);
+    runtime.close().unwrap();
+}
+
+#[test]
 fn metadata_only_effect_preserves_actual_recorded_data_generation_and_w() {
     let (runtime, mut service, config) = native_case("v7-native-metadata-generation", 3);
     let shard = DfsMetadataShardId::new(config.shard_id.clone());

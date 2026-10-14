@@ -1330,6 +1330,15 @@ fn validate_committed_intent_content(
             "recorded committed intent changes its exact terminal outcome".into(),
         ));
     }
+    // A carried terminal keeps its original shard's epoch. Only the exact
+    // recorded outcome above (local or from the validated source witness) can
+    // retain an epoch newer than this independent destination shard's epoch.
+    // Content identity alone cannot mint such an outcome.
+    if intent.owner_epoch > record.owner_epoch {
+        return Err(MetadataBackendError::Serde(
+            "intent effect claims a future authority epoch".into(),
+        ));
+    }
     if record.terminal_intent.as_ref().is_some_and(|terminal| {
         let mut captured = terminal.clone();
         if intent.object_metadata.is_none() {
@@ -1810,7 +1819,10 @@ fn validate_intent_effect(
     >,
 ) -> Result<()> {
     crate::file_history::validate_intent_publication(intent)?;
-    if intent.owner_epoch > record.owner_epoch {
+    // Committed outcomes are checked against their original recorded source
+    // by validate_committed_intent_content at both author prepare and commit.
+    // Their historical epoch is not destination publication authority.
+    if intent.status != DfsWriteIntentStatus::Committed && intent.owner_epoch > record.owner_epoch {
         return Err(MetadataBackendError::Serde(
             "intent effect claims a future authority epoch".into(),
         ));
