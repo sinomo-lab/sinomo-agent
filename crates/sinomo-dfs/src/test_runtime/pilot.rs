@@ -353,6 +353,16 @@ fn embedded_runtime_journal_and_snapshot_roundtrip_survive_receiver_reopen() {
     assert!(snapshot_prefix.is_well_formed());
     assert_eq!(snapshot_prefix.journal_sequence, snapshot_head);
     runtime.stop_node(&replica).unwrap();
+    // Full-set preparation does not imply that every receiver has already
+    // replayed the later commit marker. Preserve its exact stopped cut as the
+    // pre-install state; the explicit snapshot RPC below must establish the
+    // source's complete committed image.
+    let before_install =
+        LocalSobjMetadataBackend::open_for_inspection(shard_id.clone(), &replica_root)
+            .unwrap()
+            .export_shard_table_snapshot(&shard_id)
+            .unwrap()
+            .unwrap();
     let command = DfsMetadataSnapshotInstallCommand {
         request_id: "embedded-real-snapshot-roundtrip".to_string(),
         source_node_id: primary.clone(),
@@ -402,25 +412,38 @@ fn embedded_runtime_journal_and_snapshot_roundtrip_survive_receiver_reopen() {
         let before =
             LocalSobjMetadataBackend::open_for_inspection(shard_id.clone(), &replica_root).unwrap();
         assert_eq!(
-            before.get_file_system(&shard.file_system_id).unwrap(),
-            Some(file_system.clone())
-        );
-        assert_eq!(
-            before.metadata_replay_cursor(&shard_id).unwrap(),
-            snapshot_head
-        );
-        assert_eq!(
-            before.metadata_prefix_proof().unwrap(),
-            snapshot_prefix.clone()
+            before
+                .export_shard_table_snapshot(&shard_id)
+                .unwrap()
+                .unwrap(),
+            before_install,
+            "held background traffic must preserve the entire actual pre-install cut"
         );
     }
     runtime.assert_fault_budgets().unwrap();
     assert_eq!(runtime.observation_dropped_count(), 0);
-    let response = runtime
+    let missing_image = runtime
         .rpc_request(
             &primary,
             &replica,
             dfs_metadata_snapshot_install_rpc_request(&command).unwrap(),
+            Duration::from_secs(3),
+        )
+        .expect_err("a value-only head cannot replace the native snapshot image");
+    assert!(missing_image.contains("snapshot install requires a native image attachment"));
+    assert_eq!(
+        LocalSobjMetadataBackend::open_for_inspection(shard_id.clone(), &replica_root)
+            .unwrap()
+            .export_shard_table_snapshot(&shard_id)
+            .unwrap()
+            .unwrap(),
+        before_install
+    );
+    let response = runtime
+        .rpc_call(
+            &primary,
+            &replica,
+            crate::dfs_metadata_snapshot_install_rpc_call(&command).unwrap(),
             Duration::from_secs(3),
         )
         .unwrap();
@@ -434,6 +457,11 @@ fn embedded_runtime_journal_and_snapshot_roundtrip_survive_receiver_reopen() {
     ));
     runtime.assert_fault_budgets().unwrap();
     assert_eq!(runtime.observation_dropped_count(), 0);
+    // The explicit receiver effect is complete. Retire only this fixture's
+    // gates before asking native ownership to drain; held calls fail not-sent.
+    runtime.clear_faults();
+    receiver_outgoing_gate.close();
+    primary_replication_gate.close();
 
     runtime.stop_node(&replica).unwrap();
     {
