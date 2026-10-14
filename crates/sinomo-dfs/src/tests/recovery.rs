@@ -894,7 +894,7 @@ fn sifs_posix_rename_directory_bounded_job_resumes_after_reopen() {
         }
 
         let job = dfs
-            .posix_rename_directory_bounded(old_dir, new_dir, 1)
+            .posix_rename_directory_bounded_routed(old_dir, new_dir, 1)
             .expect("first bounded rename batch");
         assert_eq!(job.status, DfsNamespaceJobStatus::Running);
         assert!(
@@ -902,11 +902,11 @@ fn sifs_posix_rename_directory_bounded_job_resumes_after_reopen() {
             "a one-step directory rename should persist remaining subtree work"
         );
         assert!(matches!(
-            dfs.posix_stat(old_dir),
+            dfs.posix_stat_distributed(old_dir),
             Err(DfsPosixError::NotFound { .. })
         ));
         assert_eq!(
-            dfs.posix_stat(new_dir)
+            dfs.posix_stat_distributed(new_dir)
                 .expect("new root after first batch")
                 .kind,
             DfsObjectKind::Directory
@@ -919,23 +919,24 @@ fn sifs_posix_rename_directory_bounded_job_resumes_after_reopen() {
     {
         let mut dfs = runtime.client(&node_id).unwrap();
         let mut job = dfs
-            .posix_resume_namespace_job_bounded(&job_id, 2)
+            .posix_resume_namespace_job_bounded_routed(&job_id, old_dir, 2)
             .expect("resume bounded rename after reopen");
         while job.status != DfsNamespaceJobStatus::Completed {
             job = dfs
-                .posix_resume_namespace_job_bounded(&job_id, 2)
+                .posix_resume_namespace_job_bounded_routed(&job_id, old_dir, 2)
                 .expect("resume next rename batch");
         }
         assert!(job.processed_object_count >= old_files.len() as u64);
         for path in &old_files {
             assert!(matches!(
-                dfs.posix_read_file(path),
+                dfs.posix_read_file_distributed(path),
                 Err(DfsPosixError::NotFound { .. })
             ));
         }
         for (old_path, new_path) in old_files.iter().zip(new_files.iter()) {
             assert_eq!(
-                dfs.posix_read_file(new_path).expect("new file content"),
+                dfs.posix_read_file_distributed(new_path)
+                    .expect("new file content"),
                 old_path.as_bytes()
             );
         }
@@ -944,7 +945,7 @@ fn sifs_posix_rename_directory_bounded_job_resumes_after_reopen() {
     runtime.stop_node(&node_id).unwrap();
     runtime.reopen_node(node_id.clone()).unwrap();
     {
-        let dfs = runtime.client(&node_id).unwrap();
+        let mut dfs = runtime.metadata_primary_service(new_dir).unwrap();
         let job = dfs
             .metadata_backend
             .as_ref()
@@ -956,7 +957,9 @@ fn sifs_posix_rename_directory_bounded_job_resumes_after_reopen() {
         assert!(job.completed_at.is_some());
         for new_path in &new_files {
             assert_eq!(
-                dfs.posix_stat(new_path).expect("reloaded moved file").kind,
+                dfs.posix_stat_distributed(new_path)
+                    .expect("reloaded moved file")
+                    .kind,
                 DfsObjectKind::File
             );
         }
