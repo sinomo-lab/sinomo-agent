@@ -1877,11 +1877,59 @@ fn background_quorum_stage_refills_failed_target_without_retry_tick() {
     let primary = config.primary_node_id;
     let nodes = crate::test_support::DfsTestRuntime::ordered_node_ids(name, 3);
     let path = "/services/native-quorum-refill.bin";
-    let mut file_system = runtime.file_system();
-    let mut policy = DfsSubtreePolicy::new(path, DfsObjectPolicy::ReplicatedEventual, 2, 3);
-    policy.required_node_ids = nodes.clone();
-    file_system.subtree_policies.push(policy);
-    dfs.add_file_system(file_system).unwrap();
+    drop(dfs);
+    let mut placement = DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 2, 3).unwrap();
+    placement.required_node_ids = nodes.clone();
+    let accepted = runtime
+        .apply_placement_policy(&primary, path, DfsPlacementScope::SelfOnly, placement)
+        .unwrap();
+    let control = runtime.shared_control_plane().unwrap();
+    let setup_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    loop {
+        let job = control
+            .with_client(|kv| {
+                DfsControlPlaneStore::new(kv.as_mut())
+                    .placement_reconciliation(&accepted.file_system_id, &accepted.job_id)
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.accepted_config, accepted.accepted_config);
+        assert_eq!(job.scanned_object_count, 0);
+        assert!(job.last_error.is_none());
+        if job.state == DfsPlacementReconciliationState::Completed {
+            break;
+        }
+        let remaining = setup_deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "actual empty Apply remains within its network budget"
+        );
+        runtime
+            .maintenance_tick(&primary, remaining)
+            .unwrap()
+            .outcome
+            .unwrap();
+    }
+    drop(control);
+    let background = runtime
+        .deny_background_replica_before_claim(&primary)
+        .unwrap();
+    let mut dfs = runtime.metadata_primary_service(path).unwrap();
+    let (_, _, policy) = dfs
+        .managed_replication_policy_for_path(path, DfsObjectPolicy::ReplicatedEventual, 3)
+        .unwrap();
+    assert_eq!(
+        (policy.min_commit_replicas, policy.desired_replicas),
+        (2, 3)
+    );
+    assert_eq!(
+        policy
+            .required_node_ids
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        nodes.iter().cloned().collect()
+    );
     runtime.install_fault(crate::test_support::DfsTestFaultRule {
         source: Some(primary.clone()),
         target: None,
@@ -1889,7 +1937,7 @@ fn background_quorum_stage_refills_failed_target_without_retry_tick() {
         call_id: None,
         origin: Some(crate::test_support::DfsTestRpcOrigin::RegisteredHost),
         remaining_hits: 1,
-        action: crate::test_support::DfsTestFaultAction::BudgetExhausted,
+        action: crate::test_support::DfsTestFaultAction::BudgetExhaustedForFirstCall,
     });
     let before = runtime.rpc_observations().len();
     let retry_tick = dfs.repair_retry_tick;
@@ -1902,7 +1950,7 @@ fn background_quorum_stage_refills_failed_target_without_retry_tick() {
             &bytes,
             DfsWriteOptions {
                 replica_candidates: nodes,
-                policy: DfsReplicationPolicy::new(2, 3).unwrap(),
+                policy,
                 wait_for_commit: true,
                 foreground_replica_repair: false,
             },
@@ -1926,6 +1974,16 @@ fn background_quorum_stage_refills_failed_target_without_retry_tick() {
         .find(|event| event.phase == crate::test_support::DfsTestRpcPhase::Completed)
         .unwrap();
     assert_ne!(failed.target, accepted.target);
+    assert_ne!(failed.call_id, accepted.call_id);
+    assert_eq!(
+        calls
+            .iter()
+            .filter(
+                |event| event.phase == crate::test_support::DfsTestRpcPhase::EndedWithoutResponse
+            )
+            .count(),
+        1
+    );
     let receipts = dfs
         .metadata_backend()
         .unwrap()
@@ -1954,6 +2012,7 @@ fn background_quorum_stage_refills_failed_target_without_retry_tick() {
     drop(peer);
     drop(dfs);
     runtime.clear_faults();
+    drop(background);
     runtime.close().unwrap();
 }
 

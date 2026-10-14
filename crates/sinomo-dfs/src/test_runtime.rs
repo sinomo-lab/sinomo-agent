@@ -247,6 +247,10 @@ pub enum FaultAction {
         captured: Arc<Mutex<Vec<CapturedFetchReply>>>,
     },
     BudgetExhausted,
+    /// Bind the negative fault to the first matching physical call identity.
+    /// Other calls remain outside its scope; repeated delivery of that exact
+    /// call still obeys the ordinary fail-closed exhausted-budget behavior.
+    BudgetExhaustedForFirstCall,
     /// Fail this real call with the normal transient route error category.
     TransientRouteFailureBeforeDispatch,
     /// Reject only a decoded actual source RPC subtype before dispatch.
@@ -382,9 +386,13 @@ impl Fabric {
             self.exhausted_budgets.fetch_add(1, Ordering::Relaxed);
             return Some(FaultAction::BudgetExhausted);
         }
+        if matches!(rule.action, FaultAction::BudgetExhaustedForFirstCall) {
+            rule.call_id.get_or_insert(observation.call_id);
+        }
         rule.remaining_hits -= 1;
         Some(match &rule.action {
-            FaultAction::BudgetExhaustedForSourcePhase(_) => FaultAction::BudgetExhausted,
+            FaultAction::BudgetExhaustedForSourcePhase(_)
+            | FaultAction::BudgetExhaustedForFirstCall => FaultAction::BudgetExhausted,
             _ => rule.action.clone(),
         })
     }
@@ -3257,6 +3265,16 @@ impl DfsTestRuntime {
         )
     }
     pub fn install_fault(&self, rule: FaultRule) {
+        if matches!(rule.action, FaultAction::BudgetExhaustedForFirstCall) {
+            assert_eq!(
+                rule.remaining_hits, 1,
+                "first-call fault has one exact physical-call budget"
+            );
+            assert!(
+                rule.call_id.is_none(),
+                "the first actual matching call supplies its identity"
+            );
+        }
         assert!(
             (1..=32).contains(&rule.remaining_hits),
             "bounded fault rule required"
