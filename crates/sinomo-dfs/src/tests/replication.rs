@@ -48,52 +48,38 @@ fn dfs_metadata_replication_retry_gate_tracks_incomplete_outcomes() {
 
 #[test]
 fn missing_current_manifest_blob_returns_pending_replication() {
-    let root = temp_root("read-missing-current-manifest-blob");
-    let node_id = NodeId::from_legacy_named("node_missing_blob").expect("node");
-    let replica = NodeId::from_legacy_named("node_missing_blob_replica").expect("node");
-    let object_id = DfsObjectId::from_legacy_named("obj_missing_blob").expect("object");
-    let version = DfsVersion::from_legacy_named("version_2").expect("version");
     let bytes = vec![b'm'; 17 * 1024];
-    let (_runtime, mut dfs) = native_sifs_service(
-        "missing_current_manifest_blob_returns_pending_replication",
-        node_id.clone(),
+    let (runtime, mut dfs, stat, withdrawn) = super::repair::native_withdrawn_local_replica_fixture(
+        "native-read-missing-current-blob",
+        &bytes,
     );
-    let manifest = dfs
-        .content
-        .put_object_version(object_id.as_str(), version.as_str(), &bytes)
-        .expect("seed manifest");
-    let hex = manifest
-        .content_hash
-        .strip_prefix("blake3:")
-        .expect("blake3 hash");
-    std::fs::remove_file(root.join("content").join("blobs").join(&hex[..2]).join(hex))
-        .expect("remove blob");
-    let mut metadata = file_metadata(node_id);
-    metadata.object_id = object_id.clone();
-    metadata.policy = DfsObjectPolicy::ReplicatedEventual;
-    metadata.version = version.clone();
-    metadata.current_locations = vec![replica.clone()];
-    metadata.content_hash = Some(manifest.content_hash.clone());
-    metadata.content_size_bytes = Some(bytes.len() as u64);
-    dfs.add_object_metadata(metadata).expect("metadata");
-
+    let remaining = dfs
+        .metadata_backend()
+        .unwrap()
+        .receipts_for_version(&stat.object_id, &stat.version)
+        .unwrap();
+    assert_eq!(remaining.len(), 1);
+    let replica = remaining[0].replica_node_id.clone();
+    assert_ne!(replica, withdrawn.replica_node_id);
+    let hash = stat.content_hash.as_deref().unwrap();
+    dfs.content()
+        .debug_remove_loose_blob(hash)
+        .expect("damage actual native cached bytes");
+    assert!(dfs.content().read_blob(hash).is_err());
+    let holder = runtime.client(&replica).unwrap();
+    assert_eq!(holder.content().read_blob(hash).unwrap(), bytes);
+    drop(holder);
     let outcome = dfs
-        .read_local_object_with_state(&object_id, false)
+        .read_local_object_with_state(&stat.object_id, false)
         .expect("missing blob is treated as cache miss");
-
-    assert!(matches!(
-        outcome,
-        NetworkedDfsReadOutcome::PendingReplication {
-            object_id: pending_object_id,
-            version: pending_version,
-            content_hash,
-            current_locations,
-        } if pending_object_id == object_id
-            && pending_version == version
-            && content_hash.as_deref() == Some(manifest.content_hash.as_str())
-            && current_locations == vec![replica]
-    ));
-    std::fs::remove_dir_all(root).ok();
+    assert!(
+        matches!(outcome, NetworkedDfsReadOutcome::PendingReplication {
+        object_id, version, content_hash, current_locations,
+    } if object_id == stat.object_id && version == stat.version
+        && content_hash == stat.content_hash && current_locations == vec![replica])
+    );
+    drop(dfs);
+    runtime.close().unwrap();
 }
 
 #[test]

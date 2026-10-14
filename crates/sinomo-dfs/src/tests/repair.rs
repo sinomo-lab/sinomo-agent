@@ -1856,13 +1856,37 @@ fn eventual_write_with_local_receipt_tolerates_unreachable_desired_replica() {
         .unwrap();
     assert_eq!(current.version, stat.version);
     assert_eq!(current.current_locations, vec![owner.clone()]);
-    assert!(
-        runtime
-            .rpc_observations()
-            .iter()
-            .any(|event| event.source == owner
+    let failed_attempt_observed = || {
+        runtime.rpc_observations().iter().any(|event| {
+            event.source == owner
                 && event.target == replica
-                && event.phase == crate::test_runtime::RpcPhase::EndedWithoutResponse)
+                && event.route == DFS_DATA_REPAIR_REPLICA_ROUTE
+                && event.phase == crate::test_runtime::RpcPhase::EndedWithoutResponse
+        })
+    };
+    // W1 acknowledgement precedes background N2 delivery. Drive the actual
+    // owner until the injected unreachable-target attempt has really ended.
+    let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    while !failed_attempt_observed() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "no actual failed repair attempt within the normal caller budget"
+        );
+        runtime
+            .maintenance_tick(&owner, remaining)
+            .unwrap()
+            .outcome
+            .unwrap();
+    }
+    assert!(failed_attempt_observed());
+    assert_eq!(
+        service
+            .metadata_backend()
+            .unwrap()
+            .get_object(&stat.object_id)
+            .unwrap(),
+        Some(current)
     );
     drop(service);
     runtime.clear_faults();
@@ -2899,37 +2923,41 @@ fn retry_pending_repairs_keeps_same_content_after_metadata_only_advance() {
 
 #[test]
 fn receipt_updates_visible_current_locations_for_current_version() {
-    let root = temp_root("receipt-updates-current-locations");
-    let owner = NodeId::from_legacy_named("node_receipt_location_owner").expect("owner");
-    let replica = NodeId::from_legacy_named("node_receipt_location_replica").expect("replica");
-    let object_id = DfsObjectId::from_legacy_named("obj_receipt_location").expect("object");
-    let version = DfsVersion::from_legacy_named("version_2").expect("version");
-    let (_runtime, mut dfs) = native_sifs_service(
-        "receipt_updates_visible_current_locations_for_current_version",
-        owner.clone(),
+    let (runtime, mut dfs, stat, receipt) = native_withdrawn_local_replica_fixture(
+        "native-receipt-restores-current-location",
+        b"real replica location bytes",
     );
-    let mut metadata = file_metadata(owner.clone());
-    metadata.object_id = object_id.clone();
-    metadata.version = version.clone();
-    metadata.policy = DfsObjectPolicy::ReplicatedEventual;
-    metadata.current_locations = vec![owner.clone()];
-    metadata.content_hash = Some("blake3:receipt-location".to_string());
-    dfs.add_object_metadata(metadata).expect("metadata");
-
-    dfs.put_metadata_receipt(
-        &sifs_file_system_id(),
-        &object_id,
-        &version,
-        &replica,
-        "blake3:receipt-location",
-    )
-    .expect("receipt");
-
-    let object = dfs
-        .current_read_object_metadata(&object_id)
-        .expect("current object");
-    assert_eq!(object.current_locations, vec![owner, replica]);
-    std::fs::remove_dir_all(root).ok();
+    let before = dfs.current_read_object_metadata(&stat.object_id).unwrap();
+    assert_eq!(before.current_locations.len(), 1);
+    assert!(!before.current_locations.contains(&receipt.replica_node_id));
+    assert!(
+        dfs.put_metadata_receipt(
+            &stat.file_system_id,
+            &stat.object_id,
+            &stat.version,
+            &receipt.replica_node_id,
+            receipt.content_hash.as_deref().unwrap(),
+        )
+        .unwrap()
+    );
+    let object = dfs.current_read_object_metadata(&stat.object_id).unwrap();
+    let mut expected = before;
+    expected.current_locations.push(receipt.replica_node_id);
+    assert_eq!(
+        dfs.metadata_backend()
+            .unwrap()
+            .get_object(&stat.object_id)
+            .unwrap()
+            .as_ref(),
+        Some(&expected)
+    );
+    assert_eq!(
+        object, expected,
+        "only the genuine replica location changes"
+    );
+    assert_eq!(object.version, stat.version);
+    drop(dfs);
+    runtime.close().unwrap();
 }
 
 #[test]
@@ -5705,8 +5733,9 @@ fn committed_intent_repairs_already_current_stale_locations() {
     runtime.close().unwrap();
 }
 
-fn native_receipt_republication_fixture(
+pub(super) fn native_withdrawn_local_replica_fixture(
     name: &str,
+    bytes: &[u8],
 ) -> (
     crate::test_runtime::DfsTestRuntime,
     NetworkedDfsService<DfsNodeTransport>,
@@ -5716,7 +5745,6 @@ fn native_receipt_republication_fixture(
     let path = "/services/receipt-republication";
     let (runtime, owner, nodes, mut author, policy) =
         native_owned_repair_fixture(name, path, 1, 2, false);
-    let bytes = b"real native receipt publication bytes";
     let stat = author
         .posix_write_file(
             path,
@@ -5802,13 +5830,19 @@ fn native_receipt_republication_fixture(
             .unwrap(),
         bytes
     );
+    // Start the receipt caller without the withdrawing reader's transient
+    // health suppression. The real withdrawn metadata and surviving W remain.
+    drop(author);
+    let author = runtime.metadata_primary_service(path).unwrap();
     (runtime, author, stat, receipt)
 }
 
 #[test]
 fn duplicate_metadata_receipt_publication_is_idempotent() {
-    let (runtime, mut dfs, stat, receipt) =
-        native_receipt_republication_fixture("native-receipt-idempotence");
+    let (runtime, mut dfs, stat, receipt) = native_withdrawn_local_replica_fixture(
+        "native-receipt-idempotence",
+        b"real native receipt publication bytes",
+    );
     let hash = receipt.content_hash.as_deref().unwrap();
     assert!(
         dfs.put_metadata_receipt(
@@ -5851,8 +5885,10 @@ fn duplicate_metadata_receipt_publication_is_idempotent() {
 
 #[test]
 fn conflicting_metadata_receipt_from_same_replica_is_rejected() {
-    let (runtime, mut dfs, stat, receipt) =
-        native_receipt_republication_fixture("native-receipt-conflict");
+    let (runtime, mut dfs, stat, receipt) = native_withdrawn_local_replica_fixture(
+        "native-receipt-conflict",
+        b"real native receipt publication bytes",
+    );
     let hash = receipt.content_hash.as_deref().unwrap();
     assert!(
         dfs.put_metadata_receipt(
