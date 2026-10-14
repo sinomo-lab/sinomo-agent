@@ -933,9 +933,9 @@ fn daemon_metadata_authority_retries_preserve_one_absolute_deadline() {
 struct TestPlacementAuthorityPermitRecord {
     job_id: String,
     holder_id: String,
-    holder_cluster_id: Option<String>,
-    holder_node_id: Option<NodeId>,
-    holder_session_id: Option<String>,
+    holder_cluster_id: String,
+    holder_node_id: NodeId,
+    holder_session_id: String,
 }
 
 #[test]
@@ -15097,6 +15097,14 @@ fn default_dfs_reactor_propagates_mandatory_recovery_failure() {
     sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
         .expect("sync cluster state");
     let runtime = daemon_test_runtime("default-dfs-bootstrap-recovery-required");
+    let recovery_error =
+        recover_prior_process_default_dfs_placement_authority(&paths, runtime.handle())
+            .expect_err("direct recovery requires actual data-owner custody");
+    assert!(
+        matches!(&recovery_error, DaemonError::Parse { detail }
+        if detail.contains("without a live exclusive main-daemon data-owner lock")),
+        "unexpected direct recovery error: {recovery_error}"
+    );
     let mut reactor =
         DaemonDefaultDfsReconciliationReactor::new(&cluster_paths, &local).expect("reactor");
 
@@ -15111,7 +15119,9 @@ fn default_dfs_reactor_propagates_mandatory_recovery_failure() {
         .expect_err("authoritative startup must propagate recovery failure");
 
     assert!(
-        matches!(&error, DaemonError::Parse { detail } if detail.contains("without a live exclusive main-daemon data-owner lock")),
+        matches!(&error, DaemonError::Network { address, detail }
+            if address == "DFS startup mounted-work replay"
+                && detail == "startup replay has no registered runtime host"),
         "unexpected recovery error: {error}"
     );
 }
@@ -15281,7 +15291,9 @@ fn default_dfs_reactor_defers_recovery_failure_on_non_voter() {
         ))
         .expect_err("non-voter recovery failure remains pending for retry");
     assert!(
-        matches!(&reactor_error, DaemonError::Parse { detail } if detail.contains("without a live exclusive main-daemon data-owner lock")),
+        matches!(&reactor_error, DaemonError::Network { address, detail }
+            if address == "DFS startup mounted-work replay"
+                && detail == "startup replay has no registered runtime host"),
         "unexpected reactor error: {reactor_error}"
     );
     assert_eq!(
@@ -15375,9 +15387,9 @@ fn seed_test_prior_process_placement_permit(
     let permit = TestPlacementAuthorityPermitRecord {
         job_id: format!("prior-process-{case}-job"),
         holder_id: format!("prior-process-{case}-holder"),
-        holder_cluster_id: Some(cluster_id.to_string()),
-        holder_node_id: Some(local_node_id.clone()),
-        holder_session_id: Some(format!("prior-process-{case}-session")),
+        holder_cluster_id: cluster_id.to_string(),
+        holder_node_id: local_node_id.clone(),
+        holder_session_id: format!("prior-process-{case}-session"),
     };
     append_cluster_raft_command(
         cluster_paths,
