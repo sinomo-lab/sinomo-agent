@@ -2394,7 +2394,11 @@ pub(super) fn daemon_dfs_stale_authority(
         current_generation,
         current_ready: authority
             .retained_complete_prefix_revision_for_generation(current_generation)
-            .is_some(),
+            .is_some()
+            && matches!(
+                authority.write_configuration_readiness(),
+                Ok(crate::DfsWriteConfigurationReadiness::Ready(_))
+            ),
     })
 }
 
@@ -2402,10 +2406,36 @@ pub(super) fn daemon_dfs_require_retained_authority(
     authority: &Arc<DaemonDfsMetadataAuthorityGeneration>,
     expected_generation: u64,
 ) -> Result<(), DaemonDfsAuthorityPreExecutionError> {
-    authority
+    if authority
         .retained_complete_prefix_revision_for_generation(expected_generation)
-        .map(|_| ())
-        .ok_or_else(|| daemon_dfs_stale_authority(authority, expected_generation))
+        .is_none()
+    {
+        return Err(daemon_dfs_stale_authority(authority, expected_generation));
+    }
+    // A shared refresh publishes the filesystem prefix before its complete
+    // configuration. The last preeffect fence must reject that partial cut,
+    // even when an ordinary revision catch-up leaves authority generation equal.
+    match authority
+        .write_configuration_readiness()
+        .map_err(DaemonDfsAuthorityPreExecutionError::Failed)?
+    {
+        crate::DfsWriteConfigurationReadiness::Pending => {
+            Err(daemon_dfs_stale_authority(authority, expected_generation))
+        }
+        crate::DfsWriteConfigurationReadiness::Ready(_) => authority
+            .retained_complete_prefix_revision_for_generation(expected_generation)
+            .map(|_| ())
+            .ok_or_else(|| daemon_dfs_stale_authority(authority, expected_generation)),
+    }
+}
+
+// Read-only observation of the actual fence, never an admission capability.
+#[cfg(test)]
+pub(crate) fn test_retained_authority_admission_is_ready(
+    authority: &Arc<DaemonDfsMetadataAuthorityGeneration>,
+    generation: u64,
+) -> bool {
+    daemon_dfs_require_retained_authority(authority, generation).is_ok()
 }
 
 impl DaemonDfsMetadataAuthorityPreflight {
@@ -2433,9 +2463,7 @@ impl DaemonDfsMetadataAuthorityPreflight {
         Arc::ptr_eq(authority, &self.authority)
             && authority.generation() == generation
             && (allow_generation_rollover || generation == self.generation)
-            && authority
-                .retained_complete_prefix_revision_for_generation(generation)
-                .is_some()
+            && daemon_dfs_require_retained_authority(authority, generation).is_ok()
     }
 }
 

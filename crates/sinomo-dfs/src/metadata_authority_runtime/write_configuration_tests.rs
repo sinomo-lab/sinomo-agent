@@ -1633,3 +1633,55 @@ async fn native_host_preflight_joins_configuration_after_first_prefix_is_publish
     assert_eq!(host.read_count(), 3);
     assert_eq!(host.queued_count(), 0);
 }
+
+#[tokio::test]
+async fn admission_fence_rejects_partial_configuration_after_same_generation_refresh() {
+    let host = NativeProjectionHost::new(true);
+    let runtime = attach(&host);
+    runtime.request_authoritative_refresh();
+    host.run_next().await;
+    let generation = runtime.generation();
+    assert!(crate::runtime_host::test_retained_authority_admission_is_ready(&runtime, generation));
+    {
+        let mut inputs = host.inputs.lock().unwrap();
+        inputs.authority.revision = KvRevision(11);
+        inputs.authority.commit_index = 111;
+        inputs.floor.revision = KvRevision(11);
+        inputs.floor.applied_index = 111;
+    }
+    host.content_gate.armed.store(true, Ordering::Release);
+    runtime.require_authoritative_revision(KvRevision(11));
+    let refresh = tokio::spawn(host.take_task().unwrap());
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        host.content_gate.entered.notified(),
+    )
+    .await
+    .unwrap();
+    let paused_generation = runtime.generation();
+    let prefix = runtime.state.current_complete_prefix_revision();
+    let pending = matches!(
+        runtime.write_configuration_readiness().unwrap(),
+        crate::DfsWriteConfigurationReadiness::Pending
+    );
+    let admitted =
+        crate::runtime_host::test_retained_authority_admission_is_ready(&runtime, generation);
+    // Drain the original shared owner before any diagnostic assertion fails.
+    host.content_gate.release.notify_one();
+    refresh.await.unwrap();
+    assert_eq!(paused_generation, generation);
+    assert_eq!(prefix, Some(KvRevision(11)));
+    assert!(pending);
+    assert!(
+        !admitted,
+        "metadata-prefix readiness alone must not admit execution while the shared configuration is incomplete"
+    );
+    assert!(
+        crate::runtime_host::test_retained_authority_admission_is_ready(
+            &runtime,
+            runtime.generation()
+        )
+    );
+    assert_eq!(host.read_count(), 6);
+    assert_eq!(host.queued_count(), 0);
+}
