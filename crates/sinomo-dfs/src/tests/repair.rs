@@ -3238,7 +3238,7 @@ fn hydrate_from_metadata_backend_restores_committed_pending_write_for_missing_re
 #[test]
 fn hydrate_from_metadata_backend_skips_non_coordinator_repair_sender_state() {
     let name = "native-observer-repair-hydration";
-    let (runtime, mut primary, config) =
+    let (runtime, initial, config) =
         crate::test_support::current_native_metadata_service(name, 3, "/services").unwrap();
     let owner = config.primary_node_id;
     let others = crate::test_runtime::DfsTestRuntime::ordered_node_ids(name, 3)
@@ -3247,6 +3247,11 @@ fn hydrate_from_metadata_backend_skips_non_coordinator_repair_sender_state() {
         .collect::<Vec<_>>();
     let replica = others[0].clone();
     let observer = others[1].clone();
+    drop(initial);
+    let mut primary = runtime.metadata_primary_service("/services").unwrap();
+    let mut policy = DfsReplicationPolicy::new(1, 2).unwrap();
+    policy.required_node_ids = vec![owner.clone(), replica.clone()];
+    policy.forbidden_node_ids = vec![observer.clone()];
     for route in [DFS_DATA_STAGE_BLOB_ROUTE, DFS_DATA_REPAIR_REPLICA_ROUTE] {
         runtime.install_fault(crate::test_support::DfsTestFaultRule {
             source: Some(owner.clone()),
@@ -3263,7 +3268,7 @@ fn hydrate_from_metadata_backend_skips_non_coordinator_repair_sender_state() {
             "/services/native-observer-hydration",
             b"repair stays with actual metadata primary",
             DfsWriteOptions {
-                policy: DfsReplicationPolicy::new(1, 2).unwrap(),
+                policy,
                 replica_candidates: vec![owner.clone(), replica],
                 wait_for_commit: true,
                 foreground_replica_repair: false,

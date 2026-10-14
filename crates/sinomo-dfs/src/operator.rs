@@ -1298,7 +1298,7 @@ mod tests {
             runtime.define_node(node.clone()).unwrap();
         }
         runtime.start_nodes().unwrap();
-        let mut writer = runtime.client(&nodes[0]).unwrap();
+        let mut writer = runtime.metadata_primary_service("/").unwrap();
         let path = "/operator-staging.bin";
         let original = writer
             .posix_write_file(
@@ -1321,6 +1321,10 @@ mod tests {
         policy.required_node_ids = vec![nodes[0].clone(), nodes[2].clone()];
         file_system.subtree_policies.push(policy);
         writer.add_file_system(file_system).unwrap();
+        drop(writer);
+        let mut writer = runtime.metadata_primary_service("/").unwrap();
+        let mut pending_policy = DfsReplicationPolicy::new(2, 2).unwrap();
+        pending_policy.required_node_ids = vec![nodes[0].clone(), nodes[2].clone()];
         runtime.install_fault(DfsTestFaultRule {
             source: None,
             target: Some(nodes[2].clone()),
@@ -1340,7 +1344,7 @@ mod tests {
                 },
                 b"pending actual W2 bytes".to_vec(),
                 vec![nodes[0].clone(), nodes[2].clone()],
-                DfsReplicationPolicy::new(2, 2).unwrap(),
+                pending_policy,
             )
             .unwrap();
         let crate::NetworkedDfsWriteOutcome::Pending {
@@ -1790,7 +1794,7 @@ mod tests {
             runtime.define_node(node.clone()).unwrap();
         }
         runtime.start_nodes().unwrap();
-        let mut writer = runtime.client(&nodes[0]).unwrap();
+        let mut writer = runtime.metadata_primary_service("/").unwrap();
         let fs_id = runtime.file_system().file_system_id;
         let baseline = writer
             .metadata_backend()
@@ -1815,8 +1819,12 @@ mod tests {
             file_system.subtree_policies.push(policy);
         }
         writer.add_file_system(file_system).unwrap();
+        drop(writer);
+        let mut writer = runtime.metadata_primary_service("/").unwrap();
+        let mut pending_policy = DfsReplicationPolicy::new(2, 2).unwrap();
+        pending_policy.required_node_ids = vec![nodes[0].clone(), nodes[2].clone()];
         let options = crate::DfsWriteOptions {
-            policy: DfsReplicationPolicy::new(2, 2).unwrap(),
+            policy: pending_policy.clone(),
             replica_candidates: nodes.clone(),
             wait_for_commit: true,
             foreground_replica_repair: true,
@@ -1836,12 +1844,14 @@ mod tests {
             remaining_hits: 32,
             action: DfsTestFaultAction::BudgetExhausted,
         });
+        let mut alpha_policy = DfsReplicationPolicy::new(1, 2).unwrap();
+        alpha_policy.required_node_ids = vec![nodes[0].clone(), nodes[2].clone()];
         let alpha = writer
             .posix_write_file(
                 "/operator-alpha.bin",
                 b"new alpha",
                 crate::DfsWriteOptions {
-                    policy: DfsReplicationPolicy::new(1, 2).unwrap(),
+                    policy: alpha_policy,
                     replica_candidates: nodes.clone(),
                     wait_for_commit: true,
                     foreground_replica_repair: false,
@@ -1860,7 +1870,7 @@ mod tests {
                 },
                 b"pending beta".to_vec(),
                 vec![nodes[0].clone(), nodes[2].clone()],
-                DfsReplicationPolicy::new(2, 2).unwrap(),
+                pending_policy,
             )
             .unwrap();
         let crate::NetworkedDfsWriteOutcome::Pending {
