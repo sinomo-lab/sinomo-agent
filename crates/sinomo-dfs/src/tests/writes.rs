@@ -4251,7 +4251,7 @@ fn sifs_non_replica_requester_routes_namespace_op_with_read_your_write() {
     _runtime.close().expect("normal native owner drain");
 }
 
-fn finish_native_placement_fixture_apply(
+pub(super) fn finish_native_placement_fixture_apply(
     runtime: &crate::test_runtime::DfsTestRuntime,
     accepted: &DfsPlacementReconciliationJob,
 ) {

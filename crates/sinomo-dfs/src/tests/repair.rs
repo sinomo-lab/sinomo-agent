@@ -7353,9 +7353,13 @@ fn native_browser_fresh_repair_custody_reaches_n2_after_healing() {
     let mut policy = DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 2).unwrap();
     policy.required_node_ids = vec![owner.clone()];
     policy.forbidden_node_ids = vec![requester.clone()];
-    runtime
+    let accepted = runtime
         .apply_placement_policy(&owner, "/services", DfsPlacementScope::Subtree, policy)
         .unwrap();
+    // Complete the actual setup Apply before the Browser creates its corpus.
+    // Otherwise that independent job can enroll placement owners for these
+    // same versions while this test is identifying the Browser's own custody.
+    super::writes::finish_native_placement_fixture_apply(&runtime, &accepted);
     let control = runtime.shared_control_plane().unwrap();
     control.with_client(|kv| {
         let mut store = DfsControlPlaneStore::new(kv.as_mut());
@@ -7399,8 +7403,8 @@ fn native_browser_fresh_repair_custody_reaches_n2_after_healing() {
     }
     // Use the normal caller's configured policy resolver, as the CLI does;
     // the POSIX write API preserves the replication policy in its options.
-    let mut writer = runtime.client(&requester).unwrap();
-    let (resolved, advertisements, managed_policy) = writer
+    let mut requester_client = runtime.client(&requester).unwrap();
+    let (resolved, advertisements, managed_policy) = requester_client
         .managed_replication_policy_for_path(
             "/services/unknown-head.bin",
             DfsObjectPolicy::ReplicatedEventual,
@@ -7449,7 +7453,7 @@ fn native_browser_fresh_repair_custody_reaches_n2_after_healing() {
         crate::DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE
     );
     let _: crate::DaemonDfsBrowserWriteFileResponse = first_response.decode_body().unwrap();
-    let first = writer
+    let first = requester_client
         .posix_stat_distributed("/services/unknown-head.bin")
         .unwrap();
     assert_eq!(first.file_system_id, config.file_system_id);
@@ -7477,7 +7481,9 @@ fn native_browser_fresh_repair_custody_reaches_n2_after_healing() {
         crate::DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE
     );
     let _: crate::DaemonDfsBrowserWriteFileResponse = middle_response.decode_body().unwrap();
-    let middle = writer.posix_stat_distributed(&first.path).unwrap();
+    let middle = requester_client
+        .posix_stat_distributed(&first.path)
+        .unwrap();
     assert_eq!(middle.file_system_id, config.file_system_id);
     assert_eq!(middle.path, "/services/unknown-head.bin");
     assert_eq!(middle.content_hash, Some(content_hash(b"rule-b")));
@@ -7503,7 +7509,9 @@ fn native_browser_fresh_repair_custody_reaches_n2_after_healing() {
         crate::DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE
     );
     let _: crate::DaemonDfsBrowserWriteFileResponse = head_response.decode_body().unwrap();
-    let head = writer.posix_stat_distributed(&middle.path).unwrap();
+    let head = requester_client
+        .posix_stat_distributed(&middle.path)
+        .unwrap();
     assert_eq!(head.file_system_id, config.file_system_id);
     assert_eq!(head.path, "/services/unknown-head.bin");
     assert_eq!(head.content_hash, Some(content_hash(b"rule-c")));
@@ -7514,49 +7522,10 @@ fn native_browser_fresh_repair_custody_reaches_n2_after_healing() {
     assert_eq!(middle.object_id, head.object_id);
     assert_ne!(first.version, middle.version);
     assert_ne!(middle.version, head.version);
-    writer.posix_unlink(&head.path).unwrap();
-    assert!(matches!(
-        writer.posix_stat_distributed(&head.path),
-        Err(crate::DfsPosixError::NotFound { .. })
-    ));
-    drop(writer);
     let queue = LocalDfsRepairQueueStore::new(default_dfs_repair_attempt_snapshot_path(
         runtime.data_dir(&owner),
     ));
     let before = queue.view().unwrap();
-    {
-        let inspect = runtime.metadata_primary_service(&head.path).unwrap();
-        let backend = inspect.metadata_backend().unwrap();
-        let version = backend
-            .get_version(&head.object_id, &head.version)
-            .unwrap()
-            .unwrap();
-        assert!(version.visible);
-        assert_eq!(version.file_system_id, head.file_system_id);
-        assert_eq!(version.object_id, head.object_id);
-        assert_eq!(version.version, head.version);
-        assert_eq!(version.content_hash, head.content_hash);
-        assert_eq!(version.size_bytes, Some(b"rule-c".len() as u64));
-        let receipts = backend
-            .receipts_for_version(&head.object_id, &head.version)
-            .unwrap();
-        assert!(
-            receipts.iter().any(|receipt| {
-                crate::content_durability::receipt_matches_target_version(receipt, &version, &owner)
-            }),
-            "the actual preferred W1 owner has its exact durable target receipt"
-        );
-        assert!(
-            receipts.iter().all(|receipt| {
-                !crate::content_durability::receipt_matches_target_version(
-                    receipt, &version, &replica,
-                ) && !crate::content_durability::receipt_matches_target_version(
-                    receipt, &version, &requester,
-                )
-            }),
-            "the missing replica and outside-plan requester supply no borrowed durable receipt"
-        );
-    }
     let fresh = before
         .records
         .iter()
@@ -7700,6 +7669,67 @@ fn native_browser_fresh_repair_custody_reaches_n2_after_healing() {
     }
     drop(inspect);
 
+    // Current producer identity is established above while its namespace head
+    // is live. Unlink can legitimately give retained history a different repair
+    // owner; preserve the original deleted-version and no-send custody checks.
+    requester_client.posix_unlink(&head.path).unwrap();
+    assert!(matches!(
+        requester_client.posix_stat_distributed(&head.path),
+        Err(crate::DfsPosixError::NotFound { .. })
+    ));
+    drop(requester_client);
+    {
+        let inspect = runtime.metadata_primary_service(&head.path).unwrap();
+        let backend = inspect.metadata_backend().unwrap();
+        let version = backend
+            .get_version(&head.object_id, &head.version)
+            .unwrap()
+            .unwrap();
+        assert!(version.visible);
+        assert_eq!(version.file_system_id, head.file_system_id);
+        assert_eq!(version.object_id, head.object_id);
+        assert_eq!(version.version, head.version);
+        assert_eq!(version.content_hash, head.content_hash);
+        assert_eq!(version.size_bytes, Some(b"rule-c".len() as u64));
+        let receipts = backend
+            .receipts_for_version(&head.object_id, &head.version)
+            .unwrap();
+        assert!(
+            receipts.iter().any(|receipt| {
+                crate::content_durability::receipt_matches_target_version(receipt, &version, &owner)
+            }),
+            "the actual preferred W1 owner has its exact durable target receipt"
+        );
+        assert!(
+            receipts.iter().all(|receipt| {
+                !crate::content_durability::receipt_matches_target_version(
+                    receipt, &version, &replica,
+                ) && !crate::content_durability::receipt_matches_target_version(
+                    receipt, &version, &requester,
+                )
+            }),
+            "the missing replica and outside-plan requester supply no borrowed durable receipt"
+        );
+    }
+    let deleted = queue.view().unwrap();
+    let deleted_obligation = deleted
+        .records
+        .iter()
+        .find(|row| {
+            row.object_id == head.object_id
+                && row.version == head.version
+                && Some(row.content_hash.as_str()) == head.content_hash.as_deref()
+                && row.missing_replica_node_id == replica
+                && row.transfer_delivery_state == Some(NetworkDeliveryState::DefinitelyNotSent)
+                && row.transfer_request_id.is_none()
+                && row.completed_transfer_request_id.is_none()
+        })
+        .expect("the deleted Browser revision retains its actual no-send repair obligation");
+    assert_eq!(
+        deleted_obligation.transfer_kind,
+        Some(DfsRepairTransferKind::Repair)
+    );
+
     let original_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
     let first_observation = runtime.rpc_observations().len();
     runtime.clear_faults();
@@ -7745,7 +7775,8 @@ fn native_browser_fresh_repair_custody_reaches_n2_after_healing() {
     let (receipts, after) = loop {
         assert!(
             Instant::now() < original_deadline,
-            "the current repair completes within its original five-second window"
+            "the current repair completes within its original five-second window; ready_intent={ready_intent}; tail={tail:?}; actual_queue={:?}; first_tick={observation:?}; calls={:?}",
+            queue.view(), runtime.rpc_observations()[first_observation..].iter().rev().take(32).collect::<Vec<_>>()
         );
         let inspect = runtime.metadata_primary_service(&tail.path).unwrap();
         let receipts = inspect
