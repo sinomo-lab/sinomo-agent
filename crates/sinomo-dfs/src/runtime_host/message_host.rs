@@ -2973,6 +2973,9 @@ fn attempt_daemon_dfs_message_command_with_remote_phase(
             crate::service_commit::BEFORE_CREATE_PREPARE.with(|hook| {
                 hook.borrow_mut().take();
             });
+            crate::publication_guard::AFTER_PREPARED_AUTHORIZATION.with(|hook| {
+                hook.borrow_mut().take();
+            });
         }
     }
     // A fixture may arm the existing one-shot on this actual Main worker.

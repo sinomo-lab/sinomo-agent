@@ -10,6 +10,13 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
+#[cfg(test)]
+thread_local! {
+    /// Pause only after the real author guard and complete participant evidence
+    /// exist. Tests may interrupt delivery; they cannot supply acknowledgement claims.
+    pub(crate) static AFTER_PREPARED_AUTHORIZATION: std::cell::RefCell<Option<Box<dyn FnOnce(&DfsPreparedOperationDigest, &crate::DfsPreparedOperationPayload)>>> = const { std::cell::RefCell::new(None) };
+}
+
 /// Actual backend identity. This is a lock index, never author permission.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct DfsPublicationOwnerScope {
@@ -1072,6 +1079,12 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
             operation_id: digest.operation_id.clone(),
         })?;
         let guard = self.authorize_prepared_publication_from_record(digest, record)?;
+        #[cfg(test)]
+        if let Some(after_authorization) =
+            AFTER_PREPARED_AUTHORIZATION.with(|hook| hook.borrow_mut().take())
+        {
+            after_authorization(digest, &payload);
+        }
         let source_witness = guard.source_witness.clone();
         let data_dir = self
             .publication_execution

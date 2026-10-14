@@ -8273,6 +8273,107 @@ fn daemon_dfs_maintenance_tick_runs_anti_entropy() {
     native.close().unwrap();
 }
 
+// Establish real lag without allowing a publication with an incomplete ACK set.
+// The stopped receiver has durably accepted the exact hidden prepare; it has not
+// received the later commit marker when the publisher resumes.
+fn create_directory_with_replica_stopped_before_commit(
+    runtime: &mut crate::test_runtime::DfsTestRuntime,
+    source: &mut crate::NetworkedDfsService<crate::DfsNodeTransport>,
+    primary: &NodeId,
+    replica: &NodeId,
+    path: &str,
+) -> crate::DfsPreparedOperationDigest {
+    let (captured_tx, captured_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let pause = Mutex::new(Some((captured_tx, release_rx)));
+    let expected_path = path.to_string();
+    let hook: Arc<DaemonDfsPreDispatchTestHook> = Arc::new(move |point, command, _| {
+        if !matches!(point, DaemonDfsPreDispatchTestPoint::BeforeExecute { .. }) {
+            return Ok(());
+        }
+        let Some(command) = command else {
+            return Ok(());
+        };
+        let crate::DfsNetworkMessage::NamespaceRequest(request) = &command.routed_message.message
+        else {
+            return Ok(());
+        };
+        if !matches!(&request.operation, crate::DfsNamespaceOperation::MkdirAll { path } if path == &expected_path)
+        {
+            return Ok(());
+        }
+        let (captured, release) = pause
+            .lock()
+            .unwrap()
+            .take()
+            .expect("one native directory producer");
+        let path = expected_path.clone();
+        crate::publication_guard::AFTER_PREPARED_AUTHORIZATION.with(|hook| {
+            assert!(hook.borrow().is_none());
+            *hook.borrow_mut() = Some(Box::new(move |digest, payload| {
+                assert!(
+                    payload
+                        .transaction
+                        .objects
+                        .iter()
+                        .any(|object| object.path == path)
+                );
+                assert_eq!(digest.payload_digest, payload.canonical_digest().unwrap());
+                captured.send(digest.clone()).unwrap();
+                release
+                    .recv()
+                    .expect("test releases the real admitted writer");
+            }));
+        });
+        Ok(())
+    });
+    let hook = install_daemon_dfs_pre_dispatch_test_hook(runtime.data_dir(primary), hook);
+    struct Release(Option<std::sync::mpsc::Sender<()>>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+    let digest = std::thread::scope(|scope| {
+        let release = Release(Some(release_tx));
+        let publisher = scope.spawn(|| source.posix_mkdir_all(path));
+        let digest = captured_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("actual full-participant author guard");
+        runtime
+            .stop_node(replica)
+            .expect("stop acknowledged disposable replica before commit");
+        drop(release);
+        publisher
+            .join()
+            .unwrap()
+            .expect("publication uses its genuine complete prepare acknowledgements");
+        digest
+    });
+    drop(hook);
+    let backend = crate::LocalSobjMetadataBackend::open_for_inspection(
+        digest.shard_id.clone(),
+        crate::default_dfs_metadata_shards_root(runtime.data_dir(replica))
+            .join(crate::metadata_keys::key_segment(&digest.shard_id.0)),
+    )
+    .unwrap();
+    let original = backend
+        .prepared_operation_record(&digest.operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(original.digest, digest);
+    assert_eq!(original.status, crate::DfsPreparedOperationStatus::Prepared);
+    assert!(
+        backend
+            .get_object_by_path(&digest.file_system_id, path)
+            .unwrap()
+            .is_none()
+    );
+    digest
+}
+
 #[test]
 fn daemon_dfs_status_reads_configured_sharded_metadata_backend() {
     let nodes =
@@ -8322,12 +8423,14 @@ fn daemon_dfs_status_reads_configured_sharded_metadata_backend() {
         .unwrap()
         .unwrap()
         .materialized_through_sequence;
-    runtime
-        .stop_node(&offline_node)
-        .expect("stop actual replica");
-    source
-        .posix_mkdir_all("/services/status-sharded")
-        .expect("current guarded metadata write with a real recovery majority");
+    let admitted = create_directory_with_replica_stopped_before_commit(
+        &mut runtime,
+        &mut source,
+        &source_node,
+        &offline_node,
+        "/services/status-sharded",
+    );
+    assert_eq!(admitted.prepare_sequence, before_sequence + 1);
     let status = sinomo_dfs::inspect_cluster_aware_dfs_status(&data_dir, &cluster_paths)
         .expect("current sharded status");
     assert_eq!(status.file_system_count, 1);
@@ -8354,18 +8457,37 @@ fn daemon_dfs_status_reads_configured_sharded_metadata_backend() {
         "the guarded directory mutation contributes one prepare and one commit"
     );
     assert!(services_status.replay_cursors.is_empty());
-    assert!(
-        services_status
-            .replica_lag
-            .iter()
-            .any(|lag| lag.target_node_id == offline_node && lag.lag_entries >= 2),
-        "the stopped native replica has not acknowledged the new operation"
+    let stopped_lag = services_status
+        .replica_lag
+        .iter()
+        .find(|lag| lag.target_node_id == offline_node)
+        .expect("stopped configured participant lag");
+    assert_eq!(
+        services_status.journal_last_sequence - admitted.prepare_sequence,
+        1,
+        "full-participant publication leaves only its commit marker behind the acknowledged preparation"
+    );
+    assert_eq!(
+        stopped_lag.lag_entries,
+        services_status.journal_last_sequence - admitted.prepare_sequence,
+        "reported lag equals the proven native prefix gap, not an assumed degraded-write frame count"
     );
     let pending = daemon_dfs_pending_maintenance_work(&paths).expect("pending maintenance");
     assert_eq!(pending.pending_write_count, 0);
     assert_eq!(pending.pending_repair_count, 0);
     assert_eq!(pending.pending_namespace_job_count, 0);
-    assert!(pending.metadata_replica_lag_count > 0);
+    assert_eq!(
+        pending.metadata_replica_lag_count, 0,
+        "offline lag is not immediately executable work"
+    );
+    assert_eq!(
+        pending.deferred_work_count, 1,
+        "the stopped participant's exact commit-marker gap remains accounted for"
+    );
+    assert!(
+        !pending.has_work(),
+        "only the explicitly counted deferred publisher remains"
+    );
     assert_eq!(pending.pending_local_membership_handoff_count, 0);
     assert_eq!(pending.due_time_based_maintenance_count, 0);
     assert!(
@@ -14768,18 +14890,22 @@ fn default_cluster_metadata_shard_transfers_after_candidate_replays_current_jour
         .expect("actual assignment")
         .expect("services");
     let mut source = fixture.client(&primary).expect("real source client");
-    fixture
-        .stop_node(&candidate)
-        .expect("stop actual candidate");
-    source
-        .posix_mkdir("/services/transfer-replay-witness")
-        .expect("actual metadata-majority publication");
-    let snapshot = source
+    let admitted = create_directory_with_replica_stopped_before_commit(
+        &mut fixture,
+        &mut source,
+        &primary,
+        &candidate,
+        "/services/transfer-replay-witness",
+    );
+    let current = fixture.metadata_primary_service("/services").unwrap();
+    let snapshot = current
         .metadata_backend()
         .expect("actual source backend")
         .export_shard_table_snapshot(&DfsMetadataShardId::new("services"))
         .expect("native source snapshot")
         .expect("services snapshot");
+    assert!(snapshot.materialized_through_sequence > admitted.prepare_sequence);
+    drop(current);
     let mut desired = actual.clone();
     desired.primary_node_id = candidate.clone();
     desired.replica_node_ids =
