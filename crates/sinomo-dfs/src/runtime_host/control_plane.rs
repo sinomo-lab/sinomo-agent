@@ -177,7 +177,7 @@ impl DaemonDfsControlPlaneKvClient {
     pub(super) fn synchronize_retained_metadata_authority(
         &self,
     ) -> Result<DaemonDfsRetainedMetadataSync, KvError> {
-        if let Some(synchronized) = self.try_synchronize_retained_metadata_authority()? {
+        if let Some(synchronized) = self.try_synchronize_retained_configuration()? {
             return Ok(synchronized);
         }
         // Browser/restore workers are synchronous, but a missing certificate
@@ -191,7 +191,7 @@ impl DaemonDfsControlPlaneKvClient {
     async fn synchronize_retained_metadata_authority_async(
         &self,
     ) -> Result<DaemonDfsRetainedMetadataSync, KvError> {
-        if let Some(synchronized) = self.try_synchronize_retained_metadata_authority()? {
+        if let Some(synchronized) = self.try_synchronize_retained_configuration()? {
             return Ok(synchronized);
         }
         let authority = self.retained_metadata_authority.as_ref().ok_or_else(|| {
@@ -203,14 +203,25 @@ impl DaemonDfsControlPlaneKvClient {
                 // One in-flight shared refresh owns the proof. Its completion
                 // can change topology or be superseded by a newer revision;
                 // replan against the resulting generation, never the old one.
-                authority
+                let proof = authority
                     .ensure_complete_prefix_for_generation_async(
                         generation,
                         #[cfg(test)]
                         None,
                     )
                     .await;
-                if let Some(synchronized) = self.try_synchronize_retained_metadata_authority()? {
+                if proof.is_some() && self.write_configuration_projection_required {
+                    // The filesystem prefix publishes before the shared
+                    // content/provider bundle. Join that same owner within
+                    // this synchronization's original timeout and replan cap.
+                    authority
+                        .ensure_write_configuration_ready_async()
+                        .await
+                        .map_err(|error| KvError::AuthorityUnavailable {
+                            detail: error.to_string(),
+                        })?;
+                }
+                if let Some(synchronized) = self.try_synchronize_retained_configuration()? {
                     return Ok(synchronized);
                 }
             }
@@ -229,6 +240,29 @@ impl DaemonDfsControlPlaneKvClient {
                     authority.generation(),
                 ),
             })?
+    }
+
+    /// sinomo:kv-configuration: A daemon client requiring the shared configuration may lend its compact prefix only after the same retained bundle is ready at the native floor.
+    fn try_synchronize_retained_configuration(
+        &self,
+    ) -> Result<Option<DaemonDfsRetainedMetadataSync>, KvError> {
+        let synchronized = self.try_synchronize_retained_metadata_authority()?;
+        if synchronized.is_some() && self.write_configuration_projection_required {
+            let authority = self.retained_metadata_authority.as_ref().ok_or_else(|| {
+                self.superseded_authority_error("missing required write configuration owner")
+            })?;
+            if matches!(
+                authority.write_configuration_readiness().map_err(|error| {
+                    KvError::AuthorityUnavailable {
+                        detail: error.to_string(),
+                    }
+                })?,
+                crate::DfsWriteConfigurationReadiness::Pending
+            ) {
+                return Ok(None);
+            }
+        }
+        Ok(synchronized)
     }
 
     fn try_synchronize_retained_metadata_authority(
@@ -1841,4 +1875,19 @@ impl sinomo_dfs::AsyncDfsControlPlaneKvClient for GatedNativePlacementControlPla
             native.await
         })
     }
+}
+
+#[cfg(test)]
+pub(crate) async fn test_retained_client_configuration_sync(
+    authority: Arc<DaemonDfsMetadataAuthorityGeneration>,
+    paths: &ClusterPaths,
+) -> Result<(), KvError> {
+    let mut client =
+        DaemonDfsControlPlaneKvClient::new_on_runtime(paths, &tokio::runtime::Handle::current());
+    client.retained_metadata_authority = Some(authority);
+    client.write_configuration_projection_required = true;
+    client
+        .synchronize_retained_metadata_authority_async()
+        .await?;
+    sinomo_dfs::DfsControlPlaneKvClient::write_configuration_projection(&client).map(|_| ())
 }

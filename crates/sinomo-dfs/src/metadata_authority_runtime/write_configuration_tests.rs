@@ -1721,3 +1721,58 @@ async fn configuration_published_between_pending_read_and_waiter_check_is_revali
         "a concurrently completed native publication must replace the earlier pending observation",
     );
 }
+
+#[tokio::test]
+async fn retained_control_client_joins_configuration_after_early_filesystem_prefix() {
+    let host = NativeProjectionHost::new(true);
+    let runtime = attach(&host);
+    host.content_gate.armed.store(true, Ordering::Release);
+    runtime.request_authoritative_refresh();
+    let refresh = tokio::spawn(host.take_task().unwrap());
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        host.content_gate.entered.notified(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        runtime.state.current_complete_prefix_revision(),
+        Some(KvRevision(10))
+    );
+    assert!(matches!(
+        runtime.write_configuration_readiness().unwrap(),
+        crate::DfsWriteConfigurationReadiness::Pending
+    ));
+    let directory = sinomo_testdir::TestDir::new("retained-client-configuration-boundary");
+    let paths = sinomo_core::network::ClusterPaths::new(&sinomo_core::local::SinomoDataDir::new(
+        directory.path(),
+    ));
+    let mut synchronization = Box::pin(
+        crate::runtime_host::test_retained_client_configuration_sync(Arc::clone(&runtime), &paths),
+    );
+    let first_poll = std::future::poll_fn(|context| {
+        std::task::Poll::Ready(synchronization.as_mut().poll(context))
+    })
+    .await;
+    // Drain the original native-proof owner before asserting the boundary.
+    host.content_gate.release.notify_one();
+    refresh.await.unwrap();
+    assert!(
+        first_poll.is_pending(),
+        "a required configuration client cannot return after only the filesystem prefix: {first_poll:?}"
+    );
+    synchronization.await.unwrap();
+    crate::runtime_host::test_retained_client_configuration_sync(Arc::clone(&runtime), &paths)
+        .await
+        .unwrap();
+    host.inputs.lock().unwrap().floor_unavailable = true;
+    assert!(
+        crate::runtime_host::test_retained_client_configuration_sync(Arc::clone(&runtime), &paths)
+            .await
+            .is_err(),
+        "an unavailable native floor remains terminal on a warm client"
+    );
+    assert_eq!(host.read_count(), 3);
+    assert_eq!(host.spawned.load(Ordering::Acquire), 1);
+    assert_eq!(host.queued_count(), 0);
+}
