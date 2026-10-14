@@ -3422,6 +3422,36 @@ impl DfsTestRuntime {
             )
             .map_err(|e| e.to_string())
     }
+    /// The same authenticated native carrier as rpc_result, with its caller
+    /// future exposed for cancellation checks. No runtime/owner is synthesized.
+    pub fn rpc_result_future(
+        &self,
+        source: &NodeId,
+        target: &NodeId,
+        call: ObjectRpcCall,
+        timeout: Duration,
+    ) -> impl std::future::Future<Output = Result<ObjectRpcResult, String>> + Send + use<> {
+        let carrier = Carrier {
+            source: source.clone(),
+            fabric: Arc::clone(&self.fabric),
+            origin: RpcOrigin::ExplicitFixtureRpc,
+        };
+        let target = target.clone();
+        async move {
+            carrier
+                .call_async(
+                    &target,
+                    call,
+                    DfsObjectRpcSendOptions::default()
+                        .with_overall_timeout(timeout)
+                        .cluster_rpc_options(),
+                    true,
+                )
+                .await
+                .map_err(|error| error.to_string())
+        }
+    }
+
     pub fn rpc_call(
         &self,
         source: &NodeId,

@@ -9133,7 +9133,6 @@ fn cancelled_daemon_dfs_rpc_retains_committed_work_edges() {
     .expect("actual cancellation capture before normal mounts");
     native.start_nodes().unwrap();
     let shard = native.root_shard().unwrap();
-    let mut source = native.client(&shard.primary_node_id).unwrap();
     let local = shard.primary_node_id.clone();
     let remote = shard.replica_node_ids[0].clone();
     let missing_replica = shard.replica_node_ids[1].clone();
@@ -9141,18 +9140,69 @@ fn cancelled_daemon_dfs_rpc_retains_committed_work_edges() {
     let paths = DaemonPaths::new(&data_dir);
     let file_system = native.file_system();
     let path = "/cancelled-publish-edge.txt";
+    let mut placement =
+        crate::DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 2).unwrap();
+    placement.required_node_ids = vec![local.clone(), missing_replica.clone()];
+    let accepted = native
+        .apply_placement_policy(&local, path, crate::DfsPlacementScope::SelfOnly, placement)
+        .unwrap();
+    let control = native.shared_control_plane().unwrap();
+    let setup_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    loop {
+        let job = control
+            .with_client(|kv| {
+                crate::DfsControlPlaneStore::new(kv.as_mut())
+                    .placement_reconciliation(&accepted.file_system_id, &accepted.job_id)
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.accepted_config, accepted.accepted_config);
+        assert_eq!(job.scanned_object_count, 0);
+        assert!(job.last_error.is_none());
+        if job.state == crate::DfsPlacementReconciliationState::Completed {
+            break;
+        }
+        let remaining = setup_deadline.saturating_duration_since(Instant::now());
+        assert!(!remaining.is_zero());
+        native
+            .maintenance_tick(&local, remaining)
+            .unwrap()
+            .outcome
+            .unwrap();
+    }
+    drop(control);
+    let mut source = native.metadata_primary_service(path).unwrap();
+    let (_, _, policy) = source
+        .managed_replication_policy_for_path(path, DfsObjectPolicy::ReplicatedEventual, 2)
+        .unwrap();
     let prior = source
         .posix_write_file(
             path,
             b"real previous head",
             DfsWriteOptions {
-                policy: DfsReplicationPolicy::new(1, 1).unwrap(),
-                replica_candidates: vec![local.clone()],
+                policy: policy.clone(),
+                replica_candidates: vec![local.clone(), missing_replica.clone()],
                 wait_for_commit: true,
-                foreground_replica_repair: false,
+                foreground_replica_repair: true,
             },
         )
         .unwrap();
+    let base_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    while source
+        .metadata_backend()
+        .unwrap()
+        .receipts_for_version(&prior.object_id, &prior.version)
+        .unwrap()
+        .len()
+        != 2
+    {
+        assert!(
+            Instant::now() < base_deadline,
+            "the real predecessor copies must settle before the cancellation fault"
+        );
+        source.retry_pending_repairs_bounded(1).unwrap();
+        source.process_incoming().unwrap();
+    }
     let original = source
         .metadata_backend()
         .unwrap()
@@ -9163,7 +9213,7 @@ fn cancelled_daemon_dfs_rpc_retains_committed_work_edges() {
     native.install_fault(crate::test_runtime::FaultRule {
         source: Some(local.clone()),
         target: Some(missing_replica.clone()),
-        route: None,
+        route: Some(crate::DFS_DATA_REPAIR_REPLICA_ROUTE.into()),
         call_id: None,
         origin: None,
         remaining_hits: 32,
@@ -9182,7 +9232,9 @@ fn cancelled_daemon_dfs_rpc_retains_committed_work_edges() {
     write.authority_shard = Some(shard.clone());
     write.requester_blob_pre_staged = false;
     write.desired_replica_nodes = vec![local.clone(), missing_replica];
-    write.policy = DfsReplicationPolicy::new(1, 2).expect("W=1, N=2 policy");
+    write.policy = policy;
+    let committed_version = write.request.target_version.clone();
+    let committed_hash = crate::content_hash(&write.bytes);
     write
         .object_metadata
         .as_mut()
@@ -9198,11 +9250,13 @@ fn cancelled_daemon_dfs_rpc_retains_committed_work_edges() {
     let (committed_rx, release_tx) =
         install_daemon_dfs_message_committed_edge_test_hook(request_id);
     let runtime = daemon_test_runtime("daemon-dfs-cancelled-rpc-publish-edge");
-    let task_paths = paths.clone();
-    let task_runtime = runtime.handle().clone();
-    let rpc = runtime.handle().spawn(async move {
-        handle_daemon_dfs_message_async(&task_paths, command, None, None, &task_runtime).await
-    });
+    let invocation = native.rpc_result_future(
+        &remote,
+        &local,
+        crate::dfs_message_rpc_call(&command).unwrap(),
+        sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+    );
+    let rpc = runtime.handle().spawn(invocation);
 
     committed_rx
         .recv_timeout(Duration::from_secs(3))
@@ -9216,8 +9270,9 @@ fn cancelled_daemon_dfs_rpc_retains_committed_work_edges() {
         .expect("reopen metadata backend")
         .get_object(&object_id)
         .expect("read committed object")
-        .is_some(),
-        "the mutation must be durable before the cancellable RPC boundary"
+        .is_some_and(|object| object.version == committed_version
+            && object.content_hash.as_deref() == Some(committed_hash.as_str())),
+        "the NEW mutation must be durable before the cancellable RPC boundary"
     );
     assert_eq!(
         LocalSobjMetadataBackend::new(
@@ -9288,7 +9343,9 @@ fn cancelled_daemon_dfs_rpc_retains_subscribed_replica_progress_edge() {
     .expect("actual cancellation capture before normal mounts");
     native.start_nodes().unwrap();
     let shard = native.root_shard().unwrap();
-    let mut source = native.client(&shard.primary_node_id).unwrap();
+    let mut source = native
+        .metadata_primary_service("/native-cancel-progress-marker")
+        .unwrap();
     let primary = shard.primary_node_id.clone();
     let replica = shard.replica_node_ids[0].clone();
     let data_dir = native.data_dir(&replica).clone();
@@ -9313,6 +9370,20 @@ fn cancelled_daemon_dfs_rpc_retains_subscribed_replica_progress_edge() {
         .get_object(&stat.object_id)
         .unwrap()
         .unwrap();
+    let target = source.capture_metadata_quorum_sync_target(&object).unwrap();
+    let certificate = source
+        .sync_metadata_shard_to_quorum(&target, sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
+        .unwrap();
+    assert_eq!(certificate.acknowledged_node_ids.len(), 3);
+    native.install_fault(crate::test_runtime::FaultRule {
+        source: Some(primary.clone()),
+        target: Some(replica.clone()),
+        route: None,
+        call_id: None,
+        origin: Some(crate::test_runtime::RpcOrigin::RegisteredHost),
+        remaining_hits: 32,
+        action: crate::test_runtime::FaultAction::BudgetExhausted,
+    });
     let before = source
         .metadata_backend()
         .unwrap()
@@ -9322,7 +9393,14 @@ fn cancelled_daemon_dfs_rpc_retains_subscribed_replica_progress_edge() {
         .find(|status| status.shard_id.0 == shard.shard_id)
         .unwrap()
         .journal_last_sequence;
-    late_native_hidden_suffix(&mut source, &shard, 1);
+    let after_sequence = late_native_hidden_suffix(&mut source, &shard, 1);
+    assert_eq!(after_sequence, before + 1);
+    let expected_prefix = source
+        .metadata_backend()
+        .unwrap()
+        .metadata_prefix_proof(&DfsMetadataShardId::new(&shard.shard_id))
+        .unwrap()
+        .unwrap();
     let batch = source
         .metadata_backend()
         .unwrap()
@@ -9356,30 +9434,31 @@ fn cancelled_daemon_dfs_rpc_retains_subscribed_replica_progress_edge() {
         request_id,
         DfsRoutedMessage {
             source_node_id: primary.clone(),
-            target_node_id: replica,
+            target_node_id: replica.clone(),
             frame_id: 90_102,
             message_id: 90_102,
-            message: DfsNetworkMessage::MetadataJournalBatch(DfsMetadataJournalBatchCommand {
-                request_id: "dfs_metadata_cancelled_replica_progress".to_string(),
-                source_node_id: Some(primary),
-                file_system_id: Some(file_system.file_system_id.clone()),
-                authority_epoch: Some(shard.epoch),
-                verify_prefix_only: false,
-                prefix_probe: None,
-                authority_probe: None,
-                durable_replication: None,
-                batch: framed,
-            }),
+            message: DfsNetworkMessage::MetadataJournalBatch(
+                crate::metadata_replication::dfs_metadata_durable_journal_batch_command(
+                    &primary,
+                    &replica,
+                    &file_system.file_system_id,
+                    shard.epoch,
+                    framed,
+                    false,
+                ),
+            ),
         },
     );
     let (committed_rx, release_tx) =
         install_daemon_dfs_message_committed_edge_test_hook(request_id);
     let runtime = daemon_test_runtime("daemon-dfs-cancelled-rpc-replica-progress");
-    let task_paths = paths.clone();
-    let task_runtime = runtime.handle().clone();
-    let rpc = runtime.handle().spawn(async move {
-        handle_daemon_dfs_message_async(&task_paths, command, None, None, &task_runtime).await
-    });
+    let invocation = native.rpc_result_future(
+        &primary,
+        &replica,
+        crate::dfs_message_rpc_call(&command).unwrap(),
+        sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+    );
+    let rpc = runtime.handle().spawn(invocation);
 
     committed_rx
         .recv_timeout(Duration::from_secs(3))
@@ -9396,6 +9475,23 @@ fn cancelled_daemon_dfs_rpc_retains_subscribed_replica_progress_edge() {
         Some(object.clone()),
         "the replica journal batch must be durable before RPC cancellation"
     );
+    let durable = LocalSobjMetadataBackend::open_for_inspection(
+        DfsMetadataShardId::new(&shard.shard_id),
+        crate::default_dfs_metadata_shards_root(&data_dir)
+            .join(crate::metadata_keys::key_segment(&shard.shard_id)),
+    )
+    .unwrap();
+    assert_eq!(
+        durable.journal_last_sequence(),
+        after_sequence,
+        "the actual new native frame is durable before caller cancellation"
+    );
+    assert_eq!(
+        durable.journal_since_limited(before, 1).unwrap(),
+        batch.entries,
+        "the receiver persisted the exact original frame, not just an old visible object"
+    );
+    drop(durable);
     rpc.abort();
     let cancelled = runtime
         .block_on(rpc)
@@ -9419,6 +9515,24 @@ fn cancelled_daemon_dfs_rpc_retains_subscribed_replica_progress_edge() {
             .expect("reconciliation wake channel remains open"),
         "a cancelled RPC must still emit the subscribed replica-progress generation"
     );
+    loop {
+        let materialized = LocalSobjMetadataBackend::open_for_inspection(
+            DfsMetadataShardId::new(&shard.shard_id),
+            crate::default_dfs_metadata_shards_root(&data_dir)
+                .join(crate::metadata_keys::key_segment(&shard.shard_id)),
+        )
+        .unwrap()
+        .metadata_prefix_proof()
+        .unwrap();
+        if materialized == expected_prefix {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the owned replay must materialize the exact prefix within the existing edge budget"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
     let cache_slot = daemon_dfs_message_service_cache()
         .root(&data_dir.root())
         .expect("actual root cache slot");
@@ -9453,6 +9567,7 @@ fn cancelled_daemon_dfs_rpc_retains_subscribed_replica_progress_edge() {
     if let Some(trace) = &trace {
         trace.close().unwrap();
     }
+    native.clear_faults();
     native.close().unwrap();
     if let Some(trace) = trace {
         trace.export().unwrap();
