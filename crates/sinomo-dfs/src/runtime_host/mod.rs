@@ -2563,6 +2563,12 @@ impl DaemonDfsReplicaMaterializationLane {
         // high-water mark. The lane's final drop transfers one cleanup edge to
         // the scoped allocator lane after every attempted pass.
         self.allocator_cleanup_needed.store(true, Ordering::Release);
+        #[cfg(any(test, feature = "test-support"))]
+        let _blocking_owner_observation = materialization_test::observe_blocking_owner(
+            &self.data_dir,
+            &self.lane.shard_id,
+            &self._data_owner_lock,
+        );
         #[cfg(test)]
         wait_at_daemon_dfs_message_committed_edge_test_hook(&format!(
             "replica-materialization:{}",

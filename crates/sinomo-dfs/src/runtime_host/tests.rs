@@ -1442,7 +1442,6 @@ fn replica_materialization_cancellation_retains_blocking_replay_capabilities() {
         "replica-materialization:{}",
         fixture.data_dir.root().display()
     ));
-    let owners_before = Arc::strong_count(&fixture.data_owner);
     fixture.pause.release();
     started
         .recv_timeout(Duration::from_secs(2))
@@ -1466,7 +1465,9 @@ fn replica_materialization_cancellation_retains_blocking_replay_capabilities() {
         );
         assert!(fixture.shard.try_checkout().unwrap().is_none());
         assert!(
-            Arc::strong_count(&fixture.data_owner) >= owners_before,
+            fixture
+                .pause
+                .blocking_replay_holds_owner(&fixture.data_owner),
             "the actual blocking replay retains the Main owner"
         );
         release.send(()).unwrap();
@@ -1480,6 +1481,11 @@ fn replica_materialization_cancellation_retains_blocking_replay_capabilities() {
             .await
             .unwrap()
             .unwrap(),
+        );
+        assert!(
+            !fixture
+                .pause
+                .blocking_replay_holds_owner(&fixture.data_owner)
         );
     });
     fixture.close();
@@ -15790,6 +15796,16 @@ fn daemon_intent_scan_cursor_survives_dropped_maintenance_shell_and_resets_with_
     drop(caller);
     let cluster_state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
         .expect("current bootstrap state");
+    // Retain native authority before admission across cache replacement. No
+    // background scan may run between eviction and observing the fresh owner.
+    let preflight = runtime
+        .block_on(warm_daemon_dfs_metadata_authority_for_identity_async(
+            &cluster_paths,
+            &cluster_state.cluster_id,
+            &cluster_state.local_node_id,
+            &runtime,
+        ))
+        .expect("retain exact authority across cache-owner replacement");
     let scheduler = daemon_dfs_mutation_scheduler(&data_dir).expect("scheduler");
     let admission = runtime
         .block_on(scheduler.admit(&DfsMessageExecutionScope::GlobalExclusive))
@@ -15814,9 +15830,19 @@ fn daemon_intent_scan_cursor_survives_dropped_maintenance_shell_and_resets_with_
         after: Some(key(2)),
         through: Some(key(9)),
     });
+    let initial_cursor = owner
+        .cursor()
+        .expect("actual admitted startup scan position");
     owner
-        .advance(&None, expected.clone())
+        .advance(&initial_cursor, expected.clone())
         .expect("complete raw page cursor");
+    assert_eq!(owner.cursor().unwrap(), expected);
+    owner.advance(&initial_cursor, None).unwrap();
+    assert_eq!(
+        owner.cursor().unwrap(),
+        expected,
+        "a stale compare cannot rewind the scan"
+    );
     // Cancellation/error destroys the taken service without returning it. The
     // cache's independent Arc must retain both after-key and frozen upper cut.
     drop(retained);
@@ -15863,21 +15889,6 @@ fn daemon_intent_scan_cursor_survives_dropped_maintenance_shell_and_resets_with_
     // Eviction is a real cache-owner replacement, unlike merely constructing
     // two services with a manually shared cursor. A fresh owner safely rewinds.
     assert!(evict_daemon_dfs_message_service_cache(&data_dir).unwrap());
-    // Eviction can release the last strong authority runtime along with the
-    // service cache. Production warms its replacement before global admission;
-    // retain that exact preflight through the new owner's synchronous take.
-    drop(admission);
-    let preflight = runtime
-        .block_on(warm_daemon_dfs_metadata_authority_for_identity_async(
-            &cluster_paths,
-            &cluster_state.cluster_id,
-            &cluster_state.local_node_id,
-            &runtime,
-        ))
-        .expect("rewarm exact authority before replacement maintenance admission");
-    let admission = runtime
-        .block_on(scheduler.admit(&DfsMessageExecutionScope::GlobalExclusive))
-        .expect("reacquire exclusive ownership after authority preflight");
     let replaced = take_daemon_dfs_message_mutation_service_for_maintenance(
         &data_dir,
         &cluster_paths,
