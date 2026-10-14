@@ -1199,7 +1199,7 @@ pub(crate) fn read_daemon_dfs_message_peer_snapshot(
 }
 
 /// sinomo:kv-configuration: Borrow both routing scopes from the native owner's same applied projection; this grants no publication authority.
-fn read_native_dfs_peer_configuration(
+pub(super) fn read_native_dfs_peer_configuration(
     cluster_paths: &ClusterPaths,
     state: &sinomo_core::ClusterBootstrapState,
     deadline: Instant,

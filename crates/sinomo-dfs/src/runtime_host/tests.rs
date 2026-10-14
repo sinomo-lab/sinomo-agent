@@ -16320,23 +16320,21 @@ fn native_peer_projection_uses_owned_members_and_catalog_without_optional_checkp
     let host = registered_dfs_runtime_host(runtime.data_dir(&nodes[0]))
         .unwrap()
         .unwrap();
-    let state = sinomo_core::cluster::read_cluster_state_without_kv(&ClusterPaths::new(
-        runtime.data_dir(&nodes[0]),
-    ))
+    let paths = ClusterPaths::new(runtime.data_dir(&nodes[0]));
+    let state = sinomo_core::cluster::read_cluster_state_without_kv(&paths).unwrap();
+    // Derive the negative input from the same owned, applied projection as
+    // the normal peer reader. Optional local checkpoint reads can be older
+    // than the genuine mounted catalog this test just proved available.
+    let (members, mut entries) = read_native_dfs_peer_configuration(
+        &paths,
+        &state,
+        Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+    )
     .unwrap();
-    let members = host
-        .cluster
-        .kv_range_prefix_local("/cluster/members/")
-        .unwrap()
-        .value
+    let members = members
         .into_iter()
         .map(|entry| entry.decode::<sinomo_core::ClusterMemberRecord>().unwrap())
         .collect::<Vec<_>>();
-    let mut entries = host
-        .cluster
-        .kv_range_prefix_local(sinomo_core::service::CLUSTER_SERVICES_KV_PREFIX)
-        .unwrap()
-        .value;
     let mut changed = false;
     for entry in &mut entries {
         let mut instance = entry
