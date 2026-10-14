@@ -5664,56 +5664,126 @@ fn repair_replica_accepts_stale_base_when_content_hash_matches_current() {
 }
 
 #[test]
-fn reconnect_refreshes_unmanaged_local_manifest_receipt() {
-    let root = temp_root("reconnect-refreshes-unmanaged-receipt");
-    let local = NodeId::from_legacy_named("node_reconnect_unmanaged_local").expect("local");
-    let remote = NodeId::from_legacy_named("node_reconnect_unmanaged_remote").expect("remote");
-    let object_id =
-        DfsObjectId::from_legacy_named("obj_reconnect_unmanaged_receipt").expect("object");
-    let version = DfsVersion::from_legacy_named("version_reconnect_unmanaged").expect("version");
+fn unmanaged_manifest_reconnect_requires_native_receipt_publication() {
     let bytes = b"ordinary reconnect bytes";
-    let (_runtime, mut dfs) = native_sifs_service(
-        "reconnect_refreshes_unmanaged_local_manifest_receipt",
-        local.clone(),
+    let (runtime, mut dfs, stat, removed) = native_withdrawn_local_replica_fixture_for_policy(
+        "native-unmanaged-manifest-reconnect",
+        bytes,
+        false,
     );
+    assert!(dfs.control_plane.is_some());
+    // A reconnect starts with a real local manifest for these already verified
+    // bytes. Recording local content is not a clustered receipt publication.
     let manifest = dfs
-        .content
-        .put_object_version(object_id.as_str(), version.as_str(), bytes)
-        .expect("seed local manifest and blob");
-    let mut metadata = file_metadata(local.clone());
-    metadata.object_id = object_id.clone();
-    metadata.path = "/services/reconnect-unmanaged.txt".to_string();
-    metadata.policy = DfsObjectPolicy::ReplicatedEventual;
-    metadata.version = version.clone();
-    metadata.current_locations = vec![remote];
-    metadata.content_hash = Some(manifest.content_hash.clone());
-    metadata.content_size_bytes = Some(bytes.len() as u64);
-    dfs.add_object_metadata(metadata).expect("metadata");
+        .content()
+        .put_object_version(stat.object_id.as_str(), stat.version.as_str(), bytes)
+        .unwrap();
+    assert_eq!(Some(manifest.content_hash), stat.content_hash);
 
-    let reconciliation = dfs
-        .reconcile_local_manifests(&object_id)
-        .expect("reconcile unmanaged manifest");
-
-    assert_eq!(reconciliation.refreshed_receipts, 1);
+    assert!(
+        dfs.backend_receipt_for_replica(&stat.object_id, &stat.version, &removed.replica_node_id)
+            .unwrap()
+            .is_none()
+    );
+    let before = dfs
+        .metadata_backend()
+        .unwrap()
+        .export_shard_table_snapshot(&DfsMetadataShardId::new("services"))
+        .unwrap()
+        .unwrap();
+    let reconciliation = dfs.reconcile_local_manifests(&stat.object_id).unwrap();
+    assert_eq!(
+        reconciliation.refreshed_receipts, 0,
+        "local manifest enumeration cannot grant clustered receipt authority without a current publication"
+    );
     assert!(!reconciliation.missing_current);
-    assert!(
+    assert_eq!(
         dfs.metadata_backend()
-            .expect("backend")
-            .receipts_for_version(&object_id, &version)
-            .expect("receipts")
-            .iter()
-            .any(|receipt| receipt.replica_node_id == local),
-        "ordinary reconnect keeps its legacy receipt refresh behavior"
+            .unwrap()
+            .export_shard_table_snapshot(&DfsMetadataShardId::new("services"))
+            .unwrap()
+            .unwrap(),
+        before
+    );
+    assert_eq!(
+        dfs.content()
+            .read_object_version(stat.object_id.as_str(), stat.version.as_str())
+            .unwrap()
+            .1,
+        bytes
+    );
+
+    // The actual current owner can republish its verified local copy while the
+    // other real replica still supplies the recorded W1 durability witness.
+    assert!(
+        dfs.put_metadata_receipt(
+            &stat.file_system_id,
+            &stat.object_id,
+            &stat.version,
+            &removed.replica_node_id,
+            stat.content_hash.as_deref().unwrap()
+        )
+        .unwrap()
+    );
+    let receipt = dfs
+        .backend_receipt_for_replica(&stat.object_id, &stat.version, &removed.replica_node_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (
+            &receipt.receipt.file_system_id,
+            &receipt.receipt.object_id,
+            &receipt.receipt.committed_version,
+            &receipt.receipt.owner_node_id,
+            &receipt.replica_node_id,
+            &receipt.content_hash
+        ),
+        (
+            &removed.receipt.file_system_id,
+            &removed.receipt.object_id,
+            &removed.receipt.committed_version,
+            &removed.receipt.owner_node_id,
+            &removed.replica_node_id,
+            &removed.content_hash
+        )
+    );
+    assert_ne!(
+        receipt.receipt.event_id, removed.receipt.event_id,
+        "a new native publication carries its own actual event"
+    );
+    assert!(receipt.received_at >= removed.received_at);
+    let current = dfs.current_read_object_metadata(&stat.object_id).unwrap();
+    assert_eq!(current.version, stat.version);
+    assert_eq!(current.content_hash, stat.content_hash);
+    assert!(current.current_locations.contains(&receipt.replica_node_id));
+    assert_eq!(
+        dfs.metadata_backend()
+            .unwrap()
+            .receipts_for_version(&stat.object_id, &stat.version)
+            .unwrap()
+            .len(),
+        2
     );
     assert!(
-        dfs.metadata()
-            .object(&object_id)
-            .expect("object")
-            .current_locations
-            .contains(&local),
-        "ordinary reconnect keeps its legacy location refresh behavior"
+        !dfs.put_metadata_receipt(
+            &stat.file_system_id,
+            &stat.object_id,
+            &stat.version,
+            &receipt.replica_node_id,
+            stat.content_hash.as_deref().unwrap()
+        )
+        .unwrap(),
+        "the same actual receipt is published once"
     );
-    std::fs::remove_dir_all(root).ok();
+    assert_eq!(
+        dfs.backend_receipt_for_replica(&stat.object_id, &stat.version, &receipt.replica_node_id)
+            .unwrap()
+            .as_ref(),
+        Some(&receipt),
+        "an exact duplicate does not mint another event or timestamp"
+    );
+    drop(dfs);
+    runtime.close().unwrap();
 }
 
 #[test]
@@ -5984,9 +6054,42 @@ pub(super) fn native_withdrawn_local_replica_fixture(
     DfsStat,
     DfsReplicaReceiptRecord,
 ) {
+    native_withdrawn_local_replica_fixture_for_policy(name, bytes, true)
+}
+
+fn native_withdrawn_local_replica_fixture_for_policy(
+    name: &str,
+    bytes: &[u8],
+    managed: bool,
+) -> (
+    crate::test_runtime::DfsTestRuntime,
+    NetworkedDfsService<DfsNodeTransport>,
+    DfsStat,
+    DfsReplicaReceiptRecord,
+) {
     let path = "/services/receipt-republication";
-    let (runtime, owner, nodes, mut author, policy) =
-        native_owned_repair_fixture(name, path, 1, 2, false);
+    let (runtime, owner, nodes, mut author, policy) = if managed {
+        native_owned_repair_fixture(name, path, 1, 2, false)
+    } else {
+        let (runtime, browser, config) =
+            crate::test_support::current_native_metadata_service(name, 2, path).unwrap();
+        drop(browser);
+        let owner = config.primary_node_id;
+        let nodes = crate::test_runtime::DfsTestRuntime::ordered_node_ids(name, 2);
+        let mut author = runtime.metadata_primary_service(path).unwrap();
+        let (resolved, _, policy) = author
+            .managed_replication_policy_for_path(path, DfsObjectPolicy::ReplicatedEventual, 2)
+            .unwrap();
+        assert!(
+            resolved.source_path.is_none(),
+            "unmanaged native path uses its actual default policy"
+        );
+        assert_eq!(
+            (policy.min_commit_replicas, policy.desired_replicas),
+            (1, 2)
+        );
+        (runtime, owner, nodes, author, policy)
+    };
     let stat = author
         .posix_write_file(
             path,
