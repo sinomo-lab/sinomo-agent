@@ -10396,14 +10396,32 @@ fn daemon_dfs_distributed_write_skips_cold_full_metadata_hydrate() {
         "the first mutation after failed maintenance must reuse the checked returned lane"
     );
 
+    // Open the actual control client before taking global admission: its
+    // normal native opener itself needs a publication lease.
+    let control = native.shared_control_plane().unwrap();
     let current_state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
         .expect("cluster state before peer-only maintenance refresh");
+    // Match ordinary Main maintenance: join current configuration before
+    // acquiring its actual global mutation admission, then take that cut.
+    let warm = runtime
+        .block_on(warm_daemon_dfs_metadata_authority_for_identity_async(
+            &cluster_paths,
+            &current_state.cluster_id,
+            &local,
+            runtime.handle(),
+        ))
+        .unwrap();
+    let scheduler = daemon_dfs_mutation_scheduler(&data_dir).unwrap();
+    let admission = runtime
+        .block_on(scheduler.admit(&DfsMessageExecutionScope::GlobalExclusive))
+        .unwrap();
+    let admitted = warm.for_admission(&admission);
     let retained = take_daemon_dfs_message_mutation_service_for_maintenance(
         &data_dir,
         &cluster_paths,
         &current_state,
         runtime.handle(),
-        None,
+        Some(&admitted),
     )
     .expect("take mutation lane before peer-only refresh");
     let added_peer = remote.clone();
@@ -10428,7 +10446,6 @@ fn daemon_dfs_distributed_write_skips_cold_full_metadata_hydrate() {
             ));
     }
     assert_ne!(member.endpoints, before_endpoints);
-    let control = native.shared_control_plane().unwrap();
     control
         .with_client(|kv| {
             kv.put(
@@ -10471,14 +10488,30 @@ fn daemon_dfs_distributed_write_skips_cold_full_metadata_hydrate() {
         "peer-only maintenance refresh must retain the open metadata backend"
     );
 
+    drop(admission);
     let current_state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
         .expect("current cluster state");
+    // Match ordinary Main maintenance: join current configuration before
+    // acquiring its actual global mutation admission, then take that cut.
+    let warm = runtime
+        .block_on(warm_daemon_dfs_metadata_authority_for_identity_async(
+            &cluster_paths,
+            &current_state.cluster_id,
+            &local,
+            runtime.handle(),
+        ))
+        .unwrap();
+    let scheduler = daemon_dfs_mutation_scheduler(&data_dir).unwrap();
+    let admission = runtime
+        .block_on(scheduler.admit(&DfsMessageExecutionScope::GlobalExclusive))
+        .unwrap();
+    let admitted = warm.for_admission(&admission);
     let mut retained = take_daemon_dfs_message_mutation_service_for_maintenance(
         &data_dir,
         &cluster_paths,
         &current_state,
         runtime.handle(),
-        None,
+        Some(&admitted),
     )
     .expect("take mutation lane for authority-change validation");
     assert!(
@@ -10494,6 +10527,8 @@ fn daemon_dfs_distributed_write_skips_cold_full_metadata_hydrate() {
         .service
         .release_resident_metadata_backend()
         .unwrap();
+
+    drop(admission);
 
     let changed_root_shard = native
         .reassign_metadata_shard(
