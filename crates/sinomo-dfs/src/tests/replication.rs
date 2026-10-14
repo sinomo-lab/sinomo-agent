@@ -186,78 +186,134 @@ fn sifs_cluster_posix_replica_catches_up_after_journal_publish() {
     let mut cluster = sifs_posix_cluster("sifs-cluster-catchup", "/users");
     let path = "/users/replicated.txt";
     let bytes = b"observer should converge to this content";
-
-    sifs_cluster_routed_posix_write(&mut cluster, path, bytes);
-
-    // The observer never participated in the write; it learns the namespace
-    // through the primary's metadata journal publication.
+    let original = cluster
+        ._runtime
+        .metadata_shards()
+        .unwrap()
+        .into_iter()
+        .find(|shard| shard.shard_id == "users")
+        .unwrap();
+    // A configured participant must ACK every prepare. Establish the intended
+    // initially uninvolved observer through a real membership transition.
+    let initial = cluster
+        ._runtime
+        .reassign_metadata_shard(
+            &original.file_system_id,
+            &original.shard_id,
+            cluster.primary_node.clone(),
+            vec![cluster.writer_node.clone()],
+        )
+        .unwrap();
+    assert!(!initial.replica_node_ids.contains(&cluster.observer_node));
+    let mut policy = DfsReplicationPolicy::new(1, 1).unwrap();
+    policy.required_node_ids = vec![cluster.primary_node.clone()];
+    policy.forbidden_node_ids = vec![cluster.observer_node.clone()];
+    cluster
+        .writer
+        .posix_write_file(
+            path,
+            bytes,
+            DfsWriteOptions {
+                policy,
+                replica_candidates: vec![cluster.primary_node.clone()],
+                wait_for_commit: true,
+                foreground_replica_repair: true,
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        cluster.observer.posix_stat(path),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+    let observer_root =
+        crate::default_dfs_metadata_shards_root(cluster._runtime.data_dir(&cluster.observer_node))
+            .join(crate::metadata_keys::key_segment(&original.shard_id));
+    let before = LocalSobjMetadataBackend::open_for_inspection(
+        DfsMetadataShardId::new(&original.shard_id),
+        &observer_root,
+    )
+    .unwrap();
     assert!(
-        matches!(
-            cluster.observer.posix_stat(path),
-            Err(DfsPosixError::NotFound { .. })
-        ),
-        "observer must not see the path before metadata publication"
+        before
+            .get_object_by_path(&original.file_system_id, path)
+            .unwrap()
+            .is_none(),
+        "the actual unassigned observer must not have the unpublished-to-it path"
     );
-
-    let expected_hash = content_hash(bytes);
-    sifs_cluster_publish_metadata_until(&mut cluster, path, |cluster| {
-        cluster
+    drop(before);
+    assert!(
+        !cluster
             .observer
-            .posix_stat(path)
-            .is_ok_and(|stat| stat.content_hash.as_deref() == Some(expected_hash.as_str()))
-    });
-
-    let stat = cluster.observer.posix_stat(path).expect("observer stat");
-    assert_eq!(stat.kind, DfsObjectKind::File);
-    assert_eq!(stat.size_bytes, Some(bytes.len() as u64));
-    let entries = cluster
-        .observer
-        .posix_list_dir("/users")
-        .expect("observer list /users");
-    assert!(
-        entries.iter().any(|entry| entry.path == path),
-        "observer directory listing must contain the replicated path: {entries:?}"
+            .content()
+            .has_blob(&content_hash(bytes))
+            .unwrap()
     );
 
-    // Content follows metadata on demand.
+    // The existing native catch-up protocol publishes the real prefix before
+    // joint activation adds this observer to the metadata participant set.
+    let joined = cluster
+        ._runtime
+        .reassign_metadata_shard(
+            &initial.file_system_id,
+            &initial.shard_id,
+            cluster.primary_node.clone(),
+            vec![cluster.writer_node.clone(), cluster.observer_node.clone()],
+        )
+        .unwrap();
+    assert_eq!(joined.epoch, initial.epoch + 1);
+    assert!(joined.replica_node_ids.contains(&cluster.observer_node));
+    drop(cluster.observer);
+    cluster.observer = cluster._runtime.client(&cluster.observer_node).unwrap();
+    let expected_hash = content_hash(bytes);
+    let stat = cluster
+        .observer
+        .posix_stat(path)
+        .expect("actual caught-up replica stat");
+    assert_eq!(stat.kind, DfsObjectKind::File);
+    assert_eq!(stat.content_hash.as_deref(), Some(expected_hash.as_str()));
+    assert_eq!(stat.size_bytes, Some(bytes.len() as u64));
+    let entries = cluster.observer.posix_list_dir("/users").unwrap();
+    assert!(entries.iter().any(|entry| entry.path == path));
+    assert!(
+        !cluster.observer.content().has_blob(&expected_hash).unwrap(),
+        "metadata catch-up must not invent a content replica"
+    );
     let read = sifs_cluster_fetch_for_local_read(&mut cluster, |c| &mut c.observer, path);
     assert_eq!(read, bytes.to_vec());
-
-    // Publication is idempotent: republishing must not error or regress state.
     let publication = cluster
         ._runtime
         .maintenance_tick(
             &cluster.primary_node,
             sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
         )
-        .expect("ordinary idempotent Main metadata publication");
+        .unwrap();
     assert!(publication.outcome.is_ok(), "{:?}", publication.outcome);
     assert_eq!(publication.omitted_kv_event_count, 0);
     sifs_posix_cluster_pump_round(&mut cluster);
-    let stat = cluster
-        .observer
-        .posix_stat(path)
-        .expect("observer stat after republish");
     assert_eq!(
-        stat.content_hash.as_deref(),
+        cluster
+            .observer
+            .posix_stat(path)
+            .unwrap()
+            .content_hash
+            .as_deref(),
         Some(expected_hash.as_str()),
-        "republishing the journal must not regress replicated metadata"
+        "idempotent publication must not regress the actual replica"
     );
-
-    // The writer is also a configured replica. Normal Main replication must
-    // preserve its current namespace and readable body as well.
     assert_eq!(
-        cluster.writer.posix_read_file(path).expect("writer read"),
-        bytes.to_vec()
+        cluster.writer.posix_read_file_distributed(path).unwrap(),
+        bytes
     );
-
-    assert!(
-        cluster.rejections.is_empty(),
-        "no journal batch may be rejected during routed writes and catch-up: {:?}",
-        cluster.rejections
-    );
-
-    drop(cluster);
+    assert!(cluster.rejections.is_empty(), "{:?}", cluster.rejections);
+    let SifsPosixCluster {
+        primary,
+        writer,
+        observer,
+        _runtime,
+        ..
+    } = cluster;
+    drop((primary, writer, observer));
+    _runtime.close().unwrap();
 }
 
 #[test]
