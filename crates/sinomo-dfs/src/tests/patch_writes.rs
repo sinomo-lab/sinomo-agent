@@ -599,8 +599,11 @@ fn sifs_posix_write_at_replicates_large_extent_patch_in_chunks_without_full_blob
 
 #[test]
 fn sifs_posix_write_at_retries_lost_patch_stage_as_patch() {
-    let (mut runtime, owner, replica, mut owner_dfs, replica_dfs) =
+    let (mut runtime, owner, replica, owner_browser, replica_dfs) =
         native_patch_services("sifs_posix_write_at_retries_lost_patch_stage_as_patch");
+    drop(owner_browser);
+    // Inspect and retry the same real Core that owns this pending patch.
+    let mut owner_dfs = runtime.metadata_primary_service("/services").unwrap();
     let path = "/services/retry-write-at-patch.bin";
 
     let mut initial = vec![0_u8; 256 * 1024 + 31];
@@ -653,6 +656,14 @@ fn sifs_posix_write_at_retries_lost_patch_stage_as_patch() {
         "the actual first stage must attempt a patch RPC"
     );
     for _ in 0..16 {
+        // The pending patch belongs to this actual Core producer. Advance its
+        // normal retry state before Main publishes the resulting durable work.
+        owner_dfs
+            .retry_pending_repairs()
+            .expect("actual producer patch retry");
+        owner_dfs
+            .process_incoming()
+            .expect("actual producer patch completion");
         runtime
             .maintenance_tick(&owner, Duration::from_secs(5))
             .expect("normal pending-patch repair pass");
@@ -672,8 +683,11 @@ fn sifs_posix_write_at_retries_lost_patch_stage_as_patch() {
 
 #[test]
 fn sifs_posix_write_at_retries_lost_patch_attachment() {
-    let (mut runtime, owner, replica, mut owner_dfs, replica_dfs) =
+    let (mut runtime, owner, replica, owner_browser, replica_dfs) =
         native_patch_services("sifs_posix_write_at_retries_lost_patch_attachment");
+    drop(owner_browser);
+    // Inspect and retry the same real Core that owns this pending patch.
+    let mut owner_dfs = runtime.metadata_primary_service("/services").unwrap();
     let path = "/services/retry-write-at-patch.bin";
 
     let mut initial = vec![0_u8; 512 * 1024 + 11];
@@ -785,6 +799,14 @@ fn sifs_posix_write_at_retries_lost_patch_attachment() {
         "the actual first stage must attempt a patch RPC"
     );
     for _ in 0..16 {
+        // The pending patch belongs to this actual Core producer. Advance its
+        // normal retry state before Main publishes the resulting durable work.
+        owner_dfs
+            .retry_pending_repairs()
+            .expect("actual producer patch retry");
+        owner_dfs
+            .process_incoming()
+            .expect("actual producer patch completion");
         runtime
             .maintenance_tick(&owner, Duration::from_secs(5))
             .expect("normal pending-patch repair pass");
@@ -923,7 +945,10 @@ fn sifs_cluster_posix_contract_concurrent_write_at_truncate_races() {
             .posix_stat(path)
             .is_ok_and(|stat| stat.size_bytes == Some(12))
     });
-    let extended = cluster.writer.posix_read_file(path).expect("extended read");
+    let extended = cluster
+        .writer
+        .posix_read_file_distributed(path)
+        .expect("extended read");
     assert_eq!(
         &extended[final_bytes.len().min(12)..],
         vec![0; 12usize.saturating_sub(final_bytes.len())].as_slice(),
