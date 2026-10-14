@@ -2101,6 +2101,13 @@ pub(crate) async fn warm_daemon_dfs_metadata_authority_before_deadline(
     #[cfg(test)] native_read_observer,
 )
             .await;
+        if proof.is_some() {
+            // The shared refresh publishes its filesystem prefix before the
+            // complete configuration bundle. Join that same owner before
+            // handing a supposedly ready service to synchronous execution.
+            // This await retains the caller's original deadline and replan cap.
+            authority_generation.ensure_write_configuration_ready_async().await?;
+        }
         if proof.is_some() && authority_generation.generation() == expected_generation {
             return Ok(DaemonDfsMetadataAuthorityPreflight {
                 authority: authority_generation,

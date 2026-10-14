@@ -1584,3 +1584,52 @@ async fn required_revision_withdraws_configuration_before_queued_refresh_runs() 
     assert_eq!(host.queued_count(), 0);
     assert_eq!(runtime.storage_generation(), storage_generation);
 }
+
+#[tokio::test]
+async fn native_host_preflight_joins_configuration_after_first_prefix_is_published() {
+    let host = NativeProjectionHost::new(true);
+    let runtime = attach(&host);
+    host.content_gate.armed.store(true, Ordering::Release);
+    runtime.request_authoritative_refresh();
+    let refresh = tokio::spawn(host.take_task().unwrap());
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        host.content_gate.entered.notified(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        runtime.state.current_complete_prefix_revision(),
+        Some(KvRevision(10))
+    );
+    assert!(matches!(
+        runtime.write_configuration_readiness().unwrap(),
+        crate::DfsWriteConfigurationReadiness::Pending
+    ));
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+    let mut preflight = Box::pin(
+        crate::runtime_host::warm_daemon_dfs_metadata_authority_before_deadline(
+            Arc::clone(&runtime),
+            deadline,
+            None,
+        ),
+    );
+    require_pending(preflight.as_mut()).await;
+    assert_eq!(host.spawned.load(Ordering::Acquire), 1);
+    host.content_gate.release.notify_one();
+    refresh.await.unwrap();
+    let _admitted = tokio::time::timeout_at(deadline, preflight)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        runtime.state.current_complete_prefix_revision(),
+        Some(KvRevision(10))
+    );
+    assert!(matches!(
+        runtime.write_configuration_readiness().unwrap(),
+        crate::DfsWriteConfigurationReadiness::Ready(Some(_))
+    ));
+    assert_eq!(host.read_count(), 3);
+    assert_eq!(host.queued_count(), 0);
+}
