@@ -1535,6 +1535,11 @@ mod tests {
             OffsetDateTime::now_utc(),
         )
         .unwrap();
+        // The custom corpus is authored by the actual Root Core. Keep the
+        // original all-shard reader count and inspect through a fresh Main
+        // browser after publication, rather than using it as a producer.
+        drop(writer);
+        let mut writer = runtime.metadata_primary_service(path).unwrap();
         crate::test_support::publish_current_payload(&mut writer, payload).unwrap();
         let stat = writer
             .posix_write_file(
@@ -1548,7 +1553,9 @@ mod tests {
                 },
             )
             .unwrap();
-        let backend = writer.metadata_backend().unwrap();
+        drop(writer);
+        let reader = runtime.client(&nodes[0]).unwrap();
+        let backend = reader.metadata_backend().unwrap();
         let inspector = DfsOperatorInspector::new(backend);
         let all = inspector
             .repairs(Some(&stat.file_system_id), Some(&stat.object_id))
@@ -1598,7 +1605,7 @@ mod tests {
                 .state,
             DfsAgentObjectState::PendingRepair
         );
-        drop(writer);
+        drop(reader);
         runtime.close().unwrap();
     }
 
