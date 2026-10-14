@@ -1685,3 +1685,39 @@ async fn admission_fence_rejects_partial_configuration_after_same_generation_ref
     assert_eq!(host.read_count(), 6);
     assert_eq!(host.queued_count(), 0);
 }
+
+#[tokio::test]
+async fn configuration_published_between_pending_read_and_waiter_check_is_revalidated() {
+    let host = NativeProjectionHost::new(true);
+    let runtime = attach(&host);
+    runtime.request_authoritative_refresh();
+    host.run_next().await;
+    let original = runtime.write_configuration_projection().unwrap().unwrap();
+    let generation = runtime.generation();
+    let reads = host.read_count();
+    let publications = host.spawned.load(Ordering::Acquire);
+    // Retain the actual three-prefix native publication. Deliver it at the
+    // precise read/check boundary, as the existing refresh owner can do.
+    let published = Mutex::new(Some(std::mem::take(
+        &mut *runtime.write_configuration.lock().unwrap(),
+    )));
+    let publish = || {
+        if let Some(configuration) = published.lock().unwrap().take() {
+            *runtime.write_configuration.lock().unwrap() = configuration;
+        }
+    };
+    let result = runtime
+        .ensure_write_configuration_ready_with_pending_observer(Some(&publish))
+        .await;
+    assert!(published.lock().unwrap().is_none());
+    assert_eq!(host.read_count(), reads);
+    assert_eq!(host.spawned.load(Ordering::Acquire), publications);
+    assert_eq!(runtime.generation(), generation);
+    assert!(Arc::ptr_eq(
+        &original,
+        &runtime.write_configuration_projection().unwrap().unwrap()
+    ));
+    result.expect(
+        "a concurrently completed native publication must replace the earlier pending observation",
+    );
+}

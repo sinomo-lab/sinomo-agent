@@ -210,6 +210,18 @@ where
     }
 }
 
+// Keep a missing publication distinct from a failed native floor read. A
+// refresh may publish between the observation and its caller's next lock.
+enum DfsWriteConfigurationReadError {
+    Pending(DfsError),
+    Unavailable(DfsError),
+}
+impl From<DfsError> for DfsWriteConfigurationReadError {
+    fn from(error: DfsError) -> Self {
+        Self::Unavailable(error)
+    }
+}
+
 struct DfsMetadataAuthorityRefreshOwner {
     runtime: Arc<DfsMetadataAuthorityRuntime>,
 }
@@ -776,6 +788,18 @@ impl DfsMetadataAuthorityRuntime {
     pub fn write_configuration_projection(
         self: &Arc<Self>,
     ) -> Result<Option<Arc<crate::DfsWriteConfigurationProjection>>, DfsError> {
+        self.read_write_configuration()
+            .map_err(|error| match error {
+                DfsWriteConfigurationReadError::Pending(error)
+                | DfsWriteConfigurationReadError::Unavailable(error) => error,
+            })
+    }
+
+    /// sinomo:kv-configuration: Check the existing resident native floor before lending a retained configuration cut.
+    fn read_write_configuration(
+        self: &Arc<Self>,
+    ) -> Result<Option<Arc<crate::DfsWriteConfigurationProjection>>, DfsWriteConfigurationReadError>
+    {
         if !self.write_configuration_requested.load(Ordering::Acquire) {
             if self.host().is_some_and(|host| {
                 host.supports_write_configuration_projection()
@@ -783,7 +807,8 @@ impl DfsMetadataAuthorityRuntime {
             }) {
                 return Err(DfsError::Network {
                     message: "native configuration floor is unavailable".into(),
-                });
+                }
+                .into());
             }
             return Ok(None);
         }
@@ -805,17 +830,18 @@ impl DfsMetadataAuthorityRuntime {
             {
                 return Ok(None);
             }
-            return Err(DfsError::Network {
+            return Err(DfsWriteConfigurationReadError::Pending(DfsError::Network {
                 message: "DFS write configuration is awaiting a coherent authoritative projection"
                     .into(),
-            });
+            }));
         };
         #[cfg(any(test, feature = "test-support"))]
         if crate::test_runtime::native_configuration_floor_is_denied(self.as_ref()) {
             return Err(DfsError::Network {
                 message: "native configuration floor is unavailable at the injected read boundary"
                     .into(),
-            });
+            }
+            .into());
         }
         let floor = host.write_configuration_floor()?;
         if !view.matches_floor(&floor) {
@@ -837,10 +863,10 @@ impl DfsMetadataAuthorityRuntime {
                 host.authority_changed();
                 self.request_authoritative_refresh();
             }
-            return Err(DfsError::Network {
+            return Err(DfsWriteConfigurationReadError::Pending(DfsError::Network {
                 message: "DFS write configuration authority floor advanced; no write was admitted"
                     .into(),
-            });
+            }));
         }
         Ok(Some(view))
     }
@@ -848,22 +874,12 @@ impl DfsMetadataAuthorityRuntime {
     pub fn write_configuration_readiness(
         self: &Arc<Self>,
     ) -> Result<crate::DfsWriteConfigurationReadiness, DfsError> {
-        match self.write_configuration_projection() {
+        match self.read_write_configuration() {
             Ok(view) => Ok(crate::DfsWriteConfigurationReadiness::Ready(view)),
-            Err(error) => {
-                let missing = self
-                    .write_configuration
-                    .lock()
-                    .map(|configuration| configuration.snapshot().is_none())
-                    .map_err(|_| DfsError::Network {
-                        message: "DFS write configuration projection lock poisoned".into(),
-                    })?;
-                if self.write_configuration_requested.load(Ordering::Acquire) && missing {
-                    Ok(crate::DfsWriteConfigurationReadiness::Pending)
-                } else {
-                    Err(error)
-                }
+            Err(DfsWriteConfigurationReadError::Pending(_)) => {
+                Ok(crate::DfsWriteConfigurationReadiness::Pending)
             }
+            Err(DfsWriteConfigurationReadError::Unavailable(error)) => Err(error),
         }
     }
 
@@ -872,13 +888,29 @@ impl DfsMetadataAuthorityRuntime {
     /// The caller supplies its existing projection/RPC deadline around this
     /// future; neither handoff nor a pending bundle creates another deadline.
     pub async fn ensure_write_configuration_ready_async(self: &Arc<Self>) -> Result<(), DfsError> {
+        self.ensure_write_configuration_ready_with_pending_observer(
+            #[cfg(test)]
+            None,
+        )
+        .await
+    }
+
+    async fn ensure_write_configuration_ready_with_pending_observer(
+        self: &Arc<Self>,
+        #[cfg(test)] pending_observer: Option<&(dyn Fn() + Send + Sync)>,
+    ) -> Result<(), DfsError> {
         let mut completion = self.refresh_completion.subscribe();
         let mut joined_owner = false;
         loop {
-            let error = match self.write_configuration_projection() {
+            let error = match self.read_write_configuration() {
                 Ok(_) => return Ok(()),
-                Err(error) => error,
+                Err(DfsWriteConfigurationReadError::Pending(error)) => error,
+                Err(DfsWriteConfigurationReadError::Unavailable(error)) => return Err(error),
             };
+            #[cfg(test)]
+            if let Some(observer) = pending_observer {
+                observer();
+            }
             let (missing, pending) = self
                 .write_configuration
                 .lock()
@@ -892,9 +924,13 @@ impl DfsMetadataAuthorityRuntime {
                     message: "DFS write configuration projection lock poisoned".into(),
                 })?;
             if !missing {
-                // A native floor error with a still-published view remains an
-                // error. It is never converted into a speculative refresh.
-                return Err(error);
+                // The observed missing publication completed before this
+                // check. Revalidate its actual native floor; do not return the
+                // stale Pending error or initiate another refresh owner.
+                // Yield so repeated concurrent transitions remain subject to
+                // the caller's original async deadline.
+                tokio::task::yield_now().await;
+                continue;
             }
             if self.refresh_in_flight.load(Ordering::Acquire) {
                 joined_owner = true;
