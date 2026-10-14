@@ -160,6 +160,13 @@ fn persisted_repair_attempts_prevent_duplicate_retry_after_reopen() {
     let (runtime, mut dfs, config) =
         crate::test_support::current_native_metadata_service(name, 2, "/services").unwrap();
     let owner = config.primary_node_id;
+    drop(dfs);
+    let background = runtime
+        .deny_background_replica_before_claim(&owner)
+        .unwrap();
+    let mut dfs = runtime
+        .metadata_primary_service("/services/native-recorded-backoff")
+        .unwrap();
     let replica = crate::test_support::DfsTestRuntime::ordered_node_ids(name, 2)
         .into_iter()
         .find(|node| *node != owner)
@@ -202,7 +209,10 @@ fn persisted_repair_attempts_prevent_duplicate_retry_after_reopen() {
     // returned in-flight record is restart bookkeeping, never a receipt or
     // permission to run repair without current native authority.
     drop(dfs);
-    let mut reopened = runtime.client(&owner).unwrap();
+    let mut reopened = runtime
+        .metadata_primary_service("/services/native-recorded-backoff")
+        .unwrap();
+    reopened.hydrate_from_metadata_backend().unwrap();
     let before = runtime.rpc_observations().len();
     assert!(records[0].next_retry_unix_nanos > dfs_now_unix_nanos());
     assert!(
@@ -233,6 +243,7 @@ fn persisted_repair_attempts_prevent_duplicate_retry_after_reopen() {
     );
     drop(peer);
     drop(reopened);
+    drop(background);
     runtime.close().unwrap();
 }
 
@@ -242,6 +253,13 @@ fn persisted_repair_attempts_prevent_duplicate_fetch_after_reopen() {
     let (runtime, mut dfs, config) =
         crate::test_support::current_native_metadata_service(name, 3, "/services").unwrap();
     let primary = config.primary_node_id;
+    drop(dfs);
+    let background = runtime
+        .deny_background_replica_before_claim(&primary)
+        .unwrap();
+    let mut dfs = runtime
+        .metadata_primary_service("/services/native-fetch-backoff.bin")
+        .unwrap();
     let other = crate::test_support::DfsTestRuntime::ordered_node_ids(name, 3)
         .into_iter()
         .filter(|node| *node != primary)
@@ -314,10 +332,30 @@ fn persisted_repair_attempts_prevent_duplicate_fetch_after_reopen() {
     assert_eq!(records[0].content_hash, hash);
     assert_eq!(records[0].missing_replica_node_id, target);
     assert!(records[0].in_flight);
-    assert!(records[0].transfer_request_id.is_some());
+    let pending = dfs
+        .writes
+        .pending_writes
+        .get(&records[0].intent_id)
+        .expect("actual producer owns the pending Fetch");
+    assert!(pending.fetch_inflight_from.contains(&source));
+    assert!(
+        pending
+            .fetch_inflight_request_ids
+            .get(&source)
+            .is_some_and(|id| !id.is_empty()),
+        "the actual source Fetch has its own correlated request identity"
+    );
+    assert!(
+        records[0].transfer_request_id.is_none(),
+        "a source Fetch cannot invent custody of a separate target Repair"
+    );
+    assert!(!pending.repair_inflight_request_ids.contains_key(&target));
     assert!(records[0].next_retry_unix_nanos > dfs_now_unix_nanos());
     drop(dfs);
-    let mut reopened = runtime.client(&primary).unwrap();
+    let mut reopened = runtime
+        .metadata_primary_service("/services/native-fetch-backoff.bin")
+        .unwrap();
+    reopened.hydrate_from_metadata_backend().unwrap();
     let before_retry = runtime.rpc_observations().len();
     assert!(records[0].next_retry_unix_nanos > dfs_now_unix_nanos());
     assert!(
@@ -346,6 +384,7 @@ fn persisted_repair_attempts_prevent_duplicate_fetch_after_reopen() {
     drop(actual_source);
     drop(reopened);
     runtime.clear_faults();
+    drop(background);
     runtime.close().unwrap();
 }
 
