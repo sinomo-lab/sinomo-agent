@@ -300,6 +300,25 @@ struct Transfer {
     target: NodeId,
     task: tokio::task::JoinHandle<Result<(), NetworkError>>,
 }
+struct RpcObservationCheckpoint {
+    path: std::path::PathBuf,
+    records: usize,
+    digest: blake3::Hash,
+}
+impl RpcObservationCheckpoint {
+    fn verify(&self) -> Result<(), String> {
+        let bytes = std::fs::read(&self.path).map_err(|error| error.to_string())?;
+        let records: Vec<String> =
+            serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+        if blake3::hash(&bytes) != self.digest || records.len() != self.records {
+            return Err(format!(
+                "RPC observation checkpoint changed: {}",
+                self.path.display()
+            ));
+        }
+        Ok(())
+    }
+}
 struct Fabric {
     dropped_observations: AtomicUsize,
     exhausted_budgets: AtomicUsize,
@@ -307,6 +326,7 @@ struct Fabric {
     nodes: Mutex<BTreeMap<NodeId, Arc<Endpoint>>>,
     faults: Mutex<Vec<FaultRule>>,
     observations: Mutex<Vec<RpcObservation>>,
+    observation_checkpoints: Mutex<Vec<RpcObservationCheckpoint>>,
     transfers: Mutex<Vec<Transfer>>,
 }
 impl Fabric {
@@ -1839,6 +1859,7 @@ impl DfsTestRuntime {
             nodes: Mutex::new(BTreeMap::new()),
             faults: Mutex::new(Vec::new()),
             observations: Mutex::new(Vec::new()),
+            observation_checkpoints: Mutex::new(Vec::new()),
             transfers: Mutex::new(Vec::new()),
         });
         let mut nodes = BTreeMap::new();
@@ -3285,7 +3306,65 @@ impl DfsTestRuntime {
         self.fabric.dropped_observations.load(Ordering::Relaxed)
     }
 
-    /// Captured dispatch events from the actual registered transport adapters.
+    /// Seal a complete observation window to the fixture's disk before starting
+    /// another corpus batch. The live buffer remains bounded by MAX_OBSERVATIONS;
+    /// no event or omission counter is discarded. Normal close verifies every
+    /// complete segment, including its count and digest, before claiming coverage.
+    /// Observation readers subsequently see the new, explicitly selected window.
+    pub fn checkpoint_rpc_observation_window(&self) -> Result<usize, String> {
+        use std::io::Write;
+        let mut records = self
+            .fabric
+            .observations
+            .lock()
+            .map_err(|_| "observations poisoned")?;
+        if self.observation_dropped_count() != 0 {
+            return Err("cannot checkpoint a censored RPC observation window".into());
+        }
+        if records.is_empty() {
+            return Ok(0);
+        }
+        let mut checkpoints = self
+            .fabric
+            .observation_checkpoints
+            .lock()
+            .map_err(|_| "observation checkpoints poisoned")?;
+        let path = self
+            .root
+            .as_ref()
+            .ok_or("fixture root was retained")?
+            .join(format!("rpc-observations-{:06}.json", checkpoints.len()));
+        // Debug includes every field, including the carrier's private timeout
+        // and protection options. Do not replace it with a lossy route summary.
+        let bytes = serde_json::to_vec(
+            &records
+                .iter()
+                .map(|event| format!("{event:?}"))
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|error| error.to_string())?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|error| error.to_string())?;
+        file.write_all(&bytes)
+            .and_then(|_| file.sync_all())
+            .map_err(|error| error.to_string())?;
+        let checkpoint = RpcObservationCheckpoint {
+            path,
+            records: records.len(),
+            digest: blake3::hash(&bytes),
+        };
+        checkpoint.verify()?;
+        let count = records.len();
+        checkpoints.push(checkpoint);
+        records.clear();
+        Ok(count)
+    }
+
+    /// Actual adapter events in the current window. Only an explicit successful
+    /// checkpoint begins a new window; ordinary fixtures retain their lifetime.
     pub fn rpc_observations(&self) -> Vec<RpcObservation> {
         self.fabric
             .observations
@@ -3745,6 +3824,16 @@ impl DfsTestRuntime {
         run_unit(Box::pin(self.kv_peers.join(CLOSE_TIMEOUT)))?;
         self.join_transfers(None)?;
         self.assert_fault_budgets()?;
+        let checkpoints = self
+            .fabric
+            .observation_checkpoints
+            .lock()
+            .map_err(|_| "observation checkpoints poisoned")?;
+        for checkpoint in checkpoints.iter() {
+            checkpoint.verify()?;
+        }
+        let checkpointed_records: usize = checkpoints.iter().map(|entry| entry.records).sum();
+        drop(checkpoints);
         match namespace {
             Some(required) if required.omitted != 0 || required.records.is_empty() => {
                 return Err("DFS namespace observation window was empty or censored".into());
@@ -3773,7 +3862,8 @@ impl DfsTestRuntime {
             .observations
             .lock()
             .map_err(|_| "lifetime observations poisoned")?
-            .len();
+            .len()
+            + checkpointed_records;
         let lifetime_omitted = self.fabric.dropped_observations.load(Ordering::Acquire);
         let coverage = DfsTestObservationCoverageReport {
             namespace_records: namespace.map(|required| required.records.len()),

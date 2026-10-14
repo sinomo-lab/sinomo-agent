@@ -19,6 +19,72 @@ use crate::{
 use tokio::sync::Semaphore;
 
 #[test]
+fn observation_checkpoints_preserve_full_events_and_reject_missing_or_changed_evidence() {
+    let node = DfsTestRuntime::ordered_node_ids("observation-checkpoints", 1).remove(0);
+    let mut runtime = DfsTestRuntime::new("observation-checkpoints", node.clone()).unwrap();
+    runtime.start_nodes().unwrap();
+    let mut client = runtime.client(&node).unwrap();
+    client
+        .posix_mkdir_all("/users/observation-checkpoint")
+        .unwrap();
+    let before = runtime.rpc_observations();
+    assert!(!before.is_empty());
+    let count = runtime.checkpoint_rpc_observation_window().unwrap();
+    assert_eq!(count, before.len());
+    assert!(runtime.rpc_observations().is_empty());
+    {
+        let seals = runtime.fabric.observation_checkpoints.lock().unwrap();
+        let seal = &seals[0];
+        let bytes = std::fs::read(&seal.path).unwrap();
+        let restored: Vec<String> = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            restored,
+            before
+                .iter()
+                .map(|event| format!("{event:?}"))
+                .collect::<Vec<_>>()
+        );
+        std::fs::write(&seal.path, b"[]").unwrap();
+        assert!(seal.verify().is_err(), "changed evidence must fail closed");
+        std::fs::remove_file(&seal.path).unwrap();
+        assert!(seal.verify().is_err(), "missing evidence must fail closed");
+        std::fs::write(&seal.path, bytes).unwrap();
+        seal.verify().unwrap();
+    }
+    client
+        .posix_stat_distributed("/users/observation-checkpoint")
+        .unwrap();
+    let next = runtime.rpc_observations();
+    assert!(!next.is_empty());
+    let collision = runtime
+        .root
+        .as_ref()
+        .unwrap()
+        .join("rpc-observations-000001.json");
+    std::fs::write(&collision, b"existing recovery evidence").unwrap();
+    assert!(runtime.checkpoint_rpc_observation_window().is_err());
+    assert_eq!(
+        format!("{:?}", runtime.rpc_observations()),
+        format!("{next:?}")
+    );
+    assert_eq!(
+        std::fs::read(&collision).unwrap(),
+        b"existing recovery evidence"
+    );
+    std::fs::remove_file(collision).unwrap();
+    assert_eq!(
+        runtime.checkpoint_rpc_observation_window().unwrap(),
+        next.len()
+    );
+    assert_eq!(runtime.observation_dropped_count(), 0);
+    drop(client);
+    let coverage = runtime.close_inner(None).unwrap();
+    assert!(coverage.lifetime_records >= count + next.len());
+    assert_eq!(coverage.lifetime_omitted, 0);
+    assert_eq!(coverage.full_lifetime_coverage, "available");
+}
+
+#[test]
 fn embedded_runtime_journal_and_snapshot_roundtrip_survive_receiver_reopen() {
     let nodes = DfsTestRuntime::ordered_node_ids("embedded-replication-roundtrip", 3);
     let seed = nodes[0].clone();

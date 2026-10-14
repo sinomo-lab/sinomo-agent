@@ -535,7 +535,8 @@ fn sifs_cluster_posix_routed_op_replays_deep_catch_up_across_batches() {
         mut replica,
         ..
     } = cluster;
-    let mut users_primary = users_primary;
+    drop(users_primary);
+    let mut users_primary = _runtime.metadata_primary_service("/users").unwrap();
 
     // Build a deep journal on the users primary locally (no publication).
     let local_options = DfsWriteOptions {
@@ -544,6 +545,7 @@ fn sifs_cluster_posix_routed_op_replays_deep_catch_up_across_batches() {
         wait_for_commit: true,
         foreground_replica_repair: true,
     };
+    let mut checkpointed = 0;
     for index in 0..700 {
         users_primary
             .posix_write_file(
@@ -552,23 +554,18 @@ fn sifs_cluster_posix_routed_op_replays_deep_catch_up_across_batches() {
                 local_options.clone(),
             )
             .expect("bulk create");
-    }
-
-    let stop = Arc::new(AtomicBool::new(false));
-    let users_stop = Arc::clone(&stop);
-    let users_thread = std::thread::spawn(move || {
-        let mut users_primary = users_primary;
-        while !users_stop.load(Ordering::SeqCst) {
-            users_primary
-                .process_incoming()
-                .expect("users primary pump");
-            std::thread::sleep(Duration::from_millis(1));
+        if (index + 1) % 100 == 0 {
+            checkpointed += _runtime.checkpoint_rpc_observation_window().unwrap();
         }
-        users_primary
-    });
-    let services_stop = Arc::clone(&stop);
-    let services_thread =
-        std::thread::spawn(move || pump_sifs_service_until_stop(services_primary, services_stop));
+    }
+    assert!(
+        checkpointed > 4096,
+        "full corpus observations exceed one buffer"
+    );
+
+    // Main and its native carrier already run under the real runtime owner.
+    // Drop the corpus producer before exercising the remote requester.
+    drop(users_primary);
 
     // One routed namespace op must catch the replica up through the entire
     // backlog, not just the first bounded batch.
@@ -585,10 +582,11 @@ fn sifs_cluster_posix_routed_op_replays_deep_catch_up_across_batches() {
     );
     assert!(replica.posix_stat("/users/deep-sync-marker").is_ok());
 
-    stop.store(true, Ordering::SeqCst);
-    users_thread.join().expect("users thread");
-    services_thread.join().expect("services thread");
-    std::fs::remove_dir_all(&root).ok();
+    assert_eq!(_runtime.observation_dropped_count(), 0);
+    drop((services_primary, replica, shared_kv));
+    _runtime
+        .close()
+        .expect("normal Main and native owner drain");
 }
 
 #[test]
@@ -609,7 +607,8 @@ fn sifs_cluster_posix_mkdir_all_replays_deep_catch_up_across_batches() {
         mut replica,
         ..
     } = cluster;
-    let mut users_primary = users_primary;
+    drop(users_primary);
+    let mut users_primary = _runtime.metadata_primary_service("/users").unwrap();
 
     let local_options = DfsWriteOptions {
         policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
@@ -617,6 +616,7 @@ fn sifs_cluster_posix_mkdir_all_replays_deep_catch_up_across_batches() {
         wait_for_commit: true,
         foreground_replica_repair: true,
     };
+    let mut checkpointed = 0;
     for index in 0..700 {
         users_primary
             .posix_write_file(
@@ -625,23 +625,18 @@ fn sifs_cluster_posix_mkdir_all_replays_deep_catch_up_across_batches() {
                 local_options.clone(),
             )
             .expect("bulk create");
-    }
-
-    let stop = Arc::new(AtomicBool::new(false));
-    let users_stop = Arc::clone(&stop);
-    let users_thread = std::thread::spawn(move || {
-        let mut users_primary = users_primary;
-        while !users_stop.load(Ordering::SeqCst) {
-            users_primary
-                .process_incoming()
-                .expect("users primary pump");
-            std::thread::sleep(Duration::from_millis(1));
+        if (index + 1) % 100 == 0 {
+            checkpointed += _runtime.checkpoint_rpc_observation_window().unwrap();
         }
-        users_primary
-    });
-    let services_stop = Arc::clone(&stop);
-    let services_thread =
-        std::thread::spawn(move || pump_sifs_service_until_stop(services_primary, services_stop));
+    }
+    assert!(
+        checkpointed > 4096,
+        "full corpus observations exceed one buffer"
+    );
+
+    // Main and its native carrier already run under the real runtime owner.
+    // Drop the corpus producer before exercising the remote requester.
+    drop(users_primary);
 
     replica
         .posix_mkdir_all("/users/deep-mkdir-all/leaf")
@@ -661,10 +656,11 @@ fn sifs_cluster_posix_mkdir_all_replays_deep_catch_up_across_batches() {
     assert!(replica.posix_stat("/users/deep-mkdir-all").is_ok());
     assert!(replica.posix_stat("/users/deep-mkdir-all/leaf").is_ok());
 
-    stop.store(true, Ordering::SeqCst);
-    users_thread.join().expect("users thread");
-    services_thread.join().expect("services thread");
-    std::fs::remove_dir_all(&root).ok();
+    assert_eq!(_runtime.observation_dropped_count(), 0);
+    drop((services_primary, replica, shared_kv));
+    _runtime
+        .close()
+        .expect("normal Main and native owner drain");
 }
 
 #[test]
