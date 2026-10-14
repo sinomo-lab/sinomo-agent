@@ -341,9 +341,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<(), DfsError> {
         if self.coordinator.is_commit_ready(intent_id)? {
             if let Err(error) = self.apply_committed_intent(intent_id) {
-                // A failed CAS can leave a durable prepare. Reconcile that
-                // exact record, without treating transport/authority failure
-                // or missing create metadata as proof that it was aborted.
+                // A failed author attempt may have found a different immutable
+                // prepare with the same ID. It cannot authorize publication of
+                // that body. Recognize only an already committed outcome here;
+                // pending work retains its ordinary maintenance/exact-retry
+                // recovery path and is never automatically aborted.
                 let record = self.coordinator.intent(intent_id).and_then(|intent| {
                     self.metadata_backend.as_ref().and_then(|backend| {
                         backend
@@ -353,7 +355,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     })
                 });
                 if let Some(record) = record {
-                    match self.reconcile_observed_write_intent(&record, false) {
+                    match self.reconcile_observed_write_intent_with_policy(&record, false, true) {
                         Ok(Some(updated)) if updated.status == DfsWriteIntentStatus::Committed => {
                             return Ok(());
                         }
