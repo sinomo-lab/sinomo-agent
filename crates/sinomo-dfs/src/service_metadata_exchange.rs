@@ -1021,11 +1021,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let request_id = command.request_id.clone();
         let shard_id = command.shard_id.clone();
         let next_after_sequence = command.next_after_sequence;
-        // Snapshot authority is checked against the exact committed shard
-        // assignment below. Refresh even for ordinary replica repair: a
-        // receiver may have remained online with an older cached KV snapshot
-        // while the shard epoch advanced without changing its membership.
-        self.refresh_control_plane_latest()?;
+        let retained_context = if let Some(file_system_id) = command.file_system_id.as_ref() {
+            self.retained_metadata_replica_context(file_system_id, &shard_id)?
+        } else {
+            None
+        };
         let authority_shard = if command.source_node_id != source_node_id {
             Err(DfsMetadataRejection::new(
                 DfsMetadataRejectionCode::Other,
@@ -1037,15 +1037,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 "metadata snapshot ingest requires a committed control-plane shard view"
                     .to_string(),
             ))
-        } else if let (Some(file_system_id), Some(_)) =
+        } else if let (Some(_), Some(_)) =
             (command.file_system_id.as_ref(), command.authority_epoch)
         {
-            let control_plane = self
-                .control_plane
-                .as_mut()
-                .expect("snapshot control plane checked above");
-            match DfsControlPlaneStore::new(control_plane.as_mut())
-                .get_metadata_shard(file_system_id, &shard_id.0)?
+            match retained_context
+                .as_ref()
+                .map(|context| context.shard.clone())
             {
                 None => Err(DfsMetadataRejection::new(
                     DfsMetadataRejectionCode::Other,
@@ -1094,15 +1091,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let (permit, rejection) = match authority_shard {
             Ok(shard) => {
                 let pending_membership_handoff = if command.primary_handoff_id.is_some() {
-                    let control_plane = self
-                        .control_plane
-                        .as_mut()
-                        .expect("snapshot control plane checked above");
-                    DfsControlPlaneStore::new(control_plane.as_mut())
-                        .get_metadata_shard_membership_handoff(
-                            &shard.file_system_id,
-                            &shard.shard_id,
-                        )?
+                    retained_context
+                        .as_ref()
+                        .and_then(|context| context.pending_membership_handoff.clone())
                 } else {
                     None
                 };
@@ -1480,6 +1471,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     &header,
                     &command.batch.journal_frames,
                     &probe.prepared_prefix,
+                    &probe.operation,
                 )
             } else {
                 backend.persist_journal_frames_with_replica_permit_report(
@@ -1699,6 +1691,32 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(())
     }
 
+    /// Borrow only the existing host-owned coherent configuration. Missing or
+    /// withdrawn evidence is unavailable, never an implicit KV refresh.
+    pub(crate) fn retained_metadata_replica_context(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        shard_id: &DfsMetadataShardId,
+    ) -> Result<Option<DfsMetadataReplicaShardContext>, DfsError> {
+        let Some(control) = self.control_plane.as_ref() else {
+            return Ok(None);
+        };
+        let Some(projection) = control.write_configuration_projection()? else {
+            return Ok(None);
+        };
+        let entries = projection
+            .entries(crate::metadata_authority_runtime::DFS_METADATA_AUTHORITY_PREFIX)
+            .ok_or_else(|| DfsError::Metadata {
+                message: "retained write configuration omits metadata authority".into(),
+            })?;
+        crate::metadata_authority_projection::metadata_replica_context_from_authority_entries(
+            entries,
+            &self.node_id,
+            file_system_id,
+            shard_id,
+        )
+    }
+
     fn validate_metadata_journal_batch_source(
         &mut self,
         source_node_id: &NodeId,
@@ -1711,20 +1729,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     .into(),
             ));
         }
-        // Do not reject a current primary from a stale cached KV snapshot.
-        // The permit minted below is an authority boundary, so it must use a
-        // freshly committed control-plane view on every ingest attempt.
-        let validation_started = Instant::now();
-        let refresh_started = Instant::now();
-        self.refresh_control_plane_latest()?;
-        let refresh_ms = refresh_started.elapsed().as_millis();
-        let Some(control_plane) = self.control_plane.as_mut() else {
-            return Ok(Err(
-                ("metadata journal ingest requires a committed control-plane shard view"
-                    .to_string())
-                .into(),
-            ));
-        };
         let ordinary_applied_batch =
             !command.verify_prefix_only && command.authority_probe.is_none();
         if ordinary_applied_batch
@@ -1763,42 +1767,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     .into(),
             ));
         };
-        let lookup_started = Instant::now();
-        let store = DfsControlPlaneStore::new(control_plane.as_mut());
-        let Some(shard) = store.get_metadata_shard(&file_system_id, &batch.shard_id.0)? else {
-            return Ok(Err((format!(
-                "metadata journal batch has no configured shard {}",
-                batch.shard_id.0
-            ))
-            .into()));
+        let Some(context) =
+            self.retained_metadata_replica_context(&file_system_id, &batch.shard_id)?
+        else {
+            return Ok(Err(
+                "metadata journal ingest requires the host's coherent retained configuration"
+                    .into(),
+            ));
         };
-        let pending_membership_handoff = if command
-            .prefix_probe
-            .as_ref()
-            .and_then(|probe| probe.primary_handoff_id.as_ref())
-            .is_some()
-        {
-            store.get_metadata_shard_membership_handoff(&file_system_id, &batch.shard_id.0)?
-        } else {
-            None
-        };
-        let lookup_ms = lookup_started.elapsed().as_millis();
-        crate::dfs_perf_trace(format_args!(
-            "metadata-journal-source-validation node={} source={} filesystem={} shard={} sequence={} handoff_lookup={} refresh_ms={} lookup_ms={} total_ms={}",
-            self.node_id,
-            source_node_id,
-            file_system_id,
-            batch.shard_id.0,
-            batch.next_after_sequence,
-            command
-                .prefix_probe
-                .as_ref()
-                .and_then(|probe| probe.primary_handoff_id.as_ref())
-                .is_some(),
-            refresh_ms,
-            lookup_ms,
-            validation_started.elapsed().as_millis(),
-        ));
+        let shard = context.shard;
+        let pending_membership_handoff = context.pending_membership_handoff;
         if ordinary_applied_batch
             && (command.file_system_id.as_ref() != Some(&shard.file_system_id)
                 || command.authority_epoch != Some(shard.epoch))
@@ -1830,7 +1808,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 )
                 || crate::service_replica::metadata_authority_operation_prepare_sequence(
                     &probe.operation,
-                ) != batch.next_after_sequence
+                ) > batch.next_after_sequence
+                || crate::service_replica::metadata_authority_probe_confirmation_id(probe).is_none()
+                || probe.prepared_prefix.journal_sequence != batch.next_after_sequence
             {
                 return Ok(Err((format!(
                     "metadata authority probe does not match the exact committed assignment for shard {} epoch {}",

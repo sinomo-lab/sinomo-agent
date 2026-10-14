@@ -43,8 +43,9 @@ use crate::{DfsObjectId, DfsVersion};
 
 /// Current storage schema. Older snapshots are decoded only by the external
 /// converter; the prepared-operation protocol remains independently versioned.
-/// Generation 9 requires the durable content-copy source-release stage.
-pub const METADATA_TABLE_SNAPSHOT_FORMAT_VERSION: u16 = 9;
+/// Generation 10 requires original alias comparisons in durable job frames.
+/// Prior native declarations are admitted only by the external MIG converter.
+pub const METADATA_TABLE_SNAPSHOT_FORMAT_VERSION: u16 = 10;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct MetadataTableFileGeneration {

@@ -24,6 +24,12 @@ pub enum MetadataBackendError {
         root: PathBuf,
         processed_records: usize,
     },
+    #[error("original {family} {identity} has no immutable source custody for {requirement}")]
+    MissingOriginalSourceCustody {
+        family: String,
+        identity: String,
+        requirement: String,
+    },
     #[error("metadata serialization error: {0}")]
     Serde(String),
     #[error("metadata serialization error: {message}")]

@@ -290,6 +290,7 @@ impl StandaloneImportAuthority {
                 &proposal.source_cut,
                 actual_source_root,
                 &floors,
+                &[],
             )?;
             while reader
                 .next_chunk(crate::metadata::source_ancestry::MAX_SOURCE_ANCESTRY_CHUNK_BYTES)?

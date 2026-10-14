@@ -226,8 +226,14 @@ impl NativeImportAuthority {
                 &proof,
             )?;
             self.original_scope_still_retired(&proof)?;
-            let stage = self.commit(blueprint.plan.stage_request.clone())?;
-            let activation = self.commit(blueprint.activation_request.clone())?;
+            let stage = self.observe_original_import_commit(
+                &blueprint.plan,
+                blueprint.plan.stage_request.clone(),
+            )?;
+            let activation = self.observe_original_import_commit(
+                &blueprint.plan,
+                blueprint.activation_request.clone(),
+            )?;
             Self::require_committed(&stage)?;
             Self::require_committed(&activation)?;
             if !stage.result.replayed_committed_request
@@ -237,6 +243,9 @@ impl NativeImportAuthority {
                     "placement retirement requires previously committed original requests",
                 ));
             }
+            // Receipt reads supply no new authority. Recheck the same actual
+            // retirement before this observation can advance placement work.
+            self.original_scope_still_retired(&proof)?;
         }
         Ok(())
     }

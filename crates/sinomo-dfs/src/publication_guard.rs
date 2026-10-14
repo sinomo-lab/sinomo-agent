@@ -150,6 +150,88 @@ impl DfsPublicationExecutionProvider {
             runtime,
         })
     }
+    /// Reuse the producer's existing admission and OS owner for bootstrap.
+    /// This does not acquire another permit or bind a metadata instance.
+    pub(crate) fn from_execution_owners(
+        execution: &DfsPublicationExecutionOwners,
+        authority: Arc<crate::DfsMetadataAuthorityRuntime>,
+        runtime: tokio::runtime::Handle,
+    ) -> Result<Arc<Self>> {
+        let scheduler = {
+            let admission = execution.admission.lock().map_err(|_| {
+                MetadataBackendError::Serde("publication admission is poisoned".into())
+            })?;
+            let admission = admission.as_ref().ok_or_else(|| {
+                MetadataBackendError::Serde(
+                    "bootstrap publication admission was transferred".into(),
+                )
+            })?;
+            if !admission.is_global() && !admission.is_exact() {
+                return Err(MetadataBackendError::Serde(
+                    "bootstrap publication requires actual mutation admission".into(),
+                ));
+            }
+            admission.scheduler()
+        };
+        Ok(Self::from_runtime(
+            execution.data_root.clone(),
+            Arc::clone(&execution._data_owner),
+            scheduler,
+            authority,
+            runtime,
+        ))
+    }
+
+    /// Qualify the existing initial instance field from the normal host owner.
+    /// This retained-only check grants no publication or handoff permission.
+    pub(crate) fn validate_initial_epoch_binding(
+        &self,
+        scope: &DfsPublicationOwnerScope,
+        digest: &DfsPreparedOperationDigest,
+        execution: &DfsPublicationExecutionOwners,
+        expected: &crate::DfsMetadataShardConfig,
+    ) -> Result<()> {
+        let owner = crate::runtime_host::publication_runtime_owner(scope.root())
+            .map_err(|error| MetadataBackendError::Serde(error.to_string()))?
+            .ok_or_else(|| {
+                MetadataBackendError::Serde("initial epoch has no actual data owner".into())
+            })?;
+        if !Arc::ptr_eq(&owner, &self.data_owner)
+            || !Arc::ptr_eq(&execution._data_owner, &self.data_owner)
+            || !execution.admits(scope, &digest.file_system_id, &digest.shard_id)
+            || !self.data_owner.owns_backend_root(scope.root())
+            || self.authority.storage_generation() != self.storage_generation
+        {
+            return Err(MetadataBackendError::Serde(
+                "initial epoch owner/storage generation changed".into(),
+            ));
+        }
+        let generation = self.authority.projection_generation();
+        let (shards, filesystem) = self
+            .authority
+            .cached_publication_configuration(&digest.file_system_id, generation)
+            .map_err(|error| MetadataBackendError::Serde(error.to_string()))?
+            .ok_or_else(|| {
+                MetadataBackendError::Serde("initial epoch configuration is unavailable".into())
+            })?;
+        if filesystem
+            .as_ref()
+            .is_none_or(|filesystem| filesystem.file_system_id != digest.file_system_id)
+            || !scope.matches(digest)
+            || expected.file_system_id != digest.file_system_id
+            || expected.shard_id != digest.shard_id.0
+            || expected.epoch != digest.owner_epoch
+            || !shards.iter().any(|shard| shard == expected)
+            || self.authority.storage_generation() != self.storage_generation
+            || self.authority.projection_generation() != generation
+        {
+            return Err(MetadataBackendError::Serde(
+                "initial epoch differs from the coherent configuration".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn acquire(
         &self,
         scope: &crate::DfsPreparedOperationScope,
@@ -163,7 +245,7 @@ impl DfsPublicationExecutionProvider {
             });
         }
         // The provider retains this physical backend generation. Ordinary
-        // proof/watermark updates do not replace that backend; each operation
+        // proof updates do not replace that backend; each operation
         // instead captures and revalidates the actual current authority cut.
         #[cfg(any(test, feature = "test-support"))]
         let _native_cache_context = crate::native_shard_trace::enter_metadata_cache_context(
@@ -551,12 +633,6 @@ enum DfsPublicationAuthority {
         expected: crate::DfsMetadataShardConfig,
         acknowledged: BTreeSet<sinomo_core::node::NodeId>,
     },
-    Recovery {
-        expected: crate::DfsMetadataShardConfig,
-        acknowledged: BTreeSet<sinomo_core::node::NodeId>,
-        required: usize,
-        permit: crate::DfsMetadataOperationPermit,
-    },
 }
 
 pub struct DfsPublicationGuard {
@@ -577,6 +653,38 @@ pub(crate) struct DfsPublicationCommitGuard {
 impl DfsPublicationCommitGuard {
     pub(crate) fn source_witness(&self) -> Option<&crate::DfsSourceAdoptionWitness> {
         self._guard.source_witness.as_deref()
+    }
+    pub(crate) fn record_source_terminal(
+        &self,
+        commit: &crate::DfsPreparedOperationCommitReference,
+        prefix: &crate::DfsMetadataPrefixProof,
+        storage: crate::metadata_table_store::MetadataTableStorageGeneration,
+    ) -> Result<()> {
+        let Some(witness) = self
+            .source_witness()
+            .filter(|source| source.supplies_source_family())
+        else {
+            return Ok(());
+        };
+        let DfsPublicationAuthority::FullShard { expected, .. } = &self._guard.authority else {
+            return Err(MetadataBackendError::Serde(
+                "native source terminal requires its full assigned author proof".into(),
+            ));
+        };
+        let execution = self._guard.execution.as_ref().ok_or_else(|| {
+            MetadataBackendError::Serde(
+                "native source terminal lost actual effect execution".into(),
+            )
+        })?;
+        witness.record_kernel_terminal(
+            &self._guard.writer.scope,
+            expected,
+            &execution._data_owner,
+            &self._guard.digest,
+            commit,
+            prefix,
+            storage,
+        )
     }
 }
 
@@ -788,6 +896,25 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
         &mut self,
         mut payload: crate::DfsPreparedOperationPayload,
     ) -> Result<DfsPreparedOperationDigest> {
+        let mut reservations = self
+            .metadata_backend
+            .as_ref()
+            .ok_or_else(|| {
+                MetadataBackendError::Serde("prepare requires a current durable backend".into())
+            })?
+            .prepared_operation_reservations(&payload)?;
+        reservations.sort_by_key(|record| record.digest.prepare_sequence);
+        for record in reservations {
+            if record.owner_epoch >= payload.owner_epoch || payload.metadata_effects.iter().any(|effect|
+                matches!(effect, crate::DfsPreparedMetadataEffect::ResolvePreparedOperation {digest,..} if digest == &record.digest)) {
+                continue;
+            }
+            // An older author was retired by the existing handoff/epoch fence.
+            // Recovery still validates the current primary, original readset,
+            // full shard proof and body; failure leaves the reservation intact.
+            self.recover_one_prepared_operation(record)
+                .map_err(|error| MetadataBackendError::Serde(error.to_string()))?;
+        }
         self.rebind_prepared_publication_instance_if_frozen(&payload)
             .map_err(|error| MetadataBackendError::Serde(error.to_string()))?;
         let stored_file_system = self
@@ -797,7 +924,19 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
                 MetadataBackendError::Serde("prepare requires a current durable backend".into())
             })?
             .get_file_system_on_shard(&payload.shard_id, &payload.file_system_id)?;
-        if !payload.metadata_effects.iter().any(|effect| matches!(effect,
+        let supersedes_original = payload.metadata_effects.iter().any(|effect| {
+            matches!(
+                effect,
+                crate::DfsPreparedMetadataEffect::ResolvePreparedOperation {
+                    status: crate::DfsPreparedOperationStatus::Superseded,
+                    ..
+                }
+            )
+        });
+        // Recovery re-certifies the original complete body. A refreshed local
+        // filesystem projection must not append an unrelated effect to it;
+        // the kernel still checks the exact retiring body and current authority.
+        if !supersedes_original && !payload.metadata_effects.iter().any(|effect| matches!(effect,
             crate::DfsPreparedMetadataEffect::PutFileSystem { file_system } if file_system.file_system_id == payload.file_system_id)) {
             let file_system = self.metadata.filesystems.get(&payload.file_system_id).cloned()
                 .or_else(|| stored_file_system.clone())
@@ -1056,12 +1195,13 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
             prepare_sequence: digest.prepare_sequence,
             payload_digest: digest.payload_digest.clone(),
         };
-        let authorization = if let Some(control) = self.control_plane.as_mut() {
-            let shard = crate::DfsControlPlaneStore::new(control.as_mut())
-                .get_metadata_shard(&digest.file_system_id, &digest.shard_id.0)?
+        let authorization = if self.control_plane.is_some() {
+            let shard = self
+                .retained_metadata_replica_context(&digest.file_system_id, &digest.shard_id)?
                 .ok_or_else(|| crate::DfsError::Metadata {
-                    message: "publication shard is unavailable".into(),
-                })?;
+                    message: "publication requires the host's coherent shard configuration".into(),
+                })?
+                .shard;
             let batch = self
                 .metadata_backend
                 .as_ref()
@@ -1091,6 +1231,11 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
         } else {
             Arc::new(shard_fence_guard(&scope))
         };
+        let provider = self.publication_provider.current();
+        let clustered = authorization.as_ref().map(|authorization| {
+            let crate::DfsCanonicalAuthorization::FullShard { expected_shard, .. } = authorization;
+            expected_shard
+        });
         let writer = self
             .metadata_backend
             .as_mut()
@@ -1100,12 +1245,13 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
                 &digest.shard_id,
                 digest,
                 source_witness.as_deref(),
+                provider.as_deref(),
+                execution.as_deref(),
+                clustered,
             )?;
         #[cfg(any(test, feature = "test-support"))]
         let mut native_trace =
             crate::native_shard_trace::begin_guard_trace(scope.root(), &digest.shard_id, digest);
-        #[cfg(any(test, feature = "test-support"))]
-        let final_read_scope = native_trace.as_ref().map(|trace| trace.enter_final_read());
         let authority = match authorization {
             Some(crate::DfsCanonicalAuthorization::FullShard {
                 expected_shard,
@@ -1113,10 +1259,22 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
                 operation_digest,
                 prepare_sequence,
             }) => {
-                if operation_digest != digest.payload_digest
-                    || prepare_sequence != digest.prepare_sequence
-                    || !self.metadata_shard_assignment_still_exact(&expected_shard)?
-                {
+                let configuration_matches = operation_digest == digest.payload_digest
+                    && prepare_sequence == digest.prepare_sequence
+                    && {
+                        #[cfg(any(test, feature = "test-support"))]
+                        let _native_configuration_scope = native_trace
+                            .as_ref()
+                            .map(|trace| trace.enter_retained_configuration());
+                        // Observe this existing verified view, not another read.
+                        self.retained_metadata_replica_context(
+                            &digest.file_system_id,
+                            &digest.shard_id,
+                        )?
+                        .as_ref()
+                        .is_some_and(|context| context.shard == expected_shard)
+                    };
+                if !configuration_matches {
                     return Err(crate::DfsError::StaleOwnerEpoch {
                         file_system_id: digest.file_system_id.clone(),
                         local_node_id: self.node_id.clone(),
@@ -1127,43 +1285,6 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
                 DfsPublicationAuthority::FullShard {
                     expected: expected_shard,
                     acknowledged: acknowledged_node_ids.into_iter().collect(),
-                }
-            }
-            Some(crate::DfsCanonicalAuthorization::ClusterQuorum {
-                expected_shard,
-                acknowledged_node_ids,
-                operation_digest,
-                permit_id,
-                native_permit,
-            }) => {
-                if operation_digest != digest.payload_digest
-                    || permit_id.is_empty()
-                    || !self.metadata_shard_assignment_still_exact(&expected_shard)?
-                {
-                    return Err(crate::DfsError::StaleOwnerEpoch {
-                        file_system_id: digest.file_system_id.clone(),
-                        local_node_id: self.node_id.clone(),
-                        primary_node_id: expected_shard.primary_node_id,
-                        epoch: expected_shard.epoch,
-                    });
-                }
-                let permit = native_permit.filter(|permit| permit.permit_id == permit_id
-                    ).ok_or_else(|| crate::DfsError::Metadata {
-                        message: "V7 recovery publication lacks an exact fresh native Raft permit receipt".into(),
-                    })?;
-                let required = expected_shard
-                    .replica_node_ids
-                    .iter()
-                    .chain(std::iter::once(&expected_shard.primary_node_id))
-                    .collect::<BTreeSet<_>>()
-                    .len()
-                    / 2
-                    + 1;
-                DfsPublicationAuthority::Recovery {
-                    expected: expected_shard,
-                    acknowledged: acknowledged_node_ids.into_iter().collect(),
-                    required,
-                    permit,
                 }
             }
             None => {
@@ -1209,8 +1330,6 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
                 }
             }
         };
-        #[cfg(any(test, feature = "test-support"))]
-        drop(final_read_scope);
         if let Some(witness) = source_witness.as_deref() {
             witness.validate_for(&payload, digest)?;
         }
@@ -1239,17 +1358,6 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
                 } => NativeGuardAuthorityV1::FullShard {
                     expected: expected.clone(),
                     authenticated_acknowledged_node_ids: acknowledged.iter().cloned().collect(),
-                },
-                DfsPublicationAuthority::Recovery {
-                    expected,
-                    acknowledged,
-                    required,
-                    permit,
-                } => NativeGuardAuthorityV1::Recovery {
-                    expected: expected.clone(),
-                    authenticated_acknowledged_node_ids: acknowledged.iter().cloned().collect(),
-                    required_metadata_quorum: *required,
-                    native_permit: permit.clone(),
                 },
             };
             let execution = guard.execution.as_ref().map(|owners| {
@@ -1343,26 +1451,6 @@ impl DfsPublicationGuard {
                     && expected.shard_id == digest.shard_id.0
                     && expected.epoch == digest.owner_epoch
                     && &required == acknowledged
-            }
-            DfsPublicationAuthority::Recovery {
-                expected,
-                acknowledged,
-                required,
-                permit,
-            } => {
-                let members = expected
-                    .replica_node_ids
-                    .iter()
-                    .chain(std::iter::once(&expected.primary_node_id))
-                    .cloned()
-                    .collect::<BTreeSet<_>>();
-                expected.file_system_id == digest.file_system_id
-                    && expected.shard_id == digest.shard_id.0
-                    && expected.epoch == digest.owner_epoch
-                    && *required == members.len() / 2 + 1
-                    && acknowledged.contains(&expected.primary_node_id)
-                    && acknowledged.intersection(&members).count() >= *required
-                    && permit.matches_native_preparation(expected, &digest)
             }
         };
         if !valid_authority {

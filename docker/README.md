@@ -81,8 +81,75 @@ SINOMO_TEST_PROJECT=sinomo-dfs-verification \
 SINOMO_TEST_DFS_ONLY=1 bash docker/test-cluster.sh
 ```
 
+For a usable DFS correctness milestone with latency/throughput optimization deferred,
+select the separate maintained baseline lane on a disposable project:
+
+```sh
+SINOMO_TEST_PROJECT=sinomo-dfs-baseline \
+SINOMO_TEST_DFS_BASELINE_ONLY=1 \
+SINOMO_TEST_BUILD=0 \
+SINOMO_TEST_BINARY=/absolute/path/to/verified-sinomo \
+SINOMO_DOCKER_BINARY=/absolute/path/to/verified-sinomo \
+SINOMO_TEST_ARTIFACTS=/absolute/path/to/fresh-baseline-artifacts \
+flock /tmp/sinomo-maintenance-build.lock bash docker/test-cluster.sh
+```
+
+This retains formation, authenticated network readiness, explicit guarded six-member
+metadata assignment, all-node mutation/convergence, and required debug/tracing/CPU
+profiler support. It then runs baseline invariants, read-your-write, cross-node
+visibility, prefix rename, real disk damage, network interruption/heal, process
+restart durability, core-only component removal/restoration with lost replies,
+normal mutations, retained-version restart/replay, and native primary handoff.
+Final invariants, routed status, convergence and the same joint CPU/network quiet
+gate are attempted even after an earlier functional failure. Existing scenario
+commands, operation IDs, deadlines and byte/receipt assertions are unchanged.
+A failed functional or quiet gate remains a failed baseline.
+
+The maintained network interruption case seeds a real file under the complete
+six-member metadata assignment, then disconnects assigned node6. The attempted
+overwrite must leave its exact caller-owned operation durably Prepared and its
+new version nonvisible; a generic CLI error is insufficient evidence. The probe
+reads the native primary's typed prepare/canonical cut, without classifying error
+text or claiming that every internal failure is a quorum failure. After the real
+network heals, the same node, operation ID, bytes and captured ordinary write
+options must produce the matching Applied receipt. Cross-node reads, a fresh new
+write and node6 process restart/read then verify recovery. Neither partial
+metadata publication nor a replacement operation is accepted. Both the baseline
+and full lanes use this contract with their existing deadlines and transports.
+
+
+`dfs-baseline-scope.json`, `REPORT.md` and `report.json` list every required case
+and explicitly mark separate codec, CLI latency, payload, raw disk, bulk, large-file
+and KV performance distributions as **NOT_RUN**. This lane makes no performance
+acceptance claim and does not relax any workload threshold. `SINOMO_TEST_DFS_ONLY=1`
+and the default full verifier keep their existing performance gates. The baseline
+selector is mutually exclusive with the other focused lanes and requires fresh
+artifact paths; `REUSE=1` still means retained-state evidence, not clean formation.
+
+The native metadata roster/expected epochs and pending/activated handoff reports
+are retained in `dfs-requested-topology*.json`, the convergence probe artifacts,
+and `dfs-handoff/handoff.json`. Six containers do not establish six Raft voters:
+default fresh formation has one seed voter and five learners. Multi-voter failure
+and rollout/restart evidence requires the separate maintained three-voter rollout
+recovery lane. An unrelated running application is never stopped by this lane;
+explicitly authorize coexistence with `SINOMO_TEST_ALLOW_OTHER_COMPOSE=1` when needed.
+
 Convergence checks obtain pending handoffs and shard epochs from one authoritative
 KV snapshot per probe; the asynchronous on-disk checkpoint is not readiness evidence.
+
+A fresh harness run explicitly requests its six-node metadata assignment through
+`sinomo dfs metadata shard set-replicas SHARD --expected-epoch EPOCH --replica NODE`
+(repeat `--replica` for every non-primary member), then uses the existing
+`transfer-primary` command to place root, services, and users on node1, node2,
+and node3. Each phase leaves the active assignment unchanged until the native
+retiring fence and joint prefix acknowledgements authorize activation. The
+replica command rejects a stale epoch, duplicate replica, or current primary in
+the replica list; its existing participant admission also requires authorized
+members with the current prepare capability. The harness records intents and
+exact activated epochs within its unchanged convergence deadline. Retained
+`REUSE=1` projects keep their administrative assignments; discovery never expands
+a committed assignment automatically.
+
 
 This resets and removes the selected disposable project's volumes. `KEEP=1`
 is spelled `SINOMO_TEST_KEEP=1` and retains it at teardown only;
@@ -728,7 +795,8 @@ is a diagnostic comparison, not acceptance.
 
 After transport readiness and DFS metadata-shard placement have converged, and before each
 no-load realtime network leg, the benchmark requires one uninterrupted 30-second monotonic
-interval in which every one of the six service containers remains at or below 10 percent CPU.
+interval in which every one of the six service containers remains at or below 10 percent CPU
+and 65,536 bytes/second of combined TX plus RX over all interfaces, including loopback.
 DFS convergence is deliberately outside the Docker-only 60-second cluster-formation gate,
 but it is a prerequisite for quietness: otherwise final shard handoff commits can race the
 idle-load measurement. The harness searches for the sustained quiet interval for at most 120
@@ -738,7 +806,17 @@ missing row, stream exit, or five-second stream stall resets the full duration. 
 aggregate container CPU is the authority, so main daemons, shadow supervisors, entrypoint
 helpers, and any short-lived process inside the container are all charged to the gate. The
 harness snapshots the exact main/shadow PID plus process start tick before and after the
-candidate interval; any unavailable or changed generation resets the complete duration. The
+candidate interval; any unavailable or changed generation resets the complete duration.
+The same stats groups trigger read-only `/proc/net/dev` counter captures through Docker exec;
+exact integer deltas, not Docker's rounded NetIO text, determine network eligibility. The
+existing main/shadow scanner also verifies that both roles share the sampled network namespace.
+Missing Linux counters, resets, a changed namespace or interface inventory, and stale samples
+are unavailable evidence and reset the whole window. This works through the selected Docker
+context for Linux containers; unsupported counters fail closed. It never queries another project.
+Network captures use the same monotonic window and inherited 120-second deadline. After the
+final network endpoint is sealed, the continuous CPU stream also covers the read-only collector
+exits. The network window ends at that sealed joint cut; later CPU-only cleanup is reported
+separately. All observation work within the window remains charged; no overhead is subtracted. The
 stats stream remains active during the final generation scan, and the gate cannot pass until a
 quiet cumulative interval for every container covers through the end of that scan. It writes
 every per-container interval, wall-clock timestamp, and monotonic coverage boundary to
@@ -753,8 +831,9 @@ Each quiet gate also launches a bounded idle diagnostic in
 captures CPU profiles on all six main daemons, and records background-work
 counter deltas alongside stage/I/O, per-route RPC and process-window tables. Collection runs
 during the gate and its overhead is included. The generated verification report
-copies the gate verdict and per-node CPU sample summaries directly from the
-continuous stream. Trace loss or missing counters remains explicit, independently
+copies the gate verdict, per-node CPU stream summaries and exact network interval summaries.
+Raw all-interface endpoints and unavailable rows are retained under
+`network-quiet-<leg>.network/`. Trace loss or missing counters remains explicit, independently
 of the CPU gate verdict. To investigate an already running, verified cluster,
 use `python3 docker/profile-idle.py --help`; the driver never builds or changes
 cluster lifecycle.

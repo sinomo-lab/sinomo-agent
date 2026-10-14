@@ -102,6 +102,8 @@ pub enum RpcPhase {
     Constructed,
     BeforeDispatch,
     AfterDispatch,
+    /// Normal Hosted decoder returned the actual namespace header.
+    Decoded,
     Completed,
     EndedWithoutResponse,
 }
@@ -110,7 +112,7 @@ pub struct RpcObservation {
     pub source: NodeId,
     pub target: NodeId,
     pub call_id: u64,
-    /// Actual inline repair head only; streamed values and body readers stay untouched.
+    /// Actual inline repair or normally decoded namespace head; observation never reads a body.
     pub dfs_frame_id: Option<u64>,
     pub dfs_intent_id: Option<String>,
     pub dfs_request_id: Option<String>,
@@ -125,6 +127,45 @@ pub struct RpcObservation {
     pub streamed_value: bool,
     pub body_bytes: Option<u64>,
 }
+// The context carries only one real carrier invocation's observation identity.
+// It wraps the unchanged registry future and never authorizes or modifies work.
+#[derive(Clone)]
+struct NativeRpcCallContext {
+    fabric: std::sync::Weak<Fabric>,
+    observation: RpcObservation,
+}
+tokio::task_local! {
+    static NATIVE_RPC_CALL_CONTEXT: NativeRpcCallContext;
+}
+
+/// Observe the command returned by the normal decoder after signer validation.
+/// Streamed value bodies have already been consumed by that ordinary decoder;
+/// this observer copies only existing scalar identity fields.
+pub(crate) fn observe_decoded_namespace_call(command: &crate::DfsMessageCommand) {
+    let crate::DfsNetworkMessage::NamespaceRequest(request) = &command.routed_message.message
+    else {
+        return;
+    };
+    let _ = NATIVE_RPC_CALL_CONTEXT.try_with(|context| {
+        let head = &command.routed_message;
+        if context.observation.route != crate::DFS_DATA_NAMESPACE_ROUTE
+            || context.observation.source != head.source_node_id
+            || context.observation.target != head.target_node_id
+        {
+            return;
+        }
+        let Some(fabric) = context.fabric.upgrade() else {
+            return;
+        };
+        let mut observation = context.observation.clone();
+        observation.phase = RpcPhase::Decoded;
+        observation.dfs_frame_id = Some(head.frame_id);
+        observation.dfs_request_id = Some(request.request_id.clone());
+        observation.dfs_file_system_id = Some(request.file_system_id.clone());
+        fabric.record(observation);
+    });
+}
+
 /// Bounded negative changes to replies already produced by native read RPC.
 #[derive(Clone, Copy)]
 pub enum ReadReplyFault {
@@ -239,10 +280,21 @@ struct Endpoint {
     data_dir: Arc<SinomoDataDir>,
     cluster: Arc<dyn ClusterAccess>,
     registry: ServiceRegistry,
+    kv_available: Arc<AtomicBool>,
     accepting: AtomicBool,
     active: AtomicUsize,
     idle: Notify,
 }
+impl Endpoint {
+    fn admits_route(&self, route: &str) -> bool {
+        if sinomo_core::kv::CLUSTER_KV_RPC_ROUTES.contains(&route) {
+            self.kv_available.load(Ordering::Acquire) && self.registry.owns(route)
+        } else {
+            self.accepting.load(Ordering::Acquire)
+        }
+    }
+}
+
 struct Transfer {
     source: NodeId,
     target: NodeId,
@@ -435,13 +487,23 @@ impl Carrier {
     ) -> Result<ObjectRpcResult, NetworkError> {
         let endpoint = {
             let nodes = self.fabric.nodes.lock().expect("DFS test nodes");
+            let source = nodes
+                .get(&self.source)
+                .ok_or_else(|| NetworkError::UnknownNode {
+                    node_id: self.source.clone(),
+                })?;
+            if !source.admits_route(&call.request.route) {
+                return Err(NetworkError::UnknownNode {
+                    node_id: self.source.clone(),
+                });
+            }
             let endpoint = nodes
                 .get(target)
                 .cloned()
                 .ok_or_else(|| NetworkError::UnknownNode {
                     node_id: target.clone(),
                 })?;
-            if !endpoint.accepting.load(Ordering::Acquire) {
+            if !endpoint.admits_route(&call.request.route) {
                 return Err(NetworkError::UnknownNode {
                     node_id: target.clone(),
                 });
@@ -455,7 +517,7 @@ impl Carrier {
             observation: observation.clone(),
             completed: false,
         };
-        if !endpoint.accepting.load(Ordering::Acquire) {
+        if !endpoint.admits_route(&call.request.route) {
             return Err(NetworkError::UnknownNode {
                 node_id: target.clone(),
             });
@@ -472,10 +534,11 @@ impl Carrier {
                 ));
             }
             Some(FaultAction::TransientRouteFailureBeforeDispatch) => {
-                return Err(NetworkError::Io {
-                    operation: "cluster target rpc".into(),
-                    detail: "bounded injected no usable route before dispatch".into(),
-                });
+                return Err(NetworkError::delivery_failed(
+                    "cluster target rpc",
+                    NetworkDeliveryState::DefinitelyNotSent,
+                    "bounded injected no usable route before dispatch",
+                ));
             }
             Some(FaultAction::PauseBeforeDispatch(gate)) => {
                 let permit = gate.acquire().await.map_err(|_| {
@@ -489,7 +552,7 @@ impl Carrier {
             }
             _ => {}
         }
-        if !endpoint.accepting.load(Ordering::Acquire) {
+        if !endpoint.admits_route(&call.request.route) {
             return Err(NetworkError::delivery_failed(
                 "shared DFS test dispatch admission",
                 NetworkDeliveryState::DefinitelyNotSent,
@@ -559,6 +622,7 @@ impl Carrier {
             .lock()
             .expect("DFS test source identity")
             .get(&self.source)
+            .filter(|source| source.admits_route(&incoming.request.route))
             .map(|source| source.data_dir.clone());
         let source_data = source_state.ok_or_else(|| NetworkError::UnknownNode {
             node_id: self.source.clone(),
@@ -585,9 +649,15 @@ impl Carrier {
             Box::new(ReplySink(response_tx)),
         );
         dispatch_started.store(true, Ordering::Release);
-        endpoint
-            .registry
-            .dispatch(context, incoming.request)
+        let native_call = NativeRpcCallContext {
+            fabric: Arc::downgrade(&self.fabric),
+            observation: observation.clone(),
+        };
+        NATIVE_RPC_CALL_CONTEXT
+            .scope(
+                native_call,
+                endpoint.registry.dispatch(context, incoming.request),
+            )
             .await
             .map_err(|error| NetworkError::Io {
                 operation: "shared DFS native service dispatch".into(),
@@ -2055,7 +2125,11 @@ impl DfsTestRuntime {
             sinomo_module::cluster_service_catalog_publisher_component_factory()
                 .map_err(|error| error.to_string())?,
         );
-        let mut factories = vec![catalog];
+        let hosted: Arc<dyn sinomo_module::ComponentFactory> = Arc::new(
+            crate::runtime_host::hosted_cluster_kv_test_factory(Arc::clone(&self.kv_peers))
+                .map_err(|error| error.to_string())?,
+        );
+        let mut factories = vec![hosted, catalog];
         if dfs_enabled {
             factories.insert(0, dfs);
         }
@@ -2135,6 +2209,7 @@ impl DfsTestRuntime {
                 .active_snapshot()
                 .registry()
                 .clone(),
+            kv_available: Arc::clone(&endpoint.kv_available),
             accepting: AtomicBool::new(false),
             active: AtomicUsize::new(0),
             idle: Notify::new(),
@@ -2203,10 +2278,11 @@ impl DfsTestRuntime {
             fabric: self.fabric.clone(),
             origin: RpcOrigin::RegisteredHost,
         });
-        let cluster = crate::runtime_host::test_cluster_access_for_node_on_voter(
+        let cluster = crate::runtime_host::test_cluster_access_for_node_on_voter_with_rpc(
             &data_dir,
             self.data_dir(&self.primary),
             Some(Arc::clone(&self.kv_peers)),
+            Some(carrier.clone()),
         );
         let context = ComponentContext::new(data_dir.clone())
             .with_host_role(ComponentHostRole::Embedded)
@@ -2231,6 +2307,7 @@ impl DfsTestRuntime {
                 .active_snapshot()
                 .registry()
                 .clone(),
+            kv_available: Arc::clone(&self.nodes[node].kv_available),
             accepting: AtomicBool::new(false),
             active: AtomicUsize::new(0),
             idle: Notify::new(),
@@ -3156,6 +3233,24 @@ impl DfsTestRuntime {
         assert!(rules.len() < 64);
         rules.push(rule)
     }
+    /// Remove only the caller's exact configured negative transport rules.
+    /// Already-running calls retain their cloned actions; native state, replies,
+    /// other rules and sticky exhaustion accounting remain unchanged.
+    #[cfg(test)]
+    pub(crate) fn remove_faults_matching(
+        &self,
+        mut selected: impl FnMut(&FaultRule) -> bool,
+    ) -> usize {
+        let mut rules = self
+            .fabric
+            .faults
+            .lock()
+            .expect("native fixture fault rules");
+        let before = rules.len();
+        rules.retain(|rule| !selected(rule));
+        before - rules.len()
+    }
+
     /// Heal only configured transport faults. This neither acknowledges work
     /// nor changes persisted state; already-paused calls still own their gates.
     pub fn clear_faults(&self) {
@@ -3911,6 +4006,7 @@ pub(crate) fn observe_native_kv_request(
     }
     Ok(())
 }
+
 impl DfsTestRuntime {
     /// Observe/fail an actual native KV request before its ordinary admission.
     /// This hook can never supply a positive response, receipt or authority.
@@ -4194,5 +4290,158 @@ impl DfsTestRuntime {
             _registration: DfsTestNativeKvHookRegistration(entry),
             fault,
         })
+    }
+}
+
+#[cfg(test)]
+mod normal_native_kv_admission_tests {
+    use super::*;
+    use sinomo_core::kv::{KvOp, KvTxn, KvTxnRequest};
+
+    #[test]
+    fn mounted_native_kv_routes_work_before_dfs_preparation_and_stop_removes_admission() {
+        let name = "native-core-kv-before-dfs-prepared";
+        let node = DfsTestRuntime::ordered_node_ids(name, 1).remove(0);
+        let mut native = DfsTestRuntime::new(name, node.clone()).unwrap();
+        native.bootstrap_planned_cluster().unwrap();
+        native.prepare_projection(&node).unwrap();
+        let carrier = Carrier {
+            source: node.clone(),
+            fabric: Arc::clone(&native.fabric),
+            origin: RpcOrigin::RegisteredHost,
+        };
+        let request = KvTxnRequest::generated(KvTxn {
+            compares: Vec::new(),
+            success: vec![KvOp::Put {
+                key: "/test/core-kv-before-dfs-ready".into(),
+                value: b"actual native control before DFS preparation".to_vec(),
+                lease_id: None,
+            }],
+            failure: Vec::new(),
+        });
+        let payload = sinomo_core::kv::cluster_kv_txn_rpc_payload(&request).unwrap();
+        let call = || {
+            ObjectRpcCall::value(ObjectRpcRequest::from_encoded_body(
+                payload.route,
+                payload.category,
+                payload.body.clone(),
+            ))
+        };
+        assert!(
+            run_rpc(carrier.call_async(&node, call(), ClusterObjectRpcOptions::default(), true))
+                .is_err(),
+            "no mounted endpoint can admit control work"
+        );
+        native.mount_node(&node).unwrap();
+        let endpoint = Arc::clone(&native.fabric.nodes.lock().unwrap()[&node]);
+        assert!(
+            !endpoint.accepting.load(Ordering::Acquire),
+            "normal DFS preparation has not run"
+        );
+        assert!(endpoint.kv_available.load(Ordering::Acquire));
+        assert!(endpoint.admits_route(sinomo_core::kv::CLUSTER_KV_TXN_ROUTE));
+        assert!(!endpoint.admits_route(crate::DFS_DIRECT_READ_ROUTE));
+        let response =
+            run_rpc(carrier.call_async(&node, call(), ClusterObjectRpcOptions::default(), true))
+                .unwrap();
+        let response = executor()
+            .block_on(response.into_materialized_value_response(64 * 1024))
+            .unwrap();
+        let response: sinomo_core::kv::ClusterKvTxnRpcResponse = response.decode_body().unwrap();
+        assert!(response.txn_response.as_ref().unwrap().succeeded);
+        let outcome = executor()
+            .block_on(
+                endpoint
+                    .cluster
+                    .kv_request_outcome_authoritative_async(request.request_id.clone()),
+            )
+            .unwrap();
+        sinomo_core::kv::validate_cluster_kv_request_outcome_read(&outcome).unwrap();
+        let sinomo_core::kv::KvRequestOutcome::Committed(record) = outcome.outcome else {
+            panic!("normal Core route must have its actual committed native receipt");
+        };
+        assert_eq!(record.request_id, request.request_id);
+        assert_eq!(record.command_digest, response.command_digest);
+        assert_eq!(record.txn_response, response.txn_response);
+        let dfs = ObjectRpcCall::value(
+            ObjectRpcRequest::encode_body(crate::DFS_DIRECT_READ_ROUTE, "dfs", &()).unwrap(),
+        );
+        assert!(
+            run_rpc(carrier.call_async(&node, dfs, ClusterObjectRpcOptions::default(), true))
+                .is_err()
+        );
+        assert!(!endpoint.accepting.load(Ordering::Acquire));
+        // Negative control only: even a prepared DFS admission cannot replace
+        // the actual native KV owner's live flag. No request is dispatched.
+        endpoint.accepting.store(true, Ordering::Release);
+        endpoint.kv_available.store(false, Ordering::Release);
+        assert!(!endpoint.admits_route(sinomo_core::kv::CLUSTER_KV_TXN_ROUTE));
+        endpoint.accepting.store(false, Ordering::Release);
+        endpoint.kv_available.store(true, Ordering::Release);
+        let kv_available = Arc::clone(&endpoint.kv_available);
+        drop(endpoint); // Do not retain mounted DFS services/data owners over stop.
+        native.stop_node(&node).unwrap();
+        assert!(!kv_available.load(Ordering::Acquire));
+        assert!(!native.fabric.nodes.lock().unwrap().contains_key(&node));
+        let paths = ClusterPaths::new(native.data_dir(&node));
+        let wal = paths.kv_paths().raft_wal_paths(&node).wal;
+        let before = std::fs::read(&wal).unwrap();
+        assert!(
+            run_rpc(carrier.call_async(&node, call(), ClusterObjectRpcOptions::default(), true))
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&wal).unwrap(), before);
+        native.close().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod owned_fault_cleanup_tests {
+    use super::*;
+
+    #[test]
+    fn removing_owned_capture_rule_preserves_an_unknown_capture_with_the_same_selector() {
+        // Pure negative-rule configuration; no receiver, ACK, quorum or Ready
+        // outcome is manufactured or exercised by this utility test.
+        let name = "native-owned-fault-rule-cleanup-data";
+        let nodes = DfsTestRuntime::ordered_node_ids(name, 2);
+        let mut runtime = DfsTestRuntime::new(name, nodes[0].clone()).unwrap();
+        runtime.define_node(nodes[1].clone()).unwrap();
+        let owned = Arc::new(Mutex::new(StageExchangeCapture::default()));
+        let unknown = Arc::new(Mutex::new(StageExchangeCapture::default()));
+        let configured = |capture| FaultRule {
+            source: Some(nodes[0].clone()),
+            target: Some(nodes[1].clone()),
+            route: Some(crate::DFS_DATA_STAGE_BLOB_ROUTE.into()),
+            call_id: None,
+            origin: Some(RpcOrigin::RegisteredHost),
+            remaining_hits: 1,
+            action: FaultAction::CaptureStageExchangeAndLoseAfterDispatch(capture),
+        };
+        runtime.install_fault(configured(Arc::clone(&owned)));
+        runtime.install_fault(configured(Arc::clone(&unknown)));
+        let removed = runtime.remove_faults_matching(|rule| {
+            matches!(&rule.action, FaultAction::CaptureStageExchangeAndLoseAfterDispatch(capture)
+                if Arc::ptr_eq(capture, &owned))
+        });
+        assert_eq!(removed, 1);
+        assert_eq!(runtime.remove_faults_matching(|rule| {
+            matches!(&rule.action, FaultAction::CaptureStageExchangeAndLoseAfterDispatch(capture)
+                if Arc::ptr_eq(capture, &owned))
+        }), 0);
+        {
+            let remaining = runtime.fabric.faults.lock().unwrap();
+            assert_eq!(remaining.len(), 1);
+            assert_eq!(remaining[0].remaining_hits, 1);
+            assert!(matches!(&remaining[0].action,
+                FaultAction::CaptureStageExchangeAndLoseAfterDispatch(capture)
+                    if Arc::ptr_eq(capture, &unknown)));
+            assert_eq!(runtime.fabric.exhausted_budgets.load(Ordering::Relaxed), 0);
+        }
+        runtime.remove_faults_matching(|rule| {
+            matches!(&rule.action, FaultAction::CaptureStageExchangeAndLoseAfterDispatch(capture)
+                if Arc::ptr_eq(capture, &unknown))
+        });
+        runtime.close().unwrap();
     }
 }

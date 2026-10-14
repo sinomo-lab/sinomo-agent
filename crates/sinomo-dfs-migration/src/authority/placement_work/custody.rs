@@ -50,6 +50,7 @@ pub(crate) struct PlacementCustodyResponse {
     pub(crate) stored_request_id: Option<KvRequestId>,
     pub(crate) envelope: Option<PlacementCustodyEnvelope>,
 }
+
 impl NativeImportAuthority {
     pub(super) fn placement_coordinator(
         &self,
@@ -227,31 +228,54 @@ impl NativeImportAuthority {
         }
         sinomo_core::kv::decode_kv_value(rows[0]).map_err(error)
     }
-    pub(super) fn placement_outcome(&self, request: &KvTxnRequest) -> Result<Option<bool>> {
-        let read = block_native(
-            &self.runtime,
-            self.cluster()?
-                .kv_request_outcome_authoritative_async(request.request_id.clone()),
-        )?;
+    pub(super) fn placement_outcome(
+        &self,
+        request: &KvTxnRequest,
+        permission_subject: &sinomo_core::node::NodeId,
+        captured_rows: &[MetadataCapturedKvEntry],
+    ) -> Result<Option<bool>> {
+        self.placement_outcome_evaluated(request, permission_subject, captured_rows)
+            .map_err(NativeEvaluationError::into_metadata)
+    }
+    fn placement_outcome_evaluated(
+        &self,
+        request: &KvTxnRequest,
+        permission_subject: &sinomo_core::node::NodeId,
+        captured_rows: &[MetadataCapturedKvEntry],
+    ) -> std::result::Result<Option<bool>, NativeEvaluationError> {
+        // The outer bridge only preserves its execution error. Native service
+        // errors remain typed DATA until the shared product evaluation ends.
+        let read = block_native(&self.runtime, async {
+            Ok::<_, sinomo_dfs::MetadataBackendError>(
+                self.cluster()?
+                    .kv_request_outcome_authoritative_async(request.request_id.clone())
+                    .await,
+            )
+        })?
+        .map_err(NativeEvaluationError::Native)?;
+        sinomo_core::kv::validate_cluster_kv_request_outcome_read(&read).map_err(error)?;
         current_authority(&read.authority)?;
         let record = match read.outcome {
             KvRequestOutcome::Committed(record) => record,
             KvRequestOutcome::RejectedBeforeCommit { .. } => return Ok(Some(false)),
             KvRequestOutcome::Unknown { .. } | KvRequestOutcome::Expired => return Ok(None),
         };
-        let exact = sinomo_core::kv::kv_command_digest(&KvCommand::Txn(request.txn.clone()))
-            .map_err(error)?;
+        Self::validate_original_command_preimage(
+            request,
+            permission_subject,
+            captured_rows,
+            &record.command_digest,
+        )?;
         if record.request_id != request.request_id
-            || record.command_digest != exact
             || record.term == 0
             || record.log_index == 0
             || read.authority.term < record.term
             || read.authority.commit_index < record.log_index
             || read.authority.revision < record.revision
         {
-            return Err(error(
-                "native placement outcome changes exact request/digest/term/index",
-            ));
+            return Err(
+                error("native placement outcome changes exact request/digest/term/index").into(),
+            );
         }
         Ok(Some(
             record
@@ -260,8 +284,13 @@ impl NativeImportAuthority {
                 .is_some_and(|response| response.succeeded),
         ))
     }
-    fn placement_committed(&self, request: &KvTxnRequest) -> Result<bool> {
-        self.placement_outcome(request)
+    fn placement_committed(
+        &self,
+        request: &KvTxnRequest,
+        permission_subject: &sinomo_core::node::NodeId,
+        captured_rows: &[MetadataCapturedKvEntry],
+    ) -> Result<bool> {
+        self.placement_outcome(request, permission_subject, captured_rows)
             .map(|outcome| outcome == Some(true))
     }
     /// Only the controller's locally owned attempt path calls this method.
@@ -271,10 +300,18 @@ impl NativeImportAuthority {
         envelope: &PlacementCustodyEnvelope,
     ) -> Result<Option<DfsNativeTxnCommit>> {
         self.validate_placement_custody(envelope)?;
-        match self.placement_outcome(&envelope.request)? {
+        match self.placement_outcome(
+            &envelope.request,
+            &envelope.coordinator.node_id,
+            &envelope.coordinator.guards,
+        )? {
             Some(false) => return Ok(None),
             Some(true) => {
-                let replay = self.commit(envelope.request.clone())?;
+                let replay = self.observe_original_native_commit(
+                    envelope.request.clone(),
+                    &envelope.coordinator.node_id,
+                    &envelope.coordinator.guards,
+                )?;
                 Self::require_committed(&replay)?;
                 if !replay.result.replayed_committed_request {
                     return Err(error(
@@ -368,28 +405,57 @@ impl NativeImportAuthority {
         goal: &OriginalPlacementGoal,
         envelope: &PlacementCustodyEnvelope,
     ) -> Result<bool> {
+        self.evaluate_received_placement_custody(goal, envelope)
+            .map_err(NativeEvaluationError::into_metadata)
+    }
+    pub(super) fn evaluate_received_placement_custody(
+        &self,
+        goal: &OriginalPlacementGoal,
+        envelope: &PlacementCustodyEnvelope,
+    ) -> std::result::Result<bool, NativeEvaluationError> {
         self.validate_placement_custody(envelope)?;
         if envelope.goal.job.entry != goal.job.entry {
-            return Err(error("peer custody changes original DATA subject"));
+            return Err(error("peer custody changes original DATA subject").into());
         }
         // Never turn received uncommitted request DATA into its first effect.
-        if !self.placement_committed(&envelope.request)? {
+        if self.placement_outcome_evaluated(
+            &envelope.request,
+            &envelope.coordinator.node_id,
+            &envelope.coordinator.guards,
+        )? != Some(true)
+        {
             return Ok(false);
         }
         for blueprint in &envelope.blueprints {
-            if !self.placement_committed(&blueprint.plan.stage_request)?
-                || !self.placement_committed(&blueprint.activation_request)?
-            {
+            if !self.placement_committed(
+                &blueprint.plan.stage_request,
+                &blueprint
+                    .plan
+                    .expected_handoff
+                    .retiring_shard
+                    .primary_node_id,
+                &blueprint.plan.captured_entries,
+            )? || !self.placement_committed(
+                &blueprint.activation_request,
+                &blueprint
+                    .plan
+                    .expected_handoff
+                    .retiring_shard
+                    .primary_node_id,
+                &blueprint.plan.captured_entries,
+            )? {
                 return Ok(false);
             }
         }
         self.verify_placement_blueprints(goal, &envelope.blueprints)?;
-        let commit = self.commit(envelope.request.clone())?;
+        let commit = self.observe_original_native_commit(
+            envelope.request.clone(),
+            &envelope.coordinator.node_id,
+            &envelope.coordinator.guards,
+        )?;
         Self::require_committed(&commit)?;
         if !commit.result.replayed_committed_request {
-            return Err(error(
-                "peer placement custody was not an actual committed replay",
-            ));
+            return Err(error("peer placement custody was not an actual committed replay").into());
         }
         if envelope.phase == PlacementCustodyPhase::Publication {
             self.validate_published_placement_goal(goal, &envelope.request)?;
@@ -510,7 +576,11 @@ impl NativeImportAuthority {
             let old: PlacementCustodyEnvelope =
                 serde_json::from_slice(&std::fs::read(&path).map_err(error)?).map_err(error)?;
             if old.request != envelope.request {
-                match self.placement_outcome(&old.request)? {
+                match self.placement_outcome(
+                    &old.request,
+                    &old.coordinator.node_id,
+                    &old.coordinator.guards,
+                )? {
                     Some(true) => {
                         return Err(error("winning placement custody cannot be replaced"));
                     }

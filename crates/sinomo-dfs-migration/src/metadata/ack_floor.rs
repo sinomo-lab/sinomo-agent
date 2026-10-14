@@ -255,7 +255,9 @@ pub(crate) fn acknowledged_source_floors_for_root(
     shard: &DfsMetadataShardId,
 ) -> Result<Vec<LegacyAcknowledgement>> {
     let current = super::current_root(root)?;
-    if source_format != Some(sinomo_dfs::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION) {
+    if source_format != Some(9)
+        && source_format != Some(sinomo_dfs::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION)
+    {
         if current {
             return Err(invalid(
                 "actual current ACK source cannot use a legacy format declaration",
@@ -263,9 +265,9 @@ pub(crate) fn acknowledged_source_floors_for_root(
         }
         return legacy_acknowledged_source_floors_for_root(root, file_system_id);
     }
-    if !current {
+    if super::original_native_root_format(root)? != source_format {
         return Err(invalid(
-            "declared current ACK source lacks its actual native generation header",
+            "declared native ACK source lacks its actual generation header",
         ));
     }
     let (prefix, authority) =

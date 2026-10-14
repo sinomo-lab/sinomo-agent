@@ -1633,11 +1633,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
         let touch_parent_on_create = options.touch_parent_on_create;
 
-        let initial_receipt_node_ids = if desired_replica_nodes.contains(&self.node_id) {
-            vec![self.node_id.clone()]
-        } else {
-            Default::default()
-        };
+        // Ingestion already durably bound this exact local object/version.
+        // The primary can change the caller's replica hint during planning;
+        // filter this real receipt only against that final plan in apply.
+        let initial_receipt_node_ids = vec![self.node_id.clone()];
         self.apply_distributed_manifest(
             request,
             expected_base_version,
@@ -1671,11 +1670,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         operation_id: String,
         foreground_replica_repair: bool,
     ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
-        let receipt_nodes = desired_replica_nodes
-            .contains(&self.node_id)
-            .then(|| self.node_id.clone())
-            .into_iter()
-            .collect();
+        // This actual ingested patch is local durability DATA. Final native
+        // replanning below decides whether the local node may count toward W.
+        let receipt_nodes = vec![self.node_id.clone()];
         self.apply_distributed_manifest(
             request,
             Some(base_version.clone()),
@@ -3175,7 +3172,7 @@ mod initial_receipt_tests {
                 .filter(|node| *node != historical_owner)
                 .collect::<Vec<_>>();
             let path = format!("/services/planned-{w}-{n}.bin");
-            let mut policy = crate::DfsPlacementPolicy::new(object_policy, w, n).unwrap();
+            let mut policy = crate::DfsPlacementPolicy::new(object_policy.clone(), w, n).unwrap();
             policy.required_node_ids = selected.clone();
             runtime
                 .apply_placement_policy(
@@ -3185,19 +3182,43 @@ mod initial_receipt_tests {
                     policy,
                 )
                 .unwrap();
-            let mut service = runtime.client(&historical_owner).unwrap();
+            // Candidate node hints are not a placement policy. Consume the
+            // actual managed constraint at the current owning Core producer.
+            let mut service = runtime.metadata_primary_service(&path).unwrap();
+            let native_placement = service
+                .placement_snapshot_cache()
+                .snapshot()
+                .expect("the actual mounted host already published its placement evidence");
+            assert!(!native_placement.nodes.is_empty());
+            let planned_policy = service
+                .managed_write_replication_policy_for_path(&path, object_policy, n)
+                .unwrap();
+            assert_eq!(planned_policy.min_commit_replicas, w);
+            assert_eq!(planned_policy.desired_replicas, n);
+            assert_eq!(
+                planned_policy
+                    .required_node_ids
+                    .iter()
+                    .cloned()
+                    .collect::<BTreeSet<_>>(),
+                selected.iter().cloned().collect()
+            );
             let stat = service
                 .posix_write_file(
                     &path,
                     b"actual selected current replicas",
                     crate::DfsWriteOptions {
-                        policy: DfsReplicationPolicy::new(w, n).unwrap(),
+                        policy: planned_policy,
                         replica_candidates: selected.clone(),
                         wait_for_commit: true,
                         foreground_replica_repair: true,
                     },
                 )
                 .unwrap();
+            // Reopen only the actual current Core view after its complete
+            // foreground replica work, without relying on the producer cache.
+            drop(service);
+            let service = runtime.metadata_primary_service(&path).unwrap();
             let object = service
                 .metadata_backend()
                 .unwrap()
@@ -3206,12 +3227,26 @@ mod initial_receipt_tests {
                 .unwrap();
             assert_eq!(object.owner_node_id, historical_owner);
             assert_eq!(
+                object.version, stat.version,
+                "inspect the actual published generation"
+            );
+            assert_eq!(
+                object.content_hash.as_deref(),
+                Some(crate::content_hash(b"actual selected current replicas").as_str())
+            );
+            assert_eq!(
                 object
                     .current_locations
                     .iter()
                     .cloned()
                     .collect::<BTreeSet<_>>(),
-                selected.iter().cloned().collect()
+                selected.iter().cloned().collect(),
+                "actual object {object:?}; native write history {:?}",
+                service
+                    .metadata_backend()
+                    .unwrap()
+                    .object_write_intent_history(&stat.object_id)
+                    .unwrap(),
             );
             let policy = DfsReplicationPolicy::new(w, n)
                 .unwrap()

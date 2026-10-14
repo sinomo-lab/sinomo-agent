@@ -319,6 +319,31 @@ impl NativeImportAuthority {
 }
 
 impl NativeImportAuthority {
+    fn qualified_topology_import_plan(
+        &self,
+        source: &MetadataSourceCut,
+        installed_root: &Path,
+        stage: &KvTxnRequest,
+        activation: &KvTxnRequest,
+        proof: &sinomo_dfs::DfsMetadataShardMembershipHandoffProof,
+    ) -> Result<MetadataImportPlan> {
+        let (plan, _) = crate::metadata::retained_native_import_plan(
+            installed_root,
+            &proof.retiring_shard.file_system_id,
+            &sinomo_dfs::DfsMetadataShardId::new(&proof.retiring_shard.shard_id),
+            &proof.handoff_id,
+        )?
+        .ok_or_else(|| error("topology observation lacks its qualified installed native plan"))?;
+        Self::validate_plan(&plan)?;
+        if digest(&plan.source_cut)? != digest(source)? || &plan.stage_request != stage {
+            return Err(error(
+                "topology observation changes its exact source/stage plan",
+            ));
+        }
+        self.validate_activation_request(activation, &plan, proof)?;
+        Ok(plan)
+    }
+
     /// Queue after the certified installer has removed its intent and released
     /// its RootSlot. Historic topology is DATA, never a current writer permit.
     pub(super) fn queue_native_original_topology(
@@ -356,8 +381,6 @@ impl NativeImportAuthority {
                 "original native topology has no native import certificate",
             ));
         };
-        Self::require_committed(&self.commit(certificate.stage_commit.request.clone())?)?;
-        Self::require_committed(&self.commit(certificate.activation_commit.request.clone())?)?;
         let proof = &certificate.joint_handoff_proof;
         if proof.cause != Self::import_cause(source)?
             || proof.desired_shard.file_system_id != original.desired_shard.file_system_id
@@ -367,17 +390,35 @@ impl NativeImportAuthority {
                 "original topology DATA changed its exact activated source scope",
             ));
         }
+        let plan = self.qualified_topology_import_plan(
+            source,
+            installed_root,
+            &certificate.stage_commit.request,
+            &certificate.activation_commit.request,
+            proof,
+        )?;
+        self.original_scope_still_retired(proof)?;
+        Self::require_committed(
+            &self
+                .observe_original_import_commit(&plan, certificate.stage_commit.request.clone())?,
+        )?;
+        Self::require_committed(&self.observe_original_import_commit(
+            &plan,
+            certificate.activation_commit.request.clone(),
+        )?)?;
+        self.original_scope_still_retired(proof)?;
         self.queue_original_topology_work(
             source,
             installed_root,
             proof.desired_shard.clone(),
-            certificate.stage_commit.request.clone(),
+            plan,
             certificate.activation_commit.request.clone(),
+            proof.clone(),
         )
     }
 
     /// Rebind historic desired DATA only across the proven storage-schema
-    /// successor. The old request is replayed, never used as a9 writer permit.
+    /// successor. The original transaction is observed, never a current writer permit.
     fn queue_prior_native_topology(
         &self,
         source: &MetadataSourceCut,
@@ -422,7 +463,7 @@ impl NativeImportAuthority {
                     "historic topology DATA lost its original desired configuration",
                 ));
             };
-            if source.source_format_version != Some(8)
+            if !matches!(source.source_format_version, Some(8 | 9))
                 || current_proof.retiring_shard.file_system_id
                     != original.desired_shard.file_system_id
                 || current_proof.retiring_shard.shard_id != original.desired_shard.shard_id
@@ -430,7 +471,7 @@ impl NativeImportAuthority {
                 || current_proof.retiring_shard.epoch >= current_proof.desired_shard.epoch
             {
                 return Err(error(
-                    "historic topology DATA has no exact native8-to-current import lineage",
+                    "historic topology DATA has no exact prior-native-to-current import lineage",
                 ));
             }
             if current_proof.state_fingerprint != current_image_fingerprint
@@ -446,8 +487,23 @@ impl NativeImportAuthority {
                     "historic topology callback changes its actual current activation binding",
                 ));
             }
-            Self::require_committed(&self.commit(stage_commit.request.clone())?)?;
-            Self::require_committed(&self.commit(activation_commit.request.clone())?)?;
+            let current_plan = self.qualified_topology_import_plan(
+                source,
+                installed_root,
+                &stage_commit.request,
+                &activation_commit.request,
+                current_proof,
+            )?;
+            self.original_scope_still_retired(current_proof)?;
+            Self::require_committed(
+                &self
+                    .observe_original_import_commit(&current_plan, stage_commit.request.clone())?,
+            )?;
+            Self::require_committed(&self.observe_original_import_commit(
+                &current_plan,
+                activation_commit.request.clone(),
+            )?)?;
+            self.original_scope_still_retired(current_proof)?;
             if !crate::metadata::current_root(installed_root)? {
                 return Err(error(
                     "historic topology callback has no current storage generation",
@@ -490,8 +546,11 @@ impl NativeImportAuthority {
                 error("historic topology DATA lacks its actual original joint proof")
             })?;
             self.validate_activation_request(&prior_request, &prior, &prior_proof)?;
-            Self::require_committed(&self.commit(prior.stage_request.clone())?)?;
-            Self::require_committed(&self.commit(prior_request)?)?;
+            Self::require_committed(
+                &self.observe_original_import_commit(&prior, prior.stage_request.clone())?,
+            )?;
+            Self::require_committed(&self.observe_original_import_commit(&prior, prior_request)?)?;
+            self.original_scope_still_retired(current_proof)?;
             if !topology_matches(&current_proof.retiring_shard, &prior_proof.desired_shard) {
                 // A genuinely different topology superseded the historic DATA.
                 // A schema-only successor does not satisfy this condition.
@@ -512,8 +571,9 @@ impl NativeImportAuthority {
                 &topology_source,
                 installed_root,
                 current_proof.desired_shard.clone(),
-                stage_commit.request.clone(),
+                current_plan,
                 activation_commit.request.clone(),
+                current_proof.clone(),
             )?;
         }
         Ok(())
@@ -544,10 +604,13 @@ impl NativeImportAuthority {
                 error("published historic topology has no actual current activation")
             })?;
             self.validate_activation_request(&request, &plan, &proof)?;
-            let stage_commit = self.commit(plan.stage_request.clone())?;
-            let activation_commit = self.commit(request)?;
+            self.original_scope_still_retired(&proof)?;
+            let stage_commit =
+                self.observe_original_import_commit(&plan, plan.stage_request.clone())?;
+            let activation_commit = self.observe_original_import_commit(&plan, request)?;
             Self::require_committed(&stage_commit)?;
             Self::require_committed(&activation_commit)?;
+            self.original_scope_still_retired(&proof)?;
             let source_retirements = self.verify_original_source_retirements(
                 source,
                 &plan,
@@ -603,14 +666,22 @@ impl NativeImportAuthority {
                 "published topology native activation changed its exact source/image scope",
             ));
         }
-        Self::require_committed(&self.commit(plan.stage_request.clone())?)?;
-        Self::require_committed(&self.commit(activation_request.clone())?)?;
+        self.validate_activation_request(&activation_request, &plan, &proof)?;
+        self.original_scope_still_retired(&proof)?;
+        Self::require_committed(
+            &self.observe_original_import_commit(&plan, plan.stage_request.clone())?,
+        )?;
+        Self::require_committed(
+            &self.observe_original_import_commit(&plan, activation_request.clone())?,
+        )?;
+        self.original_scope_still_retired(&proof)?;
         self.queue_original_topology_work(
             source,
             installed_root,
-            proof.desired_shard,
-            plan.stage_request,
+            proof.desired_shard.clone(),
+            plan,
             activation_request,
+            proof,
         )
     }
 
@@ -619,9 +690,17 @@ impl NativeImportAuthority {
         source: &MetadataSourceCut,
         installed_root: &Path,
         current: sinomo_dfs::DfsMetadataShardConfig,
-        stage_request: KvTxnRequest,
+        plan: MetadataImportPlan,
         activation_request: KvTxnRequest,
+        current_proof: sinomo_dfs::DfsMetadataShardMembershipHandoffProof,
     ) -> Result<()> {
+        Self::validate_plan(&plan)?;
+        self.validate_activation_request(&activation_request, &plan, &current_proof)?;
+        if current_proof.desired_shard != current {
+            return Err(error(
+                "topology callback changes its actual activated current scope",
+            ));
+        }
         let original = source
             .original_handoff
             .as_ref()
@@ -673,8 +752,16 @@ impl NativeImportAuthority {
                     if !Arc::ptr_eq(&owner, &authority.owner) {
                         return Ok(false);
                     }
-                    Self::require_committed(&authority.commit(stage_request.clone())?)?;
-                    Self::require_committed(&authority.commit(activation_request.clone())?)?;
+                    authority.original_scope_still_retired(&current_proof)?;
+                    Self::require_committed(
+                        &authority
+                            .observe_original_import_commit(&plan, plan.stage_request.clone())?,
+                    )?;
+                    Self::require_committed(
+                        &authority
+                            .observe_original_import_commit(&plan, activation_request.clone())?,
+                    )?;
+                    authority.original_scope_still_retired(&current_proof)?;
                     let mut control = authority.control_client(&root)?;
                     let mut store = sinomo_dfs::DfsControlPlaneStore::new(&mut control);
                     let actual = store

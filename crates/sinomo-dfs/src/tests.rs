@@ -500,17 +500,52 @@ fn native_read_fixture(
     let mut policy =
         DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedConfirmed, copies, copies).unwrap();
     policy.required_node_ids = holders.clone();
+    policy.forbidden_node_ids = crate::test_runtime::DfsTestRuntime::ordered_node_ids(name, 3)
+        .into_iter()
+        .filter(|node| !holders.contains(node))
+        .collect();
+    let expected_holders = holders.iter().cloned().collect::<BTreeSet<_>>();
+    let expected_forbidden = policy
+        .forbidden_node_ids
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
     runtime
         .apply_placement_policy(&primary, &path, DfsPlacementScope::Subtree, policy)
         .unwrap();
     let mut writer = runtime.client(&owner).unwrap();
+    let (resolved, _, replication) = writer
+        .managed_replication_policy_for_path(&path, DfsObjectPolicy::ReplicatedConfirmed, copies)
+        .unwrap();
+    assert_eq!(
+        resolved.policy.consistency,
+        DfsObjectPolicy::ReplicatedConfirmed
+    );
+    assert_eq!(replication.min_commit_replicas, copies);
+    assert_eq!(replication.desired_replicas, copies);
+    assert_eq!(
+        replication
+            .required_node_ids
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        expected_holders
+    );
+    assert_eq!(
+        replication
+            .forbidden_node_ids
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        expected_forbidden
+    );
     let stat = writer
         .posix_write_file(
             &path,
             &bytes,
             DfsWriteOptions {
                 replica_candidates: holders.clone(),
-                policy: DfsReplicationPolicy::new(copies, copies).unwrap(),
+                policy: replication,
                 wait_for_commit: true,
                 foreground_replica_repair: true,
             },
@@ -521,8 +556,18 @@ fn native_read_fixture(
             .iter()
             .cloned()
             .collect::<BTreeSet<_>>(),
-        holders.into_iter().collect()
+        expected_holders
     );
+    for holder in &holders {
+        let client = runtime.client(holder).unwrap();
+        let actual = client
+            .content()
+            .read_blob(stat.content_hash.as_deref().expect("actual published hash"))
+            .expect("actual recorded holder bytes, inline or loose");
+        assert_eq!(actual.len(), bytes.len());
+        assert_eq!(Some(content_hash(&actual)), stat.content_hash);
+        assert_eq!(actual, bytes);
+    }
     drop(writer);
     (runtime, owner, replica, reader, stat, bytes)
 }
@@ -1255,7 +1300,6 @@ fn pump_dfs_services_collect_rejections<T: DfsMessageTransport>(
 
 struct SifsTwoPrimaryCluster {
     root: PathBuf,
-    _runtime: crate::test_runtime::DfsTestRuntime,
     users_primary_node: NodeId,
     services_primary_node: NodeId,
     replica_node: NodeId,
@@ -1264,6 +1308,9 @@ struct SifsTwoPrimaryCluster {
     services_primary: NetworkedDfsService<DfsNodeTransport>,
     replica: NetworkedDfsService<DfsNodeTransport>,
     rejections: Vec<String>,
+    // Implicit panic cleanup has the same order as close(): external clients
+    // release before the actual component/runtime owner begins shutdown.
+    _runtime: crate::test_runtime::DfsTestRuntime,
 }
 impl SifsTwoPrimaryCluster {
     fn close(self) {
@@ -1414,24 +1461,85 @@ fn sifs_two_primary_cluster(name: &str) -> SifsTwoPrimaryCluster {
     let shared_kv = runtime
         .shared_control_plane()
         .expect("actual native control plane");
-    // Keep the normal configured placement. The default manager may complete
-    // a newer root handoff while a forced fixture reassignment is waiting.
     let nodes = [users_primary_node, services_primary_node, replica_node];
     let configs = runtime
         .metadata_shards()
         .expect("actual current shard configuration");
-    let users_primary_node = configs
+    let users_config = configs
         .iter()
         .find(|config| config.shard_id == "users")
         .expect("normal users shard")
-        .primary_node_id
         .clone();
-    let services_primary_node = configs
+    let mut services_config = configs
         .iter()
         .find(|config| config.shard_id == "services")
         .expect("normal services shard")
-        .primary_node_id
         .clone();
+    let users_primary_node = users_config.primary_node_id.clone();
+    if services_config.primary_node_id == users_primary_node {
+        // Native genesis may expand under its original owner. This fixture's
+        // second primary is an explicit product handoff, not a discovery rule.
+        let members = std::iter::once(services_config.primary_node_id.clone())
+            .chain(services_config.replica_node_ids.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(members, nodes.iter().cloned().collect());
+        let target = services_config
+            .replica_node_ids
+            .iter()
+            .find(|node| **node != users_primary_node)
+            .expect("actual assigned replica may become the second primary")
+            .clone();
+        let replicas = members
+            .iter()
+            .filter(|node| **node != target)
+            .cloned()
+            .collect();
+        let activated = runtime
+            .reassign_metadata_shard(
+                &services_config.file_system_id,
+                &services_config.shard_id,
+                target.clone(),
+                replicas,
+            )
+            .expect("ordinary topology-preserving services primary handoff");
+        assert_eq!(activated.primary_node_id, target);
+        assert_eq!(
+            std::iter::once(activated.primary_node_id.clone())
+                .chain(activated.replica_node_ids.iter().cloned())
+                .collect::<BTreeSet<_>>(),
+            members
+        );
+        let current = runtime
+            .metadata_shards()
+            .expect("actual activated configurations");
+        assert_eq!(
+            current.iter().find(|config| config.shard_id == "users"),
+            Some(&users_config)
+        );
+        assert_eq!(
+            current.iter().find(|config| config.shard_id == "services"),
+            Some(&activated)
+        );
+        services_config = activated;
+    }
+    let proof = shared_kv
+        .with_client(|kv| {
+            DfsControlPlaneStore::new(kv.as_mut()).get_metadata_shard_membership_handoff_proof(
+                &services_config.file_system_id,
+                &services_config.shard_id,
+            )
+        })
+        .expect("actual services activation proof read")
+        .expect("services role is backed by a real native activation");
+    assert_eq!(proof.desired_shard, services_config);
+    assert!(
+        crate::control_plane::metadata_shard_membership_handoff_acknowledgements_are_safe(
+            &proof.retiring_shard,
+            &proof.desired_shard,
+            &proof.acknowledged_node_ids.iter().cloned().collect()
+        )
+    );
+    let services_primary_node = services_config.primary_node_id.clone();
     assert_ne!(users_primary_node, services_primary_node);
     assert!(nodes.contains(&users_primary_node) && nodes.contains(&services_primary_node));
     let replica_node = nodes
@@ -1483,7 +1591,7 @@ fn sifs_outsider_cluster(name: &str) -> SifsPosixCluster {
         .metadata_shards()
         .expect("native source configuration")
     {
-        let replicas = vec![cluster.primary_node.clone(), cluster.writer_node.clone()];
+        let replicas = vec![cluster.writer_node.clone()];
         cluster
             ._runtime
             .reassign_metadata_shard(

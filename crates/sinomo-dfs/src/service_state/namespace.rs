@@ -22,6 +22,50 @@ struct NamespacePlanningState {
 }
 
 impl NamespaceReadSet {
+    /// Freeze original observations into a durable job before yielding. Only
+    /// a genuinely absent physical identity may be newly observed here; an
+    /// existing replacement must retain its producer's original observation.
+    pub(crate) fn bind_recorded_expectations(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        objects: &mut [crate::DfsNamespaceObjectVersionExpectation],
+        paths: &mut [crate::DfsNamespacePathOccupantExpectation],
+    ) -> Result<(), crate::DfsError> {
+        for expected in objects {
+            match self
+                .objects
+                .get(&(file_system_id.clone(), expected.object_id.clone()))
+            {
+                Some(original) => expected.expected_version = original.clone(),
+                None if expected.expected_version.is_none() => {}
+                None => {
+                    return Err(crate::DfsError::Metadata {
+                        message: format!(
+                            "durable namespace frame has no original object observation: {}",
+                            expected.object_id
+                        ),
+                    });
+                }
+            }
+        }
+        for expected in paths {
+            let path = crate::namespace::metadata_path(&expected.path);
+            match self.paths.get(&(file_system_id.clone(), path)) {
+                Some(original) => expected.expected_object_id = original.clone(),
+                None if expected.expected_object_id.is_none() => {}
+                None => {
+                    return Err(crate::DfsError::Metadata {
+                        message: format!(
+                            "durable namespace frame has no original path observation: {}",
+                            expected.path
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn bind_expectations(
         &self,
         file_system_id: &DfsFileSystemId,
@@ -283,6 +327,65 @@ impl DfsNamespaceExecution {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn durable_capture_preserves_original_versions_and_distinguishes_missing_absence() {
+        let fs = crate::sifs_file_system_id();
+        let parent =
+            crate::namespace::directory_object("/services", sinomo_core::node::NodeId::generate());
+        let mut later = parent.clone();
+        later.version = crate::namespace::next_version(&parent.version);
+        let execution = DfsNamespaceExecution::default();
+        let planning = execution.begin_planning();
+        execution.observe_path(&fs, "/services", Some(&parent));
+        execution.observe_path(&fs, "/services", Some(&later));
+        let original = execution.captured_reads().unwrap();
+        let mut objects = vec![crate::DfsNamespaceObjectVersionExpectation {
+            object_id: parent.object_id.clone(),
+            expected_version: Some(later.version.clone()),
+        }];
+        let mut paths = vec![crate::DfsNamespacePathOccupantExpectation {
+            path: "/services".into(),
+            expected_object_id: Some(parent.object_id.clone()),
+        }];
+        original
+            .bind_recorded_expectations(&fs, &mut objects, &mut paths)
+            .unwrap();
+        assert_eq!(objects[0].expected_version, Some(parent.version.clone()));
+        drop(planning);
+        assert!(execution.captured_reads().is_none());
+        assert!(
+            NamespaceReadSet::default()
+                .bind_recorded_expectations(&fs, &mut objects, &mut paths)
+                .is_err()
+        );
+        let new_object = crate::DfsObjectId::generate();
+        let mut absent_object = vec![crate::DfsNamespaceObjectVersionExpectation {
+            object_id: new_object,
+            expected_version: None,
+        }];
+        let mut absent_path = vec![crate::DfsNamespacePathOccupantExpectation {
+            path: "/services/new".into(),
+            expected_object_id: None,
+        }];
+        NamespaceReadSet::default()
+            .bind_recorded_expectations(&fs, &mut absent_object, &mut absent_path)
+            .unwrap();
+        assert!(absent_object[0].expected_version.is_none());
+        assert!(absent_path[0].expected_object_id.is_none());
+        let mut recorded_absence = NamespaceReadSet::default();
+        recorded_absence
+            .objects
+            .insert((fs.clone(), parent.object_id.clone()), None);
+        recorded_absence
+            .paths
+            .insert((fs.clone(), "services".into()), None);
+        recorded_absence
+            .bind_recorded_expectations(&fs, &mut objects, &mut paths)
+            .unwrap();
+        assert!(objects[0].expected_version.is_none());
+        assert!(paths[0].expected_object_id.is_none());
+    }
 
     #[test]
     fn finishing_request_returns_evidence_and_clears_its_lifetime() {

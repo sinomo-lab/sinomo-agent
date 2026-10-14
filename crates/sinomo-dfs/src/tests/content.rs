@@ -163,7 +163,10 @@ fn native_content_root_catalog_pages_share_one_recorded_cut() {
             .unwrap();
     }
     let shard = runtime.root_shard().unwrap();
-    let backend = writer.metadata_backend_mut().unwrap();
+    drop(writer);
+    let mut owner = runtime.metadata_primary_service("/").unwrap();
+    let backend = owner.metadata_backend_mut().unwrap();
+    backend.begin_consistent_read_snapshot().unwrap();
     let request = DfsContentRootCatalogPageRequest {
         identity: DfsContentRootCatalogShardIdentity::from_config(&shard),
         expected_topology_digest: dfs_content_root_catalog_topology_digest_with_file_systems(
@@ -183,7 +186,12 @@ fn native_content_root_catalog_pages_share_one_recorded_cut() {
     loop {
         let mut next = request.clone();
         next.after = cursor;
+        if let Some(after) = &next.after {
+            next.minimum_journal_sequence = after.journal_sequence;
+            next.minimum_state_fingerprint = Some(after.state_fingerprint.clone());
+        }
         let page = backend.content_root_catalog_page(&next).unwrap();
+        page.validate_for_request(&next).unwrap();
         pages += 1;
         let identity = (page.coverage.clone(), page.generated_at_unix_nanos);
         if let Some(cut) = &cut {
@@ -200,7 +208,8 @@ fn native_content_root_catalog_pages_share_one_recorded_cut() {
     }
     assert!(pages > 1);
     assert!(entries.len() > 300);
-    drop(writer);
+    backend.end_consistent_read_snapshot();
+    drop(owner);
     runtime.close().unwrap();
 }
 
@@ -391,7 +400,10 @@ fn fetch_response_reuses_existing_local_blob_without_rehashing_payload() {
         .apply_placement_policy(&owner, path, DfsPlacementScope::Subtree, current_policy)
         .unwrap();
     deny_native_read_repair(&runtime, &owner, &target);
-    let mut first = runtime.client(&owner).unwrap();
+    let _background = runtime
+        .deny_background_replica_before_claim(&owner)
+        .unwrap();
+    let mut first = runtime.metadata_primary_service(path).unwrap();
     let bytes = vec![0x76; 2 * 1024 * 1024 + 4096];
     let version = crate::namespace::next_version(&base.version);
     let request = DfsWriteRequest {
@@ -461,7 +473,7 @@ fn fetch_response_reuses_existing_local_blob_without_rehashing_payload() {
     // native Fetch into this same content store before the queued duplicate.
     runtime.clear_faults();
     deny_native_read_repair(&runtime, &owner, &target);
-    let mut second = runtime.client(&owner).unwrap();
+    let mut second = runtime.metadata_primary_service(path).unwrap();
     second.hydrate_from_metadata_backend().unwrap();
     for _ in 0..32 {
         second.retry_pending_repairs_bounded(1).unwrap();
@@ -512,6 +524,7 @@ fn fetch_response_reuses_existing_local_blob_without_rehashing_payload() {
     drop(second);
     drop(first);
     runtime.clear_faults();
+    drop(_background);
     runtime.close().unwrap();
 }
 
@@ -627,120 +640,149 @@ fn rejected_streamed_stage_does_not_reserve_version_for_later_valid_content() {
 
 #[test]
 fn stage_blob_persists_when_response_target_is_unroutable() {
-    let root = temp_root("stage-response-target-unroutable");
-    let owner = NodeId::from_legacy_named("node_stage_notify_owner").expect("node");
-    let replica = NodeId::from_legacy_named("node_stage_notify_replica").expect("node");
-    let object_id = DfsObjectId::from_legacy_named("obj_stage_notify").expect("object");
-    let version = DfsVersion::from_legacy_named("version_2").expect("version");
-    let bytes = b"stage durable despite lost requester";
-    let mut metadata = file_metadata(owner.clone());
-    metadata.object_id = object_id.clone();
-    metadata.policy = DfsObjectPolicy::ReplicatedEventual;
-    metadata.current_locations = vec![owner.clone()];
-    let mut dfs = NetworkedDfsService::new(
-        crate::test_runtime::DfsTestRuntime::local_transport(replica.clone()),
-        LocalContentStore::new(root.join("content")).expect("content"),
-    );
-
-    let event = dfs
-        .handle_stage_blob(
-            owner,
-            DfsStageBlobCommand {
-                request_id: "dfs_net_req_stage_unroutable".to_string(),
-                intent_id: "dfs_intent_stage_unroutable".to_string(),
-                file_system_id: metadata.file_system_id.clone(),
-                object_id: object_id.clone(),
-                expected_base_version: Some(metadata.version.clone()),
-                version: version.clone(),
-                content_hash: content_hash(bytes),
-                bytes: bytes.to_vec(),
-                object_metadata: Some(metadata),
-                authority_shard: None,
-            },
-        )
-        .expect("unroutable response target should not fail durable stage");
-
-    assert!(matches!(
-        event,
-        NetworkedDfsServiceEvent::BlobStaged {
-            object_id: staged_object_id,
-            version: staged_version,
-            replica_node_id,
-            ..
-        } if staged_object_id == object_id
-            && staged_version == version
-            && replica_node_id == replica
-    ));
-    let manifest = dfs
+    // Reuse the normal native producer/receiver and its captured Stage reply.
+    // The receiver completed persistence; only actual reply delivery was lost.
+    let (runtime, owner, replica, writer, stat, _intent, exchange, background) =
+        super::repair::native_committed_stage_backlog("stage-response-target-unroutable");
+    assert_eq!(exchange.source_node_id, owner);
+    assert_eq!(exchange.target_node_id, replica);
+    let DfsNetworkMessage::StageBlob(command) = &exchange.command.routed_message.message else {
+        panic!("actual native Stage command required");
+    };
+    let DfsNetworkMessage::StageBlobResponse(response) = &exchange.response.message else {
+        panic!("actual completed native Stage reply required");
+    };
+    assert_eq!(exchange.response.source_node_id, replica);
+    assert_eq!(exchange.response.target_node_id, owner);
+    assert_eq!(response.request_id, command.request_id);
+    assert_eq!(response.intent_id, command.intent_id);
+    assert_eq!(response.file_system_id, stat.file_system_id);
+    assert_eq!(response.object_id, stat.object_id);
+    assert_eq!(response.version, stat.version);
+    assert_eq!(response.replica_node_id, replica);
+    let bytes = writer
         .content
-        .read_manifest(object_id.as_str(), version.as_str())
+        .read_blob(
+            stat.content_hash
+                .as_deref()
+                .expect("original producer hash"),
+        )
+        .expect("original hash-addressed producer bytes");
+    let expected_hash = content_hash(&bytes);
+    assert!(
+        matches!(&response.result, DfsBlobTransferResult::Durable { content_hash }
+        if content_hash == &expected_hash)
+    );
+    let receiver = runtime.client(&replica).expect("actual native receiver");
+    let manifest = receiver
+        .content
+        .read_manifest(stat.object_id.as_str(), stat.version.as_str())
         .expect("stage manifest");
+    assert_eq!(manifest.content_hash, expected_hash);
+    assert_eq!(manifest.size_bytes, bytes.len() as u64);
     assert_eq!(
-        dfs.content.read_blob(&manifest.content_hash).expect("blob"),
+        receiver
+            .content
+            .read_blob(&manifest.content_hash)
+            .expect("blob"),
         bytes
     );
-
-    std::fs::remove_dir_all(root).ok();
+    drop(receiver);
+    drop(writer);
+    drop(background);
+    runtime.clear_faults();
+    runtime.close().expect("ordinary native close");
 }
 
 #[test]
 fn reconcile_local_manifests_requires_current_blob_bytes() {
-    let root = temp_root("reconcile-requires-current-blob");
-    let node_id = NodeId::from_legacy_named("node_reconcile_missing_blob").expect("node");
-    let remote = NodeId::from_legacy_named("node_reconcile_remote").expect("node");
-    let object_id = DfsObjectId::from_legacy_named("obj_reconcile_missing_blob").expect("object");
-    let version = DfsVersion::from_legacy_named("version_2").expect("version");
+    let name = "reconcile-requires-current-blob";
+    let (runtime, client, config) =
+        crate::test_support::current_native_metadata_service(name, 2, "/services").unwrap();
+    let node_id = config.primary_node_id;
+    drop(client);
+    let remote = crate::test_runtime::DfsTestRuntime::ordered_node_ids(name, 2)
+        .into_iter()
+        .find(|node| *node != node_id)
+        .unwrap();
+    let path = "/services/reconcile-requires-current-blob.bin";
+    let mut policy = DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 1).unwrap();
+    policy.required_node_ids = vec![remote.clone()];
+    runtime
+        .apply_placement_policy(&node_id, path, DfsPlacementScope::Subtree, policy)
+        .unwrap();
     let bytes = vec![b'r'; 17 * 1024];
-    let (_runtime, mut dfs) = native_sifs_service(
-        "reconcile_local_manifests_requires_current_blob_bytes",
-        node_id.clone(),
+    let mut dfs = runtime
+        .metadata_primary_service(path)
+        .expect("actual current metadata owner");
+    let mut replication = DfsReplicationPolicy::new(1, 1).unwrap();
+    replication.required_node_ids = vec![remote.clone()];
+    replication.forbidden_node_ids = vec![node_id.clone()];
+    let stat = dfs
+        .posix_write_file(
+            path,
+            &bytes,
+            DfsWriteOptions {
+                policy: replication,
+                replica_candidates: vec![remote.clone()],
+                wait_for_commit: true,
+                foreground_replica_repair: true,
+            },
+        )
+        .expect("actual remote content publication");
+    let before = dfs
+        .metadata_backend()
+        .unwrap()
+        .receipts_for_version(&stat.object_id, &stat.version)
+        .unwrap();
+    assert!(!before.is_empty());
+    assert!(
+        before
+            .iter()
+            .all(|receipt| receipt.replica_node_id == remote)
     );
+    assert!(
+        !before
+            .iter()
+            .any(|receipt| receipt.replica_node_id == node_id)
+    );
+    let object_before = dfs
+        .current_read_object_metadata(&stat.object_id)
+        .expect("recorded head");
+    assert_eq!(object_before.current_locations, vec![remote.clone()]);
+    // An actual verified local manifest does not create a metadata receipt.
     let manifest = dfs
         .content
-        .put_object_version(object_id.as_str(), version.as_str(), &bytes)
-        .expect("seed manifest");
-    let hex = manifest
-        .content_hash
-        .strip_prefix("blake3:")
-        .expect("blake3 hash");
-    std::fs::remove_file(
-        _runtime
-            .data_dir(&node_id)
-            .dfs_dir()
-            .join("content")
-            .join("blobs")
-            .join(&hex[..2])
-            .join(hex),
-    )
-    .expect("remove blob");
-    let mut metadata = file_metadata(node_id);
-    metadata.object_id = object_id.clone();
-    metadata.policy = DfsObjectPolicy::ReplicatedEventual;
-    metadata.version = version.clone();
-    metadata.current_locations = vec![remote.clone()];
-    metadata.content_hash = Some(manifest.content_hash.clone());
-    metadata.content_size_bytes = Some(bytes.len() as u64);
-    dfs.add_object_metadata(metadata).expect("metadata");
-
+        .put_object_version(stat.object_id.as_str(), stat.version.as_str(), &bytes)
+        .expect("seed real local manifest only");
+    assert_eq!(manifest.content_hash, stat.content_hash.unwrap());
+    dfs.content
+        .debug_remove_loose_blob(&manifest.content_hash)
+        .expect("remove actual local blob");
     let reconciliation = dfs
-        .reconcile_local_manifests(&object_id)
+        .reconcile_local_manifests(&stat.object_id)
         .expect("reconcile");
-
     assert_eq!(reconciliation.refreshed_receipts, 0);
     assert!(reconciliation.missing_current);
-    assert!(
+    assert_eq!(
         dfs.metadata_backend()
-            .expect("backend")
-            .receipts_for_version(&object_id, &version)
-            .expect("receipts")
-            .is_empty()
+            .unwrap()
+            .receipts_for_version(&stat.object_id, &stat.version)
+            .unwrap(),
+        before,
+        "missing local bytes cannot alter the genuine remote receipt or add a local receipt"
+    );
+    assert_eq!(
+        dfs.current_read_object_metadata(&stat.object_id).unwrap(),
+        object_before
     );
     assert_eq!(
         dfs.metadata()
-            .object(&object_id)
+            .object(&stat.object_id)
             .expect("object")
             .current_locations,
         vec![remote]
     );
-    std::fs::remove_dir_all(root).ok();
+    drop(dfs);
+    runtime.close().expect("ordinary native close");
 }

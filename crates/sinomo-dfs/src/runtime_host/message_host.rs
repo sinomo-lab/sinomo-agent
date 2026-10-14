@@ -326,14 +326,19 @@ pub(super) fn try_take_daemon_dfs_message_mutation_service_for_maintenance(
             metadata_authority_preflight,
         )?;
     }
-    let control_plane = daemon_dfs_control_plane_client_on_runtime(cluster_paths, Some(runtime))
+    // Route discovery uses the same mounted owner's existing membership and
+    // service projections as ordinary message admission. A fresh generic
+    // configuration client would download the service catalog on every tick.
+    // Publication still validates the retained authority generation below.
+    let peer_snapshot = read_daemon_dfs_message_peer_snapshot(cluster_paths)?
+        .filter(|snapshot| {
+            snapshot.cluster_id == cluster_state.cluster_id
+                && snapshot.local_node_id == cluster_state.local_node_id
+        })
         .ok_or_else(|| sinomo_dfs::DfsError::Network {
-            message: "DFS maintenance has no registered configuration client".into(),
+            message: "DFS maintenance has no matching native peer projection".into(),
         })?;
-    let peer_node_ids = registered_dfs_runtime_peer_node_ids(control_plane.as_ref(), cluster_state)
-        .map_err(|error| sinomo_dfs::DfsError::Network {
-            message: error.to_string(),
-        })?;
+    let peer_node_ids = peer_snapshot.peer_node_ids;
     let metadata_authority_generation = match metadata_authority_preflight {
         Some(preflight) => {
             daemon_dfs_require_retained_authority(&preflight.authority, preflight.generation)?;
@@ -1165,20 +1170,48 @@ pub(crate) fn read_daemon_dfs_message_peer_snapshot(
     if host.shutting_down.load(Ordering::Acquire) {
         return Ok(None);
     }
-    // sinomo:kv-configuration: Route discovery consumes the active native owner's local projection; publication authority is checked by the common guard mint.
-    let members = host
-        .cluster
-        .kv_range_prefix_local("/cluster/members/")
-        .map_err(|error| sinomo_dfs::DfsError::Network {
-            message: error.to_string(),
-        })?;
-    let services = host
-        .cluster
-        .kv_range_prefix_local(sinomo_core::service::CLUSTER_SERVICES_KV_PREFIX)
-        .map_err(|error| sinomo_dfs::DfsError::Network {
-            message: error.to_string(),
-        })?;
-    peer_snapshot_from_configuration_entries(&state, members.value, services.value).map(Some)
+    let (members, services) = read_native_dfs_peer_configuration(
+        cluster_paths,
+        &state,
+        Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+    )?;
+    if host.shutting_down.load(Ordering::Acquire) {
+        return Ok(None);
+    }
+    peer_snapshot_from_configuration_entries(&state, members, services).map(Some)
+}
+
+/// sinomo:kv-configuration: Borrow both routing scopes from the native owner's same applied projection; this grants no publication authority.
+fn read_native_dfs_peer_configuration(
+    cluster_paths: &ClusterPaths,
+    state: &sinomo_core::ClusterBootstrapState,
+    deadline: Instant,
+) -> Result<(Vec<sinomo_core::kv::KvEntry>, Vec<sinomo_core::kv::KvEntry>), sinomo_dfs::DfsError> {
+    let wal_paths = cluster_paths
+        .kv_paths()
+        .raft_wal_paths(&state.local_node_id);
+    let read = sinomo_core::kv::with_cluster_kv_resident_read_projection_before(
+        &wal_paths,
+        &state.local_node_id,
+        deadline,
+        |projection| {
+            let members = projection.read_index_prefix_limited_by_payload_bytes(
+                "/cluster/members/",
+                sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES,
+                sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_PAYLOAD_BYTES,
+            )?;
+            let services = projection.read_index_prefix_limited_by_payload_bytes(
+                sinomo_core::service::CLUSTER_SERVICES_KV_PREFIX,
+                sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES,
+                sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_PAYLOAD_BYTES,
+            )?;
+            Ok::<_, KvError>((members, services))
+        },
+    )
+    .ok_or_else(|| KvError::Busy {
+        path: wal_paths.root.display().to_string(),
+    })??;
+    read.value.map_err(Into::into)
 }
 
 fn peer_snapshot_from_configuration_entries(
@@ -1242,37 +1275,15 @@ pub(crate) async fn read_daemon_dfs_message_peer_snapshot_before(
                 message: error.to_string(),
             }
         })?;
-    let wal_paths = cluster_paths
-        .kv_paths()
-        .raft_wal_paths(&state.local_node_id);
+    let peer_paths = cluster_paths.clone();
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
     let task_owner = Arc::clone(&host);
     // Register the SAME blocking task before awaiting. A canceled caller must
     // not detach native/data-owner custody from the component's ordinary drain.
     let task = runtime.spawn_blocking(move || {
         let result = (|| -> Result<Option<DaemonDfsMessagePeerSnapshot>, sinomo_dfs::DfsError> {
-            let read = sinomo_core::kv::with_cluster_kv_resident_read_projection_before(
-                &wal_paths,
-                &state.local_node_id,
-                deadline.into_std(),
-                |projection| {
-                    let members = projection.read_index_prefix_limited_by_payload_bytes(
-                        "/cluster/members/",
-                        sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES,
-                        sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_PAYLOAD_BYTES,
-                    )?;
-                    let services = projection.read_index_prefix_limited_by_payload_bytes(
-                        sinomo_core::service::CLUSTER_SERVICES_KV_PREFIX,
-                        sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES,
-                        sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_PAYLOAD_BYTES,
-                    )?;
-                    Ok::<_, KvError>((members, services))
-                },
-            )
-            .ok_or_else(|| KvError::Busy {
-                path: wal_paths.root.display().to_string(),
-            })??;
-            let (members, services) = read.value?;
+            let (members, services) =
+                read_native_dfs_peer_configuration(&peer_paths, &state, deadline.into_std())?;
             if host.shutting_down.load(Ordering::Acquire)
                 || !registered_dfs_runtime_host(&data_dir)
                     .map_err(|error| sinomo_dfs::DfsError::Network {
@@ -1284,7 +1295,12 @@ pub(crate) async fn read_daemon_dfs_message_peer_snapshot_before(
             }
             if tokio::time::Instant::now() >= deadline {
                 return Err(KvError::Busy {
-                    path: wal_paths.root.display().to_string(),
+                    path: peer_paths
+                        .kv_paths()
+                        .raft_wal_paths(&state.local_node_id)
+                        .root
+                        .display()
+                        .to_string(),
                 }
                 .into());
             }
@@ -1322,7 +1338,7 @@ pub(crate) fn schedule_daemon_dfs_message_deferred_work(
             crate::runtime_message::checkpoint_detached_replica_delivery(&data_dir, event)
         });
         let response_runtime = tokio_runtime.clone();
-        worker.set_background_response_handler(move |message| {
+        worker.set_background_response_handler(move |message, original| {
             let request_id = match &message.message {
                 sinomo_dfs::DfsNetworkMessage::RepairReplicaResponse(response) => {
                     format!("dfs_background_repair_{}", response.request_id)
@@ -1344,6 +1360,7 @@ pub(crate) fn schedule_daemon_dfs_message_deferred_work(
                 &paths,
                 command,
                 &response_runtime,
+                original,
             )
             .map(|_| ())
             .map_err(|error| sinomo_dfs::DfsError::Network {
@@ -3014,6 +3031,28 @@ fn attempt_daemon_dfs_message_command_with_remote_phase(
         }
         _ => None,
     };
+    let publication_provider = publication_scope
+        .as_ref()
+        .map(|scope| {
+            let authority = metadata_authority_preflight
+                .as_ref()
+                .map(|preflight| Arc::clone(&preflight.authority))
+                .or_else(|| {
+                    service_lane_handle
+                        .detached_send_runtime()
+                        .metadata_authority_generation()
+                })
+                .ok_or_else(|| sinomo_dfs::DfsError::Metadata {
+                    message: "admitted publication has no actual retained runtime authority".into(),
+                })?;
+            crate::DfsPublicationExecutionProvider::from_execution_owners(
+                &scope.owners(),
+                authority,
+                runtime.clone(),
+            )
+            .map_err(sinomo_dfs::DfsError::from)
+        })
+        .transpose()?;
     let execution = crate::runtime_message::execute_runtime_message_command_with_verified_fetch(
         &service_lane_handle,
         peer_node_ids,
@@ -3024,6 +3063,7 @@ fn attempt_daemon_dfs_message_command_with_remote_phase(
         publication_scope
             .as_ref()
             .map(crate::publication_guard::DfsPublicationExecutionScope::owners),
+        publication_provider,
         completed_phase,
         |repair_queue_records| {
             persist_daemon_dfs_repair_queue_records(data_dir, repair_queue_records)
@@ -4069,7 +4109,7 @@ pub(crate) fn handle_daemon_dfs_message_on_runtime(
     command: DfsMessageCommand,
     runtime: &tokio::runtime::Handle,
 ) -> Result<DfsMessageResponse, DaemonError> {
-    handle_daemon_dfs_message_on_runtime_with_priority(paths, command, runtime, false)
+    handle_daemon_dfs_message_on_runtime_with_priority(paths, command, runtime, false, None)
 }
 
 /// A detached worker has matched this return to its authenticated peer and
@@ -4079,9 +4119,72 @@ fn handle_daemon_dfs_message_on_runtime_with_background_response(
     paths: &DaemonPaths,
     command: DfsMessageCommand,
     runtime: &tokio::runtime::Handle,
+    original: Option<&sinomo_dfs::DfsRoutedMessage>,
 ) -> Result<sinomo_dfs::DfsMessageResponse, DaemonError> {
     let _data_owner_lock = require_daemon_dfs_data_owner_lock(paths)?;
-    handle_daemon_dfs_message_on_runtime_with_priority(paths, command, runtime, true)
+    handle_daemon_dfs_message_on_runtime_with_priority(paths, command, runtime, true, original)
+}
+
+/// Route DATA from an actual locally owned original request. This supplies no
+/// author capability: current intent/queue/policy and native kernel guards still
+/// validate the reply and publication under the selected ordinary shard lease.
+pub(super) fn owned_repair_completion_scope(
+    original: &sinomo_dfs::DfsRoutedMessage,
+    returned: &sinomo_dfs::DfsRoutedMessage,
+    local: &NodeId,
+    shards: &[sinomo_dfs::DfsMetadataShardConfig],
+) -> Result<DfsMessageExecutionScope, sinomo_dfs::DfsError> {
+    let invalid = || sinomo_dfs::DfsError::Metadata {
+        message: "owned repair completion does not match its current original request/assignment"
+            .into(),
+    };
+    let (
+        sinomo_dfs::DfsNetworkMessage::RepairReplica(request),
+        sinomo_dfs::DfsNetworkMessage::RepairReplicaResponse(response),
+    ) = (&original.message, &returned.message)
+    else {
+        return Err(invalid());
+    };
+    let assignment = request.authority_shard.as_ref().ok_or_else(invalid)?;
+    let object = request.object_metadata.as_ref().ok_or_else(invalid)?;
+    if !request.background_repair
+        || &original.source_node_id != local
+        || &returned.target_node_id != local
+        || returned.source_node_id != original.target_node_id
+        || response.replica_node_id != original.target_node_id
+        || response.request_id != request.request_id
+        || response.intent_id != request.intent_id
+        || response.file_system_id != request.file_system_id
+        || response.object_id != request.object_id
+        || response.version != request.version
+        || assignment.file_system_id != request.file_system_id
+        || &assignment.primary_node_id != local
+        || assignment.shard_id.trim().is_empty()
+        || object.file_system_id != request.file_system_id
+        || object.object_id != request.object_id
+    {
+        return Err(invalid());
+    }
+    if matches!(&response.result,
+        sinomo_dfs::DfsBlobTransferResult::Committed { content_hash }
+            | sinomo_dfs::DfsBlobTransferResult::Durable { content_hash }
+            if content_hash != &request.content_hash)
+    {
+        return Err(invalid());
+    }
+    let selected = sinomo_dfs::select_metadata_shard_config_for_path_strict_default_sifs_split(
+        &request.file_system_id,
+        shards,
+        &object.path,
+    )?
+    .ok_or_else(invalid)?;
+    if selected != *assignment {
+        return Err(invalid());
+    }
+    Ok(DfsMessageExecutionScope::ExactShard {
+        file_system_id: assignment.file_system_id.clone(),
+        shard_id: sinomo_dfs::DfsMetadataShardId::new(&assignment.shard_id),
+    })
 }
 
 fn handle_daemon_dfs_message_on_runtime_with_priority(
@@ -4089,11 +4192,12 @@ fn handle_daemon_dfs_message_on_runtime_with_priority(
     command: DfsMessageCommand,
     runtime: &tokio::runtime::Handle,
     background_response: bool,
+    original_repair: Option<&sinomo_dfs::DfsRoutedMessage>,
 ) -> Result<sinomo_dfs::DfsMessageResponse, DaemonError> {
     let data_dir = daemon_data_dir(paths)?;
     let data_dir = SinomoDataDir::new(data_dir);
     let cluster_paths = ClusterPaths::new(&data_dir);
-    let execution_scope = dfs_message_execution_scope(&command);
+    let mut execution_scope = dfs_message_execution_scope(&command);
     let Some(peer_snapshot) = read_daemon_dfs_message_peer_snapshot(&cluster_paths)? else {
         return Err(DaemonError::ClusterOrphan);
     };
@@ -4108,6 +4212,52 @@ fn handle_daemon_dfs_message_on_runtime_with_priority(
             ))?,
         )
     };
+    if let Some(original) = original_repair {
+        let preflight = metadata_authority_preflight.as_ref().ok_or_else(|| {
+            sinomo_dfs::DfsError::Metadata {
+                message: "owned repair completion has no current retained configuration".into(),
+            }
+        })?;
+        daemon_dfs_require_retained_authority(&preflight.authority, preflight.generation)
+            .map_err(DaemonDfsAuthorityPreExecutionError::into_dfs_error)?;
+        let projection_generation = preflight.authority.projection_generation();
+        let shards = preflight
+            .authority
+            .cached_metadata_shards(
+                &match &command.routed_message.message {
+                    sinomo_dfs::DfsNetworkMessage::RepairReplicaResponse(response) => {
+                        response.file_system_id.clone()
+                    }
+                    _ => {
+                        return Err(sinomo_dfs::DfsError::Metadata {
+                            message:
+                                "owned repair completion provenance names another reply family"
+                                    .into(),
+                        }
+                        .into());
+                    }
+                },
+                projection_generation,
+            )?
+            .ok_or_else(|| sinomo_dfs::DfsError::Metadata {
+                message: "owned repair completion current configuration projection is unavailable"
+                    .into(),
+            })?;
+        execution_scope = owned_repair_completion_scope(
+            original,
+            &command.routed_message,
+            &peer_snapshot.local_node_id,
+            &shards,
+        )?;
+        if preflight.authority.projection_generation() != projection_generation {
+            return Err(sinomo_dfs::DfsError::Metadata {
+                message: "owned repair completion configuration changed before admission".into(),
+            }
+            .into());
+        }
+        daemon_dfs_require_retained_authority(&preflight.authority, preflight.generation)
+            .map_err(DaemonDfsAuthorityPreExecutionError::into_dfs_error)?;
+    }
     let mut mutation_admission = if background_response {
         let scheduler = daemon_dfs_mutation_scheduler(&data_dir)?;
         Some(runtime.block_on(admit_daemon_dfs_message(
@@ -4125,8 +4275,8 @@ fn handle_daemon_dfs_message_on_runtime_with_priority(
         command,
         None,
         &execution_scope,
-        false,
-        true,
+        original_repair.is_some(),
+        original_repair.is_none(),
         metadata_authority_preflight,
         Duration::ZERO,
         &mut mutation_admission,

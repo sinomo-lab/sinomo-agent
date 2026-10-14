@@ -1099,8 +1099,13 @@ pub struct DfsNodeDetachedSendWorker {
     transport: DfsNodeTransport,
     deferred_target_node_ids: BTreeSet<NodeId>,
     prepared_replica_calls: Arc<std::sync::Mutex<Vec<DfsCheckpointedReplicaCall>>>,
-    background_response_handler:
-        Option<Arc<dyn Fn(DfsRoutedMessage) -> Result<(), DfsError> + Send + Sync>>,
+    background_response_handler: Option<
+        Arc<
+            dyn Fn(DfsRoutedMessage, Option<&DfsRoutedMessage>) -> Result<(), DfsError>
+                + Send
+                + Sync,
+        >,
+    >,
     background_delivery_handler: Option<
         Arc<
             dyn Fn(
@@ -1203,11 +1208,15 @@ impl DfsNodeDetachedSendWorker {
         (background.and(ordinary), background_retry)
     }
 
-    /// Deliver authenticated RPC returns through the host's ordinary message
-    /// validation after dispatch has released its source mutation owner.
+    /// Deliver authenticated RPC returns through the existing admitted handler
+    /// after releasing source mutation custody. The optional original is DATA
+    /// from this SAME checkpointed local repair call, never peer authority.
     pub(crate) fn set_background_response_handler<F>(&mut self, handler: F)
     where
-        F: Fn(DfsRoutedMessage) -> Result<(), DfsError> + Send + Sync + 'static,
+        F: Fn(DfsRoutedMessage, Option<&DfsRoutedMessage>) -> Result<(), DfsError>
+            + Send
+            + Sync
+            + 'static,
     {
         self.background_response_handler = Some(Arc::new(handler));
     }
@@ -1330,9 +1339,10 @@ impl DfsNodeDetachedSendWorker {
             }
         };
         for message in returned {
-            let matching = match &message.message {
-                DfsNetworkMessage::RepairReplicaResponse(response) => {
-                    expected.iter().any(|(target, original, _, _)| {
+            let original = match &message.message {
+                DfsNetworkMessage::RepairReplicaResponse(response) => expected
+                    .iter()
+                    .find(|(target, original, _, _)| {
                         let DfsNetworkMessage::RepairReplica(command) = &original.message else {
                             return false;
                         };
@@ -1346,16 +1356,16 @@ impl DfsNodeDetachedSendWorker {
                             && response.object_id == command.object_id
                             && response.version == command.version
                     })
-                }
-                _ => false,
+                    .map(|(_, original, _, _)| original),
+                _ => None,
             };
-            if !matching {
+            let Some(original) = original else {
                 first_error.get_or_insert_with(|| DfsError::Network {
                     message: "background DFS repair returned an unmatched response identity".into(),
                 });
                 continue;
-            }
-            if let Err(error) = handler(message) {
+            };
+            if let Err(error) = handler(message, Some(original)) {
                 first_error.get_or_insert(error);
             }
         }
@@ -2858,7 +2868,13 @@ impl DfsNodeTransport {
     fn flush_detached_peer_sends_excluding_targets(
         &mut self,
         deferred_target_node_ids: &BTreeSet<NodeId>,
-        response_handler: Option<&(dyn Fn(DfsRoutedMessage) -> Result<(), DfsError> + Send + Sync)>,
+        response_handler: Option<
+            &(
+                 dyn Fn(DfsRoutedMessage, Option<&DfsRoutedMessage>) -> Result<(), DfsError>
+                     + Send
+                     + Sync
+             ),
+        >,
     ) -> Result<(), NetworkError> {
         self.flush_detached_peer_sends_with_now_mode(
             &Instant::now,
@@ -2871,7 +2887,13 @@ impl DfsNodeTransport {
     fn flush_detached_peer_sends_exclusive_excluding_targets(
         &mut self,
         deferred_target_node_ids: &BTreeSet<NodeId>,
-        response_handler: Option<&(dyn Fn(DfsRoutedMessage) -> Result<(), DfsError> + Send + Sync)>,
+        response_handler: Option<
+            &(
+                 dyn Fn(DfsRoutedMessage, Option<&DfsRoutedMessage>) -> Result<(), DfsError>
+                     + Send
+                     + Sync
+             ),
+        >,
     ) -> Result<(), NetworkError> {
         self.flush_detached_peer_sends_with_now_mode(
             &Instant::now,
@@ -2894,7 +2916,13 @@ impl DfsNodeTransport {
         now: &F,
         wait_for_drain_gate: bool,
         deferred_target_node_ids: &BTreeSet<NodeId>,
-        response_handler: Option<&(dyn Fn(DfsRoutedMessage) -> Result<(), DfsError> + Send + Sync)>,
+        response_handler: Option<
+            &(
+                 dyn Fn(DfsRoutedMessage, Option<&DfsRoutedMessage>) -> Result<(), DfsError>
+                     + Send
+                     + Sync
+             ),
+        >,
     ) -> Result<(), NetworkError>
     where
         F: Fn() -> Instant + ?Sized,
@@ -3221,7 +3249,13 @@ impl DfsNodeTransport {
         &mut self,
         returned_messages: Vec<DfsRoutedMessage>,
         fetch: Option<&DfsRoutedMessage>,
-        response_handler: Option<&(dyn Fn(DfsRoutedMessage) -> Result<(), DfsError> + Send + Sync)>,
+        response_handler: Option<
+            &(
+                 dyn Fn(DfsRoutedMessage, Option<&DfsRoutedMessage>) -> Result<(), DfsError>
+                     + Send
+                     + Sync
+             ),
+        >,
     ) -> Result<(), NetworkError> {
         for returned_message in returned_messages {
             if let (Some(original), Some(handler)) = (fetch, response_handler) {
@@ -3247,7 +3281,7 @@ impl DfsNodeTransport {
                         detail: "detached DFS fetch returned an unmatched response identity".into(),
                     });
                 }
-                handler(returned_message).map_err(|error| NetworkError::Io {
+                handler(returned_message, None).map_err(|error| NetworkError::Io {
                     operation: "deliver detached DFS fetch response to Main".into(),
                     detail: error.to_string(),
                 })?;

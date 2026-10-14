@@ -695,8 +695,21 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
     let peer_node_ids = retained.peer_node_ids.clone();
     let detached_send_runtime = Arc::clone(&retained.detached_send_runtime);
     let mut maintenance_service = &mut retained.lane.service;
+    let publication_provider = publication_owners
+        .as_ref()
+        .map(|owners| {
+            crate::DfsPublicationExecutionProvider::from_execution_owners(
+                owners,
+                Arc::clone(&metadata_authority_generation),
+                runtime.clone(),
+            )
+        })
+        .transpose()?;
     let publication_scope =
         publication_owners.map(|owners| maintenance_service.publication_execution.install(owners));
+    // Release this strong owner before returning the reusable lane to cache.
+    let publication_provider_scope = publication_provider
+        .map(|provider| maintenance_service.publication_provider.install(provider));
     let placement_advertisements = maintenance_service
         .placement_content_candidates()
         .unwrap_or_default();
@@ -946,6 +959,7 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
     }
     // Rebuild only a genuinely quiescent service. Explicit recovery is not a
     // process restart and cannot discard live fetch/repair or namespace custody.
+    drop(publication_provider_scope);
     drop(publication_scope);
     let preserve_remote_continuation = remote_namespace_phase.is_some();
     let reset_to_lazy = !preserve_remote_continuation

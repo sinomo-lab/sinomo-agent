@@ -25,6 +25,63 @@ pub(crate) struct SourceAncestryChunk {
     pub(crate) resulting_anchor: Option<DfsMetadataPrefixProof>,
 }
 
+/// Independently captured LOCAL original-source checkpoint DATA. Its caller
+/// retains and validates the actual snapshot/root custody; this is not an ACK.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SourceCheckpointAnchor {
+    pub(crate) shard_id: sinomo_dfs::DfsMetadataShardId,
+    pub(crate) prefix_proof: DfsMetadataPrefixProof,
+}
+
+/// Interpret only the released scalar V1 prefix domain as an internal DATA
+/// anchor. The original acknowledgement remains byte-for-byte unchanged.
+pub(crate) fn source_ack_prefix_anchor(
+    floor: &LegacyAcknowledgement,
+    source_format: Option<u16>,
+    physical_shard: &sinomo_dfs::DfsMetadataShardId,
+    source_head: u64,
+) -> Result<Option<DfsMetadataPrefixProof>> {
+    if floor.journal_sequence > source_head {
+        return Err(error(
+            "retained source ACK floor is ahead of the immutable source cut",
+        ));
+    }
+    if let Some(proof) = &floor.durable_prefix_proof {
+        source_proof::validate(proof)?;
+        if proof.journal_sequence != floor.journal_sequence {
+            return Err(error(
+                "source ACK prefix anchor differs from its actual floor",
+            ));
+        }
+        return Ok(Some(proof.clone()));
+    }
+    if floor.state_fingerprint.is_empty() {
+        return Ok(None);
+    }
+    if !matches!(source_format, Some(3 | 6)) || floor.shard_id != *physical_shard {
+        return Err(error(
+            "scalar source ACK prefix has an unsupported format or foreign physical shard",
+        ));
+    }
+    let hash = floor
+        .state_fingerprint
+        .strip_prefix("dfs-metadata-prefix-v1:blake3:")
+        .ok_or_else(|| error("source ACK scalar has no released prefix identity"))?;
+    if hash.len() != 64
+        || !hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(error("source ACK scalar prefix is not canonical V1"));
+    }
+    Ok(Some(DfsMetadataPrefixProof {
+        version: 1,
+        journal_sequence: floor.journal_sequence,
+        digest: floor.state_fingerprint.clone(),
+    }))
+}
+
 fn binding(cut: &MetadataSourceCut) -> Result<String> {
     let bytes = serde_json::to_vec(&(
         &cut.source_identity,
@@ -97,6 +154,7 @@ pub(crate) fn source_ancestry_reader(
     cut: &MetadataSourceCut,
     actual_source_root: &Path,
     floors: &[LegacyAcknowledgement],
+    checkpoints: &[SourceCheckpointAnchor],
 ) -> Result<OwnedSourceAncestryReader> {
     let fence = super::retain_source_fence(actual_source_root)?;
     super::validate_retained_source_identity(
@@ -104,7 +162,7 @@ pub(crate) fn source_ancestry_reader(
         &cut.source_identity,
         &cut.source_snapshot_fingerprint,
     )?;
-    let verifier = SourceAncestryVerifier::new(cut, floors)?;
+    let verifier = SourceAncestryVerifier::new(cut, floors, checkpoints)?;
     let next_sequence = verifier.next_sequence;
     Ok(OwnedSourceAncestryReader {
         _source_fence: fence,
@@ -182,6 +240,7 @@ pub(crate) struct SourceAncestryVerifier {
     binding: String,
     floors: Vec<LegacyAcknowledgement>,
     proofs: Vec<Option<DfsMetadataPrefixProof>>,
+    checkpoints: Vec<SourceCheckpointAnchor>,
     head: u64,
     head_proof: Option<DfsMetadataPrefixProof>,
     next_sequence: u64,
@@ -190,27 +249,57 @@ pub(crate) struct SourceAncestryVerifier {
     poisoned: bool,
 }
 impl SourceAncestryVerifier {
-    pub(crate) fn new(cut: &MetadataSourceCut, floors: &[LegacyAcknowledgement]) -> Result<Self> {
-        let mut proofs = Vec::with_capacity(floors.len());
-        for floor in floors {
-            if floor.journal_sequence > cut.source_journal_sequence {
+    pub(crate) fn new(
+        cut: &MetadataSourceCut,
+        floors: &[LegacyAcknowledgement],
+        checkpoints: &[SourceCheckpointAnchor],
+    ) -> Result<Self> {
+        for checkpoint in checkpoints {
+            let proof = &checkpoint.prefix_proof;
+            source_proof::validate(proof)?;
+            if checkpoint.shard_id != cut.scope_shard {
                 return Err(error(
-                    "retained source ACK floor is ahead of the immutable source cut",
+                    "local source checkpoint has a foreign physical shard",
                 ));
             }
-            let Some(proof) = floor.durable_prefix_proof.clone() else {
-                // A legacy authority height carries no prefix identity. Keep
-                // that constraint, but cover it only with an actual anchored
-                // ACK in the SAME encoded source clock. Each such anchor is
-                // independently checked and extended below; no proof is copied
-                // into the height-only row.
-                if !floor.state_fingerprint.is_empty()
-                    || !floors.iter().any(|anchor| {
-                        anchor.shard_id == floor.shard_id
-                            && anchor.journal_sequence >= floor.journal_sequence
-                            && anchor.durable_prefix_proof.is_some()
-                    })
-                {
+            if proof.journal_sequence > cut.source_journal_sequence {
+                return Err(error(
+                    "local source checkpoint is ahead of the immutable source cut",
+                ));
+            }
+            if proof.journal_sequence == cut.source_journal_sequence
+                && cut.source_exact_prefix.as_ref() != Some(proof)
+            {
+                return Err(error(
+                    "local source checkpoint forks the immutable source cut",
+                ));
+            }
+        }
+        let anchors = floors
+            .iter()
+            .map(|floor| {
+                source_ack_prefix_anchor(
+                    floor,
+                    cut.source_format_version,
+                    &cut.scope_shard,
+                    cut.source_journal_sequence,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut proofs = Vec::with_capacity(floors.len());
+        for (floor, anchor) in floors.iter().zip(&anchors) {
+            let Some(proof) = anchor.clone() else {
+                // Cover an unchanged height-only row only with a same-clock
+                // ACK or independently captured LOCAL checkpoint. Every
+                // covering anchor still has its own full replay obligation.
+                if !(floors.iter().zip(&anchors).any(|(other, proof)| {
+                    other.shard_id == floor.shard_id
+                        && other.journal_sequence >= floor.journal_sequence
+                        && proof.is_some()
+                }) || checkpoints.iter().any(|checkpoint| {
+                    checkpoint.shard_id == floor.shard_id
+                        && checkpoint.prefix_proof.journal_sequence >= floor.journal_sequence
+                })) {
                     return Err(error(
                         "source ACK floor has no retained prefix anchor; ancestry is unavailable",
                     ));
@@ -218,12 +307,6 @@ impl SourceAncestryVerifier {
                 proofs.push(None);
                 continue;
             };
-            source_proof::validate(&proof)?;
-            if proof.journal_sequence != floor.journal_sequence {
-                return Err(error(
-                    "source ACK prefix anchor differs from its actual floor",
-                ));
-            }
             if floor.journal_sequence == cut.source_journal_sequence
                 && ((!floor.state_fingerprint.is_empty()
                     && floor.state_fingerprint != cut.source_state_fingerprint)
@@ -235,7 +318,7 @@ impl SourceAncestryVerifier {
             }
             proofs.push(Some(proof));
         }
-        if !floors.is_empty() {
+        if !floors.is_empty() || !checkpoints.is_empty() {
             let head = cut
                 .source_exact_prefix
                 .as_ref()
@@ -247,10 +330,15 @@ impl SourceAncestryVerifier {
                 ));
             }
         }
-        let next_sequence = floors
+        let next_sequence = proofs
             .iter()
-            .filter(|floor| floor.durable_prefix_proof.is_some())
-            .map(|floor| floor.journal_sequence)
+            .flatten()
+            .map(|proof| proof.journal_sequence)
+            .chain(
+                checkpoints
+                    .iter()
+                    .map(|checkpoint| checkpoint.prefix_proof.journal_sequence),
+            )
             .min()
             .unwrap_or(cut.source_journal_sequence)
             .checked_add(1)
@@ -259,6 +347,7 @@ impl SourceAncestryVerifier {
             binding: binding(cut)?,
             floors: floors.to_vec(),
             proofs,
+            checkpoints: checkpoints.to_vec(),
             head: cut.source_journal_sequence,
             head_proof: cut.source_exact_prefix.clone(),
             next_sequence,
@@ -316,21 +405,48 @@ impl SourceAncestryVerifier {
                 return Err(error("source anchor has a different frame sequence"));
             }
         }
-        for (floor, proof) in self.floors.iter().zip(&mut self.proofs) {
-            let Some(proof) = proof else { continue };
-            if floor.journal_sequence >= chunk.sequence {
+        let scalar_v2_suffix = self
+            .head_proof
+            .as_ref()
+            .is_some_and(|proof| proof.version == 2);
+        let ack_anchors = self
+            .floors
+            .iter()
+            .zip(&mut self.proofs)
+            .filter_map(|(floor, proof)| {
+                proof.as_mut().map(|proof| {
+                    (
+                        &floor.shard_id,
+                        proof,
+                        floor.durable_prefix_proof.is_none() && scalar_v2_suffix,
+                    )
+                })
+            });
+        let checkpoint_anchors = self
+            .checkpoints
+            .iter_mut()
+            .map(|checkpoint| (&checkpoint.shard_id, &mut checkpoint.prefix_proof, false));
+        for (shard, proof, scalar_v2_suffix) in ack_anchors.chain(checkpoint_anchors) {
+            if proof.journal_sequence >= chunk.sequence {
                 continue;
             }
-            if entry.get("shard_id") != Some(&serde_json::to_value(&floor.shard_id).map_err(error)?)
-            {
+            if entry.get("shard_id") != Some(&serde_json::to_value(shard).map_err(error)?) {
                 return Err(error(
                     "source ancestry frame crosses the actual encoded ACK shard",
                 ));
             }
-            let version = chunk
-                .resulting_anchor
-                .as_ref()
-                .map_or(proof.version, |anchor| anchor.version);
+            // A released scalar V1 ACK can precede the known exact-frame V2
+            // suffix. Test this ONE continuation; every captured intermediate
+            // anchor and the exact immutable head must agree. No transition
+            // search, checkpoint substitution, or ACK rewrite is permitted.
+            let version = if scalar_v2_suffix {
+                2
+            } else {
+                chunk
+                    .resulting_anchor
+                    .as_ref()
+                    .map_or(proof.version, |anchor| anchor.version)
+            };
             *proof = source_proof::extend_as(proof, chunk.sequence, &self.frame, version)?;
             if chunk
                 .resulting_anchor
@@ -358,6 +474,11 @@ impl SourceAncestryVerifier {
                 .proofs
                 .iter()
                 .flatten()
+                .chain(
+                    self.checkpoints
+                        .iter()
+                        .map(|checkpoint| &checkpoint.prefix_proof),
+                )
                 .any(|proof| Some(proof) != self.head_proof.as_ref())
         {
             return Err(error(
@@ -436,8 +557,9 @@ mod tests {
     #[test]
     fn original_frames_stream_in_fragments_and_cross_an_actual_v1_v2_anchor() {
         let (_dir, cut, ack, _) = fixture();
-        let mut reader = source_ancestry_reader(&cut, &cut.source_root, &[ack.clone()]).unwrap();
-        let mut verifier = SourceAncestryVerifier::new(&cut, &[ack]).unwrap();
+        let mut reader =
+            source_ancestry_reader(&cut, &cut.source_root, &[ack.clone()], &[]).unwrap();
+        let mut verifier = SourceAncestryVerifier::new(&cut, &[ack], &[]).unwrap();
         assert!(verifier.finish().is_err());
         let mut count = 0;
         while let Some(chunk) = reader.next_chunk(17).unwrap() {
@@ -448,6 +570,55 @@ mod tests {
         assert!(count > 1);
         verifier.finish().unwrap();
     }
+    #[test]
+    fn checkpoint_and_head_ack_do_not_replace_an_older_ack_original_frame() {
+        let (_dir, mut cut, older, bytes) = fixture();
+        let head = cut.source_exact_prefix.clone().unwrap();
+        cut.source_state_fingerprint = head.digest.clone();
+        let newest = LegacyAcknowledgement {
+            shard_id: older.shard_id.clone(),
+            journal_sequence: head.journal_sequence,
+            state_fingerprint: head.digest.clone(),
+            durable_prefix_proof: Some(head.clone()),
+        };
+        let checkpoint = SourceCheckpointAnchor {
+            shard_id: cut.scope_shard.clone(),
+            prefix_proof: head.clone(),
+        };
+        let floors = vec![older, newest];
+        let checkpoints = vec![checkpoint];
+        let mut reader =
+            source_ancestry_reader(&cut, &cut.source_root, &floors, &checkpoints).unwrap();
+        assert!(reader.next_chunk(1024 * 1024).unwrap().is_some());
+        assert!(reader.next_chunk(1024 * 1024).unwrap().is_none());
+
+        let path =
+            super::super::evidence_path(cut.staged_root.parent().unwrap(), head.journal_sequence);
+        fs::remove_file(&path).unwrap();
+        assert!(
+            retained_anchor(cut.staged_root.parent().unwrap(), head.journal_sequence)
+                .unwrap()
+                .is_some()
+        );
+        let mut reader =
+            source_ancestry_reader(&cut, &cut.source_root, &floors, &checkpoints).unwrap();
+        assert!(matches!(reader.next_chunk(1024 * 1024),
+            Err(sinomo_dfs::MetadataBackendError::Io { path: missing, source })
+                if missing == path && source.kind() == std::io::ErrorKind::NotFound));
+        assert!(
+            SourceAncestryVerifier::new(&cut, &floors, &checkpoints)
+                .unwrap()
+                .finish()
+                .is_err()
+        );
+        // Restore the same original bytes, never synthesize a checkpoint frame.
+        fs::write(&path, &bytes).unwrap();
+        let mut reader =
+            source_ancestry_reader(&cut, &cut.source_root, &floors, &checkpoints).unwrap();
+        assert!(reader.next_chunk(1024 * 1024).unwrap().is_some());
+        assert!(reader.next_chunk(1024 * 1024).unwrap().is_none());
+    }
+
     #[test]
     fn changed_frame_cut_or_fragment_order_never_confirms_ancestry() {
         let (_dir, cut, ack, bytes) = fixture();
@@ -466,7 +637,7 @@ mod tests {
                 1 => bad.offset = 1,
                 _ => bad.bytes[8] ^= 1,
             }
-            let mut verifier = SourceAncestryVerifier::new(&cut, &[ack.clone()]).unwrap();
+            let mut verifier = SourceAncestryVerifier::new(&cut, &[ack.clone()], &[]).unwrap();
             assert!(verifier.apply(&bad).is_err());
             assert!(verifier.apply(&chunk).is_err());
             assert!(verifier.finish().is_err());
@@ -475,16 +646,18 @@ mod tests {
     #[test]
     fn partial_frame_never_confirms_source_101_over_retained_floor_100() {
         let (_dir, cut, ack, _) = fixture();
-        let mut reader = source_ancestry_reader(&cut, &cut.source_root, &[ack.clone()]).unwrap();
+        let mut reader =
+            source_ancestry_reader(&cut, &cut.source_root, &[ack.clone()], &[]).unwrap();
         let first = reader.next_chunk(17).unwrap().unwrap();
-        let mut verifier = SourceAncestryVerifier::new(&cut, &[ack]).unwrap();
+        let mut verifier = SourceAncestryVerifier::new(&cut, &[ack], &[]).unwrap();
         verifier.apply(&first).unwrap();
         assert!(verifier.finish().is_err());
     }
     #[test]
     fn restart_replays_the_exact_durable_source_chunks_before_confirming() {
         let (dir, cut, ack, _) = fixture();
-        let mut reader = source_ancestry_reader(&cut, &cut.source_root, &[ack.clone()]).unwrap();
+        let mut reader =
+            source_ancestry_reader(&cut, &cut.source_root, &[ack.clone()], &[]).unwrap();
         let ledger = dir.path().join("receiver-ledger");
         fs::create_dir(&ledger).unwrap();
         let mut count = 0;
@@ -493,7 +666,7 @@ mod tests {
             fs::write(ledger.join(format!("{count:020}.sobj")), bytes).unwrap();
             count += 1;
         }
-        let mut verifier = SourceAncestryVerifier::new(&cut, &[ack]).unwrap();
+        let mut verifier = SourceAncestryVerifier::new(&cut, &[ack], &[]).unwrap();
         for ordinal in 0..count {
             let chunk: SourceAncestryChunk = serde_ext::from_bytes(
                 &fs::read(ledger.join(format!("{ordinal:020}.sobj"))).unwrap(),
@@ -508,14 +681,15 @@ mod tests {
         let (_dir, cut, mut ack, _) = fixture();
         let stage = cut.staged_root.parent().unwrap();
         fs::remove_file(anchor_path(stage, 101)).unwrap();
-        let mut reader = source_ancestry_reader(&cut, &cut.source_root, &[ack.clone()]).unwrap();
+        let mut reader =
+            source_ancestry_reader(&cut, &cut.source_root, &[ack.clone()], &[]).unwrap();
         while reader.next_chunk(1024).is_ok_and(|chunk| chunk.is_some()) {}
         assert!(reader.next_chunk(1024).is_err());
         ack.durable_prefix_proof = None;
-        assert!(SourceAncestryVerifier::new(&cut, &[ack]).is_err());
+        assert!(SourceAncestryVerifier::new(&cut, &[ack], &[]).is_err());
         fs::remove_file(super::super::evidence_path(stage, 101)).unwrap();
         let (_, _, ack, _) = fixture();
-        let mut reader = source_ancestry_reader(&cut, &cut.source_root, &[ack]).unwrap();
+        let mut reader = source_ancestry_reader(&cut, &cut.source_root, &[ack], &[]).unwrap();
         assert!(reader.next_chunk(1024).is_err());
     }
     #[test]
@@ -529,8 +703,8 @@ mod tests {
         };
         let floors = vec![authority.clone(), ack.clone()];
         let original = serde_json::to_vec(&floors).unwrap();
-        let mut reader = source_ancestry_reader(&cut, &cut.source_root, &floors).unwrap();
-        let mut verifier = SourceAncestryVerifier::new(&cut, &floors).unwrap();
+        let mut reader = source_ancestry_reader(&cut, &cut.source_root, &floors, &[]).unwrap();
+        let mut verifier = SourceAncestryVerifier::new(&cut, &floors, &[]).unwrap();
         assert_eq!(verifier.floors.len(), 2);
         assert_eq!(verifier.proofs[0], None);
         assert!(verifier.finish().is_err());
@@ -546,7 +720,7 @@ mod tests {
         let mut head = ack;
         head.journal_sequence = cut.source_journal_sequence;
         head.durable_prefix_proof = cut.source_exact_prefix.clone();
-        SourceAncestryVerifier::new(&cut, &[authority, head])
+        SourceAncestryVerifier::new(&cut, &[authority, head], &[])
             .unwrap()
             .finish()
             .unwrap();
@@ -568,11 +742,11 @@ mod tests {
                 2 => bad.shard_id = DfsMetadataShardId::new("different-clock"),
                 3 => bad.state_fingerprint = "unanchored-prefix-identity".into(),
                 _ => {
-                    assert!(SourceAncestryVerifier::new(&cut, &[bad]).is_err());
+                    assert!(SourceAncestryVerifier::new(&cut, &[bad], &[]).is_err());
                     continue;
                 }
             }
-            assert!(SourceAncestryVerifier::new(&cut, &[bad, ack.clone()]).is_err());
+            assert!(SourceAncestryVerifier::new(&cut, &[bad, ack.clone()], &[]).is_err());
         }
         let mut head = ack.clone();
         head.journal_sequence = cut.source_journal_sequence;
@@ -581,10 +755,271 @@ mod tests {
         fork.durable_prefix_proof.as_mut().unwrap().digest =
             format!("dfs-metadata-prefix-v1:blake3:{}", "0".repeat(64));
         let floors = [authority, fork, head];
-        let mut reader = source_ancestry_reader(&cut, &cut.source_root, &floors).unwrap();
+        let mut reader = source_ancestry_reader(&cut, &cut.source_root, &floors, &[]).unwrap();
         assert!(
             reader.next_chunk(1024).is_err(),
             "lower fork cannot be hidden by matching head"
+        );
+    }
+
+    #[test]
+    fn local_checkpoint_covers_unchanged_authority_and_replays_after_restart() {
+        let (dir, mut cut, ack, _) = fixture();
+        cut.scope_shard = ack.shard_id.clone();
+        let checkpoints = [SourceCheckpointAnchor {
+            shard_id: ack.shard_id.clone(),
+            prefix_proof: ack.durable_prefix_proof.unwrap(),
+        }];
+        let floors = [LegacyAcknowledgement {
+            shard_id: ack.shard_id,
+            journal_sequence: 99,
+            state_fingerprint: String::new(),
+            durable_prefix_proof: None,
+        }];
+        let original = serde_json::to_vec(&floors).unwrap();
+        let original_checkpoints = serde_json::to_vec(&checkpoints).unwrap();
+        let mut reader =
+            source_ancestry_reader(&cut, &cut.source_root, &floors, &checkpoints).unwrap();
+        let mut verifier = SourceAncestryVerifier::new(&cut, &floors, &checkpoints).unwrap();
+        assert_eq!(verifier.proofs, vec![None]);
+        assert!(verifier.finish().is_err());
+        let ledger = dir.path().join("checkpoint-receiver-ledger");
+        fs::create_dir(&ledger).unwrap();
+        let mut count = 0;
+        while let Some(chunk) = reader.next_chunk(17).unwrap() {
+            verifier.apply(&chunk).unwrap();
+            if count == 0 {
+                assert!(verifier.finish().is_err(), "a fragment is not ancestry");
+            }
+            fs::write(
+                ledger.join(format!("{count:020}.sobj")),
+                serde_ext::to_bytes(&chunk, 1, LengthMode::U32).unwrap(),
+            )
+            .unwrap();
+            count += 1;
+        }
+        assert!(count > 1);
+        verifier.finish().unwrap();
+        let mut restarted = SourceAncestryVerifier::new(&cut, &floors, &checkpoints).unwrap();
+        for ordinal in 0..count {
+            let chunk = serde_ext::from_bytes::<SourceAncestryChunk>(
+                &fs::read(ledger.join(format!("{ordinal:020}.sobj"))).unwrap(),
+            )
+            .unwrap();
+            restarted.apply(&chunk).unwrap();
+        }
+        restarted.finish().unwrap();
+        assert_eq!(restarted.floors[0].durable_prefix_proof, None);
+        assert_eq!(serde_json::to_vec(&floors).unwrap(), original);
+        assert_eq!(
+            serde_json::to_vec(&checkpoints).unwrap(),
+            original_checkpoints
+        );
+    }
+
+    #[test]
+    fn local_checkpoint_requires_its_actual_scope_cut_and_floor_coverage() {
+        let (_dir, mut cut, ack, _) = fixture();
+        cut.scope_shard = ack.shard_id.clone();
+        let checkpoint = SourceCheckpointAnchor {
+            shard_id: ack.shard_id.clone(),
+            prefix_proof: ack.durable_prefix_proof.unwrap(),
+        };
+        let authority = LegacyAcknowledgement {
+            shard_id: ack.shard_id,
+            journal_sequence: 99,
+            state_fingerprint: String::new(),
+            durable_prefix_proof: None,
+        };
+        assert!(SourceAncestryVerifier::new(&cut, &[authority.clone()], &[]).is_err());
+        for change in 0..7 {
+            let mut bad = checkpoint.clone();
+            let mut floor = authority.clone();
+            match change {
+                0 => bad.prefix_proof.journal_sequence = floor.journal_sequence - 1,
+                1 => bad.prefix_proof.journal_sequence = cut.source_journal_sequence + 1,
+                2 => bad.shard_id = DfsMetadataShardId::new("foreign-checkpoint-clock"),
+                3 => bad.prefix_proof.journal_sequence = cut.source_journal_sequence,
+                4 => bad.prefix_proof.version = 3,
+                5 => floor.journal_sequence = cut.source_journal_sequence + 1,
+                _ => floor.state_fingerprint = "unanchored-identity".into(),
+            }
+            assert!(SourceAncestryVerifier::new(&cut, &[floor], &[bad]).is_err());
+        }
+    }
+
+    #[test]
+    fn local_checkpoint_fork_is_not_hidden_by_an_ack_at_the_exact_head() {
+        let (_dir, mut cut, mut ack, _) = fixture();
+        cut.scope_shard = ack.shard_id.clone();
+        let mut checkpoint = SourceCheckpointAnchor {
+            shard_id: ack.shard_id.clone(),
+            prefix_proof: ack.durable_prefix_proof.clone().unwrap(),
+        };
+        checkpoint.prefix_proof.digest =
+            format!("dfs-metadata-prefix-v1:blake3:{}", "0".repeat(64));
+        let authority = LegacyAcknowledgement {
+            shard_id: ack.shard_id.clone(),
+            journal_sequence: 99,
+            state_fingerprint: String::new(),
+            durable_prefix_proof: None,
+        };
+        ack.journal_sequence = cut.source_journal_sequence;
+        ack.durable_prefix_proof = cut.source_exact_prefix.clone();
+        let floors = [authority, ack];
+        let mut reader =
+            source_ancestry_reader(&cut, &cut.source_root, &floors, &[checkpoint]).unwrap();
+        assert!(
+            reader.next_chunk(1024).is_err(),
+            "every lower checkpoint remains an independent constraint"
+        );
+        assert_eq!(floors[0].durable_prefix_proof, None);
+    }
+
+    #[test]
+    fn local_checkpoint_cannot_replace_missing_or_changed_original_frames() {
+        let (_dir, mut cut, ack, bytes) = fixture();
+        cut.scope_shard = ack.shard_id.clone();
+        let checkpoints = [SourceCheckpointAnchor {
+            shard_id: ack.shard_id.clone(),
+            prefix_proof: ack.durable_prefix_proof.unwrap(),
+        }];
+        let floors = [LegacyAcknowledgement {
+            shard_id: ack.shard_id,
+            journal_sequence: 99,
+            state_fingerprint: String::new(),
+            durable_prefix_proof: None,
+        }];
+        let mut chunk = SourceAncestryChunk {
+            source_binding: binding(&cut).unwrap(),
+            sequence: 101,
+            frame_length: bytes.len() as u64,
+            offset: 0,
+            bytes,
+            resulting_anchor: cut.source_exact_prefix.clone(),
+        };
+        chunk.bytes[8] ^= 1;
+        let mut verifier = SourceAncestryVerifier::new(&cut, &floors, &checkpoints).unwrap();
+        assert!(verifier.apply(&chunk).is_err());
+        assert!(verifier.finish().is_err());
+        fs::remove_file(super::super::evidence_path(
+            cut.staged_root.parent().unwrap(),
+            101,
+        ))
+        .unwrap();
+        let mut reader =
+            source_ancestry_reader(&cut, &cut.source_root, &floors, &checkpoints).unwrap();
+        assert!(reader.next_chunk(1024).is_err());
+    }
+
+    #[test]
+    fn released_scalar_v1_prefix_covers_height_without_rewriting_original_ack() {
+        let (_dir, mut cut, mut prefix, _) = fixture();
+        cut.scope_shard = prefix.shard_id.clone();
+        cut.source_format_version = Some(6);
+        prefix.state_fingerprint = prefix.durable_prefix_proof.take().unwrap().digest;
+        let authority = LegacyAcknowledgement {
+            shard_id: prefix.shard_id.clone(),
+            journal_sequence: 99,
+            state_fingerprint: String::new(),
+            durable_prefix_proof: None,
+        };
+        let floors = [authority, prefix];
+        let original = serde_json::to_vec(&floors).unwrap();
+        // The first exact-frame V2 step has no separate table anchor. The
+        // unchanged scalar ACK and exact head authenticate the complete suffix.
+        fs::remove_file(anchor_path(cut.staged_root.parent().unwrap(), 101)).unwrap();
+        let mut reader = source_ancestry_reader(&cut, &cut.source_root, &floors, &[]).unwrap();
+        let mut verifier = SourceAncestryVerifier::new(&cut, &floors, &[]).unwrap();
+        assert_eq!(verifier.next_sequence, 101);
+        assert_eq!(verifier.proofs[0], None);
+        assert_eq!(verifier.proofs[1].as_ref().unwrap().version, 1);
+        assert!(verifier.finish().is_err());
+        let mut chunks = Vec::new();
+        while let Some(chunk) = reader.next_chunk(17).unwrap() {
+            verifier.apply(&chunk).unwrap();
+            chunks.push(chunk);
+        }
+        verifier.finish().unwrap();
+        let mut restarted = SourceAncestryVerifier::new(&cut, &floors, &[]).unwrap();
+        for chunk in chunks {
+            restarted.apply(&chunk).unwrap();
+        }
+        restarted.finish().unwrap();
+        assert_eq!(serde_json::to_vec(&floors).unwrap(), original);
+        assert!(
+            verifier
+                .floors
+                .iter()
+                .all(|floor| floor.durable_prefix_proof.is_none())
+        );
+    }
+
+    #[test]
+    fn released_scalar_prefix_rejects_foreign_unknown_fork_and_incomplete_chain() {
+        let (_dir, mut cut, mut prefix, bytes) = fixture();
+        cut.scope_shard = prefix.shard_id.clone();
+        cut.source_format_version = Some(6);
+        prefix.state_fingerprint = prefix.durable_prefix_proof.take().unwrap().digest;
+        for change in 0..9 {
+            let mut bad = prefix.clone();
+            let mut changed_cut = cut.clone();
+            match change {
+                0 => bad.state_fingerprint = format!("blake3:{}", "0".repeat(64)),
+                1 => bad.state_fingerprint = bad.state_fingerprint.to_uppercase(),
+                2 => {
+                    bad.state_fingerprint =
+                        format!("dfs-metadata-prefix-v2:blake3:{}", "0".repeat(64))
+                }
+                3 => bad.shard_id = DfsMetadataShardId::new("foreign"),
+                4 => bad.journal_sequence = cut.source_journal_sequence + 1,
+                5 => changed_cut.source_format_version = None,
+                6 => changed_cut.source_format_version = Some(2),
+                7 => changed_cut.source_format_version = Some(9),
+                _ => changed_cut.source_exact_prefix.as_mut().unwrap().version = 3,
+            }
+            assert!(SourceAncestryVerifier::new(&changed_cut, &[bad], &[]).is_err());
+        }
+        let mut fork = prefix.clone();
+        fork.state_fingerprint = format!("dfs-metadata-prefix-v1:blake3:{}", "0".repeat(64));
+        let head = LegacyAcknowledgement {
+            shard_id: prefix.shard_id.clone(),
+            journal_sequence: cut.source_journal_sequence,
+            state_fingerprint: String::new(),
+            durable_prefix_proof: cut.source_exact_prefix.clone(),
+        };
+        let mut reader =
+            source_ancestry_reader(&cut, &cut.source_root, &[fork, head], &[]).unwrap();
+        assert!(
+            reader.next_chunk(1024).is_err(),
+            "matching head never hides the lower scalar fork"
+        );
+        let mut changed: serde_json::Value = serde_ext::from_bytes(&bytes).unwrap();
+        changed["created_at"] = serde_json::json!("1970-01-01T00:00:01Z");
+        let changed = serde_ext::to_bytes(&changed, 1, LengthMode::U32).unwrap();
+        let mut verifier = SourceAncestryVerifier::new(&cut, &[prefix.clone()], &[]).unwrap();
+        assert!(
+            verifier
+                .apply(&SourceAncestryChunk {
+                    source_binding: binding(&cut).unwrap(),
+                    sequence: 101,
+                    frame_length: changed.len() as u64,
+                    offset: 0,
+                    bytes: changed,
+                    resulting_anchor: cut.source_exact_prefix.clone(),
+                })
+                .is_err()
+        );
+        assert!(verifier.finish().is_err());
+        fs::remove_file(super::super::evidence_path(
+            cut.staged_root.parent().unwrap(),
+            101,
+        ))
+        .unwrap();
+        let mut reader = source_ancestry_reader(&cut, &cut.source_root, &[prefix], &[]).unwrap();
+        assert!(
+            reader.next_chunk(1024).is_err(),
+            "original frame custody cannot be replaced by the head"
         );
     }
 }

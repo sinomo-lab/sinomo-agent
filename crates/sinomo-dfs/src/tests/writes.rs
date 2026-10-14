@@ -45,24 +45,33 @@ fn node_transport_completes_synchronous_replica_write() {
 
     assert_eq!(stat.current_locations, nodes);
     assert_eq!(stat.size_bytes, Some(b"replicated bytes".len() as u64));
-    let backend = dfs.metadata_backend().expect("current native backend");
+    let owner = runtime
+        .metadata_primary_service("/services/node_route-transport.txt")
+        .expect("actual current Core owns the sealed publication");
+    let backend = owner.metadata_backend().expect("current native backend");
     let record = backend
-        .list_prepared_operations()
-        .expect("stored preparations")
+        .export_table_snapshot()
+        .expect("entire actual sealed publication table")
+        .tables
+        .prepared_operations_v7
         .into_iter()
         .find(|record| {
-            record
-                .payload
-                .terminal_intent
-                .as_ref()
-                .is_some_and(|intent| {
-                    intent.object_id == stat.object_id && intent.target_version == stat.version
-                })
+            record.terminal_intent.as_ref().is_some_and(|intent| {
+                intent.object_id == stat.object_id && intent.target_version == stat.version
+            })
         })
         .expect("sealed write outcome");
+    record
+        .validate()
+        .expect("entire original committed digest/body");
     assert_eq!(record.status, DfsPreparedOperationStatus::Committed);
+    assert!(
+        backend
+            .committed_prepared_operation(&record.digest)
+            .unwrap()
+            .is_some()
+    );
     let remote_receipts = record
-        .payload
         .content_receipts
         .iter()
         .filter(|receipt| receipt.replica_node_id == remote)
@@ -82,6 +91,7 @@ fn node_transport_completes_synchronous_replica_write() {
             .unwrap(),
         b"replicated bytes"
     );
+    drop(owner);
     drop(replica);
     drop(dfs);
     drop(control);
@@ -145,20 +155,14 @@ fn control_plane_default_bootstrap_host_writes_default_dfs_records() {
         DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedConfirmed, 1, 1).unwrap(),
     )
     .unwrap();
-    let mut config = service
-        .control_plane_client_mut()
-        .unwrap()
-        .range_prefix(&file_system_config_key(&sifs_file_system_id()))
-        .unwrap()
-        .into_iter()
-        .find(|entry| entry.key == file_system_config_key(&sifs_file_system_id()))
-        .unwrap()
-        .decode::<DfsFileSystemConfig>()
-        .unwrap();
-    upsert_placement_rule(&mut config.subtree_policies, rule.clone());
-    DfsControlPlaneStore::new(service.control_plane_client_mut().unwrap())
-        .put_file_system_config(&config)
-        .unwrap();
+    runtime
+        .apply_placement_policy(
+            &node,
+            "/managed",
+            DfsPlacementScope::Subtree,
+            DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedConfirmed, 1, 1).unwrap(),
+        )
+        .expect("normal guarded placement configuration producer");
     drop(service);
     runtime.stop_node(&node).unwrap();
     runtime.reopen_node(node.clone()).unwrap();
@@ -215,11 +219,11 @@ fn default_sifs_metadata_materialization_writes_node_directories_and_visible_ver
 }
 
 #[test]
-fn stage_response_commits_restored_pending_intent_without_inflight_request_id() {
+fn restored_pending_stage_rejects_old_ack_and_commits_exact_fresh_transfer() {
     let name = "native-stage-reply-restored-owner";
     let (mut runtime, initial, config) =
         crate::test_support::current_native_metadata_service(name, 2, "/services").unwrap();
-    let owner = config.primary_node_id;
+    let owner = config.primary_node_id.clone();
     drop(initial);
     let nodes = crate::test_runtime::DfsTestRuntime::ordered_node_ids(name, 2);
     let replica = nodes.iter().find(|node| **node != owner).unwrap().clone();
@@ -230,7 +234,7 @@ fn stage_response_commits_restored_pending_intent_without_inflight_request_id() 
     runtime
         .apply_placement_policy(&owner, &path, DfsPlacementScope::Subtree, first_policy)
         .unwrap();
-    let mut writer = runtime.client(&owner).unwrap();
+    let mut writer = runtime.metadata_primary_service(&path).unwrap();
     let base = writer
         .posix_write_file(
             &path,
@@ -242,10 +246,52 @@ fn stage_response_commits_restored_pending_intent_without_inflight_request_id() 
     let mut next_policy =
         DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedConfirmed, 2, 2).unwrap();
     next_policy.required_node_ids = nodes.clone();
-    runtime
+    let apply = runtime
         .apply_placement_policy(&owner, &path, DfsPlacementScope::Subtree, next_policy)
         .unwrap();
-    let mut writer = runtime.client(&owner).unwrap();
+    // Finish the actual managed Apply before the intended Pending write.
+    // Its real predecessor copy and mutation permit are setup work, not an
+    // arbitrary Busy outcome to retry during the ACK identity test.
+    let control = runtime.shared_control_plane().unwrap();
+    let apply_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    loop {
+        let current = control
+            .with_client(|kv| {
+                DfsControlPlaneStore::new(kv.as_mut())
+                    .placement_reconciliation(&base.file_system_id, &apply.job_id)
+            })
+            .unwrap()
+            .unwrap();
+        if current.state == DfsPlacementReconciliationState::Completed {
+            break;
+        }
+        assert!(
+            matches!(
+                current.state,
+                DfsPlacementReconciliationState::Pending
+                    | DfsPlacementReconciliationState::Scanning
+                    | DfsPlacementReconciliationState::Repairing
+            ),
+            "actual setup Apply failed: {current:?}"
+        );
+        let remaining = apply_deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "normal setup Apply did not complete: {current:?}"
+        );
+        let tick = runtime.maintenance_tick(&owner, remaining).unwrap();
+        assert!(
+            tick.outcome.is_ok(),
+            "actual normal setup maintenance failed: {:?}",
+            tick.outcome
+        );
+        std::thread::yield_now();
+    }
+    drop(control);
+    let background = runtime
+        .deny_background_replica_before_claim(&owner)
+        .unwrap();
+    let mut writer = runtime.metadata_primary_service(&path).unwrap();
     let bytes = vec![0x73; 2 * 1024 * 1024 + 4096];
     let version = crate::namespace::next_version(&base.version);
     let request = DfsWriteRequest {
@@ -275,10 +321,29 @@ fn stage_response_commits_restored_pending_intent_without_inflight_request_id() 
     };
     assert_eq!((durable_receipts, required_receipts), (1, 2));
     let received = writer.transport.drain_incoming_messages().unwrap();
-    assert!(received.iter().any(|routed| routed.source_node_id == replica && routed.target_node_id == owner
-        && matches!(&routed.message, DfsNetworkMessage::StageBlobResponse(response)
-            if response.intent_id == intent_id && response.object_id == request.object_id && response.version == version
-                && matches!(&response.result, DfsBlobTransferResult::Durable { content_hash: hash } if hash == &content_hash(&bytes)))));
+    let originals = received
+        .iter()
+        .filter(|routed| {
+            routed.source_node_id == replica
+                && routed.target_node_id == owner
+                && matches!(&routed.message, DfsNetworkMessage::StageBlobResponse(response)
+            if response.intent_id == intent_id && response.file_system_id == request.file_system_id
+                && response.object_id == request.object_id && response.version == version
+                && response.replica_node_id == replica
+                && matches!(&response.result, DfsBlobTransferResult::Durable { content_hash: hash }
+                    if hash == &content_hash(&bytes)))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let [original] = originals.as_slice() else {
+        panic!("one canonical original Stage response required");
+    };
+    let DfsNetworkMessage::StageBlobResponse(original_response) = &original.message else {
+        unreachable!()
+    };
+    writer
+        .ensure_stage_response_matches_pending(original_response, &content_hash(&bytes))
+        .unwrap();
     let stored = writer
         .metadata_backend()
         .unwrap()
@@ -303,7 +368,7 @@ fn stage_response_commits_restored_pending_intent_without_inflight_request_id() 
     drop(writer);
     runtime.stop_node(&owner).unwrap();
     runtime.reopen_node(owner.clone()).unwrap();
-    let mut restored = runtime.client(&owner).unwrap();
+    let mut restored = runtime.metadata_primary_service(&path).unwrap();
     restored.hydrate_from_metadata_backend().unwrap();
     assert!(
         restored
@@ -324,13 +389,195 @@ fn stage_response_commits_restored_pending_intent_without_inflight_request_id() 
             .status,
         DfsWriteIntentStatus::Committed
     );
-    let events = restored
-        .process_routed_messages_with_options(received, false)
+    let before = restored
+        .metadata_backend()
+        .unwrap()
+        .export_table_snapshot()
         .unwrap();
-    assert!(events.iter().any(|event| matches!(event, NetworkedDfsServiceEvent::BlobStaged { replica_node_id, .. } if replica_node_id == &replica)));
+    let before_intent = restored.coordinator().intent(&intent_id).unwrap().clone();
+    assert_eq!(
+        restored
+            .metadata_backend()
+            .unwrap()
+            .get_intent(&request.object_id, &intent_id)
+            .unwrap()
+            .as_ref(),
+        Some(&stored)
+    );
+    let rejection = restored
+        .ensure_stage_response_matches_pending(original_response, &content_hash(&bytes))
+        .unwrap_err();
+    assert!(matches!(rejection, DfsError::Distributed { .. }));
+    let work = DfsCommittedWorkTracker::new();
+    restored.set_committed_work_tracker(work.clone());
+    let events = restored
+        .process_routed_messages_with_options(vec![original.clone()], false)
+        .unwrap();
+    let [
+        NetworkedDfsServiceEvent::BlobStageRejected {
+            intent_id: rejected_intent,
+            object_id,
+            replica_node_id,
+            reason,
+        },
+    ] = events.as_slice()
+    else {
+        panic!("old uncorrelated ACK must have one typed Stage rejection: {events:?}");
+    };
+    assert_eq!(rejected_intent, &intent_id);
+    assert_eq!(object_id, &request.object_id);
+    assert_eq!(replica_node_id, &replica);
+    assert_eq!(reason, &rejection.to_string());
+    assert_eq!(work.take(), DfsMessageCommittedWork::default());
+    assert_eq!(
+        restored
+            .metadata_backend()
+            .unwrap()
+            .export_table_snapshot()
+            .unwrap(),
+        before,
+        "the old ACK changes neither the full durable tables nor their exact prefix"
+    );
+    assert_eq!(
+        restored.coordinator().intent(&intent_id),
+        Some(&before_intent)
+    );
     assert!(
-        matches!(restored.write_outcome(&intent_id).unwrap(), NetworkedDfsWriteOutcome::Committed { version: current, content_hash: hash, .. }
-        if current == version && hash == content_hash(&bytes))
+        restored
+            .writes
+            .pending_writes
+            .get(&intent_id)
+            .unwrap()
+            .stage_inflight_request_ids
+            .is_empty()
+    );
+    assert!(matches!(
+        restored.write_outcome(&intent_id).unwrap(),
+        NetworkedDfsWriteOutcome::Pending {
+            durable_receipts: 1,
+            required_receipts: 2,
+            ..
+        }
+    ));
+
+    // Use the normal existing foreground retry producer, not the prior ACK or
+    // a fabricated request reservation. Main background claims remain denied.
+    runtime.clear_faults();
+    let capture = runtime.capture_served_work(&replica, 32).unwrap();
+    let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    let prior_deadline = restored.transport.set_operation_deadline(Some(deadline));
+    restored.retry_pending_repairs().unwrap();
+    let fresh_request = restored
+        .writes
+        .pending_writes
+        .get(&intent_id)
+        .unwrap()
+        .stage_inflight_request_ids
+        .get(&replica)
+        .cloned()
+        .expect("normal retry must own a fresh actual Stage request");
+    assert_ne!(fresh_request, original_response.request_id);
+    let fresh = restored.transport.drain_incoming_messages().unwrap();
+    let replies = fresh
+        .iter()
+        .filter_map(|routed| {
+            if routed.source_node_id != replica || routed.target_node_id != owner {
+                return None;
+            }
+            match &routed.message {
+                DfsNetworkMessage::StageBlobResponse(response)
+                    if response.request_id == fresh_request && response.intent_id == intent_id =>
+                {
+                    Some(response)
+                }
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>();
+    let [reply] = replies.as_slice() else {
+        panic!("one actual fresh Stage acknowledgement required");
+    };
+    let mut expected = original_response.clone();
+    expected.request_id = fresh_request.clone();
+    assert_eq!(
+        *reply, &expected,
+        "only the current transfer request changes the original exact reply tuple"
+    );
+    restored
+        .ensure_stage_response_matches_pending(reply, &content_hash(&bytes))
+        .unwrap();
+    let stages = capture
+        .records()
+        .into_iter()
+        .filter(|record| {
+            matches!(
+        &record.command.routed_message.message, DfsNetworkMessage::StageBlob(command)
+            if command.request_id == fresh_request && command.intent_id == intent_id)
+        })
+        .collect::<Vec<_>>();
+    let [stage] = stages.as_slice() else {
+        panic!("one genuine fresh Stage receiver required");
+    };
+    assert!(stage.succeeded);
+    assert_eq!(stage.command.routed_message.source_node_id, owner);
+    assert_eq!(stage.command.routed_message.target_node_id, replica);
+    let DfsNetworkMessage::StageBlob(command) = &stage.command.routed_message.message else {
+        unreachable!()
+    };
+    assert_eq!(command.file_system_id, request.file_system_id);
+    assert_eq!(command.object_id, request.object_id);
+    assert_eq!(command.version, request.target_version);
+    assert_eq!(command.expected_base_version, stored.base_version);
+    assert_eq!(command.content_hash, content_hash(&bytes));
+    assert_eq!(command.authority_shard.as_ref(), Some(&config));
+    let events = restored
+        .process_routed_messages_with_options(fresh, false)
+        .unwrap();
+    assert!(events.iter().any(|event| matches!(event, NetworkedDfsServiceEvent::BlobStaged {
+        intent_id: current_intent, object_id, version: current_version, replica_node_id, content_hash: hash,
+    } if current_intent == &intent_id && object_id == &request.object_id && current_version == &version
+        && replica_node_id == &replica && hash == &content_hash(&bytes))));
+    assert!(
+        matches!(restored.write_outcome(&intent_id).unwrap(), NetworkedDfsWriteOutcome::Committed {
+        version: current, content_hash: hash, .. } if current == version && hash == content_hash(&bytes))
+    );
+    assert!(
+        Instant::now() <= deadline,
+        "the fresh owned transfer completes inside the unchanged default timeout"
+    );
+    restored.transport.set_operation_deadline(prior_deadline);
+    let committed = restored
+        .metadata_backend()
+        .unwrap()
+        .export_table_snapshot()
+        .unwrap();
+    let record = committed
+        .tables
+        .prepared_operations_v7
+        .iter()
+        .find(|record| {
+            record.payload.prepared_intent.as_ref() == Some(&stored)
+                && record
+                    .payload
+                    .terminal_intent
+                    .as_ref()
+                    .is_some_and(|intent| {
+                        intent.intent_id == intent_id
+                            && intent.file_system_id == request.file_system_id
+                            && intent.object_id == request.object_id
+                            && intent.target_version == version
+                    })
+        })
+        .expect("fresh receipt commits the complete original nonterminal body");
+    record.validate().unwrap();
+    assert_eq!(record.status, DfsPreparedOperationStatus::Committed);
+    assert!(
+        restored
+            .metadata_backend()
+            .unwrap()
+            .committed_prepared_operation(&record.digest)
+            .unwrap()
+            .is_some()
     );
     let current = restored
         .metadata_backend()
@@ -357,47 +604,73 @@ fn stage_response_commits_restored_pending_intent_without_inflight_request_id() 
         bytes
     );
     drop(actual);
+    drop(capture);
     drop(restored);
+    drop(background);
     runtime.clear_faults();
     runtime.close().unwrap();
 }
 
 #[test]
 fn posix_non_foreground_write_reports_only_durable_locations() {
-    let root = temp_root("posix-non-foreground-current-locations");
-    let local = NodeId::from_legacy_named("node_posix_async_repair_local").expect("local node");
-    let remote = NodeId::from_legacy_named("node_posix_async_repair_remote").expect("remote node");
-    let (_runtime, mut dfs) = native_sifs_service(
-        "posix_non_foreground_write_reports_only_durable_locations",
-        local.clone(),
-    );
-    dfs.posix_mkdir_all("/services").expect("services dir");
-
+    let name = "posix-non-foreground-current-locations";
+    let (runtime, initial, shard) =
+        crate::test_support::current_native_metadata_service(name, 2, "/services").unwrap();
+    let local = shard.primary_node_id.clone();
+    let remote = crate::test_runtime::DfsTestRuntime::ordered_node_ids(name, 2)
+        .into_iter()
+        .find(|node| node != &local)
+        .unwrap();
+    drop(initial);
+    let path = "/services/async-repair.txt";
+    let mut placement = DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 2).unwrap();
+    placement.required_node_ids = vec![local.clone(), remote.clone()];
+    runtime
+        .apply_placement_policy(&local, path, DfsPlacementScope::SelfOnly, placement.clone())
+        .unwrap();
+    runtime.install_fault(crate::test_runtime::FaultRule {
+        source: Some(local.clone()),
+        target: Some(remote.clone()),
+        route: Some(DFS_DATA_STAGE_BLOB_ROUTE.into()),
+        call_id: None,
+        origin: None,
+        remaining_hits: 32,
+        action: crate::test_runtime::FaultAction::BudgetExhausted,
+    });
+    let mut dfs = runtime.client(&local).unwrap();
     let stat = dfs
         .posix_write_file(
-            "/services/async-repair.txt",
+            path,
             b"commit locally and repair the remote replica later",
             DfsWriteOptions {
-                policy: DfsReplicationPolicy::new(1, 2).expect("policy"),
-                replica_candidates: vec![local.clone(), remote.clone()],
+                policy: placement.replication_policy(Default::default()).unwrap(),
+                replica_candidates: vec![local.clone(), remote],
                 wait_for_commit: true,
                 foreground_replica_repair: false,
             },
         )
         .expect("non-foreground write");
-
     assert_eq!(
         stat.current_locations,
         vec![local],
         "the returned POSIX stat must not claim an async repair target is durable"
     );
+    let mut owner = runtime.metadata_primary_service(path).unwrap();
+    owner
+        .hydrate_from_metadata_backend()
+        .expect("restore actual committed repair obligation");
     assert_eq!(
-        dfs.operational_metrics().expect("metrics").repair_job_count,
+        owner
+            .operational_metrics()
+            .expect("actual owner metrics")
+            .repair_job_count,
         1,
         "the remote desired replica should remain queued for repair"
     );
-
-    std::fs::remove_dir_all(root).ok();
+    drop(owner);
+    drop(dfs);
+    runtime.clear_faults();
+    runtime.close().expect("normal owner drain");
 }
 
 #[test]
@@ -434,7 +707,10 @@ fn posix_local_primary_detached_manifest_write_persists_visible_metadata_without
             action: crate::test_runtime::FaultAction::BudgetExhausted,
         });
     }
-    let mut writer = runtime.client(&local).unwrap();
+    let background = runtime
+        .deny_background_replica_before_claim(&local)
+        .unwrap();
+    let mut writer = runtime.metadata_primary_service(path).unwrap();
     let bytes = vec![0x63; 2 * 1024 * 1024 + 8192];
     let expected_hash = content_hash(&bytes);
     let before = runtime.rpc_observations().len();
@@ -481,13 +757,14 @@ fn posix_local_primary_detached_manifest_write_persists_visible_metadata_without
     drop(writer);
     runtime.stop_node(&local).unwrap();
     runtime.reopen_node(local.clone()).unwrap();
-    let mut reloaded = runtime.client(&local).unwrap();
+    let mut reloaded = runtime.metadata_primary_service(path).unwrap();
     let actual = reloaded.posix_stat(path).unwrap();
     assert_eq!(actual.object_id, stat.object_id);
     assert_eq!(actual.version, stat.version);
     assert_eq!(actual.content_hash.as_deref(), Some(expected_hash.as_str()));
     assert_eq!(reloaded.posix_read_file(path).unwrap(), bytes);
     drop(reloaded);
+    drop(background);
     runtime.clear_faults();
     runtime.close().unwrap();
 }
@@ -500,6 +777,10 @@ fn posix_transient_create_routes_precommit_records_to_path_shard() {
         "/services",
     )
     .expect("normal current runtime");
+    drop(service);
+    let mut service = runtime
+        .metadata_primary_service("/services/transient-create.txt")
+        .expect("actual owning Core producer and body inspector");
     let stat = service
         .posix_write_file(
             "/services/transient-create.txt",
@@ -509,9 +790,13 @@ fn posix_transient_create_routes_precommit_records_to_path_shard() {
         .expect("normal transient creation");
     let shard = DfsMetadataShardId::new(config.shard_id);
     let backend = service.metadata_backend().unwrap();
+    // The active-preparation index intentionally excludes terminal bodies.
+    // This assertion inspects the actual complete committed record instead.
     let record = backend
-        .list_prepared_operations()
+        .export_table_snapshot()
         .unwrap()
+        .tables
+        .prepared_operations_v7
         .into_iter()
         .find(|record| {
             record
@@ -519,10 +804,22 @@ fn posix_transient_create_routes_precommit_records_to_path_shard() {
                 .terminal_intent
                 .as_ref()
                 .is_some_and(|intent| {
-                    intent.object_id == stat.object_id && intent.target_version == stat.version
+                    intent.file_system_id == stat.file_system_id
+                        && intent.object_id == stat.object_id
+                        && intent.target_version == stat.version
                 })
         })
         .expect("complete data publication body");
+    record
+        .validate()
+        .expect("actual immutable body/digest correspondence");
+    assert!(
+        backend
+            .committed_prepared_operation(&record.digest)
+            .unwrap()
+            .is_some(),
+        "the exact exported body must have its actual terminal commit marker"
+    );
     assert_eq!(record.payload.shard_id, shard);
     assert_eq!(record.status, DfsPreparedOperationStatus::Committed);
     assert!(!record.payload.content_receipts.is_empty());
@@ -557,22 +854,53 @@ fn remote_manifest_write_defers_failed_post_commit_fetch() {
 
 #[test]
 fn hydrate_from_metadata_backend_does_not_resurrect_aborted_pending_write() {
-    let root = temp_root("hydrate-skips-aborted-pending-write");
-    let owner = NodeId::from_legacy_named("node_hydrate_abort_owner").expect("node");
-    let replica = NodeId::from_legacy_named("node_hydrate_abort_replica").expect("node");
-    let object_id = DfsObjectId::from_legacy_named("obj_hydrate_abort").expect("object");
-    let version_1 = DfsVersion::from_legacy_named("version_1").expect("version");
-    let version_2 = DfsVersion::from_legacy_named("version_2").expect("version");
-    let (_runtime, mut dfs) = native_sifs_service(
-        "hydrate_from_metadata_backend_does_not_resurrect_aborted_pending_write",
-        owner.clone(),
-    );
-    let mut metadata = file_metadata(owner.clone());
-    metadata.object_id = object_id.clone();
-    metadata.version = version_1.clone();
-    metadata.policy = DfsObjectPolicy::ReplicatedEventual;
-    dfs.add_object_metadata(metadata).expect("object");
-
+    let name = "native-hydration-aborted-pending-write";
+    let path = "/services/native-hydration-abort.bin";
+    let (runtime, initial, config) =
+        crate::test_support::current_native_metadata_service(name, 2, path).unwrap();
+    let owner = config.primary_node_id;
+    drop(initial);
+    let nodes = crate::test_runtime::DfsTestRuntime::ordered_node_ids(name, 2);
+    let replica = nodes.iter().find(|node| **node != owner).unwrap().clone();
+    let mut base_policy =
+        DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 1).unwrap();
+    base_policy.required_node_ids = vec![owner.clone()];
+    runtime
+        .apply_placement_policy(&owner, path, DfsPlacementScope::SelfOnly, base_policy)
+        .unwrap();
+    let mut main = runtime.client(&owner).unwrap();
+    let base = main
+        .posix_write_file(
+            path,
+            b"actual predecessor before abort",
+            DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
+        )
+        .unwrap();
+    drop(main);
+    let object_id = base.object_id;
+    let version_1 = base.version;
+    let version_2 = crate::namespace::next_version(&version_1);
+    let mut target_policy =
+        DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 2, 2).unwrap();
+    target_policy.required_node_ids = nodes.clone();
+    runtime
+        .apply_placement_policy(&owner, path, DfsPlacementScope::SelfOnly, target_policy)
+        .unwrap();
+    for route in [
+        crate::DFS_DATA_STAGE_BLOB_ROUTE,
+        crate::DFS_DATA_REPAIR_REPLICA_ROUTE,
+    ] {
+        runtime.install_fault(crate::test_support::DfsTestFaultRule {
+            source: Some(owner.clone()),
+            target: Some(replica.clone()),
+            route: Some(route.into()),
+            call_id: None,
+            origin: Some(crate::test_support::DfsTestRpcOrigin::RegisteredHost),
+            remaining_hits: 32,
+            action: crate::test_support::DfsTestFaultAction::BudgetExhausted,
+        });
+    }
+    let mut dfs = runtime.metadata_primary_service(path).unwrap();
     let write = dfs
         .write_distributed_eventual(
             DfsWriteRequest {
@@ -644,7 +972,9 @@ fn hydrate_from_metadata_backend_does_not_resurrect_aborted_pending_write() {
         next_intent_id, intent_id,
         "hydration must observe closed intent ids so new writes do not reuse them"
     );
-    std::fs::remove_dir_all(root).ok();
+    drop(dfs);
+    runtime.clear_faults();
+    runtime.close().unwrap();
 }
 
 #[test]
@@ -676,41 +1006,50 @@ fn hydrate_from_metadata_backend_keeps_incomplete_new_object_intent_invisible() 
             action: crate::test_support::DfsTestFaultAction::BudgetExhausted,
         });
     }
-    let mut writer = runtime.client(&owner).unwrap();
+    let mut writer = runtime.metadata_primary_service(&path).unwrap();
     let bytes = vec![0x67; 2 * 1024 * 1024 + 17];
-    let stat = writer
-        .posix_write_file(
-            &path,
-            &bytes,
-            DfsWriteOptions {
-                policy: DfsReplicationPolicy::new(2, 2).unwrap(),
-                replica_candidates: nodes,
-                wait_for_commit: false,
-                foreground_replica_repair: true,
-            },
-        )
-        .unwrap();
+    let started = writer.posix_write_file(
+        &path,
+        &bytes,
+        DfsWriteOptions {
+            policy: DfsReplicationPolicy::new(2, 2).unwrap(),
+            replica_candidates: nodes,
+            wait_for_commit: false,
+            foreground_replica_repair: true,
+        },
+    );
+    let (object_id, target_version) = match started {
+        Ok(stat) => (stat.object_id, stat.version),
+        Err(DfsPosixError::PendingWrite { intent_id, .. }) => {
+            let actual = writer
+                .coordinator()
+                .intent(&intent_id)
+                .expect("actual owning producer retained its pending intent");
+            (actual.object_id.clone(), actual.target_version.clone())
+        }
+        other => panic!("actual W2 Stage interruption must retain pending data: {other:?}"),
+    };
     let backend = writer.metadata_backend().unwrap();
     let intent = backend
         .write_intents_page(None, 64)
         .unwrap()
         .intents
         .into_iter()
-        .find(|intent| intent.object_id == stat.object_id && intent.target_version == stat.version)
-        .unwrap();
+        .find(|intent| intent.object_id == object_id && intent.target_version == target_version)
+        .expect("actual hidden native intent");
     assert_ne!(intent.status, DfsWriteIntentStatus::Committed);
-    assert!(backend.get_object(&stat.object_id).unwrap().is_none());
+    assert!(backend.get_object(&object_id).unwrap().is_none());
     drop(writer);
     runtime.stop_node(&owner).unwrap();
     runtime.reopen_node(owner.clone()).unwrap();
-    let mut restored = runtime.client(&owner).unwrap();
+    let mut restored = runtime.metadata_primary_service(&path).unwrap();
     restored.hydrate_from_metadata_backend().unwrap();
-    assert!(restored.metadata().object(&stat.object_id).is_none());
+    assert!(restored.metadata().object(&object_id).is_none());
     assert!(
         restored
             .metadata_backend()
             .unwrap()
-            .get_object(&stat.object_id)
+            .get_object(&object_id)
             .unwrap()
             .is_none()
     );
@@ -718,7 +1057,7 @@ fn hydrate_from_metadata_backend_keeps_incomplete_new_object_intent_invisible() 
         restored
             .metadata_backend()
             .unwrap()
-            .get_intent(&stat.object_id, &intent.intent_id)
+            .get_intent(&object_id, &intent.intent_id)
             .unwrap()
             .unwrap()
             .status,
@@ -760,7 +1099,7 @@ fn hydrate_from_metadata_backend_restores_staging_pending_write_size_from_local_
     runtime
         .apply_placement_policy(&owner, path, DfsPlacementScope::Subtree, current_policy)
         .unwrap();
-    let mut writer = runtime.client(&owner).unwrap();
+    let mut writer = runtime.metadata_primary_service(path).unwrap();
     for route in [
         crate::DFS_DATA_STAGE_BLOB_ROUTE,
         crate::DFS_DATA_REPAIR_REPLICA_ROUTE,
@@ -813,7 +1152,7 @@ fn hydrate_from_metadata_backend_restores_staging_pending_write_size_from_local_
     drop(writer);
     runtime.stop_node(&owner).unwrap();
     runtime.reopen_node(owner.clone()).unwrap();
-    let mut restored = runtime.client(&owner).unwrap();
+    let mut restored = runtime.metadata_primary_service(path).unwrap();
     restored.hydrate_from_metadata_backend().unwrap();
     let pending = restored.writes.pending_writes.get(&intent_id).unwrap();
     assert_eq!(pending.size_bytes, manifest.size_bytes);
@@ -926,7 +1265,7 @@ fn native_owned_pending_write(
     runtime
         .apply_placement_policy(&owner, &path, DfsPlacementScope::Subtree, base_policy)
         .unwrap();
-    let mut writer = runtime.client(&owner).unwrap();
+    let mut writer = runtime.metadata_primary_service(&path).unwrap();
     let base = writer
         .posix_write_file(
             &path,
@@ -941,7 +1280,7 @@ fn native_owned_pending_write(
     runtime
         .apply_placement_policy(&owner, &path, DfsPlacementScope::Subtree, target_policy)
         .unwrap();
-    let mut writer = runtime.client(&owner).unwrap();
+    let mut writer = runtime.metadata_primary_service(&path).unwrap();
     let bytes = vec![0x7b; 4096];
     let request = DfsWriteRequest {
         file_system_id: base.file_system_id,
@@ -970,6 +1309,10 @@ fn native_owned_pending_write(
 fn committed_pending_write_cleanup_drops_stale_stage_inflight_state() {
     let (runtime, _, replica, mut writer, request, bytes, intent) =
         native_owned_pending_write("native-committed-stage-cleanup");
+    assert!(
+        !writer.transport.delegates_local_namespace_authority(),
+        "Stage cleanup must inspect the actual Core coordinator owner"
+    );
     let pending = writer.writes.pending_writes.get(&intent).unwrap();
     assert!(
         pending.stage_inflight_request_ids.contains_key(&replica),
@@ -1034,14 +1377,115 @@ fn write_outcome_uses_backend_current_metadata_after_pending_state_is_removed() 
 
 #[test]
 fn commit_version_applies_when_response_target_is_unroutable() {
-    let (runtime, owner, replica, mut writer, request, bytes, intent) =
-        native_owned_pending_write("native-commit-lost-real-reply");
-    runtime.install_fault(crate::test_support::DfsTestFaultRule {
+    let name = "native-commit-lost-real-reply";
+    let (runtime, initial, config) =
+        crate::test_support::current_native_metadata_service(name, 2, "/services").unwrap();
+    let owner = config.primary_node_id.clone();
+    drop(initial);
+    let nodes = crate::test_runtime::DfsTestRuntime::ordered_node_ids(name, 2);
+    let replica = nodes.iter().find(|node| **node != owner).unwrap().clone();
+    let path = format!("/services/{name}.bin");
+    let mut placement =
+        DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedConfirmed, 2, 2).unwrap();
+    placement.required_node_ids = nodes.clone();
+    let accepted = runtime
+        .apply_placement_policy(&owner, &path, DfsPlacementScope::SelfOnly, placement)
+        .unwrap();
+    let control = runtime.shared_control_plane().unwrap();
+    let read_apply = || {
+        control
+            .with_client(|kv| {
+                DfsControlPlaneStore::new(kv.as_mut())
+                    .placement_reconciliation(&accepted.file_system_id, &accepted.job_id)
+            })
+            .unwrap()
+            .expect("the exact native empty-path Apply job")
+    };
+    let setup_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    for _ in 0..2 {
+        let current = read_apply();
+        assert_eq!(current.accepted_config, accepted.accepted_config);
+        assert_eq!(current.path, path);
+        assert_eq!(current.scanned_object_count, 0);
+        assert_eq!(current.scheduled_repair_count, 0);
+        assert!(current.last_error.is_none());
+        if current.state == DfsPlacementReconciliationState::Completed {
+            break;
+        }
+        assert!(matches!(
+            current.state,
+            DfsPlacementReconciliationState::Pending
+                | DfsPlacementReconciliationState::Scanning
+                | DfsPlacementReconciliationState::Repairing
+        ));
+        let remaining = setup_deadline.saturating_duration_since(Instant::now());
+        assert!(!remaining.is_zero());
+        runtime
+            .maintenance_tick(&owner, remaining)
+            .unwrap()
+            .outcome
+            .unwrap();
+    }
+    assert_eq!(
+        read_apply().state,
+        DfsPlacementReconciliationState::Completed
+    );
+    assert!(Instant::now() < setup_deadline);
+    drop(control);
+    let mut browser = runtime.client(&owner).unwrap();
+    let base = browser
+        .posix_write_file(
+            &path,
+            b"actual manual-fixture predecessor",
+            DfsWriteOptions {
+                policy: DfsReplicationPolicy::new(2, 2).unwrap(),
+                replica_candidates: nodes.clone(),
+                wait_for_commit: true,
+                foreground_replica_repair: true,
+            },
+        )
+        .unwrap();
+    drop(browser);
+    let mut writer = runtime.metadata_primary_service(&path).unwrap();
+    writer.flush_detached_transport_sends().unwrap();
+    let request = DfsWriteRequest {
+        file_system_id: base.file_system_id.clone(),
+        object_id: base.object_id,
+        target_version: crate::namespace::next_version(&base.version),
+        requesting_node_id: owner.clone(),
+    };
+    let bytes = vec![0x7b; 4096];
+    let mut policy = DfsReplicationPolicy::new(2, 2).unwrap();
+    policy.required_node_ids = nodes.clone();
+    let outcome = writer
+        .write_distributed_reader_with_candidates(
+            request.clone(),
+            std::io::Cursor::new(&bytes),
+            nodes,
+            policy,
+            DfsDistributedWriteOptions::default(),
+        )
+        .unwrap();
+    let NetworkedDfsWriteOutcome::Pending {
+        intent_id: intent, ..
+    } = outcome
+    else {
+        panic!("the actual owning Core has not consumed its genuine Stage reply")
+    };
+    let pending = writer
+        .writes
+        .pending_writes
+        .get(&intent)
+        .expect("actual producer's pending body");
+    assert_eq!(pending.version, request.target_version);
+    assert!(pending.stage_inflight_request_ids.contains_key(&replica));
+    let receiver = runtime.capture_served_work(&replica, 32).unwrap();
+    runtime.install_fault(crate::test_runtime::FaultRule {
         source: Some(owner.clone()),
         target: Some(replica.clone()),
         route: Some(crate::DFS_DATA_COMMIT_VERSION_ROUTE.into()),
         call_id: None,
-        origin: Some(crate::test_support::DfsTestRpcOrigin::RegisteredHost),
+        origin: Some(crate::test_runtime::RpcOrigin::RegisteredHost),
         remaining_hits: 1,
         action: crate::test_runtime::FaultAction::LoseReplyAfterDispatch,
     });
@@ -1051,6 +1495,40 @@ fn commit_version_applies_when_response_target_is_unroutable() {
         writer.write_outcome(&intent).unwrap(),
         NetworkedDfsWriteOutcome::Committed { .. }
     ));
+    let delivery = writer.flush_detached_transport_sends();
+    assert!(
+        matches!(
+            &delivery,
+            Ok(())
+                | Err(DfsError::NetworkDelivery {
+                    delivery_state: sinomo_core::network::NetworkDeliveryState::PossiblyApplied,
+                    ..
+                })
+        ),
+        "unexpected outbox result: {delivery:?}"
+    );
+    let observed = runtime.rpc_observations();
+    let attempts = observed[before..]
+        .iter()
+        .filter(|event| {
+            event.source == owner
+                && event.target == replica
+                && event.route == crate::DFS_DATA_COMMIT_VERSION_ROUTE
+                && event.phase == crate::test_runtime::RpcPhase::EndedWithoutResponse
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        attempts.len(),
+        1,
+        "the original producer's selected native notification must fail once"
+    );
+    let call_id = attempts[0].call_id;
+    assert!(
+        observed[before..]
+            .iter()
+            .any(|event| event.call_id == call_id
+                && event.phase == crate::test_runtime::RpcPhase::BeforeDispatch)
+    );
     let committed = writer
         .metadata_backend()
         .unwrap()
@@ -1062,25 +1540,235 @@ fn commit_version_applies_when_response_target_is_unroutable() {
         committed.content_hash.as_deref(),
         Some(content_hash(&bytes).as_str())
     );
-    let _delivery = writer.flush_detached_transport_sends();
-    assert!(
-        runtime.rpc_observations()[before..]
-            .iter()
-            .any(|event| event.source == owner
-                && event.target == replica
-                && event.route == crate::DFS_DATA_COMMIT_VERSION_ROUTE
-                && event.phase == crate::test_support::DfsTestRpcPhase::EndedWithoutResponse),
-        "the normal queued notification crosses its actual negative carrier boundary"
+    let captured = receiver.records();
+    let delivered = captured
+        .iter()
+        .filter_map(|record| match &record.command.routed_message.message {
+            DfsNetworkMessage::CommitVersion(command)
+                if command.intent_id == intent
+                    && command.object_id == request.object_id
+                    && command.version == request.target_version =>
+            {
+                assert_eq!(record.command.routed_message.source_node_id, owner);
+                assert_eq!(record.command.routed_message.target_node_id, replica);
+                assert_eq!(command.file_system_id, request.file_system_id);
+                assert_eq!(command.content_hash, content_hash(&bytes));
+                assert_eq!(command.object_metadata.as_ref(), Some(&committed));
+                assert_eq!(command.authority_shard.as_ref(), Some(&config));
+                assert!(record.succeeded);
+                Some(command.clone())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        delivered.len(),
+        1,
+        "the genuine receiver executed before its reply was lost"
     );
+    let removed = runtime.remove_faults_matching(|rule| {
+        rule.source.as_ref() == Some(&owner)
+            && rule.target.as_ref() == Some(&replica)
+            && rule.route.as_deref() == Some(crate::DFS_DATA_COMMIT_VERSION_ROUTE)
+            && rule.call_id.is_none()
+            && rule.origin == Some(crate::test_runtime::RpcOrigin::RegisteredHost)
+            && rule.remaining_hits == 0
+            && matches!(
+                &rule.action,
+                crate::test_runtime::FaultAction::LoseReplyAfterDispatch
+            )
+    });
+    assert_eq!(
+        removed, 1,
+        "remove only this verified native notification fault"
+    );
+    runtime.assert_fault_budgets().unwrap();
+    let acknowledged = Arc::new(Mutex::new(Vec::<DfsRoutedMessage>::new()));
+    runtime.install_fault(crate::test_runtime::FaultRule {
+        source: Some(owner.clone()),
+        target: Some(replica.clone()),
+        route: Some(crate::DFS_DATA_COMMIT_VERSION_ROUTE.into()),
+        call_id: None,
+        origin: Some(crate::test_runtime::RpcOrigin::RegisteredHost),
+        remaining_hits: 32,
+        action: crate::test_runtime::FaultAction::CaptureCommitReplyAfterDispatch(Arc::clone(
+            &acknowledged,
+        )),
+    });
+    let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    let original_receipts = writer
+        .metadata_backend()
+        .unwrap()
+        .receipts_for_version(&request.object_id, &request.target_version)
+        .unwrap();
+    let original_write = writer
+        .metadata_backend()
+        .unwrap()
+        .export_table_snapshot()
+        .unwrap()
+        .tables
+        .prepared_operations_v7
+        .into_iter()
+        .find(|record| {
+            record.terminal_intent.as_ref().is_some_and(|terminal| {
+                terminal.intent_id == intent
+                    && terminal.object_id == request.object_id
+                    && terminal.target_version == request.target_version
+            })
+        })
+        .expect("actual committed immutable write body");
+    original_write.validate().unwrap();
+    assert_eq!(original_write.status, DfsPreparedOperationStatus::Committed);
+    let target = writer
+        .capture_metadata_quorum_sync_target(&committed)
+        .unwrap();
+    let certificate = writer
+        .sync_metadata_shard_to_quorum(&target, deadline.saturating_duration_since(Instant::now()))
+        .unwrap();
+    assert_eq!(
+        certificate
+            .acknowledged_node_ids
+            .into_iter()
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([owner.clone(), replica.clone()])
+    );
+    // The failed original private outbox cools for five seconds. End that
+    // completed producer normally, then exercise the existing recovery entry
+    // from its actual durable intent/receipts rather than resetting that clock.
+    drop(writer);
+    let mut writer = runtime.metadata_primary_service(&path).unwrap();
+    writer
+        .hydrate_from_metadata_backend_for_commit_promotion_recovery()
+        .unwrap();
     assert_eq!(
         writer
             .metadata_backend()
             .unwrap()
             .get_object(&request.object_id)
-            .unwrap()
             .unwrap(),
-        committed,
-        "a real lost/unsent notification never rewinds its already-published authoritative head"
+        Some(committed.clone())
+    );
+    assert_eq!(
+        writer
+            .metadata_backend()
+            .unwrap()
+            .receipts_for_version(&request.object_id, &request.target_version)
+            .unwrap(),
+        original_receipts
+    );
+    assert_eq!(
+        writer
+            .metadata_backend()
+            .unwrap()
+            .prepared_operation_record(&original_write.operation_id)
+            .unwrap(),
+        Some(original_write.clone())
+    );
+    loop {
+        if Instant::now() >= deadline {
+            break;
+        }
+        writer.flush_detached_transport_sends().unwrap();
+        if acknowledged.lock().unwrap().iter().any(|routed| matches!(&routed.message,
+            DfsNetworkMessage::CommitVersionResponse(response) if response.intent_id == intent
+                && response.object_id == request.object_id && response.version == request.target_version
+                && matches!(&response.result, DfsBlobTransferResult::Committed { content_hash: hash }
+                    if hash == &content_hash(&bytes)))) { break; }
+        std::thread::yield_now();
+    }
+    let recovered_reports = receiver.records();
+    let recovered_replies = acknowledged.lock().unwrap().clone();
+    let custody = serde_json::json!({
+        "intent_id": intent,
+        "write_request": request,
+        "committed_object": committed,
+        "original_write": original_write,
+        "original_receipts": original_receipts,
+        "original_delivered_commands": delivered,
+        "recovered_reports": recovered_reports.iter().map(|report| serde_json::json!({
+            "command": report.command, "succeeded": report.succeeded,
+            "repair_record_count": report.repair_record_count,
+        })).collect::<Vec<_>>(),
+        "recovered_replies": recovered_replies,
+        "completed_within_original_deadline": Instant::now() < deadline,
+    });
+    std::fs::write(
+        runtime
+            .data_dir(&owner)
+            .root()
+            .join("notification-recovery-custody.json"),
+        serde_json::to_vec(&custody).unwrap(),
+    )
+    .unwrap();
+    assert!(Instant::now() < deadline);
+    let replies = acknowledged
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|routed| {
+            matches!(&routed.message,
+        DfsNetworkMessage::CommitVersionResponse(response) if response.intent_id == intent
+            && response.object_id == request.object_id && response.version == request.target_version
+            && matches!(&response.result, DfsBlobTransferResult::Committed { content_hash: hash }
+                if hash == &content_hash(&bytes)))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(replies.len(), 1);
+    let DfsNetworkMessage::CommitVersionResponse(response) = &replies[0].message else {
+        unreachable!()
+    };
+    assert_eq!(replies[0].source_node_id, replica);
+    assert_eq!(replies[0].target_node_id, owner);
+    assert_eq!(response.intent_id, intent);
+    assert_eq!(response.file_system_id, request.file_system_id);
+    assert_eq!(response.object_id, request.object_id);
+    assert_eq!(response.version, request.target_version);
+    assert_eq!(response.replica_node_id, replica);
+    assert!(
+        matches!(&response.result, DfsBlobTransferResult::Committed { content_hash: hash }
+        if hash == &content_hash(&bytes))
+    );
+    let successful = receiver
+        .records()
+        .into_iter()
+        .filter_map(|record| match record.command.routed_message.message {
+            DfsNetworkMessage::CommitVersion(command)
+                if command.request_id == response.request_id =>
+            {
+                Some(command)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(!successful.is_empty());
+    assert!(successful.iter().all(|command| command == &successful[0]));
+    // A new recovery producer owns a new transport request ID. The durable
+    // write identity and every semantic notification field remain original.
+    assert_eq!(successful[0].intent_id, delivered[0].intent_id);
+    assert_eq!(successful[0].file_system_id, delivered[0].file_system_id);
+    assert_eq!(successful[0].object_id, delivered[0].object_id);
+    assert_eq!(
+        successful[0].expected_base_version,
+        delivered[0].expected_base_version
+    );
+    assert_eq!(successful[0].version, delivered[0].version);
+    assert_eq!(successful[0].content_hash, delivered[0].content_hash);
+    assert_eq!(successful[0].object_metadata, delivered[0].object_metadata);
+    assert_eq!(successful[0].authority_shard, delivered[0].authority_shard);
+    assert_eq!(runtime.remove_faults_matching(|rule| {
+        rule.source.as_ref() == Some(&owner) && rule.target.as_ref() == Some(&replica)
+            && rule.route.as_deref() == Some(crate::DFS_DATA_COMMIT_VERSION_ROUTE)
+            && matches!(&rule.action, crate::test_runtime::FaultAction::CaptureCommitReplyAfterDispatch(actual)
+                if Arc::ptr_eq(actual, &acknowledged))
+    }), 1);
+    assert_eq!(
+        writer
+            .metadata_backend()
+            .unwrap()
+            .get_object(&request.object_id)
+            .unwrap(),
+        Some(committed.clone())
     );
     let actual = runtime.client(&replica).unwrap();
     assert_eq!(
@@ -1089,8 +1777,7 @@ fn commit_version_applies_when_response_target_is_unroutable() {
             .read_object_version(request.object_id.as_str(), request.target_version.as_str())
             .unwrap()
             .1,
-        bytes,
-        "actual bytes were durably staged before W2, and notification loss cannot undo them"
+        bytes
     );
     assert_eq!(
         actual
@@ -1103,22 +1790,122 @@ fn commit_version_applies_when_response_target_is_unroutable() {
         request.target_version
     );
     drop(actual);
-    runtime.clear_faults();
-    writer.flush_detached_transport_sends().unwrap();
+    drop(receiver);
     drop(writer);
     runtime.close().unwrap();
 }
 
 #[test]
 fn committed_intent_applies_when_commit_notification_target_is_unroutable() {
-    let (runtime, owner, replica, mut writer, request, bytes, intent) =
-        native_owned_pending_write("native-commit-unsent-real-notification");
-    runtime.install_fault(crate::test_support::DfsTestFaultRule {
+    let name = "native-commit-unsent-real-notification";
+    let (runtime, initial, config) =
+        crate::test_support::current_native_metadata_service(name, 2, "/services").unwrap();
+    let owner = config.primary_node_id.clone();
+    drop(initial);
+    let nodes = crate::test_runtime::DfsTestRuntime::ordered_node_ids(name, 2);
+    let replica = nodes.iter().find(|node| **node != owner).unwrap().clone();
+    let path = format!("/services/{name}.bin");
+    let mut placement =
+        DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedConfirmed, 2, 2).unwrap();
+    placement.required_node_ids = nodes.clone();
+    let accepted = runtime
+        .apply_placement_policy(&owner, &path, DfsPlacementScope::SelfOnly, placement)
+        .unwrap();
+    let control = runtime.shared_control_plane().unwrap();
+    let read_apply = || {
+        control
+            .with_client(|kv| {
+                DfsControlPlaneStore::new(kv.as_mut())
+                    .placement_reconciliation(&accepted.file_system_id, &accepted.job_id)
+            })
+            .unwrap()
+            .expect("the exact native empty-path Apply job")
+    };
+    let setup_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    for _ in 0..2 {
+        let current = read_apply();
+        assert_eq!(current.accepted_config, accepted.accepted_config);
+        assert_eq!(current.path, path);
+        assert_eq!(current.scanned_object_count, 0);
+        assert_eq!(current.scheduled_repair_count, 0);
+        assert!(current.last_error.is_none());
+        if current.state == DfsPlacementReconciliationState::Completed {
+            break;
+        }
+        assert!(matches!(
+            current.state,
+            DfsPlacementReconciliationState::Pending
+                | DfsPlacementReconciliationState::Scanning
+                | DfsPlacementReconciliationState::Repairing
+        ));
+        let remaining = setup_deadline.saturating_duration_since(Instant::now());
+        assert!(!remaining.is_zero());
+        runtime
+            .maintenance_tick(&owner, remaining)
+            .unwrap()
+            .outcome
+            .unwrap();
+    }
+    assert_eq!(
+        read_apply().state,
+        DfsPlacementReconciliationState::Completed
+    );
+    assert!(Instant::now() < setup_deadline);
+    drop(control);
+    let mut browser = runtime.client(&owner).unwrap();
+    let base = browser
+        .posix_write_file(
+            &path,
+            b"actual manual-fixture predecessor",
+            DfsWriteOptions {
+                policy: DfsReplicationPolicy::new(2, 2).unwrap(),
+                replica_candidates: nodes.clone(),
+                wait_for_commit: true,
+                foreground_replica_repair: true,
+            },
+        )
+        .unwrap();
+    drop(browser);
+    let mut writer = runtime.metadata_primary_service(&path).unwrap();
+    writer.flush_detached_transport_sends().unwrap();
+    let request = DfsWriteRequest {
+        file_system_id: base.file_system_id.clone(),
+        object_id: base.object_id,
+        target_version: crate::namespace::next_version(&base.version),
+        requesting_node_id: owner.clone(),
+    };
+    let bytes = vec![0x7b; 4096];
+    let mut policy = DfsReplicationPolicy::new(2, 2).unwrap();
+    policy.required_node_ids = nodes.clone();
+    let outcome = writer
+        .write_distributed_reader_with_candidates(
+            request.clone(),
+            std::io::Cursor::new(&bytes),
+            nodes,
+            policy,
+            DfsDistributedWriteOptions::default(),
+        )
+        .unwrap();
+    let NetworkedDfsWriteOutcome::Pending {
+        intent_id: intent, ..
+    } = outcome
+    else {
+        panic!("the actual owning Core has not consumed its genuine Stage reply")
+    };
+    let pending = writer
+        .writes
+        .pending_writes
+        .get(&intent)
+        .expect("actual producer's pending body");
+    assert_eq!(pending.version, request.target_version);
+    assert!(pending.stage_inflight_request_ids.contains_key(&replica));
+    let receiver = runtime.capture_served_work(&replica, 32).unwrap();
+    runtime.install_fault(crate::test_runtime::FaultRule {
         source: Some(owner.clone()),
         target: Some(replica.clone()),
         route: Some(crate::DFS_DATA_COMMIT_VERSION_ROUTE.into()),
         call_id: None,
-        origin: Some(crate::test_support::DfsTestRpcOrigin::RegisteredHost),
+        origin: Some(crate::test_runtime::RpcOrigin::RegisteredHost),
         remaining_hits: 1,
         action: crate::test_runtime::FaultAction::BudgetExhausted,
     });
@@ -1128,6 +1915,40 @@ fn committed_intent_applies_when_commit_notification_target_is_unroutable() {
         writer.write_outcome(&intent).unwrap(),
         NetworkedDfsWriteOutcome::Committed { .. }
     ));
+    let delivery = writer.flush_detached_transport_sends();
+    assert!(
+        matches!(
+            &delivery,
+            Ok(())
+                | Err(DfsError::NetworkDelivery {
+                    delivery_state: sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent,
+                    ..
+                })
+        ),
+        "unexpected outbox result: {delivery:?}"
+    );
+    let observed = runtime.rpc_observations();
+    let attempts = observed[before..]
+        .iter()
+        .filter(|event| {
+            event.source == owner
+                && event.target == replica
+                && event.route == crate::DFS_DATA_COMMIT_VERSION_ROUTE
+                && event.phase == crate::test_runtime::RpcPhase::EndedWithoutResponse
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        attempts.len(),
+        1,
+        "the original producer's selected native notification must fail once"
+    );
+    let call_id = attempts[0].call_id;
+    assert!(
+        observed[before..]
+            .iter()
+            .any(|event| event.call_id == call_id
+                && event.phase == crate::test_runtime::RpcPhase::BeforeDispatch)
+    );
     let committed = writer
         .metadata_backend()
         .unwrap()
@@ -1139,25 +1960,225 @@ fn committed_intent_applies_when_commit_notification_target_is_unroutable() {
         committed.content_hash.as_deref(),
         Some(content_hash(&bytes).as_str())
     );
-    let _delivery = writer.flush_detached_transport_sends();
+    let captured = receiver.records();
+    let delivered = captured
+        .iter()
+        .filter_map(|record| match &record.command.routed_message.message {
+            DfsNetworkMessage::CommitVersion(command)
+                if command.intent_id == intent
+                    && command.object_id == request.object_id
+                    && command.version == request.target_version =>
+            {
+                assert_eq!(record.command.routed_message.source_node_id, owner);
+                assert_eq!(record.command.routed_message.target_node_id, replica);
+                assert_eq!(command.file_system_id, request.file_system_id);
+                assert_eq!(command.content_hash, content_hash(&bytes));
+                assert_eq!(command.object_metadata.as_ref(), Some(&committed));
+                assert_eq!(command.authority_shard.as_ref(), Some(&config));
+                assert!(record.succeeded);
+                Some(command.clone())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
     assert!(
-        runtime.rpc_observations()[before..]
-            .iter()
-            .any(|event| event.source == owner
-                && event.target == replica
-                && event.route == crate::DFS_DATA_COMMIT_VERSION_ROUTE
-                && event.phase == crate::test_support::DfsTestRpcPhase::EndedWithoutResponse),
-        "the normal queued notification crosses its actual negative carrier boundary"
+        delivered.is_empty(),
+        "the denied original call never reached the real receiver"
     );
+    let removed = runtime.remove_faults_matching(|rule| {
+        rule.source.as_ref() == Some(&owner)
+            && rule.target.as_ref() == Some(&replica)
+            && rule.route.as_deref() == Some(crate::DFS_DATA_COMMIT_VERSION_ROUTE)
+            && rule.call_id.is_none()
+            && rule.origin == Some(crate::test_runtime::RpcOrigin::RegisteredHost)
+            && rule.remaining_hits == 0
+            && matches!(
+                &rule.action,
+                crate::test_runtime::FaultAction::BudgetExhausted
+            )
+    });
+    assert_eq!(
+        removed, 1,
+        "remove only this verified native notification fault"
+    );
+    runtime.assert_fault_budgets().unwrap();
+    let acknowledged = Arc::new(Mutex::new(Vec::<DfsRoutedMessage>::new()));
+    runtime.install_fault(crate::test_runtime::FaultRule {
+        source: Some(owner.clone()),
+        target: Some(replica.clone()),
+        route: Some(crate::DFS_DATA_COMMIT_VERSION_ROUTE.into()),
+        call_id: None,
+        origin: Some(crate::test_runtime::RpcOrigin::RegisteredHost),
+        remaining_hits: 32,
+        action: crate::test_runtime::FaultAction::CaptureCommitReplyAfterDispatch(Arc::clone(
+            &acknowledged,
+        )),
+    });
+    let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    let original_receipts = writer
+        .metadata_backend()
+        .unwrap()
+        .receipts_for_version(&request.object_id, &request.target_version)
+        .unwrap();
+    let original_write = writer
+        .metadata_backend()
+        .unwrap()
+        .export_table_snapshot()
+        .unwrap()
+        .tables
+        .prepared_operations_v7
+        .into_iter()
+        .find(|record| {
+            record.terminal_intent.as_ref().is_some_and(|terminal| {
+                terminal.intent_id == intent
+                    && terminal.object_id == request.object_id
+                    && terminal.target_version == request.target_version
+            })
+        })
+        .expect("actual committed immutable write body");
+    original_write.validate().unwrap();
+    assert_eq!(original_write.status, DfsPreparedOperationStatus::Committed);
+    let target = writer
+        .capture_metadata_quorum_sync_target(&committed)
+        .unwrap();
+    let certificate = writer
+        .sync_metadata_shard_to_quorum(&target, deadline.saturating_duration_since(Instant::now()))
+        .unwrap();
+    assert_eq!(
+        certificate
+            .acknowledged_node_ids
+            .into_iter()
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([owner.clone(), replica.clone()])
+    );
+    // The failed original private outbox cools for five seconds. End that
+    // completed producer normally, then exercise the existing recovery entry
+    // from its actual durable intent/receipts rather than resetting that clock.
+    drop(writer);
+    let mut writer = runtime.metadata_primary_service(&path).unwrap();
+    writer
+        .hydrate_from_metadata_backend_for_commit_promotion_recovery()
+        .unwrap();
     assert_eq!(
         writer
             .metadata_backend()
             .unwrap()
             .get_object(&request.object_id)
-            .unwrap()
             .unwrap(),
-        committed,
-        "a real lost/unsent notification never rewinds its already-published authoritative head"
+        Some(committed.clone())
+    );
+    assert_eq!(
+        writer
+            .metadata_backend()
+            .unwrap()
+            .receipts_for_version(&request.object_id, &request.target_version)
+            .unwrap(),
+        original_receipts
+    );
+    assert_eq!(
+        writer
+            .metadata_backend()
+            .unwrap()
+            .prepared_operation_record(&original_write.operation_id)
+            .unwrap(),
+        Some(original_write.clone())
+    );
+    loop {
+        if Instant::now() >= deadline {
+            break;
+        }
+        writer.flush_detached_transport_sends().unwrap();
+        if acknowledged.lock().unwrap().iter().any(|routed| matches!(&routed.message,
+            DfsNetworkMessage::CommitVersionResponse(response) if response.intent_id == intent
+                && response.object_id == request.object_id && response.version == request.target_version
+                && matches!(&response.result, DfsBlobTransferResult::Committed { content_hash: hash }
+                    if hash == &content_hash(&bytes)))) { break; }
+        std::thread::yield_now();
+    }
+    let recovered_reports = receiver.records();
+    let recovered_replies = acknowledged.lock().unwrap().clone();
+    let custody = serde_json::json!({
+        "intent_id": intent,
+        "write_request": request,
+        "committed_object": committed,
+        "original_write": original_write,
+        "original_receipts": original_receipts,
+        "original_delivered_commands": delivered,
+        "recovered_reports": recovered_reports.iter().map(|report| serde_json::json!({
+            "command": report.command, "succeeded": report.succeeded,
+            "repair_record_count": report.repair_record_count,
+        })).collect::<Vec<_>>(),
+        "recovered_replies": recovered_replies,
+        "completed_within_original_deadline": Instant::now() < deadline,
+    });
+    std::fs::write(
+        runtime
+            .data_dir(&owner)
+            .root()
+            .join("notification-recovery-custody.json"),
+        serde_json::to_vec(&custody).unwrap(),
+    )
+    .unwrap();
+    assert!(Instant::now() < deadline);
+    let replies = acknowledged
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|routed| {
+            matches!(&routed.message,
+        DfsNetworkMessage::CommitVersionResponse(response) if response.intent_id == intent
+            && response.object_id == request.object_id && response.version == request.target_version
+            && matches!(&response.result, DfsBlobTransferResult::Committed { content_hash: hash }
+                if hash == &content_hash(&bytes)))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(replies.len(), 1);
+    let DfsNetworkMessage::CommitVersionResponse(response) = &replies[0].message else {
+        unreachable!()
+    };
+    assert_eq!(replies[0].source_node_id, replica);
+    assert_eq!(replies[0].target_node_id, owner);
+    assert_eq!(response.intent_id, intent);
+    assert_eq!(response.file_system_id, request.file_system_id);
+    assert_eq!(response.object_id, request.object_id);
+    assert_eq!(response.version, request.target_version);
+    assert_eq!(response.replica_node_id, replica);
+    assert!(
+        matches!(&response.result, DfsBlobTransferResult::Committed { content_hash: hash }
+        if hash == &content_hash(&bytes))
+    );
+    let successful = receiver
+        .records()
+        .into_iter()
+        .filter_map(|record| match record.command.routed_message.message {
+            DfsNetworkMessage::CommitVersion(command)
+                if command.request_id == response.request_id =>
+            {
+                Some(command)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(!successful.is_empty());
+    assert!(successful.iter().all(|command| command == &successful[0]));
+    assert_eq!(
+        successful[0].expected_base_version,
+        Some(base.version.clone())
+    );
+    assert_eq!(runtime.remove_faults_matching(|rule| {
+        rule.source.as_ref() == Some(&owner) && rule.target.as_ref() == Some(&replica)
+            && rule.route.as_deref() == Some(crate::DFS_DATA_COMMIT_VERSION_ROUTE)
+            && matches!(&rule.action, crate::test_runtime::FaultAction::CaptureCommitReplyAfterDispatch(actual)
+                if Arc::ptr_eq(actual, &acknowledged))
+    }), 1);
+    assert_eq!(
+        writer
+            .metadata_backend()
+            .unwrap()
+            .get_object(&request.object_id)
+            .unwrap(),
+        Some(committed.clone())
     );
     let actual = runtime.client(&replica).unwrap();
     assert_eq!(
@@ -1166,8 +2187,7 @@ fn committed_intent_applies_when_commit_notification_target_is_unroutable() {
             .read_object_version(request.object_id.as_str(), request.target_version.as_str())
             .unwrap()
             .1,
-        bytes,
-        "actual bytes were durably staged before W2, and notification loss cannot undo them"
+        bytes
     );
     assert_eq!(
         actual
@@ -1180,28 +2200,69 @@ fn committed_intent_applies_when_commit_notification_target_is_unroutable() {
         request.target_version
     );
     drop(actual);
-    runtime.clear_faults();
-    writer.flush_detached_transport_sends().unwrap();
+    drop(receiver);
     drop(writer);
     runtime.close().unwrap();
 }
 
 #[test]
 fn replica_stage_and_commit_do_not_append_authoritative_metadata() {
+    fn metadata(
+        data_dir: &sinomo_core::local::SinomoDataDir,
+        shard_id: &DfsMetadataShardId,
+    ) -> LocalSobjMetadataBackend {
+        LocalSobjMetadataBackend::open_for_inspection(
+            shard_id.clone(),
+            crate::default_dfs_metadata_shards_root(data_dir).join(&shard_id.0),
+        )
+        .expect("read-only actual replica metadata")
+    }
     fn prefix(
-        service: &NetworkedDfsService<DfsNodeTransport>,
+        data_dir: &sinomo_core::local::SinomoDataDir,
         shard_id: &DfsMetadataShardId,
     ) -> (u64, DfsMetadataPrefixProof) {
-        let backend = service.metadata_backend().expect("actual native observer");
-        let sequence = backend
-            .metadata_shard_statuses()
-            .unwrap()
-            .into_iter()
-            .find(|status| &status.shard_id == shard_id)
-            .unwrap()
-            .journal_last_sequence;
-        let proof = backend.metadata_prefix_proof(shard_id).unwrap().unwrap();
-        (sequence, proof)
+        let backend = metadata(data_dir, shard_id);
+        (
+            backend.journal_last_sequence(),
+            backend.metadata_prefix_proof().unwrap(),
+        )
+    }
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct ReplicaState {
+        prefix: (u64, DfsMetadataPrefixProof),
+        tables: DfsMetadataTableSnapshot,
+        storage_generation: u64,
+        publish_requests: usize,
+    }
+    fn state(
+        data_dir: &sinomo_core::local::SinomoDataDir,
+        lane: &DfsMutationLaneKey,
+    ) -> ReplicaState {
+        let backend = metadata(data_dir, &lane.shard_id);
+        ReplicaState {
+            prefix: (
+                backend.journal_last_sequence(),
+                backend.metadata_prefix_proof().unwrap(),
+            ),
+            tables: backend.export_table_snapshot(),
+            storage_generation:
+                crate::runtime_host::daemon_dfs_storage_environment_dirty_generation(data_dir),
+            publish_requests: crate::runtime_host::daemon_dfs_metadata_publish_lane_request_count(
+                data_dir, lane,
+            ),
+        }
+    }
+    #[derive(Clone)]
+    struct Report {
+        command: DfsMessageCommand,
+        work: DfsMessageCommittedWork,
+        succeeded: bool,
+    }
+    #[derive(Clone)]
+    struct CommitObservation {
+        command: DfsMessageCommand,
+        before: ReplicaState,
+        after: Option<ReplicaState>,
     }
     struct Release(Option<std::sync::mpsc::Sender<()>>);
     impl Drop for Release {
@@ -1232,49 +2293,90 @@ fn replica_stage_and_commit_do_not_append_authoritative_metadata() {
     runtime
         .apply_placement_policy(&owner, path, DfsPlacementScope::Subtree, placement)
         .unwrap();
-    let mut writer = runtime.client(&owner).unwrap();
-    // Open the normal observer before holding the source's publication edge.
+    let mut writer = runtime.metadata_primary_service(path).unwrap();
+    // This native client supplies actual content-store inspection only.
     let observer = runtime.client(&replica).unwrap();
     let replica_data = runtime.data_dir(&replica).clone();
     let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
-    let before_prefix = prefix(&observer, &shard_id);
+    let before_prefix = prefix(&replica_data, &shard_id);
     let lane_key = DfsMutationLaneKey {
         file_system_id: shard.file_system_id.clone(),
         shard_id: shard_id.clone(),
     };
-    let before_publish = crate::runtime_host::daemon_dfs_metadata_publish_lane_request_count(
-        &replica_data,
-        &lane_key,
-    );
-    let capture = runtime.capture_served_work(&replica, 32).unwrap();
-    // Keep the actual target journal unchanged while the other native metadata
-    // peer supplies the ordinary recovery quorum for this source publication.
-    for route in [
-        DFS_METADATA_JOURNAL_BATCH_ROUTE,
-        DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE,
-    ] {
-        runtime.install_fault(crate::test_runtime::FaultRule {
-            source: Some(owner.clone()),
-            target: Some(replica.clone()),
-            route: Some(route.into()),
-            call_id: None,
-            origin: Some(crate::test_runtime::RpcOrigin::RegisteredHost),
-            remaining_hits: 32,
-            action: crate::test_runtime::FaultAction::BudgetExhausted,
+    let reports = Arc::new(Mutex::new(Vec::<Report>::new()));
+    let commits = Arc::new(Mutex::new(Vec::<CommitObservation>::new()));
+    let observed_reports = Arc::clone(&reports);
+    let observed_commits = Arc::clone(&commits);
+    let observed_data = replica_data.clone();
+    let observed_lane = lane_key.clone();
+    let source_node = owner.clone();
+    let target_node = replica.clone();
+    // Use the existing actual Main hook for both work reports and the exact
+    // Commit effect's physical boundary. This supplies no execution authority.
+    let hook: Arc<crate::runtime_host::DaemonDfsPreDispatchTestHook> =
+        Arc::new(move |point, command, _preflight| {
+            let Some(command) = command else {
+                return Ok(());
+            };
+            if command.routed_message.source_node_id != source_node
+                || command.routed_message.target_node_id != target_node
+                || !matches!(
+                    &command.routed_message.message,
+                    DfsNetworkMessage::StageBlob(_) | DfsNetworkMessage::CommitVersion(_)
+                )
+            {
+                return Ok(());
+            }
+            match point {
+                crate::runtime_host::DaemonDfsPreDispatchTestPoint::BeforeExecute {
+                    admission_held,
+                } => {
+                    assert!(
+                        admission_held,
+                        "actual Commit receiver retains its native admission"
+                    );
+                    let mut captured = observed_commits.lock().unwrap();
+                    assert!(captured.len() < 32, "bounded actual Commit capture");
+                    captured.push(CommitObservation {
+                        command: command.clone(),
+                        before: state(&observed_data, &observed_lane),
+                        after: None,
+                    });
+                }
+                crate::runtime_host::DaemonDfsPreDispatchTestPoint::AfterReport {
+                    committed_work,
+                    succeeded,
+                    ..
+                } => {
+                    {
+                        let mut captured = observed_commits.lock().unwrap();
+                        let observation = captured
+                            .iter_mut()
+                            .rev()
+                            .find(|observation| {
+                                observation.command == *command && observation.after.is_none()
+                            })
+                            .expect("same actual Commit has a BeforeExecute observation");
+                        observation.after = Some(state(&observed_data, &observed_lane));
+                    }
+                    let mut captured = observed_reports.lock().unwrap();
+                    assert!(captured.len() < 32, "bounded actual Main work capture");
+                    captured.push(Report {
+                        command: command.clone(),
+                        work: committed_work,
+                        succeeded,
+                    });
+                }
+                _ => {}
+            }
+            Ok(())
         });
-    }
+    let capture =
+        crate::runtime_host::install_daemon_dfs_pre_dispatch_test_hook(&replica_data, hook);
+    // Hidden source prepares also require every metadata participant. Observe
+    // each replica effect under its actual admission instead of denying that
+    // legitimate primary journal before the Create boundary can be reached.
     let committed_replies = Arc::new(Mutex::new(Vec::new()));
-    runtime.install_fault(crate::test_runtime::FaultRule {
-        source: Some(owner.clone()),
-        target: Some(replica.clone()),
-        route: Some(DFS_DATA_COMMIT_VERSION_ROUTE.into()),
-        call_id: None,
-        origin: Some(crate::test_runtime::RpcOrigin::RegisteredHost),
-        remaining_hits: 1,
-        action: crate::test_runtime::FaultAction::CaptureCommitReplyAfterDispatch(Arc::clone(
-            &committed_replies,
-        )),
-    });
     let bytes = vec![0x63; 2 * 1024 * 1024 + 4096];
     let expected_hash = content_hash(&bytes);
     let options = DfsWriteOptions {
@@ -1285,7 +2387,7 @@ fn replica_stage_and_commit_do_not_append_authoritative_metadata() {
     };
     let (captured_tx, captured_rx) = std::sync::mpsc::sync_channel(1);
     let (release_tx, release_rx) = std::sync::mpsc::channel();
-    let (writer, payload, stage, after_stage_storage) = std::thread::scope(|scope| {
+    let (writer, payload, stage) = std::thread::scope(|scope| {
         // Unwinding any paused-phase assertion releases only this test gate;
         // the scoped source thread then joins before runtime teardown.
         let release = Release(Some(release_tx));
@@ -1310,8 +2412,8 @@ fn replica_stage_and_commit_do_not_append_authoritative_metadata() {
             .expect("genuine W2 Stage durability before the source's Create prepare");
         payload.validate().unwrap();
         let intent = payload.prepared_intent.as_ref().unwrap();
-        let stages = capture
-            .records()
+        let stages = reports
+            .lock().unwrap().clone()
             .into_iter()
             .filter(|row| matches!(&row.command.routed_message.message,
                 DfsNetworkMessage::StageBlob(command) if command.object_id == intent.object_id
@@ -1322,7 +2424,7 @@ fn replica_stage_and_commit_do_not_append_authoritative_metadata() {
         };
         assert!(stage_report.succeeded);
         assert!(
-            !stage_report.committed_work.publish_metadata,
+            !stage_report.work.publish_metadata,
             "content staging cannot schedule a metadata publication"
         );
         assert_eq!(stage_report.command.routed_message.source_node_id, owner);
@@ -1339,39 +2441,59 @@ fn replica_stage_and_commit_do_not_append_authoritative_metadata() {
             observer.content().read_blob(&stage.content_hash).unwrap(),
             bytes
         );
+        let stage_observation = commits
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|row| row.command == stage_report.command)
+            .unwrap()
+            .clone();
+        let stage_after = stage_observation
+            .after
+            .as_ref()
+            .expect("actual Stage AfterReport");
         assert_eq!(
-            prefix(&observer, &shard_id),
-            before_prefix,
-            "first content staging cannot append the target's native journal"
+            stage_observation.before.prefix, stage_after.prefix,
+            "Stage cannot append the actual target journal"
+        );
+        assert_eq!(
+            stage_observation.before.tables, stage_after.tables,
+            "Stage cannot publish or change authoritative metadata records"
+        );
+        assert_eq!(
+            stage_observation.before.publish_requests,
+            stage_after.publish_requests
         );
         assert!(
-            observer
-                .metadata_backend()
-                .unwrap()
+            metadata(&replica_data, &shard_id)
                 .get_object(&stage.object_id)
                 .unwrap()
                 .is_none(),
             "the first Stage effect has no durable namespace object"
         );
-        assert_eq!(
-            crate::runtime_host::daemon_dfs_metadata_publish_lane_request_count(
-                &replica_data,
-                &lane_key
-            ),
-            before_publish
-        );
+
         let stage = stage.clone();
-        let after_stage_storage =
-            crate::runtime_host::daemon_dfs_storage_environment_dirty_generation(&replica_data);
+        // The real assigned participants stay available for source Create.
+        runtime.install_fault(crate::test_runtime::FaultRule {
+            source: Some(owner.clone()),
+            target: Some(replica.clone()),
+            route: Some(DFS_DATA_COMMIT_VERSION_ROUTE.into()),
+            call_id: None,
+            origin: Some(crate::test_runtime::RpcOrigin::RegisteredHost),
+            remaining_hits: 1,
+            action: crate::test_runtime::FaultAction::CaptureCommitReplyAfterDispatch(Arc::clone(
+                &committed_replies,
+            )),
+        });
         // Release before joining or reading source authority, including unwinds.
         drop(release);
         let (writer, result, flushed) = publisher.join().expect("normal source producer");
-        let stat = result.expect("genuine degraded native metadata publication");
+        let stat = result.expect("genuine full-assigned native metadata publication");
         flushed.expect("deliver actual queued CommitVersion");
         assert_eq!(stat.object_id, stage.object_id);
         assert_eq!(stat.version, stage.version);
         assert_eq!(stat.content_hash.as_deref(), Some(expected_hash.as_str()));
-        (writer, payload, stage, after_stage_storage)
+        (writer, payload, stage)
     });
     let stored = writer
         .metadata_backend()
@@ -1396,8 +2518,10 @@ fn replica_stage_and_commit_do_not_append_authoritative_metadata() {
             .unwrap()
             .is_some()
     );
-    let commits = capture
-        .records()
+    let commit_reports = reports
+        .lock()
+        .unwrap()
+        .clone()
         .into_iter()
         .filter(|row| {
             matches!(&row.command.routed_message.message,
@@ -1405,14 +2529,14 @@ fn replica_stage_and_commit_do_not_append_authoritative_metadata() {
                 && command.intent_id == stage.intent_id && command.version == stage.version)
         })
         .collect::<Vec<_>>();
-    let [commit_report] = commits.as_slice() else {
+    let [commit_report] = commit_reports.as_slice() else {
         panic!("one actual CommitVersion receiver report required");
     };
     assert!(commit_report.succeeded);
     assert_eq!(commit_report.command.routed_message.source_node_id, owner);
     assert_eq!(commit_report.command.routed_message.target_node_id, replica);
     assert_eq!(
-        commit_report.committed_work,
+        commit_report.work,
         crate::DfsMessageCommittedWork::default(),
         "replica commit notification performs no durable metadata or content mutation"
     );
@@ -1437,55 +2561,54 @@ fn replica_stage_and_commit_do_not_append_authoritative_metadata() {
                 if hash == &expected_hash)),
         "actual receiver must commit the genuinely staged bytes"
     );
-    assert_eq!(
-        crate::runtime_host::daemon_dfs_storage_environment_dirty_generation(&replica_data),
-        after_stage_storage,
-        "a Commit notification performs no content-store mutation"
-    );
-    assert_eq!(
-        crate::runtime_host::daemon_dfs_metadata_publish_lane_request_count(
-            &replica_data,
-            &lane_key
-        ),
-        before_publish,
-        "neither replica data-plane effect schedules metadata publication"
-    );
-    assert_eq!(
-        prefix(&observer, &shard_id),
-        before_prefix,
-        "replica data-plane commands wait for primary journal replay before mutating the durable shard"
-    );
+    let observations = commits
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|row| {
+            matches!(
+                row.command.routed_message.message,
+                DfsNetworkMessage::CommitVersion(_)
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let [observation] = observations.as_slice() else {
+        panic!("one actual Commit effect boundary required");
+    };
+    assert_eq!(observation.command, commit_report.command);
+    let after = observation
+        .after
+        .as_ref()
+        .expect("actual Commit AfterReport");
     assert!(
-        observer
-            .metadata_backend()
-            .unwrap()
-            .get_object(&stage.object_id)
-            .unwrap()
-            .is_none(),
-        "replica cache metadata must not be published to the durable shard backend"
+        observation.before.prefix.0 > before_prefix.0,
+        "the restored participant receives the actual primary preparation before Commit"
+    );
+    let target_prepare = observation
+        .before
+        .tables
+        .tables
+        .prepared_operations_v7
+        .iter()
+        .find(|record| record.digest == stored.digest)
+        .expect("the actual target holds the same primary-authored complete body");
+    target_prepare.validate().unwrap();
+    assert_eq!(target_prepare.payload, stored.payload);
+    assert_eq!(
+        after, &observation.before,
+        "Commit changes neither the target's real journal/tables, content generation nor publication work"
     );
     assert_eq!(observer.content().read_blob(&expected_hash).unwrap(), bytes);
-    // Borrow the SAME existing served lane; clone its handle before releasing
-    // the process-global cache mutex, then release the lane before assertions.
-    let actual_lane = {
-        let cache_slot = crate::dfs_runtime_message_cache()
-            .root(&replica_data.root())
-            .expect("actual root cache slot");
-        let cache = cache_slot.lock().unwrap();
-        cache
-            .as_ref()
-            .and_then(|entry| entry.primary_service.clone())
-    }
-    .expect("actual retained Stage/Commit receiver lane");
-    let cached = {
-        let lane = actual_lane.lock().unwrap();
-        lane.service.current_read_object_metadata(&stage.object_id)
-    }
-    .expect("actual committed replica cache");
-    assert_eq!(cached.version, stage.version);
-    assert_eq!(cached.content_hash.as_deref(), Some(expected_hash.as_str()));
-    assert!(cached.current_locations.contains(&replica));
-    drop(actual_lane);
+    assert_eq!(
+        observer
+            .content()
+            .read_object_version(stage.object_id.as_str(), stage.version.as_str())
+            .unwrap()
+            .1,
+        bytes,
+        "actual Stage bytes remain bound after the canonical Commit acknowledgement"
+    );
     drop(capture);
     drop(observer);
     drop(writer);
@@ -1509,7 +2632,7 @@ fn commit_version_rejects_manifest_without_content_bytes() {
     runtime
         .apply_placement_policy(&owner, &path, DfsPlacementScope::Subtree, first_policy)
         .unwrap();
-    let mut writer = runtime.client(&owner).unwrap();
+    let mut writer = runtime.metadata_primary_service(&path).unwrap();
     let base = writer
         .posix_write_file(
             &path,
@@ -1524,7 +2647,7 @@ fn commit_version_rejects_manifest_without_content_bytes() {
     runtime
         .apply_placement_policy(&owner, &path, DfsPlacementScope::Subtree, next_policy)
         .unwrap();
-    let mut writer = runtime.client(&owner).unwrap();
+    let mut writer = runtime.metadata_primary_service(&path).unwrap();
     let bytes = vec![0x73; 2 * 1024 * 1024 + 4096];
     let version = crate::namespace::next_version(&base.version);
     let request = DfsWriteRequest {
@@ -1758,31 +2881,36 @@ fn sifs_self_only_eventual_write_uses_local_fast_path() {
 
 #[test]
 fn duplicate_commit_metadata_application_is_idempotent() {
-    let root = temp_root("duplicate-commit-metadata-idempotent");
     let node_id = NodeId::from_legacy_named("node_duplicate_commit_meta").expect("node");
-    let object_id = DfsObjectId::from_legacy_named("obj_duplicate_commit_meta").expect("object");
+    let path = "/services/native-duplicate-commit-metadata.bin";
     let bytes = b"duplicate commit bytes";
-
-    let (_runtime, mut dfs) = native_sifs_service(
+    let (runtime, mut main) = native_sifs_service(
         "duplicate_commit_metadata_application_is_idempotent",
         node_id.clone(),
     );
-    let mut metadata = file_metadata(node_id.clone());
-    metadata.object_id = object_id.clone();
-    metadata.policy = DfsObjectPolicy::ReplicatedEventual;
-    metadata.last_modified_by_event_id =
-        Some(EventId::from_legacy_named("evt_duplicate_commit_base").expect("event"));
-    let version = metadata.version.clone();
-    let hash = dfs
-        .put_local_object_version(metadata, bytes)
-        .expect("local version");
+    let actual = main
+        .posix_write_file(
+            path,
+            bytes,
+            DfsWriteOptions::replicated_eventual(vec![node_id]),
+        )
+        .unwrap();
+    drop(main);
+    let mut dfs = runtime.metadata_primary_service(path).unwrap();
+    let object_id = actual.object_id;
+    let version = actual.version;
+    let hash = actual
+        .content_hash
+        .expect("actual canonical committed hash");
     let before = dfs
         .current_read_object_metadata(&object_id)
         .expect("current object");
-    let journal_count_before = std::fs::read_dir(root.join("metadata/journal"))
-        .expect("journal dir")
-        .count();
-
+    let shard = DfsMetadataShardId::new("services");
+    let prefix_before = dfs
+        .metadata_backend()
+        .unwrap()
+        .metadata_prefix_proof(&shard)
+        .unwrap();
     let committed = dfs
         .commit_local_metadata(&object_id, &version, &hash, dfs_now_unix_nanos())
         .expect("duplicate commit metadata");
@@ -1798,15 +2926,18 @@ fn duplicate_commit_metadata_application_is_idempotent() {
     );
     assert_eq!(after.modified_at_unix_nanos, before.modified_at_unix_nanos);
     assert_eq!(after.changed_at_unix_nanos, before.changed_at_unix_nanos);
-    let journal_count_after = std::fs::read_dir(root.join("metadata/journal"))
-        .expect("journal dir")
-        .count();
+    let backend = dfs.metadata_backend_mut().unwrap();
+    backend
+        .begin_consistent_read_snapshot_for_path(&before.file_system_id, path)
+        .unwrap();
+    let prefix_after = backend.metadata_prefix_proof(&shard).unwrap();
+    backend.end_consistent_read_snapshot_for_path(&before.file_system_id, path);
     assert_eq!(
-        journal_count_after, journal_count_before,
-        "duplicate committed metadata application must not emit visible metadata churn"
+        prefix_after, prefix_before,
+        "duplicate committed metadata application must not append canonical visible effects"
     );
-
-    std::fs::remove_dir_all(root).ok();
+    drop(dfs);
+    runtime.close().unwrap();
 }
 
 #[test]
@@ -2092,8 +3223,11 @@ fn sifs_distributed_write_rejects_stale_backend_base_version() {
         )
         .expect("initial write");
 
-    let stale = runtime.client(&node_id).unwrap();
-    let stale_stat = stale.posix_stat(file_path).expect("stale stat");
+    // The private CAS producer is the actual owning Core, not Main's routed
+    // requester. Its earlier stat is genuine; the kernel must reject that base
+    // after a later ordinary publication advances the native version.
+    let mut stale_writer = runtime.metadata_primary_service(file_path).unwrap();
+    let stale_stat = stale_writer.posix_stat(file_path).expect("stale stat");
 
     writer
         .posix_write_file_at(
@@ -2104,14 +3238,13 @@ fn sifs_distributed_write_rejects_stale_backend_base_version() {
         )
         .expect("fresh offset write");
     let fresh_stat = writer.posix_stat(file_path).expect("fresh stat");
-    let journal_count_before_conflict = writer
+    let journal_count_before_conflict = stale_writer
         .metadata_backend()
         .expect("writer metadata backend")
         .journal_since(0)
         .expect("journal before conflict")
         .len();
 
-    let mut stale_writer = stale;
     let request = DfsWriteRequest {
         file_system_id: stale_stat.file_system_id.clone(),
         object_id: stale_stat.object_id.clone(),
@@ -2425,9 +3558,33 @@ fn sifs_cluster_posix_contract_large_streamed_write_visibility() {
     let old_hash = content_hash(&old);
     let new_hash = content_hash(&new);
     let mut observations = Vec::new();
-
-    sifs_cluster_routed_posix_write(&mut cluster, path, &old);
-    let old_stat = cluster.writer.posix_stat(path).expect("old stat");
+    let holders = vec![cluster.writer_node.clone(), cluster.observer_node.clone()];
+    let mut placement =
+        DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedConfirmed, 2, 2).unwrap();
+    placement.required_node_ids = holders.clone();
+    cluster
+        ._runtime
+        .apply_placement_policy(
+            &cluster.writer_node,
+            path,
+            DfsPlacementScope::SelfOnly,
+            placement.clone(),
+        )
+        .unwrap();
+    cluster.writer = cluster._runtime.client(&cluster.writer_node).unwrap();
+    let old_stat = cluster
+        .writer
+        .posix_write_file(
+            path,
+            &old,
+            DfsWriteOptions {
+                policy: placement.replication_policy(Default::default()).unwrap(),
+                replica_candidates: holders.clone(),
+                wait_for_commit: true,
+                foreground_replica_repair: true,
+            },
+        )
+        .unwrap();
     record_posix_observation(
         &mut observations,
         scenario,
@@ -2438,50 +3595,155 @@ fn sifs_cluster_posix_contract_large_streamed_write_visibility() {
         "committed",
         Some(&old_stat),
     );
-    let write = cluster.writer.posix_write_file(
-        path,
-        &new,
-        DfsWriteOptions {
-            policy: DfsReplicationPolicy::new(2, 2).expect("strict policy"),
-            replica_candidates: vec![cluster.writer_node.clone(), cluster.observer_node.clone()],
-            wait_for_commit: false,
-            foreground_replica_repair: true,
-        },
-    );
-    assert!(
-        matches!(write, Ok(_) | Err(DfsPosixError::PendingWrite { .. })),
-        "large staged write must commit or report pending, got {write:?}"
-    );
-
-    let pre_commit = cluster
-        .primary
-        .posix_stat(path)
-        .expect("primary pre-commit stat");
-    record_posix_observation(
-        &mut observations,
-        scenario,
-        "reader-before-commit",
-        &cluster.primary_node,
-        path,
-        Instant::now(),
-        "stat",
-        Some(&pre_commit),
-    );
-    assert_ne!(
-        pre_commit.content_hash.as_deref(),
-        Some(new_hash.as_str()),
-        "large chunked bytes must not become visible before commit"
-    );
-
-    sifs_posix_cluster_pump_until(&mut cluster, "large chunked write commit", |cluster| {
-        cluster
-            .writer
-            .posix_stat(path)
-            .is_ok_and(|stat| stat.content_hash.as_deref() == Some(new_hash.as_str()))
+    let config = cluster
+        ._runtime
+        .metadata_shards()
+        .unwrap()
+        .into_iter()
+        .find(|row| row.shard_id == "services")
+        .unwrap();
+    assert_eq!(config.primary_node_id, cluster.primary_node);
+    let root = default_dfs_metadata_shards_root(cluster._runtime.data_dir(&cluster.primary_node))
+        .join(&config.shard_id);
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    struct Release(Arc<tokio::sync::Semaphore>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.0.add_permits(32);
+        }
+    }
+    let capture = cluster
+        ._runtime
+        .capture_served_work(&cluster.observer_node, 16)
+        .unwrap();
+    cluster
+        ._runtime
+        .install_fault(crate::test_runtime::FaultRule {
+            source: Some(cluster.primary_node.clone()),
+            target: Some(cluster.observer_node.clone()),
+            route: Some(DFS_DATA_STAGE_BLOB_ROUTE.into()),
+            call_id: None,
+            origin: Some(crate::test_runtime::RpcOrigin::RegisteredHost),
+            remaining_hits: 32,
+            action: crate::test_runtime::FaultAction::PauseAfterDispatch(Arc::clone(&gate)),
+        });
+    let deadline = Instant::now() + SIFS_CLUSTER_PUMP_DEADLINE;
+    let report = std::thread::scope(|scope| {
+        // This guard unwinds before scope joins the actual blocked producer.
+        let release = Release(Arc::clone(&gate));
+        let writer = &mut cluster.writer;
+        let bytes = &new;
+        let policy = placement.replication_policy(Default::default()).unwrap();
+        let candidates = holders.clone();
+        let producer = scope.spawn(move || {
+            writer.posix_write_file(
+                path,
+                bytes,
+                DfsWriteOptions {
+                    policy,
+                    replica_candidates: candidates,
+                    wait_for_commit: true,
+                    foreground_replica_repair: true,
+                },
+            )
+        });
+        let report = loop {
+            if let Some(row) = capture.records().into_iter().find(|row| matches!(
+                &row.command.routed_message.message, DfsNetworkMessage::StageBlob(stage) if stage.content_hash == new_hash)) { break row; }
+            assert!(
+                Instant::now() < deadline,
+                "actual streamed Stage did not reach its receiver"
+            );
+            std::thread::sleep(SIFS_CLUSTER_PUMP_IDLE_SLEEP);
+        };
+        assert!(report.succeeded);
+        let DfsNetworkMessage::StageBlob(stage) = &report.command.routed_message.message else {
+            unreachable!()
+        };
+        assert_eq!(
+            report.command.routed_message.source_node_id,
+            cluster.primary_node
+        );
+        assert_eq!(
+            report.command.routed_message.target_node_id,
+            cluster.observer_node
+        );
+        assert_eq!(stage.content_hash, new_hash);
+        assert_eq!(stage.object_id, old_stat.object_id);
+        assert_eq!(stage.expected_base_version, Some(old_stat.version.clone()));
+        assert_eq!(
+            cluster
+                .observer
+                .content()
+                .read_blob(&stage.content_hash)
+                .unwrap(),
+            new,
+            "all actual stream bytes are durable before the held W2 response"
+        );
+        // Read the actual native materialized head without requesting another
+        // execution from the Main producer whose real response is held here.
+        let inspection = LocalSobjMetadataBackend::open_for_inspection(
+            DfsMetadataShardId::new(config.shard_id.clone()),
+            &root,
+        )
+        .unwrap();
+        let current = inspection.get_object(&old_stat.object_id).unwrap().unwrap();
+        assert_eq!(current.version, old_stat.version);
+        assert_eq!(current.content_hash.as_deref(), Some(old_hash.as_str()));
+        assert_ne!(
+            current.content_hash.as_deref(),
+            Some(new_hash.as_str()),
+            "large chunked bytes cannot become visible before the required response"
+        );
+        assert!(
+            inspection
+                .get_version(&stage.object_id, &stage.version)
+                .unwrap()
+                .is_none()
+        );
+        drop(inspection);
+        record_posix_observation(
+            &mut observations,
+            scenario,
+            "reader-before-commit",
+            &cluster.primary_node,
+            path,
+            Instant::now(),
+            "actual durable precommit head",
+            Some(&old_stat),
+        );
+        assert_eq!(cluster._runtime.remove_faults_matching(|rule| {
+            rule.source.as_ref() == Some(&cluster.primary_node) && rule.target.as_ref() == Some(&cluster.observer_node)
+            && rule.route.as_deref() == Some(DFS_DATA_STAGE_BLOB_ROUTE)
+            && matches!(&rule.action, crate::test_runtime::FaultAction::PauseAfterDispatch(g) if Arc::ptr_eq(g, &gate))
+        }), 1);
+        drop(release);
+        let written = producer
+            .join()
+            .expect("normal native write producer")
+            .expect("held real reply completes the write");
+        assert_eq!(written.version, stage.version);
+        assert_eq!(written.content_hash.as_deref(), Some(new_hash.as_str()));
+        assert!(
+            Instant::now() < deadline,
+            "actual commit exceeded the original budget"
+        );
+        report
     });
-    let committed = cluster.writer.posix_stat(path).expect("committed stat");
+    let committed = cluster
+        .writer
+        .posix_stat_distributed(path)
+        .expect("current committed stat");
     assert_eq!(committed.content_hash.as_deref(), Some(new_hash.as_str()));
     assert_ne!(old_hash, new_hash);
+    assert_eq!(
+        cluster.observer.posix_read_file_distributed(path).unwrap(),
+        new
+    );
+    assert!(capture.records().iter().any(
+        |row| row.command.routed_message.message_id == report.command.routed_message.message_id
+    ));
+    drop(capture);
     assert_sifs_cluster_no_posix_leaks(&cluster, scenario);
     finish_posix_observations(&observations);
     drop(cluster);
@@ -2620,8 +3882,7 @@ fn sharded_lazy_reader_sees_sibling_visible_overwrite() {
 fn sifs_cluster_posix_blocking_write_and_read_with_live_peers() {
     // End-to-end through the blocking POSIX surface that the FUSE adapter and
     // CLI use: `wait_for_commit: true` writes on a non-primary node and
-    // blocking distributed reads, with peer nodes pumping their own event
-    // loops on threads like live daemons.
+    // blocking distributed reads through the registered native runtime.
     let cluster = sifs_posix_cluster("sifs-cluster-blocking", "/users");
     let path = "/users/blocking.txt";
     let bytes = b"blocking write through live peers".to_vec();
@@ -2636,17 +3897,6 @@ fn sifs_cluster_posix_blocking_write_and_read_with_live_peers() {
         rejections: _,
         _runtime,
     } = cluster;
-
-    let stop_primary = Arc::new(AtomicBool::new(false));
-    let primary_stop = Arc::clone(&stop_primary);
-    let primary_thread = std::thread::spawn(move || {
-        let mut primary = primary;
-        while !primary_stop.load(Ordering::SeqCst) {
-            primary.process_incoming().expect("primary pump");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        primary
-    });
 
     // The production write path: blocks until the routed write commits.
     let stat = writer
@@ -2664,38 +3914,17 @@ fn sifs_cluster_posix_blocking_write_and_read_with_live_peers() {
 
     // Read-your-write immediately after the blocking write returns.
     assert_eq!(
-        writer.posix_read_file(path).expect("read your write"),
+        writer
+            .posix_read_file_distributed(path)
+            .expect("read your write"),
         bytes
     );
 
-    // Stop the primary thread and publish its journal so the observer learns
-    // the namespace.
-    stop_primary.store(true, Ordering::SeqCst);
-    let mut primary = primary_thread.join().expect("primary thread");
-    let deadline = Instant::now() + SIFS_CLUSTER_PUMP_DEADLINE;
-    loop {
-        let publication = _runtime
-            .maintenance_tick(
-                &primary_node,
-                deadline
-                    .saturating_duration_since(Instant::now())
-                    .min(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT),
-            )
-            .expect("ordinary Main publication");
-        assert!(publication.outcome.is_ok(), "{:?}", publication.outcome);
-        assert_eq!(publication.omitted_kv_event_count, 0);
-        primary.process_incoming().expect("primary pump");
-        writer.process_incoming().expect("writer pump");
-        observer.process_incoming().expect("observer pump");
-        if observer.posix_stat(path).is_ok() {
-            break;
-        }
-        if Instant::now() >= deadline {
-            panic!("observer did not learn the namespace from journal publication");
-        }
-        std::thread::sleep(SIFS_CLUSTER_PUMP_IDLE_SLEEP);
-    }
-
+    assert_eq!(
+        observer.posix_stat_distributed(path).unwrap().version,
+        stat.version
+    );
+    let mut primary = primary;
     // The blocking distributed read consults the metadata primary and fetches
     // content from the writer replica while both peers keep serving frames.
     let read = sifs_cluster_blocking_distributed_read_with_pump(
@@ -2709,7 +3938,10 @@ fn sifs_cluster_posix_blocking_write_and_read_with_live_peers() {
     );
     assert_eq!(read, bytes);
 
-    drop(_runtime);
+    drop(primary);
+    drop(writer);
+    drop(observer);
+    _runtime.close().expect("normal runtime owner drain");
 }
 
 #[test]
@@ -2936,36 +4168,24 @@ fn sifs_non_replica_requester_routes_namespace_op_with_read_your_write() {
         ..
     } = cluster;
 
-    let stop_primary = Arc::new(AtomicBool::new(false));
-    let primary_stop = Arc::clone(&stop_primary);
-    let primary_thread = std::thread::spawn(move || {
-        let mut primary = primary;
-        while !primary_stop.load(Ordering::SeqCst) {
-            primary.process_incoming().expect("primary pump");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        primary
-    });
-
-    // The outsider is not in the shard's replica set; the routed mkdir's
-    // response batches must still replay into its local mirror.
+    // The public Main client retains the real routed result and reads through
+    // the owner; it does not author a second local journal mirror.
     observer
         .posix_mkdir_all("/users/outsider/nested")
         .expect("routed mkdir from non-replica requester");
 
-    // Read-your-write without any further pumping: the mirror was updated by
-    // the response replay alone.
+    // Read-your-write through the normal current owner with no private pump.
     assert_eq!(
         observer
-            .posix_stat("/users/outsider/nested")
+            .posix_stat_distributed("/users/outsider/nested")
             .expect("outsider reads its own routed namespace write")
             .kind,
         DfsObjectKind::Directory
     );
 
-    stop_primary.store(true, Ordering::SeqCst);
-    primary_thread.join().expect("primary thread");
-    drop(_runtime);
+    drop(primary);
+    drop(observer);
+    _runtime.close().expect("normal native owner drain");
 }
 
 struct NativeMainAbortFixture {
@@ -3342,10 +4562,46 @@ fn normal_main_abort_rejects_other_actor_and_fences_actual_late_stage_reply() {
         &case.record().status
     ));
     drop(other);
+    // Keep a genuine earlier owning-Core view across the normal Main abort.
+    // No coordinator status, durable record, epoch or receipt is fabricated.
+    let mut earlier = case.runtime.metadata_primary_service(&case.path).unwrap();
+    earlier.hydrate_from_metadata_backend().unwrap();
+    assert!(matches!(
+        earlier.coordinator.intent(&case.intent_id).unwrap().state,
+        DfsWriteIntentState::AwaitingReceipts
+    ));
     let aborted = case.writer.abort_pending_write(&case.intent_id).unwrap();
     assert_eq!(aborted.state, DfsWriteIntentState::Aborted);
     case.assert_terminal_caller_body_cleared();
     let prefix = case.prefix();
+    let terminal = case.record();
+    assert_eq!(terminal.status, DfsWriteIntentStatus::Aborted);
+    assert!(matches!(
+        earlier.coordinator.intent(&case.intent_id).unwrap().state,
+        DfsWriteIntentState::AwaitingReceipts
+    ));
+    let replay = earlier.capture_mounted_mutation(|service| {
+        service.process_routed_messages_with_options(vec![case.exchange.response.clone()], false)
+    });
+    let events = replay
+        .outcome
+        .expect("actual closed tuple rejects the original late response");
+    assert!(events.iter().any(|event| matches!(event,
+        NetworkedDfsServiceEvent::BlobStageRejected { intent_id, object_id, replica_node_id, .. }
+        if intent_id == &case.intent_id && object_id == &case.request.object_id
+            && replica_node_id == &case.requester)));
+    assert_eq!(replay.committed_work, DfsCommittedWork::default());
+    assert_eq!(
+        case.record(),
+        terminal,
+        "exact aborted body remains unchanged"
+    );
+    assert_eq!(
+        case.prefix(),
+        prefix,
+        "late receipt cannot append an authoritative frame"
+    );
+    drop(earlier);
     let mut recipient = case.runtime.client(&case.requester).unwrap();
     recipient
         .transport
@@ -3380,10 +4636,34 @@ fn normal_main_abort_publication_failure_retains_pending_until_actual_recovery()
     let name = "native-main-abort-publication-failure";
     let mut case = NativeMainAbortFixture::with_node_count(name, 3);
     let original = case.record();
-    let unavailable = crate::test_runtime::DfsTestRuntime::ordered_node_ids(name, 3)
+    let config = case
+        .runtime
+        .metadata_shards()
+        .unwrap()
         .into_iter()
-        .find(|node| node != &case.main && node != &case.requester)
+        .find(|config| {
+            config.file_system_id == case.request.file_system_id && config.shard_id == case.shard.0
+        })
         .unwrap();
+    assert_eq!(config.primary_node_id, case.main);
+    let participants = std::iter::once(config.primary_node_id.clone())
+        .chain(config.replica_node_ids.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(participants.len(), 3);
+    let unavailable = participants
+        .iter()
+        .find(|node| **node != case.main && **node != case.requester)
+        .unwrap()
+        .clone();
+    let mut owner = case.runtime.metadata_primary_service(&case.path).unwrap();
+    assert_eq!(
+        owner
+            .metadata_backend()
+            .unwrap()
+            .get_intent(&case.request.object_id, &case.intent_id)
+            .unwrap(),
+        Some(original.clone())
+    );
     for route in [
         crate::DFS_METADATA_JOURNAL_BATCH_ROUTE,
         crate::DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE,
@@ -3398,31 +4678,76 @@ fn normal_main_abort_publication_failure_retains_pending_until_actual_recovery()
             action: crate::test_runtime::FaultAction::BudgetExhausted,
         });
     }
-    let fault = case
-        .runtime
-        .metadata_operation_floor_fault(&case.main)
-        .unwrap();
-    fault.operation_floor_denial_trigger(crate::metadata_shard_operation_floor_key(
-        &case.request.file_system_id,
-        &case.shard.0,
-    ))();
-    let rejected = case
-        .writer
-        .abort_pending_write(&case.intent_id)
+    // The original Main producer supplied the genuine pending actor/body.
+    // Enter its ordinary typed owner-side abort so a native participant denial
+    // is not converted into the namespace RPC's formatted rejection string.
+    let rejected = owner
+        .abort_routed_pending_write(
+            &case.requester,
+            &case.request.file_system_id,
+            &case.abort_operation(),
+        )
         .unwrap_err();
     assert!(
-        fault.denied_operation_floor_reads() > 0,
-        "the actual publication boundary must reject its floor read"
-    );
-    assert!(
-        rejected.to_string().contains("retry the read"),
-        "{rejected}"
+        matches!(&rejected, DfsError::MetadataRecoveryQuorumUnavailable {
+        file_system_id, shard_id, required, verified,
+    } if file_system_id == &case.request.file_system_id && shard_id == &case.shard.0
+        && *required == participants.len() && *verified + 1 == *required),
+        "{rejected:?}"
     );
     assert_eq!(
-        case.record(),
-        original,
-        "failed publication cannot install terminal intent effects"
+        owner
+            .metadata_backend()
+            .unwrap()
+            .get_intent(&case.request.object_id, &case.intent_id)
+            .unwrap(),
+        Some(original.clone()),
+        "failed ALL-assigned publication cannot install terminal intent effects"
     );
+    let aborted_prepares = owner.metadata_backend().unwrap().list_prepared_operations().unwrap().into_iter()
+        .filter(|record| record.file_system_id == case.request.file_system_id && record.shard_id == case.shard
+            && record.metadata_effects.iter().any(|effect| matches!(effect,
+                DfsPreparedMetadataEffect::PutIntent { intent }
+                if intent.intent_id == case.intent_id && intent.object_id == case.request.object_id
+                    && intent.target_version == case.request.target_version && intent.status == DfsWriteIntentStatus::Aborted)))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        aborted_prepares.len(),
+        1,
+        "the exact failed abort remains durably Prepared"
+    );
+    let prepared = &aborted_prepares[0];
+    prepared.validate().unwrap();
+    assert_eq!(prepared.status, DfsPreparedOperationStatus::Prepared);
+    assert_eq!(prepared.owner_epoch, config.epoch);
+    assert!(
+        owner
+            .metadata_backend()
+            .unwrap()
+            .committed_prepared_operation(&prepared.digest)
+            .unwrap()
+            .is_none()
+    );
+    let candidate = prepared
+        .metadata_effects
+        .iter()
+        .find_map(|effect| match effect {
+            DfsPreparedMetadataEffect::PutIntent { intent }
+                if intent.intent_id == case.intent_id =>
+            {
+                Some(intent.clone())
+            }
+            _ => None,
+        })
+        .unwrap();
+    let mut unchanged = candidate.clone();
+    unchanged.status = original.status.clone();
+    unchanged.updated_at = original.updated_at;
+    assert_eq!(
+        unchanged, original,
+        "the candidate retains every original pending body field"
+    );
+    assert_eq!(case.record(), original);
     assert!(
         case.writer
             .writes
@@ -3434,7 +4759,29 @@ fn normal_main_abort_publication_failure_retains_pending_until_actual_recovery()
                 .is_some_and(|command| command.request_id == case.operation_id))
     );
     case.assert_current_unchanged();
-    drop(fault);
+    assert_eq!(
+        case.runtime.remove_faults_matching(|rule| {
+            rule.source.as_ref() == Some(&case.main)
+                && rule.target.as_ref() == Some(&unavailable)
+                && rule.call_id.is_none()
+                && rule.origin.is_none()
+                && matches!(
+                    rule.route.as_deref(),
+                    Some(
+                        crate::DFS_METADATA_JOURNAL_BATCH_ROUTE
+                            | crate::DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE
+                    )
+                )
+                && matches!(
+                    &rule.action,
+                    crate::test_runtime::FaultAction::BudgetExhausted
+                )
+        }),
+        2,
+        "heal only the actual unavailable participant's metadata routes"
+    );
+    case.runtime.assert_fault_budgets().unwrap();
+    drop(owner);
     case.runtime
         .request_repair_reconciliation(&case.main)
         .unwrap();
@@ -3443,6 +4790,37 @@ fn normal_main_abort_publication_failure_retains_pending_until_actual_recovery()
         .unwrap()
         .outcome
         .unwrap();
+    let recovered = case.runtime.metadata_primary_service(&case.path).unwrap();
+    let terminal = recovered
+        .metadata_backend()
+        .unwrap()
+        .prepared_operation_record(&prepared.operation_id)
+        .unwrap()
+        .unwrap();
+    terminal.validate().unwrap();
+    assert_eq!(terminal.status, DfsPreparedOperationStatus::Committed);
+    assert_eq!(terminal.digest, prepared.digest);
+    assert_eq!(
+        terminal.payload, prepared.payload,
+        "normal recovery commits the SAME sealed abort body and ID"
+    );
+    assert!(
+        recovered
+            .metadata_backend()
+            .unwrap()
+            .committed_prepared_operation(&prepared.digest)
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        recovered
+            .metadata_backend()
+            .unwrap()
+            .get_intent(&case.request.object_id, &case.intent_id)
+            .unwrap(),
+        Some(candidate)
+    );
+    drop(recovered);
     let aborted = case.writer.abort_pending_write(&case.intent_id).unwrap();
     assert_eq!(aborted.state, DfsWriteIntentState::Aborted);
     case.assert_terminal_caller_body_cleared();

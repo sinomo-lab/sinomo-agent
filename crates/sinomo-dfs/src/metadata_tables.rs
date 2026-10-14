@@ -484,46 +484,53 @@ impl DfsNamespacePrepareFootprint {
     }
 }
 
-pub(crate) fn namespace_prepare_footprint(
-    prepare: &DfsPreparedOperationRecord,
-) -> DfsNamespacePrepareFootprint {
-    let mut object_ids = prepare
+pub(crate) fn prepared_payload_reservation_keys(
+    payload: &crate::DfsPreparedOperationPayload,
+) -> (BTreeSet<DfsObjectId>, BTreeSet<String>) {
+    let mut object_ids = payload
         .expected_object_versions
         .iter()
         .map(|expected| expected.object_id.clone())
         .collect::<BTreeSet<_>>();
     object_ids.extend(
-        prepare
+        payload
             .transaction
             .objects
             .iter()
             .map(|object| object.object_id.clone()),
     );
     object_ids.extend(
-        prepare
+        payload
             .transaction
             .content_reference_identity
             .iter()
             .map(|identity| identity.object_id.clone()),
     );
     object_ids.extend(
-        prepare
+        payload
             .metadata_effects
             .iter()
             .flat_map(|effect| effect.affected_object_ids()),
     );
-    let mut paths = prepare
+    let mut paths = payload
         .expected_path_occupants
         .iter()
         .map(|expected| normalize_path(&expected.path))
         .collect::<BTreeSet<_>>();
     paths.extend(
-        prepare
+        payload
             .transaction
             .objects
             .iter()
             .map(|object| normalize_path(&object.path)),
     );
+    (object_ids, paths)
+}
+
+pub(crate) fn namespace_prepare_footprint(
+    prepare: &DfsPreparedOperationRecord,
+) -> DfsNamespacePrepareFootprint {
+    let (object_ids, paths) = prepared_payload_reservation_keys(&prepare.payload);
     DfsNamespacePrepareFootprint::from_validated_parts(prepare, object_ids, paths)
 }
 
@@ -1657,6 +1664,42 @@ impl DfsMetadataTables {
             .filter(|request| request.status == DfsNamespaceRequestStatus::Pending)
             .map(Self::namespace_request_order_key)
             .collect();
+    }
+
+    pub(crate) fn prepared_operation_reservations(
+        &self,
+        payload: &crate::DfsPreparedOperationPayload,
+    ) -> Vec<DfsPreparedOperationRecord> {
+        let (objects, paths) = prepared_payload_reservation_keys(payload);
+        let mut ids = BTreeSet::new();
+        if let Some(index) = self
+            .namespace_prepare_object_owners
+            .get(&payload.file_system_id)
+        {
+            for object in objects {
+                if let Some(owners) = index.get(&object) {
+                    ids.extend(owners.iter().cloned());
+                }
+            }
+        }
+        if let Some(index) = self
+            .namespace_prepare_path_owners
+            .get(&payload.file_system_id)
+        {
+            for path in paths {
+                if let Some(owners) = index.get(&path) {
+                    ids.extend(owners.iter().cloned());
+                }
+            }
+        }
+        ids.into_iter()
+            .filter_map(|id| self.prepared_operations_v7.get(&id))
+            .filter(|record| {
+                record.status == DfsPreparedOperationStatus::Prepared
+                    && record.operation_id != payload.operation_id
+            })
+            .cloned()
+            .collect()
     }
 
     pub(crate) fn namespace_prepare_object_owner_other_than(

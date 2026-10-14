@@ -21,11 +21,12 @@ use crate::posix_path::{
     posix_path_is_at_or_under_prefix, subtree_prefix,
 };
 use crate::{
-    DfsDirectoryPageCursor, DfsError, DfsFileSystemId, DfsMessageTransport,
+    DfsDirectoryPageCursor, DfsError, DfsFileSystemId, DfsMessageTransport, DfsMetadataShardId,
     DfsMetadataVersionPinRecord, DfsNamespaceJobFrame, DfsNamespaceJobKind, DfsNamespaceJobOrigin,
     DfsNamespaceJobRecord, DfsNamespaceJobStatus, DfsNamespaceObjectPrecondition,
-    DfsNamespaceOperation, DfsNamespaceTransaction, DfsObjectId, DfsObjectKind, DfsObjectMetadata,
-    DfsObjectVersionRecord, DfsPosixCoordinationResult, DfsReplicaReceiptRecord,
+    DfsNamespaceObjectVersionExpectation, DfsNamespaceOperation,
+    DfsNamespacePathOccupantExpectation, DfsNamespaceTransaction, DfsObjectId, DfsObjectKind,
+    DfsObjectMetadata, DfsObjectVersionRecord, DfsPosixCoordinationResult, DfsReplicaReceiptRecord,
     DfsWriteIntentReceipt, DfsWriteIntentReceiptRetentionState, DfsWriteIntentState,
     DfsWriteIntentStatus, NetworkedDfsService, object_version_record, sifs_file_system_id,
 };
@@ -383,11 +384,38 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<()> {
         let source_prefix = subtree_prefix(source_path);
         let target_prefix = subtree_prefix(target_path);
-        let page = self.child_objects_for_sifs_dir_page(
-            source_path,
-            cursor,
-            POSIX_RECURSIVE_CLEAR_JOB_PAGE_SIZE,
-        )?;
+        // Enumeration selects identities, not the original head of a nested
+        // authority. Record only the owning shard's selected object below.
+        let speculative = self.namespace_execution.begin_independent_planning();
+        let page = if let Some(source) = self.routed_namespace_shard_for_path(source_path)? {
+            match self.query_metadata_authority_impl(
+                &source,
+                crate::DfsMetadataSelection::DirectoryPage {
+                    path: source_path.to_string(),
+                    after: cursor.cloned(),
+                    limit: POSIX_RECURSIVE_CLEAR_JOB_PAGE_SIZE,
+                },
+            )? {
+                crate::DfsMetadataQueryResult::DirectoryPage { entries, after } => {
+                    crate::DfsDirectoryPage {
+                        objects: entries.into_iter().map(|(object, _)| object).collect(),
+                        next_cursor: after,
+                    }
+                }
+                _ => {
+                    return Err(DfsPosixError::Dfs(DfsError::Metadata {
+                        message: "source directory authority returned another query kind".into(),
+                    }));
+                }
+            }
+        } else {
+            self.child_objects_for_sifs_dir_page(
+                source_path,
+                cursor,
+                POSIX_RECURSIVE_CLEAR_JOB_PAGE_SIZE,
+            )?
+        };
+        drop(speculative);
         let mut resolved = Vec::new();
         for object in page.objects {
             let old_path = normalize_posix_path(&object.path)?;
@@ -395,9 +423,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 continue;
             };
             let new_path = format!("{target_prefix}{suffix}");
-            let Some(current) = self.object_by_id(&object.object_id)? else {
+            let current = if self.routed_namespace_primary_for_path(&old_path)?.is_some() {
+                self.lookup_sifs_path_direct_distributed_synced(&old_path)?
+            } else {
+                self.object_by_id(&object.object_id)?
+            };
+            let Some(current) = current else {
                 continue;
             };
+            if current.object_id != object.object_id {
+                return Err(DfsPosixError::InvalidPath { path: old_path });
+            }
             if current.kind == DfsObjectKind::Tombstone {
                 continue;
             }
@@ -575,7 +611,46 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<()> {
         let old_path = normalize_posix_path(old_path)?;
         let target_path = normalize_posix_path(&frame_object.path)?;
-        let mut current = self.object_by_id(&frame_object.object_id)?;
+        let phase_key = job.map(|job| {
+            Self::cross_shard_job_phase_operation_id(
+                job,
+                &format!(
+                    "adopt-object-family\0{}\0{old_path}",
+                    frame_object.object_id
+                ),
+            )
+        });
+        let prepared_source = phase_key
+            .as_ref()
+            .and_then(|key| self.prepared_remote_sources.get(key))
+            .map(|prepared| prepared.family.source_object.clone());
+        let mut current = if let Some(source) = prepared_source {
+            // The resumed phase already owns this exact source capture. Never
+            // re-read through the writer it holds or replace its original head.
+            Some(source)
+        } else {
+            let speculative = self.namespace_execution.begin_independent_planning();
+            let candidate = self.object_by_id(&frame_object.object_id)?;
+            drop(speculative);
+            if candidate.as_ref().is_none_or(|object| {
+                object.path == old_path || object.kind == DfsObjectKind::Tombstone
+            }) && self.routed_namespace_primary_for_path(&old_path)?.is_some()
+            {
+                // An ancestor shard may retain the original genesis row of a
+                // nested shard root. Select this phase's input from its actual
+                // source authority before constructing the immutable prepare.
+                let source = self.lookup_sifs_path_direct_distributed_synced(&old_path)?;
+                if source
+                    .as_ref()
+                    .is_some_and(|object| object.object_id != frame_object.object_id)
+                {
+                    return Err(DfsPosixError::InvalidPath { path: old_path });
+                }
+                source
+            } else {
+                candidate
+            }
+        };
         if current
             .as_ref()
             .is_none_or(|current| current.kind == DfsObjectKind::Tombstone)
@@ -1393,20 +1468,62 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         primary: NodeId,
         operation: DfsNamespaceOperation,
     ) -> Result<Option<DfsPosixCoordinationResult>> {
+        let canonical_fence_phase = match &operation {
+            DfsNamespaceOperation::InstallHardlinkTargetFence { .. } => {
+                Some("install-target-fence")
+            }
+            DfsNamespaceOperation::CommitHardlinkTargetFence { .. } => Some("commit-target-fence"),
+            _ => None,
+        };
+        // A plain service owns no Main admission to release. Preserve both
+        // original canonical-fence identities and its existing direct route.
+        if self.publication_execution.current().is_none()
+            && let Some(phase) = canonical_fence_phase
+        {
+            let job = job.ok_or_else(|| {
+                DfsPosixError::Dfs(DfsError::Metadata {
+                    message: "canonical target phase has no durable source job".into(),
+                })
+            })?;
+            return self.route_namespace_operation_with_request_id_and_result(
+                Self::hardlink_alias_job_phase_operation_id(job, phase),
+                primary,
+                operation,
+            );
+        }
+        // Native Main may own the source's global mutation admission. Its
+        // target alias publication needs this node's target-shard replica ACK,
+        // so use the existing owned phase and release that admission first.
+        // Plain service callers own no such runtime admission and retain their
+        // existing synchronous route.
+        if matches!(operation, DfsNamespaceOperation::AdoptHardlinkAlias { .. })
+            && self.publication_execution.current().is_none()
+        {
+            return self.route_namespace_operation_with_result(primary, operation);
+        }
         if matches!(
             operation,
             DfsNamespaceOperation::AdoptObjectAtPath { .. }
                 | DfsNamespaceOperation::FinalizeObjectFamilyAdoption { .. }
+                | DfsNamespaceOperation::AdoptHardlinkAlias { .. }
+                | DfsNamespaceOperation::InstallHardlinkTargetFence { .. }
+                | DfsNamespaceOperation::CommitHardlinkTargetFence { .. }
         ) {
             let job = job.ok_or_else(|| {
                 DfsPosixError::Dfs(DfsError::Metadata {
                     message: "remote source phase has no durable job".into(),
                 })
             })?;
-            let request = Self::cross_shard_job_phase_operation_id(job, phase);
+            let request = match canonical_fence_phase {
+                Some(phase) => Self::hardlink_alias_job_phase_operation_id(job, phase),
+                None => Self::cross_shard_job_phase_operation_id(job, phase),
+            };
             if matches!(
                 operation,
                 DfsNamespaceOperation::FinalizeObjectFamilyAdoption { .. }
+                    | DfsNamespaceOperation::AdoptHardlinkAlias { .. }
+                    | DfsNamespaceOperation::InstallHardlinkTargetFence { .. }
+                    | DfsNamespaceOperation::CommitHardlinkTargetFence { .. }
             ) && let Some(outcome) = self.completed_remote_namespace_phases.remove(&request)
             {
                 if let crate::DfsNamespaceResult::Rejected {
@@ -1446,7 +1563,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         command,
                         pending,
                         deadline: self.transport.operation_deadline().unwrap_or_else(|| {
-                            std::time::Instant::now() + crate::DEFAULT_DFS_POSIX_SYNC_TIMEOUT
+                            let timeout = if canonical_fence_phase.is_some() {
+                                crate::DFS_ROUTED_NAMESPACE_OP_TIMEOUT
+                            } else {
+                                crate::DEFAULT_DFS_POSIX_SYNC_TIMEOUT
+                            };
+                            std::time::Instant::now() + timeout
                         }),
                     },
                 ),
@@ -1501,6 +1623,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if let Some(job) = self.namespace_job(&job_id)? {
             return self.drive_cross_shard_namespace_job(job);
         }
+        let original_reads = self.capture_namespace_transaction_read_set(&transaction)?;
         let target_object_id =
             alias
                 .link_target_object_id
@@ -1529,11 +1652,41 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let target_path = normalize_posix_path(&target.path)?;
         let target_primary = self.routed_namespace_primary_for_path(&target_path)?;
         if target_primary.is_none() {
-            return Err(DfsPosixError::Dfs(DfsError::Distributed {
-                message: format!(
-                    "hardlink alias coordinator for {source_path} was invoked without a foreign canonical authority at {target_path}"
-                ),
-            }));
+            // One node can own two distinct physical writers. Use the same
+            // durable saga and local Core phases, never a combined transaction
+            // or a self-network request. Both exact current assignments still
+            // qualify every independent publication below.
+            let shards = self
+                .metadata_shard_config_snapshot(&alias.file_system_id)?
+                .ok_or_else(|| {
+                    DfsPosixError::Dfs(DfsError::Metadata {
+                        message: "same-node alias saga has no current configuration projection"
+                            .into(),
+                    })
+                })?;
+            let source = crate::select_metadata_shard_config_for_path(
+                &alias.file_system_id,
+                &shards,
+                &source_path,
+            )
+            .map_err(DfsError::from)?;
+            let target = crate::select_metadata_shard_config_for_path(
+                &alias.file_system_id,
+                &shards,
+                &target_path,
+            )
+            .map_err(DfsError::from)?;
+            if !matches!((source.as_ref(), target.as_ref()), (Some(source), Some(target))
+                if source.shard_id != target.shard_id
+                    && source.primary_node_id == self.node_id
+                    && target.primary_node_id == self.node_id)
+            {
+                return Err(DfsPosixError::Dfs(DfsError::Distributed {
+                    message: format!(
+                        "hardlink alias saga for {source_path} has no two distinct locally owned physical shards at {target_path}"
+                    ),
+                }));
+            }
         }
         let file_system_id = alias.file_system_id.clone();
         self.ensure_path_not_in_cross_shard_flight(&file_system_id, &source_path)?;
@@ -1590,7 +1743,30 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     expected_target,
                     committed_target,
                 },
-                DfsNamespaceJobFrame::CrossShardHardlinkAliasCommit { transaction },
+                DfsNamespaceJobFrame::CrossShardHardlinkAliasCommit {
+                    transaction,
+                    shard_id: original_reads.shard_id,
+                    expected_object_versions: original_reads
+                        .expected_object_versions
+                        .into_iter()
+                        .map(
+                            |(object_id, expected_version)| DfsNamespaceObjectVersionExpectation {
+                                object_id,
+                                expected_version,
+                            },
+                        )
+                        .collect(),
+                    expected_path_occupants: original_reads
+                        .expected_path_occupants
+                        .into_iter()
+                        .map(
+                            |(path, expected_object_id)| DfsNamespacePathOccupantExpectation {
+                                path,
+                                expected_object_id,
+                            },
+                        )
+                        .collect(),
+                },
                 DfsNamespaceJobFrame::CrossShardHardlinkTargetFenceInstall {
                     fence: Box::new(crate::metadata_records::DfsHardlinkTargetFence::from_job(
                         fence,
@@ -1612,6 +1788,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         job: &DfsNamespaceJobRecord,
         transaction: DfsNamespaceTransaction,
+        shard_id: DfsMetadataShardId,
+        expected_object_versions: Vec<DfsNamespaceObjectVersionExpectation>,
+        expected_path_occupants: Vec<DfsNamespacePathOccupantExpectation>,
     ) -> Result<()> {
         let origin = job.origin.as_ref().ok_or_else(|| {
             DfsPosixError::Dfs(DfsError::Metadata {
@@ -1636,8 +1815,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // not attach a Completed request record to this intermediate alias
         // generation. The outer request becomes terminal only after the
         // canonical target frame commits and the complete job returns.
-        let outcome = self
-            .apply_namespace_transaction_with_feed_provenance_only(transaction, &origin.request_id);
+        let saved_execution = self.namespace_execution.suspend_request_prepare();
+        let outcome = self.apply_namespace_transaction_with_recorded_read_set(
+            transaction,
+            &origin.request_id,
+            shard_id,
+            expected_object_versions,
+            expected_path_occupants,
+        );
+        self.namespace_execution
+            .restore_request_prepare(saved_execution);
         self.namespace_execution
             .restore_request(previous_active_request);
         outcome
@@ -1667,8 +1854,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             source_path: source_path.to_string(),
         };
         match self.routed_namespace_primary_for_path(&fence.root_path)? {
-            Some(primary) => self.route_namespace_operation_with_request_id(
-                Self::hardlink_alias_job_phase_operation_id(source_job, "install-target-fence"),
+            Some(primary) => self.route_cross_shard_job_phase(
+                Some(source_job),
+                "install-target-fence",
                 primary,
                 operation,
             ),
@@ -1692,8 +1880,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             committed_target: committed_target.clone(),
         };
         match self.routed_namespace_primary_for_path(&committed_target.path)? {
-            Some(primary) => self.route_namespace_operation_with_request_id(
-                Self::hardlink_alias_job_phase_operation_id(source_job, "commit-target-fence"),
+            Some(primary) => self.route_cross_shard_job_phase(
+                Some(source_job),
+                "commit-target-fence",
                 primary,
                 operation,
             ),
@@ -1980,6 +2169,92 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 &frame,
                 DfsNamespaceJobFrame::CrossShardHardlinkAliasCommit { .. }
             );
+            if let DfsNamespaceJobFrame::CrossShardAdopt {
+                moved_object,
+                old_path,
+                ..
+            } = &frame
+            {
+                let phase = Self::cross_shard_job_phase_operation_id(
+                    &job,
+                    &format!(
+                        "adopt-object-family\0{}\0{old_path}",
+                        moved_object.object_id
+                    ),
+                );
+                if let Some(outcome) = self.completed_remote_namespace_phases.get(&phase)
+                    && let crate::DfsNamespaceResult::Rejected {
+                        reason,
+                        posix_error,
+                        ..
+                    } = &outcome.result
+                {
+                    let error = crate::posix_model::posix_error_for_namespace_rejection(
+                        reason.clone(),
+                        posix_error.clone(),
+                    );
+                    self.completed_remote_namespace_phases.remove(&phase);
+                    let structured = matches!(
+                        &error,
+                        DfsPosixError::NotFound { .. }
+                            | DfsPosixError::MissingParent { .. }
+                            | DfsPosixError::IsDirectory { .. }
+                            | DfsPosixError::NotDirectory { .. }
+                            | DfsPosixError::AlreadyExists { .. }
+                            | DfsPosixError::InvalidPath { .. }
+                            | DfsPosixError::Conflict { .. }
+                            | DfsPosixError::DirectoryNotEmpty { .. }
+                    );
+                    if structured && let Some(execution) = self.publication_execution.current() {
+                        let actor = crate::source_adoption::actor_for_root(execution.data_root())?;
+                        let retained = self.namespace_job(&job.job_id)?.ok_or_else(|| {
+                            DfsPosixError::Dfs(DfsError::Metadata {
+                                message: "rejected adoption lost its exact original job".into(),
+                            })
+                        })?;
+                        let configs = self.namespace_shards_for_exact_paths(
+                            &retained.file_system_id,
+                            [old_path.as_str()],
+                        )?;
+                        if let [source] = configs.as_slice() {
+                            let physical = self
+                                .metadata_backend
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    DfsPosixError::Dfs(DfsError::Metadata {
+                                        message: "rejected adoption has no current backend".into(),
+                                    })
+                                })?
+                                .publication_owner_scope(
+                                    &retained.file_system_id,
+                                    &crate::DfsMetadataShardId::new(&source.shard_id),
+                                )?;
+                            let failed = retained.clone();
+                            if actor.finish_locally_cancelled_adoption(
+                                &phase,
+                                &retained,
+                                moved_object,
+                                old_path,
+                                &physical,
+                                &execution,
+                                || {
+                                    self.fail_namespace_job(failed, error.to_string())
+                                        .map(|_| ())
+                                },
+                            )? {
+                                return Err(error);
+                            }
+                        }
+                    }
+                    // The native host already correlated this exact target
+                    // response. An admitted target can still retain the actual
+                    // source/job writers. Preserve the original durable Running
+                    // row and propagate its rejection before recapturing that
+                    // source or appending a redundant error-only job update.
+                    self.namespace_execution.record_job();
+                    return Err(error);
+                }
+            }
             let outcome = match frame.clone() {
                 DfsNamespaceJobFrame::CrossShardAdopt {
                     moved_object,
@@ -2028,7 +2303,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     let _ = (target_object_id, destination_primary_node_id);
                     let source_path = job.root_path.clone();
                     match self.routed_namespace_primary_for_path(&alias.path)? {
-                        Some(primary) => self.route_namespace_operation(
+                        Some(primary) => self.route_cross_shard_job_phase(
+                            Some(&job),
+                            "adopt-hardlink-alias",
                             primary,
                             DfsNamespaceOperation::AdoptHardlinkAlias { alias, source_path },
                         ),
@@ -2042,9 +2319,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     fence,
                     source_path,
                 } => self.install_hardlink_target_fence(&job, &fence.into_job()?, &source_path),
-                DfsNamespaceJobFrame::CrossShardHardlinkAliasCommit { transaction } => {
-                    self.commit_hardlink_alias_transaction(&job, transaction)
-                }
+                DfsNamespaceJobFrame::CrossShardHardlinkAliasCommit {
+                    transaction,
+                    shard_id,
+                    expected_object_versions,
+                    expected_path_occupants,
+                } => self.commit_hardlink_alias_transaction(
+                    &job,
+                    transaction,
+                    shard_id,
+                    expected_object_versions,
+                    expected_path_occupants,
+                ),
                 DfsNamespaceJobFrame::CrossShardHardlinkTargetFenceCommit {
                     fence_job_id,
                     source_path,
@@ -2189,6 +2475,41 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             &moved_object.file_system_id,
             std::iter::once(old_path.as_str()),
         )?;
+        if let [source] = source_shards.as_slice()
+            && source.primary_node_id != self.node_id
+        {
+            // Native adoption retires a remote source at its actual owner
+            // before advancing this durable completion frame. On resume,
+            // corroborate source invisibility and the exact finalized target;
+            // the coordinator must never author a replica-side tombstone.
+            let current = self.query_metadata_authority_impl(
+                source,
+                crate::DfsMetadataSelection::CurrentObject {
+                    object_id: moved_object.object_id.clone(),
+                },
+            )?;
+            let at_source = self.lookup_sifs_path_direct_distributed_synced(&old_path)?;
+            if !matches!(
+                current,
+                crate::DfsMetadataQueryResult::CurrentObject { object: None }
+            ) || at_source
+                .as_ref()
+                .is_some_and(|object| object.kind != DfsObjectKind::Tombstone)
+            {
+                return Err(DfsPosixError::Conflict {
+                    path: old_path,
+                    reason: "remote source authority has not completed the original retirement"
+                        .into(),
+                });
+            }
+            self.verify_cross_shard_adoption_finalized(moved_object, &old_path, None)?;
+            self.apply_metadata_object_to_service_state(moved_object.clone())?;
+            self.clear_metadata_lookup_cache();
+            if touch_parent {
+                self.touch_parent_directory_if_local_primary(&old_path)?;
+            }
+            return Ok(());
+        }
         let source_object = if let Some(backend) = self.metadata_backend.as_ref() {
             if let [shard] = source_shards.as_slice() {
                 backend.get_object_by_path_on_shard(
@@ -2398,16 +2719,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 } else {
                     backend.get_object_by_path(&object.file_system_id, &eviction.path)?
                 };
-                if previous_path_occupant.as_ref() == Some(eviction) {
-                    // The index retains the old tombstone path. Replacement
-                    // must bind that exact physical occupant as well as its
-                    // head, while checking the incoming path independently.
-                    self.namespace_execution.observe_path(
-                        &object.file_system_id,
-                        &eviction.path,
-                        Some(eviction),
-                    );
-                }
+                // The old path may index the separate tombstone created by
+                // source cleanup, rather than the original object's eviction.
+                // The prepare footprint checks that actual occupant too; bind
+                // its original head and path, or its actual physical absence.
+                self.namespace_execution.observe_path(
+                    &object.file_system_id,
+                    &eviction.path,
+                    previous_path_occupant.as_ref(),
+                );
             }
         }
         if !content_reference_outcomes.is_empty()

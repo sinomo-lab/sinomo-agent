@@ -97,6 +97,45 @@ pub struct NativeMetadataImportCertificate {
         Vec<crate::authority::source_retirement::NativeSourceRetirementCertificate>,
     pub(crate) data_reservation_retirements:
         Vec<crate::authority::source_retirement::NativeDataReservationRetirementCertificate>,
+    /// Re-earned only by authenticated native receiver verification. Saved
+    /// installation records cannot deserialize into this held qualifier.
+    #[serde(skip)]
+    pub(crate) legacy_local_source: Option<VerifiedLegacyReceiverSource>,
+}
+#[derive(Clone, Debug)]
+pub(crate) struct VerifiedLegacyReceiverSource {
+    pub(crate) original_root: PathBuf,
+    pub(crate) actual_root: PathBuf,
+    pub(crate) source_identity: String,
+    pub(crate) snapshot_fingerprint: String,
+    pub(crate) source_format_version: u16,
+    pub(crate) source_prefix: DfsMetadataPrefixProof,
+    pub(crate) source_fences: Vec<Arc<File>>,
+}
+/// This header DATA cannot qualify a receiver by itself. The caller must first
+/// authenticate its actual native proposal/activation and complete ledger.
+pub(crate) fn legacy_receiver_prefix(
+    root: &Path,
+    prefix: Option<&DfsMetadataPrefixProof>,
+) -> Result<Option<(u16, DfsMetadataPrefixProof)>> {
+    if original_native_root_format(root)?.is_some() {
+        return Ok(None);
+    }
+    let header = legacy_source_checkpoint_header(root)?
+        .ok_or_else(|| error("legacy receiver has no actual source header"))?;
+    let prefix = prefix.ok_or_else(|| error("legacy receiver has no actual own source prefix"))?;
+    source_proof::validate(prefix)?;
+    if !matches!(header.source_format_version, 3 | 6)
+        || prefix.version != 2
+        || header.prefix_proof.journal_sequence > prefix.journal_sequence
+        || header.prefix_proof.journal_sequence == prefix.journal_sequence
+            && header.prefix_proof != *prefix
+    {
+        return Err(error(
+            "legacy receiver changes its own source format or V2 clock",
+        ));
+    }
+    Ok(Some((header.source_format_version, prefix.clone())))
 }
 #[derive(Clone, Serialize)]
 pub struct StandaloneMetadataImportCertificate {
@@ -1469,7 +1508,10 @@ impl MetadataConverter {
             });
         }
         processed = budget - remaining;
-        if session.header.get("format_version").and_then(Value::as_u64) == Some(8) {
+        if matches!(
+            session.header.get("format_version").and_then(Value::as_u64),
+            Some(8 | 9)
+        ) {
             if let Some(topology) = prior_native::topology_data(&session.source_root, shard)? {
                 pending.push(topology);
             }
@@ -1782,7 +1824,8 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 /// Prior native generations keep their own exact clocks while being imported.
 /// This classifier is conversion DATA, never admission to the current DFS reader.
 pub(crate) fn native_source_format(format: Option<u16>) -> bool {
-    matches!(format, Some(8)) || format == Some(sinomo_dfs::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION)
+    matches!(format, Some(8 | 9))
+        || format == Some(sinomo_dfs::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION)
 }
 pub(crate) fn native_source_root(root: &Path, format: Option<u16>) -> Result<bool> {
     let Some(format) = format.filter(|format| native_source_format(Some(*format))) else {
@@ -1794,10 +1837,21 @@ pub(crate) fn native_source_root(root: &Path, format: Option<u16>) -> Result<boo
         metadata_root_at_format(root, format)
     }
 }
+/// Exact generation DATA for the two unchanged native ACK encodings. This
+/// does not grant normal DFS admission or turn a source header into authority.
+pub(crate) fn original_native_root_format(root: &Path) -> Result<Option<u16>> {
+    if current_root(root)? {
+        Ok(Some(sinomo_dfs::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION))
+    } else if metadata_root_at_format(root, 9)? {
+        Ok(Some(9))
+    } else {
+        Ok(None)
+    }
+}
 pub(crate) fn inspect_import_candidate(
     root: &Path,
 ) -> Result<sinomo_dfs::DfsMetadataCandidateIdentity> {
-    if native_source_root(root, Some(8))? {
+    if native_source_root(root, Some(8))? || native_source_root(root, Some(9))? {
         prior_native::inspect(root)
     } else {
         sinomo_dfs::inspect_metadata_candidate(root)
@@ -1866,6 +1920,169 @@ pub(crate) fn current_root(root: &Path) -> Result<bool> {
     }
     let first_prefix = sinomo_dfs::read_current_metadata_table_log_prefix(root)?;
     Ok(snapshot_current || first_prefix.is_some())
+}
+/// Exact LOCAL original snapshot DATA, distinct from an acknowledged floor.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SourceCheckpointCapture {
+    pub(crate) source_root: PathBuf,
+    pub(crate) source_identity: String,
+    pub(crate) snapshot_fingerprint: String,
+    pub(crate) source_format_version: u16,
+    pub(crate) generation: Option<String>,
+    pub(crate) semantic_state_fingerprint: Option<String>,
+    pub(crate) anchor: source_ancestry::SourceCheckpointAnchor,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SourceCheckpointHeader {
+    pub(crate) source_format_version: u16,
+    pub(crate) generation: Option<String>,
+    pub(crate) semantic_state_fingerprint: Option<String>,
+    pub(crate) prefix_proof: DfsMetadataPrefixProof,
+}
+/// Qualify only the actual original header. Stream qualification reads the
+/// bounded native header, not a source inventory or the snapshot row stream.
+pub(crate) fn legacy_source_checkpoint_header(
+    root: &Path,
+) -> Result<Option<SourceCheckpointHeader>> {
+    let path = root.join("records/tables/snapshot.sobj");
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let stream = sinomo_core::storage::migration::stream::is_stream(&path).map_err(error)?;
+    let mut header = serde_json::Map::new();
+    if stream {
+        let bytes = sinomo_core::storage::migration::stream::read_header(&path).map_err(error)?;
+        header = source_document::decode_original_document(&bytes)?
+            .as_object()
+            .ok_or_else(|| error("original snapshot header is not an object"))?
+            .clone();
+    } else {
+        let mut cursor = sobj_cursor::Cursor::open(&path)?;
+        while let Some(item) = cursor.next(&path)? {
+            if let sobj_cursor::Item::Header(key, value) = item {
+                header.insert(key, value);
+            }
+        }
+    }
+    let Some(format @ (3 | 6)) = header.get("format_version").and_then(Value::as_u64) else {
+        return Ok(None);
+    };
+    let sequence = header
+        .get("materialized_through_sequence")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| error("original shard checkpoint omits its materialized sequence"))?;
+    let proof: DfsMetadataPrefixProof = serde_json::from_value(
+        header
+            .get("prefix_proof")
+            .cloned()
+            .ok_or_else(|| error("original shard checkpoint omits its actual prefix"))?,
+    )
+    .map_err(error)?;
+    source_proof::validate(&proof)?;
+    if proof.version != 2 || proof.journal_sequence != sequence {
+        return Err(error(
+            "original shard checkpoint changes its exact native clock",
+        ));
+    }
+    let generation = header
+        .get("generation")
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|value| {
+                    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+                .map(str::to_owned)
+                .ok_or_else(|| error("original shard checkpoint has an invalid generation"))
+        })
+        .transpose()?;
+    let semantic_state_fingerprint = header
+        .get("semantic_state_fingerprint")
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| error("original shard checkpoint has an invalid semantic checksum"))
+        })
+        .transpose()?;
+    if format == 3 {
+        if !stream {
+            return Err(error(
+                "original format3 checkpoint lacks its released stream framing",
+            ));
+        }
+        let expected = blake3::hash(
+            &serde_json::to_vec(&(3u16, Some(sequence), Some(&proof))).map_err(error)?,
+        )
+        .to_hex()
+        .to_string();
+        if generation.as_deref() != Some(expected.as_str()) {
+            return Err(error(
+                "original format3 checkpoint changes its released generation binding",
+            ));
+        }
+    } else if generation.is_none() && semantic_state_fingerprint.is_none() {
+        return Err(error(
+            "original format6 checkpoint omits its actual source binding",
+        ));
+    }
+    if !stream {
+        let expected = semantic_state_fingerprint
+            .as_ref()
+            .ok_or_else(|| error("original plain checkpoint omits its semantic checksum"))?;
+        if wire_json::snapshot_fingerprint(&path)? != *expected {
+            return Err(error(
+                "original plain checkpoint changes its semantic checksum",
+            ));
+        }
+    }
+    Ok(Some(SourceCheckpointHeader {
+        source_format_version: format as u16,
+        generation,
+        semantic_state_fingerprint,
+        prefix_proof: proof,
+    }))
+}
+/// Capture full LOCAL checkpoint custody only for an actual uncovered
+/// height-only obligation. The caller retains the physical source fence.
+pub(crate) fn capture_legacy_source_checkpoint(
+    root: &Path,
+    shard: &DfsMetadataShardId,
+) -> Result<Option<SourceCheckpointCapture>> {
+    let Some(header) = legacy_source_checkpoint_header(root)? else {
+        return Ok(None);
+    };
+    let snapshot = Path::new("records/tables/snapshot.sobj");
+    let inventory = source::discover(root)?;
+    let mut selected = inventory.clone();
+    selected.files.retain(|file| file.relative == snapshot);
+    let mut cursor = source::SourceCursor::new(selected);
+    while source::next(root, &mut cursor)?.is_some() {}
+    if legacy_source_checkpoint_header(root)?.as_ref() != Some(&header) {
+        return Err(error(
+            "original checkpoint header changed during full capture",
+        ));
+    }
+    inventory.verify(root)?;
+    let snapshot_fingerprint = inventory
+        .snapshot_fingerprint()
+        .ok_or_else(|| error("original shard checkpoint has no exact snapshot fingerprint"))?
+        .to_owned();
+    Ok(Some(SourceCheckpointCapture {
+        source_root: root.to_owned(),
+        source_identity: inventory.fingerprint,
+        snapshot_fingerprint,
+        source_format_version: header.source_format_version,
+        generation: header.generation,
+        semantic_state_fingerprint: header.semantic_state_fingerprint,
+        anchor: source_ancestry::SourceCheckpointAnchor {
+            shard_id: shard.clone(),
+            prefix_proof: header.prefix_proof,
+        },
+    }))
 }
 pub(crate) fn metadata_root_at_format(root: &Path, format: u16) -> Result<bool> {
     let path = root.join("records/tables/snapshot.sobj");
@@ -2951,6 +3168,123 @@ fn apply_event(session: &mut Session, event: &ConversionEvent) -> Result<()> {
     }
     Ok(())
 }
+/// Keep byte-identical original ancestry when a normal replica snapshot repair
+/// moved its old journal into an archive. A checkpoint is not a replacement for
+/// an older ACK's exact frame obligation. This helper changes only fixture DATA.
+#[cfg(test)]
+pub(crate) fn retain_fixture_original_journal_ancestry(
+    baseline: &Path,
+    modeled_source: &Path,
+    shard: &DfsMetadataShardId,
+    head: &DfsMetadataPrefixProof,
+    floors: &[ack_floor::LegacyAcknowledgement],
+) -> Result<()> {
+    source_proof::validate(head)?;
+    let mut donors = vec![baseline.to_owned()];
+    let archives = baseline.join("replica-repair-archives");
+    if archives.exists() {
+        let mut archived = Vec::new();
+        for entry in fs::read_dir(&archives).map_err(error)? {
+            let entry = entry.map_err(error)?;
+            if !entry.file_type().map_err(error)?.is_dir() {
+                return Err(error("original replica-repair archive is not a directory"));
+            }
+            archived.push(entry.path());
+        }
+        // Ordering selects no authority: every donor is read and conflicting
+        // same-slot bytes fail, rather than choosing the newest archive.
+        archived.sort();
+        donors.extend(archived);
+    }
+    let mut frames = BTreeMap::<u64, Vec<u8>>::new();
+    for donor in donors {
+        for record in source::fixture_journal_frames(&donor)? {
+            let source::SourceRecord::JournalFrame { entry, exact_bytes } = record else {
+                return Err(error("original journal observation lost its frame"));
+            };
+            let sequence = entry
+                .get("sequence")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| error("original fixture frame has no sequence"))?;
+            if sequence == 0
+                || sequence > head.journal_sequence
+                || entry.get("shard_id") != Some(&serde_json::to_value(shard).map_err(error)?)
+            {
+                return Err(error(
+                    "original fixture frame is outside the actual snapshot cut",
+                ));
+            }
+            if frames
+                .get(&sequence)
+                .is_some_and(|prior| prior != &exact_bytes)
+            {
+                return Err(error("original fixture journals fork at the same sequence"));
+            }
+            frames.insert(sequence, exact_bytes);
+        }
+    }
+    for floor in floors {
+        let mut proof = floor
+            .durable_prefix_proof
+            .clone()
+            .ok_or_else(|| error("native fixture floor has no original prefix proof"))?;
+        source_proof::validate(&proof)?;
+        if floor.shard_id != *shard
+            || proof.journal_sequence != floor.journal_sequence
+            || proof.journal_sequence > head.journal_sequence
+            || (!floor.state_fingerprint.is_empty() && floor.state_fingerprint != proof.digest)
+        {
+            return Err(error(
+                "original fixture ACK changes its scope, cut or prefix",
+            ));
+        }
+        while proof.journal_sequence < head.journal_sequence {
+            let sequence = proof
+                .journal_sequence
+                .checked_add(1)
+                .ok_or_else(|| error("original fixture ancestry sequence overflow"))?;
+            let bytes = frames.get(&sequence).ok_or_else(|| {
+                error(format!(
+                    "native source fixture lacks exact original journal frame {sequence}"
+                ))
+            })?;
+            proof = source_proof::extend_as(&proof, sequence, bytes, head.version)?;
+        }
+        if proof != *head {
+            return Err(error(
+                "original fixture frame chain forks the actual snapshot prefix",
+            ));
+        }
+    }
+    for (sequence, bytes) in frames {
+        // Loose journal documents are an existing released-source family. Keep
+        // the actual decoded frame bytes, with no re-encoding or fabricated row.
+        let path = modeled_source
+            .join("journal")
+            .join(format!("{sequence:020}.sobj"));
+        if path.exists() {
+            if fs::read(&path).map_err(error)? != bytes {
+                return Err(error(
+                    "modeled source already has a different original frame",
+                ));
+            }
+        } else {
+            fs::create_dir_all(
+                path.parent()
+                    .ok_or_else(|| error("fixture journal has no parent"))?,
+            )
+            .map_err(error)?;
+            fs::write(&path, &bytes).map_err(error)?;
+        }
+        if fs::read(&path).map_err(error)? != bytes {
+            return Err(error(
+                "modeled source did not retain exact original frame bytes",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_source_snapshot(session: &Session) -> Result<()> {
     if let Some(expected) = session
         .header
@@ -3425,6 +3759,257 @@ fn complete_installation_intent(stage: &Path, prior: bool) -> Result<()> {
         .map(|_| ())
         .map_err(error)
 }
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativeImportInstallTestPoint {
+    TargetFrozen,
+    TargetPublished,
+}
+#[cfg(test)]
+pub(crate) type NativeImportInstallTestHook = dyn Fn(
+        NativeImportInstallTestPoint,
+        &MetadataImportProposal,
+        &MetadataImportCertificate,
+        &Path,
+        &sinomo_dfs::DfsMetadataCandidateIdentity,
+    ) -> Result<()>
+    + Send
+    + Sync;
+#[cfg(test)]
+static NATIVE_IMPORT_INSTALL_TEST_HOOKS: std::sync::OnceLock<
+    Mutex<BTreeMap<PathBuf, Arc<NativeImportInstallTestHook>>>,
+> = std::sync::OnceLock::new();
+#[cfg(test)]
+pub(crate) struct NativeImportInstallTestHookGuard(PathBuf);
+#[cfg(test)]
+impl Drop for NativeImportInstallTestHookGuard {
+    fn drop(&mut self) {
+        if let Some(hooks) = NATIVE_IMPORT_INSTALL_TEST_HOOKS.get() {
+            hooks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&self.0);
+        }
+    }
+}
+/// Observe only an actual certificate already validated by the installer.
+/// The hook may interrupt a test, but cannot supply a seal or grant permission.
+#[cfg(test)]
+pub(crate) fn native_import_install_hook_for_test(
+    destination: &Path,
+    hook: Arc<NativeImportInstallTestHook>,
+) -> NativeImportInstallTestHookGuard {
+    let mut hooks = NATIVE_IMPORT_INSTALL_TEST_HOOKS
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    assert!(hooks.insert(destination.to_owned(), hook).is_none());
+    NativeImportInstallTestHookGuard(destination.to_owned())
+}
+#[cfg(test)]
+fn observe_native_import_install_for_test(
+    point: NativeImportInstallTestPoint,
+    destination: &Path,
+    proposal: &MetadataImportProposal,
+    certificate: &MetadataImportCertificate,
+    image: &Path,
+    identity: &sinomo_dfs::DfsMetadataCandidateIdentity,
+) -> Result<()> {
+    let hook = NATIVE_IMPORT_INSTALL_TEST_HOOKS.get().and_then(|hooks| {
+        hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(destination)
+            .cloned()
+    });
+    if let Some(hook) = hook {
+        hook(point, proposal, certificate, image, identity)?;
+    }
+    Ok(())
+}
+
+// The native completion seals the converted image and its target journal
+// prefix separately. Fence that actual target generation before its root can
+// replace a pathname retained by an older backend instance.
+fn freeze_native_import_candidate(
+    root: &Path,
+    shard: &DfsMetadataShardId,
+    proof: &DfsMetadataShardMembershipHandoffProof,
+    identity: &sinomo_dfs::DfsMetadataCandidateIdentity,
+) -> Result<Arc<File>> {
+    use sinomo_dfs::DfsMetadataBackend;
+    let sinomo_dfs::DfsMetadataShardHandoffCause::StorageImport { cut } = &proof.cause else {
+        return Err(error(
+            "native import candidate has no exact storage-import cause",
+        ));
+    };
+    if proof.desired_shard.shard_id != shard.0
+        || proof.retiring_shard.shard_id != shard.0
+        || proof.retiring_shard.file_system_id != proof.desired_shard.file_system_id
+        || proof.retiring_shard.epoch.checked_add(1) != Some(proof.desired_shard.epoch)
+        || cut.target_prefix != identity.prefix_proof
+        || cut.converted_image_fingerprint != identity.state_fingerprint
+        || proof.journal_sequence != identity.prefix_proof.journal_sequence
+        || proof.state_fingerprint != identity.state_fingerprint
+        || !current_root(root)?
+    {
+        return Err(error(
+            "native import write fence changes its certified target generation",
+        ));
+    }
+    let mut backend =
+        sinomo_dfs::LocalSobjMetadataBackend::open_for_inspection(shard.clone(), root)?;
+    let matches_target = |freeze: &sinomo_dfs::DfsMetadataShardWriteFreeze| {
+        freeze.handoff_id == proof.handoff_id
+            && freeze.retiring_epoch == proof.retiring_shard.epoch
+            && freeze
+                .activated_epoch
+                .is_none_or(|epoch| epoch == proof.desired_shard.epoch)
+            && freeze.journal_sequence == identity.prefix_proof.journal_sequence
+            && freeze.state_fingerprint == identity.prefix_proof.digest
+            && freeze.rebind_prefix_proof == identity.prefix_proof
+    };
+    if let Some(freeze) = backend.metadata_shard_write_freeze(shard)? {
+        if !matches_target(&freeze) {
+            return Err(error(
+                "native import candidate has a conflicting durable write freeze",
+            ));
+        }
+    } else {
+        let freeze = backend
+            .freeze_metadata_shard_for_membership_handoff(
+                shard,
+                &proof.handoff_id,
+                proof.retiring_shard.epoch,
+            )?
+            .ok_or_else(|| {
+                error("native import candidate did not persist its actual writer freeze")
+            })?;
+        if !matches_target(&freeze) {
+            return Err(error(
+                "native import candidate prefix changed while freezing its writer",
+            ));
+        }
+    }
+    if !backend.mark_metadata_shard_membership_handoff_activated(
+        shard,
+        &proof.handoff_id,
+        proof.desired_shard.epoch,
+    )? {
+        return Err(error(
+            "native import candidate did not activate its exact writer freeze",
+        ));
+    }
+    drop(backend);
+    // Hold the same target lock through exchange. The marker remains after
+    // release; only the normal current-assignment rebind may grant writes.
+    let fence = retain_source_fence(root)?;
+    let backend = sinomo_dfs::LocalSobjMetadataBackend::open_for_inspection(shard.clone(), root)?;
+    let freeze = backend
+        .metadata_shard_write_freeze(shard)?
+        .ok_or_else(|| error("native import candidate lost its durable write freeze"))?;
+    if !matches_target(&freeze)
+        || freeze.activated_epoch != Some(proof.desired_shard.epoch)
+        || inspect_import_candidate(root)? != *identity
+    {
+        return Err(error(
+            "native import target changed before its fenced exchange",
+        ));
+    }
+    Ok(fence)
+}
+
+#[cfg(test)]
+pub(crate) fn freeze_native_import_candidate_for_test(
+    root: &Path,
+    shard: &DfsMetadataShardId,
+    proof: &DfsMetadataShardMembershipHandoffProof,
+    identity: &sinomo_dfs::DfsMetadataCandidateIdentity,
+) -> Result<Arc<File>> {
+    freeze_native_import_candidate(root, shard, proof, identity)
+}
+
+/// The native import ACKs name a real installed/staged target clock. Retain
+/// that cursor only as a delivery hint; each later prepare still needs a fresh
+/// complete-body/prefix ACK from every assigned participant.
+fn retain_native_import_publication_cursors(
+    image_root: &Path,
+    proposal: &MetadataImportProposal,
+    certificate: &MetadataImportCertificate,
+    identity: &sinomo_dfs::DfsMetadataCandidateIdentity,
+    authority: &dyn MetadataImportAuthority,
+) -> Result<()> {
+    let (MetadataImportProposal::Native(native), MetadataImportCertificate::Native(seal)) =
+        (proposal, certificate)
+    else {
+        return Ok(());
+    };
+    let proof = &seal.joint_handoff_proof;
+    let local = authority.local_node_id()?;
+    if proof.desired_shard.primary_node_id != local {
+        return Ok(());
+    }
+    let sinomo_dfs::DfsMetadataShardHandoffCause::StorageImport { cut } = &proof.cause else {
+        return Err(error(
+            "native publication cursor has no actual import cause",
+        ));
+    };
+    if proof.handoff_id != native.expected_handoff.handoff_id
+        || proof.retiring_shard != native.expected_handoff.retiring_shard
+        || proof.desired_shard != native.expected_handoff.desired_shard
+        || proof.desired_shard.shard_id != proposal.scope_shard.0
+        || !proposal
+            .file_system_ids
+            .contains(&proof.desired_shard.file_system_id)
+        || cut.target_prefix != identity.prefix_proof
+        || cut.converted_image_fingerprint != identity.state_fingerprint
+        || seal.target_exact_prefix != identity.prefix_proof
+        || seal.current_image_fingerprint != identity.state_fingerprint
+        || inspect_import_candidate(image_root)? != *identity
+    {
+        return Err(error(
+            "native publication cursor changes its certified target/scope",
+        ));
+    }
+    use sinomo_dfs::DfsMetadataBackend;
+    let mut backend = sinomo_dfs::LocalSobjMetadataBackend::open_for_inspection(
+        proposal.scope_shard.clone(),
+        image_root,
+    )?;
+    for node in &proof.acknowledged_node_ids {
+        if *node == local || !proof.desired_shard.replica_node_ids.contains(node) {
+            continue;
+        }
+        // No SOURCE height, old cursor, unacknowledged target or convenient
+        // maximum is promoted into the new target clock.
+        if backend.metadata_replication_cursor(node, &proposal.scope_shard)?
+            > identity.prefix_proof.journal_sequence
+        {
+            return Err(error(
+                "native import publication cursor is ahead of its exact target",
+            ));
+        }
+        backend.put_metadata_replication_cursor(
+            node,
+            &proposal.scope_shard,
+            identity.prefix_proof.journal_sequence,
+        )?;
+        if backend.metadata_replication_cursor(node, &proposal.scope_shard)?
+            != identity.prefix_proof.journal_sequence
+        {
+            return Err(error(
+                "native import publication cursor lost its exact target clock",
+            ));
+        }
+    }
+    if inspect_import_candidate(image_root)? != *identity {
+        return Err(error(
+            "native publication hints changed the certified image",
+        ));
+    }
+    Ok(())
+}
+
 fn install_certified_stage(
     session: &Session,
     proposal: &MetadataImportProposal,
@@ -3437,7 +4022,8 @@ fn install_certified_stage(
     } else {
         session.destination_root.as_path()
     };
-    let prior = native_source_root(image_root, Some(8))?;
+    let prior =
+        native_source_root(image_root, Some(8))? || native_source_root(image_root, Some(9))?;
     let jobs = if prior {
         Vec::new()
     } else {
@@ -3561,6 +4147,7 @@ fn install_certified_stage(
                     &proposal.source_cut,
                     &session.source_root,
                     &floors,
+                    &[],
                 )?;
                 while reader
                     .next_chunk(source_ancestry::MAX_SOURCE_ANCESTRY_CHUNK_BYTES)?
@@ -3571,11 +4158,10 @@ fn install_certified_stage(
         }
         _ => return Err(error("import certificate uses a different authority mode")),
     };
-    let certified_current_receiver = match (proposal, certificate) {
+    let certified_receiver = match (proposal, certificate) {
         (MetadataImportProposal::Native(native), MetadataImportCertificate::Native(seal)) => {
             proposal.source_root == session.destination_root
                 && proposal.source_cut.source_root != proposal.source_root
-                && current_root(&session.source_root)?
                 && matches!(
                     seal.joint_handoff_proof.cause,
                     sinomo_dfs::DfsMetadataShardHandoffCause::StorageImport { .. }
@@ -3597,9 +4183,56 @@ fn install_certified_stage(
         }
         _ => false,
     };
+    let certified_native_format = if certified_receiver {
+        original_native_root_format(&session.source_root)?
+    } else {
+        None
+    };
+    let certified_current_receiver = certified_native_format.is_some();
+    let certified_legacy_receiver = if certified_receiver && !certified_current_receiver {
+        let MetadataImportCertificate::Native(seal) = certificate else {
+            return Err(error(
+                "legacy LOCAL binding has no native receiver certificate",
+            ));
+        };
+        let local = seal
+            .legacy_local_source
+            .as_ref()
+            .ok_or_else(|| error("legacy LOCAL binding has no authenticated receiver ledger"))?;
+        if local.original_root != proposal.source_root
+            || local.actual_root != session.source_root
+            || local.source_identity != session.inventory.fingerprint
+            || local.snapshot_fingerprint
+                != session
+                    .inventory
+                    .snapshot_fingerprint()
+                    .unwrap_or(&session.inventory.fingerprint)
+            || Some(&local.source_prefix) != proposal.source_exact_prefix.as_ref()
+            || !matches!(local.source_format_version, 3 | 6)
+            || local.source_prefix.version != 2
+            || local.source_fences.is_empty()
+        {
+            return Err(error(
+                "legacy LOCAL binding changes its verified source custody",
+            ));
+        }
+        true
+    } else {
+        false
+    };
     for fs in &proposal.file_system_ids {
         let local_format = if certified_current_receiver {
-            Some(sinomo_dfs::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION)
+            certified_native_format
+        } else if certified_legacy_receiver {
+            let MetadataImportCertificate::Native(seal) = certificate else {
+                unreachable!()
+            };
+            Some(
+                seal.legacy_local_source
+                    .as_ref()
+                    .expect("verified legacy source")
+                    .source_format_version,
+            )
         } else {
             proposal.source_cut.source_format_version
         };
@@ -3637,7 +4270,44 @@ fn install_certified_stage(
         }
     }
     session.inventory.verify(&session.source_root)?;
+    // Record only real native target-image ACKs before taking the exchange
+    // writer fence. This also re-earns the same hints on interrupted completion.
+    retain_native_import_publication_cursors(
+        image_root,
+        proposal,
+        certificate,
+        &identity,
+        authority,
+    )?;
+    let target_fence = match certificate {
+        MetadataImportCertificate::Native(seal) => Some(freeze_native_import_candidate(
+            image_root,
+            &proposal.scope_shard,
+            &seal.joint_handoff_proof,
+            &identity,
+        )?),
+        MetadataImportCertificate::Standalone(_) => None,
+    };
+    #[cfg(test)]
+    observe_native_import_install_for_test(
+        NativeImportInstallTestPoint::TargetFrozen,
+        &session.destination_root,
+        proposal,
+        certificate,
+        image_root,
+        &identity,
+    )?;
     if image_root == session.destination_root {
+        drop(target_fence);
+        #[cfg(test)]
+        observe_native_import_install_for_test(
+            NativeImportInstallTestPoint::TargetPublished,
+            &session.destination_root,
+            proposal,
+            certificate,
+            &session.destination_root,
+            &identity,
+        )?;
         // The image already crossed the rename boundary. Acceptance still
         // follows a newly obtained native seal and exact retained-source check.
         // Recertification completed under actual retained-source custody.
@@ -3727,7 +4397,7 @@ fn install_certified_stage(
             "completed-original-candidate-stamp-v8.json",
         )?;
     }
-    let receiver_local_source = if certified_current_receiver
+    let receiver_local_source = if (certified_current_receiver || certified_legacy_receiver)
         && proposal.source_cut.source_root != session.destination_root
     {
         Some(ReceiverLocalSourceBinding {
@@ -3844,6 +4514,24 @@ fn install_certified_stage(
             "installed current metadata image differs from its actual native certificate",
         ));
     }
+    if let Some(fence) = target_fence.as_ref() {
+        SOURCE_FENCES
+            .get_or_init(Mutex::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&proposal.staged_root);
+        register_source_fence(&session.destination_root, fence)?;
+    }
+    drop(target_fence);
+    #[cfg(test)]
+    observe_native_import_install_for_test(
+        NativeImportInstallTestPoint::TargetPublished,
+        &session.destination_root,
+        proposal,
+        certificate,
+        &session.destination_root,
+        &identity,
+    )?;
     if !prior {
         authority.resume_imported_namespace_jobs(
             &proposal.source_cut,
@@ -4109,7 +4797,7 @@ mod recovery_session_tests {
                 .unwrap();
         drop(MigrationStreamWriter::resume(&path, &header, &Default::default()).unwrap());
         let original = fs::read(&path).unwrap();
-        assert_eq!(sinomo_dfs::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION, 9);
+        assert_eq!(sinomo_dfs::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION, 10);
         assert!(!current_root(&root).unwrap());
         assert_eq!(discover_metadata_source(&root, &root).unwrap(), Some(root));
         assert_eq!(fs::read(path).unwrap(), original);
@@ -4125,7 +4813,7 @@ mod recovery_session_tests {
         let progress = previous.join("progress.json");
         fs::write(&progress, b"retained source replay ledger").unwrap();
         let current = conversion_stage_base_path(&destination, &shard).unwrap();
-        assert_eq!(current, previous.join("target-format-9"));
+        assert_eq!(current, previous.join("target-format-10"));
         assert_eq!(
             fs::read(&progress).unwrap(),
             b"retained source replay ledger"
@@ -4160,6 +4848,14 @@ mod recovery_session_tests {
             .open(&lock_path)
             .unwrap();
         actual_writer.lock_exclusive().unwrap();
+        // Model the unpublished file role of the normal atomic head producer.
+        // Its contents carry no source or readiness authority.
+        let unpublished = source.join(format!("journal/.head.sobj.tmp-{}-0", std::process::id()));
+        fs::write(&unpublished, b"unpublished current head").unwrap();
+        assert!(matches!(source::has_migration_source_data(&source),
+            Err(MetadataBackendError::StoragePreparationPending { root: pending_root, processed_records: 0 })
+            if pending_root == source.canonicalize().unwrap()));
+        assert_eq!(fs::read(&unpublished).unwrap(), b"unpublished current head");
         let result = retain_source_fence(&source);
         assert!(matches!(result,
             Err(MetadataBackendError::StoragePreparationPending { root: pending_root, processed_records: 0 })
@@ -4177,6 +4873,149 @@ mod recovery_session_tests {
         );
         drop(captured);
         competitor.try_lock_exclusive().unwrap();
+        drop(competitor);
+        // An unlocked stale temporary name is still original DATA. Unknown
+        // files remain complete inventory inputs, never silently discarded.
+        assert!(source::has_migration_source_data(&source).unwrap());
+        assert_eq!(fs::read(&unpublished).unwrap(), b"unpublished current head");
+        let unknown = source.join("unknown-original.sobj");
+        fs::write(&unknown, b"retained unknown original bytes").unwrap();
+        assert!(source::has_migration_source_data(&source).unwrap());
+        assert_eq!(
+            fs::read(&unknown).unwrap(),
+            b"retained unknown original bytes"
+        );
+        // Only a real current backend can establish the current declaration.
+        let current = root.path().join("current");
+        let backend =
+            sinomo_dfs::LocalSobjMetadataBackend::new(DfsMetadataShardId::new("current"), &current)
+                .unwrap();
+        drop(backend);
+        assert!(current_root(&current).unwrap());
+        assert!(!source::has_migration_source_data(&current).unwrap());
+    }
+
+    #[test]
+    fn native_target_freeze_survives_exchange_and_fences_retained_backend() {
+        use sinomo_dfs::DfsMetadataBackend;
+        let name = "native-target-freeze-exchange";
+        let nodes = sinomo_dfs::test_support::DfsTestRuntime::ordered_node_ids(name, 1);
+        let mut runtime =
+            sinomo_dfs::test_support::DfsTestRuntime::new(name, nodes[0].clone()).unwrap();
+        runtime.start_nodes().unwrap();
+        let handle = runtime.runtime_handle();
+        let _entered = handle.enter();
+        let retiring = runtime.root_shard().unwrap();
+        let shard = DfsMetadataShardId::new(&retiring.shard_id);
+        let dir = sinomo_testdir::TestDir::new(name);
+        let destination = dir.join("root");
+        let candidate = dir.join("candidate");
+        let archived = dir.join("retained");
+        let mut retained =
+            sinomo_dfs::LocalSobjMetadataBackend::new(shard.clone(), &destination).unwrap();
+        let payload = sinomo_dfs::DfsPreparedOperationPayload::for_metadata_effects(
+            sinomo_dfs::DfsPreparedOperationScope {
+                operation_id: "old-projection-after-root-exchange".into(),
+                file_system_id: retiring.file_system_id.clone(),
+                shard_id: shard.clone(),
+                owner_epoch: retiring.epoch,
+            },
+            Vec::new(),
+            Vec::new(),
+            vec![sinomo_dfs::DfsPreparedMetadataEffect::PutFileSystem {
+                file_system: runtime.file_system(),
+            }],
+            time::OffsetDateTime::UNIX_EPOCH,
+        )
+        .unwrap();
+        let digest = retained.prepare_operation(payload.clone(), None).unwrap();
+        let snapshot = retained.export_table_snapshot();
+        let writer = sinomo_dfs::DfsMetadataCandidateWriter::open(&candidate).unwrap();
+        let identity = writer
+            .write(*snapshot.tables, snapshot.prefix_proof)
+            .unwrap();
+        drop(writer);
+        let desired = DfsMetadataShardConfig {
+            epoch: retiring.epoch + 1,
+            ..retiring.clone()
+        };
+        // This tests the local fence primitive with an explicit model of the
+        // seal fields. It does not construct a native certificate or Ready.
+        let proof = DfsMetadataShardMembershipHandoffProof {
+            cause: sinomo_dfs::DfsMetadataShardHandoffCause::StorageImport {
+                cut: sinomo_dfs::DfsMetadataStorageImportCut {
+                    source_cut_digest: "local-fence-model".into(),
+                    source_journal_sequence: identity.prefix_proof.journal_sequence,
+                    source_state_fingerprint: identity.prefix_proof.digest.clone(),
+                    target_prefix: identity.prefix_proof.clone(),
+                    converted_image_fingerprint: identity.state_fingerprint.clone(),
+                    pending_mapping_digest: "local-fence-model".into(),
+                },
+            },
+            handoff_id: "local-fence-model".into(),
+            retiring_shard: retiring.clone(),
+            desired_shard: desired.clone(),
+            journal_sequence: identity.prefix_proof.journal_sequence,
+            state_fingerprint: identity.state_fingerprint.clone(),
+            acknowledged_node_ids: vec![nodes[0].clone()],
+        };
+        let target_fence =
+            freeze_native_import_candidate(&candidate, &shard, &proof, &identity).unwrap();
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(candidate.join("journal/write.lock"))
+            .unwrap();
+        assert_eq!(
+            lock.try_lock_exclusive().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        fs::rename(&destination, &archived).unwrap();
+        fs::rename(&candidate, &destination).unwrap();
+        assert_eq!(inspect_import_candidate(&destination).unwrap(), identity);
+        drop(target_fence);
+        drop(lock);
+        assert!(matches!(
+            retained.publication_writer_session(
+                &retiring.file_system_id,
+                &shard,
+                &digest,
+                None,
+                None,
+                None,
+                None
+            ),
+            Err(MetadataBackendError::MembershipHandoffFrozen { .. })
+        ));
+        assert!(matches!(
+            retained.prepare_operation(payload.clone(), None),
+            Err(MetadataBackendError::MembershipHandoffFrozen { .. })
+        ));
+        let mut cold =
+            sinomo_dfs::LocalSobjMetadataBackend::new(shard.clone(), &destination).unwrap();
+        assert!(matches!(
+            cold.prepare_operation(payload, None),
+            Err(MetadataBackendError::MembershipHandoffFrozen { .. })
+        ));
+        let marker = cold.metadata_shard_write_freeze(&shard).unwrap().unwrap();
+        assert_eq!(marker.activated_epoch, Some(desired.epoch));
+        assert_eq!(marker.rebind_prefix_proof, identity.prefix_proof);
+        let marker_path = destination.join("journal/membership-handoff-write-freeze.sobj");
+        let original_marker = fs::read(&marker_path).unwrap();
+        drop(freeze_native_import_candidate(&destination, &shard, &proof, &identity).unwrap());
+        assert_eq!(fs::read(&marker_path).unwrap(), original_marker);
+        let mut foreign = proof.clone();
+        foreign.handoff_id.push_str("-foreign");
+        assert!(freeze_native_import_candidate(&destination, &shard, &foreign, &identity).is_err());
+        let mut fork = identity.clone();
+        fork.prefix_proof.digest.push('0');
+        assert!(freeze_native_import_candidate(&destination, &shard, &proof, &fork).is_err());
+        assert_eq!(fs::read(&marker_path).unwrap(), original_marker);
+        assert_eq!(inspect_import_candidate(&destination).unwrap(), identity);
+        drop(cold);
+        drop(retained);
+        drop(_entered);
+        runtime.close().unwrap();
     }
 
     #[test]

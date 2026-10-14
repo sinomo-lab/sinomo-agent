@@ -35,18 +35,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         shard_id: &DfsMetadataShardId,
         owner_epoch: u64,
     ) -> Result<Option<DfsMetadataShardConfig>, DfsError> {
-        let Some(kv) = self.control_plane.as_mut() else {
+        let Some(context) =
+            self.retained_metadata_replica_context(&_object.file_system_id, shard_id)?
+        else {
             return Ok(None);
         };
-        let mut control = DfsControlPlaneStore::new(kv.as_mut());
-        let file_system_id = _object.file_system_id.clone();
-        let Some(shard) = control.get_metadata_shard(&file_system_id, &shard_id.0)? else {
-            return Ok(None);
-        };
-        if shard.primary_node_id != self.node_id
-            || shard.epoch < owner_epoch
-            || !control.metadata_shard_authority_is_current(&shard)?
-        {
+        let shard = context.shard;
+        if shard.primary_node_id != self.node_id || shard.epoch < owner_epoch {
             return Ok(None);
         }
         Ok(Some(shard))
@@ -106,23 +101,26 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if record.status != DfsPreparedOperationStatus::Prepared {
             return Ok(false);
         }
-        let Some(kv) = self.control_plane.as_mut() else {
+        if self.control_plane.is_none() {
             if record.digest.owner_epoch == 0 {
-                self.commit_stored_prepared_operation(&record.digest)?;
+                let committed = self.commit_stored_prepared_operation(&record.digest)?;
+                self.finish_recovered_prepared_publication(
+                    &committed.payload,
+                    committed.published,
+                )?;
                 return Ok(true);
             }
             return Ok(false);
         };
-        let mut control = DfsControlPlaneStore::new(kv.as_mut());
-        let Some(shard) =
-            control.get_metadata_shard(&record.digest.file_system_id, &record.digest.shard_id.0)?
+        let Some(context) = self.retained_metadata_replica_context(
+            &record.digest.file_system_id,
+            &record.digest.shard_id,
+        )?
         else {
             return Ok(false);
         };
-        if shard.primary_node_id != self.node_id
-            || shard.epoch < record.digest.owner_epoch
-            || !control.metadata_shard_authority_is_current(&shard)?
-        {
+        let shard = context.shard;
+        if shard.primary_node_id != self.node_id || shard.epoch < record.digest.owner_epoch {
             return Ok(false);
         }
         if shard.epoch != record.digest.owner_epoch {
@@ -133,7 +131,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .expect("recovery backend")
                 .prepared_operation_digest(&operation_id)?
             {
-                self.commit_stored_prepared_operation(&digest)?;
+                let committed = self.commit_stored_prepared_operation(&digest)?;
+                self.finish_recovered_prepared_publication(
+                    &committed.payload,
+                    committed.published,
+                )?;
                 return Ok(true);
             }
             let mut payload = (*record.payload).clone();
@@ -154,11 +156,38 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             // Original read-set, content evidence, effects and caller identity
             // remain immutable. The new owner certifies a new complete body;
             // old reservation retirement is atomic with this guarded commit.
-            self.publish_prepared_operation(payload)?;
+            let committed = self.publish_prepared_operation(payload)?;
+            self.finish_recovered_prepared_publication(&committed.payload, committed.published)?;
             return Ok(true);
         }
-        self.commit_stored_prepared_operation(&record.digest)?;
+        let committed = self.commit_stored_prepared_operation(&record.digest)?;
+        self.finish_recovered_prepared_publication(&committed.payload, committed.published)?;
         Ok(true)
+    }
+
+    fn finish_recovered_prepared_publication(
+        &mut self,
+        payload: &DfsPreparedOperationPayload,
+        published: bool,
+    ) -> Result<(), DfsError> {
+        if published {
+            // Keep the real commit's follow-up work even if rebuilding a local
+            // projection fails. Recovery must publish its commit marker too.
+            self.record_message_committed_work(DfsMessageCommittedWork {
+                publish_metadata: true,
+                semantic_changes: true,
+                repair_maintenance: payload.terminal_intent.is_some(),
+                namespace_maintenance: payload.metadata_effects.iter().any(|effect| {
+                    matches!(effect, DfsPreparedMetadataEffect::PutNamespaceJob { .. })
+                }),
+                ..Default::default()
+            });
+        }
+        self.refresh_recorded_prepared_rows(payload)?;
+        if let Some(intent) = payload.terminal_intent.as_ref() {
+            self.refresh_committed_write_projection(&intent.intent_id)?;
+        }
+        Ok(())
     }
 
     /// Map each durable write intent to the exact local metadata shard that

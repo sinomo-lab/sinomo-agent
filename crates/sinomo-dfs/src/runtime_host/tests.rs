@@ -2637,7 +2637,105 @@ fn background_repair_dispatch_releases_source_for_reciprocal_routine_admission()
     let sink_scheduler = Arc::clone(&source_scheduler);
     let sink_runtime = runtime.handle().clone();
     let sink_replies = Arc::clone(&replies);
-    worker.set_background_response_handler(move |message| {
+    let sink_original = native.commands[&target].clone();
+    let sink_shards = native.native.metadata_shards().unwrap();
+    let sink_local = source.clone();
+    let other_shard = sink_shards
+        .iter()
+        .find(|shard| shard.shard_id == "services")
+        .expect("the genuine native setup has the independent Services shard");
+    let reciprocal_scope = DfsMessageExecutionScope::ExactShard {
+        file_system_id: other_shard.file_system_id.clone(),
+        shard_id: sinomo_dfs::DfsMetadataShardId::new(&other_shard.shard_id),
+    };
+    worker.set_background_response_handler(move |message, original| {
+        let original =
+            original.expect("checkpointed reply retains its original locally owned request");
+        assert_eq!(original, &sink_original);
+        let scope = super::message_host::owned_repair_completion_scope(
+            original,
+            &message,
+            &sink_local,
+            &sink_shards,
+        )
+        .expect("the exact native request and reply select their current owning shard");
+        assert!(
+            matches!(&scope, DfsMessageExecutionScope::ExactShard { shard_id, .. }
+            if shard_id.0 == "root")
+        );
+        // Mutate only DATA clones of the actual native pair. None may earn even
+        // a scheduling scope, and none is dispatched or applied to a backend.
+        let mut foreign = original.clone();
+        foreign.source_node_id = original.target_node_id.clone();
+        assert!(
+            super::message_host::owned_repair_completion_scope(
+                &foreign,
+                &message,
+                &sink_local,
+                &sink_shards,
+            )
+            .is_err()
+        );
+        let mut stale = original.clone();
+        let DfsNetworkMessage::RepairReplica(request) = &mut stale.message else {
+            unreachable!()
+        };
+        request.authority_shard.as_mut().unwrap().epoch += 1;
+        assert!(
+            super::message_host::owned_repair_completion_scope(
+                &stale,
+                &message,
+                &sink_local,
+                &sink_shards,
+            )
+            .is_err()
+        );
+        let mut wrong_path = original.clone();
+        let DfsNetworkMessage::RepairReplica(request) = &mut wrong_path.message else {
+            unreachable!()
+        };
+        request.object_metadata.as_mut().unwrap().path = "/services/foreign-repair.bin".into();
+        assert!(
+            super::message_host::owned_repair_completion_scope(
+                &wrong_path,
+                &message,
+                &sink_local,
+                &sink_shards,
+            )
+            .is_err()
+        );
+        let mut wrong_version = message.clone();
+        let DfsNetworkMessage::RepairReplicaResponse(response) = &mut wrong_version.message else {
+            unreachable!()
+        };
+        response.version =
+            sinomo_core::Id::derived("test.owned-repair.foreign-version", b"negative");
+        assert!(
+            super::message_host::owned_repair_completion_scope(
+                original,
+                &wrong_version,
+                &sink_local,
+                &sink_shards,
+            )
+            .is_err()
+        );
+        let mut wrong_hash = message.clone();
+        let DfsNetworkMessage::RepairReplicaResponse(response) = &mut wrong_hash.message else {
+            unreachable!()
+        };
+        let DfsBlobTransferResult::Committed { content_hash } = &mut response.result else {
+            panic!("the actual native peer committed this repair body")
+        };
+        content_hash.push('0');
+        assert!(
+            super::message_host::owned_repair_completion_scope(
+                original,
+                &wrong_hash,
+                &sink_local,
+                &sink_shards,
+            )
+            .is_err()
+        );
         assert!(
             super::message_host::daemon_dfs_message_preempts_maintenance(&message.message),
             "ordinary unsolicited repair replies retain foreground classification"
@@ -2645,11 +2743,7 @@ fn background_repair_dispatch_releases_source_for_reciprocal_routine_admission()
         let admission = sink_runtime.block_on(async {
             tokio::time::timeout(
                 Duration::from_secs(1),
-                admit_daemon_dfs_message(
-                    &sink_scheduler,
-                    &DfsMessageExecutionScope::GlobalExclusive,
-                    false,
-                ),
+                admit_daemon_dfs_message(&sink_scheduler, &scope, false),
             )
             .await
             .expect("matched reply reacquires fresh source admission")
@@ -2677,24 +2771,22 @@ fn background_repair_dispatch_releases_source_for_reciprocal_routine_admission()
             .unwrap();
         let reciprocal = tokio::time::timeout(
             Duration::from_secs(1),
-            admit_daemon_dfs_message(
-                &source_scheduler,
-                &DfsMessageExecutionScope::GlobalExclusive,
-                false,
-            ),
+            admit_daemon_dfs_message(&source_scheduler, &reciprocal_scope, false),
         )
         .await
-        .expect("root namespace can enter the source while its repair waits")
+        .expect("independent Services work can enter while the Root repair waits")
         .unwrap();
         assert!(!source_interest.is_requested());
         assert!(!target_interest.is_requested());
-        drop(reciprocal);
+        // Keep the independent shard lease until the real repair return has
+        // completed its earned Root admission. A global restamp would stall.
         drop(target_owner);
         tokio::time::timeout(Duration::from_secs(1), dispatch)
             .await
             .expect("reciprocal work resolves without preempting either Routine")
             .unwrap()
             .unwrap();
+        drop(reciprocal);
     });
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(replies.load(Ordering::SeqCst), 1);
@@ -2760,7 +2852,7 @@ fn background_repair_worker_replacement_retains_parked_owned_payload() {
         .unwrap();
     let mut previous = service.detach_message_deferred_work();
     drop(service);
-    previous.set_background_response_handler(|_| panic!("an offline target must stay parked"));
+    previous.set_background_response_handler(|_, _| panic!("an offline target must stay parked"));
     previous.set_deferred_target_node_ids([target.clone()].into_iter().collect());
     assert!(previous.has_pending().unwrap());
     assert!(!previous.scheduling_snapshot().unwrap().0);
@@ -2780,7 +2872,11 @@ fn background_repair_worker_replacement_retains_parked_owned_payload() {
         "replacement must retain the previous reader"
     );
     let sink_replies = Arc::clone(&replies);
-    replacement.set_background_response_handler(move |message| {
+    replacement.set_background_response_handler(move |message, original| {
+        assert!(
+            original.is_some(),
+            "checkpointed reply retains its original locally owned request"
+        );
         assert!(
             matches!(message.message, DfsNetworkMessage::RepairReplicaResponse(response)
             if response.request_id == expected_request_id
@@ -2913,7 +3009,11 @@ fn assert_background_repair_same_policy_replacement_wakes(register_after_publica
         let mut replacement = replacement_service.detach_message_deferred_work();
         drop(replacement_service);
         let sink_replies = Arc::clone(&replies);
-        replacement.set_background_response_handler(move |message| {
+        replacement.set_background_response_handler(move |message, original| {
+            assert!(
+                original.is_some(),
+                "checkpointed reply retains its original locally owned request"
+            );
             assert!(
                 matches!(message.message, DfsNetworkMessage::RepairReplicaResponse(response)
                 if response.request_id == expected_request_id
@@ -3039,7 +3139,8 @@ fn background_repair_checkpoint_survives_cancellation_without_publishing_unpersi
             sinomo_dfs::LocalContentStore::new(root.join("checkpoint-source-content")).unwrap(),
         );
         let mut older_worker = service.prepare_background_replica_worker();
-        older_worker.set_background_response_handler(|_| panic!("an older holder must stay empty"));
+        older_worker
+            .set_background_response_handler(|_, _| panic!("an older holder must stay empty"));
         service.set_background_replica_dispatch(maintenance_kind.replica_dispatch_is_deferred());
         // Capture the new holder before the cancellable generation starts,
         // as both regular maintenance kinds do. Private preparations stay invisible.
@@ -3137,7 +3238,11 @@ fn background_repair_checkpoint_survives_cancellation_without_publishing_unpersi
         let sink_scheduler = Arc::clone(&scheduler);
         let sink_runtime = runtime.handle().clone();
         let sink_replies = Arc::clone(&replies);
-        worker.set_background_response_handler(move |message| {
+        worker.set_background_response_handler(move |message, original| {
+            assert!(
+                original.is_some(),
+                "checkpointed reply retains its original locally owned request"
+            );
             let admission = sink_runtime.block_on(async {
                 tokio::time::timeout(
                     Duration::from_secs(1),
@@ -3307,7 +3412,11 @@ fn assert_background_repair_batch_continues_after_error(unmatched_peer: bool) {
     let mut worker = service.detach_message_deferred_work();
     drop(service);
     let observed_healthy = Arc::clone(&healthy_replies);
-    worker.set_background_response_handler(move |message| {
+    worker.set_background_response_handler(move |message, original| {
+        assert!(
+            original.is_some(),
+            "checkpointed reply retains its original locally owned request"
+        );
         assert!(
             matches!(&message.message, DfsNetworkMessage::RepairReplicaResponse(response)
             if matches!(response.result, DfsBlobTransferResult::Committed { .. }))
@@ -5985,7 +6094,8 @@ fn daemon_dfs_metadata_journal_batch_applies_to_local_backend() {
     let replica = shard.replica_node_ids[0].clone();
     let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
     let mut writer = runtime.client(&primary).unwrap();
-    let before = writer
+    let initial = runtime.metadata_primary_service("/").unwrap();
+    let before = initial
         .metadata_backend()
         .unwrap()
         .export_shard_table_snapshot(&shard_id)
@@ -5993,6 +6103,7 @@ fn daemon_dfs_metadata_journal_batch_applies_to_local_backend() {
         .unwrap()
         .prefix_proof
         .journal_sequence;
+    drop(initial);
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
     runtime.install_fault(crate::test_runtime::FaultRule {
         source: Some(primary.clone()),
@@ -6059,20 +6170,22 @@ fn daemon_dfs_metadata_journal_batch_applies_to_local_backend() {
                 &source, &batch,
             )
             .map_err(|error| error.to_string())?;
+            let command = crate::metadata_replication::dfs_metadata_durable_journal_batch_command(
+                &shard.primary_node_id,
+                &replica,
+                &shard.file_system_id,
+                shard.epoch,
+                frames,
+                false,
+            );
+            assert!(
+                command.durable_replication.is_some(),
+                "the actual frame carries its normal exact-prefix purpose"
+            );
             let request = sinomo_core::network::ObjectRpcRequest::encode_body(
                 crate::DFS_METADATA_JOURNAL_BATCH_ROUTE,
                 crate::DFS_RPC_CATEGORY,
-                &crate::DfsMetadataJournalBatchCommand {
-                    request_id: "native-first-replica-ingest".into(),
-                    source_node_id: Some(shard.primary_node_id.clone()),
-                    file_system_id: Some(shard.file_system_id.clone()),
-                    authority_epoch: Some(shard.epoch),
-                    verify_prefix_only: false,
-                    prefix_probe: None,
-                    authority_probe: None,
-                    durable_replication: None,
-                    batch: frames,
-                },
+                &command,
             )
             .map_err(|error| error.to_string())?;
             let response = runtime.rpc_request(
@@ -8332,8 +8445,14 @@ fn late_native_replication_fixture(
     crate::NetworkedDfsService<crate::DfsNodeTransport>,
     DfsMetadataShardConfig,
 ) {
-    crate::test_support::current_native_metadata_service(name, 3, "/")
-        .expect("normal owned native metadata fixture")
+    let (native, requester, shard) =
+        crate::test_support::current_native_metadata_service(name, 3, "/")
+            .expect("normal owned native metadata fixture");
+    drop(requester);
+    let source = native
+        .metadata_primary_service("/")
+        .expect("actual owning Root Core producer");
+    (native, source, shard)
 }
 
 fn late_native_hidden_suffix(
@@ -8410,6 +8529,14 @@ fn daemon_dfs_metadata_journal_publish_replicates_all_local_primary_shards() {
         let installed = native
             .reassign_metadata_shard(&fs, &config.shard_id, local.clone(), members)
             .unwrap();
+        let mut source = native
+            .metadata_primary_service(if installed.shard_id == "root" {
+                "/"
+            } else {
+                "/services"
+            })
+            .unwrap();
+        late_native_hidden_suffix(&mut source, &installed, 1);
         expected.push(DfsMetadataShardId::new(installed.shard_id));
     }
     let (peer, _) = native.peer_transports(&local).unwrap();
@@ -8618,7 +8745,7 @@ fn daemon_dfs_metadata_journal_publish_stops_after_replica_rejection() {
     let observed = Arc::clone(&attempts);
     let selected = target.clone();
     let sender: DfsMetadataJournalBatchSender = Arc::new(move |node, command, budget| {
-        if node != &selected {
+        if node != &selected || command.batch.shard_id != shard_id {
             return actual(node, command, budget);
         }
         observed.fetch_add(1, Ordering::SeqCst);
@@ -8784,7 +8911,10 @@ fn daemon_dfs_metadata_journal_publish_bounds_endpoint_fallbacks_per_target() {
     let attempted = Arc::new(Mutex::new(Vec::new()));
     let observed = Arc::clone(&attempted);
     let sender: DfsMetadataJournalBatchSender = Arc::new(move |node, command, budget| {
-        observed.lock().unwrap().push(node.clone());
+        observed
+            .lock()
+            .unwrap()
+            .push((node.clone(), command.batch.shard_id.clone()));
         actual(node, command, budget)
     });
     let data = native.data_dir(&local);
@@ -8803,7 +8933,7 @@ fn daemon_dfs_metadata_journal_publish_bounds_endpoint_fallbacks_per_target() {
             .lock()
             .unwrap()
             .iter()
-            .filter(|node| **node == target)
+            .filter(|(node, shard)| *node == target && shard.0 == "root")
             .count(),
         1,
         "publisher makes one target-level attempt; the normal carrier owns route fallback"
@@ -15111,6 +15241,7 @@ fn daemon_dfs_transactions_do_not_materialize_post_commit_snapshots() {
         local_data_dir: data_dir.clone(),
         authority_data_dir: data_dir.clone(),
         peers: None,
+        object_rpc: None,
         full_commit_calls: AtomicUsize::new(0),
         compact_commit_calls: AtomicUsize::new(0),
     });
@@ -15489,6 +15620,75 @@ fn stopped_runtime_joins_a_started_blocking_child_registered_during_drain() {
         "normal remount owns a new capability, rather than reusing the drained owner"
     );
     drop(reopened);
+    native.close().unwrap();
+}
+
+#[test]
+fn maintenance_peer_discovery_uses_owned_projection_without_authoritative_reads() {
+    let (native, mut requester, shard) = crate::test_support::current_native_metadata_service(
+        "native-maintenance-no-catalog-refetch",
+        3,
+        "/",
+    )
+    .unwrap();
+    requester
+        .posix_write_file(
+            "/peer-discovery-ready",
+            b"native readiness",
+            crate::DfsWriteOptions::replicated_eventual(vec![shard.primary_node_id.clone()]),
+        )
+        .unwrap();
+    drop(requester);
+    let data_dir = native.data_dir(&shard.primary_node_id).clone();
+    let paths = ClusterPaths::new(&data_dir);
+    let state = sinomo_core::cluster::read_cluster_state_without_kv(&paths).unwrap();
+    let runtime = native.runtime_handle();
+    let expected = std::iter::once(shard.primary_node_id.clone())
+        .chain(shard.replica_node_ids.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    let scheduler = daemon_dfs_mutation_scheduler(&data_dir).unwrap();
+    let admission = runtime
+        .block_on(scheduler.admit(&DfsMessageExecutionScope::GlobalExclusive))
+        .unwrap();
+    take_daemon_dfs_test_authoritative_prefix_call_count(&paths);
+    for _ in 0..8 {
+        let mut retained = take_daemon_dfs_message_mutation_service_for_maintenance(
+            &data_dir, &paths, &state, &runtime, None,
+        )
+        .unwrap();
+        assert_eq!(
+            retained
+                .peer_node_ids
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            expected
+        );
+        assert_eq!(
+            retained
+                .lane
+                .service
+                .placement_content_candidates()
+                .unwrap()
+                .into_iter()
+                .map(|candidate| candidate.node_id)
+                .collect::<BTreeSet<_>>(),
+            expected,
+            "content planning consumes the same coherent advertisements without metadata discovery"
+        );
+        assert!(
+            restore_daemon_dfs_message_mutation_service_after_maintenance(
+                &data_dir, &paths, &runtime, retained,
+            )
+            .unwrap()
+        );
+    }
+    assert_eq!(
+        take_daemon_dfs_test_authoritative_prefix_call_count(&paths),
+        0,
+        "maintenance lane handoff must not refetch the already-owned provider catalog"
+    );
+    drop(admission);
     native.close().unwrap();
 }
 

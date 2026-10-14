@@ -927,10 +927,15 @@ pub(crate) fn dfs_runtime_message_uses_content_read_lane(command: &DfsMessageCom
     }
 }
 
+// Repair replies have no wire shard. Only the host that still owns the exact
+// original local call may supply their scoped admission; unpaired ingress keeps
+// its existing global scope and current intent/policy validation.
 pub(crate) fn dfs_runtime_message_supports_exact_service_lane(command: &DfsMessageCommand) -> bool {
     matches!(
         &command.routed_message.message,
-        DfsNetworkMessage::MetadataJournalBatch(_) | DfsNetworkMessage::MetadataSnapshotInstall(_)
+        DfsNetworkMessage::MetadataJournalBatch(_)
+            | DfsNetworkMessage::MetadataSnapshotInstall(_)
+            | DfsNetworkMessage::RepairReplicaResponse(_)
     ) || matches!(
         &command.routed_message.message,
         DfsNetworkMessage::NamespaceRequest(namespace) if namespace.authority_shards.len() == 1
@@ -1128,6 +1133,7 @@ pub(crate) fn execute_runtime_message_command_with_verified_fetch<F>(
     execution_scope: &crate::DfsMessageExecutionScope,
     verified_fetch: Option<crate::service_fetch_transfer::VerifiedDfsBlobFetch>,
     publication_owners: Option<Arc<crate::publication_guard::DfsPublicationExecutionOwners>>,
+    publication_provider: Option<Arc<crate::DfsPublicationExecutionProvider>>,
     completed_phase: Option<crate::source_adoption::CompletedRemoteNamespacePhase>,
     persist_repair_records: F,
 ) -> Result<DfsRuntimeMessageExecution, crate::DfsError>
@@ -1163,6 +1169,10 @@ where
     }
     let _publication_scope =
         publication_owners.map(|owners| service_lane.service.publication_execution.install(owners));
+    // Cached idle lanes must not pin the daemon's OS owner. The provider and
+    // actual admission remain together only for this synchronous execution.
+    let _publication_provider_scope = publication_provider
+        .map(|provider| service_lane.service.publication_provider.install(provider));
     service_lane.refresh_peer_targets(peer_node_ids);
     let resident_metadata_scope = service_lane.resident_metadata_scope.clone();
     let backend_checkout_started = std::time::Instant::now();

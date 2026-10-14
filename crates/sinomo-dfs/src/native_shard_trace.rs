@@ -57,7 +57,6 @@ struct NativeAuthoritativeRead {
     requested_keys: Vec<String>,
     read: sinomo_core::kv::KvAuthoritativeRead<Vec<Option<sinomo_core::kv::KvEntry>>>,
     accepted_projection_generation: String,
-    guard_context_id: Option<String>,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct NativeMountedIdentityV1 {
@@ -413,7 +412,7 @@ impl NativeShardTraceCapture {
                 required_unavailable_facts: &[
                     "source/build/schema/model hash envelope binding",
                     "certified complete initial cut",
-                    "native config/ACK/permit and correlation of captured final authority read",
+                    "same consumed retained configuration, all assigned ACKs and actual writer/freeze custody",
                     "actual lane/writer/fence/admission identities",
                     "replica/handoff/reply causal observations",
                 ],
@@ -618,34 +617,23 @@ pub(crate) fn record_authoritative_read(
             requested_keys: keys.to_vec(),
             read: read.clone(),
             accepted_projection_generation: accepted_generation.to_string(),
-            guard_context_id: FINAL_READ_CONTEXT.with(|slot| {
-                slot.borrow()
-                    .as_ref()
-                    .filter(|context| {
-                        context
-                            .capture
-                            .upgrade()
-                            .is_some_and(|actual| Arc::ptr_eq(&actual, &capture))
-                    })
-                    .map(|context| context.guard_id.clone())
-            }),
         });
     }
 }
 
 #[derive(Clone)]
-struct FinalReadContext {
+struct RetainedConfigurationContext {
     capture: Weak<Capture>,
     guard_id: String,
 }
-thread_local! { static FINAL_READ_CONTEXT:RefCell<Option<FinalReadContext>>=const {RefCell::new(None)}; }
+thread_local! { static RETAINED_CONFIGURATION_CONTEXT:RefCell<Option<RetainedConfigurationContext>>=const {RefCell::new(None)}; }
 /// Observation-only dynamic scope, never an admission or authority capability.
-pub(crate) struct NativeFinalReadScope {
-    previous: Option<FinalReadContext>,
+pub(crate) struct NativeRetainedConfigurationScope {
+    previous: Option<RetainedConfigurationContext>,
 }
-impl Drop for NativeFinalReadScope {
+impl Drop for NativeRetainedConfigurationScope {
     fn drop(&mut self) {
-        FINAL_READ_CONTEXT.with(|slot| *slot.borrow_mut() = self.previous.take());
+        RETAINED_CONFIGURATION_CONTEXT.with(|slot| *slot.borrow_mut() = self.previous.take());
     }
 }
 #[derive(Debug, Serialize)]
@@ -657,12 +645,6 @@ pub(crate) enum NativeGuardAuthorityV1 {
     FullShard {
         expected: crate::DfsMetadataShardConfig,
         authenticated_acknowledged_node_ids: Vec<sinomo_core::node::NodeId>,
-    },
-    Recovery {
-        expected: crate::DfsMetadataShardConfig,
-        authenticated_acknowledged_node_ids: Vec<sinomo_core::node::NodeId>,
-        required_metadata_quorum: usize,
-        native_permit: crate::DfsMetadataOperationPermit,
     },
 }
 #[derive(Debug, Serialize)]
@@ -747,13 +729,14 @@ pub(crate) fn begin_guard_trace(
     })
 }
 impl NativeGuardTrace {
-    pub(crate) fn enter_final_read(&self) -> NativeFinalReadScope {
-        let context = FinalReadContext {
+    pub(crate) fn enter_retained_configuration(&self) -> NativeRetainedConfigurationScope {
+        let context = RetainedConfigurationContext {
             capture: Arc::downgrade(&self.capture),
             guard_id: self.guard_id.clone(),
         };
-        NativeFinalReadScope {
-            previous: FINAL_READ_CONTEXT.with(|slot| slot.borrow_mut().replace(context)),
+        NativeRetainedConfigurationScope {
+            previous: RETAINED_CONFIGURATION_CONTEXT
+                .with(|slot| slot.borrow_mut().replace(context)),
         }
     }
     /// Called only at the normal successful mint with copies of its actual
@@ -1171,6 +1154,9 @@ struct NativeConfigurationCutObservationV1 {
     scopes: [Vec<sinomo_core::kv::KvEntry>; 3],
     authority: [sinomo_core::kv::KvAuthorityProof; 3],
     retained_projection_floor: sinomo_core::kv::KvLocalRead<Option<sinomo_core::kv::KvEntry>>,
+    // SAME normal accepted immutable view consumed at this actual guard's
+    // final recheck. Correlation is observational and grants no authority.
+    guard_context_id: Option<String>,
 }
 pub(crate) fn record_configuration_cut(
     data_root: &Path,
@@ -1229,6 +1215,17 @@ pub(crate) fn record_configuration_cut(
                 scopes: view.scopes.clone(),
                 authority: view.authority.clone(),
                 retained_projection_floor: view.floor.clone(),
+                guard_context_id: RETAINED_CONFIGURATION_CONTEXT.with(|slot| {
+                    slot.borrow()
+                        .as_ref()
+                        .filter(|context| {
+                            context
+                                .capture
+                                .upgrade()
+                                .is_some_and(|actual| Arc::ptr_eq(&actual, &capture))
+                        })
+                        .map(|context| context.guard_id.clone())
+                }),
             });
     }
 }
@@ -1636,12 +1633,6 @@ pub(crate) enum NativeBoundaryFactsV1 {
         authenticated_requester_node_id: sinomo_core::node::NodeId,
         command: NativeContentStageIdentityV1,
         response: crate::DfsStageBlobResponse,
-    },
-    RecoveryPermitIssued {
-        expected: crate::DfsMetadataShardConfig,
-        operation: crate::DfsMetadataAuthorityOperation,
-        permit: crate::DfsMetadataOperationPermit,
-        authenticated_recovery_node_ids: Vec<sinomo_core::node::NodeId>,
     },
     ReplicaWriteFreezeRead {
         read_id: String,

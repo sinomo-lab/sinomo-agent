@@ -359,6 +359,307 @@ impl NativeImportAuthority {
         }
         found.ok_or_else(|| error("exact original native import request blueprint is unavailable"))
     }
+    /// A saved-only primary retries the ordinary guarded first CAS. A stage
+    /// already present/activated is observed, never resubmitted as a new effect.
+    fn recover_stage_commit(&self, plan: &MetadataImportPlan) -> Result<DfsNativeTxnCommit> {
+        Self::validate_plan(plan)?;
+        let h = &plan.expected_handoff;
+        let keys = vec![
+            sinomo_dfs::metadata_shard_key(
+                &h.retiring_shard.file_system_id,
+                &h.retiring_shard.shard_id,
+            ),
+            sinomo_dfs::metadata_shard_membership_handoff_key(
+                &h.retiring_shard.file_system_id,
+                &h.retiring_shard.shard_id,
+            ),
+            sinomo_dfs::metadata_shard_membership_handoff_proof_key(
+                &h.retiring_shard.file_system_id,
+                &h.retiring_shard.shard_id,
+            ),
+        ];
+        let (state, _) = self.read_exact(&keys)?;
+        let assignment: DfsMetadataShardConfig = state[0]
+            .entry
+            .as_ref()
+            .ok_or_else(|| error("saved import assignment vanished"))?
+            .decode()
+            .map_err(error)?;
+        let prior_proof = state[2]
+            .entry
+            .as_ref()
+            .map(|entry| entry.decode::<DfsMetadataShardMembershipHandoffProof>())
+            .transpose()
+            .map_err(error)?;
+        let saved_only = assignment == h.retiring_shard
+            && state[1].entry.is_none()
+            && prior_proof
+                .as_ref()
+                .is_none_or(|proof| proof.handoff_id != h.handoff_id);
+        if saved_only && self.local_node()? != h.retiring_shard.primary_node_id {
+            return Err(error(
+                "saved-only stage requires its actual retiring primary",
+            ));
+        }
+        let before = if saved_only {
+            None
+        } else {
+            Some(self.check_handoff_state(plan)?)
+        };
+        let mut source_fence = None;
+        if self.local_node()? == plan.expected_handoff.retiring_shard.primary_node_id {
+            let source = &plan.source_cut;
+            self.validate_source_root(&source.source_root)?;
+            self.validate_source_root(&source.staged_root)?;
+            source_fence = Some(crate::metadata::retain_source_fence(&source.source_root)?);
+            crate::metadata::validate_retained_source_identity(
+                &source.source_root,
+                &source.source_identity,
+                &source.source_snapshot_fingerprint,
+            )?;
+            let input_path = source.staged_root.join("native-import-input.json");
+            let (input_source, input_entries, input_authority): (
+                MetadataSourceCut,
+                Vec<MetadataCapturedKvEntry>,
+                KvAuthorityProof,
+            ) = serde_json::from_slice(&std::fs::read(input_path).map_err(error)?)
+                .map_err(error)?;
+            if digest(&input_source)? != digest(source)?
+                || serde_json::to_value(&input_entries).map_err(error)?
+                    != serde_json::to_value(&plan.captured_entries).map_err(error)?
+                || input_authority != plan.captured_authority
+            {
+                return Err(error(
+                    "original stage replay changed its captured source/input authority",
+                ));
+            }
+            let original_path = source.staged_root.join(format!(
+                "native-request-{}.json",
+                plan.stage_request.request_id,
+            ));
+            let original: KvTxnRequest =
+                serde_json::from_slice(&std::fs::read(original_path).map_err(error)?)
+                    .map_err(error)?;
+            if original != plan.stage_request
+                || KvRequestId::derived(
+                    "dfs-storage-import-control-v7",
+                    digest(&original.txn)?.as_bytes(),
+                ) != original.request_id
+            {
+                return Err(error(
+                    "original stage replay changed its immutable request/producer identity",
+                ));
+            }
+        }
+        if saved_only {
+            // Saving the plan/request precedes the ordinary first atomic CAS.
+            // No receipt is inferred from files or absent domain keys.
+            let outcome = block_native(
+                &self.runtime,
+                self.cluster()?
+                    .kv_request_outcome_authoritative_async(plan.stage_request.request_id.clone()),
+            )?;
+            sinomo_core::kv::validate_cluster_kv_request_outcome_read(&outcome).map_err(error)?;
+            current_authority(&outcome.authority)?;
+            if !matches!(
+                outcome.outcome,
+                sinomo_core::kv::KvRequestOutcome::Unknown { .. }
+            ) {
+                return Err(error(
+                    "saved-only stage has a prior or unavailable native outcome",
+                ));
+            }
+            let mut permission_keys = BTreeSet::new();
+            for node in std::iter::once(&h.retiring_shard.primary_node_id)
+                .chain(&h.retiring_shard.replica_node_ids)
+            {
+                permission_keys.insert(sinomo_core::node::cluster_member_key(node));
+                permission_keys.insert(sinomo_core::node::cluster_capability_policy_key(node));
+            }
+            let (permissions, _) =
+                self.read_exact(&permission_keys.into_iter().collect::<Vec<_>>())?;
+            self.require_current_assignment_members(
+                std::slice::from_ref(&h.retiring_shard),
+                &permissions,
+            )?;
+            let (fresh, _) = self.read_exact(&keys)?;
+            if serde_json::to_value(&fresh).map_err(error)?
+                != serde_json::to_value(&state).map_err(error)?
+            {
+                return Err(error("saved-only stage moved before its first atomic CAS"));
+            }
+            // The exact existing request/CAS and normal host authorization are
+            // retained. A concurrent stage cannot bypass its Missing compare.
+            let stage = self.commit(plan.stage_request.clone())?;
+            Self::require_committed(&stage)?;
+            self.check_handoff_state(plan)?;
+            return Ok(stage);
+        }
+        let stage = self.observe_original_import_commit(plan, plan.stage_request.clone())?;
+        Self::require_committed(&stage)?;
+        if Some(self.check_handoff_state(plan)?) != before {
+            return Err(error(
+                "native handoff moved while its original stage receipt was observed",
+            ));
+        }
+        drop(source_fence);
+        Ok(stage)
+    }
+    /// Observe the exact existing physical transaction under this domain plan.
+    /// Captured authorization bytes do not identify a historical caller.
+    pub(super) fn observe_original_import_commit(
+        &self,
+        plan: &MetadataImportPlan,
+        request: KvTxnRequest,
+    ) -> Result<DfsNativeTxnCommit> {
+        self.evaluate_original_import_commit(plan, request)
+            .map_err(NativeEvaluationError::into_metadata)
+    }
+    pub(super) fn evaluate_original_import_commit(
+        &self,
+        plan: &MetadataImportPlan,
+        request: KvTxnRequest,
+    ) -> std::result::Result<DfsNativeTxnCommit, NativeEvaluationError> {
+        Self::validate_plan(plan)?;
+        self.evaluate_original_native_commit(
+            request,
+            &plan.expected_handoff.retiring_shard.primary_node_id,
+            &plan.captured_entries,
+        )
+    }
+
+    /// Domain callers bind immutable custody and current scope separately.
+    /// This observes a native receipt and never delegates a first effect.
+    pub(super) fn observe_original_native_commit(
+        &self,
+        request: KvTxnRequest,
+        owner: &sinomo_core::node::NodeId,
+        captured_issuer_rows: &[MetadataCapturedKvEntry],
+    ) -> Result<DfsNativeTxnCommit> {
+        self.evaluate_original_native_commit(request, owner, captured_issuer_rows)
+            .map_err(NativeEvaluationError::into_metadata)
+    }
+    pub(super) fn evaluate_original_native_commit(
+        &self,
+        request: KvTxnRequest,
+        owner: &sinomo_core::node::NodeId,
+        captured_issuer_rows: &[MetadataCapturedKvEntry],
+    ) -> std::result::Result<DfsNativeTxnCommit, NativeEvaluationError> {
+        // Preserve only raw read availability until the ordinary wrapper ends.
+        // Both wrappers execute this same observation; neither submits a command.
+        let read = block_native(&self.runtime, async {
+            Ok::<_, MetadataBackendError>(
+                self.cluster()?
+                    .kv_request_outcome_authoritative_async(request.request_id.clone())
+                    .await,
+            )
+        })?
+        .map_err(NativeEvaluationError::Native)?;
+        sinomo_core::kv::validate_cluster_kv_request_outcome_read(&read).map_err(error)?;
+        current_authority(&read.authority)?;
+        let sinomo_core::kv::KvRequestOutcome::Committed(record) = read.outcome else {
+            return Err(
+                error("original import request has no actual committed native receipt").into(),
+            );
+        };
+        let submitted = sinomo_core::kv::kv_command_digest(&KvCommand::Txn(request.txn.clone()))
+            .map_err(error)?;
+        if record.request_id != request.request_id
+            || record.term == 0
+            || record.log_index == 0
+            || record
+                .txn_response
+                .as_ref()
+                .is_none_or(|response| !response.succeeded || response.revision != record.revision)
+        {
+            return Err(error(
+                "original import native receipt does not bind its successful request",
+            )
+            .into());
+        }
+        Self::validate_original_command_preimage(
+            &request,
+            owner,
+            captured_issuer_rows,
+            &record.command_digest,
+        )?;
+        let result = sinomo_core::kv::ClusterKvTxnCompactCommitResult {
+            request_id: record.request_id,
+            submitted_command_digest: Some(submitted),
+            command_digest: record.command_digest,
+            txn_response: record.txn_response,
+            authority: KvAuthorityProof {
+                term: record.term,
+                commit_index: record.log_index,
+                revision: record.revision,
+                basis: KvAuthorityBasis::ExactCommittedRequest,
+            },
+            replayed_committed_request: true,
+        };
+        let commit = DfsNativeTxnCommit { request, result };
+        Self::require_committed(&commit)?;
+        Ok(commit)
+    }
+
+    /// Match only the unchanged local body or released Remote ingress's exact
+    /// four authorization compares. Captured rows are original byte DATA;
+    /// current domain authority is checked separately by every caller.
+    pub(super) fn validate_original_command_preimage(
+        request: &KvTxnRequest,
+        permission_subject: &sinomo_core::node::NodeId,
+        captured_rows: &[MetadataCapturedKvEntry],
+        physical_digest: &sinomo_core::kv::KvCommandDigest,
+    ) -> Result<()> {
+        let bare = sinomo_core::kv::kv_command_digest(&KvCommand::Txn(request.txn.clone()))
+            .map_err(error)?;
+        if &bare == physical_digest {
+            return Ok(());
+        }
+        let captured = |key: &str| -> Result<sinomo_core::kv::KvEntry> {
+            let mut rows = captured_rows.iter().filter(|row| row.key == key);
+            let row = rows
+                .next()
+                .ok_or_else(|| error("original receipt lacks captured permission preimage"))?;
+            let entry = row
+                .entry
+                .clone()
+                .ok_or_else(|| error("original permission preimage was absent"))?;
+            if rows.next().is_some() || entry.key != key {
+                return Err(error(
+                    "original permission preimage changes or repeats its key",
+                ));
+            }
+            Ok(entry)
+        };
+        let member = captured(&sinomo_core::node::cluster_member_key(permission_subject))?;
+        let policy = captured(&sinomo_core::node::cluster_capability_policy_key(
+            permission_subject,
+        ))?;
+        let original: sinomo_core::cluster::ClusterMemberRecord = member.decode().map_err(error)?;
+        if &original.node_id != permission_subject {
+            return Err(error("original permission preimage has a foreign subject"));
+        }
+        let signer = sinomo_core::service::ServiceSigner::Remote {
+            node_id: permission_subject.to_string(),
+            public_key: original.node_public_key,
+        };
+        let physical = sinomo_core::cluster::fence_remote_cluster_kv_txn_request_with_entries(
+            Some(&member),
+            Some(&policy),
+            &signer,
+            request.clone(),
+        )
+        .map_err(error)?;
+        if sinomo_core::kv::kv_command_digest(&KvCommand::Txn(physical.txn)).map_err(error)?
+            != *physical_digest
+        {
+            return Err(error(
+                "original receipt has no exact physical command preimage",
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) fn recover_plan(
         &self,
         source: &MetadataSourceCut,
@@ -436,7 +737,7 @@ impl NativeImportAuthority {
                 "immutable native import blueprint changed after restart",
             ));
         }
-        let stage = self.commit(plan.stage_request.clone())?;
+        let stage = self.recover_stage_commit(&plan)?;
         Self::require_committed(&stage)?;
         self.check_handoff_state(&plan)?;
         Ok(Some(plan))
@@ -700,9 +1001,9 @@ impl NativeImportAuthority {
         DfsNativeTxnCommit,
         DfsMetadataShardMembershipHandoffProof,
     )> {
-        let stage = self.commit(plan.stage_request.clone())?;
-        Self::require_committed(&stage)?;
         if let Some(proof) = self.check_handoff_state(plan)? {
+            let stage = self.observe_original_import_commit(plan, plan.stage_request.clone())?;
+            Self::require_committed(&stage)?;
             let request = match &plan.activation_request {
                 Some(request) => request.clone(),
                 None => {
@@ -717,10 +1018,22 @@ impl NativeImportAuthority {
                     "retained activation request differs from native proof",
                 ));
             }
-            let activation = self.commit(request)?;
+            let activation = self.observe_original_import_commit(plan, request)?;
             Self::require_committed(&activation)?;
+            if self.check_handoff_state(plan)? != Some(proof.clone()) {
+                return Err(error(
+                    "native activation moved while original receipts were observed",
+                ));
+            }
             return Ok((stage, activation, proof));
         }
+        if self.local_node()? != plan.expected_handoff.retiring_shard.primary_node_id {
+            return Err(error(
+                "only the actual retiring primary can advance an unfinished native import",
+            ));
+        }
+        let stage = self.recover_stage_commit(plan)?;
+        Self::require_committed(&stage)?;
         if provenance_plan_root
             .join("native-activation-request.json")
             .exists()
@@ -892,6 +1205,7 @@ impl NativeImportAuthority {
             &plan.source_cut,
             &plan.source_cut.source_root,
             &retained,
+            &floors.checkpoints,
         )?;
         let mut ordinal = 0u64;
         while let Some(chunk) =

@@ -39,7 +39,68 @@ pub(super) struct PendingSourcePreparation {
 enum SourcePreparationState {
     Unbound(Arc<crate::DfsSourceAdoptionSourceCapture>),
     Bound(PreparedSourceAdoption),
-    Revoked,
+    // Volatile ownership of terminal publication after an exact unclaimed
+    // cancellation. It grants no effect authority and serializes only rebind.
+    Terminalizing(Arc<CancelledSourcePreparation>),
+    Revoked {
+        // DATA from an actual guarded unclaimed-offer retirement. No writer,
+        // target admission or committed outcome is retained here.
+        cancelled: Option<Arc<CancelledSourcePreparation>>,
+    },
+}
+struct CancelledSourcePreparation {
+    plan: SourcePreparationPlan,
+    token: SourcePreparationToken,
+    prepared: PreparedSourceAdoption,
+    physical_scope: crate::publication_guard::DfsPublicationOwnerScope,
+    authority_generation: u64,
+    storage_generation: u64,
+}
+
+struct CancelledTerminalization {
+    pending: Arc<PendingSourcePreparation>,
+    cancelled: Arc<CancelledSourcePreparation>,
+}
+impl Drop for CancelledTerminalization {
+    fn drop(&mut self) {
+        let mut state = self
+            .pending
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if matches!(&*state, SourcePreparationState::Terminalizing(actual)
+            if Arc::ptr_eq(actual, &self.cancelled))
+        {
+            *state = SourcePreparationState::Revoked {
+                cancelled: Some(self.cancelled.clone()),
+            };
+        }
+    }
+}
+fn terminalization_blocks_job(
+    rows: &BTreeMap<String, Arc<PendingSourcePreparation>>,
+    job: &crate::DfsNamespaceJobRecord,
+) -> Result<bool> {
+    for pending in rows.values().filter(|pending| {
+        pending.plan.job.file_system_id == job.file_system_id
+            && pending.plan.job.job_id == job.job_id
+    }) {
+        if matches!(
+            &*pending
+                .state
+                .lock()
+                .map_err(|_| error("source preparation state poisoned"))?,
+            SourcePreparationState::Terminalizing(_)
+        ) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+fn terminalization_busy() -> MetadataBackendError {
+    MetadataBackendError::StatusUnavailable {
+        reason: "source preparation is settling its exact rejected adoption".into(),
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "state", content = "body", rename_all = "kebab-case")]
@@ -47,6 +108,55 @@ pub(crate) enum SourcePreparationRevocation {
     Revoked(SourcePreparationToken),
     Bound(PreparedSourceAdoption),
 }
+fn validate_cancelled_preparation_plan(
+    cancelled: &CancelledSourcePreparation,
+    current: &SourcePreparationPlan,
+) -> Result<()> {
+    // Comparison DATA only, never an input replacement or rebase. Preserve
+    // every original frame, cursor, object precondition, operation and owner;
+    // only the coordinator's error text and update timestamp may differ.
+    let mut compared = current.clone();
+    compared.job.updated_at = cancelled.plan.job.updated_at;
+    compared.job.failure_reason = cancelled.plan.job.failure_reason.clone();
+    if compared != cancelled.plan {
+        tracing::warn!(target: "sinomo.dfs.source_adoption",
+            request = %current.request_id,
+            job = %current.job.job_id,
+            original_token = ?cancelled.token,
+            pending_frames_equal = current.job.pending_frames == cancelled.plan.job.pending_frames,
+            processed_count_equal = current.job.processed_object_count == cancelled.plan.job.processed_object_count,
+            original_job = ?cancelled.plan.job,
+            current_job = ?current.job,
+            "cancelled source preparation rejected changed original job/body");
+        return Err(error(
+            "cancelled source retry changes original operation/body",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_cancelled_source_rows(
+    cancelled: &CancelledSourcePreparation,
+    current: &DfsCrossShardSourceFamily,
+) -> Result<()> {
+    // The fresh native writer determines its own actual cut; the old cancelled
+    // clock stays historical DATA. All original source rows must still match.
+    let rows = |family: &DfsCrossShardSourceFamily| -> Result<serde_json::Value> {
+        let mut data = serde_json::to_value(family).map_err(error)?;
+        data.as_object_mut()
+            .ok_or_else(|| error("cancelled source family is not a typed object"))?
+            .remove("source_journal_sequence")
+            .ok_or_else(|| error("cancelled source family has no actual source clock"))?;
+        Ok(data)
+    };
+    if rows(&cancelled.prepared.family)? != rows(current)? {
+        return Err(error(
+            "fresh source capture changes cancelled original source rows",
+        ));
+    }
+    Ok(())
+}
+
 impl PendingSourcePreparation {
     pub(super) fn holds_unbound(&self) -> Result<bool> {
         Ok(matches!(
@@ -59,6 +169,240 @@ impl PendingSourcePreparation {
     }
 }
 impl DfsSourceAdoptionActor {
+    fn rebind_capture_backend(
+        &self,
+        backend: &mut crate::LocalSobjMetadataBackend,
+        expected: &DfsMetadataShardConfig,
+    ) -> Result<()> {
+        let shard_id = crate::DfsMetadataShardId::new(&expected.shard_id);
+        if !backend.metadata_shard_instance_writes_frozen(&shard_id)? {
+            return Ok(());
+        }
+        // A newly opened capture owns no successor binding. Reuse the normal
+        // completed-handoff proof and exact-prefix check against the runtime's
+        // coherent configuration; an activated marker alone grants nothing.
+        let projection = self
+            .authority
+            .write_configuration_projection()
+            .map_err(error)?
+            .ok_or_else(|| error("source capture configuration unavailable"))?;
+        let entries = projection
+            .entries(crate::DFS_METADATA_AUTHORITY_PREFIX)
+            .ok_or_else(|| error("source capture configuration scope unavailable"))?;
+        let active_key = crate::metadata_shard_key(&expected.file_system_id, &expected.shard_id);
+        let active: Option<DfsMetadataShardConfig> = entries
+            .iter()
+            .find(|entry| entry.key == active_key)
+            .map(|entry| entry.decode())
+            .transpose()
+            .map_err(error)?;
+        if active.as_ref() != Some(expected) || expected.primary_node_id != self.node {
+            return Err(error("source capture cannot bind a different active shard"));
+        }
+        let pending_key = crate::metadata_shard_membership_handoff_key(
+            &expected.file_system_id,
+            &expected.shard_id,
+        );
+        let proof_key = crate::metadata_shard_membership_handoff_proof_key(
+            &expected.file_system_id,
+            &expected.shard_id,
+        );
+        let pending = entries
+            .iter()
+            .find(|entry| entry.key == pending_key)
+            .map(|entry| entry.decode())
+            .transpose()
+            .map_err(error)?;
+        let proof = entries
+            .iter()
+            .find(|entry| entry.key == proof_key)
+            .map(|entry| entry.decode())
+            .transpose()
+            .map_err(error)?;
+        if !crate::service_sync::rebind_completed_metadata_shard_membership_handoff(
+            backend,
+            &self.node,
+            expected,
+            pending.as_ref(),
+            proof.as_ref(),
+        )
+        .map_err(error)?
+        {
+            return Err(error("source capture has no completed exact handoff proof"));
+        }
+        Ok(())
+    }
+
+    pub(super) fn revoke_cancelled_bound_preparation(
+        &self,
+        offer: &DfsSourceAdoptionOffer,
+        physical_scope: crate::publication_guard::DfsPublicationOwnerScope,
+        authority_generation: u64,
+        storage_generation: u64,
+    ) -> Result<()> {
+        for actor in std::iter::once(self).chain(self.predecessors.iter().map(Arc::as_ref)) {
+            let preparations = actor
+                .source_preparations
+                .lock()
+                .map_err(|_| error("cancelled source preparations poisoned"))?;
+            for pending in preparations.values() {
+                let mut state = pending
+                    .state
+                    .lock()
+                    .map_err(|_| error("cancelled source preparation state poisoned"))?;
+                let SourcePreparationState::Bound(prepared) = &*state else {
+                    continue;
+                };
+                if prepared.offer != *offer {
+                    continue;
+                }
+                let cancelled = Arc::new(CancelledSourcePreparation {
+                    plan: pending.plan.clone(),
+                    token: pending.token.clone(),
+                    prepared: prepared.clone(),
+                    physical_scope: physical_scope.clone(),
+                    authority_generation,
+                    storage_generation,
+                });
+                *state = SourcePreparationState::Revoked {
+                    cancelled: Some(cancelled),
+                };
+            }
+        }
+        Ok(())
+    }
+    /// Existing volatile cancellation DATA can serialize a terminal attempt;
+    /// only the normal current native kernel may publish the Failed job.
+    pub(crate) fn finish_locally_cancelled_adoption(
+        &self,
+        request_id: &str,
+        job: &crate::DfsNamespaceJobRecord,
+        destination: &crate::DfsObjectMetadata,
+        source_path: &str,
+        physical_scope: &crate::publication_guard::DfsPublicationOwnerScope,
+        execution: &crate::publication_guard::DfsPublicationExecutionOwners,
+        finish: impl FnOnce() -> crate::posix_model::Result<()>,
+    ) -> crate::posix_model::Result<bool> {
+        if job.kind != crate::DfsNamespaceJobKind::RenameObjectAcrossShardPrimaries
+            || job.status != DfsNamespaceJobStatus::Running
+            || job.processed_object_count != 0
+            || job.root_path != source_path
+            || destination.kind != crate::DfsObjectKind::File
+        {
+            return Ok(false);
+        }
+        let preparations = self
+            .source_preparations
+            .lock()
+            .map_err(|_| error("source preparations poisoned"))?;
+        let Some(pending) = preparations.get(request_id).cloned() else {
+            return Ok(false);
+        };
+        let mut state = pending
+            .state
+            .lock()
+            .map_err(|_| error("source preparation state poisoned"))?;
+        let SourcePreparationState::Revoked {
+            cancelled: Some(cancelled),
+        } = &*state
+        else {
+            return Ok(false);
+        };
+        let cancelled = Arc::clone(cancelled);
+        for other in preparations.values().filter(|other| {
+            !Arc::ptr_eq(other, &pending)
+                && other.plan.job.file_system_id == job.file_system_id
+                && other.plan.job.job_id == job.job_id
+        }) {
+            if !matches!(
+                &*other
+                    .state
+                    .lock()
+                    .map_err(|_| error("source preparation state poisoned"))?,
+                SourcePreparationState::Revoked { .. }
+            ) {
+                return Ok(false);
+            }
+        }
+        for previous in &self.predecessors {
+            let rows = previous
+                .source_preparations
+                .lock()
+                .map_err(|_| error("retained source preparations poisoned"))?;
+            for other in rows.values().filter(|other| {
+                other.plan.job.file_system_id == job.file_system_id
+                    && other.plan.job.job_id == job.job_id
+            }) {
+                if !matches!(
+                    &*other
+                        .state
+                        .lock()
+                        .map_err(|_| error("retained source state poisoned"))?,
+                    SourcePreparationState::Revoked { .. }
+                ) {
+                    return Ok(false);
+                }
+            }
+        }
+        let offer = &cancelled.prepared.offer;
+        let plan = &cancelled.plan;
+        let mut current = plan.clone();
+        current.job = job.clone();
+        current.destination = destination.clone();
+        current.source_path = source_path.into();
+        current.request_id = request_id.into();
+        validate_cancelled_preparation_plan(&cancelled, &current)?;
+        if offer.source_node_id != self.node
+            || offer.job_offer.coordinator_node_id != self.node
+            || plan.source_config != plan.job_config
+            || plan.source_config.primary_node_id != self.node
+            || plan.destination != *destination
+            || plan.source_path != source_path
+            || cancelled.prepared.family.source_object.kind != crate::DfsObjectKind::File
+            || &cancelled.physical_scope != physical_scope
+            || self.authority.storage_generation() != cancelled.storage_generation
+            || self.authority.generation() != cancelled.authority_generation
+            || execution.data_root() != self.data_root
+            || !execution.admits(
+                physical_scope,
+                &job.file_system_id,
+                physical_scope.shard_id(),
+            )
+        {
+            return Ok(false);
+        }
+        self.validate_preparation_plan(&self.node, &current)?;
+        let owner = crate::runtime_host::publication_runtime_owner(physical_scope.root())
+            .map_err(error)?
+            .ok_or_else(|| error("cancelled source has no current native data owner"))?;
+        if !Arc::ptr_eq(&owner, &self._owner) {
+            return Ok(false);
+        }
+        let retired = self
+            .retired_jobs
+            .lock()
+            .map_err(|_| error("original job retirement poisoned"))?;
+        if !retired
+            .get(&offer.job_offer.session_id)
+            .is_some_and(|(actual, digest)| actual == offer && digest.is_none())
+        {
+            return Ok(false);
+        }
+        drop(retired);
+        *state = SourcePreparationState::Terminalizing(cancelled.clone());
+        let reservation = CancelledTerminalization {
+            pending: pending.clone(),
+            cancelled,
+        };
+        drop(state);
+        drop(preparations);
+        // An in-flight actual capture can now finish its existing relock and
+        // release its writer. No mutex is held while native publication waits.
+        let result = finish();
+        drop(reservation);
+        result.map(|()| true)
+    }
+
     pub(super) fn revoke_unbound_preparation(
         &self,
         caller: &NodeId,
@@ -95,14 +439,15 @@ impl DfsSourceAdoptionActor {
             SourcePreparationState::Bound(prepared) => {
                 return Ok(SourcePreparationRevocation::Bound(prepared.clone()));
             }
-            SourcePreparationState::Revoked => {
+            SourcePreparationState::Revoked { .. } => {
                 return Ok(SourcePreparationRevocation::Revoked(token.clone()));
             }
+            SourcePreparationState::Terminalizing(_) => return Err(terminalization_busy()),
             SourcePreparationState::Unbound(_) => {}
         }
         // The same lock serializes revocation against all offer construction.
         // This drops only the unbound actual writer, never a target witness.
-        *state = SourcePreparationState::Revoked;
+        *state = SourcePreparationState::Revoked { cancelled: None };
         RETAINED
             .get_or_init(Default::default)
             .lock()
@@ -144,24 +489,61 @@ impl DfsSourceAdoptionActor {
             .source_preparations
             .lock()
             .map_err(|_| error("source preparation poisoned"))?;
-        if let Some(existing) = preparations.get(&plan.request_id) {
-            if existing.plan != plan {
-                return Err(error(
-                    "local source retry changed its complete preparation plan",
-                ));
+        if terminalization_blocks_job(&preparations, &plan.job)? {
+            return Err(terminalization_busy());
+        }
+        for previous in &self.predecessors {
+            let rows = previous
+                .source_preparations
+                .lock()
+                .map_err(|_| error("retained source preparations poisoned"))?;
+            if terminalization_blocks_job(&rows, &plan.job)? {
+                return Err(terminalization_busy());
             }
-            match &*existing
+        }
+        if let Some(existing) = preparations.get(&plan.request_id) {
+            let state = existing
                 .state
                 .lock()
-                .map_err(|_| error("source preparation state poisoned"))?
-            {
-                SourcePreparationState::Bound(prepared) => return Ok(prepared.offer.clone()),
+                .map_err(|_| error("source preparation state poisoned"))?;
+            match &*state {
+                SourcePreparationState::Terminalizing(_) => return Err(terminalization_busy()),
+                SourcePreparationState::Revoked {
+                    cancelled: Some(cancelled),
+                } => {
+                    validate_cancelled_preparation_plan(cancelled, &plan)?;
+                    validate_cancelled_source_rows(cancelled, capture.family())?;
+                }
+                SourcePreparationState::Revoked { cancelled: None } => {
+                    if existing.plan != plan {
+                        #[cfg(test)]
+                        tracing::warn!(target: "sinomo.dfs.source_adoption",
+                            original_plan = ?existing.plan,
+                            current_plan = ?plan,
+                            "local unbound-revoked source guard rejected different complete plan");
+                        return Err(error(
+                            "local source retry changed its complete preparation plan",
+                        ));
+                    }
+                }
+                SourcePreparationState::Bound(prepared) => {
+                    if existing.plan != plan {
+                        return Err(error(
+                            "local source retry changed its complete preparation plan",
+                        ));
+                    }
+                    return Ok(prepared.offer.clone());
+                }
                 SourcePreparationState::Unbound(_) => {
+                    if existing.plan != plan {
+                        return Err(error(
+                            "local source retry changed its complete preparation plan",
+                        ));
+                    }
                     return Err(error(
                         "local source phase already owns an unbound preparation",
                     ));
                 }
-                SourcePreparationState::Revoked => {}
             }
         }
         let (source_capture, job_capture) = capture.into_parts();
@@ -227,6 +609,12 @@ impl DfsSourceAdoptionActor {
             .map_err(|_| error("source preparation state poisoned"))?
         {
             SourcePreparationState::Bound(prepared) => prepared.clone(),
+            SourcePreparationState::Revoked {
+                cancelled: Some(cancelled),
+            } => {
+                validate_cancelled_preparation_plan(cancelled, plan)?;
+                return Ok(None);
+            }
             _ => return Ok(None),
         };
         if pending.plan == *plan {
@@ -501,10 +889,23 @@ impl DfsSourceAdoptionActor {
         plan: SourcePreparationPlan,
     ) -> Result<SourcePreparationToken> {
         self.validate_preparation_plan(caller, &plan)?;
+        let mut cancelled = None;
         let mut pending = self
             .source_preparations
             .lock()
             .map_err(|_| error("source preparation poisoned"))?;
+        if terminalization_blocks_job(&pending, &plan.job)? {
+            return Err(terminalization_busy());
+        }
+        for previous in &self.predecessors {
+            let rows = previous
+                .source_preparations
+                .lock()
+                .map_err(|_| error("retained source preparations poisoned"))?;
+            if terminalization_blocks_job(&rows, &plan.job)? {
+                return Err(terminalization_busy());
+            }
+        }
         if !pending.contains_key(&plan.request_id) {
             for previous in &self.predecessors {
                 let mut old = previous
@@ -512,15 +913,21 @@ impl DfsSourceAdoptionActor {
                     .lock()
                     .map_err(|_| error("retained source preparations poisoned"))?;
                 if let Some(existing) = old.get(&plan.request_id).cloned() {
-                    if matches!(
-                        *existing
-                            .state
-                            .lock()
-                            .map_err(|_| error("retained source state poisoned"))?,
-                        SourcePreparationState::Revoked
-                    ) {
+                    let state = existing
+                        .state
+                        .lock()
+                        .map_err(|_| error("retained source state poisoned"))?;
+                    if matches!(&*state, SourcePreparationState::Terminalizing(_)) {
+                        return Err(terminalization_busy());
+                    }
+                    if let SourcePreparationState::Revoked { cancelled: old } = &*state {
+                        if let Some(old) = old {
+                            validate_cancelled_preparation_plan(old, &plan)?;
+                            cancelled = Some(Arc::clone(old));
+                        }
                         continue;
                     }
+                    drop(state);
                     if existing.plan != plan {
                         return Err(error(
                             "retained source preparation changed its complete plan",
@@ -538,14 +945,23 @@ impl DfsSourceAdoptionActor {
                 .state
                 .lock()
                 .map_err(|_| error("source preparation state poisoned"))?;
-            if !matches!(*state, SourcePreparationState::Revoked) {
+            if matches!(&*state, SourcePreparationState::Terminalizing(_)) {
+                return Err(terminalization_busy());
+            }
+            if !matches!(*state, SourcePreparationState::Revoked { .. }) {
                 if existing.plan != plan {
                     return Err(error("source preparation retry changed its complete plan"));
                 }
                 return Ok(existing.token.clone());
             }
+            if let SourcePreparationState::Revoked { cancelled: old } = &*state {
+                if let Some(old) = old {
+                    validate_cancelled_preparation_plan(old, &plan)?;
+                    cancelled = Some(Arc::clone(old));
+                }
+            }
             drop(state);
-            pending.remove(&plan.request_id);
+            // Retain the cancelled DATA until a fresh real capture succeeds.
         }
         drop(pending);
         let root = crate::default_dfs_metadata_shards_root(
@@ -558,6 +974,7 @@ impl DfsSourceAdoptionActor {
             crate::DfsMetadataShardId::new(&plan.source_config.shard_id),
             root,
         )?;
+        self.rebind_capture_backend(&mut backend, &plan.source_config)?;
         let capture = backend
             .capture_source_adoption_source(&plan.destination.object_id, &plan.source_path)?;
         if plan
@@ -568,6 +985,9 @@ impl DfsSourceAdoptionActor {
             return Err(error("actual source head changed before remote capture"));
         }
         self.validate_preparation_plan(caller, &plan)?;
+        if let Some(cancelled) = &cancelled {
+            validate_cancelled_source_rows(cancelled, capture.family())?;
+        }
         let token = SourcePreparationToken {
             request_id: plan.request_id.clone(),
             capture_id: sinomo_core::Id::generate().to_string(),
@@ -577,16 +997,40 @@ impl DfsSourceAdoptionActor {
             source_node_id: self.node.clone(),
             prefix: capture.prefix().clone(),
         };
+        #[cfg(any(test, feature = "test-support"))]
+        crate::source_adoption_test::capture_preparation_and_pause(
+            &self.data_root,
+            crate::source_adoption_test::DfsSourcePausePoint::BeforeSourceRegistration,
+            &plan,
+            &token,
+            None,
+            &self.runtime,
+        );
         let mut pending = self
             .source_preparations
             .lock()
             .map_err(|_| error("source preparation poisoned"))?;
+        if terminalization_blocks_job(&pending, &plan.job)? {
+            return Err(terminalization_busy());
+        }
+        for previous in &self.predecessors {
+            let rows = previous
+                .source_preparations
+                .lock()
+                .map_err(|_| error("retained source preparations poisoned"))?;
+            if terminalization_blocks_job(&rows, &plan.job)? {
+                return Err(terminalization_busy());
+            }
+        }
         if let Some(existing) = pending.get(&plan.request_id) {
             let state = existing
                 .state
                 .lock()
                 .map_err(|_| error("source preparation state poisoned"))?;
-            if !matches!(*state, SourcePreparationState::Revoked) {
+            if matches!(&*state, SourcePreparationState::Terminalizing(_)) {
+                return Err(terminalization_busy());
+            }
+            if !matches!(*state, SourcePreparationState::Revoked { .. }) {
                 if existing.plan != plan {
                     return Err(error(
                         "source preparation changed while its actual writer queued",
@@ -672,7 +1116,8 @@ impl DfsSourceAdoptionActor {
                 }
                 return Ok(existing.clone());
             }
-            SourcePreparationState::Revoked => {
+            SourcePreparationState::Terminalizing(_) => return Err(terminalization_busy()),
+            SourcePreparationState::Revoked { .. } => {
                 return Err(error(
                     "source preparation was atomically revoked before binding",
                 ));
@@ -782,6 +1227,7 @@ impl DfsSourceAdoptionActor {
                     crate::DfsMetadataShardId::new(&plan.job_config.shard_id),
                     root,
                 )?;
+                self.rebind_capture_backend(&mut backend, &plan.job_config)?;
                 let capture = backend.capture_source_adoption_job(&plan.job.job_id)?;
                 if capture.job() != &plan.job {
                     return Err(error(
@@ -923,6 +1369,90 @@ mod genuine_source_first_tests {
     use super::*;
     use std::time::Duration;
 
+    fn source_first_local_owned_options(
+        native: &crate::test_support::DfsTestRuntime,
+        nested: &DfsMetadataShardConfig,
+        directory: &crate::DfsStat,
+    ) -> crate::DfsWriteOptions {
+        let inspector = native.metadata_primary_service(&directory.path).unwrap();
+        let object = inspector
+            .metadata_backend()
+            .expect("actual owning shard backend")
+            .get_object(&directory.object_id)
+            .unwrap()
+            .expect("the actual declared genesis directory");
+        assert_eq!(object.file_system_id, nested.file_system_id);
+        assert_eq!(object.path, directory.path);
+        assert_eq!(object.kind, crate::DfsObjectKind::Directory);
+        assert_eq!(object.policy, sinomo_core::DfsObjectPolicy::LocalOwned);
+        assert_eq!(object.owner_node_id, nested.primary_node_id);
+        assert_eq!(object.current_locations, vec![object.owner_node_id.clone()]);
+        assert_eq!(directory.policy, object.policy);
+        assert_eq!(directory.current_locations, object.current_locations);
+        // This is the stored content owner, not the later Root coordinator.
+        // Normal LocalOwned validation and durable commit remain enabled.
+        crate::DfsWriteOptions {
+            policy: crate::DfsReplicationPolicy::new(1, 1).unwrap(),
+            replica_candidates: vec![object.owner_node_id],
+            wait_for_commit: true,
+            foreground_replica_repair: true,
+        }
+    }
+
+    // Keep this fixture's source-before-job order explicit. Native default
+    // reconciliation preserves the activated assignment, so constructor node
+    // order alone does not select the actual Root coordinator.
+    fn source_first_coordinator_and_target(
+        native: &crate::test_support::DfsTestRuntime,
+        nested: &DfsMetadataShardConfig,
+        nodes: &[NodeId],
+    ) -> (NodeId, NodeId) {
+        let configs = native.metadata_shards().unwrap();
+        let root = configs
+            .iter()
+            .find(|cfg| cfg.shard_id == "root")
+            .unwrap()
+            .clone();
+        let activated = if nested.primary_node_id < root.primary_node_id {
+            root
+        } else {
+            let primary = nodes
+                .iter()
+                .find(|node| **node > nested.primary_node_id)
+                .expect("a real later node for the source-first coordinator")
+                .clone();
+            let replicas = std::iter::once(root.primary_node_id.clone())
+                .chain(root.replica_node_ids.iter().cloned())
+                .filter(|node| *node != primary)
+                .collect();
+            native
+                .reassign_metadata_shard(&root.file_system_id, &root.shard_id, primary, replicas)
+                .unwrap()
+        };
+        let configs = native.metadata_shards().unwrap();
+        assert_eq!(
+            configs.iter().find(|cfg| cfg.shard_id == "root"),
+            Some(&activated),
+            "the genuine primary handoff must have activated before the operation"
+        );
+        assert_eq!(
+            configs.iter().find(|cfg| cfg.shard_id == nested.shard_id),
+            Some(nested),
+            "the original nested source assignment stays exact"
+        );
+        assert!(nested.primary_node_id < activated.primary_node_id);
+        let mut progress = native.client(&activated.primary_node_id).unwrap();
+        progress.posix_mkdir("/source-capture-progress").unwrap();
+        drop(progress);
+        let target = configs
+            .iter()
+            .find(|cfg| cfg.shard_id == "users")
+            .unwrap()
+            .primary_node_id
+            .clone();
+        (activated.primary_node_id, target)
+    }
+
     #[test]
     fn actual_source_first_bound_offer_survives_exact_revocation() {
         let name = "native-source-first-bind-revoke";
@@ -932,37 +1462,46 @@ mod genuine_source_first_tests {
             native.define_node(node.clone()).unwrap();
         }
         native.start_nodes().unwrap();
+        // The normal native genesis already defines this real node's parent
+        // and files directory. Declare the empty physical source shard over
+        // that exact genesis root; never create a directory/parent across two
+        // physical writers or copy a pre-existing file into the new shard.
+        let from_path = crate::sifs_node_path(&nodes[0]);
+        let source_path = crate::sifs_node_files_path(&nodes[0]);
         let nested = native
-            .bootstrap_empty_metadata_prefix("native-deep-source", "/services/source-first/deep")
+            .bootstrap_empty_metadata_prefix("native-deep-source", &source_path)
             .unwrap();
-        let configs = native.metadata_shards().unwrap();
-        let coordinator = configs
-            .iter()
-            .find(|cfg| cfg.shard_id == "services")
-            .unwrap()
-            .primary_node_id
-            .clone();
-        let target = configs
-            .iter()
-            .find(|cfg| cfg.shard_id == "users")
-            .unwrap()
-            .primary_node_id
-            .clone();
-        assert!(nested.primary_node_id < coordinator);
-        let mut requester = native.client(&nodes[0]).unwrap();
-        let from = "/services/source-first";
+        let mut seed = native.client(&nodes[0]).unwrap();
+        let from = from_path.as_str();
         let to = "/users/source-first";
-        requester.posix_mkdir_all(&format!("{from}/deep")).unwrap();
-        let original = requester
+        let source_directory = seed.posix_stat_distributed(&source_path).unwrap();
+        assert_eq!(source_directory.kind, crate::DfsObjectKind::Directory);
+        assert_eq!(source_directory.path, source_path);
+        let original = seed
             .posix_write_file(
-                &format!("{from}/deep/child.bin"),
+                &format!("{from}/files/child.bin"),
                 b"actual source-first bytes",
-                crate::DfsWriteOptions::replicated_eventual(nodes.clone()),
+                source_first_local_owned_options(&native, &nested, &source_directory),
             )
             .unwrap();
-        let source_directory = requester
-            .posix_stat_distributed(&format!("{from}/deep"))
-            .unwrap();
+        assert_eq!(original.policy, sinomo_core::DfsObjectPolicy::LocalOwned);
+        assert_eq!(
+            original.current_locations,
+            source_directory.current_locations
+        );
+        assert_eq!(
+            seed.posix_read_file_distributed(&format!("{from}/files/child.bin"))
+                .unwrap(),
+            b"actual source-first bytes"
+        );
+        assert_eq!(
+            seed.posix_stat_distributed(&source_path).unwrap().object_id,
+            source_directory.object_id
+        );
+        drop(seed);
+        let (coordinator, target) = source_first_coordinator_and_target(&native, &nested, &nodes);
+        assert!(nested.primary_node_id < coordinator);
+        let mut requester = native.client(&nodes[0]).unwrap();
         let source_pause = native
             .pause_source_preparation(
                 &coordinator,
@@ -1039,18 +1578,40 @@ mod genuine_source_first_tests {
         let mut reader = native.client(&nodes[2]).unwrap();
         assert_eq!(
             reader
-                .posix_stat_distributed(&format!("{to}/deep/child.bin"))
+                .posix_stat_distributed(&format!("{to}/files/child.bin"))
                 .unwrap()
                 .object_id,
             original.object_id
         );
         assert_eq!(
             reader
-                .posix_read_file_distributed(&format!("{to}/deep/child.bin"))
+                .posix_read_file_distributed(&format!("{to}/files/child.bin"))
                 .unwrap(),
             b"actual source-first bytes"
         );
         drop(reader);
+        let observations = native.rpc_observations();
+        let source_calls = observations
+            .iter()
+            .filter(|event| {
+                event.origin == crate::test_runtime::RpcOrigin::RegisteredHost
+                    && event.phase == crate::test_runtime::RpcPhase::BeforeDispatch
+                    && (event.route == SOURCE_ADOPTION_ROUTE
+                        || event.route == "/dfs/data/namespace")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            source_calls
+                .iter()
+                .any(|event| event.route == SOURCE_ADOPTION_ROUTE)
+        );
+        assert!(
+            source_calls
+                .iter()
+                .all(|event| event.options.destination_process_affinity()
+                    == sinomo_core::network::DestinationProcessAffinity::MainDaemon),
+            "source custody and target publication must reach Main when a node also has a shadow"
+        );
         assert_eq!(native.observation_dropped_count(), 0);
         native.close().unwrap();
     }
@@ -1063,37 +1624,46 @@ mod genuine_source_first_tests {
             native.define_node(node.clone()).unwrap();
         }
         native.start_nodes().unwrap();
+        // The normal native genesis already defines this real node's parent
+        // and files directory. Declare the empty physical source shard over
+        // that exact genesis root; never create a directory/parent across two
+        // physical writers or copy a pre-existing file into the new shard.
+        let from_path = crate::sifs_node_path(&nodes[0]);
+        let source_path = crate::sifs_node_files_path(&nodes[0]);
         let nested = native
-            .bootstrap_empty_metadata_prefix("native-deep-source", "/services/source-first/deep")
+            .bootstrap_empty_metadata_prefix("native-deep-source", &source_path)
             .unwrap();
-        let configs = native.metadata_shards().unwrap();
-        let coordinator = configs
-            .iter()
-            .find(|cfg| cfg.shard_id == "services")
-            .unwrap()
-            .primary_node_id
-            .clone();
-        let target = configs
-            .iter()
-            .find(|cfg| cfg.shard_id == "users")
-            .unwrap()
-            .primary_node_id
-            .clone();
-        assert!(nested.primary_node_id < coordinator);
-        let mut requester = native.client(&nodes[0]).unwrap();
-        let from = "/services/source-first";
+        let mut seed = native.client(&nodes[0]).unwrap();
+        let from = from_path.as_str();
         let to = "/users/source-first";
-        requester.posix_mkdir_all(&format!("{from}/deep")).unwrap();
-        let original = requester
+        let source_directory = seed.posix_stat_distributed(&source_path).unwrap();
+        assert_eq!(source_directory.kind, crate::DfsObjectKind::Directory);
+        assert_eq!(source_directory.path, source_path);
+        let original = seed
             .posix_write_file(
-                &format!("{from}/deep/child.bin"),
+                &format!("{from}/files/child.bin"),
                 b"actual source-first bytes",
-                crate::DfsWriteOptions::replicated_eventual(nodes.clone()),
+                source_first_local_owned_options(&native, &nested, &source_directory),
             )
             .unwrap();
-        let source_directory = requester
-            .posix_stat_distributed(&format!("{from}/deep"))
-            .unwrap();
+        assert_eq!(original.policy, sinomo_core::DfsObjectPolicy::LocalOwned);
+        assert_eq!(
+            original.current_locations,
+            source_directory.current_locations
+        );
+        assert_eq!(
+            seed.posix_read_file_distributed(&format!("{from}/files/child.bin"))
+                .unwrap(),
+            b"actual source-first bytes"
+        );
+        assert_eq!(
+            seed.posix_stat_distributed(&source_path).unwrap().object_id,
+            source_directory.object_id
+        );
+        drop(seed);
+        let (coordinator, target) = source_first_coordinator_and_target(&native, &nested, &nodes);
+        assert!(nested.primary_node_id < coordinator);
+        let mut requester = native.client(&nodes[0]).unwrap();
         let source_pause = native
             .pause_source_preparation(
                 &coordinator,
@@ -1168,21 +1738,21 @@ mod genuine_source_first_tests {
         drop(bind_pause);
         let mut reader = native.client(&nodes[0]).unwrap();
         reader
-            .posix_mkdir_all("/services/unbound-job-writer-progress")
+            .posix_mkdir("/source-capture-progress/after")
             .unwrap();
         reader
             .posix_rename_with_operation_id(from, to, &operation)
             .unwrap();
         assert_eq!(
             reader
-                .posix_stat_distributed(&format!("{to}/deep/child.bin"))
+                .posix_stat_distributed(&format!("{to}/files/child.bin"))
                 .unwrap()
                 .object_id,
             original.object_id
         );
         assert_eq!(
             reader
-                .posix_read_file_distributed(&format!("{to}/deep/child.bin"))
+                .posix_read_file_distributed(&format!("{to}/files/child.bin"))
                 .unwrap(),
             b"actual source-first bytes"
         );
@@ -1199,37 +1769,46 @@ mod genuine_source_first_tests {
             native.define_node(node.clone()).unwrap();
         }
         native.start_nodes().unwrap();
+        // The normal native genesis already defines this real node's parent
+        // and files directory. Declare the empty physical source shard over
+        // that exact genesis root; never create a directory/parent across two
+        // physical writers or copy a pre-existing file into the new shard.
+        let from_path = crate::sifs_node_path(&nodes[0]);
+        let source_path = crate::sifs_node_files_path(&nodes[0]);
         let nested = native
-            .bootstrap_empty_metadata_prefix("native-deep-source", "/services/source-first/deep")
+            .bootstrap_empty_metadata_prefix("native-deep-source", &source_path)
             .unwrap();
-        let configs = native.metadata_shards().unwrap();
-        let coordinator = configs
-            .iter()
-            .find(|cfg| cfg.shard_id == "services")
-            .unwrap()
-            .primary_node_id
-            .clone();
-        let target = configs
-            .iter()
-            .find(|cfg| cfg.shard_id == "users")
-            .unwrap()
-            .primary_node_id
-            .clone();
-        assert!(nested.primary_node_id < coordinator);
-        let mut requester = native.client(&nodes[0]).unwrap();
-        let from = "/services/source-first";
+        let mut seed = native.client(&nodes[0]).unwrap();
+        let from = from_path.as_str();
         let to = "/users/source-first";
-        requester.posix_mkdir_all(&format!("{from}/deep")).unwrap();
-        let original = requester
+        let source_directory = seed.posix_stat_distributed(&source_path).unwrap();
+        assert_eq!(source_directory.kind, crate::DfsObjectKind::Directory);
+        assert_eq!(source_directory.path, source_path);
+        let original = seed
             .posix_write_file(
-                &format!("{from}/deep/child.bin"),
+                &format!("{from}/files/child.bin"),
                 b"actual source-first bytes",
-                crate::DfsWriteOptions::replicated_eventual(nodes.clone()),
+                source_first_local_owned_options(&native, &nested, &source_directory),
             )
             .unwrap();
-        let source_directory = requester
-            .posix_stat_distributed(&format!("{from}/deep"))
-            .unwrap();
+        assert_eq!(original.policy, sinomo_core::DfsObjectPolicy::LocalOwned);
+        assert_eq!(
+            original.current_locations,
+            source_directory.current_locations
+        );
+        assert_eq!(
+            seed.posix_read_file_distributed(&format!("{from}/files/child.bin"))
+                .unwrap(),
+            b"actual source-first bytes"
+        );
+        assert_eq!(
+            seed.posix_stat_distributed(&source_path).unwrap().object_id,
+            source_directory.object_id
+        );
+        drop(seed);
+        let (coordinator, target) = source_first_coordinator_and_target(&native, &nested, &nodes);
+        assert!(nested.primary_node_id < coordinator);
+        let mut requester = native.client(&nodes[0]).unwrap();
         let source_pause = native
             .pause_source_preparation(
                 &coordinator,
@@ -1334,7 +1913,7 @@ mod genuine_source_first_tests {
         let mut reader = native.client(&nodes[0]).unwrap();
         if revoked_first {
             reader
-                .posix_mkdir_all("/services/unbound-job-writer-progress")
+                .posix_mkdir("/source-capture-progress/after")
                 .unwrap();
             reader
                 .posix_rename_with_operation_id(from, to, &operation)
@@ -1342,14 +1921,14 @@ mod genuine_source_first_tests {
         }
         assert_eq!(
             reader
-                .posix_stat_distributed(&format!("{to}/deep/child.bin"))
+                .posix_stat_distributed(&format!("{to}/files/child.bin"))
                 .unwrap()
                 .object_id,
             original.object_id
         );
         assert_eq!(
             reader
-                .posix_read_file_distributed(&format!("{to}/deep/child.bin"))
+                .posix_read_file_distributed(&format!("{to}/files/child.bin"))
                 .unwrap(),
             b"actual source-first bytes"
         );
@@ -1382,7 +1961,7 @@ mod actual_unbound_capture_tests {
             .unwrap();
         let pause = native.pause_remote_namespace_phase(&node).unwrap();
         let mut source_client = native.client(&node).unwrap();
-        std::thread::scope(|scope| {
+        let original_origin = std::thread::scope(|scope| {
             let original = scope.spawn(move || requester.posix_rename(from, to));
             let captured = pause.wait_captured(Duration::from_secs(5)).unwrap();
             let crate::DfsNetworkMessage::NamespaceRequest(command) =
@@ -1421,6 +2000,37 @@ mod actual_unbound_capture_tests {
                 .unwrap();
                 native.rpc_request(&node, &node, rpc, Duration::from_secs(5))
             };
+            let original_pending = actor
+                .source_preparations
+                .lock()
+                .unwrap()
+                .values()
+                .find(|pending| {
+                    matches!(
+                        &*pending.state.lock().unwrap(),
+                        SourcePreparationState::Bound(prepared) if prepared.offer == *source_offer
+                    )
+                })
+                .cloned()
+                .expect("same actual native Bound source preparation");
+            let original_plan = original_pending.plan.clone();
+            let original_token = original_pending.token.clone();
+            let mut unknown = source_offer.clone();
+            unknown.session_id = sinomo_core::Id::generate().to_string();
+            let no_effect = call(&DfsSourceAdoptionRequest::CancelUnclaimed {
+                offer: unknown.clone(),
+            })
+            .unwrap()
+            .decode_body::<DfsSourceAdoptionRpcResponse>()
+            .unwrap();
+            assert!(
+                matches!(no_effect, DfsSourceAdoptionRpcResponse::SourceCancelled { offer } if offer == unknown)
+            );
+            assert!(
+                matches!(&*original_pending.state.lock().unwrap(),
+                SourcePreparationState::Bound(prepared) if prepared.offer == *source_offer),
+                "idempotent unknown cancellation is no proof against this real Bound offer"
+            );
             let cancelled = call(&DfsSourceAdoptionRequest::CancelUnclaimed {
                 offer: source_offer.clone(),
             })
@@ -1430,17 +2040,201 @@ mod actual_unbound_capture_tests {
             assert!(
                 matches!(cancelled, DfsSourceAdoptionRpcResponse::SourceCancelled { offer } if offer == *source_offer)
             );
-            let plan = SourcePreparationPlan {
-                request_id: sinomo_core::Id::generate().to_string(),
-                job,
-                job_config: source_offer.job_offer.job_config.clone(),
-                source_config: source_offer.source_config.clone(),
-                target_config: source_offer.target_config.clone(),
-                destination: source_offer.destination.clone(),
-                source_path: source_path.clone(),
-                expected_source: Some(expected),
-                transfer_id: source_offer.transfer_id.clone(),
+            let cancelled_data = match &*original_pending.state.lock().unwrap() {
+                SourcePreparationState::Revoked {
+                    cancelled: Some(data),
+                } => Arc::clone(data),
+                _ => panic!("actual exact unclaimed retirement revokes its Bound memo"),
             };
+            assert_eq!(cancelled_data.plan, original_plan);
+            assert_eq!(cancelled_data.token, original_token);
+            assert_eq!(cancelled_data.prepared.offer, *source_offer);
+            assert_eq!(cancelled_data.plan.job, job);
+            assert_eq!(cancelled_data.prepared.family.source_object, expected);
+            let inspected = call(&DfsSourceAdoptionRequest::InspectSourcePreparation {
+                plan: original_plan.clone(),
+            })
+            .unwrap()
+            .decode_body::<DfsSourceAdoptionRpcResponse>()
+            .unwrap();
+            assert!(
+                matches!(
+                    inspected,
+                    DfsSourceAdoptionRpcResponse::SourcePreparationInspected { prepared: None }
+                ),
+                "cancelled DATA is not a live offer or a committed adoption"
+            );
+            assert!(!original_plan.job.pending_frames.is_empty());
+            let mut changed = original_plan.clone();
+            changed.job.pending_frames.clear();
+            assert!(
+                matches!(validate_cancelled_preparation_plan(&cancelled_data, &changed),
+                Err(MetadataBackendError::Serde(message)) if message == "source adoption custody: cancelled source retry changes original operation/body"),
+                "changed original semantic frames fail the SAME production comparison"
+            );
+            let mut changed = original_plan.clone();
+            changed.expected_source.as_mut().unwrap().version = crate::DfsVersion::generate();
+            assert!(
+                matches!(validate_cancelled_preparation_plan(&cancelled_data, &changed),
+                Err(MetadataBackendError::Serde(message)) if message == "source adoption custody: cancelled source retry changes original operation/body"),
+                "changed original source precondition cannot recapture under the old phase ID"
+            );
+            let mut changed_family = cancelled_data.prepared.family.clone();
+            changed_family.source_object.version = crate::DfsVersion::generate();
+            assert!(
+                matches!(validate_cancelled_source_rows(&cancelled_data, &changed_family),
+                Err(MetadataBackendError::Serde(message)) if message == "source adoption custody: fresh source capture changes cancelled original source rows")
+            );
+            // A genuine fresh native capture already owns its writer before
+            // this reservation. Its existing relock must release that capture,
+            // rather than rebind or wait on a terminalizer needing the writer.
+            let registration = native
+                .pause_source_preparation(
+                    &node,
+                    crate::source_adoption_test::DfsSourcePausePoint::BeforeSourceRegistration,
+                )
+                .unwrap();
+            let mut current = native.metadata_primary_service(from).unwrap();
+            let scope = crate::DfsPreparedOperationScope {
+                file_system_id: original_plan.job.file_system_id.clone(),
+                shard_id: crate::DfsMetadataShardId::new(&original_plan.job_config.shard_id),
+                owner_epoch: original_plan.job_config.epoch,
+                operation_id: "test.cancelled-terminalization-owned-scope".into(),
+            };
+            let ownership = current.acquire_prepared_execution(&scope).unwrap();
+            let execution = current
+                .publication_execution
+                .current()
+                .expect("actual native Core provider admission");
+            let physical = current
+                .metadata_backend()
+                .unwrap()
+                .publication_owner_scope(&scope.file_system_id, &scope.shard_id)
+                .unwrap();
+            let mut progressed = original_plan.job.clone();
+            progressed.processed_object_count = 1;
+            assert!(
+                !actor
+                    .finish_locally_cancelled_adoption(
+                        &original_plan.request_id,
+                        &progressed,
+                        &original_plan.destination,
+                        &original_plan.source_path,
+                        &physical,
+                        &execution,
+                        || panic!("an earlier-effect job cannot enter terminal publication")
+                    )
+                    .unwrap()
+            );
+            assert!(
+                !actor
+                    .finish_locally_cancelled_adoption(
+                        "missing-native-cancellation",
+                        &original_plan.job,
+                        &original_plan.destination,
+                        &original_plan.source_path,
+                        &physical,
+                        &execution,
+                        || panic!("absence cannot enter terminal publication")
+                    )
+                    .unwrap()
+            );
+            let mut directory = original_plan.destination.clone();
+            directory.kind = crate::DfsObjectKind::Directory;
+            assert!(
+                !actor
+                    .finish_locally_cancelled_adoption(
+                        &original_plan.request_id,
+                        &original_plan.job,
+                        &directory,
+                        &original_plan.source_path,
+                        &physical,
+                        &execution,
+                        || panic!(
+                            "a directory generation cannot enter single-file terminal publication"
+                        )
+                    )
+                    .unwrap()
+            );
+            std::thread::scope(|race| {
+                let actor = Arc::clone(&actor);
+                let source = node.clone();
+                let actual_plan = original_plan.clone();
+                let mut capture =
+                    Some(race.spawn(move || actor.acquire_remote_source(&source, actual_plan)));
+                let held = registration.wait_preparation(Duration::from_secs(5));
+                let result = if held.is_ok() {
+                    actor_for_root(&native.data_dir(&node).root()).unwrap().finish_locally_cancelled_adoption(
+                        &original_plan.request_id, &original_plan.job, &original_plan.destination,
+                        &original_plan.source_path, &physical, &execution,
+                        || {
+                            registration.release();
+                            let denied = capture.take().unwrap().join().unwrap();
+                            assert!(matches!(denied, Err(MetadataBackendError::StatusUnavailable { reason })
+                                if reason == "source preparation is settling its exact rejected adoption"));
+                            let writable = current.metadata_backend.as_mut().unwrap()
+                                .capture_source_adoption_source(&original_plan.destination.object_id,
+                                    &original_plan.source_path).unwrap();
+                            assert_eq!(writable.family().source_object, expected);
+                            drop(writable);
+                            Err(crate::DfsPosixError::Conflict {
+                                path: from.into(), reason: "native failed-terminal-publication control".into(),
+                            })
+                        },
+                    )
+                } else {
+                    Err(crate::DfsPosixError::Dfs(crate::DfsError::Metadata {
+                        message: format!("native post-capture boundary unavailable: {held:?}"),
+                    }))
+                };
+                registration.release();
+                if let Some(capture) = capture {
+                    let _ = capture.join();
+                }
+                let held = held.expect("actual fresh writer reached post-capture registration");
+                assert_eq!(held.plan, original_plan);
+                assert_ne!(held.token.capture_id, original_token.capture_id);
+                assert!(
+                    matches!(result, Err(crate::DfsPosixError::Conflict { reason, .. })
+                    if reason == "native failed-terminal-publication control")
+                );
+            });
+            assert!(matches!(&*original_pending.state.lock().unwrap(),
+                SourcePreparationState::Revoked { cancelled: Some(actual) }
+                    if Arc::ptr_eq(actual, &cancelled_data)));
+            assert_eq!(
+                current
+                    .metadata_backend()
+                    .unwrap()
+                    .get_namespace_job(&job.job_id)
+                    .unwrap(),
+                Some(job.clone())
+            );
+            let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                actor.finish_locally_cancelled_adoption(
+                    &original_plan.request_id,
+                    &original_plan.job,
+                    &original_plan.destination,
+                    &original_plan.source_path,
+                    &physical,
+                    &execution,
+                    || panic!("native terminal reservation unwind control"),
+                )
+            }));
+            assert!(unwind.is_err());
+            assert!(matches!(&*original_pending.state.lock().unwrap(),
+                SourcePreparationState::Revoked { cancelled: Some(actual) }
+                    if Arc::ptr_eq(actual, &cancelled_data)));
+            drop(execution);
+            drop(ownership);
+            drop(current);
+            drop(registration);
+            // This is an independent unbound-capture control, as in the
+            // original native test. Mint its own ID once before its first RPC;
+            // never replace the cancelled original move's same-phase memo.
+            let mut plan = original_plan.clone();
+            plan.request_id = sinomo_core::Id::generate().to_string();
+            let control_request_id = plan.request_id.clone();
             let prepared = call(&DfsSourceAdoptionRequest::AcquireSource { plan })
                 .unwrap()
                 .decode_body::<DfsSourceAdoptionRpcResponse>()
@@ -1448,6 +2242,12 @@ mod actual_unbound_capture_tests {
             let DfsSourceAdoptionRpcResponse::SourcePrepared(token) = prepared else {
                 panic!("actual native writer capture");
             };
+            assert_eq!(token.request_id, control_request_id);
+            assert_ne!(token.request_id, original_token.request_id);
+            assert_ne!(
+                token.capture_id, original_token.capture_id,
+                "fresh actual writer custody does not reuse the retired capture"
+            );
             let mut changed = token.clone();
             changed.capture_id = sinomo_core::Id::generate().to_string();
             let rejected =
@@ -1504,11 +2304,99 @@ mod actual_unbound_capture_tests {
             assert!(!revoked.holds_unbound().unwrap());
             assert!(matches!(
                 *revoked.state.lock().unwrap(),
-                SourcePreparationState::Revoked
+                SourcePreparationState::Revoked { .. }
             ));
+            let original = preparations
+                .get(&original_plan.request_id)
+                .expect("the original phase remains independently recorded");
+            assert!(Arc::ptr_eq(original, &original_pending));
+            assert_eq!(original.plan, original_plan);
+            assert_eq!(original.token, original_token);
+            match &*original.state.lock().unwrap() {
+                SourcePreparationState::Revoked {
+                    cancelled: Some(actual),
+                } => {
+                    assert_eq!(actual.plan, cancelled_data.plan);
+                    assert_eq!(actual.token, cancelled_data.token);
+                    assert_eq!(
+                        serde_json::to_value(&actual.prepared).unwrap(),
+                        serde_json::to_value(&cancelled_data.prepared).unwrap()
+                    );
+                }
+                _ => panic!("the independent control must not replace original cancellation DATA"),
+            }
+            original_plan
+                .job
+                .origin
+                .clone()
+                .expect("actual original Main request identity")
         });
         drop(pause);
         drop(source_client);
+        // The cancelled offer proves no target effect. Normal Main recovery
+        // captures fresh custody and completes the original still-running job.
+        let mut finish = native.client(&node).unwrap();
+        assert_eq!(original_origin.requester_node_id, node);
+        let moved = finish
+            .posix_rename_with_operation_id(from, to, &original_origin.operation_id)
+            .unwrap();
+        assert_eq!(
+            finish.posix_read_file_distributed(to).unwrap(),
+            b"real captured bytes"
+        );
+        drop(finish);
+        let actor = actor_for_root(&native.data_dir(&node).root()).unwrap();
+        let (completed_pending, completed_prepared) = actor
+            .source_preparations
+            .lock()
+            .unwrap()
+            .values()
+            .find_map(|pending| match &*pending.state.lock().unwrap() {
+                SourcePreparationState::Bound(prepared)
+                    if prepared.offer.object_id == moved.object_id =>
+                {
+                    Some((Arc::clone(pending), prepared.clone()))
+                }
+                _ => None,
+            })
+            .expect("actual successful native adoption Bound DATA");
+        assert!(
+            actor
+                .completed_sources
+                .lock()
+                .unwrap()
+                .contains_key(&completed_prepared.offer.session_id)
+        );
+        assert!(
+            !actor
+                .sessions
+                .lock()
+                .unwrap()
+                .contains_key(&completed_prepared.offer.session_id)
+        );
+        let cancelled = actor
+            .call_rpc(
+                &node,
+                &DfsSourceAdoptionRequest::CancelUnclaimed {
+                    offer: completed_prepared.offer.clone(),
+                },
+            )
+            .unwrap();
+        assert!(
+            matches!(cancelled, DfsSourceAdoptionRpcResponse::SourceCancelled { offer }
+            if offer == completed_prepared.offer)
+        );
+        match &*completed_pending.state.lock().unwrap() {
+            SourcePreparationState::Bound(actual) => assert_eq!(
+                serde_json::to_value(actual).unwrap(),
+                serde_json::to_value(&completed_prepared).unwrap()
+            ),
+            _ => {
+                panic!("missing already-completed source session is no guarded cancellation proof")
+            }
+        }
+        drop(completed_pending);
+        drop(actor);
         assert_eq!(native.observation_dropped_count(), 0);
         native.close().unwrap();
     }

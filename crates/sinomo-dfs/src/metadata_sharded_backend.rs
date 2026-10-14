@@ -3536,6 +3536,13 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         self.shard_backend(&digest.shard_id)?
             .prepared_operation_record(operation_id)
     }
+    fn prepared_operation_reservations(
+        &self,
+        payload: &crate::DfsPreparedOperationPayload,
+    ) -> Result<Vec<DfsPreparedOperationRecord>> {
+        self.shard_backend(&payload.shard_id)?
+            .prepared_operation_reservations(payload)
+    }
     fn list_prepared_operations(&self) -> Result<Vec<DfsPreparedOperationRecord>> {
         let mut records = Vec::new();
         for shard in self.shards.keys() {
@@ -3649,10 +3656,21 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         shard_id: &DfsMetadataShardId,
         digest: &DfsPreparedOperationDigest,
         source: Option<&crate::DfsSourceAdoptionWitness>,
+        provider: Option<&crate::publication_guard::DfsPublicationExecutionProvider>,
+        execution: Option<&crate::publication_guard::DfsPublicationExecutionOwners>,
+        clustered: Option<&crate::DfsMetadataShardConfig>,
     ) -> Result<crate::publication_guard::DfsPublicationWriterSession> {
         self.require_prepared_operation_shard(file_system_id, shard_id)?;
         self.shard_backend_mut(shard_id)?
-            .publication_writer_session(file_system_id, shard_id, digest, source)
+            .publication_writer_session(
+                file_system_id,
+                shard_id,
+                digest,
+                source,
+                provider,
+                execution,
+                clustered,
+            )
     }
 
     fn publication_writer_file_system(
@@ -6054,6 +6072,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         batch: &DfsMetadataJournalBatch,
         frames: &[DfsMetadataJournalFrameRecord],
         expected_target_prefix: &DfsMetadataPrefixProof,
+        expected_operation: &crate::DfsMetadataAuthorityOperation,
     ) -> Result<DfsMetadataReplicaApplyReport> {
         self.require_replica_ingest_permit_for_shard(permit, &batch.shard_id)?;
         self.shard_backend_mut(&batch.shard_id)?
@@ -6062,6 +6081,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
                 batch,
                 frames,
                 expected_target_prefix,
+                expected_operation,
             )
     }
 

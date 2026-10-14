@@ -102,6 +102,98 @@ fn commit_kernel(
 }
 
 #[test]
+fn superseding_prepare_preserves_original_body_despite_changed_local_filesystem_view() {
+    let (mut runtime, mut service, config) = native_case("v7-native-immutable-supersession", 3);
+    let shard = DfsMetadataShardId::new(config.shard_id.clone());
+    let current = directory(&mut service, "/services/v7-native-immutable-supersession");
+    let mut changed = current.clone();
+    changed.version = DfsVersion::generate();
+    changed.mode = 0o600;
+    let original = namespace_payload(&config, &current, changed.clone(), "immutable-original");
+    let stored_filesystem = service
+        .metadata_backend()
+        .unwrap()
+        .get_file_system_on_shard(&shard, &config.file_system_id)
+        .unwrap()
+        .unwrap();
+    let digest = service
+        .metadata_backend_mut()
+        .unwrap()
+        .prepare_operation(original.clone(), None)
+        .unwrap();
+    // A local projection is DATA, not permission to change a retained body.
+    // Keep real native authority/assignment and the actual stored definition.
+    let mut local_view = stored_filesystem.clone();
+    local_view.display_name.push_str(" refreshed local view");
+    service
+        .metadata
+        .filesystems
+        .insert(config.file_system_id.clone(), local_view.clone());
+    let mut replacement = original.clone();
+    replacement.operation_id = "immutable-replacement".into();
+    replacement
+        .metadata_effects
+        .push(crate::DfsPreparedMetadataEffect::ResolvePreparedOperation {
+            digest: digest.clone(),
+            status: crate::DfsPreparedOperationStatus::Superseded,
+        });
+    let mut wrong = replacement.clone();
+    wrong.operation_id = "immutable-wrong-readset".into();
+    wrong.expected_object_versions[0].expected_version = None;
+    assert!(service.publish_prepared_operation(wrong).is_err());
+    let retained = service
+        .metadata_backend()
+        .unwrap()
+        .prepared_operation_record(&digest.operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(retained.payload.as_ref(), &original);
+    assert_eq!(retained.status, crate::DfsPreparedOperationStatus::Prepared);
+    let published = service
+        .publish_prepared_operation(replacement.clone())
+        .unwrap();
+    assert!(published.published);
+    assert_eq!(published.payload.as_ref(), &replacement);
+    let retained = service
+        .metadata_backend()
+        .unwrap()
+        .prepared_operation_record(&digest.operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(retained.payload.as_ref(), &original);
+    assert_eq!(
+        retained.status,
+        crate::DfsPreparedOperationStatus::Superseded
+    );
+    assert_eq!(
+        service
+            .metadata_backend()
+            .unwrap()
+            .get_file_system_on_shard(&shard, &config.file_system_id)
+            .unwrap(),
+        Some(stored_filesystem)
+    );
+    assert_eq!(
+        service
+            .metadata_backend()
+            .unwrap()
+            .get_object(&current.object_id)
+            .unwrap(),
+        Some(changed.clone())
+    );
+    // Fresh operations still carry a changed definition through the ordinary
+    // complete-body path; only immutable supersession excludes enrichment.
+    let mut next = changed.clone();
+    next.version = DfsVersion::generate();
+    let fresh = namespace_payload(&config, &changed, next, "immutable-next-fresh");
+    let published = service.publish_prepared_operation(fresh).unwrap();
+    assert!(published.payload.metadata_effects.iter().any(|effect| matches!(effect,
+        crate::DfsPreparedMetadataEffect::PutFileSystem { file_system } if file_system == &local_view)));
+    drop(service);
+    runtime.close().unwrap();
+}
+
+#[test]
 fn prepared_v7_namespace_commit_and_exact_retry_use_one_digest_marker() {
     let (mut runtime, mut service, config) = native_case("v7-native-namespace", 3);
     let shard = DfsMetadataShardId::new(config.shard_id.clone());
@@ -201,6 +293,28 @@ fn prepared_v7_namespace_commit_and_exact_retry_use_one_digest_marker() {
     wrong.payload_digest.push('0');
     assert!(service.commit_stored_prepared_operation(&wrong).is_err());
     drop(service);
+    // The exact recorded retry above ran with every metadata peer stopped.
+    // Cold runtime admission is separate: restore the real participants,
+    // including the fixture's KV voter, before asking it for fresh readiness.
+    let mut stopped_peers = config
+        .replica_node_ids
+        .iter()
+        .filter(|peer| **peer != config.primary_node_id)
+        .map(|peer| {
+            let state = sinomo_core::cluster::read_cluster_state_without_kv(
+                &sinomo_core::network::ClusterPaths::new(runtime.data_dir(peer)),
+            )
+            .unwrap();
+            (
+                sinomo_core::kv::cluster_kv_raft_local_is_voter(&state),
+                peer.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    stopped_peers.sort_by_key(|(voter, _)| !*voter);
+    for (_, peer) in stopped_peers {
+        runtime.reopen_node(peer).unwrap();
+    }
     runtime.stop_node(&config.primary_node_id).unwrap();
     runtime.reopen_node(config.primary_node_id.clone()).unwrap();
     let reopened = runtime.client(&config.primary_node_id).unwrap();
@@ -1762,5 +1876,64 @@ fn native_owned_recovery_starts_at_exact_tables_despite_a_lagging_cursor_hint() 
         b"actual native bytes"
     );
     drop(reopened);
+    runtime.close().unwrap();
+}
+
+#[test]
+fn prepared_v7_initial_epoch_requires_the_real_host_provider() {
+    let (mut runtime, mut service, config) = native_case("v7-initial-host-bind", 1);
+    let shard = DfsMetadataShardId::new(config.shard_id.clone());
+    let current = directory(&mut service, "/services/v7-initial-host-bind");
+    let mut committed = current.clone();
+    committed.version = DfsVersion::generate();
+    committed.mode = 0o600;
+    let payload = namespace_payload(&config, &current, committed.clone(), "v7-host-bind");
+    let digest = service
+        .metadata_backend_mut()
+        .unwrap()
+        .prepare_operation(payload, None)
+        .unwrap();
+    let scope = service
+        .metadata_backend()
+        .unwrap()
+        .publication_owner_scope(&config.file_system_id, &shard)
+        .unwrap();
+    let mut unbound = LocalSobjMetadataBackend::new(shard.clone(), scope.root()).unwrap();
+    assert_eq!(unbound.instance_authority_epoch, None);
+    assert!(
+        unbound
+            .publication_writer_session(
+                &config.file_system_id,
+                &shard,
+                &digest,
+                None,
+                None,
+                None,
+                Some(&config)
+            )
+            .is_err()
+    );
+    assert_eq!(unbound.instance_authority_epoch, None);
+    assert!(
+        unbound
+            .committed_prepared_operation(&digest)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        unbound.get_object(&current.object_id).unwrap(),
+        Some(current)
+    );
+    drop(unbound);
+    assert!(commit_kernel(&mut service, &digest).unwrap().published);
+    assert_eq!(
+        service
+            .metadata_backend()
+            .unwrap()
+            .get_object(&committed.object_id)
+            .unwrap(),
+        Some(committed)
+    );
+    drop(service);
     runtime.close().unwrap();
 }

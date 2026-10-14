@@ -1160,6 +1160,8 @@ impl Service for DfsDataPlaneService {
                             command.routed_message.source_node_id
                         )));
                     }
+                    #[cfg(any(test, feature = "test-support"))]
+                    crate::test_runtime::observe_decoded_namespace_call(&command);
                     let message_response = service
                         .host
                         .handle_message(command, attachment, traceparent, encoded_value_bytes)
@@ -1239,7 +1241,7 @@ fn dfs_inspection(
 
 async fn authoritative_metadata_replica_shard_context(
     host: Option<&dyn DfsDataPlaneHost>,
-    cluster: Option<Arc<dyn ClusterAccess>>,
+    _cluster: Option<Arc<dyn ClusterAccess>>,
     data_dir: Arc<SinomoDataDir>,
     file_system_id: Option<DfsFileSystemId>,
     shard_id: DfsMetadataShardId,
@@ -1268,80 +1270,15 @@ async fn authoritative_metadata_replica_shard_context(
         return Ok(context);
     }
 
-    let Some(cluster) = cluster else {
-        // A resident local Raft projection can be internally coherent yet
-        // belong to a retired primary generation. Without a retained host
-        // proof or current-term ClusterAccess proof there is no authority to
-        // admit metadata replica writes, so fail closed immediately.
-        dfs_service_perf_trace(format_args!(
-            "metadata-replica-authority-context shard={} mode=authority-unavailable handoff={} total_ms={}",
-            shard_id.0,
-            primary_handoff_id.is_some(),
-            started_at.elapsed().as_millis(),
-        ));
-        return Ok(None);
-    };
-    let shard_key = metadata_shard_key(&file_system_id, &shard_id.0);
-    let handoff_key = metadata_shard_membership_handoff_key(&file_system_id, &shard_id.0);
-    let authority_keys = vec![shard_key, handoff_key];
-    let authority_read_started_at = Instant::now();
-    let authoritative = cluster
-        .kv_get_authoritative_exact_set_async(authority_keys.clone())
-        .await?;
-    let authority_read_ms = authority_read_started_at.elapsed().as_millis();
-    let authority_term = authoritative.authority.term;
-    let authority_revision = authoritative.authority.revision;
-    // Besides proving one current-term authority point for both records, this
-    // rejects wrong-order values and entries whose revisions exceed that proof.
-    sinomo_core::kv::validate_cluster_kv_authoritative_entries_read(
-        &authority_keys,
-        &authoritative,
-    )?;
-    let mut values = authoritative.value.into_iter();
-    let shard_entry = values.next().expect("validated exact-key-set length");
-    let handoff_entry = values.next().expect("validated exact-key-set length");
-    let shard = shard_entry
-        .map(|entry| entry.decode::<DfsMetadataShardConfig>())
-        .transpose()?;
-    let Some(shard) = shard else {
-        dfs_service_perf_trace(format_args!(
-            "metadata-replica-authority-context shard={} mode=authoritative-missing local_read_ms={} authority_read_ms={} authority_term={} authority_revision={} total_ms={}",
-            shard_id.0,
-            0,
-            authority_read_ms,
-            authority_term,
-            authority_revision.0,
-            started_at.elapsed().as_millis(),
-        ));
-        return Ok(None);
-    };
-    let pending_membership_handoff = handoff_entry
-        .map(|entry| entry.decode::<DfsMetadataShardMembershipHandoff>())
-        .transpose()?
-        .filter(|handoff| {
-            handoff.retiring_shard == shard
-                && handoff.desired_shard.file_system_id == shard.file_system_id
-                && handoff.desired_shard.shard_id == shard.shard_id
-                && handoff.desired_shard.epoch == shard.epoch.saturating_add(1)
-        });
-    let state =
-        sinomo_core::cluster::read_cluster_state_without_kv(&ClusterPaths::new(data_dir.as_ref()))?;
-    let context = DfsMetadataReplicaShardContext {
-        local_node_id: state.local_node_id,
-        shard,
-        pending_membership_handoff,
-    };
+    // A host without the existing retained authority contract is unavailable.
+    // Replica ingress never starts a second control-plane authority protocol.
     dfs_service_perf_trace(format_args!(
-        "metadata-replica-authority-context shard={} mode=authoritative local_read_ms={} authority_read_ms={} authority_term={} authority_revision={} handoff={} total_ms={}",
+        "metadata-replica-authority-context shard={} mode=authority-unavailable handoff={} total_ms={}",
         shard_id.0,
-        0,
-        authority_read_ms,
-        authority_term,
-        authority_revision.0,
         primary_handoff_id.is_some(),
         started_at.elapsed().as_millis(),
     ));
-    Ok(Some(context))
+    Ok(None)
 }
 
 fn authenticated_dfs_cluster_source_node_id(

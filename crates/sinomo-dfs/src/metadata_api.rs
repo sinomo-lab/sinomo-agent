@@ -85,6 +85,30 @@ pub struct DfsMetadataReplicaIngestPermit {
     pending_primary_handoff_id: Option<String>,
 }
 
+/// Verify the immutable original preparation independently of the current cut.
+/// A digest-only eviction or a revoked body cannot supply publication evidence.
+pub(crate) fn validated_metadata_authority_operation_digest(
+    record: &DfsPreparedOperationRecord,
+    operation: &crate::DfsMetadataAuthorityOperation,
+) -> Result<DfsPreparedOperationDigest> {
+    record.validate()?;
+    let proof = &record.digest;
+    if !matches!(
+        record.status,
+        DfsPreparedOperationStatus::Prepared | DfsPreparedOperationStatus::Committed
+    ) || !matches!(operation, crate::DfsMetadataAuthorityOperation::PreparedOperation {
+            operation_id, file_system_id, shard_id, owner_epoch, prepare_sequence, payload_digest
+        } if operation_id == &proof.operation_id && file_system_id == &proof.file_system_id
+            && shard_id == &proof.shard_id && *owner_epoch == proof.owner_epoch
+            && *prepare_sequence == proof.prepare_sequence && payload_digest == &proof.payload_digest)
+    {
+        return Err(MetadataBackendError::Serde(
+            "authority operation differs from its complete live preparation".into(),
+        ));
+    }
+    Ok(proof.clone())
+}
+
 /// Result of one replica journal apply plus any proof computed from entries
 /// that became durable during that exact call.
 #[doc(hidden)]
@@ -363,6 +387,32 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         operation_id: &str,
     ) -> Result<Option<crate::DfsPreparedOperationRecord>>;
     fn list_prepared_operations(&self) -> Result<Vec<crate::DfsPreparedOperationRecord>>;
+    /// Read only the prepared bodies reserving this operation's footprint.
+    /// This grants no authority to resolve them; the native author must use
+    /// the existing guarded recovery path with the original body/readset.
+    fn prepared_operation_reservations(
+        &self,
+        payload: &crate::DfsPreparedOperationPayload,
+    ) -> Result<Vec<crate::DfsPreparedOperationRecord>> {
+        let (objects, paths) = crate::metadata_tables::prepared_payload_reservation_keys(payload);
+        Ok(self
+            .list_prepared_operations()?
+            .into_iter()
+            .filter(|record| {
+                if record.status != crate::DfsPreparedOperationStatus::Prepared
+                    || record.file_system_id != payload.file_system_id
+                    || record.shard_id != payload.shard_id
+                    || record.operation_id == payload.operation_id
+                {
+                    return false;
+                }
+                let footprint = crate::metadata_tables::namespace_prepare_footprint(record);
+                !objects.is_disjoint(footprint.object_ids())
+                    || !paths.is_disjoint(footprint.normalized_paths())
+            })
+            .collect())
+    }
+
     fn prepared_operation_for_request(
         &self,
         requester_node_id: &sinomo_core::node::NodeId,
@@ -417,6 +467,9 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         _shard_id: &DfsMetadataShardId,
         _digest: &crate::metadata_records::DfsPreparedOperationDigest,
         _source: Option<&crate::DfsSourceAdoptionWitness>,
+        provider: Option<&crate::publication_guard::DfsPublicationExecutionProvider>,
+        execution: Option<&crate::publication_guard::DfsPublicationExecutionOwners>,
+        clustered: Option<&crate::DfsMetadataShardConfig>,
     ) -> Result<crate::publication_guard::DfsPublicationWriterSession>;
 
     fn publication_writer_file_system(
@@ -2162,18 +2215,17 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         frames: &[DfsMetadataJournalFrameRecord],
     ) -> Result<DfsMetadataReplicaApplyReport>;
 
-    /// Persist an authority operation whose exact target prefix is known.
-    ///
-    /// Durable local backends use `expected_target_prefix` to authenticate a
-    /// delayed authority operation after a later ordinary catch-up prefix has
-    /// already materialized. The exact source frames and prepared prefix remain
-    /// required for acknowledgement.
+    /// Persist the complete current source cut and independently verify its
+    /// named original preparation, including the full body and actual slot.
+    /// Later frames remain part of the exact prefix obligation. A delayed cut
+    /// must still extend to any later locally acknowledged durable history.
     fn persist_authority_journal_frames_with_replica_permit_report(
         &mut self,
         permit: &DfsMetadataReplicaIngestPermit,
         batch: &DfsMetadataJournalBatch,
         frames: &[DfsMetadataJournalFrameRecord],
         expected_target_prefix: &DfsMetadataPrefixProof,
+        expected_operation: &crate::DfsMetadataAuthorityOperation,
     ) -> Result<DfsMetadataReplicaApplyReport>;
 
     /// Materialize any journal suffix previously admitted at the durable ACK

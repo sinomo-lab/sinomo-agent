@@ -779,7 +779,16 @@ impl DfsDefaultClusterAsyncBootstrapHost for DfsControlPlaneDefaultClusterAsyncB
             if default_materialization_is_current(&self.data_dir.root(), &signature) {
                 return Ok(());
             }
+            let publication_provider =
+                crate::runtime_host::bootstrap_publication_execution_provider(
+                    &self.data_dir,
+                    &self.cluster_paths,
+                    &self.publication_owners,
+                    &tokio::runtime::Handle::current(),
+                )
+                .await?;
             self.publish_current_bootstrap(
+                publication_provider,
                 &file_system,
                 shards,
                 bootstrap_owner_node_ids,
@@ -1434,11 +1443,33 @@ async fn default_cluster_metadata_shard_with_service_nodes(
         require_current_metadata_members(state, &desired)?;
         return Ok(desired);
     };
+    if current.file_system_id != file_system.file_system_id
+        || current.shard_id != shard_id
+        || current.assignment != desired.assignment
+        || current.default_policy != desired.default_policy
+        || current.epoch == 0
+    {
+        return Err(DfsError::Metadata {
+            message: "current default metadata assignment changes its exact scope or policy".into(),
+        });
+    }
+    require_current_metadata_members(state, &current)?;
+    let initial_native_assignment = current.epoch == 1
+        && current.primary_node_id == bootstrap_primary_node_id
+        && current.replica_node_ids.is_empty();
+    if !initial_native_assignment {
+        // The authoritative active assignment is the persistent configuration.
+        // Discovery supplies initial defaults, not permission to replace a
+        // completed native membership or primary-role handoff. Further changes
+        // use the same explicit guarded configuration handoff protocol.
+        return Ok(current);
+    }
     if !host.native_genesis_committed_async(current.clone()).await? {
         return Ok(current);
     }
-    // A new singleton expands only after its complete native genesis is committed. Failover requires durable, shared
-    // authority; a daemon's transient route suspicion cannot change placement.
+    // Only the exact initial singleton expands after its native genesis commits.
+    // Existing epoch, replica presence or a sorted discovery layout alone never
+    // establish that a later assignment is bootstrap work.
     desired.primary_node_id = default_target_primary_node_id;
     desired.replica_node_ids =
         default_metadata_shard_replica_node_ids(service_node_ids, &desired.primary_node_id);

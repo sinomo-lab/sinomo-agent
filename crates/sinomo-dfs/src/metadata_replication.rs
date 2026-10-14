@@ -6220,14 +6220,17 @@ pub(crate) fn validate_durable_metadata_journal_frames(
         }
         return Ok(());
     }
-    if command.prefix_probe.is_some() || command.batch.journal_frames.is_empty() {
+    if command.prefix_probe.is_some()
+        || (command.batch.journal_frames.is_empty()
+            && (command.authority_probe.is_none() || command.durable_replication.is_some()))
+    {
         return Err("current metadata ingest requires its one exact-frame carrier".into());
     }
     match (&command.durable_replication, &command.authority_probe) {
         (Some(replication), None) if !replication.confirmation_id.is_empty() => {}
         (None, Some(probe)) => {
             let prefix = &probe.prepared_prefix;
-            if !prefix.is_well_formed()
+            if crate::service_replica::metadata_authority_probe_confirmation_id(probe).is_none()
                 || prefix.journal_sequence != command.batch.next_after_sequence
             {
                 return Err(
@@ -6238,6 +6241,9 @@ pub(crate) fn validate_durable_metadata_journal_frames(
         _ => {
             return Err("metadata ingest requires exactly one current confirmation purpose".into());
         }
+    }
+    if command.batch.journal_frames.is_empty() {
+        return Ok(());
     }
     validate_durable_metadata_journal_frame_order(
         "current metadata journal",
@@ -6409,6 +6415,44 @@ pub fn process_dfs_metadata_journal_batch(
         }
         return response;
     }
+    if command.batch.journal_frames.is_empty() {
+        // Confirmation only: no ingest, repair, fabricated frame or cursor ACK.
+        // The authenticated current shard context above is still mandatory.
+        let context = context.expect("validated authority query has a shard context");
+        let probe = command
+            .authority_probe
+            .as_ref()
+            .expect("validated authority query purpose");
+        let confirmation = crate::service_replica::verify_persisted_metadata_authority_probe_inner(
+            backend,
+            &context.shard,
+            probe,
+            false,
+        );
+        let confirmation = match confirmation {
+            Ok(value) => value,
+            Err(error) => {
+                return dfs_metadata_journal_rejection_response(&command, error.to_string());
+            }
+        };
+        let floor = crate::DfsMetadataAuthorityAckFloor {
+            shard_id: shard_id.clone(),
+            journal_sequence: next_after_sequence,
+            durable_prefix_proof: probe.prepared_prefix.clone(),
+        };
+        if let Err(error) = backend.put_metadata_authority_ack_floor(&floor) {
+            return dfs_metadata_journal_rejection_response(&command, error.to_string());
+        }
+        return DfsMetadataJournalBatchResponse {
+            request_id: command.request_id,
+            shard_id,
+            next_after_sequence,
+            applied_entries: 0,
+            verified_prefix_only: false,
+            verified_authority_probe_id: Some(confirmation),
+            result: DfsMetadataJournalBatchResult::Applied,
+        };
+    }
     let context = context.expect("validated metadata replica ingest has a shard context");
     let permit = DfsMetadataReplicaIngestPermit::new_validated(
         context.shard.file_system_id.clone(),
@@ -6429,6 +6473,7 @@ pub fn process_dfs_metadata_journal_batch(
             &header,
             &command.batch.journal_frames,
             &probe.prepared_prefix,
+            &probe.operation,
         )
     } else {
         backend.persist_journal_frames_with_replica_permit_report(
@@ -7225,10 +7270,8 @@ pub fn validate_dfs_metadata_journal_batch_source(
         ));
     }
     if let Some(probe) = command.authority_probe.as_ref() {
-        let has_authority_payload = !command.batch.journal_frames.is_empty();
         if command.verify_prefix_only
             || command.prefix_probe.is_some()
-            || !has_authority_payload
             || probe.probe_id.is_empty()
             || probe.expected_shard != context.shard
             || !crate::service_replica::metadata_authority_operation_is_well_formed_for_shard(
@@ -7237,7 +7280,9 @@ pub fn validate_dfs_metadata_journal_batch_source(
             )
             || crate::service_replica::metadata_authority_operation_prepare_sequence(
                 &probe.operation,
-            ) != command.batch.next_after_sequence
+            ) > command.batch.next_after_sequence
+            || crate::service_replica::metadata_authority_probe_confirmation_id(probe).is_none()
+            || probe.prepared_prefix.journal_sequence != command.batch.next_after_sequence
         {
             return Some(dfs_metadata_journal_rejection_response(
                 command,

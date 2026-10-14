@@ -9,7 +9,9 @@ impl LocalSobjMetadataBackend {
         batch: &DfsMetadataJournalBatch,
         frames: &[DfsMetadataJournalFrameRecord],
     ) -> Result<DfsMetadataReplicaApplyReport> {
-        self.persist_exact_journal_frames_with_replica_permit_report(permit, batch, frames, None)
+        self.persist_exact_journal_frames_with_replica_permit_report(
+            permit, batch, frames, None, None,
+        )
     }
 
     pub(super) fn persist_exact_journal_frames_with_replica_permit_report(
@@ -18,6 +20,7 @@ impl LocalSobjMetadataBackend {
         batch: &DfsMetadataJournalBatch,
         frames: &[DfsMetadataJournalFrameRecord],
         expected_target_prefix: Option<&DfsMetadataPrefixProof>,
+        expected_operation: Option<&crate::DfsMetadataAuthorityOperation>,
     ) -> Result<DfsMetadataReplicaApplyReport> {
         if !batch.entries.is_empty() || frames.is_empty() {
             return Err(MetadataBackendError::Serde(format!(
@@ -33,6 +36,11 @@ impl LocalSobjMetadataBackend {
                 "metadata shard {} authority ingest has an invalid expected prefix at sequence {}",
                 batch.shard_id.0, batch.next_after_sequence
             )));
+        }
+        if expected_target_prefix.is_some() != expected_operation.is_some() {
+            return Err(MetadataBackendError::Serde(
+                "authority ingest requires both the current cut and original operation".into(),
+            ));
         }
         let decode_started = Instant::now();
         let entries = frames
@@ -59,6 +67,7 @@ impl LocalSobjMetadataBackend {
             &decoded_batch,
             frames,
             expected_target_prefix,
+            expected_operation,
         )
     }
 
@@ -68,6 +77,7 @@ impl LocalSobjMetadataBackend {
         batch: &DfsMetadataJournalBatch,
         frames: &[DfsMetadataJournalFrameRecord],
         expected_target_prefix: Option<&DfsMetadataPrefixProof>,
+        expected_operation: Option<&crate::DfsMetadataAuthorityOperation>,
     ) -> Result<DfsMetadataReplicaApplyReport> {
         self.require_replication_source_shard(&batch.shard_id)?;
         validate_replicated_journal_batch_entry_order(batch)?;
@@ -148,6 +158,35 @@ impl LocalSobjMetadataBackend {
                 }
             };
             validation_tables.apply_checked(op)?;
+        }
+        if let Some(operation) = expected_operation {
+            let crate::DfsMetadataAuthorityOperation::PreparedOperation {
+                operation_id,
+                file_system_id,
+                shard_id,
+                owner_epoch,
+                prepare_sequence,
+                ..
+            } = operation;
+            if file_system_id != permit.file_system_id()
+                || shard_id != &batch.shard_id
+                || *owner_epoch != permit.source_epoch()
+                || *prepare_sequence > batch.next_after_sequence
+            {
+                return Err(MetadataBackendError::Serde(
+                    "authority operation is outside the validated current source cut".into(),
+                ));
+            }
+            let record = validation_tables.prepared_operations_v7.get(operation_id).ok_or_else(|| {
+                MetadataBackendError::Serde(
+                    "authority operation has no complete original body in the validated current cut".into(),
+                )
+            })?;
+            namespace_authority_proof = Some(
+                crate::metadata_api::validated_metadata_authority_operation_digest(
+                    record, operation,
+                )?,
+            );
         }
         self.next_sequence = self.next_sequence.max(durable_next_sequence);
         let target_sequence = batch.next_after_sequence;

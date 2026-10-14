@@ -1848,8 +1848,14 @@ pub enum DfsNamespaceJobFrame {
     },
     /// Commit the exact alias-shard transaction while both authorities reject
     /// reads and mutations for the affected paths.
+    #[serde(rename = "cross-shard-hardlink-alias-commit-with-read-set-v1")]
     CrossShardHardlinkAliasCommit {
         transaction: DfsNamespaceTransaction,
+        /// Original physical scope and complete comparisons, captured before
+        /// the first target phase. None is an observed absence, never a default.
+        shard_id: DfsMetadataShardId,
+        expected_object_versions: Vec<DfsNamespaceObjectVersionExpectation>,
+        expected_path_occupants: Vec<DfsNamespacePathOccupantExpectation>,
     },
     /// Commit the pre-minted canonical generation and release its durable
     /// fence. Retrying this frame is exact and idempotent.

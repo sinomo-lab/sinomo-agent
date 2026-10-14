@@ -4,6 +4,7 @@ use crate::DfsMessageCommand;
 pub enum DfsSourcePausePoint {
     TargetDispatch,
     SourceAcquired,
+    BeforeSourceRegistration,
     BeforeBind,
 }
 #[derive(Clone, Debug)]

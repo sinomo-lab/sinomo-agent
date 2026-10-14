@@ -327,6 +327,9 @@ impl LocalSobjMetadataBackend {
         shard_id: &DfsMetadataShardId,
         digest: &DfsPreparedOperationDigest,
         source: Option<&crate::DfsSourceAdoptionWitness>,
+        provider: Option<&crate::publication_guard::DfsPublicationExecutionProvider>,
+        execution: Option<&crate::publication_guard::DfsPublicationExecutionOwners>,
+        clustered: Option<&crate::DfsMetadataShardConfig>,
     ) -> Result<DfsPublicationWriterSession> {
         if shard_id != &self.shard_id || digest.shard_id != self.shard_id {
             return Err(MetadataBackendError::Serde(
@@ -345,6 +348,22 @@ impl LocalSobjMetadataBackend {
         } else {
             Arc::new(self.begin_metadata_write()?)
         };
+        if let Some(expected) = clustered
+            && self.instance_authority_epoch.is_none()
+        {
+            // The held writer validator already rejects every durable marker
+            // for an unbound instance. No pending/activated fence is bypassed.
+            let provider = provider.ok_or_else(|| {
+                MetadataBackendError::Serde(
+                    "unbound clustered writer requires the actual retained host provider".into(),
+                )
+            })?;
+            let execution = execution.ok_or_else(|| {
+                MetadataBackendError::Serde("initial epoch requires actual effect admission".into())
+            })?;
+            provider.validate_initial_epoch_binding(&scope, digest, execution, expected)?;
+            self.instance_authority_epoch = Some(digest.owner_epoch);
+        }
         let record = self
             .tables
             .prepared_operations_v7
@@ -357,6 +376,7 @@ impl LocalSobjMetadataBackend {
             || &digest.file_system_id != file_system_id
             || &digest.shard_id != shard_id
             || record.status == DfsPreparedOperationStatus::Aborted
+            || (clustered.is_some() && self.instance_authority_epoch != Some(digest.owner_epoch))
             || self
                 .instance_authority_epoch
                 .is_some_and(|epoch| epoch != digest.owner_epoch)
@@ -414,6 +434,21 @@ impl LocalSobjMetadataBackend {
             ));
         }
         if let Some(entry) = &record.committed_entry {
+            if commit_owner
+                .source_witness()
+                .is_some_and(|source| source.supplies_source_family())
+            {
+                let prefix = self.prefix_proof.as_ref().ok_or_else(|| {
+                    MetadataBackendError::Serde(
+                        "native source terminal has no certified kernel prefix".into(),
+                    )
+                })?;
+                commit_owner.record_source_terminal(
+                    entry,
+                    prefix,
+                    metadata_table_storage_generation(&self.root)?,
+                )?;
+            }
             #[cfg(any(test, feature = "test-support"))]
             if let Some(observation) = &mut native_observation {
                 observation.observe(
@@ -503,6 +538,21 @@ impl LocalSobjMetadataBackend {
             rollback.expect("owned preapplied commit"),
         )?;
         self.checkpoint_local_materialization_cursor_if_due(entry.sequence)?;
+        if commit_owner
+            .source_witness()
+            .is_some_and(|source| source.supplies_source_family())
+        {
+            let prefix = self.prefix_proof.as_ref().ok_or_else(|| {
+                MetadataBackendError::Serde(
+                    "native source terminal has no certified kernel prefix".into(),
+                )
+            })?;
+            commit_owner.record_source_terminal(
+                &crate::DfsPreparedOperationCommitReference::from_journal_entry(&entry)?,
+                prefix,
+                metadata_table_storage_generation(&self.root)?,
+            )?;
+        }
         #[cfg(any(test, feature = "test-support"))]
         if let (Some(observation), Some(before)) = (&mut native_observation, native_before) {
             observation.observe(

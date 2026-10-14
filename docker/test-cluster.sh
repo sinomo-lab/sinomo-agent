@@ -147,6 +147,7 @@
 #   SINOMO_TEST_DFS_READY_REQUIRE_QUIET=1   also enforce the standard quiet gate before ready-only returns
 #   SINOMO_TEST_QUIET_ONLY=1               readiness and standard quiet gate, without mutation workloads
 #   SINOMO_TEST_DFS_ONLY=1                 normal/history/restart/handoff correctness and DFS benchmarks
+#   SINOMO_TEST_DFS_BASELINE_ONLY=1        all maintained DFS functional/recovery gates + joint CPU/network quiet; performance NOT_RUN
 #   SINOMO_TEST_DFS_BENCH_ITERATIONS        measured CLI operations per profile/origin (default 8)
 #   SINOMO_TEST_DFS_BENCH_WARMUP            excluded iterations per profile/origin (default 2)
 #   SINOMO_TEST_DFS_BENCH_BYTES             payload bytes for CLI history benchmark (default 4096)
@@ -209,6 +210,7 @@ DFS_READY_ONLY="${SINOMO_TEST_DFS_READY_ONLY:-0}"
 DFS_READY_REQUIRE_QUIET="${SINOMO_TEST_DFS_READY_REQUIRE_QUIET:-0}"
 QUIET_ONLY="${SINOMO_TEST_QUIET_ONLY:-0}"
 DFS_ONLY="${SINOMO_TEST_DFS_ONLY:-0}"
+DFS_BASELINE_ONLY="${SINOMO_TEST_DFS_BASELINE_ONLY:-0}"
 CLUSTER_KV_ONLY="${SINOMO_TEST_CLUSTER_KV_ONLY:-0}"
 PJDFSTEST_ONLY="${SINOMO_TEST_PJDFSTEST_ONLY:-0}"
 PJDFSTEST_PROFILE="${SINOMO_PJDFSTEST_PROFILE:-full}"
@@ -311,6 +313,10 @@ NETWORK_QUIET_DURATION_SECONDS=30
 NETWORK_QUIET_MAX_WAIT_SECONDS=120
 NETWORK_QUIET_WAIT="${SINOMO_TEST_NETWORK_QUIET_WAIT:-$NETWORK_QUIET_MAX_WAIT_SECONDS}"
 NETWORK_QUIET_MAX_CPU_PERCENT="${SINOMO_TEST_NETWORK_QUIET_MAX_CPU_PERCENT:-10}"
+# Fixed before measurement: all-interface TX+RX, including loopback, per whole
+# container. Ordinary300s control/60s discovery cadence fits beneath this idle
+# ceiling; bursts/recovery/export remain charged and reset the full window.
+NETWORK_QUIET_MAX_NETWORK_BYTES_PER_SECOND=65536
 # A continuous Docker stats stream normally produces one cumulative CPU
 # interval per second. Treat a five-second silence as unavailable evidence and
 # reset rather than assuming the unobserved interval was quiet.
@@ -500,8 +506,13 @@ validate_cluster_kv_benchmark_config() {
 }
 
 validate_dfs_suite_config() {
+  require_bounded_uint SINOMO_TEST_DFS_BASELINE_ONLY "$DFS_BASELINE_ONLY" 0 1 || return 1
+  if [ "$DFS_BASELINE_ONLY" = 1 ] && { [ "$DFS_ONLY$DFS_READY_ONLY$FORMATION_ONLY$CLUSTER_KV_ONLY$PJDFSTEST_ONLY$QUIET_ONLY${SINOMO_TEST_NETWORK_ONLY:-0}" != 0000000 ] || [ -n "$NETWORK_CASES" ]; }; then
+    log "SINOMO_TEST_DFS_BASELINE_ONLY is mutually exclusive with other focused lanes"
+    return 1
+  fi
   require_bounded_uint SINOMO_TEST_QUIET_ONLY "$QUIET_ONLY" 0 1 || return 1
-  if [ "$QUIET_ONLY" = 1 ] && { [ "$DFS_ONLY$DFS_READY_ONLY$FORMATION_ONLY$CLUSTER_KV_ONLY$PJDFSTEST_ONLY${SINOMO_TEST_NETWORK_ONLY:-0}" != 000000 ] || [ -n "$NETWORK_CASES" ]; }; then
+  if [ "$QUIET_ONLY" = 1 ] && { [ "$DFS_ONLY$DFS_BASELINE_ONLY$DFS_READY_ONLY$FORMATION_ONLY$CLUSTER_KV_ONLY$PJDFSTEST_ONLY${SINOMO_TEST_NETWORK_ONLY:-0}" != 0000000 ] || [ -n "$NETWORK_CASES" ]; }; then
     log "SINOMO_TEST_QUIET_ONLY is mutually exclusive with other focused lanes"
     return 1
   fi
@@ -785,9 +796,19 @@ NETWORK_QUIET_DAEMON_GENERATION_PROGRAM='
 NETWORK_QUIET_GENERATION_WORKER_PROGRAM='
   scan_program="$1"
   proc_root="$2"
+  counter_program="$3"
   trap "exit 143" HUP INT TERM
   while IFS= read -r request; do
-    case "$request" in ""|*[!0-9-]*) exit 2 ;; esac
+    case "$request" in
+      net-*)
+        nonce=${request#net-}
+        case "$nonce" in ""|*[!0-9-]*) exit 2 ;; esac
+        printf "%s\n" "$request"
+        if sh -c "$counter_program" sh "$scan_program"; then result=0; else result=1; fi
+        printf "%s\t%s\n" "$request" "$result"
+        continue ;;
+      ""|*[!0-9-]*) exit 2 ;;
+    esac
     printf "%s\t" "$request"
     if sh -c "$scan_program" sh "$proc_root"; then :
     else printf "unavailable\n"; exit 1
@@ -800,7 +821,10 @@ declare -A NETWORK_QUIET_GENERATION_PID=()
 NETWORK_QUIET_GENERATION_REQUEST=0
 
 network_quiet_generation_session_worker() {
-  local container="$1" lifetime="$2" fd
+  local container="$1" lifetime="$2" fd counter_program=""
+  if [ -f "${NETWORK_QUIET_NET_DIRECTORY:-}/counter-program.sh" ]; then
+    counter_program="$(cat "$NETWORK_QUIET_NET_DIRECTORY/counter-program.sh")" || return 1
+  fi
   # Do not let a later Docker client retain another session's pipe writers.
   # Coprocess descriptors are duplicated below so snapshot subshells can use
   # ordinary inherited FDs; original coprocess FDs are closed in the parent.
@@ -813,7 +837,7 @@ network_quiet_generation_session_worker() {
   exec docker exec -i "$container" \
     timeout --signal=TERM --kill-after=1s "${lifetime}s" \
     sh -c "$NETWORK_QUIET_GENERATION_WORKER_PROGRAM" sh \
-    "$NETWORK_QUIET_DAEMON_GENERATION_PROGRAM" /proc 2>/dev/null
+    "$NETWORK_QUIET_DAEMON_GENERATION_PROGRAM" /proc "$counter_program" 2>/dev/null
 }
 
 network_quiet_generation_sessions_stop() {
@@ -1029,6 +1053,8 @@ network_quiet_stats_stream_stop() {
 network_quiet_stats_stream_start() {
   network_quiet_stats_stream_stop
   NETWORK_QUIET_LAST_OBSERVED_MS=()
+  NETWORK_QUIET_NET_PREVIOUS=""
+  NETWORK_QUIET_NET_SEALED=0
   exec {NETWORK_QUIET_STATS_STREAM_FD}< <(
     network_quiet_stats_stream_worker "$@"
   )
@@ -1152,6 +1178,136 @@ network_quiet_stats_stream_read_group() {
   return 0
 }
 
+
+# Exact counters follow the SAME stats group, not an extra daemon timer or
+# another benchmark. Docker exec is the existing portable read-only profiler
+# infrastructure; absent Linux proc counters fail closed for this context.
+NETWORK_QUIET_NET_DIRECTORY=""
+NETWORK_QUIET_NET_MEMBERS_FILE=""
+NETWORK_QUIET_NET_PREVIOUS=""
+NETWORK_QUIET_NET_CURRENT_OUTPUT=""
+NETWORK_QUIET_NET_SEQUENCE=0
+NETWORK_QUIET_NET_SEALED=0
+NETWORK_QUIET_GROUP_NET_MIN_MS=0
+NETWORK_QUIET_GROUP_NET_CLOSED_MS=0
+NETWORK_QUIET_GROUP_CPU_MIN_MS=0
+NETWORK_QUIET_GROUP_CPU_MAX_MS=0
+declare -A NETWORK_QUIET_GROUP_NET_STATUS=()
+declare -A NETWORK_QUIET_GROUP_NET_RX_DELTA=()
+declare -A NETWORK_QUIET_GROUP_NET_TX_DELTA=()
+declare -A NETWORK_QUIET_GROUP_NET_INTERVAL_MS=()
+
+network_quiet_initialize_network_members() {
+  local node
+  local -a members=()
+  for node in $NODES; do members+=("$node" "${container_by_node[$node]}"); done
+  python3 - "$NETWORK_QUIET_NET_MEMBERS_FILE" "${members[@]}" <<'MEMBERS'
+import json, sys
+from pathlib import Path
+values = sys.argv[2:]
+Path(sys.argv[1]).write_text(json.dumps([
+    {'node': node, 'container_id': container}
+    for node, container in zip(values[0::2], values[1::2])]) + '\n')
+MEMBERS
+}
+
+network_quiet_sample_network_group() {
+  local deadline_ms="$1" rows node begin closed status rx tx interval namespace total_rx total_tx extra
+  local -a previous=() readers=()
+  for node in $NODES; do
+    local container="${container_by_node[$node]}"
+    if [ -n "${NETWORK_QUIET_GENERATION_READ_FD[$container]:-}" ]; then
+      readers+=(--reader "$node" "$BASHPID" "${NETWORK_QUIET_GENERATION_READ_FD[$container]}" "${NETWORK_QUIET_GENERATION_WRITE_FD[$container]}")
+    fi
+  done
+  NETWORK_QUIET_GROUP_NET_STATUS=()
+  NETWORK_QUIET_GROUP_NET_RX_DELTA=()
+  NETWORK_QUIET_GROUP_NET_TX_DELTA=()
+  NETWORK_QUIET_GROUP_NET_INTERVAL_MS=()
+  NETWORK_QUIET_GROUP_NET_MIN_MS=0
+  NETWORK_QUIET_GROUP_NET_CLOSED_MS=0
+  NETWORK_QUIET_NET_SEQUENCE=$((NETWORK_QUIET_NET_SEQUENCE + 1))
+  local output="$NETWORK_QUIET_NET_DIRECTORY/$NETWORK_QUIET_NET_SEQUENCE.json"
+  NETWORK_QUIET_NET_CURRENT_OUTPUT="$output"
+  [ -z "$NETWORK_QUIET_NET_PREVIOUS" ] || previous=(--previous "$NETWORK_QUIET_NET_PREVIOUS")
+  if ! rows="$(python3 "$SINOMO_DOCKER_DIR/quiet-network-counters.py" \
+      --project "$PROJECT" --containers "$NETWORK_QUIET_NET_MEMBERS_FILE" \
+      --deadline-ms "$deadline_ms" "${previous[@]}" "${readers[@]}" --output "$output" \
+      --generation-scanner "$NETWORK_QUIET_NET_DIRECTORY/generation-scanner.sh" \
+      2> "$output.stderr.log")"; then
+    NETWORK_QUIET_GROUP_REASON="${NETWORK_QUIET_GROUP_REASON}${NETWORK_QUIET_GROUP_REASON:+ }network-counter-collector-unavailable"
+    NETWORK_QUIET_GROUP_STRUCTURAL_ERROR=1
+    return 1
+  fi
+  # All raw successes/errors were saved before this classification.
+  NETWORK_QUIET_NET_PREVIOUS="$output"
+  while IFS=$'\t' read -r node begin closed status rx tx interval namespace total_rx total_tx extra; do
+    if [ -z "${container_by_node[$node]:-}" ] || [ -n "${NETWORK_QUIET_GROUP_NET_STATUS[$node]:-}" ] \
+        || [ -n "$extra" ] || [[ ! "$begin" =~ ^[0-9]{1,16}$ ]] \
+        || [[ ! "$closed" =~ ^[0-9]{1,16}$ ]] \
+        || [ "$((10#$closed))" -lt "$((10#$begin))" ]; then
+      NETWORK_QUIET_GROUP_REASON="${NETWORK_QUIET_GROUP_REASON}${NETWORK_QUIET_GROUP_REASON:+ }invalid-network-counter=$node"
+      NETWORK_QUIET_GROUP_STRUCTURAL_ERROR=1
+      continue
+    fi
+    NETWORK_QUIET_GROUP_NET_STATUS[$node]="$status"
+    NETWORK_QUIET_GROUP_NET_RX_DELTA[$node]="$rx"
+    NETWORK_QUIET_GROUP_NET_TX_DELTA[$node]="$tx"
+    NETWORK_QUIET_GROUP_NET_INTERVAL_MS[$node]="$interval"
+    if [ "$NETWORK_QUIET_GROUP_NET_MIN_MS" -eq 0 ] || [ "$((10#$begin))" -lt "$NETWORK_QUIET_GROUP_NET_MIN_MS" ]; then
+      NETWORK_QUIET_GROUP_NET_MIN_MS="$begin"
+    fi
+    if [ "$((10#$closed))" -gt "$NETWORK_QUIET_GROUP_NET_CLOSED_MS" ]; then
+      NETWORK_QUIET_GROUP_NET_CLOSED_MS="$closed"
+    fi
+    case "$status" in
+      within) ;;
+      baseline) NETWORK_QUIET_GROUP_REASON="${NETWORK_QUIET_GROUP_REASON}${NETWORK_QUIET_GROUP_REASON:+ }network-counter-baseline=$node" ;;
+      above) NETWORK_QUIET_GROUP_REASON="${NETWORK_QUIET_GROUP_REASON}${NETWORK_QUIET_GROUP_REASON:+ }network-over-limit=$node:${rx}+${tx}B/${interval}ms" ;;
+      *) NETWORK_QUIET_GROUP_REASON="${NETWORK_QUIET_GROUP_REASON}${NETWORK_QUIET_GROUP_REASON:+ }network-unavailable=$node"; NETWORK_QUIET_GROUP_STRUCTURAL_ERROR=1 ;;
+    esac
+  done <<< "$rows"
+  for node in $NODES; do
+    if [ -z "${NETWORK_QUIET_GROUP_NET_STATUS[$node]:-}" ]; then
+      NETWORK_QUIET_GROUP_REASON="${NETWORK_QUIET_GROUP_REASON}${NETWORK_QUIET_GROUP_REASON:+ }missing-network-counter=$node"
+      NETWORK_QUIET_GROUP_STRUCTURAL_ERROR=1
+    fi
+  done
+  [ "$NETWORK_QUIET_GROUP_STRUCTURAL_ERROR" -eq 0 ]
+}
+
+network_quiet_read_observed_group() {
+  network_quiet_stats_stream_read_group "$@" || return 1
+  NETWORK_QUIET_GROUP_CPU_MIN_MS="$NETWORK_QUIET_GROUP_MIN_MS"
+  NETWORK_QUIET_GROUP_CPU_MAX_MS="$NETWORK_QUIET_GROUP_MAX_MS"
+  if [ "$NETWORK_QUIET_GROUP_STRUCTURAL_ERROR" -eq 1 ]; then
+    NETWORK_QUIET_GROUP_NET_STATUS=()
+    NETWORK_QUIET_GROUP_NET_RX_DELTA=()
+    NETWORK_QUIET_GROUP_NET_TX_DELTA=()
+    NETWORK_QUIET_GROUP_NET_INTERVAL_MS=()
+    NETWORK_QUIET_GROUP_NET_MIN_MS=0
+    NETWORK_QUIET_GROUP_NET_CLOSED_MS=0
+    NETWORK_QUIET_NET_CURRENT_OUTPUT=""
+    return 0
+  fi
+  if [ "$NETWORK_QUIET_NET_SEALED" -eq 0 ]; then
+    network_quiet_sample_network_group "$1" || return 0
+  fi
+  # The joint window begins after BOTH baselines and ends only where BOTH
+  # streams cover. Network command uncertainty is charged conservatively.
+  if [ "$NETWORK_QUIET_GROUP_NET_MIN_MS" -le 0 ] || [ "$NETWORK_QUIET_GROUP_NET_CLOSED_MS" -le 0 ]; then
+    NETWORK_QUIET_GROUP_REASON="${NETWORK_QUIET_GROUP_REASON}${NETWORK_QUIET_GROUP_REASON:+ }network-coverage-unavailable"
+    NETWORK_QUIET_GROUP_STRUCTURAL_ERROR=1
+    return 0
+  fi
+  if [ "$NETWORK_QUIET_GROUP_NET_MIN_MS" -lt "$NETWORK_QUIET_GROUP_MIN_MS" ]; then
+    NETWORK_QUIET_GROUP_MIN_MS="$NETWORK_QUIET_GROUP_NET_MIN_MS"
+  fi
+  if [ "$NETWORK_QUIET_GROUP_NET_CLOSED_MS" -gt "$NETWORK_QUIET_GROUP_MAX_MS" ]; then
+    NETWORK_QUIET_GROUP_MAX_MS="$NETWORK_QUIET_GROUP_NET_CLOSED_MS"
+  fi
+}
+
 network_quiet_coverage_reaches() {
   local covered_through_ms="$1" target_ms="$2"
   [[ "$covered_through_ms" =~ ^[0-9]{1,16}$ ]] || return 1
@@ -1175,12 +1331,21 @@ network_quiet_write_stats_group_samples() {
     else
       sample_status=false
     fi
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
       "$sample_group" "$quiet_elapsed_ms" "$candidate" "$captured_at" \
       "$captured_ms" "$observed_ms" "$NETWORK_QUIET_GROUP_MIN_MS" \
       "$NETWORK_QUIET_GROUP_MAX_MS" "$node" "${container_by_node[$node]:-}" \
       "$container_name" "$observed_cpu" "$NETWORK_QUIET_MAX_CPU_PERCENT" \
       "$sample_status" "$group_state" >> "$path"
+    printf '\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "${NETWORK_QUIET_GROUP_NET_STATUS[$node]:-unavailable}" \
+      "${NETWORK_QUIET_GROUP_NET_RX_DELTA[$node]:-unavailable}" \
+      "${NETWORK_QUIET_GROUP_NET_TX_DELTA[$node]:-unavailable}" \
+      "${NETWORK_QUIET_GROUP_NET_INTERVAL_MS[$node]:-unavailable}" \
+      "$NETWORK_QUIET_MAX_NETWORK_BYTES_PER_SECOND" \
+      "$NETWORK_QUIET_GROUP_NET_MIN_MS" "$NETWORK_QUIET_GROUP_NET_CLOSED_MS" \
+      "$NETWORK_QUIET_GROUP_CPU_MIN_MS" "$NETWORK_QUIET_GROUP_CPU_MAX_MS" \
+      "${NETWORK_QUIET_NET_CURRENT_OUTPUT##*/}" >> "$path"
   done
 }
 
@@ -1295,6 +1460,11 @@ write_network_quiet_summary() {
     printf 'required_quiet_duration_milliseconds=%s\n' \
       "$((NETWORK_QUIET_DURATION_SECONDS * 1000))"
     printf 'cpu_sampling=docker-stats-continuous-stream\n'
+    printf 'network_authority=Linux-proc-net-dev-all-interfaces-including-loopback\n'
+    printf 'max_network_bytes_per_second=%s\n' "$NETWORK_QUIET_MAX_NETWORK_BYTES_PER_SECOND"
+    printf 'network_rate=exact-integer-TX-plus-RX-over-conservative-minimum-interval\n'
+    printf 'network_samples_directory=%s\n' "${NETWORK_QUIET_NET_DIRECTORY##*/}"
+    printf 'network_window=joint-covered-cut-before-CPU-only-collector-exit-drain\n'
     printf 'stream_stall_reset_seconds=%s\n' \
       "$NETWORK_QUIET_STREAM_STALL_SECONDS"
     printf 'wait_budget_seconds=%s\n' "$NETWORK_QUIET_WAIT"
@@ -1305,7 +1475,7 @@ write_network_quiet_summary() {
     printf 'daemon_generations_stable=%s\n' "$generation_stable"
     printf 'samples_file=%s\n' "$(basename "$samples_file")"
     printf 'generations_file=%s\n' "$(basename "$generations_file")"
-    printf '%s\n' 'coverage=continuous cumulative CPU intervals for every process in node1..node6 containers through final generation verification and helper EOF cleanup; daemon generations are a stability guard, not the CPU authority'
+    printf '%s\n' 'coverage=joint continuous CPU and exact all-interface network intervals for node1..node6; main/shadow/helpers and observation included; CPU additionally covers every read-only collector exit; unavailable counters are not zero; PID generations remain stability guards'
   } > "$path"
 }
 
@@ -1348,6 +1518,11 @@ wait_for_network_quiet_gate() {
   local samples_file="$ARTIFACTS/network-quiet-$label_slug.samples.tsv"
   local generations_file="$ARTIFACTS/network-quiet-$label_slug.generations.tsv"
   local summary_file="$ARTIFACTS/network-quiet-$label_slug.summary.txt"
+  NETWORK_QUIET_NET_DIRECTORY="$ARTIFACTS/network-quiet-$label_slug.network"
+  mkdir -p "$NETWORK_QUIET_NET_DIRECTORY" || return 1
+  NETWORK_QUIET_NET_MEMBERS_FILE="$NETWORK_QUIET_NET_DIRECTORY/containers.json"
+  printf '%s\n' "$NETWORK_QUIET_DAEMON_GENERATION_PROGRAM" > "$NETWORK_QUIET_NET_DIRECTORY/generation-scanner.sh"
+  python3 "$SINOMO_DOCKER_DIR/quiet-network-counters.py" --print-program > "$NETWORK_QUIET_NET_DIRECTORY/counter-program.sh" || return 1
 
   started_at="$(date -u +'%Y-%m-%dT%H:%M:%S.%3NZ')"
   if ! started_monotonic_ms="$(monotonic_millis)"; then
@@ -1359,12 +1534,12 @@ wait_for_network_quiet_gate() {
   )" || return 1
   wait_budget_ms="$(duration_seconds_to_millis "$NETWORK_QUIET_WAIT")" || return 1
   deadline_ms=$((10#$started_monotonic_ms + 10#$wait_budget_ms))
-  printf '%s\n' $'sample_group\tquiet_elapsed_ms\tcandidate\tconsumed_at\tconsumed_epoch_ms\tobserved_monotonic_ms\tgroup_min_monotonic_ms\tgroup_max_monotonic_ms\tnode\tcontainer_id\tcontainer_name\tcpu_percent\tmax_cpu_percent\tcpu_within_limit\twindow_state' \
+  printf '%s\n' $'sample_group\tquiet_elapsed_ms\tcandidate\tconsumed_at\tconsumed_epoch_ms\tobserved_monotonic_ms\tgroup_min_monotonic_ms\tgroup_max_monotonic_ms\tnode\tcontainer_id\tcontainer_name\tcpu_percent\tmax_cpu_percent\tcpu_within_limit\twindow_state\tnetwork_status\tdelta_rx_bytes\tdelta_tx_bytes\tminimum_network_interval_ms\tmax_network_bytes_per_second\tnetwork_covered_through_ms\tnetwork_collectors_closed_ms\tcpu_group_min_ms\tcpu_group_max_ms\tnetwork_sample_file' \
     > "$samples_file"
   printf '%s\n' $'generation_epoch\tphase\tcaptured_at\tcaptured_epoch_ms\tnode\tcontainer_id\tmain_pid\tmain_start_ticks\tshadow_pid\tshadow_start_ticks\tmatches_baseline\tstatus' \
     > "$generations_file"
 
-  log "network-quiet/$label: waiting for $EXPECTED_MAINS whole containers at <=${NETWORK_QUIET_MAX_CPU_PERCENT}% CPU for an uninterrupted ${NETWORK_QUIET_DURATION_SECONDS}s continuous-stream window (absolute ${NETWORK_QUIET_WAIT}s deadline)"
+  log "network-quiet/$label: waiting for $EXPECTED_MAINS whole containers at <=${NETWORK_QUIET_MAX_CPU_PERCENT}% CPU and <=${NETWORK_QUIET_MAX_NETWORK_BYTES_PER_SECOND}B/s combined all-interface TX+RX for an uninterrupted ${NETWORK_QUIET_DURATION_SECONDS}s continuous-stream window (absolute ${NETWORK_QUIET_WAIT}s deadline)"
   log "  network-quiet/$label: samples -> $samples_file"
   log "  network-quiet/$label: daemon generations -> $generations_file"
 
@@ -1415,6 +1590,10 @@ wait_for_network_quiet_gate() {
       continue
     fi
 
+    if ! network_quiet_initialize_network_members; then
+      last_reason="network-container-members-unavailable"
+      break
+    fi
     if ! network_quiet_stats_stream_start "${containers[@]}"; then
       last_reason="docker-stats-stream-start-failed"
       network_quiet_stream_restart_delay "$deadline_ms" || break
@@ -1424,7 +1603,7 @@ wait_for_network_quiet_gate() {
 
     # Discard one complete stream group so every later percentage is backed by
     # a prior sample from this same continuous stream.
-    if ! network_quiet_stats_stream_read_group \
+    if ! network_quiet_read_observed_group \
       "$deadline_ms" "${#containers[@]}"; then
       last_reason="${NETWORK_QUIET_GROUP_REASON:-docker-stats-stream-unavailable}"
       network_quiet_stats_stream_stop
@@ -1466,7 +1645,7 @@ wait_for_network_quiet_gate() {
     restart_stream=0
 
     while :; do
-      if ! network_quiet_stats_stream_read_group \
+      if ! network_quiet_read_observed_group \
         "$deadline_ms" "${#containers[@]}"; then
         last_reason="${NETWORK_QUIET_GROUP_REASON:-docker-stats-stream-unavailable}"
         restart_stream=1
@@ -1523,7 +1702,7 @@ wait_for_network_quiet_gate() {
         last_reason=""
         network_quiet_write_stats_group_samples "$samples_file" "$sample_group" \
           "$candidate" 0 boundary
-        log "  network-quiet/$label: candidate $candidate continuous CPU boundary established"
+        log "  network-quiet/$label: candidate $candidate continuous CPU+network boundary established"
         continue
       fi
 
@@ -1571,7 +1750,7 @@ wait_for_network_quiet_gate() {
       # Consume all queued intervals and require every container to have a
       # quiet interval ending after verification completed before accepting.
       while :; do
-        if ! network_quiet_stats_stream_read_group \
+        if ! network_quiet_read_observed_group \
           "$deadline_ms" "${#containers[@]}"; then
           last_reason="${NETWORK_QUIET_GROUP_REASON:-docker-stats-stream-unavailable}"
           restart_stream=1
@@ -1600,7 +1779,7 @@ wait_for_network_quiet_gate() {
           last_reason="$NETWORK_QUIET_GROUP_REASON"
           network_quiet_write_stats_group_samples "$samples_file" \
             "$sample_group" "$candidate" 0 verification-busy
-          log "  network-quiet/$label: CPU activity during final generation verification reset candidate $candidate: ${NETWORK_QUIET_GROUP_REASON% }"
+          log "  network-quiet/$label: CPU/network activity during final generation verification reset candidate $candidate: ${NETWORK_QUIET_GROUP_REASON% }"
           verification_reset=1
           if [ "$generation_sessions_closed" -eq 1 ]; then restart_stream=1; fi
           break
@@ -1616,9 +1795,8 @@ wait_for_network_quiet_gate() {
         if [ "$generation_sessions_closed" -eq 0 ] \
           && network_quiet_coverage_reaches \
             "$NETWORK_QUIET_GROUP_MIN_MS" "$verification_target_ms"; then
-          # EOF/reaping is part of observation too. Keep the stats producer
-          # running and extend its required coverage through helper cleanup.
-          network_quiet_generation_sessions_stop
+          # Generation verification is covered. The same read-only workers
+          # also collect network counters, so retain them until the final cut.
           verification_target_ms="$(monotonic_millis || printf '%s' "$deadline_ms")"
           generation_sessions_closed=1
           if [ "$((10#$verification_target_ms))" -ge "$deadline_ms" ]; then
@@ -1629,8 +1807,25 @@ wait_for_network_quiet_gate() {
             break
           fi
         fi
-        if network_quiet_coverage_reaches \
-          "$NETWORK_QUIET_GROUP_MIN_MS" "$verification_target_ms"; then
+        if [ "$generation_sessions_closed" -eq 1 ] \
+          && [ "$NETWORK_QUIET_NET_SEALED" -eq 0 ] \
+          && network_quiet_coverage_reaches "$NETWORK_QUIET_GROUP_MIN_MS" "$verification_target_ms"; then
+          NETWORK_QUIET_NET_SEALED=1
+          # EOF/reaping remains charged to whole-container CPU. Seal only
+          # after the last exact network cut, then cover every worker exit.
+          network_quiet_generation_sessions_stop
+          verification_target_ms="$(monotonic_millis || printf '%s' "$deadline_ms")"
+          if [ "$((10#$verification_target_ms))" -ge "$deadline_ms" ]; then
+            last_reason="quiet-window-deadline-exhausted"
+            restart_stream=1
+            break
+          fi
+          network_quiet_write_stats_group_samples "$samples_file" "$sample_group" \
+            "$candidate" "$quiet_elapsed_ms" network-sealed-cpu-cleanup
+          continue
+        fi
+        if [ "$NETWORK_QUIET_NET_SEALED" -eq 1 ] \
+          && network_quiet_coverage_reaches "$NETWORK_QUIET_GROUP_CPU_MIN_MS" "$verification_target_ms"; then
           network_quiet_write_stats_group_samples "$samples_file" \
             "$sample_group" "$candidate" "$quiet_elapsed_ms" pass
           finished_at="$(date -u +'%Y-%m-%dT%H:%M:%S.%3NZ')"
@@ -1641,7 +1836,7 @@ wait_for_network_quiet_gate() {
           elapsed=$((elapsed_ms / 1000))
           network_quiet_stats_stream_stop
           write_network_quiet_summary "$summary_file" "$label" pass \
-            "continuous CPU coverage through stable main/shadow generation verification and helper EOF cleanup" \
+            "continuous joint CPU/network coverage through stable main/shadow verification, with CPU extended through all read-only collector exits" \
             "$started_at" "$finished_at" "$elapsed" "$elapsed_ms" \
             "$sample_group" "$candidate" "$qualifying_groups" \
             "$quiet_elapsed_ms" true "$samples_file" "$generations_file"
@@ -1855,10 +2050,10 @@ network_quiet_stream_ownership_self_test() {
 # CPU evidence: first between polls, then while final generations are scanned.
 network_quiet_full_gate_mock_self_test() {
   local saved_monotonic saved_container saved_container_name saved_start
-  local saved_stop saved_delay saved_baseline saved_verify saved_read saved_log
+  local saved_stop saved_delay saved_baseline saved_verify saved_read saved_log saved_network
   local original_nodes="$NODES" original_expected="$EXPECTED_MAINS"
   local original_artifacts="$ARTIFACTS" mock_dir rc=0
-  local mock_index=0 mock_verify_index=0 mock_now=100
+  local mock_index=0 mock_verify_index=0 mock_now=100 mock_network_busy=0
   local -a mock_times=() mock_cpu=() mock_verify_targets=()
   saved_monotonic="$(declare -f monotonic_millis)"
   saved_container="$(declare -f network_quiet_container_for_node_before_deadline)"
@@ -1870,6 +2065,7 @@ network_quiet_full_gate_mock_self_test() {
   saved_verify="$(declare -f network_quiet_verify_generation_baseline)"
   saved_read="$(declare -f network_quiet_stats_stream_read_group)"
   saved_log="$(declare -f log)"
+  saved_network="$(declare -f network_quiet_sample_network_group)"
   mock_dir="$(mktemp -d "${TMPDIR:-/tmp}/sinomo-network-quiet-gate.XXXXXX")" \
     || return 1
 
@@ -1883,7 +2079,17 @@ network_quiet_full_gate_mock_self_test() {
   network_quiet_container_name_before_deadline() {
     printf 'mock-%s\n' "${1#id-}"
   }
-  network_quiet_stats_stream_start() { :; }
+  network_quiet_stats_stream_start() { NETWORK_QUIET_NET_SEALED=0; }
+  network_quiet_sample_network_group() {
+    NETWORK_QUIET_GROUP_NET_MIN_MS="$mock_now"
+    NETWORK_QUIET_GROUP_NET_CLOSED_MS="$mock_now"
+    NETWORK_QUIET_GROUP_NET_STATUS[node1]=within
+    NETWORK_QUIET_GROUP_NET_STATUS[node2]=within
+    if [ "$mock_network_busy" -eq 1 ] && [ "$mock_now" -eq 34000 ]; then
+      NETWORK_QUIET_GROUP_NET_STATUS[node2]=above
+      NETWORK_QUIET_GROUP_REASON="network-over-limit=mock-node2:65537B/1000ms"
+    fi
+  }
   network_quiet_stats_stream_stop() { :; }
   # Any unexpected restart terminates the mock instead of hiding a failure in
   # an unbounded synthetic retry loop.
@@ -1934,18 +2140,25 @@ network_quiet_full_gate_mock_self_test() {
     mock_index=0
     mock_verify_index=0
     mock_now=100
+    mock_network_busy=0
     ARTIFACTS="$mock_dir/$scenario"
     mkdir -p "$ARTIFACTS" || return 1
     case "$scenario" in
       former-sleep-gap)
-        mock_times=(1000 2000 12000 17000 18000 48000 50000)
-        mock_cpu=(1.00% 1.00% 1.00% 20.00% 1.00% 1.00% 1.00%)
+        mock_times=(1000 2000 12000 17000 18000 48000 50000 51000)
+        mock_cpu=(1.00% 1.00% 1.00% 20.00% 1.00% 1.00% 1.00% 1.00%)
         mock_verify_targets=(49000)
         ;;
       verification-busy)
-        mock_times=(1000 2000 32000 34000 35000 65000 67000)
-        mock_cpu=(1.00% 1.00% 1.00% 20.00% 1.00% 1.00% 1.00%)
+        mock_times=(1000 2000 32000 34000 35000 65000 67000 68000)
+        mock_cpu=(1.00% 1.00% 1.00% 20.00% 1.00% 1.00% 1.00% 1.00%)
         mock_verify_targets=(33000 66000)
+        ;;
+      network-verification-busy)
+        mock_times=(1000 2000 32000 34000 35000 65000 67000 68000)
+        mock_cpu=(1.00% 1.00% 1.00% 1.00% 1.00% 1.00% 1.00% 1.00%)
+        mock_verify_targets=(33000 66000)
+        mock_network_busy=1
         ;;
       *) return 1 ;;
     esac
@@ -1965,11 +2178,17 @@ network_quiet_full_gate_mock_self_test() {
           '$15 == "verification-busy" && $12 == "20.00%" { found = 1 } END { exit !found }' \
           "$samples"
         ;;
+      network-verification-busy)
+        awk -F '\t' \
+          '$15 == "verification-busy" && $12 == "1.00%" && $16 == "above" { found = 1 } END { exit !found }' \
+          "$samples"
+        ;;
     esac
   }
 
   network_quiet_run_mock_case former-sleep-gap || rc=1
   network_quiet_run_mock_case verification-busy || rc=1
+  network_quiet_run_mock_case network-verification-busy || rc=1
 
   eval "$saved_monotonic"
   eval "$saved_container"
@@ -1981,6 +2200,7 @@ network_quiet_full_gate_mock_self_test() {
   eval "$saved_verify"
   eval "$saved_read"
   eval "$saved_log"
+  eval "$saved_network"
   unset -f network_quiet_run_mock_case
   NODES="$original_nodes"
   EXPECTED_MAINS="$original_expected"
@@ -2523,6 +2743,109 @@ wait_for_dfs_ready() {
   done
 }
 
+# Discovery preserves committed assignments. A fresh disposable test project
+# therefore requests its advertised six-node layout as ordinary administration.
+# Membership expands first; primary rotation preserves that activated member ring.
+# Both phases share the EXISTING convergence deadline and native handoff protocol.
+request_fresh_dfs_topology() {
+  local deadline="$1" command_timeout node node_id roster layout report
+  local lane primary_container desired_primary shard epoch current_primary fs members replicas
+  local phase transition=0 pending_report="" rows expected observed
+  local -a command
+  roster="$ARTIFACTS/dfs-requested-topology.json"
+  rows="$ARTIFACTS/dfs-requested-topology.nodes.tsv"
+  : >"$rows"
+  for node in $NODES; do
+    command_timeout="$(deadline_command_timeout "$deadline" "$READINESS_COMMAND_TIMEOUT")" || return 1
+    node_id="$(cluster_local_node_id "$node" "$command_timeout")" || return 1
+    printf '%s\t%s\n' "$node" "$node_id" >>"$rows"
+  done
+  jq -Rn '[inputs | split("\t") | {container: .[0], node_id: .[1]}]
+    | if length != 6 or ([.[].container] | sort) != ["node1", "node2", "node3", "node4", "node5", "node6"]
+        or ([.[].node_id] | unique | length) != 6 or any(.[]; .node_id == "")
+      then error("fresh topology requires six distinct actual node identities") else . end' \
+    "$rows" >"$roster" || return 1
+  members="$(jq -c '[.[].node_id] | sort' "$roster")" || return 1
+  layout="$ARTIFACTS/dfs-requested-topology.layout.last.json"
+  while :; do
+    command_timeout="$(deadline_command_timeout "$deadline" "$READINESS_COMMAND_TIMEOUT")" || return 1
+    compose_exec_timeout "$command_timeout" node1 sinomo test run cluster.dfs.shard-layout \
+      --require-cluster --json >"$layout" 2>"$ARTIFACTS/dfs-requested-topology.layout.last.stderr.log" || return 1
+    jq -e '.status == "passed" and (.diagnostics.pending_handoff_keys | type) == "array"
+      and (.diagnostics.shards | length) == 3
+      and ([.diagnostics.shards[].lane] | sort) == ["root", "services", "users"]' \
+      "$layout" >/dev/null || return 1
+    if jq -e '.diagnostics.pending_handoff_keys | length > 0' "$layout" >/dev/null; then
+      sleep "$POLL_INTERVAL"
+      continue
+    fi
+    if [ -n "$pending_report" ]; then
+      # Exact desired epoch and participants must be active before a later phase
+      # can be requested. The native activation requires its durable joint proof.
+      expected="$(jq -c '.pending_handoff.desired_shard
+        | {file_system_id, shard_id, epoch, primary_node_id,
+           replica_node_ids}' "$pending_report")" || return 1
+      observed="$(jq -c --argjson desired "$expected" '.diagnostics.shards[]
+        | select(.file_system_id == $desired.file_system_id and .shard_id == $desired.shard_id)
+        | {file_system_id, shard_id, epoch, primary_node_id,
+           replica_node_ids}' "$layout")" || return 1
+      [ "$observed" = "$expected" ] || { log "fresh topology: handoff did not activate its exact desired assignment"; return 1; }
+      cp "$layout" "${pending_report%.json}.activated.json" || return 1
+      pending_report=""
+    fi
+    phase=""
+    for lane in root services users; do
+      case "$lane" in root) primary_container=node1 ;; services) primary_container=node2 ;; users) primary_container=node3 ;; esac
+      desired_primary="$(jq -er --arg node "$primary_container" '.[] | select(.container == $node) | .node_id' "$roster")" || return 1
+      fs="$(jq -er --arg lane "$lane" '.diagnostics.shards[] | select(.lane == $lane) | .file_system_id' "$layout")" || return 1
+      shard="$(jq -er --arg lane "$lane" '.diagnostics.shards[] | select(.lane == $lane) | .shard_id' "$layout")" || return 1
+      epoch="$(jq -er --arg lane "$lane" '.diagnostics.shards[] | select(.lane == $lane) | .epoch' "$layout")" || return 1
+      current_primary="$(jq -er --arg lane "$lane" '.diagnostics.shards[] | select(.lane == $lane) | .primary_node_id' "$layout")" || return 1
+      jq -e --arg lane "$lane" --argjson wanted "$members" '.diagnostics.shards[] | select(.lane == $lane)
+        | [.primary_node_id] + .replica_node_ids
+        | length == (unique | length) and all(.[]; . as $member | $wanted | index($member) != null)' \
+        "$layout" >/dev/null || { log "fresh topology: current assignment contains an unexpected member"; return 1; }
+      if ! jq -e --arg lane "$lane" --argjson wanted "$members" '.diagnostics.shards[] | select(.lane == $lane)
+        | ([.primary_node_id] + .replica_node_ids | sort) == $wanted' "$layout" >/dev/null; then
+        phase=membership
+        command=(sinomo dfs metadata shard set-replicas "$shard" --filesystem "$fs" --expected-epoch "$epoch" --json)
+        replicas="$(jq -c --arg primary "$current_primary" '[.[].node_id | select(. != $primary)] | sort' "$roster")" || return 1
+        while IFS= read -r node_id; do command+=(--replica "$node_id"); done < <(jq -r '.[]' <<<"$replicas")
+      elif [ "$current_primary" != "$desired_primary" ]; then
+        phase=primary
+        command=(sinomo dfs metadata shard transfer-primary "$shard" --filesystem "$fs" --to "$desired_primary" --expected-epoch "$epoch" --json)
+      else
+        continue
+      fi
+      transition=$((transition + 1))
+      report="$ARTIFACTS/dfs-requested-topology-$transition-$lane-$phase.json"
+      command_timeout="$(deadline_command_timeout "$deadline" "$READINESS_COMMAND_TIMEOUT")" || return 1
+      compose_exec_timeout "$command_timeout" node1 "${command[@]}" >"$report" 2>"${report%.json}.stderr.log" || return 1
+      jq -e --arg fs "$fs" --arg shard "$shard" --arg primary "$current_primary" --arg phase "$phase" \
+        --arg desired_primary "$desired_primary" --argjson epoch "$epoch" --argjson wanted "$members" '
+        .pending_handoff as $h
+        | $h.cause.kind == "membership"
+          and $h.retiring_shard == .shard
+          and $h.retiring_shard.file_system_id == $fs and $h.retiring_shard.shard_id == $shard
+          and $h.retiring_shard.epoch == $epoch and $h.retiring_shard.primary_node_id == $primary
+          and $h.desired_shard.file_system_id == $fs and $h.desired_shard.shard_id == $shard
+          and $h.desired_shard.epoch == ($epoch + 1)
+          and $h.desired_shard.assignment == $h.retiring_shard.assignment
+          and $h.desired_shard.default_policy == $h.retiring_shard.default_policy
+          and ([$h.desired_shard.primary_node_id] + $h.desired_shard.replica_node_ids | sort) == $wanted
+          and (if $phase == "membership" then $h.desired_shard.primary_node_id == $primary
+               else $h.desired_shard.primary_node_id == $desired_primary end)' "$report" >/dev/null || return 1
+      pending_report="$report"
+      log "fresh topology: requested $lane $phase at epoch $epoch via native handoff"
+      break
+    done
+    if [ -z "$phase" ]; then
+      log "fresh topology: six actual members and three requested primaries activated"
+      return 0
+    fi
+  done
+}
+
 dfs_converged_epoch_signature() {
   jq -er '
     if .status != "passed" then
@@ -2577,6 +2900,10 @@ wait_for_dfs_converged() {
   fi
   log "dfs-converged: waiting for the fully distributed three-lane shard layout (<=${DFS_CONVERGENCE_WAIT}s)"
   deadline=$(( $(date +%s) + DFS_CONVERGENCE_WAIT ))
+  if [ "${SINOMO_TEST_REUSE:-0}" != 1 ] && [ "${DFS_FRESH_TOPOLOGY_REQUESTED:-0}" != 1 ]; then
+    request_fresh_dfs_topology "$deadline" || return 1
+    DFS_FRESH_TOPOLOGY_REQUESTED=1
+  fi
   probe_log="$ARTIFACTS/dfs-converged.last.json"
   probe_err="$ARTIFACTS/dfs-converged.last.stderr.log"
   confirm_log="$ARTIFACTS/dfs-converged.confirm.last.json"
@@ -3594,6 +3921,93 @@ dfs_versions_correctness() {
     && dfs_acceptance_case handoff
 }
 
+
+# Correctness+quiet baseline is distinct from latency/throughput acceptance.
+# Every existing functional scenario is still attempted; a failure is retained,
+# and never converted to a skipped/pass result by later successes.
+dfs_baseline_case() {
+  local name="$1" status=passed
+  scenario "$@"
+  case " $FAILED_SCENARIOS " in *" $name "*) status=failed ;; esac
+  python3 - "$ARTIFACTS/dfs-baseline-scope.json" "$name" "$status" <<'CASE_RESULT'
+import json, sys
+from pathlib import Path
+path = Path(sys.argv[1])
+scope = json.loads(path.read_text())
+entry = next(item for item in scope['required_cases'] if item['name'] == sys.argv[2])
+entry['status'] = sys.argv[3]
+path.write_text(json.dumps(scope, indent=2) + '\n')
+CASE_RESULT
+  local receipt_status=$?
+  if [ "$receipt_status" -ne 0 ]; then
+    FAILED_SCENARIOS="$FAILED_SCENARIOS baseline-scope-$name"
+    return 1
+  fi
+}
+
+dfs_baseline_correctness() {
+  python3 - "$ARTIFACTS/dfs-baseline-scope.json" <<'BASELINE_SCOPE'
+import json, sys
+from pathlib import Path
+functional = [
+    'invariants-baseline', 'read-your-write', 'cross-node', 'rename-across-prefixes',
+    'disk-damage-recovery', 'temporary-network-recovery', 'restart-durability',
+    'dfs-core-only-components', 'dfs-normal-correctness', 'dfs-history-restart',
+    'dfs-native-handoff', 'invariants-final', 'routed-status-final',
+    'baseline-final-convergence', 'baseline-final-joint-quiet',
+]
+performance = [
+    'network-realtime-latency-gate', 'dfs-protocol-codec-baseline',
+    'network-latency-baseline', 'network-payload-baseline',
+    'network-semantic-attachment-baseline', 'network-semantic-attachment-saturation',
+    'cluster-kv-quorum-baseline', 'small-file-baseline', 'bulk-performance',
+    'disk-baseline', 'large-file-performance', 'dfs-cli-benchmarks',
+]
+Path(sys.argv[1]).write_text(json.dumps({
+    'schema': 'sinomo.dfs-correctness-baseline.v1', 'status': 'running',
+    'scope': 'maintained functional/recovery checks and joint whole-container CPU/network quietness',
+    'required_cases': [{'name': name, 'status': 'not_run'} for name in functional],
+    'performance_cases': [{'name': name, 'status': 'not_run',
+        'reason': 'separate performance distributions deferred by this explicit baseline selector'} for name in performance],
+    'observation': 'debug/tracing/CPU-profiler support remains required and charged',
+    'quiet_gate': {'cpu_percent_of_one_core': 10, 'combined_network_bytes_per_second_per_container': 65536,
+                   'all_interfaces_including_loopback': True, 'continuous_seconds': 30, 'absolute_search_seconds': 120},
+    'topology_evidence': 'dfs-requested-topology*.json, dfs-converged probe artifacts, dfs-handoff/handoff.json',
+    'voter_coverage': 'six containers do not imply six Raft voters; fresh default formation is seed voter plus learners; multi-voter failure/rollout acceptance is separate',
+    'performance_acceptance': False,
+}, indent=2) + '\n')
+BASELINE_SCOPE
+  [ "$?" -eq 0 ] || return 1
+  dfs_baseline_case "invariants-baseline" invariants_sweep
+  dfs_baseline_case "read-your-write" read_your_write
+  dfs_baseline_case "cross-node" cross_node
+  dfs_baseline_case "rename-across-prefixes" rename_across_prefixes
+  dfs_baseline_case "disk-damage-recovery" disk_damage_recovery
+  dfs_baseline_case "temporary-network-recovery" temporary_network_recovery
+  dfs_baseline_case "restart-durability" restart_durability
+  dfs_baseline_case "dfs-core-only-components" dfs_acceptance_case core-only
+  dfs_baseline_case "dfs-normal-correctness" dfs_acceptance_case normal
+  # Separate cases keep handoff and final inspection attempted even when the
+  # prior history/restart check fails; no failure is discarded or waived.
+  dfs_baseline_case "dfs-history-restart" dfs_acceptance_case history --restart-cluster
+  dfs_baseline_case "dfs-native-handoff" dfs_acceptance_case handoff
+  dfs_baseline_case "invariants-final" invariants_sweep
+  dfs_baseline_case "routed-status-final" final_routed_status
+  dfs_baseline_case "baseline-final-convergence" wait_for_dfs_converged
+  dfs_baseline_case "baseline-final-joint-quiet" wait_for_network_quiet dfs-baseline
+  python3 - "$ARTIFACTS/dfs-baseline-scope.json" "$FAILED_SCENARIOS" <<'BASELINE_FINISH'
+import json, sys
+from pathlib import Path
+path = Path(sys.argv[1])
+scope = json.loads(path.read_text())
+scope['status'] = 'passed' if not sys.argv[2].strip() and all(
+    case['status'] == 'passed' for case in scope['required_cases']) else 'failed'
+path.write_text(json.dumps(scope, indent=2) + '\n')
+raise SystemExit(0 if scope['status'] == 'passed' else 1)
+BASELINE_FINISH
+  [ "$?" -eq 0 ] && [ -z "$FAILED_SCENARIOS" ]
+}
+
 dfs_benchmarks() {
   # Recovery and handoff are deliberately excluded from timed workloads.
   wait_for_dfs_converged \
@@ -3799,17 +4213,36 @@ disk_damage_recovery() {
 }
 
 temporary_network_recovery() {
-  local path="/services/cluster-tests/$RUN_ID/network-heal.txt"
-  local payload="network heal $RUN_ID"
+  local base="/services/cluster-tests/runs/$RUN_ID/network-heal"
+  local path="$base/value.txt" new_path="$base/after-heal.txt"
+  local original_payload="before network cut $RUN_ID"
+  local payload="network heal $RUN_ID" new_payload="new write after network heal $RUN_ID"
+  local operation_id="network-heal-$RUN_ID"
   local network="${PROJECT}_seg_b"
-  local node6_container
+  local node6_container node6_id baseline_report original_json assignment_json options_json
   node6_container="$(compose ps -q node6)"
+  node6_id="$(cluster_local_node_id node6)" || return 1
   if [ -z "$node6_container" ]; then
     log "cannot find node6 container id"
     return 1
   fi
 
-  log "disconnecting node6 from $network for ${NETWORK_PARTITION_SECONDS}s"
+  # Seed under all six participants, then capture the actual immutable inputs
+  # before disconnecting any member. Later phases retain this SAME node/ID/body.
+  run_probe node2 cluster.dfs.write \
+    --param "path=$path" --param "payload=$original_payload" || return 1
+  run_probe node6 cluster.dfs.expect-file \
+    --param "path=$path" --param "payload=$original_payload" --param "timeout-seconds=$EXPECT_TIMEOUT" || return 1
+  run_probe node2 cluster.dfs.partition-write \
+    --param phase=baseline --param "path=$path" --param "payload=$payload" \
+    --param "operation-id=$operation_id" --param required-participants=6 \
+    --param "unavailable-node-id=$node6_id" --param "timeout-seconds=$EXPECT_TIMEOUT" || return 1
+  baseline_report="$ARTIFACTS/probe-$(printf '%03d' "$PROBE_INDEX")-node2-cluster.dfs.partition-write.json"
+  original_json="$(jq -ec '.diagnostics.original' "$baseline_report")" || return 1
+  assignment_json="$(jq -ec '.diagnostics.assignment' "$baseline_report")" || return 1
+  options_json="$(jq -ec '.diagnostics.write_options' "$baseline_report")" || return 1
+
+  log "disconnecting assigned node6 from $network for ${NETWORK_PARTITION_SECONDS}s"
   if ! docker network disconnect "$network" "$node6_container" >/dev/null 2>&1; then
     log "failed to disconnect node6 from $network"
     return 1
@@ -3817,22 +4250,46 @@ temporary_network_recovery() {
 
   local rc=0
   sleep "$NETWORK_PARTITION_SECONDS"
-  run_probe node2 cluster.dfs.write \
-    --param "path=$path" --param "payload=$payload" || rc=1
+  # An arbitrary write error cannot pass. This probe requires the exact native
+  # Prepared body plus unchanged canonical content/nonvisible new generation.
+  run_probe node2 cluster.dfs.partition-write \
+    --param phase=blocked --param "path=$path" --param "payload=$payload" \
+    --param "operation-id=$operation_id" --param required-participants=6 \
+    --param "unavailable-node-id=$node6_id" --param "timeout-seconds=$EXPECT_TIMEOUT" \
+    --param "original-object-json=$original_json" --param "original-assignment-json=$assignment_json" \
+    --param "original-options-json=$options_json" || rc=1
 
+  # Heal even after missing/failed cut evidence; retain that failure in rc.
   log "reconnecting node6 to $network"
   if ! docker network connect --alias node6 "$network" "$node6_container" >/dev/null 2>&1; then
     log "failed to reconnect node6 to $network"
     return 1
   fi
-
   wait_for_cluster_ready "post-network-heal" || rc=1
+  run_probe node2 cluster.dfs.partition-write \
+    --param phase=recover --param "path=$path" --param "payload=$payload" \
+    --param "operation-id=$operation_id" --param required-participants=6 \
+    --param "unavailable-node-id=$node6_id" --param "timeout-seconds=$EXPECT_TIMEOUT" \
+    --param "original-object-json=$original_json" --param "original-assignment-json=$assignment_json" \
+    --param "original-options-json=$options_json" || rc=1
   wait_for_dfs_ready || rc=1
   wait_for_dfs_converged || rc=1
-  if [ "$rc" = 0 ]; then
-    run_probe node6 cluster.dfs.expect-file \
-      --param "path=$path" --param "payload=$payload" --param "timeout-seconds=$EXPECT_TIMEOUT" || rc=1
-  fi
+  run_probe node6 cluster.dfs.expect-file \
+    --param "path=$path" --param "payload=$payload" --param "timeout-seconds=$EXPECT_TIMEOUT" || rc=1
+  run_probe node5 cluster.dfs.expect-file \
+    --param "path=$path" --param "payload=$payload" --param "timeout-seconds=$EXPECT_TIMEOUT" || rc=1
+  run_probe node2 cluster.dfs.write \
+    --param "path=$new_path" --param "payload=$new_payload" || rc=1
+  run_probe node6 cluster.dfs.expect-file \
+    --param "path=$new_path" --param "payload=$new_payload" --param "timeout-seconds=$EXPECT_TIMEOUT" || rc=1
+  compose restart node6 >/dev/null 2>&1 || { log "node6 recovery reopen failed"; return 1; }
+  wait_for_cluster_ready "post-network-recovery-reopen" || rc=1
+  wait_for_dfs_ready || rc=1
+  wait_for_dfs_converged || rc=1
+  run_probe node6 cluster.dfs.expect-file \
+    --param "path=$path" --param "payload=$payload" --param "timeout-seconds=$EXPECT_TIMEOUT" || rc=1
+  run_probe node6 cluster.dfs.expect-file \
+    --param "path=$new_path" --param "payload=$new_payload" --param "timeout-seconds=$EXPECT_TIMEOUT" || rc=1
   return "$rc"
 }
 
@@ -4142,7 +4599,7 @@ teardown() {
   python3 "$SINOMO_DOCKER_DIR/verification_report.py" "$ARTIFACTS" \
     --project "$PROJECT" --binary "$BINARY" --exit-code "$original_exit" \
     --profile "${SINOMO_TEST_PROFILE:-debug+cpu-profiler}" \
-    --lane "formation=$FORMATION_ONLY dfs-ready=$DFS_READY_ONLY quiet=$QUIET_ONLY dfs=$DFS_ONLY network=${NETWORK_CASES:-${SINOMO_TEST_NETWORK_ONLY:-0}} kv=$CLUSTER_KV_ONLY pjdfstest=$PJDFSTEST_ONLY" \
+    --lane "formation=$FORMATION_ONLY dfs-ready=$DFS_READY_ONLY quiet=$QUIET_ONLY dfs=$DFS_ONLY dfs-baseline=${DFS_BASELINE_ONLY:-0} network=${NETWORK_CASES:-${SINOMO_TEST_NETWORK_ONLY:-0}} kv=$CLUSTER_KV_ONLY pjdfstest=$PJDFSTEST_ONLY" \
     --failed-scenarios "$FAILED_SCENARIOS" || report_exit=$?
   trap - EXIT
   if [ "$original_exit" != 0 ]; then exit "$original_exit"; fi
@@ -4157,7 +4614,7 @@ if [ "${SINOMO_TEST_TIMING_HELPERS_SELF_TEST:-0}" = 1 ]; then
 fi
 
 if [ -n "$NETWORK_CASES" ]; then
-  if [ "$FORMATION_ONLY$DFS_READY_ONLY$DFS_ONLY$CLUSTER_KV_ONLY$PJDFSTEST_ONLY${SINOMO_TEST_NETWORK_ONLY:-0}" != 000000 ]; then
+  if [ "$FORMATION_ONLY$DFS_READY_ONLY$DFS_ONLY$DFS_BASELINE_ONLY$CLUSTER_KV_ONLY$PJDFSTEST_ONLY${SINOMO_TEST_NETWORK_ONLY:-0}" != 0000000 ]; then
     log "NETWORK_CASES cannot be combined with other lane selectors"; exit 1
   fi
   if [ "${SINOMO_TEST_NETWORK_PLAN:-0}" = 1 ]; then
@@ -4170,6 +4627,12 @@ fi
 
 if [ -n "$NETWORK_CASES" ] && { [ -e "$ARTIFACTS/result.json" ] || [ -e "$ARTIFACTS/network-preflight" ]; }; then
   log "refusing to overwrite an earlier network run; choose a fresh SINOMO_TEST_ARTIFACTS directory"
+  exit 1
+fi
+
+if [ "$DFS_BASELINE_ONLY" = 1 ] && { [ -e "$ARTIFACTS/verification.json" ] || [ -e "$ARTIFACTS/dfs-baseline-scope.json" ] \
+  || [ -e "$ARTIFACTS/write-latency.json" ] || [ -e "$ARTIFACTS/benchmark.json" ] || [ -e "$ARTIFACTS/result.json" ]; }; then
+  log "refusing to overwrite an earlier baseline; choose fresh SINOMO_TEST_ARTIFACTS"
   exit 1
 fi
 
@@ -4287,6 +4750,15 @@ if [ "$DFS_READY_ONLY" = 1 ]; then
     exit 1
   fi
   log "RESULT: PASS — DFS readiness, daemon mutation, and convergence gates green (probe reports in $ARTIFACTS)"
+  exit 0
+fi
+
+if [ "$DFS_BASELINE_ONLY" = 1 ]; then
+  if ! dfs_baseline_correctness; then
+    log "RESULT: FAIL — DFS baseline retains every functional/quiet failure: $FAILED_SCENARIOS (evidence in $ARTIFACTS)"
+    exit 1
+  fi
+  log "RESULT: PASS — DFS functional/recovery baseline and joint CPU/network quietness green; performance NOT_RUN (reports in $ARTIFACTS)"
   exit 0
 fi
 

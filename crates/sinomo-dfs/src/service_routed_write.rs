@@ -778,7 +778,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         .to_string(),
                 });
             }
-            return self.replayed_routed_write_outcome_for_intent(&intent);
+            return self.replayed_routed_write_outcome_for_intent(
+                &intent,
+                &expected_content_hash,
+                expected_content_size_bytes,
+            );
         }
 
         let stable_record = if let Some(backend) = self.metadata_backend.as_ref() {
@@ -831,7 +835,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             let Some(intent) = self.coordinator.intent(&record.intent_id).cloned() else {
                 return Ok(None);
             };
-            return self.replayed_routed_write_outcome_for_intent(&intent);
+            return self.replayed_routed_write_outcome_for_intent(
+                &intent,
+                &expected_content_hash,
+                expected_content_size_bytes,
+            );
         }
         if let Some(backend) = self.metadata_backend.as_ref()
             && backend
@@ -899,7 +907,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     fn replayed_routed_write_outcome_for_intent(
         &mut self,
         intent: &DistributedWriteIntent,
+        content_hash: &str,
+        content_size_bytes: u64,
     ) -> Result<Option<NetworkedDfsWriteOutcome>, DfsError> {
+        self.refresh_committed_write_projection(&intent.intent_id)?;
+        self.recover_prepared_write_for_retry(intent, content_hash, content_size_bytes)?;
         match self.write_outcome(&intent.intent_id) {
             Ok(outcome) => Ok(Some(outcome)),
             Err(error) if matches!(intent.state, DfsWriteIntentState::AwaitingReceipts) => {
@@ -2667,6 +2679,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .cloned()
             .collect::<Vec<_>>();
         for intent_id in intent_ids {
+            self.refresh_committed_write_projection(&intent_id)?;
             let result = match self.write_outcome(&intent_id) {
                 Ok(NetworkedDfsWriteOutcome::Pending { .. }) => continue,
                 Ok(outcome) => DfsDistributedWriteResult::Outcome { outcome },

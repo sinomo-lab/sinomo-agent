@@ -700,18 +700,29 @@ async fn native_remote_noop_proof_binds_complete_config_assignment_and_row_once(
 
 #[test]
 fn native_placement_preserves_actual_retained_durability_and_repair_owner_after_gc() {
-    native_placement_retirement(true);
+    native_placement_retirement(true, false);
 }
 
 #[test]
 fn native_completed_placement_does_not_resurrect_superseded_repairs_after_reopen() {
-    native_placement_retirement(false);
+    native_placement_retirement(false, false);
 }
 
-fn native_placement_retirement(retain: bool) {
-    let mut case =
-        NativePlacementFixture::with_nodes("native-placement-retained-grant", false, 1, 2);
-    let nodes = DfsTestRuntime::ordered_node_ids("native-placement-retained-grant", 2);
+#[test]
+fn native_placement_replay_after_handoff_preserves_original_committed_obligation() {
+    native_placement_retirement(true, true);
+}
+
+fn native_placement_retirement(retain: bool, replay_after_handoff: bool) {
+    let label = if replay_after_handoff {
+        "native-placement-replay-handoff"
+    } else if retain {
+        "native-placement-retained-grant"
+    } else {
+        "native-placement-retirement"
+    };
+    let mut case = NativePlacementFixture::with_nodes(label, false, 1, 2);
+    let nodes = DfsTestRuntime::ordered_node_ids(label, 2);
     let original = case.job.accepted_config.clone();
     let mut policy = DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedConfirmed, 2, 2).unwrap();
     policy.required_node_ids = nodes.clone();
@@ -841,6 +852,62 @@ fn native_placement_retirement(retain: bool) {
             &placement.plan.desired_replica_nodes,
         )
         .unwrap();
+    if replay_after_handoff {
+        let intent_id = format!(
+            "placement:{}:{}:{}",
+            job.job_id, object.object_id, object.version
+        );
+        let recorded = case
+            .service
+            .metadata_backend()
+            .unwrap()
+            .get_intent(&object.object_id, &intent_id)
+            .unwrap()
+            .unwrap();
+        let promoted = nodes[1].clone();
+        case.runtime
+            .reassign_metadata_shard(
+                &object.file_system_id,
+                "services",
+                promoted.clone(),
+                vec![case.primary.clone()],
+            )
+            .unwrap();
+        let mut owner = case.runtime.metadata_primary_service(&path).unwrap();
+        assert_eq!(owner.node_id(), &promoted);
+        let (resolved, replication, placement) =
+            reconciliation_placement_for_object(&one_copy, &job, &object).unwrap();
+        owner
+            .reconcile_object_placement_local(
+                &job.job_id,
+                &object.path,
+                &object.object_id,
+                &object.version,
+                resolved.policy.consistency,
+                replication,
+                &placement.plan.desired_replica_nodes,
+            )
+            .expect("the actual new owner must replay the same immutable placement obligation");
+        assert_eq!(
+            owner
+                .metadata_backend()
+                .unwrap()
+                .get_intent(&object.object_id, &intent_id)
+                .unwrap()
+                .unwrap(),
+            recorded
+        );
+        assert_eq!(
+            owner
+                .current_read_object_metadata(&object.object_id)
+                .unwrap()
+                .current_locations,
+            object.current_locations
+        );
+        drop(owner);
+        case.close();
+        return;
+    }
     assert_eq!(
         case.service
             .current_read_object_metadata(&object.object_id)

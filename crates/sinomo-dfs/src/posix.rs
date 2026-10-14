@@ -324,6 +324,13 @@ fn posix_error_is_concurrent_create_winner(error: &DfsPosixError) -> bool {
 
 fn posix_error_is_routed_namespace_unavailable(error: &DfsPosixError) -> bool {
     matches!(error, DfsPosixError::Dfs(DfsError::Network { .. }))
+        || matches!(
+            error,
+            DfsPosixError::Dfs(DfsError::NetworkDelivery {
+                delivery_state: sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent,
+                ..
+            })
+        )
 }
 
 #[cfg(test)]
@@ -911,6 +918,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let _namespace_plan = self.namespace_execution.begin_planning();
         let path = self.resolve_posix_dot_components_distributed(path)?;
         self.ensure_resolved_path_not_in_cross_shard_flight(&path)?;
+        // Creating the child also publishes its parent's generation. Check
+        // that existing job reservation before either durable mutation;
+        // discovering it during the result lookup would hide a committed mkdir.
+        if let Some(parent) = parent_posix_path(&path) {
+            self.ensure_resolved_path_not_in_cross_shard_flight(&parent)?;
+        }
         self.ensure_parent_directory(&path)?;
         if let Some(mut object) = self.lookup_sifs_path(&path)? {
             if object.kind != DfsObjectKind::Tombstone {

@@ -1650,9 +1650,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let Some(control_plane) = self.control_plane.as_mut() else {
             return Ok(vec![DfsNodeAdvertisement::content(self.node_id.clone())]);
         };
-        let mut candidates = DfsControlPlaneStore::new(control_plane.as_mut())
-            .cluster_view()?
-            .content_nodes;
+        let mut candidates = match control_plane.write_configuration_projection()? {
+            Some(configuration) => configuration.content_advertisements()?,
+            // Compatibility callers retain the same content advertisements;
+            // metadata offers do not participate in content placement.
+            None => DfsControlPlaneStore::new(control_plane.as_mut()).content_services()?,
+        };
         if !candidates
             .iter()
             .any(|candidate| candidate.node_id == self.node_id)
@@ -2673,7 +2676,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(());
         }
         let owner_epoch = self.local_metadata_owner_epoch_for_object(&object)?;
-        let intent = DistributedWriteIntent {
+        let mut intent = DistributedWriteIntent {
             publication: Default::default(),
             intent_id: intent_id.clone(),
             file_system_id: object.file_system_id.clone(),
@@ -2690,6 +2693,33 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             create_predecessor_object_id: None,
             state: DfsWriteIntentState::Committed,
         };
+        if let Some(recorded) = self
+            .metadata_backend
+            .as_ref()
+            .map(|backend| backend.get_intent(object_id, &intent_id))
+            .transpose()?
+            .flatten()
+        {
+            let original = crate::intent::distributed_intent_from_record(&recorded);
+            let mut current_owner = original.clone();
+            current_owner.owner_epoch = intent.owner_epoch;
+            current_owner.requesting_node_id = intent.requesting_node_id.clone();
+            if original.owner_epoch > intent.owner_epoch
+                || (original.owner_epoch == intent.owner_epoch
+                    && original.requesting_node_id != intent.requesting_node_id)
+                || current_owner != intent
+                || recorded.content_hash.as_deref() != Some(content_hash.as_str())
+            {
+                return Err(DfsError::Metadata {
+                    message: "placement replay differs from its original committed obligation"
+                        .into(),
+                });
+            }
+            // The current job/plan and actual local primary were validated
+            // above. A handoff moves execution authority, not the immutable
+            // identity of the already committed placement obligation.
+            intent = original;
+        }
         let durable_receipts = desired_replica_node_ids
             .iter()
             .filter(|node_id| current.contains(*node_id))

@@ -1429,7 +1429,9 @@ pub struct DfsMetadataPrefixProbe {
     pub primary_handoff_id: Option<String>,
 }
 
-/// Fresh request identity bound to the complete durable prepared prefix.
+/// Fresh request identity bound to the complete captured current source cut.
+/// `operation` separately identifies its immutable original preparation. The
+/// current cut includes every later frame; its head need not be the prepare slot.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct DfsMetadataAuthorityProbe {
@@ -1466,23 +1468,6 @@ pub enum DfsCanonicalAuthorization {
         expected_shard: DfsMetadataShardConfig,
         acknowledged_node_ids: Vec<NodeId>,
         prepare_sequence: u64,
-    },
-    /// A compact Raft-committed fence for the exact prepared operation.
-    ///
-    /// DFS still owns and replicates the prepare and all filesystem state.
-    /// This permit only reuses cluster KV's existing consensus log to prevent
-    /// a partial DFS acknowledgement from racing authority or membership
-    /// failover.
-    ClusterQuorum {
-        operation_digest: String,
-        expected_shard: DfsMetadataShardConfig,
-        permit_id: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        native_permit: Option<crate::DfsMetadataOperationPermit>,
-        /// Actual correlated metadata-prepare ACKs; never content receipts or
-        /// Raft votes. The private guard mint binds this recovery certificate.
-        #[serde(default)]
-        acknowledged_node_ids: Vec<NodeId>,
     },
 }
 

@@ -854,63 +854,74 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 Err(error) => return Err(error),
             };
             let _execution = self.acquire_prepared_execution(&scope)?;
-            let backend = self.metadata_backend.as_ref().expect("location backend");
-            let Some(mut current) = backend.get_object_on_shard(&scope.shard_id, object_id)? else {
-                return Ok(());
-            };
-            if current.version != *version || current.content_hash != *content_hash {
-                return Ok(());
-            }
-            let cut = backend
-                .export_shard_table_snapshot(&scope.shard_id)?
-                .ok_or_else(|| DfsError::Metadata {
-                    message: "location withdrawal has no current shard cut".into(),
-                })?;
-            let mut effects = Vec::new();
-            if current.current_locations.contains(source_node_id) {
-                current
-                    .current_locations
-                    .retain(|node| node != source_node_id);
-                effects.push(DfsPreparedMetadataEffect::PutObject {
-                    object: current.clone(),
-                });
-            }
-            if let Some(mut record) = backend.get_version(object_id, version)?
-                && record.content_hash == *content_hash
-                && record.locations.contains(source_node_id)
-            {
-                record.locations.retain(|node| node != source_node_id);
-                effects.push(DfsPreparedMetadataEffect::PutVersion { version: record });
-            }
-            if backend
-                .receipts_for_version(object_id, version)?
-                .iter()
-                .any(|receipt| receipt.replica_node_id == *source_node_id)
-            {
-                if !effects
-                    .iter()
-                    .any(|effect| matches!(effect, DfsPreparedMetadataEffect::PutObject { .. }))
-                {
+            // Object/version/receipt reads and their journal precondition must
+            // describe the same refreshed cut under the actual execution owner.
+            // An immutable read cache can otherwise expose fresh rows while the
+            // resident exporter still holds the previous journal prefix.
+            self.metadata_backend
+                .as_mut()
+                .expect("location backend")
+                .begin_consistent_read_snapshot_for_path(&object.file_system_id, &object.path)?;
+            let plan = (|| -> Result<_, DfsError> {
+                let backend = self.metadata_backend.as_ref().expect("location backend");
+                let Some(mut current) = backend.get_object_on_shard(&scope.shard_id, object_id)?
+                else {
+                    return Ok(None);
+                };
+                if current.version != *version || current.content_hash != *content_hash {
+                    return Ok(None);
+                }
+                let cut = backend
+                    .export_shard_table_snapshot(&scope.shard_id)?
+                    .ok_or_else(|| DfsError::Metadata {
+                        message: "location withdrawal has no current shard cut".into(),
+                    })?;
+                let mut effects = Vec::new();
+                if current.current_locations.contains(source_node_id) {
+                    current
+                        .current_locations
+                        .retain(|node| node != source_node_id);
                     effects.push(DfsPreparedMetadataEffect::PutObject {
                         object: current.clone(),
                     });
                 }
-                if !effects
-                    .iter()
-                    .any(|effect| matches!(effect, DfsPreparedMetadataEffect::PutVersion { .. }))
-                    && let Some(record) = backend.get_version(object_id, version)?
+                if let Some(mut record) = backend.get_version(object_id, version)?
+                    && record.content_hash == *content_hash
+                    && record.locations.contains(source_node_id)
                 {
+                    record.locations.retain(|node| node != source_node_id);
                     effects.push(DfsPreparedMetadataEffect::PutVersion { version: record });
                 }
-                effects.push(DfsPreparedMetadataEffect::RemoveReceipt {
-                    object_id: object_id.clone(),
-                    version: version.clone(),
-                    replica_node_id: source_node_id.clone(),
-                });
-            }
-            if !effects.is_empty() {
+                if backend
+                    .receipts_for_version(object_id, version)?
+                    .iter()
+                    .any(|receipt| receipt.replica_node_id == *source_node_id)
+                {
+                    if !effects
+                        .iter()
+                        .any(|effect| matches!(effect, DfsPreparedMetadataEffect::PutObject { .. }))
+                    {
+                        effects.push(DfsPreparedMetadataEffect::PutObject {
+                            object: current.clone(),
+                        });
+                    }
+                    if !effects.iter().any(|effect| {
+                        matches!(effect, DfsPreparedMetadataEffect::PutVersion { .. })
+                    }) && let Some(record) = backend.get_version(object_id, version)?
+                    {
+                        effects.push(DfsPreparedMetadataEffect::PutVersion { version: record });
+                    }
+                    effects.push(DfsPreparedMetadataEffect::RemoveReceipt {
+                        object_id: object_id.clone(),
+                        version: version.clone(),
+                        replica_node_id: source_node_id.clone(),
+                    });
+                }
+                if effects.is_empty() {
+                    return Ok(None);
+                }
                 let mut payload = DfsPreparedOperationPayload::for_metadata_effects(
-                    scope,
+                    scope.clone(),
                     vec![DfsNamespaceObjectVersionExpectation {
                         object_id: object_id.clone(),
                         expected_version: Some(version.clone()),
@@ -923,6 +934,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     time::OffsetDateTime::now_utc(),
                 )?;
                 payload.expected_journal_sequence = Some(cut.prefix_proof.journal_sequence);
+                Ok(Some((payload, current)))
+            })();
+            self.metadata_backend
+                .as_mut()
+                .expect("location backend")
+                .end_consistent_read_snapshot_for_path(&object.file_system_id, &object.path);
+            if let Some((payload, current)) = plan? {
                 self.publish_metadata_effect_payload(payload)?;
                 self.apply_metadata_object_to_service_state(current)?;
                 self.record_message_committed_work(DfsMessageCommittedWork {

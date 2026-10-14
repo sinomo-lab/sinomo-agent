@@ -100,26 +100,58 @@ def quietness_results(root):
     for path in sorted(root.glob("network-quiet-*.summary.txt")):
         summary = dict(line.split("=", 1) for line in path.read_text().splitlines() if "=" in line)
         samples = {f"node{i}": [] for i in range(1, int(summary.get("container_count", "0")) + 1)}
+        network = {node: {} for node in samples}
+        network_unavailable = {node: 0 for node in samples}
         sample_name = summary.get("samples_file", "")
         if sample_name and Path(sample_name).name == sample_name and (root / sample_name).is_file():
             for row in csv.DictReader((root / sample_name).read_text().splitlines(), delimiter="\t"):
                 if row.get("window_state") == "stream-warmup":
                     continue
+                node = row.get("node", "unavailable")
                 try:
                     cpu = float(row["cpu_percent"].rstrip("%"))
+                    if math.isfinite(cpu) and cpu >= 0:
+                        samples.setdefault(node, []).append(cpu)
                 except (ValueError, KeyError):
+                    pass
+                if "max_network_bytes_per_second" not in summary:
+                    continue  # Older CPU-only artifacts do not claim network acceptance.
+                if row.get("network_status") == "baseline":
                     continue
-                if math.isfinite(cpu) and cpu >= 0:
-                    samples.setdefault(row["node"], []).append(cpu)
+                if row.get("network_status") not in ("within", "above"):
+                    network_unavailable[node] = network_unavailable.get(node, 0) + 1
+                    continue
+                try:
+                    rx, tx, elapsed = [int(row[key]) for key in
+                        ("delta_rx_bytes", "delta_tx_bytes", "minimum_network_interval_ms")]
+                    if min(rx, tx) < 0 or elapsed <= 0:
+                        raise ValueError("invalid counter interval")
+                    name = row["network_sample_file"]
+                    if not name or Path(name).name != name:
+                        raise ValueError("network sample identity missing")
+                    network.setdefault(node, {})[name] = (rx, tx, elapsed)
+                except (ValueError, KeyError):
+                    network_unavailable[node] = network_unavailable.get(node, 0) + 1
         nodes = []
         for node, values in sorted(samples.items()):
             ordered = sorted(values)
             limit = float(summary["max_cpu_percent"])
+            endpoints = list(network.get(node, {}).values())
+            rates = sorted((rx + tx) * 1000 / elapsed for rx, tx, elapsed in endpoints)
+            net_limit = int(summary.get("max_network_bytes_per_second", "0"))
             nodes.append({"node": node, "samples": len(values),
                           "mean_cpu_percent": sum(values) / len(values) if values else None,
                           "p95_cpu_percent": ordered[math.ceil(len(values) * .95) - 1] if values else None,
                           "max_cpu_percent": max(values) if values else None,
-                          "over_limit_samples": sum(v > limit for v in values) if values else None})
+                          "over_limit_samples": sum(v > limit for v in values) if values else None,
+                          "network_intervals": len(endpoints),
+                          "network_rx_bytes": str(sum(rx for rx, _, _ in endpoints)) if endpoints else None,
+                          "network_tx_bytes": str(sum(tx for _, tx, _ in endpoints)) if endpoints else None,
+                          "network_max_combined_bytes_per_second": max(rates) if rates else None,
+                          "network_over_limit_intervals": sum((rx + tx) * 1000 > net_limit * elapsed
+                              for rx, tx, elapsed in endpoints) if endpoints else None,
+                          "network_unavailable_intervals": network_unavailable.get(node, 0),
+                          "network_gate_recorded": net_limit > 0})
         gates.append({"artifact": path.name, "summary": summary, "nodes": nodes})
     return gates
 
@@ -147,6 +179,40 @@ def write_report(root):
     if is_write:
         lines += ["Scope: " + ("standard acceptance matrix" if report["acceptance_scope"]
                               else "diagnostic; does not establish standard acceptance") + ".", ""]
+    baseline_path = root / "dfs-baseline-scope.json"
+    if baseline_path.is_file():
+        baseline_raw = baseline_path.read_bytes()
+        baseline = json.loads(baseline_raw)
+        if baseline.get("schema") != "sinomo.dfs-correctness-baseline.v1":
+            raise ValueError("unknown DFS baseline scope")
+        expected = {
+            'invariants-baseline', 'read-your-write', 'cross-node', 'rename-across-prefixes',
+            'disk-damage-recovery', 'temporary-network-recovery', 'restart-durability',
+            'dfs-core-only-components', 'dfs-normal-correctness', 'dfs-history-restart',
+            'dfs-native-handoff', 'invariants-final', 'routed-status-final',
+            'baseline-final-convergence', 'baseline-final-joint-quiet',
+        }
+        actual = [case.get('name') for case in baseline.get('required_cases', [])]
+        complete_scope = len(actual) == len(expected) and set(actual) == expected
+        report["dfs_baseline"] = baseline
+        report["source_artifacts"][baseline_path.name] = hashlib.sha256(baseline_raw).hexdigest()
+        report["performance_acceptance"] = False
+        report["passed"] = report["passed"] and complete_scope and baseline.get("status") == "passed" and all(
+            case.get("status") == "passed" for case in baseline["required_cases"])
+        lines += ["Scope: **DFS functional/recovery baseline and joint CPU/network quietness**. "
+                  "Latency, throughput and I/O performance acceptance are **NOT_RUN**.", "",
+                  baseline["voter_coverage"], ""]
+        lines += table(["Required baseline case", "Result"], [
+            (case["name"], case["status"]) for case in baseline["required_cases"]])
+        lines += [""] + table(["Separate performance family", "Result", "Reason"], [
+            (case["name"], case["status"], case["reason"]) for case in baseline["performance_cases"]])
+    elif "dfs-baseline=1" in result.get("lane", "").split():
+        report["passed"] = False
+        report["dfs_baseline"] = {"status": "not_run", "reason": "baseline prerequisites did not produce a scope receipt"}
+        report["performance_acceptance"] = False
+        lines += ["Scope: DFS baseline incomplete; required scope receipt unavailable. Performance NOT_RUN.", ""]
+    # Scope refinements can fail a claimed exit0; retain the resulting verdict.
+    lines[2] = f"Result: **{'PASS' if report['passed'] else 'FAIL / incomplete'}**. " + f"Source: [{source.name}]({source.name})."
     lines += table(["Run identity", "Value"], [
         ("Project", result.get("project")), ("Source revision", result.get("source_head")),
         ("Binary SHA-256", result.get("binary_sha256", result.get("sha256"))),
@@ -209,17 +275,35 @@ def write_report(root):
         for name in [gate["artifact"], gate["summary"].get("samples_file"), gate["summary"].get("generations_file")]:
             if name and Path(name).name == name and (root / name).is_file():
                 report["source_artifacts"][name] = hashlib.sha256((root / name).read_bytes()).hexdigest()
+        network_directory = gate["summary"].get("network_samples_directory")
+        if network_directory and Path(network_directory).name == network_directory:
+            for raw in sorted((root / network_directory).glob("*")):
+                if raw.is_file():
+                    report["source_artifacts"][str(raw.relative_to(root))] = hashlib.sha256(raw.read_bytes()).hexdigest()
     if report["quietness"]:
         lines += ["", "Quietness uses whole-container CPU (% of one CPU), including shadows, helpers and observation. "
                   "Rows summarize the continuous Docker stream, excluding its warmup row. Mean/p95/max describe "
                   "sampled intervals; the gate still requires an uninterrupted 30-second window on every node.", ""]
-        lines += table(["Quiet gate", "Result", "Required seconds / CPU %", "Search elapsed seconds", "Reason"], [
+        lines += table(["Quiet gate", "Result", "Required seconds / CPU % / network B/s", "Search elapsed seconds", "Reason"], [
             (f"[{g['summary']['label']}]({g['artifact']})", g["summary"]["status"],
-             f"{g['summary']['required_quiet_duration_seconds']} / {g['summary']['max_cpu_percent']}",
+             f"{g['summary']['required_quiet_duration_seconds']} / {g['summary']['max_cpu_percent']} / {g['summary'].get('max_network_bytes_per_second', 'unavailable')}",
              g["summary"]["elapsed_seconds"], g["summary"]["reason"]) for g in report["quietness"]])
         lines += [""] + table(["Quiet gate / node", "Intervals", "Mean CPU %", "p95 CPU %", "Max CPU %", "Over limit intervals"], [
             (f"{g['summary']['label']} / {n['node']}", n["samples"], n["mean_cpu_percent"],
              n["p95_cpu_percent"], n["max_cpu_percent"], n["over_limit_samples"])
+            for g in report["quietness"] for n in g["nodes"]])
+    if report["quietness"]:
+        lines += ["", "Network quietness counts exact combined TX/RX over all container interfaces, including loopback. "
+                  "Each interval uses a conservative minimum elapsed time; no rounded Docker NetIO field grants a pass. "
+                  "Repeated rows during final CPU-only cleanup reuse the sealed network endpoint and are counted once. "
+                  "Older CPU-only artifacts retain unavailable network acceptance.", ""]
+        lines += table(["Quiet gate / node", "Network intervals", "RX / TX B", "Max combined B/s",
+                        "Over limit / unavailable", "Network gate recorded"], [
+            (f"{g['summary']['label']} / {n['node']}", n["network_intervals"],
+             f"{n['network_rx_bytes']} / {n['network_tx_bytes']}" if n["network_intervals"] else None,
+             n["network_max_combined_bytes_per_second"],
+             f"{n['network_over_limit_intervals']} / {n['network_unavailable_intervals']}",
+             n["network_gate_recorded"])
             for g in report["quietness"] for n in g["nodes"]])
     lines += unavailable_tables()
     expected = len(report["acceptance_rows"])

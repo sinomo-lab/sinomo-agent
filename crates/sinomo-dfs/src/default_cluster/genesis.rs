@@ -182,6 +182,7 @@ impl DfsControlPlaneDefaultClusterAsyncBootstrapHost {
 
     pub(super) fn publish_current_bootstrap(
         &mut self,
+        publication_provider: Arc<crate::DfsPublicationExecutionProvider>,
         file_system: &DfsFileSystem,
         shards: Vec<DfsMetadataShardConfig>,
         bootstrap_nodes: Vec<NodeId>,
@@ -228,6 +229,9 @@ impl DfsControlPlaneDefaultClusterAsyncBootstrapHost {
                 message: "native bootstrap has no actual cluster authority client".into(),
             })?,
         );
+        service
+            .publication_provider
+            .retain_runtime_provider(publication_provider);
         let _execution = service
             .publication_execution
             .install(Arc::clone(&self.publication_owners));
