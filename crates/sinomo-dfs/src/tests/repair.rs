@@ -5868,77 +5868,101 @@ fn commit_version_conflicting_receipt_does_not_advance_visible_metadata() {
 
 #[test]
 fn commit_version_repairs_missing_local_receipt_when_backend_is_authoritative() {
-    let root = temp_root("commit-repairs-missing-local-receipt");
-    let owner = NodeId::from_legacy_named("node_commit_receipt_owner").expect("node");
-    let replica = NodeId::from_legacy_named("node_commit_receipt_replica").expect("node");
-    let object_id = DfsObjectId::from_legacy_named("obj_commit_receipt").expect("object");
-    let version_1 = DfsVersion::from_legacy_named("version_1").expect("version");
-    let version_2 = DfsVersion::from_legacy_named("version_2").expect("version");
     let bytes = b"commit should publish missing local receipt";
-    let (_runtime, mut dfs) = native_sifs_service(
-        "commit_version_repairs_missing_local_receipt_when_backend_is_authoritative",
-        replica.clone(),
-    );
-    let mut metadata = file_metadata(owner.clone());
-    metadata.object_id = object_id.clone();
-    metadata.version = version_1.clone();
-    metadata.policy = DfsObjectPolicy::ReplicatedEventual;
-    metadata.current_locations = vec![owner.clone()];
-    dfs.add_object_metadata(metadata.clone()).expect("metadata");
+    let (runtime, mut dfs, stat, removed) =
+        native_withdrawn_local_replica_fixture("native-commit-repairs-missing-receipt", bytes);
+    let shard = runtime
+        .metadata_shards()
+        .unwrap()
+        .into_iter()
+        .find(|shard| shard.shard_id == "services")
+        .unwrap();
+    assert_eq!(removed.replica_node_id, shard.primary_node_id);
+    let before = dfs
+        .metadata_backend()
+        .unwrap()
+        .receipts_for_version(&stat.object_id, &stat.version)
+        .unwrap();
+    assert_eq!(before.len(), 1);
+    assert_ne!(before[0].replica_node_id, removed.replica_node_id);
+    let intent = dfs
+        .metadata_backend()
+        .unwrap()
+        .intents_for_object(&stat.object_id)
+        .unwrap()
+        .into_iter()
+        .find(|intent| {
+            intent.target_version == stat.version
+                && intent.status == DfsWriteIntentStatus::Committed
+                && intent.publication.is_current()
+        })
+        .unwrap();
+    assert_eq!(intent.coordinator_node_id, shard.primary_node_id);
+    let metadata = dfs.current_read_object_metadata(&stat.object_id).unwrap();
     let manifest = dfs
-        .content
-        .put_object_version(object_id.as_str(), version_2.as_str(), bytes)
-        .expect("local staged content");
-
+        .content()
+        .put_object_version(stat.object_id.as_str(), stat.version.as_str(), bytes)
+        .unwrap();
+    assert_eq!(Some(manifest.content_hash.clone()), stat.content_hash);
     dfs.begin_message_committed_work();
     let event = dfs
         .handle_commit_version(
-            owner,
+            intent.coordinator_node_id.clone(),
             DfsCommitVersionCommand {
-                request_id: "dfs_net_req_commit_receipt".to_string(),
-                intent_id: "dfs_intent_commit_receipt".to_string(),
-                file_system_id: sifs_file_system_id(),
-                object_id: object_id.clone(),
-                expected_base_version: Some(version_1),
-                version: version_2.clone(),
+                request_id: format!("native-commit-replay-{}", sinomo_core::Id::generate()),
+                intent_id: intent.intent_id.clone(),
+                file_system_id: stat.file_system_id.clone(),
+                object_id: stat.object_id.clone(),
+                expected_base_version: intent.base_version,
+                version: stat.version.clone(),
                 content_hash: manifest.content_hash.clone(),
                 object_metadata: Some(metadata),
-                authority_shard: None,
+                authority_shard: Some(shard),
             },
         )
-        .expect("commit response");
-    assert!(matches!(
-        event,
-        NetworkedDfsServiceEvent::VersionCommitted {
-            object_id: committed,
-            ..
-        } if committed == object_id
-    ));
+        .unwrap();
+    assert!(
+        matches!(&event, NetworkedDfsServiceEvent::VersionCommitted {
+        object_id, version, content_hash, ..
+    } if object_id == &stat.object_id && version == &stat.version
+        && content_hash == &manifest.content_hash),
+        "actual commit event: {event:?}"
+    );
     assert!(
         dfs.take_message_committed_work().publish_metadata,
         "the actual authoritative receipt mutation must schedule its publication"
     );
-    let object = dfs
-        .current_read_object_metadata(&object_id)
-        .expect("visible metadata");
-    assert_eq!(object.version, version_2);
-    assert_eq!(
-        object.content_hash.as_deref(),
-        Some(manifest.content_hash.as_str())
-    );
+    let current = dfs.current_read_object_metadata(&stat.object_id).unwrap();
+    assert_eq!(current.version, stat.version);
+    assert_eq!(current.content_hash, stat.content_hash);
     let receipts = dfs
         .metadata_backend()
-        .expect("backend")
-        .receipts_for_version(&object_id, &version_2)
-        .expect("receipts");
-    assert_eq!(receipts.len(), 1);
-    assert_eq!(receipts[0].replica_node_id, replica);
+        .unwrap()
+        .receipts_for_version(&stat.object_id, &stat.version)
+        .unwrap();
     assert_eq!(
-        receipts[0].content_hash.as_deref(),
-        Some(manifest.content_hash.as_str())
+        receipts.len(),
+        before.len() + 1,
+        "exactly one missing local receipt is restored"
     );
-
-    std::fs::remove_dir_all(root).ok();
+    assert!(
+        receipts.contains(&before[0]),
+        "the real surviving W witness is unchanged"
+    );
+    let local = receipts
+        .iter()
+        .find(|receipt| receipt.replica_node_id == removed.replica_node_id)
+        .unwrap();
+    assert_eq!(local.content_hash, stat.content_hash);
+    assert_eq!(
+        dfs.content()
+            .read_object_version(stat.object_id.as_str(), stat.version.as_str())
+            .unwrap()
+            .1,
+        bytes
+    );
+    drop(dfs);
+    runtime.close().unwrap();
 }
 
 #[test]
