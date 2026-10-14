@@ -949,14 +949,43 @@ fn local_owned_read_is_routed_to_owner_node() {
         .find(|node| *node != owner)
         .unwrap();
     let path = "/services/native-local-owned-read";
-    let mut fs = runtime.file_system();
-    fs.subtree_policies.push(DfsSubtreePolicy::new(
-        path,
-        DfsObjectPolicy::LocalOwned,
-        1,
-        1,
-    ));
-    owner_dfs.add_file_system(fs).unwrap();
+    let apply = runtime
+        .apply_placement_policy(
+            &owner,
+            path,
+            DfsPlacementScope::SelfOnly,
+            DfsPlacementPolicy::new(DfsObjectPolicy::LocalOwned, 1, 1).unwrap(),
+        )
+        .unwrap();
+    let control = runtime.shared_control_plane().unwrap();
+    let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    loop {
+        let job = control
+            .with_client(|kv| {
+                DfsControlPlaneStore::new(kv.as_mut())
+                    .placement_reconciliation(&apply.file_system_id, &apply.job_id)
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.path, path);
+        assert_eq!(job.scanned_object_count, 0);
+        assert_eq!(job.scheduled_repair_count, 0);
+        assert!(job.last_error.is_none());
+        if job.state == DfsPlacementReconciliationState::Completed {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "normal empty LocalOwned Apply must complete"
+        );
+        runtime
+            .maintenance_tick(&owner, remaining)
+            .unwrap()
+            .outcome
+            .unwrap();
+    }
+    drop(control);
     let stat = owner_dfs
         .posix_write_file(
             path,
@@ -964,7 +993,22 @@ fn local_owned_read_is_routed_to_owner_node() {
             DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
         )
         .unwrap();
+    assert_eq!(stat.policy, DfsObjectPolicy::LocalOwned);
     let mut reader = runtime.client(&remote).unwrap();
+    // The object-id read requires known metadata. Receive the actual owner's
+    // native journal through the normal path before checking content routing.
+    let synced = reader
+        .route_namespace_operation_to_metadata_primary_with_timeout_and_options(
+            stat.file_system_id.clone(),
+            owner.clone(),
+            DfsNamespaceOperation::SyncPath { path: path.into() },
+            sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+            true,
+            true,
+        )
+        .unwrap();
+    assert_eq!(synced.result, DfsNamespaceResult::Applied);
+    assert!(!synced.metadata_journal_has_more);
     assert_eq!(
         reader
             .request_remote_object_read_without_cache(&stat.object_id)
