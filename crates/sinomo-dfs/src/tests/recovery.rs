@@ -1053,11 +1053,52 @@ fn sifs_cluster_writer_recovers_from_local_blob_loss_after_async_repair() {
         .map(|index| (index % 251) as u8)
         .collect::<Vec<_>>();
     let expected_hash = content_hash(&bytes);
+    let required = vec![cluster.writer_node.clone(), cluster.primary_node.clone()];
+    let mut placement = DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 2).unwrap();
+    placement.required_node_ids = required.clone();
+    let accepted = cluster
+        ._runtime
+        .apply_placement_policy(
+            &cluster.primary_node,
+            path,
+            DfsPlacementScope::SelfOnly,
+            placement,
+        )
+        .unwrap();
+    let control = cluster._runtime.shared_control_plane().unwrap();
+    let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    loop {
+        let job = control
+            .with_client(|kv| {
+                DfsControlPlaneStore::new(kv.as_mut())
+                    .placement_reconciliation(&accepted.file_system_id, &accepted.job_id)
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.accepted_config, accepted.accepted_config);
+        assert_eq!(job.scanned_object_count, 0);
+        assert!(job.last_error.is_none());
+        if job.state == DfsPlacementReconciliationState::Completed {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(!remaining.is_zero(), "normal empty Apply setup budget");
+        cluster
+            ._runtime
+            .maintenance_tick(&cluster.primary_node, remaining)
+            .unwrap()
+            .outcome
+            .unwrap();
+    }
+    drop(control);
+    let mut policy = DfsReplicationPolicy::new(1, 2).unwrap();
+    policy.required_node_ids = required;
+
     match cluster.writer.posix_write_file(
         path,
         &bytes,
         DfsWriteOptions {
-            policy: DfsReplicationPolicy::new(1, 2).expect("policy"),
+            policy,
             replica_candidates: vec![cluster.writer_node.clone(), cluster.primary_node.clone()],
             wait_for_commit: false,
             foreground_replica_repair: false,

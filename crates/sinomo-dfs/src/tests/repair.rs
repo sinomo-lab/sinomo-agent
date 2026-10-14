@@ -6392,7 +6392,7 @@ fn sifs_cluster_routes_bounded_directory_rename_and_resume_receipts() {
     for index in 0..4 {
         assert_eq!(
             writer
-                .posix_read_file(&format!("{to}/nested/{index}.txt"))
+                .posix_read_file_distributed(&format!("{to}/nested/{index}.txt"))
                 .expect("renamed file"),
             index.to_string().as_bytes()
         );
