@@ -13322,8 +13322,10 @@ fn metadata_authority_discovery_rolls_resident_generation_without_publish_lanes(
         loop {
             match daemon_dfs_bounded_status_resident(&data_dir, &peer_snapshot) {
                 Err(sinomo_dfs::DfsError::Network { ref message })
-                    if message
+                    if (message
                         == "bounded DFS status unavailable while the resident generation cache is being updated"
+                        || message
+                            == "DFS runtime network error at DFS message cache root identity: bounded DFS status unavailable while the resident generation cache is being updated")
                         && Instant::now() < deadline =>
                 {
                     std::thread::sleep(Duration::from_millis(2));
