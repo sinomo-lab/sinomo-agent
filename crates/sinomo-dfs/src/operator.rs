@@ -1541,6 +1541,30 @@ mod tests {
         drop(writer);
         let mut writer = runtime.metadata_primary_service(path).unwrap();
         crate::test_support::publish_current_payload(&mut writer, payload).unwrap();
+        // The kernel helper has committed the 1,024-row setup corpus, while
+        // replicas may still hold only its hidden prepare. Complete that setup
+        // through the normal directory durability barrier before creating the
+        // independent pending-repair object inspected below.
+        let corpus_head = writer
+            .metadata_backend()
+            .unwrap()
+            .journal_last_sequence()
+            .unwrap();
+        let corpus = writer.posix_sync_directory("/").unwrap();
+        assert_eq!(
+            corpus.metadata_certificate.target.journal_sequence,
+            corpus_head
+        );
+        assert_eq!(
+            corpus
+                .metadata_certificate
+                .acknowledged_node_ids
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            nodes.iter().cloned().collect(),
+            "every configured member must acknowledge the exact complete corpus"
+        );
         let stat = writer
             .posix_write_file(
                 path,
