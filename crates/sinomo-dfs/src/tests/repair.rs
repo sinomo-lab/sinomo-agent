@@ -6958,13 +6958,23 @@ fn native_repair_transfer_custody_survives_cancel_restart_and_correlates_rejecte
             sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
         );
         if wrong_object {
-            assert_eq!(
-                returned.unwrap_err(),
-                format!(
-                    "network I/O error during shared DFS native service dispatch: invalid DFS runtime operation: distributed DFS error: unknown pending write intent: {intent_id}"
+            match returned {
+                Err(error) => assert_eq!(
+                    error,
+                    format!(
+                        "network I/O error during shared DFS native service dispatch: invalid DFS runtime operation: distributed DFS error: unknown pending write intent: {intent_id}"
+                    ),
+                    "a cold Main rejects the foreign object during restoration"
                 ),
-                "the actual Main handler rejects the foreign object before it can settle custody"
-            );
+                Ok(response) => {
+                    // A warm lane already owns this intent. Its tuple validator
+                    // rejects the foreign object as a handled protocol event;
+                    // that can return an empty successful RPC envelope.
+                    let response = decode_dfs_message_rpc_response(&response).unwrap();
+                    assert_eq!(response.request_id, command.request_id);
+                    assert!(response.outbound_messages.is_empty());
+                }
+            }
         } else {
             returned.unwrap();
         }
