@@ -1776,3 +1776,115 @@ async fn retained_control_client_joins_configuration_after_early_filesystem_pref
     assert_eq!(host.spawned.load(Ordering::Acquire), 1);
     assert_eq!(host.queued_count(), 0);
 }
+
+#[tokio::test]
+async fn queued_refresh_preserves_configuration_completed_by_committed_delta() {
+    let host = NativeProjectionHost::new(true);
+    let runtime = attach(&host);
+    let inputs = host.inputs.lock().unwrap().clone();
+    let mut reads: [KvAuthoritativeRead<Vec<KvEntry>>; 3] =
+        std::array::from_fn(|scope| KvAuthoritativeRead {
+            value: inputs.scopes[scope].clone(),
+            authority: inputs.authority,
+        });
+    for read in &mut reads[1..] {
+        read.authority.revision = KvRevision(11);
+        read.authority.commit_index = 111;
+    }
+    let mut floor = inputs.floor;
+    floor.revision = KvRevision(11);
+    floor.applied_index = 111;
+    host.inputs.lock().unwrap().floor = floor.clone();
+    assert!(
+        runtime.install_authoritative_projection(
+            DfsAuthoritativePrefixProjection::complete(
+                DFS_METADATA_AUTHORITY_PREFIX,
+                reads[0].value.clone(),
+                KvRevision(10)
+            )
+            .unwrap()
+        )
+    );
+    {
+        let mut configuration = runtime.write_configuration.lock().unwrap();
+        let token = configuration.begin_refresh();
+        assert!(
+            !configuration
+                .install_bootstrap(token, reads, floor)
+                .unwrap()
+        );
+    }
+    // Queue the real singleflight while the complete native bundle still
+    // awaits its filesystem delta. Do not poll this owner until that delta
+    // has actually published the already-validated bundle.
+    runtime.require_authoritative_revision(KvRevision(11));
+    assert_eq!(host.queued_count(), 1);
+    let mut entry = inputs.scopes[0][0].clone();
+    entry.modify_revision = KvRevision(11);
+    entry.version = KvVersion(2);
+    {
+        let mut current = host.inputs.lock().unwrap();
+        current.authority.revision = KvRevision(11);
+        current.authority.commit_index = 111;
+        current.scopes[0][0] = entry.clone();
+    }
+    let observation = runtime.observe_delta_observation(&ClusterKvCommittedDelta {
+        revision: KvRevision(11),
+        compacted_revision: KvRevision::ZERO,
+        events: vec![KvEvent {
+            revision: KvRevision(11),
+            key: entry.key.clone(),
+            kind: KvEventKind::Put {
+                value: entry.value.clone(),
+            },
+        }]
+        .into(),
+        final_key_states: vec![ClusterKvCommittedKeyState {
+            key: entry.key.clone(),
+            entry: Some(entry),
+        }]
+        .into(),
+    });
+    assert!(
+        !observation.accepted,
+        "the withdrawn standalone prefix requires the full bundle rebind"
+    );
+    assert_eq!(
+        runtime.state.current_complete_prefix_revision(),
+        Some(KvRevision(11))
+    );
+    let ready = runtime.write_configuration_projection().unwrap().unwrap();
+    let generation = runtime.generation();
+    let storage_generation = runtime.storage_generation();
+    let reads_before = host.read_count();
+    host.content_gate.armed.store(true, Ordering::Release);
+    let mut refresh = host.take_task().unwrap();
+    let first_poll =
+        std::future::poll_fn(|context| std::task::Poll::Ready(refresh.as_mut().poll(context)))
+            .await;
+    let remained_ready = matches!(
+        runtime.write_configuration_readiness().unwrap(),
+        crate::DfsWriteConfigurationReadiness::Ready(Some(_))
+    );
+    // Drain a regressing implementation before failing its assertion.
+    if first_poll.is_pending() {
+        host.content_gate.release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(1), refresh)
+            .await
+            .unwrap();
+    }
+    assert!(
+        remained_ready,
+        "a delayed refresh owner must not withdraw the configuration already completed by its committed delta"
+    );
+    assert!(first_poll.is_ready());
+    assert!(Arc::ptr_eq(
+        &ready,
+        &runtime.write_configuration_projection().unwrap().unwrap()
+    ));
+    assert_eq!(host.read_count(), reads_before);
+    assert_eq!(runtime.generation(), generation);
+    assert_eq!(runtime.storage_generation(), storage_generation);
+    assert_eq!(host.spawned.load(Ordering::Acquire), 1);
+    assert_eq!(host.queued_count(), 0);
+}

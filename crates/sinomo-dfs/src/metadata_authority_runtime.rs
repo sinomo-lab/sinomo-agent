@@ -974,6 +974,14 @@ impl DfsMetadataAuthorityRuntime {
         }
         let (token, discontinuity_generation) = {
             let mut configuration = self.write_configuration.lock().ok()?;
+            // Committed deltas can complete a pending bundle after this owner
+            // was queued. Recheck under the publication lock before beginning
+            // a refresh; an obsolete owner must not withdraw the completed cut.
+            if configuration.snapshot().is_some()
+                && let Some(revision) = self.state.current_complete_prefix_revision()
+            {
+                return Some(revision);
+            }
             (
                 configuration.begin_refresh(),
                 self.discontinuity_generation.load(Ordering::Acquire),
