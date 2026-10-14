@@ -209,7 +209,43 @@ pub const fn dfs_metadata_replica_quorum_size(replica_count: usize) -> usize {
     replica_count.div_ceil(2) + 1
 }
 
+#[cfg(test)]
+thread_local! {
+    static BEFORE_REBIND_WRITER_LOCK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
 pub(crate) fn rebind_completed_metadata_shard_membership_handoff(
+    backend: &mut dyn DfsMetadataBackend,
+    local_node_id: &NodeId,
+    active: &DfsMetadataShardConfig,
+    pending: Option<&DfsMetadataShardMembershipHandoff>,
+    proof: Option<&DfsMetadataShardMembershipHandoffProof>,
+) -> Result<bool, DfsError> {
+    // Another already-bound writer can append after the read-side lineage
+    // check and before the backend acquires its write gate. Retry only that
+    // typed comparison failure, re-reading the marker and revalidating the
+    // complete proof/lineage each time. Never relax the under-lock comparison.
+    let mut prefix_retries = 2;
+    loop {
+        match rebind_completed_metadata_shard_membership_handoff_once(
+            backend,
+            local_node_id,
+            active,
+            pending,
+            proof,
+        ) {
+            Err(DfsError::MetadataRejection {
+                code: crate::DfsMetadataRejectionCode::PrefixMismatch,
+                ..
+            }) if prefix_retries > 0 => {
+                prefix_retries -= 1;
+            }
+            result => return result,
+        }
+    }
+}
+
+fn rebind_completed_metadata_shard_membership_handoff_once(
     backend: &mut dyn DfsMetadataBackend,
     local_node_id: &NodeId,
     active: &DfsMetadataShardConfig,
@@ -299,6 +335,10 @@ pub(crate) fn rebind_completed_metadata_shard_membership_handoff(
                     )?;
                 }
             }
+        }
+        #[cfg(test)]
+        if let Some(before_lock) = BEFORE_REBIND_WRITER_LOCK.with(|hook| hook.borrow_mut().take()) {
+            before_lock();
         }
         let rebound = backend.clear_metadata_shard_membership_handoff_freeze(
             &shard_id,
@@ -3091,6 +3131,196 @@ mod tests {
                 .close()
                 .expect("normal sync runtime closes all owned work");
         }
+    }
+
+    #[test]
+    fn native_rebind_rechecks_a_prefix_advanced_after_its_read() {
+        let (runtime, initial, active) = crate::test_support::current_native_metadata_service(
+            "native-rebind-prefix-advance",
+            2,
+            "/services",
+        )
+        .unwrap();
+        drop(initial);
+        let owner = active.primary_node_id.clone();
+        let shard_id = DfsMetadataShardId::new(&active.shard_id);
+        let control = runtime.shared_control_plane().unwrap();
+        let proof = control
+            .with_client(|kv| {
+                DfsControlPlaneStore::new(kv.as_mut()).get_metadata_shard_membership_handoff_proof(
+                    &active.file_system_id,
+                    &active.shard_id,
+                )
+            })
+            .unwrap()
+            .unwrap();
+        drop(control);
+        assert_eq!(proof.desired_shard, active);
+        let mut writer = runtime.metadata_primary_service("/services").unwrap();
+        let mut cold = crate::LocalSobjMetadataBackend::open_for_inspection(
+            shard_id.clone(),
+            crate::default_dfs_metadata_shards_root(runtime.data_dir(&owner))
+                .join(crate::metadata_keys::key_segment(&active.shard_id)),
+        )
+        .unwrap();
+        assert!(
+            cold.metadata_shard_instance_writes_frozen(&shard_id)
+                .unwrap()
+        );
+        let initial_prefix = DfsMetadataBackend::metadata_prefix_proof(&cold, &shard_id)
+            .unwrap()
+            .unwrap();
+        for invalidity in ["epoch", "digest", "ack"] {
+            let mut invalid = proof.clone();
+            match invalidity {
+                "epoch" => invalid.desired_shard.epoch += 1,
+                "digest" => invalid.state_fingerprint.push_str("-negative"),
+                "ack" => invalid.acknowledged_node_ids.clear(),
+                _ => unreachable!(),
+            }
+            assert!(
+                !rebind_completed_metadata_shard_membership_handoff(
+                    &mut cold,
+                    &owner,
+                    &active,
+                    None,
+                    Some(&invalid)
+                )
+                .unwrap()
+            );
+            assert!(
+                cold.metadata_shard_instance_writes_frozen(&shard_id)
+                    .unwrap()
+            );
+            assert_eq!(
+                DfsMetadataBackend::metadata_prefix_proof(&cold, &shard_id)
+                    .unwrap()
+                    .unwrap(),
+                initial_prefix
+            );
+        }
+        struct ClearHook;
+        impl Drop for ClearHook {
+            fn drop(&mut self) {
+                BEFORE_REBIND_WRITER_LOCK.with(|hook| {
+                    hook.borrow_mut().take();
+                });
+            }
+        }
+        let clear_hook = ClearHook;
+        BEFORE_REBIND_WRITER_LOCK.with(|hook| {
+            assert!(hook.borrow().is_none());
+            *hook.borrow_mut() = Some(Box::new(move || {
+                // Another genuine bound writer appends after the cold handle's
+                // proof read. No prefix or authority observation is fabricated.
+                writer
+                    .posix_mkdir_all("/services/native-rebind-concurrent-write")
+                    .unwrap();
+            }));
+        });
+        assert!(
+            rebind_completed_metadata_shard_membership_handoff(
+                &mut cold,
+                &owner,
+                &active,
+                None,
+                Some(&proof)
+            )
+            .unwrap()
+        );
+        assert!(
+            !cold
+                .metadata_shard_instance_writes_frozen(&shard_id)
+                .unwrap()
+        );
+        let final_prefix = DfsMetadataBackend::metadata_prefix_proof(&cold, &shard_id)
+            .unwrap()
+            .unwrap();
+        assert!(final_prefix.journal_sequence > initial_prefix.journal_sequence);
+        assert!(
+            cold.get_object_by_path(
+                &active.file_system_id,
+                "/services/native-rebind-concurrent-write"
+            )
+            .unwrap()
+            .is_some()
+        );
+        drop(cold);
+        // Continuous real appends cannot turn bounded retry into unchecked
+        // authority or an unbounded cold-open loop.
+        fn arm_append(
+            writer: std::sync::Arc<std::sync::Mutex<NetworkedDfsService<crate::DfsNodeTransport>>>,
+            hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+            remaining: usize,
+        ) {
+            BEFORE_REBIND_WRITER_LOCK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    let index = hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    writer
+                        .lock()
+                        .unwrap()
+                        .posix_mkdir_all(&format!("/services/native-rebind-busy-{index}"))
+                        .unwrap();
+                    if remaining > 1 {
+                        arm_append(writer, hits, remaining - 1);
+                    }
+                }));
+            });
+        }
+        let writer = std::sync::Arc::new(std::sync::Mutex::new(
+            runtime.metadata_primary_service("/services").unwrap(),
+        ));
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut cold = crate::LocalSobjMetadataBackend::open_for_inspection(
+            shard_id.clone(),
+            crate::default_dfs_metadata_shards_root(runtime.data_dir(&owner))
+                .join(crate::metadata_keys::key_segment(&active.shard_id)),
+        )
+        .unwrap();
+        arm_append(
+            std::sync::Arc::clone(&writer),
+            std::sync::Arc::clone(&hits),
+            4,
+        );
+        let error = rebind_completed_metadata_shard_membership_handoff(
+            &mut cold,
+            &owner,
+            &active,
+            None,
+            Some(&proof),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            DfsError::MetadataRejection {
+                code: crate::DfsMetadataRejectionCode::PrefixMismatch,
+                ..
+            }
+        ));
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert!(
+            cold.metadata_shard_instance_writes_frozen(&shard_id)
+                .unwrap()
+        );
+        drop(clear_hook);
+        drop(writer);
+        assert!(
+            rebind_completed_metadata_shard_membership_handoff(
+                &mut cold,
+                &owner,
+                &active,
+                None,
+                Some(&proof)
+            )
+            .unwrap()
+        );
+        assert!(
+            !cold
+                .metadata_shard_instance_writes_frozen(&shard_id)
+                .unwrap()
+        );
+        drop(cold);
+        runtime.close().unwrap();
     }
 
     #[cfg(feature = "storage-conversion")]
