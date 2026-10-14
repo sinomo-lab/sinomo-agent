@@ -6481,8 +6481,23 @@ fn daemon_dfs_maintenance_tick_resumes_namespace_jobs() {
         .unwrap();
     assert_eq!(job.status, DfsNamespaceJobStatus::Running);
     let paths = DaemonPaths::new(native.data_dir(&node));
-    let pending = daemon_dfs_pending_maintenance_work(&paths).unwrap();
-    assert_eq!(pending.pending_namespace_job_count, 1);
+    let observed_at = OffsetDateTime::now_utc();
+    let pending = daemon_dfs_pending_maintenance_work_on_runtime(
+        &paths,
+        crate::test_runtime::executor().handle(),
+    )
+    .unwrap();
+    let inspector = native.metadata_primary_service(old).unwrap();
+    let actual_job = inspector
+        .metadata_backend()
+        .unwrap()
+        .get_namespace_job(&job.job_id)
+        .unwrap();
+    drop(inspector);
+    assert_eq!(
+        pending.pending_namespace_job_count, 1,
+        "actual job at probe starting {observed_at}: {actual_job:?}; captured reply={job:?}"
+    );
     assert!(pending.should_trigger_background_maintenance());
     for _ in 0..8 {
         let tick = native
@@ -6516,9 +6531,12 @@ fn daemon_dfs_maintenance_tick_resumes_namespace_jobs() {
     assert_eq!(stored.status, DfsNamespaceJobStatus::Completed);
     assert!(stored.completed_at.is_some());
     assert_eq!(
-        daemon_dfs_pending_maintenance_work(&paths)
-            .unwrap()
-            .pending_namespace_job_count,
+        daemon_dfs_pending_maintenance_work_on_runtime(
+            &paths,
+            crate::test_runtime::executor().handle()
+        )
+        .unwrap()
+        .pending_namespace_job_count,
         0
     );
     assert_eq!(
