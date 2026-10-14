@@ -461,12 +461,54 @@ fn sifs_cluster_bulk_local_eventual_splits_mixed_primary_batch() {
     let services_thread =
         std::thread::spawn(move || pump_sifs_service_until_stop(services_primary, services_stop));
 
+    let admitted_batches = Arc::new(Mutex::new(Vec::new()));
+    let mut batch_hooks = Vec::new();
+    for owner in [&users_primary_node, &services_primary_node] {
+        let observed = Arc::clone(&admitted_batches);
+        batch_hooks.push(crate::runtime_host::install_daemon_dfs_pre_dispatch_test_hook(
+            _runtime.data_dir(owner),
+            Arc::new(move |point, command, _| {
+                if let crate::runtime_host::DaemonDfsPreDispatchTestPoint::BeforeExecute { admission_held } = point
+                    && let Some(command) = command
+                    && matches!(&command.routed_message.message,
+                        DfsNetworkMessage::NamespaceRequest(request)
+                        if matches!(&request.operation, DfsNamespaceOperation::CommitLocalEventualBatch { .. }))
+                {
+                    observed.lock().unwrap().push((
+                        command.routed_message.source_node_id.clone(),
+                        command.routed_message.target_node_id.clone(), admission_held,
+                    ));
+                }
+                Ok(())
+            }),
+        ));
+    }
     let stats = users_primary
         .posix_write_files_local_eventual_with_known_parents(vec![
             (local_path, local_bytes),
             (remote_path, remote_bytes),
         ])
         .expect("mixed-primary bulk write");
+    drop(batch_hooks);
+    let admitted = admitted_batches.lock().unwrap();
+    assert_eq!(
+        admitted.len(),
+        2,
+        "both local and remote groups must execute on their actual Main owner: {admitted:?}"
+    );
+    assert!(
+        admitted
+            .iter()
+            .all(|(source, _, owned)| source == &users_primary_node && *owned)
+    );
+    assert_eq!(
+        admitted
+            .iter()
+            .map(|(_, target, _)| target.clone())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([users_primary_node.clone(), services_primary_node.clone()])
+    );
+    drop(admitted);
     assert_eq!(stats.len(), 2);
     assert_eq!(stats[0].path, local_path);
     assert_eq!(

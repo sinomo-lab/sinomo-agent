@@ -2840,7 +2840,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .unwrap_or_else(|| "local-unsharded".to_string());
             let trace_remote = authority_node_id != self.node_id;
             let authority_commit_started = Instant::now();
-            let result = if authority_node_id != self.node_id {
+            let result = if authority_node_id != self.node_id
+                || self.transport.delegates_local_namespace_authority()
+            {
+                // A client shell delegates the same-node group to Main too.
+                // Its private committed-work bits cannot wake Main's durable
+                // metadata publication and repair owners.
                 self.route_namespace_operation_without_local_replay(
                     authority_node_id,
                     DfsNamespaceOperation::CommitLocalEventualBatch {
