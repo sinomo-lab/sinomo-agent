@@ -1717,6 +1717,79 @@ fn sifs_cluster_retried_pending_routed_create_preserves_parent_mtime_touch() {
 }
 
 #[test]
+fn routed_attribute_results_observe_current_authority_after_mutation() {
+    let mut cluster = sifs_posix_cluster("routed-current-attributes", "/users");
+    let path = "/users/current-attributes";
+    cluster
+        .writer
+        .posix_write_file(
+            path,
+            b"attribute read-your-write",
+            DfsWriteOptions::replicated_eventual(vec![cluster.writer_node.clone()]),
+        )
+        .unwrap();
+    // Prime this actual requester's existing local read view before the remote
+    // mutation. A setter result must not reuse that older attribute generation.
+    let before = cluster.writer.posix_stat(path).unwrap();
+    assert_ne!(before.accessed_at_unix_nanos, 123_000_000_000);
+    let times = cluster
+        .writer
+        .posix_set_times(path, Some(123_000_000_000), Some(456_000_000_000))
+        .unwrap();
+    let owner = cluster._runtime.metadata_primary_service(path).unwrap();
+    let actual = owner.posix_stat(path).unwrap();
+    assert_eq!(
+        (actual.accessed_at_unix_nanos, actual.modified_at_unix_nanos),
+        (123_000_000_000, 456_000_000_000)
+    );
+    assert_eq!(
+        times, actual,
+        "a successful routed setter must return its actual current author view"
+    );
+    drop(owner);
+    let mode = cluster.writer.posix_set_mode(path, 0o641).unwrap();
+    assert_eq!(mode.mode, 0o641);
+    let link = "/users/current-attributes-link";
+    cluster
+        .writer
+        .posix_symlink(
+            path,
+            link,
+            DfsWriteOptions::replicated_eventual(vec![cluster.writer_node.clone()]),
+        )
+        .unwrap();
+    let link_times = cluster
+        .writer
+        .posix_set_symlink_times(link, Some(789_000_000_000), Some(987_000_000_000))
+        .unwrap();
+    assert_eq!(link_times.kind, DfsObjectKind::Symlink);
+    assert_eq!(
+        (
+            link_times.accessed_at_unix_nanos,
+            link_times.modified_at_unix_nanos
+        ),
+        (789_000_000_000, 987_000_000_000)
+    );
+    let owner = cluster._runtime.metadata_primary_service(path).unwrap();
+    let target = owner.posix_stat(path).unwrap();
+    assert_eq!(
+        (target.accessed_at_unix_nanos, target.modified_at_unix_nanos),
+        (123_000_000_000, 456_000_000_000),
+        "lstat semantics must leave the link target unchanged"
+    );
+    drop(owner);
+    let SifsPosixCluster {
+        primary,
+        writer,
+        observer,
+        _runtime,
+        ..
+    } = cluster;
+    drop((primary, writer, observer));
+    _runtime.close().unwrap();
+}
+
+#[test]
 fn sifs_cluster_posix_routed_namespace_ops_have_read_your_write_semantics() {
     // Namespace mutations route to the actual metadata primary. Public
     // read-your-write observes current authority without assuming that the

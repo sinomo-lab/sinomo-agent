@@ -27,7 +27,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     mode,
                 },
             )?;
-            return self.posix_stat(&normalized);
+            return self.stat_routed_namespace_result(&normalized, true);
         }
         self.posix_set_mode_local(path, mode)
     }
@@ -134,7 +134,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     follow_symlink: true,
                 },
             )?;
-            return self.posix_stat(&normalized);
+            return self.stat_routed_namespace_result(&normalized, true);
         }
         self.posix_set_times_local(path, accessed_at_unix_nanos, modified_at_unix_nanos)
     }
@@ -169,7 +169,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     follow_symlink: false,
                 },
             )?;
-            return self.posix_lstat(&normalized);
+            return self.stat_routed_namespace_result(&normalized, false);
         }
         self.posix_set_symlink_times_local(path, accessed_at_unix_nanos, modified_at_unix_nanos)
     }
