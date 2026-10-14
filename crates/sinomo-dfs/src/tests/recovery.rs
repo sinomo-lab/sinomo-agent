@@ -547,13 +547,15 @@ fn recovery_hydration_skips_fully_repaired_committed_pending_write() {
 }
 
 #[test]
-fn hydrate_recovers_zero_byte_create_after_authoritative_view_refresh_failure_once() {
+fn hydrate_recovers_zero_byte_create_after_missing_native_prepare_ack_once() {
     let name = "native-zero-create-floor-return-failure";
     let (mut runtime, mut original, config) =
         crate::test_support::current_native_metadata_service(name, 3, "/services").unwrap();
     let owner = config.primary_node_id.clone();
     let parent_path = "/services/native-floor-recovery";
     let child_path = "/services/native-floor-recovery/empty.bin";
+    drop(original);
+    let mut original = runtime.metadata_primary_service(child_path).unwrap();
     original.posix_mkdir_all(parent_path).unwrap();
     let parent_before = original.posix_stat(parent_path).unwrap();
     let parent_versions_before = original
@@ -563,15 +565,15 @@ fn hydrate_recovers_zero_byte_create_after_authoritative_view_refresh_failure_on
         .unwrap()
         .len();
     let missing_ack = config.replica_node_ids[0].clone();
-    runtime.install_fault(crate::test_support::DfsTestFaultRule {
+    let missing_ack_fault = crate::test_support::DfsTestFaultRule {
         source: Some(owner.clone()),
         target: Some(missing_ack),
-        route: Some(DFS_METADATA_JOURNAL_BATCH_ROUTE.into()),
+        route: None,
         call_id: None,
         origin: Some(crate::test_support::DfsTestRpcOrigin::RegisteredHost),
         remaining_hits: 32,
         action: crate::test_support::DfsTestFaultAction::BudgetExhausted,
-    });
+    };
     let fault = runtime.metadata_operation_floor_fault(&owner).unwrap();
     let trigger = fault.operation_floor_denial_trigger(
         crate::control_plane::metadata_shard_operation_floor_key(
@@ -579,26 +581,51 @@ fn hydrate_recovers_zero_byte_create_after_authoritative_view_refresh_failure_on
             &config.shard_id,
         ),
     );
+    let runtime = std::rc::Rc::new(std::cell::RefCell::new(runtime));
+    let runtime_in_hook = std::rc::Rc::clone(&runtime);
+    let reached_prepare = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observed_prepare = Arc::clone(&reached_prepare);
     crate::service_commit::BEFORE_CREATE_PREPARE.with(|hook| {
-        *hook.borrow_mut() = Some(Box::new(move |_| trigger()));
+        *hook.borrow_mut() = Some(Box::new(move |_| {
+            observed_prepare.store(true, Ordering::SeqCst);
+            trigger();
+            runtime_in_hook.borrow().install_fault(missing_ack_fault);
+        }));
     });
     let operation_id = format!("cf_{}", sinomo_core::Id::generate());
-    let error = original
-        .posix_create_file_with_contents_and_attrs_and_operation_id(
-            child_path,
-            &[],
-            DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
-            DfsPosixCreateAttrs::new(0o640, 6101, 6102),
-            &operation_id,
-        )
-        .unwrap_err();
-    assert!(
-        error.to_string().contains("retry the read"),
-        "unexpected real failure: {error}"
+    let result = original.posix_create_file_with_contents_and_attrs_and_operation_id(
+        child_path,
+        &[],
+        DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
+        DfsPosixCreateAttrs::new(0o640, 6101, 6102),
+        &operation_id,
     );
+    // Clear an unconsumed negative hook on every outcome before reclaiming the
+    // fixture; an earlier failure must not retain its native owner accidentally.
+    crate::service_commit::BEFORE_CREATE_PREPARE.with(|hook| {
+        hook.borrow_mut().take();
+    });
+    let mut runtime = std::rc::Rc::try_unwrap(runtime)
+        .ok()
+        .expect("prepare hook released fixture")
+        .into_inner();
+    assert!(reached_prepare.load(Ordering::SeqCst));
+    let error = result.unwrap_err();
     assert!(
-        fault.denied_operation_floor_reads() > 1,
-        "the normal bounded authority retry must reach the actual floor boundary"
+        matches!(
+            &error,
+            DfsPosixError::Dfs(DfsError::MetadataRecoveryQuorumUnavailable {
+                required: 3,
+                verified: 2,
+                ..
+            })
+        ),
+        "the actual missing native participant must prevent publication: {error:?}"
+    );
+    assert_eq!(
+        fault.denied_operation_floor_reads(),
+        0,
+        "ordinary full-participant preparation must not fall back to a KV operation floor"
     );
     let backend = original.metadata_backend().unwrap();
     let prepared = backend
@@ -650,7 +677,7 @@ fn hydrate_recovers_zero_byte_create_after_authoritative_view_refresh_failure_on
         .unwrap()
         .outcome
         .unwrap();
-    let mut recovered = runtime.client(&owner).unwrap();
+    let mut recovered = runtime.metadata_primary_service(child_path).unwrap();
     recovered
         .hydrate_from_metadata_backend_for_commit_promotion_recovery()
         .unwrap();
@@ -684,7 +711,7 @@ fn hydrate_recovers_zero_byte_create_after_authoritative_view_refresh_failure_on
     drop(recovered);
     runtime.stop_node(&owner).unwrap();
     runtime.reopen_node(owner.clone()).unwrap();
-    let reopened = runtime.client(&owner).unwrap();
+    let reopened = runtime.metadata_primary_service(child_path).unwrap();
     assert_eq!(reopened.posix_stat(child_path).unwrap(), child);
     assert_eq!(reopened.posix_stat(parent_path).unwrap(), parent_after);
     assert_eq!(
