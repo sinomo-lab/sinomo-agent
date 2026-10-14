@@ -10016,12 +10016,13 @@ mod tests {
 
     #[test]
     fn primary_handoff_request_is_idempotent_and_does_not_activate_without_proof() {
-        let (runtime, mut source, current) = crate::test_support::current_native_metadata_service(
-            "native-cp-idempotent-role-request",
-            3,
-            "/",
-        )
-        .unwrap();
+        let (mut runtime, mut source, current) =
+            crate::test_support::current_native_metadata_service(
+                "native-cp-idempotent-role-request",
+                3,
+                "/",
+            )
+            .unwrap();
         // SAME normal source serialization gate: pause background freeze while
         // observing the request producer. This guard grants no publication.
         let gate = source
@@ -10100,17 +10101,31 @@ mod tests {
         );
         drop(gate);
         drop(source);
+        // All request-only assertions above were observed while the real source
+        // fence prevented activation. Finish that same requested transition
+        // before shutting down its native owner and background reconciliation.
+        let desired = first.desired_shard;
+        let activated = runtime
+            .reassign_metadata_shard(
+                &desired.file_system_id,
+                &desired.shard_id,
+                desired.primary_node_id.clone(),
+                desired.replica_node_ids.clone(),
+            )
+            .unwrap();
+        assert_eq!(activated, desired);
         runtime.close().unwrap();
     }
 
     #[test]
     fn metadata_shard_primary_role_handoff_requires_exact_existing_member_rotation() {
-        let (runtime, mut source, current) = crate::test_support::current_native_metadata_service(
-            "native-cp-exact-role-rotation",
-            3,
-            "/",
-        )
-        .unwrap();
+        let (mut runtime, mut source, current) =
+            crate::test_support::current_native_metadata_service(
+                "native-cp-exact-role-rotation",
+                3,
+                "/",
+            )
+            .unwrap();
         let desired =
             metadata_shard_primary_handoff_target(&current, &current.replica_node_ids[0]).unwrap();
         let mut wrong_order = desired.clone();
@@ -10154,6 +10169,19 @@ mod tests {
         );
         drop(gate);
         drop(source);
+        // All request-only assertions above were observed while the real source
+        // fence prevented activation. Finish that same requested transition
+        // before shutting down its native owner and background reconciliation.
+        let desired = handoff.desired_shard;
+        let activated = runtime
+            .reassign_metadata_shard(
+                &desired.file_system_id,
+                &desired.shard_id,
+                desired.primary_node_id.clone(),
+                desired.replica_node_ids.clone(),
+            )
+            .unwrap();
+        assert_eq!(activated, desired);
         runtime.close().unwrap();
     }
 

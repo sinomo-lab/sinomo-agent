@@ -3078,6 +3078,33 @@ mod metadata_publish_membership_tests {
             .find(|node| **node != original.primary_node_id)
             .unwrap()
             .clone();
+        // Shrinking the three-member ring and transferring its primary are
+        // distinct native activations. Verify each exact one-epoch boundary.
+        assert_eq!(original.replica_node_ids.len(), 2);
+        let reduced = runtime
+            .reassign_metadata_shard(
+                &original.file_system_id,
+                &original.shard_id,
+                original.primary_node_id.clone(),
+                vec![successor.clone()],
+            )
+            .unwrap();
+        assert_eq!(reduced.epoch, original.epoch + 1);
+        assert_eq!(reduced.primary_node_id, original.primary_node_id);
+        assert_eq!(reduced.replica_node_ids, vec![successor.clone()]);
+        let control = runtime.shared_control_plane().unwrap();
+        let reduction_proof = control
+            .with_client(|kv| {
+                crate::DfsControlPlaneStore::new(kv.as_mut())
+                    .get_metadata_shard_membership_handoff_proof(
+                        &original.file_system_id,
+                        &original.shard_id,
+                    )
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(reduction_proof.retiring_shard, original);
+        assert_eq!(reduction_proof.desired_shard, reduced);
         let desired = runtime
             .reassign_metadata_shard(
                 &original.file_system_id,
@@ -3086,7 +3113,25 @@ mod metadata_publish_membership_tests {
                 vec![original.primary_node_id.clone()],
             )
             .unwrap();
-        assert_eq!(desired.epoch, original.epoch + 1);
+        assert_eq!(desired.epoch, reduced.epoch + 1);
+        let role_proof = control
+            .with_client(|kv| {
+                crate::DfsControlPlaneStore::new(kv.as_mut())
+                    .get_metadata_shard_membership_handoff_proof(
+                        &original.file_system_id,
+                        &original.shard_id,
+                    )
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(role_proof.retiring_shard, reduced);
+        assert_eq!(role_proof.desired_shard, desired);
+        assert_ne!(role_proof.handoff_id, reduction_proof.handoff_id);
+        assert_eq!(desired.primary_node_id, successor);
+        assert_eq!(
+            desired.replica_node_ids,
+            vec![original.primary_node_id.clone()]
+        );
         let mut reader = runtime.client(&successor).unwrap();
         assert_eq!(
             reader
