@@ -3833,13 +3833,57 @@ fn native_replica_read_recovers_after_an_actual_content_location_is_lost() {
     runtime.start_nodes().unwrap();
     let path = "/native-lost-read-location.bin";
     let bytes = vec![0x72; 32 * 1024];
+    let mut placement = DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 2, 2).unwrap();
+    placement.required_node_ids = vec![nodes[0].clone(), nodes[1].clone()];
+    let accepted = runtime
+        .apply_placement_policy(&nodes[0], path, DfsPlacementScope::SelfOnly, placement)
+        .unwrap();
+    let control = runtime.shared_control_plane().unwrap();
+    let setup_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    loop {
+        let job = control
+            .with_client(|kv| {
+                DfsControlPlaneStore::new(kv.as_mut())
+                    .placement_reconciliation(&accepted.file_system_id, &accepted.job_id)
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.accepted_config, accepted.accepted_config);
+        assert_eq!(job.scanned_object_count, 0);
+        assert!(job.last_error.is_none());
+        if job.state == DfsPlacementReconciliationState::Completed {
+            break;
+        }
+        let remaining = setup_deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "actual empty-path Apply must finish within its existing network budget"
+        );
+        runtime
+            .maintenance_tick(&nodes[0], remaining)
+            .unwrap()
+            .outcome
+            .unwrap();
+    }
+    drop(control);
     let mut primary = runtime.client(&nodes[0]).unwrap();
+    let (_, _, policy) = primary
+        .managed_replication_policy_for_path(path, DfsObjectPolicy::ReplicatedEventual, 2)
+        .unwrap();
+    assert_eq!(
+        policy
+            .required_node_ids
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([nodes[0].clone(), nodes[1].clone()])
+    );
     let stat = primary
         .posix_write_file(
             path,
             &bytes,
             DfsWriteOptions {
-                policy: DfsReplicationPolicy::new(2, 2).unwrap(),
+                policy,
                 replica_candidates: vec![nodes[0].clone(), nodes[1].clone()],
                 wait_for_commit: true,
                 foreground_replica_repair: true,
@@ -3851,12 +3895,23 @@ fn native_replica_read_recovers_after_an_actual_content_location_is_lost() {
         .unwrap();
     drop(primary);
     let missing = runtime.client(&nodes[1]).unwrap();
-    missing
-        .content
-        .debug_remove_loose_blob(stat.content_hash.as_deref().unwrap())
-        .unwrap();
+    let hash = stat.content_hash.as_deref().unwrap();
+    assert_eq!(
+        missing.content().read_blob(hash).unwrap(),
+        bytes,
+        "the selected replica really holds the original 32KiB payload"
+    );
+    missing.content().debug_remove_loose_blob(hash).unwrap();
+    assert!(
+        missing.content().open_blob_stream(hash).is_err(),
+        "the actual selected replica storage path is unavailable"
+    );
     drop(missing);
     let mut observer = runtime.client(&nodes[2]).unwrap();
+    assert!(
+        !observer.content().has_blob(hash).unwrap(),
+        "the reader starts without a local copy"
+    );
     let shard = DfsMetadataShardId::new(runtime.root_shard().unwrap().shard_id);
     let before = observer
         .metadata_backend()
