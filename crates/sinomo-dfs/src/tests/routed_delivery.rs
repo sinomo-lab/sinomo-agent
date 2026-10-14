@@ -152,10 +152,12 @@ fn native_delivery_case(body: Body, uncertain: bool, close_owner: bool) {
             let before = runtime.rpc_observations().len();
             assert!(route(&mut client, &object, &shard, &target, &operation, body).is_err());
             assert_eq!(client.writes.pending_routed_writes, previous);
+            let after = runtime.rpc_observations();
             assert_eq!(
-                runtime.rpc_observations().len(),
+                after.len(),
                 before,
-                "closed response custody rejects before dispatch"
+                "closed response custody rejects before dispatch; new observations={:?}",
+                &after[before..]
             );
         } else {
             runtime.install_fault(FaultRule {
@@ -200,12 +202,19 @@ fn native_delivery_case(body: Body, uncertain: bool, close_owner: bool) {
                 client.write_outcome(&alias).unwrap(),
                 client.write_outcome(&operation).unwrap()
             );
-            assert_eq!(client.posix_read_file("/routed-delivery").unwrap(), PAYLOAD);
+            assert_eq!(
+                client
+                    .posix_read_file_distributed("/routed-delivery")
+                    .unwrap(),
+                PAYLOAD
+            );
         }
     } else {
         assert!(client.writes.pending_routed_writes.is_empty());
         assert_eq!(
-            authority.posix_read_file("/routed-delivery").unwrap(),
+            authority
+                .posix_read_file_distributed("/routed-delivery")
+                .unwrap(),
             b"original"
         );
         assert!(
@@ -365,7 +374,9 @@ fn native_stale_authority_redirect_keeps_original_identity_after_lost_reply() {
         std::thread::sleep(Duration::from_millis(1));
     }
     assert_eq!(
-        client.posix_read_file("/handoff-delivery").unwrap(),
+        client
+            .posix_read_file_distributed("/handoff-delivery")
+            .unwrap(),
         PAYLOAD
     );
     runtime.assert_fault_budgets().unwrap();
