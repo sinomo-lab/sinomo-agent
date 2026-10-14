@@ -231,15 +231,24 @@ fn restored_pending_stage_rejects_old_ack_and_commits_exact_fresh_transfer() {
     let mut first_policy =
         DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedConfirmed, 1, 1).unwrap();
     first_policy.required_node_ids = vec![owner.clone()];
-    runtime
+    let first_apply = runtime
         .apply_placement_policy(&owner, &path, DfsPlacementScope::Subtree, first_policy)
         .unwrap();
+    finish_native_placement_fixture_apply(&runtime, &first_apply);
     let mut writer = runtime.metadata_primary_service(&path).unwrap();
+    let (_, _, base_policy) = writer
+        .managed_replication_policy_for_path(&path, DfsObjectPolicy::ReplicatedConfirmed, 1)
+        .unwrap();
     let base = writer
         .posix_write_file(
             &path,
             b"actual original write head",
-            DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
+            DfsWriteOptions {
+                policy: base_policy,
+                replica_candidates: vec![owner.clone()],
+                wait_for_commit: true,
+                foreground_replica_repair: true,
+            },
         )
         .unwrap();
     drop(writer);
@@ -288,6 +297,23 @@ fn restored_pending_stage_rejects_old_ack_and_commits_exact_fresh_transfer() {
         std::thread::yield_now();
     }
     drop(control);
+    let current = runtime.metadata_primary_service(&path).unwrap();
+    let current_base = current.posix_stat(&path).unwrap();
+    assert_eq!(current_base.object_id, base.object_id);
+    assert_eq!(current_base.content_hash, base.content_hash);
+    assert_eq!(
+        current
+            .metadata_backend()
+            .unwrap()
+            .receipts_for_version(&current_base.object_id, &current_base.version)
+            .unwrap()
+            .into_iter()
+            .map(|receipt| receipt.replica_node_id)
+            .collect::<BTreeSet<_>>(),
+        nodes.iter().cloned().collect()
+    );
+    drop(current);
+    let base = current_base;
     let background = runtime
         .deny_background_replica_before_claim(&owner)
         .unwrap();
@@ -4188,6 +4214,39 @@ fn sifs_non_replica_requester_routes_namespace_op_with_read_your_write() {
     _runtime.close().expect("normal native owner drain");
 }
 
+fn finish_native_placement_fixture_apply(
+    runtime: &crate::test_runtime::DfsTestRuntime,
+    accepted: &DfsPlacementReconciliationJob,
+) {
+    let coordinator = runtime.root_shard().unwrap().primary_node_id;
+    let control = runtime.shared_control_plane().unwrap();
+    let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    loop {
+        let job = control
+            .with_client(|kv| {
+                DfsControlPlaneStore::new(kv.as_mut())
+                    .placement_reconciliation(&accepted.file_system_id, &accepted.job_id)
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.accepted_config, accepted.accepted_config);
+        assert!(job.last_error.is_none(), "actual fixture Apply: {job:?}");
+        if job.state == DfsPlacementReconciliationState::Completed {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "finish the accepted fixture policy before its dependent operation: {job:?}"
+        );
+        runtime
+            .maintenance_tick(&coordinator, remaining)
+            .unwrap()
+            .outcome
+            .unwrap();
+    }
+}
+
 struct NativeMainAbortFixture {
     runtime: crate::test_runtime::DfsTestRuntime,
     writer: NetworkedDfsService<DfsNodeTransport>,
@@ -4219,23 +4278,53 @@ impl NativeMainAbortFixture {
         let mut first =
             DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedConfirmed, 1, 1).unwrap();
         first.required_node_ids = vec![main.clone()];
-        runtime
+        let first_apply = runtime
             .apply_placement_policy(&requester, &path, DfsPlacementScope::SelfOnly, first)
             .unwrap();
+        finish_native_placement_fixture_apply(&runtime, &first_apply);
         let mut writer = runtime.client(&requester).unwrap();
+        let (resolved, _, base_policy) = writer
+            .managed_replication_policy_for_path(&path, DfsObjectPolicy::ReplicatedConfirmed, 1)
+            .unwrap();
+        assert_eq!(resolved.policy.required_node_ids, vec![main.clone()]);
         let base = writer
             .posix_write_file(
                 &path,
                 b"original visible bytes",
-                DfsWriteOptions::replicated_eventual(vec![main.clone()]),
+                DfsWriteOptions {
+                    policy: base_policy,
+                    replica_candidates: vec![main.clone()],
+                    wait_for_commit: true,
+                    foreground_replica_repair: true,
+                },
             )
             .unwrap();
         drop(writer);
         let mut both = DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedConfirmed, 2, 2).unwrap();
         both.required_node_ids = content_nodes.clone();
-        runtime
+        let both_apply = runtime
             .apply_placement_policy(&requester, &path, DfsPlacementScope::SelfOnly, both)
             .unwrap();
+        finish_native_placement_fixture_apply(&runtime, &both_apply);
+        let current = runtime.metadata_primary_service(&path).unwrap();
+        let current_base = current.posix_stat(&path).unwrap();
+        assert_eq!(current_base.object_id, base.object_id);
+        assert_eq!(current_base.content_hash, base.content_hash);
+        let holders = current
+            .metadata_backend()
+            .unwrap()
+            .receipts_for_version(&current_base.object_id, &current_base.version)
+            .unwrap()
+            .into_iter()
+            .map(|receipt| receipt.replica_node_id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            holders,
+            content_nodes.iter().cloned().collect(),
+            "the predecessor's actual W2 placement must complete before the lost-Stage case"
+        );
+        drop(current);
+        let base = current_base;
         let capture = Arc::new(Mutex::new(
             crate::test_runtime::StageExchangeCapture::default(),
         ));
