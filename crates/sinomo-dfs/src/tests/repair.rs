@@ -1559,7 +1559,7 @@ fn routed_inline_blob_records_requester_receipt_without_restaging() {
     let name = "native-routed-inline-requester-receipt";
     let (runtime, service, config) =
         crate::test_support::current_native_metadata_service(name, 2, "/services").unwrap();
-    let primary = config.primary_node_id;
+    let primary = config.primary_node_id.clone();
     drop(service);
     let requester = crate::test_runtime::DfsTestRuntime::ordered_node_ids(name, 2)
         .into_iter()
@@ -1568,24 +1568,115 @@ fn routed_inline_blob_records_requester_receipt_without_restaging() {
     let path = "/services/native-inline-requester.bin";
     let mut policy = DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedConfirmed, 2, 2).unwrap();
     policy.required_node_ids = vec![primary.clone(), requester.clone()];
-    runtime
+    let accepted = runtime
         .apply_placement_policy(&primary, path, DfsPlacementScope::Subtree, policy)
         .unwrap();
+    let control = runtime.shared_control_plane().unwrap();
+    let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    loop {
+        let job = control
+            .with_client(|kv| {
+                DfsControlPlaneStore::new(kv.as_mut())
+                    .placement_reconciliation(&accepted.file_system_id, &accepted.job_id)
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.accepted_config, accepted.accepted_config);
+        assert_eq!(job.scanned_object_count, 0);
+        assert!(job.last_error.is_none());
+        if job.state == DfsPlacementReconciliationState::Completed {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(!remaining.is_zero(), "normal empty Apply setup budget");
+        runtime
+            .maintenance_tick(&primary, remaining)
+            .unwrap()
+            .outcome
+            .unwrap();
+    }
+    drop(control);
     let mut writer = runtime.client(&requester).unwrap();
-    let before = runtime.rpc_observations().len();
-    let bytes = b"complete inline routed bytes genuinely held by their requester";
-    let stat = writer
+    let (_, _, replication) = writer
+        .managed_replication_policy_for_path(path, DfsObjectPolicy::ReplicatedConfirmed, 2)
+        .unwrap();
+    let base = writer
         .posix_write_file(
             path,
-            bytes,
+            b"actual inline predecessor",
             DfsWriteOptions {
                 replica_candidates: vec![primary.clone(), requester.clone()],
-                policy: DfsReplicationPolicy::new(2, 2).unwrap(),
+                policy: replication.clone(),
                 wait_for_commit: true,
                 foreground_replica_repair: true,
             },
         )
         .unwrap();
+    let version = crate::namespace::next_version(&base.version);
+    let bytes = b"complete inline routed bytes genuinely held by their requester";
+    let manifest = writer
+        .content()
+        .put_object_version(base.object_id.as_str(), version.as_str(), bytes)
+        .unwrap();
+    assert_eq!(manifest.content_hash, crate::content_hash(bytes));
+    let source = runtime.metadata_primary_service(path).unwrap();
+    let object = source
+        .metadata_backend()
+        .unwrap()
+        .get_object(&base.object_id)
+        .unwrap()
+        .unwrap();
+    drop(source);
+    let request_id = format!("native-inline-prestaged-{}", sinomo_core::Id::generate());
+    let command = DfsMessageCommand {
+        request_id: request_id.clone(),
+        routed_message: build_dfs_routed_message(
+            &requester,
+            &primary,
+            910,
+            911,
+            DfsNetworkMessage::DistributedWriteRequest(DfsDistributedWriteCommand {
+                publication: Default::default(),
+                patch: None,
+                request_id,
+                request: DfsWriteRequest {
+                    file_system_id: base.file_system_id,
+                    object_id: base.object_id,
+                    target_version: version.clone(),
+                    requesting_node_id: requester.clone(),
+                },
+                expected_base_version: Some(base.version),
+                metadata_journal_after_sequence: None,
+                bytes: bytes.to_vec(),
+                content_hash: None,
+                content_size_bytes: None,
+                requester_blob_pre_staged: true,
+                desired_replica_nodes: vec![primary.clone(), requester.clone()],
+                policy: replication,
+                object_metadata: Some(object),
+                authority_shard: Some(config),
+                touch_parent_on_create: false,
+                foreground_replica_repair: true,
+                exclusive_create: false,
+            }),
+        ),
+    };
+    let before = runtime.rpc_observations().len();
+    let result = runtime
+        .rpc_call(
+            &requester,
+            &primary,
+            crate::dfs_message_rpc_call(&command).unwrap(),
+            sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+        )
+        .unwrap();
+    let response = crate::decode_dfs_message_rpc_response(&result).unwrap();
+    assert!(response.outbound_messages.iter().any(|message| matches!(&message.message,
+        DfsNetworkMessage::DistributedWriteResponse(reply) if matches!(&reply.result,
+            DfsDistributedWriteResult::Outcome { outcome: NetworkedDfsWriteOutcome::Committed { version: committed, .. } }
+                if committed == &version))), "actual prestaged inline completion: {response:?}");
+    let stat = writer.posix_stat_distributed(path).unwrap();
+    assert_eq!(stat.version, version);
     let calls = runtime.rpc_observations()[before..].to_vec();
     assert!(calls.iter().any(|event| event.source == requester
         && event.target == primary
@@ -2515,10 +2606,9 @@ fn background_w2_stages_only_quorum_deficit_and_defers_n3_repair() {
 #[test]
 fn foreground_w2_does_not_repair_a_sibling_stage_already_inflight() {
     let name = "native-foreground-w2-held-sibling";
-    let (runtime, mut dfs, config) =
-        crate::test_support::current_native_metadata_service(name, 3, "/services").unwrap();
-    let owner = config.primary_node_id;
-    let nodes = crate::test_runtime::DfsTestRuntime::ordered_node_ids(name, 3);
+    let path = format!("/services/{name}.bin");
+    let (runtime, owner, nodes, mut dfs, policy) =
+        native_owned_repair_fixture(name, &path, 2, 3, false);
     let peers = nodes
         .iter()
         .filter(|node| **node != owner)
@@ -2526,14 +2616,35 @@ fn foreground_w2_does_not_repair_a_sibling_stage_already_inflight() {
         .collect::<Vec<_>>();
     let replica_a = peers[0].clone();
     let replica_b = peers[1].clone();
-    let path = format!("/services/{name}.bin");
     let base = dfs
         .posix_write_file(
             &path,
             b"actual stage predecessor",
-            DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
+            DfsWriteOptions {
+                policy: policy.clone(),
+                replica_candidates: nodes.clone(),
+                wait_for_commit: true,
+                foreground_replica_repair: true,
+            },
         )
         .unwrap();
+    let base_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    while dfs
+        .metadata_backend()
+        .unwrap()
+        .receipts_for_version(&base.object_id, &base.version)
+        .unwrap()
+        .len()
+        != 3
+    {
+        assert!(
+            Instant::now() < base_deadline,
+            "actual predecessor N3 must settle before selected Stage pause"
+        );
+        dfs.retry_pending_repairs().unwrap();
+        dfs.process_incoming().unwrap();
+    }
+    dfs.flush_detached_transport_sends().unwrap();
     let request = DfsWriteRequest {
         file_system_id: base.file_system_id,
         object_id: base.object_id,
@@ -2541,8 +2652,6 @@ fn foreground_w2_does_not_repair_a_sibling_stage_already_inflight() {
         requesting_node_id: owner.clone(),
     };
     let bytes = vec![0x6b; 2 * 1024 * 1024 + 4096];
-    let mut policy = DfsReplicationPolicy::new(2, 3).unwrap();
-    policy.required_node_ids = nodes.clone();
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
     runtime.install_fault(crate::test_support::DfsTestFaultRule {
         source: Some(owner.clone()),
@@ -7384,8 +7493,19 @@ fn native_browser_fresh_repair_custody_reaches_n2_after_healing() {
             .intents
             .iter()
             .find(|intent| intent.intent_id == intent_id)
-            .unwrap();
-        assert!(intent.publication.is_current());
+            .cloned()
+            .or_else(|| {
+                history
+                    .receipts
+                    .iter()
+                    .find(|receipt| receipt.intent_id == intent_id)
+                    .map(|receipt| receipt.to_intent_record())
+            })
+            .expect("actual full current intent or its canonical completion receipt");
+        assert!(
+            intent.publication.is_current(),
+            "actual queue intent={intent_id}, reconstructed={intent:?}; history={history:?}"
+        );
         assert_eq!(intent.status, DfsWriteIntentStatus::Committed);
         assert_eq!(intent.file_system_id, stat.file_system_id);
         assert_eq!(intent.object_id, stat.object_id);
