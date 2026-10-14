@@ -14565,6 +14565,34 @@ fn default_cluster_metadata_shards_cover_root_users_and_services() {
         runtime.define_node(node.clone()).unwrap();
     }
     runtime.start_nodes().unwrap();
+    // Discovery preserves committed owners. Establish the requested spread
+    // through the same explicit guarded handoffs used by an operator.
+    let initial = runtime.metadata_shards().unwrap();
+    assert!(
+        initial
+            .iter()
+            .all(|shard| shard.primary_node_id == nodes[0])
+    );
+    for (shard, target) in [("services", &nodes[1]), ("users", &nodes[2])] {
+        let fs = initial
+            .iter()
+            .find(|config| config.shard_id == shard)
+            .unwrap()
+            .file_system_id
+            .clone();
+        runtime
+            .reassign_metadata_shard(
+                &fs,
+                shard,
+                target.clone(),
+                nodes
+                    .iter()
+                    .filter(|node| *node != target)
+                    .cloned()
+                    .collect(),
+            )
+            .unwrap();
+    }
     let by_id = runtime
         .metadata_shards()
         .unwrap()
@@ -14580,7 +14608,7 @@ fn default_cluster_metadata_shards_cover_root_users_and_services() {
         DfsMetadataShardAssignment::PathPrefix { prefix } if prefix == crate::SIFS_SERVICES_PATH));
     assert!(matches!(&by_id["users"].assignment,
         DfsMetadataShardAssignment::PathPrefix { prefix } if prefix == crate::SIFS_USERS_PATH));
-    // Ordinary certified expansion now completes the normal role placement.
+    // The explicit native handoffs above now own these exact roles.
     assert_eq!(by_id["root"].primary_node_id, nodes[0]);
     assert_eq!(by_id["services"].primary_node_id, nodes[1]);
     assert_eq!(by_id["users"].primary_node_id, nodes[2]);
@@ -14627,6 +14655,32 @@ fn default_cluster_metadata_shard_expands_replicas_before_primary_transfer() {
         runtime.define_node(node.clone()).unwrap();
     }
     runtime.start_nodes().unwrap();
+    let expanded = runtime
+        .metadata_shards()
+        .unwrap()
+        .into_iter()
+        .find(|config| config.shard_id == "services")
+        .unwrap();
+    assert_eq!(expanded.primary_node_id, nodes[0]);
+    assert_eq!(
+        std::iter::once(&expanded.primary_node_id)
+            .chain(&expanded.replica_node_ids)
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        nodes.iter().cloned().collect()
+    );
+    runtime
+        .reassign_metadata_shard(
+            &expanded.file_system_id,
+            "services",
+            nodes[1].clone(),
+            nodes
+                .iter()
+                .filter(|node| **node != nodes[1])
+                .cloned()
+                .collect(),
+        )
+        .unwrap();
     let actual = runtime
         .metadata_shards()
         .unwrap()

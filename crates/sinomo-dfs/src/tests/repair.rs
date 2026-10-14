@@ -5627,103 +5627,180 @@ fn committed_intent_repairs_already_current_stale_locations() {
     runtime.close().unwrap();
 }
 
+fn native_receipt_republication_fixture(
+    name: &str,
+) -> (
+    crate::test_runtime::DfsTestRuntime,
+    NetworkedDfsService<DfsNodeTransport>,
+    DfsStat,
+    DfsReplicaReceiptRecord,
+) {
+    let path = "/services/receipt-republication";
+    let (runtime, owner, nodes, mut author, policy) =
+        native_owned_repair_fixture(name, path, 1, 2, false);
+    let bytes = b"real native receipt publication bytes";
+    let stat = author
+        .posix_write_file(
+            path,
+            bytes,
+            DfsWriteOptions {
+                policy,
+                replica_candidates: nodes.clone(),
+                wait_for_commit: true,
+                foreground_replica_repair: true,
+            },
+        )
+        .unwrap();
+    // W1 visibility can precede the ordinary N2 continuation. Drain that real
+    // owner before treating the second node as a durable fixture witness.
+    let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    loop {
+        let current = runtime.metadata_primary_service(path).unwrap();
+        let receipts = current
+            .metadata_backend()
+            .unwrap()
+            .receipts_for_version(&stat.object_id, &stat.version)
+            .unwrap();
+        drop(current);
+        if receipts.len() == 2 {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "actual N2 receipt continuation did not drain"
+        );
+        author.retry_pending_repairs_bounded(1).unwrap();
+        author.process_incoming().unwrap();
+    }
+    drop(author);
+    let mut author = runtime.metadata_primary_service(path).unwrap();
+    let actual_receipts = author
+        .metadata_backend()
+        .unwrap()
+        .receipts_for_version(&stat.object_id, &stat.version)
+        .unwrap();
+    assert_eq!(
+        actual_receipts.len(),
+        2,
+        "both actual replicas must be durable before withdrawing one receipt"
+    );
+    for node in &nodes {
+        let holder = runtime.client(node).unwrap();
+        assert_eq!(
+            holder
+                .content()
+                .read_blob(stat.content_hash.as_deref().unwrap())
+                .unwrap(),
+            bytes
+        );
+    }
+    let receipt = author
+        .backend_receipt_for_replica(&stat.object_id, &stat.version, &owner)
+        .unwrap()
+        .unwrap();
+    assert_eq!(receipt.content_hash, stat.content_hash);
+    // Simulate withdrawal of the actual location through its normal guarded
+    // path, including the exact object/version/prefix predicates. Its bytes
+    // remain durable and are checked before publishing the receipt again.
+    author
+        .mark_remote_read_location_missing(
+            &stat.object_id,
+            &stat.version,
+            &stat.content_hash,
+            &receipt.replica_node_id,
+        )
+        .unwrap();
+    assert!(
+        author
+            .backend_receipt_for_replica(&stat.object_id, &stat.version, &receipt.replica_node_id)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        author
+            .content()
+            .read_blob(stat.content_hash.as_deref().unwrap())
+            .unwrap(),
+        bytes
+    );
+    (runtime, author, stat, receipt)
+}
+
 #[test]
 fn duplicate_metadata_receipt_publication_is_idempotent() {
-    let root = temp_root("metadata-receipt-publication-idempotent");
-    let owner = NodeId::from_legacy_named("node_receipt_owner").expect("node");
-    let replica = NodeId::from_legacy_named("node_receipt_replica").expect("node");
-    let object_id = DfsObjectId::from_legacy_named("obj_receipt_idempotent").expect("object");
-    let version = DfsVersion::from_legacy_named("version_2").expect("version");
-    let content_hash = "blake3:receipt-idempotent";
-
-    let (_runtime, mut dfs) = native_sifs_service(
-        "duplicate_metadata_receipt_publication_is_idempotent",
-        owner,
+    let (runtime, mut dfs, stat, receipt) =
+        native_receipt_republication_fixture("native-receipt-idempotence");
+    let hash = receipt.content_hash.as_deref().unwrap();
+    assert!(
+        dfs.put_metadata_receipt(
+            &stat.file_system_id,
+            &stat.object_id,
+            &stat.version,
+            &receipt.replica_node_id,
+            hash
+        )
+        .unwrap()
     );
-    dfs.put_metadata_receipt(
-        &sifs_file_system_id(),
-        &object_id,
-        &version,
-        &replica,
-        content_hash,
-    )
-    .expect("first receipt");
-    let journal_sequence_before = dfs
-        .metadata_backend
-        .as_ref()
-        .expect("metadata backend")
-        .metadata_shard_statuses()
-        .expect("metadata shard status")
-        .into_iter()
-        .map(|status| status.journal_last_sequence)
-        .max()
-        .unwrap_or_default();
-
-    dfs.put_metadata_receipt(
-        &sifs_file_system_id(),
-        &object_id,
-        &version,
-        &replica,
-        content_hash,
-    )
-    .expect("duplicate receipt");
-
-    let journal_sequence_after = dfs
-        .metadata_backend
-        .as_ref()
-        .expect("metadata backend")
-        .metadata_shard_statuses()
-        .expect("metadata shard status")
-        .into_iter()
-        .map(|status| status.journal_last_sequence)
-        .max()
-        .unwrap_or_default();
+    let before = dfs
+        .metadata_backend()
+        .unwrap()
+        .export_shard_table_snapshot(&DfsMetadataShardId::new("services"))
+        .unwrap()
+        .unwrap();
+    assert!(
+        !dfs.put_metadata_receipt(
+            &stat.file_system_id,
+            &stat.object_id,
+            &stat.version,
+            &receipt.replica_node_id,
+            hash
+        )
+        .unwrap()
+    );
     assert_eq!(
-        journal_sequence_after, journal_sequence_before,
-        "duplicate replica receipts for the same content hash should not emit journal entries"
+        dfs.metadata_backend()
+            .unwrap()
+            .export_shard_table_snapshot(&DfsMetadataShardId::new("services"))
+            .unwrap()
+            .unwrap(),
+        before,
+        "duplicate actual replica receipt changes neither tables nor journal prefix"
     );
-
-    std::fs::remove_dir_all(root).ok();
+    drop(dfs);
+    runtime.close().unwrap();
 }
 
 #[test]
 fn conflicting_metadata_receipt_from_same_replica_is_rejected() {
-    let root = temp_root("metadata-receipt-conflicting-hash-rejected");
-    let owner = NodeId::from_legacy_named("node_receipt_conflict_owner").expect("node");
-    let replica = NodeId::from_legacy_named("node_receipt_conflict_replica").expect("node");
-    let object_id = DfsObjectId::from_legacy_named("obj_receipt_conflict").expect("object");
-    let version = DfsVersion::from_legacy_named("version_2").expect("version");
-    let content_hash = "blake3:receipt-original";
-    let conflicting_hash = "blake3:receipt-conflicting";
-
-    let (_runtime, mut dfs) = native_sifs_service(
-        "conflicting_metadata_receipt_from_same_replica_is_rejected",
-        owner,
-    );
+    let (runtime, mut dfs, stat, receipt) =
+        native_receipt_republication_fixture("native-receipt-conflict");
+    let hash = receipt.content_hash.as_deref().unwrap();
     assert!(
         dfs.put_metadata_receipt(
-            &sifs_file_system_id(),
-            &object_id,
-            &version,
-            &replica,
-            content_hash,
+            &stat.file_system_id,
+            &stat.object_id,
+            &stat.version,
+            &receipt.replica_node_id,
+            hash
         )
-        .expect("first receipt")
+        .unwrap()
     );
-    let journal_count_before = std::fs::read_dir(root.join("metadata/journal"))
-        .expect("journal dir")
-        .count();
-
+    let before = dfs
+        .metadata_backend()
+        .unwrap()
+        .export_shard_table_snapshot(&DfsMetadataShardId::new("services"))
+        .unwrap()
+        .unwrap();
     let error = dfs
         .put_metadata_receipt(
-            &sifs_file_system_id(),
-            &object_id,
-            &version,
-            &replica,
-            conflicting_hash,
+            &stat.file_system_id,
+            &stat.object_id,
+            &stat.version,
+            &receipt.replica_node_id,
+            "blake3:receipt-conflicting",
         )
         .expect_err("conflicting receipt must be rejected");
-
     assert!(
         error
             .to_string()
@@ -5732,20 +5809,27 @@ fn conflicting_metadata_receipt_from_same_replica_is_rejected() {
     );
     let receipts = dfs
         .metadata_backend()
-        .expect("backend")
-        .receipts_for_version(&object_id, &version)
-        .expect("receipts");
-    assert_eq!(receipts.len(), 1);
-    assert_eq!(receipts[0].content_hash.as_deref(), Some(content_hash));
-    let journal_count_after = std::fs::read_dir(root.join("metadata/journal"))
-        .expect("journal dir")
-        .count();
+        .unwrap()
+        .receipts_for_version(&stat.object_id, &stat.version)
+        .unwrap();
+    assert_eq!(receipts.len(), 2);
+    let target_receipts = receipts
+        .iter()
+        .filter(|row| row.replica_node_id == receipt.replica_node_id)
+        .collect::<Vec<_>>();
+    assert_eq!(target_receipts.len(), 1);
+    assert_eq!(target_receipts[0].content_hash.as_deref(), Some(hash));
     assert_eq!(
-        journal_count_after, journal_count_before,
-        "rejected conflicting receipt must not overwrite receipt metadata or emit journals"
+        dfs.metadata_backend()
+            .unwrap()
+            .export_shard_table_snapshot(&DfsMetadataShardId::new("services"))
+            .unwrap()
+            .unwrap(),
+        before,
+        "rejected conflicting receipt changes neither tables nor journal prefix"
     );
-
-    std::fs::remove_dir_all(root).ok();
+    drop(dfs);
+    runtime.close().unwrap();
 }
 
 #[test]
