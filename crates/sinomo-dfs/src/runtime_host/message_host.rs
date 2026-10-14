@@ -1171,7 +1171,7 @@ pub(crate) fn read_daemon_dfs_message_peer_snapshot(
         .ok_or_else(|| sinomo_dfs::DfsError::Network {
             message: "DFS peer projection requires its registered native owner".into(),
         })?;
-    if host.shutting_down.load(Ordering::Acquire) {
+    if host.shutting_down.is_cancelled() {
         return Ok(None);
     }
     let (members, services) = read_native_dfs_peer_configuration(
@@ -1179,7 +1179,7 @@ pub(crate) fn read_daemon_dfs_message_peer_snapshot(
         &state,
         Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
     )?;
-    if host.shutting_down.load(Ordering::Acquire) {
+    if host.shutting_down.is_cancelled() {
         return Ok(None);
     }
     peer_snapshot_from_configuration_entries(&state, members, services).map(Some)
@@ -1270,7 +1270,7 @@ pub(crate) async fn read_daemon_dfs_message_peer_snapshot_before(
         .ok_or_else(|| sinomo_dfs::DfsError::Network {
             message: "DFS peer projection requires its registered native owner".into(),
         })?;
-    if host.shutting_down.load(Ordering::Acquire) {
+    if host.shutting_down.is_cancelled() {
         return Ok(None);
     }
     let owner =
@@ -1288,7 +1288,7 @@ pub(crate) async fn read_daemon_dfs_message_peer_snapshot_before(
         let result = (|| -> Result<Option<DaemonDfsMessagePeerSnapshot>, sinomo_dfs::DfsError> {
             let (members, services) =
                 read_native_dfs_peer_configuration(&peer_paths, &state, deadline.into_std())?;
-            if host.shutting_down.load(Ordering::Acquire)
+            if host.shutting_down.is_cancelled()
                 || !registered_dfs_runtime_host(&data_dir)
                     .map_err(|error| sinomo_dfs::DfsError::Network {
                         message: error.to_string(),
@@ -1502,6 +1502,16 @@ pub(crate) fn open_daemon_dfs_message_service_lane_with_content(
             )?
         }
     };
+    // Synchronous quorum/handoff loops cannot observe Tokio task abortion.
+    // Link the real host's stop signal once when constructing this lane so
+    // their existing cooperative checks release admission during shutdown.
+    if let Some(host) =
+        registered_dfs_runtime_host(data_dir).map_err(|error| sinomo_dfs::DfsError::Network {
+            message: error.to_string(),
+        })?
+    {
+        service.add_cancellation(host.shutting_down.clone());
+    }
     if resident_metadata_scope.is_some() {
         service.release_resident_metadata_backend()?;
     }

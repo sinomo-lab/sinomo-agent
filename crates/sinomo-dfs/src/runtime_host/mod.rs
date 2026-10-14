@@ -355,7 +355,7 @@ pub struct DfsRuntimeHost {
     maintenance_notify: Arc<tokio::sync::Notify>,
     event_client: Option<ComponentEventClient>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
-    shutting_down: AtomicBool,
+    shutting_down: crate::DfsCancellationFlag,
 }
 
 impl DfsRuntimeHost {
@@ -372,7 +372,7 @@ impl DfsRuntimeHost {
             maintenance_notify: Arc::new(tokio::sync::Notify::new()),
             event_client: None,
             tasks: Mutex::new(Vec::new()),
-            shutting_down: AtomicBool::new(false),
+            shutting_down: crate::DfsCancellationFlag::new(),
         }
     }
 
@@ -383,7 +383,7 @@ impl DfsRuntimeHost {
 
     pub(crate) fn own_task(&self, task: tokio::task::JoinHandle<()>) {
         let mut tasks = self.tasks.lock().unwrap_or_else(|error| error.into_inner());
-        if self.shutting_down.load(Ordering::Acquire) {
+        if self.shutting_down.is_cancelled() {
             // Abort does not stop an already-running blocking task. Retain its
             // handle so the same lifecycle drain can join its actual owner.
             task.abort();
@@ -393,7 +393,7 @@ impl DfsRuntimeHost {
     }
 
     pub(crate) fn shutdown(&self) {
-        self.shutting_down.store(true, Ordering::Release);
+        self.shutting_down.cancel();
         self.response_delivery.shutdown();
         if let Ok(tasks) = self.tasks.lock() {
             for task in tasks.iter() {
@@ -1835,7 +1835,7 @@ pub(crate) async fn bootstrap_publication_execution_provider(
         .ok_or_else(|| {
             error("bootstrap publication has no actual registered runtime host".into())
         })?;
-    if host.shutting_down.load(Ordering::Acquire) {
+    if host.shutting_down.is_cancelled() {
         return Err(error(
             "bootstrap publication runtime host is stopping".into(),
         ));
@@ -1851,7 +1851,7 @@ pub(crate) async fn bootstrap_publication_execution_provider(
     // Bootstrap has written its assignment before this shared configuration
     // join. It retains the existing global admission; no nested permit is taken.
     authority.ensure_write_configuration_ready_async().await?;
-    if host.shutting_down.load(Ordering::Acquire) {
+    if host.shutting_down.is_cancelled() {
         return Err(error(
             "bootstrap publication runtime host is stopping".into(),
         ));
@@ -2004,6 +2004,7 @@ fn open_dfs_runtime_service_for_effect(
         authority,
         provider_runtime.clone(),
     );
+    let cancellation = host.shutting_down.clone();
     let transport = if effect.is_none() {
         data_plane::daemon_dfs_client_node_transport(
             state.local_node_id.clone(),
@@ -2024,9 +2025,12 @@ fn open_dfs_runtime_service_for_effect(
     // its shared reactive cache; opening a service neither samples storage nor
     // rebuilds an advisory placement snapshot. Publication permission remains
     // exclusively with the native provider/intent/receipt/kernel guards.
-    let service = NetworkedDfsService::new(transport, content).with_placement_snapshot_cache(
-        cached_daemon_dfs_placement_snapshot_cache(data_dir, &state.local_node_id),
-    );
+    let service = NetworkedDfsService::new(transport, content)
+        .with_cancellation(cancellation)
+        .with_placement_snapshot_cache(cached_daemon_dfs_placement_snapshot_cache(
+            data_dir,
+            &state.local_node_id,
+        ));
     service
         .publication_provider
         .retain_runtime_provider(publication_provider);
@@ -3092,7 +3096,7 @@ pub fn owned_storage_import_control_plane_client(
         registered_dfs_runtime_host(context.data_dir())?.ok_or_else(|| DfsRuntimeError::Parse {
             detail: "storage import normal host is not registered yet".into(),
         })?;
-    if host.shutting_down.load(Ordering::Acquire) {
+    if host.shutting_down.is_cancelled() {
         return Err(DfsRuntimeError::Parse {
             detail: "storage import native host is stopping".into(),
         });

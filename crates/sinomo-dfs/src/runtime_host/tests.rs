@@ -16077,7 +16077,7 @@ fn stopped_runtime_joins_a_started_blocking_child_registered_during_drain() {
             join_registered_runtime_for_test(&join_data_dir, Duration::from_secs(5)).await
         });
         tokio::time::timeout(Duration::from_secs(1), async {
-            while !host.shutting_down.load(Ordering::Acquire) {
+            while !host.shutting_down.is_cancelled() {
                 tokio::task::yield_now().await;
             }
         })

@@ -62,7 +62,7 @@ pub fn queue_namespace_reconciliation_work(
         detail: "namespace reconciliation has no registered runtime".into(),
     })?;
     if !Arc::ptr_eq(&current, &owner)
-        || host.shutting_down.load(Ordering::Acquire)
+        || host.shutting_down.is_cancelled()
         || binding.is_empty()
         || binding.len() > 512
     {
@@ -496,11 +496,7 @@ pub(super) fn daemon_dfs_offline_node_ids(
                 .ok()
                 .flatten()
         })
-        .filter(|host| {
-            !host
-                .shutting_down
-                .load(std::sync::atomic::Ordering::Acquire)
-        });
+        .filter(|host| !host.shutting_down.is_cancelled());
     sinomo_dfs::maintenance::dfs_offline_node_ids_with_transport_availability(
         cluster_paths,
         state,
