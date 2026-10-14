@@ -701,7 +701,10 @@ fn routed_mkdir_all_prefers_live_path_shard_over_late_source_tombstone() {
         .replica
         .posix_mkdir_all("/users/moved-tree")
         .unwrap();
-    let old = cluster.replica.posix_stat("/users/moved-tree").unwrap();
+    let old = cluster
+        .replica
+        .posix_stat_distributed("/users/moved-tree")
+        .unwrap();
     cluster
         .replica
         .posix_rename("/users/moved-tree", "/services/moved-tree")
@@ -721,7 +724,7 @@ fn routed_mkdir_all_prefers_live_path_shard_over_late_source_tombstone() {
     assert_eq!(
         cluster
             .replica
-            .posix_stat("/services/moved-tree")
+            .posix_stat_distributed("/services/moved-tree")
             .unwrap()
             .object_id,
         old.object_id
@@ -729,13 +732,13 @@ fn routed_mkdir_all_prefers_live_path_shard_over_late_source_tombstone() {
     assert_eq!(
         cluster
             .replica
-            .posix_stat("/services/moved-tree/a/b")
+            .posix_stat_distributed("/services/moved-tree/a/b")
             .unwrap()
             .kind,
         DfsObjectKind::Directory
     );
     assert!(matches!(
-        cluster.replica.posix_stat("/users/moved-tree"),
+        cluster.replica.posix_stat_distributed("/users/moved-tree"),
         Err(DfsPosixError::NotFound { .. })
     ));
     cluster.close();

@@ -2385,8 +2385,8 @@ fn sifs_cluster_routed_mkdir_all_allows_immediate_child_mkdir() {
     replica
         .posix_mkdir(child)
         .expect("immediate child mkdir sees routed mkdir_all parent");
-    assert!(replica.posix_stat(base).is_ok());
-    assert!(replica.posix_stat(child).is_ok());
+    assert!(replica.posix_stat_distributed(base).is_ok());
+    assert!(replica.posix_stat_distributed(child).is_ok());
 
     drop(users_primary);
     drop(services_primary);

@@ -4113,7 +4113,7 @@ mod tests {
         assert!(
             fixture
                 .service
-                .posix_stat("/native-after-primary-handoff")
+                .posix_stat_distributed("/native-after-primary-handoff")
                 .is_ok()
         );
         fixture.finish();
