@@ -9075,6 +9075,7 @@ fn native_connectivity_park_returns_through_actual_main_repair() {
     let before_return = runtime.rpc_observations().len();
     runtime.reopen_node(replica.clone()).unwrap();
     let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    let mut sibling_job_id = None;
     let claimed = loop {
         let core = runtime.metadata_primary_service(&stat.path).unwrap();
         let receipt = core
@@ -9097,6 +9098,27 @@ fn native_connectivity_park_returns_through_actual_main_repair() {
             .records
             .into_iter()
             .find(|row| row.intent_id == intent_id && row.missing_replica_node_id == replica);
+        let canonical_reply_lost = current.as_ref().is_some_and(|row| {
+            row.transfer_delivery_state == Some(NetworkDeliveryState::PossiblyApplied)
+                && lost.lock().unwrap().iter().any(|routed| {
+                    matches!(&routed.message, DfsNetworkMessage::RepairReplicaResponse(reply)
+                        if row.transfer_request_id.as_deref() == Some(reply.request_id.as_str()))
+                })
+        });
+        if sibling_job_id.is_none() && canonical_reply_lost {
+            // The fixture's initial Apply intentionally completed on an empty
+            // path. Start the intended independent owner through a real Apply
+            // only after the canonical receiver completed and lost its reply.
+            let mut policy =
+                DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 2).unwrap();
+            policy.required_node_ids = vec![owner.clone(), replica.clone()];
+            let sibling = runtime
+                .apply_placement_policy(&owner, &stat.path, DfsPlacementScope::Subtree, policy)
+                .unwrap();
+            assert_eq!(sibling.path, stat.path);
+            assert_eq!(sibling.file_system_id, stat.file_system_id);
+            sibling_job_id = Some(sibling.job_id);
+        }
         let replies = lost.lock().unwrap();
         for routed in replies.iter() {
             let DfsNetworkMessage::RepairReplicaResponse(reply) = &routed.message else {
@@ -9168,6 +9190,36 @@ fn native_connectivity_park_returns_through_actual_main_repair() {
                 && event.dfs_object_id.as_ref() == Some(&stat.object_id)
                 && event.dfs_version.as_ref() == Some(&stat.version))
     );
+    let sibling_job_id =
+        sibling_job_id.expect("normal Apply scheduled the independent placement owner");
+    let control = runtime.shared_control_plane().unwrap();
+    let sibling = control
+        .with_client(|kv| {
+            DfsControlPlaneStore::new(kv.as_mut())
+                .placement_reconciliation(&stat.file_system_id, &sibling_job_id)
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(sibling.matched_object_count, 1);
+    assert!(sibling.scheduled_repair_count > 0);
+    assert!(
+        runtime.rpc_observations()[before_return..]
+            .iter()
+            .any(|event| {
+                event.source == owner
+                    && event.target == replica
+                    && event.route == DFS_DATA_REPAIR_REPLICA_ROUTE
+                    && event.phase == crate::test_runtime::RpcPhase::Completed
+                    && event
+                        .dfs_intent_id
+                        .as_ref()
+                        .is_some_and(|id| id != &intent_id)
+                    && event.dfs_object_id.as_ref() == Some(&stat.object_id)
+                    && event.dfs_version.as_ref() == Some(&stat.version)
+            }),
+        "the sibling receipt must follow an actual different-owner native repair"
+    );
+    drop(control);
     let mut reader = runtime.client(&replica).unwrap();
     assert_eq!(
         reader.posix_read_file(&stat.path).unwrap(),
