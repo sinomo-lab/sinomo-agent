@@ -814,6 +814,18 @@ impl DfsSourceAdoptionActor {
             &offer.source_config,
         )
         .map_err(error)?;
+        // Capture retirement's source family under the same mutation admission
+        // as its guarded publication. A queued admission may span unrelated
+        // journal progress; the captured sequence must remain an exact predicate.
+        let retirement_scope = crate::DfsPreparedOperationScope {
+            file_system_id: offer.source_config.file_system_id.clone(),
+            shard_id: crate::DfsMetadataShardId::new(offer.source_config.shard_id.clone()),
+            owner_epoch: offer.source_config.epoch,
+            operation_id: format!("source-retirement:{}", offer.session_id),
+        };
+        let _retirement = service
+            .acquire_prepared_execution(&retirement_scope)
+            .map_err(error)?;
         let family = service
             .metadata_backend_mut()
             .ok_or_else(|| error("source completion has no native backend"))?
