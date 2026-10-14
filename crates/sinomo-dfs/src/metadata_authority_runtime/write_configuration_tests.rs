@@ -1526,3 +1526,61 @@ async fn zero_revision_discontinuity_requires_fresh_native_bootstrap_certificate
     assert_eq!(host.queued_count(), 0);
     assert_eq!(host.spawned.load(Ordering::Acquire), 2);
 }
+
+#[tokio::test]
+async fn required_revision_withdraws_configuration_before_queued_refresh_runs() {
+    let host = NativeProjectionHost::new(true);
+    let runtime = attach(&host);
+    runtime.request_authoritative_refresh();
+    host.run_next().await;
+    let before = runtime.write_configuration_projection().unwrap().unwrap();
+    assert_eq!(before.revision, KvRevision(10));
+    let storage_generation = runtime.storage_generation();
+    let reads = host.read_count();
+    let spawned = host.spawned.load(Ordering::Acquire);
+    {
+        let mut inputs = host.inputs.lock().unwrap();
+        inputs.authority.revision = KvRevision(11);
+        inputs.authority.commit_index = 111;
+        inputs.floor.revision = KvRevision(11);
+        inputs.floor.applied_index = 111;
+        let mut content = crate::DfsNodeAdvertisement::content(host.local.clone());
+        content.zone = Some("new-authoritative-zone".into());
+        inputs.scopes[1] = vec![fixture_entry(
+            &crate::content_service_key(&host.local),
+            encode_kv_value(&content).unwrap(),
+            11,
+        )];
+    }
+    // The normal owner is queued but has not yet polled its refresh body. A
+    // synchronous caller must not open on the previous configuration here.
+    runtime.require_authoritative_revision(KvRevision(11));
+    assert_eq!(runtime.state.current_complete_prefix_revision(), None);
+    assert!(matches!(
+        runtime.write_configuration_readiness().unwrap(),
+        crate::DfsWriteConfigurationReadiness::Pending
+    ));
+    assert_eq!(host.read_count(), reads);
+    assert_eq!(host.queued_count(), 1);
+    let mut ready = Box::pin(runtime.ensure_write_configuration_ready_async());
+    require_pending(ready.as_mut()).await;
+    assert_eq!(host.spawned.load(Ordering::Acquire), spawned + 1);
+    host.run_next().await;
+    tokio::time::timeout(std::time::Duration::from_secs(1), ready)
+        .await
+        .unwrap()
+        .unwrap();
+    let current = runtime.write_configuration_projection().unwrap().unwrap();
+    assert_eq!(current.revision, KvRevision(11));
+    assert_eq!(
+        runtime.state.current_complete_prefix_revision(),
+        Some(KvRevision(11))
+    );
+    assert_eq!(
+        current.content_advertisements().unwrap()[0].zone.as_deref(),
+        Some("new-authoritative-zone")
+    );
+    assert_eq!(host.read_count(), reads + 3);
+    assert_eq!(host.queued_count(), 0);
+    assert_eq!(runtime.storage_generation(), storage_generation);
+}

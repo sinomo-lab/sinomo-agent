@@ -461,7 +461,21 @@ impl DfsMetadataAuthorityRuntime {
     }
 
     pub fn require_authoritative_revision(self: &Arc<Self>, revision: KvRevision) {
-        if self.state.require_authoritative_revision(revision) {
+        let refresh = match self.write_configuration.lock() {
+            Ok(mut configuration) => {
+                let refresh = self.state.require_authoritative_revision(revision);
+                // Withdraw both projections at the same boundary. Otherwise a
+                // service opener can accept the old configuration while the
+                // required metadata refresh is queued but has not been polled.
+                // Preserve a bootstrap already buffering this required floor.
+                if refresh && configuration.observed_revision() < revision {
+                    configuration.invalidate(revision);
+                }
+                refresh
+            }
+            Err(_) => self.state.require_authoritative_revision(revision),
+        };
+        if refresh {
             self.request_authoritative_refresh();
         }
     }
