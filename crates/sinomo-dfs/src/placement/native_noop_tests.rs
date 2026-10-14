@@ -411,7 +411,12 @@ fn native_local_placement_preserves_actual_content_owner_and_bytes() {
         .unwrap();
     let object = owner.current_read_object_metadata(&stat.object_id).unwrap();
     assert_eq!(object.owner_node_id, nodes[1]);
-    let mut primary = runtime.client(&nodes[0]).unwrap();
+    let mut primary = runtime.metadata_primary_service(&path).unwrap();
+    assert_eq!(primary.node_id(), &nodes[0]);
+    let cached_before = primary
+        .content()
+        .has_blob(object.content_hash.as_ref().unwrap())
+        .unwrap();
     let control = runtime.shared_control_plane().unwrap();
     let config = control.with_client(|kv| {
         DfsControlPlaneStore::new(kv.as_mut())
@@ -448,12 +453,20 @@ fn native_local_placement_preserves_actual_content_owner_and_bytes() {
             &placement.plan.desired_replica_nodes,
         )
         .unwrap();
-    assert!(
-        !primary
+    assert_eq!(
+        primary
             .content()
             .has_blob(object.content_hash.as_ref().unwrap())
             .unwrap(),
-        "local-owner reconciliation cannot move the owner's bytes to the metadata primary"
+        cached_before,
+        "local-owner reconciliation must not add a cache copy; the initial routed write may already have cached its input"
+    );
+    assert_eq!(
+        primary
+            .current_read_object_metadata(&object.object_id)
+            .unwrap(),
+        object,
+        "the actual metadata primary must preserve the owner's canonical locations and generation"
     );
     assert_eq!(owner.posix_read_file(&path).unwrap(), bytes);
     assert_eq!(
@@ -986,8 +999,9 @@ fn native_placement_retirement(retain: bool, replay_after_handoff: bool) {
         );
         let primary = case.primary.clone();
         drop(case.service);
+        case.runtime.stop_node(&primary).unwrap();
         case.runtime.reopen_node(primary.clone()).unwrap();
-        case.service = case.runtime.client(&primary).unwrap();
+        case.service = case.runtime.metadata_primary_service(&path).unwrap();
         assert!(
             !case
                 .service
@@ -1544,34 +1558,50 @@ fn native_served_maintenance_skips_parked_job_for_tail_and_retires_superseded_he
             .compare_and_put_placement_update(&config, &config, &tail)
             .unwrap()
     }));
-    let result = runtime
-        .maintenance_tick(&nodes[0], Duration::from_secs(5))
-        .unwrap();
-    assert!(
-        result.outcome.is_ok(),
-        "ordinary served owner: {:?}",
-        result.outcome
-    );
-    assert_eq!(result.omitted_kv_event_count, 0);
-    let (parked, advanced) = control.with_client(|kv| {
-        let store = DfsControlPlaneStore::new(kv.as_mut());
-        (
-            store
-                .placement_reconciliation(&fs, &head.job_id)
-                .unwrap()
-                .unwrap(),
-            store
-                .placement_reconciliation(&fs, &tail.job_id)
-                .unwrap()
-                .unwrap(),
-        )
-    });
-    assert_eq!(
-        parked, head,
-        "pending durable repair work parks the head's object pass"
-    );
-    assert!(advanced.revision > tail.revision);
-    assert_eq!(advanced.state, DfsPlacementReconciliationState::Completed);
+    // An empty scan still checkpoints Repairing before its verification pass
+    // can complete. Drive both real phases within the original total budget.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut previous_revision = tail.revision;
+    for expected in [
+        DfsPlacementReconciliationState::Repairing,
+        DfsPlacementReconciliationState::Completed,
+    ] {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "tail must finish within the original five-second budget"
+        );
+        let result = runtime.maintenance_tick(&nodes[0], remaining).unwrap();
+        assert!(
+            result.outcome.is_ok(),
+            "ordinary served owner: {:?}",
+            result.outcome
+        );
+        assert_eq!(result.omitted_kv_event_count, 0);
+        let (parked, advanced) = control.with_client(|kv| {
+            let store = DfsControlPlaneStore::new(kv.as_mut());
+            (
+                store
+                    .placement_reconciliation(&fs, &head.job_id)
+                    .unwrap()
+                    .unwrap(),
+                store
+                    .placement_reconciliation(&fs, &tail.job_id)
+                    .unwrap()
+                    .unwrap(),
+            )
+        });
+        assert_eq!(
+            parked, head,
+            "pending durable repair work parks the head's object pass"
+        );
+        assert!(advanced.revision > previous_revision);
+        previous_revision = advanced.revision;
+        assert_eq!(advanced.state, expected);
+        assert_eq!(advanced.matched_object_count, 0);
+        assert_eq!(advanced.pending_repair_count, 0);
+    }
+    assert!(std::time::Instant::now() < deadline);
     let mut current = config.clone();
     upsert_placement_rule(
         &mut current.subtree_policies,

@@ -22,19 +22,30 @@ pub(super) fn native_managed_setup(
     }
     runtime.start_nodes().unwrap();
     let mut client = runtime.client(&nodes[0]).unwrap();
+    let mut initial_policy = crate::DfsReplicationPolicy::new(1, 1).unwrap();
+    initial_policy.required_node_ids = vec![nodes[0].clone()];
     for index in 0..4 {
-        client
+        let stat = client
             .posix_write_file(
                 &format!("/native-managed-{index}"),
                 &[index as u8; 64],
                 crate::DfsWriteOptions {
-                    policy: crate::DfsReplicationPolicy::new(1, 1).unwrap(),
+                    policy: initial_policy.clone(),
                     replica_candidates: vec![nodes[0].clone()],
                     wait_for_commit: true,
                     foreground_replica_repair: false,
                 },
             )
             .unwrap();
+        assert_eq!(
+            stat.current_locations,
+            vec![nodes[0].clone()],
+            "the later eight-repair assertion requires four real sole local replicas"
+        );
+        assert_eq!(
+            client.posix_read_file(&stat.path).unwrap(),
+            vec![index as u8; 64]
+        );
     }
     let candidates = client.placement_content_candidates().unwrap();
     assert_eq!(candidates.len(), nodes.len());
@@ -146,11 +157,9 @@ pub(super) fn native_managed_work(
                     .placement_reconciliation(&runtime.file_system().file_system_id, id)
                     .unwrap()
                     .is_some_and(|job| {
-                        matches!(
-                            job.state,
-                            DfsPlacementReconciliationState::Repairing
-                                | DfsPlacementReconciliationState::Completed
-                        )
+                        job.state == DfsPlacementReconciliationState::Completed
+                            || (job.state == DfsPlacementReconciliationState::Repairing
+                                && job.pending_repair_count > 0)
                     })
             })
         });
@@ -561,7 +570,10 @@ fn native_pending_ordinary_repair(
             });
         }
     }
-    let mut service = runtime.client(&nodes[0]).unwrap();
+    // The ordinary producer owns coordinator/queue state; a browser facade
+    // delegates it to Main and cannot be inspected as that producer.
+    let mut service = runtime.metadata_primary_service("/native-repair").unwrap();
+    assert_eq!(service.node_id(), &nodes[0]);
     let stat = service
         .posix_write_file(
             "/native-repair",
