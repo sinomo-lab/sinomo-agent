@@ -7981,17 +7981,22 @@ fn native_retained_owner_prepublication_interruption_and_queue_cas_recover_witho
             .expect("ordinary preserve owns an actual FULL retained-content intent")
             .intent_id
             .clone();
-        core.retain_content_revision(DfsContentReferenceRequest {
-            namespace: namespace.into(),
-            path: stat.path.clone(),
-            identity: identity.clone(),
-            operation: DfsContentReferenceOperation::Release {
-                reference_id: reference_id.into(),
-            },
-            operation_id: sinomo_core::Id::generate().to_string(),
-        })
-        .unwrap();
+        // Release first resolves authority across the filesystem. The public
+        // command belongs to Main's router, not this one physical Core view.
         drop(core);
+        let mut release = runtime.client(&owner).unwrap();
+        release
+            .retain_content_revision(DfsContentReferenceRequest {
+                namespace: namespace.into(),
+                path: stat.path.clone(),
+                identity: identity.clone(),
+                operation: DfsContentReferenceOperation::Release {
+                    reference_id: reference_id.into(),
+                },
+                operation_id: sinomo_core::Id::generate().to_string(),
+            })
+            .unwrap();
+        drop(release);
         let mut core = runtime.metadata_primary_service(&stat.path).unwrap();
         let backend = core.metadata_backend().unwrap();
         let version = backend
@@ -8111,6 +8116,18 @@ fn native_retained_owner_prepublication_interruption_and_queue_cas_recover_witho
         let gc_options = DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 0)
             .with_now_unix_nanos(crate::test_support::now_unix_nanos());
         assert!(core.gc_metadata_history(gc_options.clone()).is_err());
+        let original_gc = core.metadata_backend().unwrap().list_prepared_operations().unwrap()
+            .into_iter().filter(|record| record.operation_id.starts_with("history-gc:")
+                && record.metadata_effects.iter().any(|effect| matches!(effect,
+                    DfsPreparedMetadataEffect::PutIntentReceipt { receipt } if receipt.intent_id == original_id)))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            original_gc.len(),
+            1,
+            "the interrupted GC owns one exact durable preparation"
+        );
+        let original_gc = original_gc.into_iter().next().unwrap();
+        original_gc.validate().unwrap();
         assert!(
             reached.load(Ordering::SeqCst) >= 1,
             "the actual GC commit reaches its new-owner queue checkpoint"
@@ -8222,7 +8239,7 @@ fn native_retained_owner_prepublication_interruption_and_queue_cas_recover_witho
         let background = runtime
             .capture_checkpointed_background_repairs(&owner, 32)
             .unwrap();
-        let core = runtime.metadata_primary_service(&stat.path).unwrap();
+        let mut core = runtime.metadata_primary_service(&stat.path).unwrap();
         let resumed = core
             .metadata_backend()
             .unwrap()
@@ -8233,12 +8250,27 @@ fn native_retained_owner_prepublication_interruption_and_queue_cas_recover_witho
                 && row.publication.is_retained_repair()
                 && row.status == DfsWriteIntentStatus::Committed
         });
-        drop(core);
         if !already_published {
-            runtime
-                .gc_metadata_history_on_current_primaries(gc_options)
-                .unwrap();
+            // An uncertain GC must reconcile its saved body. Starting another
+            // anonymous GC would replan the clock and collide with this reservation.
+            assert!(
+                core.recover_one_prepared_operation(original_gc.clone())
+                    .unwrap()
+            );
         }
+        let committed_gc = core
+            .metadata_backend()
+            .unwrap()
+            .prepared_operation_record(&original_gc.operation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            committed_gc.status,
+            crate::DfsPreparedOperationStatus::Committed
+        );
+        assert_eq!(committed_gc.digest, original_gc.digest);
+        assert_eq!(committed_gc.payload, original_gc.payload);
+        drop(core);
         let core = runtime.metadata_primary_service(&stat.path).unwrap();
         let actual = core
             .metadata_backend()
