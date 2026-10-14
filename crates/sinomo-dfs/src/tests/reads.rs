@@ -2791,6 +2791,28 @@ fn exact_resident_hydration_replaces_only_its_shard_namespace_guards() {
         .posix_resume_namespace_job_bounded(&root_job.job_id, 512)
         .unwrap();
     assert_eq!(completed.status, DfsNamespaceJobStatus::Completed);
+    // The job and its original failed routed request are separate durable
+    // lifetimes. Finish that SAME request before starting the Services case.
+    let replayed = root
+        .posix_rename_with_operation_id(root_path, root_target, &root_operation)
+        .unwrap();
+    assert_eq!(replayed.path, root_target);
+    let root_requests = runtime
+        .metadata_primary_service(root_path)
+        .unwrap()
+        .metadata_backend()
+        .unwrap()
+        .list_namespace_requests()
+        .unwrap();
+    assert!(
+        root_requests
+            .iter()
+            .filter(|request| matches!(&request.operation,
+        DfsNamespaceOperation::Rename { from, to } if from == root_path && to == root_target))
+            .all(|request| request.status == DfsNamespaceRequestStatus::Completed),
+        "the original Root request must not remain for background replay: {root_requests:?}"
+    );
+
     runtime.install_fault(crate::test_support::DfsTestFaultRule {
         source: Some(services_primary.clone()),
         target: Some(users_primary.clone()),
