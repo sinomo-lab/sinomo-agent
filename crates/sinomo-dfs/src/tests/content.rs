@@ -152,7 +152,9 @@ fn content_root_catalog_refresh_failure_durably_invalidates_previous_catalog() {
 fn native_content_root_catalog_pages_share_one_recorded_cut() {
     let node =
         crate::test_runtime::DfsTestRuntime::ordered_node_ids("native-catalog-pages", 1).remove(0);
-    let (runtime, mut writer) = native_sifs_service("native-catalog-pages", node.clone());
+    let (runtime, browser) = native_sifs_service("native-catalog-pages", node.clone());
+    drop(browser);
+    let mut writer = runtime.metadata_primary_service("/").unwrap();
     for index in 0..300_u64 {
         writer
             .posix_write_file(
@@ -210,6 +212,7 @@ fn native_content_root_catalog_pages_share_one_recorded_cut() {
     assert!(entries.len() > 300);
     backend.end_consistent_read_snapshot();
     drop(owner);
+    assert_eq!(runtime.observation_dropped_count(), 0);
     runtime.close().unwrap();
 }
 

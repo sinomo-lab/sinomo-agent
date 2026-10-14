@@ -7153,7 +7153,7 @@ mod tests {
 
     #[test]
     fn aggregate_impact_pages_past_the_first_metadata_chunk() {
-        let (_runtime, mut service, nodes) =
+        let (runtime, service, nodes) =
             native_placement_fixture("aggregate_impact_pages_past_the_first_metadata_chunk", 1);
         let node = |label: &str| nodes[label].clone();
         let advertisement = |label: &str, zone: &str| {
@@ -7162,6 +7162,9 @@ mod tests {
             candidate
         };
         let owner = node("node-a");
+        drop(service);
+        let mut service = runtime.metadata_primary_service("/services/paged").unwrap();
+
         let objects = (0..(PLACEMENT_IMPACT_PAGE_SIZE + 17))
             .map(|index| {
                 placement_object(
@@ -7174,7 +7177,11 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        native_placement_objects(&mut service, objects);
+        let objects = native_placement_objects(&mut service, objects);
+        assert_eq!(objects.len(), PLACEMENT_IMPACT_PAGE_SIZE + 17);
+        let parent = service.posix_stat("/services/paged").unwrap();
+        assert_eq!(parent.kind, DfsObjectKind::Directory);
+        assert!(objects.iter().all(|object| object.path != parent.path));
         let mut config = placement_config(owner);
         upsert_placement_rule(
             &mut config.subtree_policies,
@@ -7197,7 +7204,8 @@ mod tests {
             .expect("paged impact");
         assert_eq!(
             impact.affected_object_count,
-            (PLACEMENT_IMPACT_PAGE_SIZE + 17) as u64
+            objects.len() as u64 + 1,
+            "the subtree includes all 273 children and their actual native parent"
         );
         assert_eq!(impact.affected_bytes, 0);
         assert_eq!(impact.copies_added, 0);
@@ -7212,9 +7220,55 @@ mod tests {
                 31,
             )
             .expect("bounded page");
-        assert_eq!(first_page.impact.affected_object_count, 31);
+        let raw_first = service
+            .placement_object_page_for_file_system(&config.file_system_id, None, 31)
+            .unwrap();
+        assert_eq!(
+            raw_first.objects.len(),
+            31,
+            "unchanged metadata page budget"
+        );
+        let outside = raw_first
+            .objects
+            .iter()
+            .filter(|object| {
+                object.path != "/services/paged" && !object.path.starts_with("/services/paged/")
+            })
+            .map(|object| object.path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outside,
+            vec!["/services"],
+            "actual bootstrap parent is outside the proposed subtree"
+        );
+        assert_eq!(first_page.impact.affected_object_count, 30);
         assert!(first_page.next_cursor.is_some());
         assert!(first_page.blocking_diagnostics.is_empty());
+        let mut paged_count = first_page.impact.affected_object_count;
+        let mut cursor = first_page.next_cursor;
+        while let Some(after) = cursor {
+            let page = service
+                .placement_impact_page_for_config(
+                    &config,
+                    "/services/paged",
+                    DfsPlacementScope::Subtree,
+                    &[advertisement("node-a", "east")],
+                    Some(&after),
+                    31,
+                )
+                .unwrap();
+            assert!(page.impact.affected_object_count <= 31);
+            assert!(page.blocking_diagnostics.is_empty());
+            paged_count += page.impact.affected_object_count;
+            cursor = page.next_cursor;
+        }
+        assert_eq!(
+            paged_count, impact.affected_object_count,
+            "every original child and its real parent is covered exactly once"
+        );
+        drop(service);
+        assert_eq!(runtime.observation_dropped_count(), 0);
+        runtime.close().unwrap();
     }
 
     #[test]
