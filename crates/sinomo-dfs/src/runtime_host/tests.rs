@@ -15840,12 +15840,15 @@ fn daemon_intent_scan_cursor_survives_dropped_maintenance_shell_and_resets_with_
     let admission = runtime
         .block_on(scheduler.admit(&DfsMessageExecutionScope::GlobalExclusive))
         .expect("exclusive maintenance ownership");
+    // Use the same retained ready generation selected under this actual global
+    // admission, including a completed provider update while admission queued.
+    let preflight = preflight.for_admission(&admission);
     let retained = take_daemon_dfs_message_mutation_service_for_maintenance(
         &data_dir,
         &cluster_paths,
         &cluster_state,
         &runtime,
-        None,
+        Some(&preflight),
     )
     .expect("take actual cached lane");
     let owner = Arc::clone(&retained.lane.service.write_intent_maintenance_scan);
@@ -15898,7 +15901,7 @@ fn daemon_intent_scan_cursor_survives_dropped_maintenance_shell_and_resets_with_
         &cluster_paths,
         &cluster_state,
         &runtime,
-        None,
+        Some(&preflight),
     )
     .expect("rebuild a real maintenance service after cancellation");
     assert!(Arc::ptr_eq(
