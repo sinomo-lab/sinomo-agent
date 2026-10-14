@@ -4965,10 +4965,18 @@ fn daemon_dfs_pending_probe_does_not_schedule_unprotected_content_gc() {
         )
         .unwrap();
     let paths = DaemonPaths::new(native.data_dir(&node));
-    let before = daemon_dfs_pending_maintenance_work(&paths).unwrap();
+    let before = daemon_dfs_pending_reactive_maintenance_work_on_runtime(
+        &paths,
+        crate::test_runtime::executor().handle(),
+    )
+    .unwrap();
     assert_eq!(before.due_time_based_maintenance_count, 0);
     assert!(client.content().has_blob(&orphan.content_hash).unwrap());
-    let after = daemon_dfs_pending_maintenance_work(&paths).unwrap();
+    let after = daemon_dfs_pending_reactive_maintenance_work_on_runtime(
+        &paths,
+        crate::test_runtime::executor().handle(),
+    )
+    .unwrap();
     assert_eq!(after.due_time_based_maintenance_count, 0);
     assert_eq!(
         after.should_trigger_background_maintenance(),
@@ -8232,16 +8240,31 @@ fn daemon_dfs_maintenance_tick_runs_anti_entropy() {
         .content()
         .debug_remove_loose_blob(object.content_hash.as_deref().unwrap())
         .unwrap();
+    let paths = DaemonPaths::new(native.data_dir(&node));
     for _ in 0..8 {
-        let tick = native
-            .maintenance_tick(&node, Duration::from_secs(5))
-            .unwrap();
+        // Inventory reconciliation is explicit. Routine resident ticks are
+        // deliberately inventory-free and must remain quiet without this ask.
+        let started = Instant::now();
+        let executor = crate::test_runtime::executor();
+        let outcome = executor.block_on(run_daemon_dfs_maintenance_tick_kind_on_runtime(
+            &paths,
+            executor.handle(),
+            DaemonDfsMaintenanceKind::AuthoritativeReconciliation {
+                content_gc_requested: false,
+                content_reservation_reconciliation_requested: true,
+                commit_promotion_recovery_requested: false,
+            },
+            sinomo_device::NodeResourceSnapshot::default(),
+        ));
+        // Join the original native invocation before checking the same limit;
+        // never abandon a running data owner on a timeout.
+        assert!(started.elapsed() <= Duration::from_secs(5));
         assert!(
-            tick.outcome.is_ok(),
-            "ordinary actual anti-entropy owner: {:?}",
-            tick.outcome
+            outcome.is_ok(),
+            "explicit actual anti-entropy owner: {outcome:?}"
         );
-        if !client
+        let inspector = native.metadata_primary_service(path).unwrap();
+        if !inspector
             .current_read_object_metadata(&object.object_id)
             .unwrap()
             .current_locations
@@ -8250,11 +8273,12 @@ fn daemon_dfs_maintenance_tick_runs_anti_entropy() {
             break;
         }
     }
-    let current = client
+    let inspector = native.metadata_primary_service(path).unwrap();
+    let current = inspector
         .current_read_object_metadata(&object.object_id)
         .unwrap();
     assert!(!current.current_locations.contains(&node));
-    let version = client
+    let version = inspector
         .metadata_backend()
         .unwrap()
         .get_version(&object.object_id, &object.version)
@@ -8269,6 +8293,7 @@ fn daemon_dfs_maintenance_tick_runs_anti_entropy() {
         .exists(),
         "completed actual scan clears its cursor"
     );
+    drop(inspector);
     drop(client);
     native.close().unwrap();
 }
