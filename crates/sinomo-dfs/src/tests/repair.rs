@@ -5546,135 +5546,146 @@ fn stage_command_conflicting_receipt_does_not_store_orphan_content() {
     std::fs::remove_dir_all(root).ok();
 }
 
-#[test]
-fn repair_replica_commits_when_response_target_is_unroutable() {
-    let root = temp_root("repair-response-target-unroutable");
-    let owner = NodeId::from_legacy_named("node_repair_notify_owner").expect("node");
-    let replica = NodeId::from_legacy_named("node_repair_notify_replica").expect("node");
-    let object_id = DfsObjectId::from_legacy_named("obj_repair_notify").expect("object");
-    let version = DfsVersion::from_legacy_named("version_2").expect("version");
-    let bytes = b"repair committed despite lost requester";
-    let mut metadata = file_metadata(owner.clone());
-    metadata.object_id = object_id.clone();
-    metadata.policy = DfsObjectPolicy::ReplicatedEventual;
-    metadata.current_locations = vec![owner.clone()];
-    let mut dfs = NetworkedDfsService::new(
-        crate::test_runtime::DfsTestRuntime::local_transport(replica.clone()),
-        LocalContentStore::new(root.join("content")).expect("content"),
-    );
-
-    let event = dfs
-        .handle_repair_replica(
-            owner,
-            DfsRepairReplicaCommand {
-                background_repair: false,
-                request_id: "dfs_net_req_repair_unroutable".to_string(),
-                intent_id: "dfs_intent_repair_unroutable".to_string(),
-                file_system_id: metadata.file_system_id.clone(),
-                object_id: object_id.clone(),
-                expected_base_version: Some(metadata.version.clone()),
-                version: version.clone(),
-                content_hash: content_hash(bytes),
-                bytes: bytes.to_vec(),
-                object_metadata: Some(metadata),
-                authority_shard: None,
+// Produce real sealed content and its missing replica before testing receiver
+// semantics. The standalone predecessor authored arbitrary object rows without
+// a sealed durability record, so it never reached replica ingest.
+fn assert_native_repair_receiver(name: &str, bytes: &[u8], advance_metadata: bool) {
+    let path = format!("/services/{name}");
+    let (runtime, owner, nodes, mut source, policy) =
+        native_owned_repair_fixture(name, &path, 1, 2, true);
+    let replica = nodes.into_iter().find(|node| *node != owner).unwrap();
+    let _background = runtime
+        .deny_background_replica_before_claim(&owner)
+        .unwrap();
+    let stat = source
+        .posix_write_file(
+            &path,
+            bytes,
+            DfsWriteOptions {
+                policy,
+                replica_candidates: vec![owner.clone(), replica.clone()],
+                wait_for_commit: true,
+                foreground_replica_repair: false,
             },
         )
-        .expect("unroutable response target should not fail repair commit");
+        .unwrap();
+    let job = source
+        .coordinator()
+        .repair_jobs()
+        .iter()
+        .find(|job| job.object_id == stat.object_id && job.missing_replica_node_id == replica)
+        .unwrap()
+        .clone();
+    let intent = source
+        .metadata_backend()
+        .unwrap()
+        .get_intent(&stat.object_id, &job.intent_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(intent.status, DfsWriteIntentStatus::Committed);
+    if advance_metadata {
+        let changed = source.posix_set_mode(&path, 0o640).unwrap();
+        assert_ne!(changed.version, stat.version);
+        assert_ne!(Some(&changed.version), intent.base_version.as_ref());
+        assert_eq!(changed.content_hash, stat.content_hash);
+    }
+    let metadata = source
+        .current_read_object_metadata(&stat.object_id)
+        .unwrap();
+    let visible_version = metadata.version.clone();
+    let shard = source
+        .command_authority_shard_for_object(Some(&metadata))
+        .unwrap()
+        .unwrap();
+    let sync = source
+        .capture_metadata_quorum_sync_target(&metadata)
+        .unwrap();
+    let certificate = source
+        .sync_metadata_shard_to_quorum(&sync, sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
+        .unwrap();
+    assert_eq!(certificate.acknowledged_node_ids.len(), 2);
+    let mut receiver = runtime.client(&replica).unwrap();
+    assert!(
+        !receiver
+            .content()
+            .has_blob(stat.content_hash.as_deref().unwrap())
+            .unwrap()
+    );
+    // This receiver has no return route; its normal native storage/configuration
+    // remain intact. The accepted bytes must survive the missing notification.
+    receiver.refresh_peer_targets(Vec::new());
+    let before = runtime.rpc_observations().len();
+    let event = receiver
+        .handle_repair_replica(
+            owner.clone(),
+            DfsRepairReplicaCommand {
+                background_repair: false,
+                request_id: format!("native-receiver-{}", sinomo_core::Id::generate()),
+                intent_id: intent.intent_id,
+                file_system_id: stat.file_system_id.clone(),
+                object_id: stat.object_id.clone(),
+                expected_base_version: intent.base_version,
+                version: stat.version.clone(),
+                content_hash: stat.content_hash.clone().unwrap(),
+                bytes: bytes.to_vec(),
+                object_metadata: Some(metadata),
+                authority_shard: Some(shard),
+            },
+        )
+        .unwrap();
+    assert!(
+        matches!(&event, NetworkedDfsServiceEvent::ReplicaRepaired {
+        object_id, version, replica_node_id, ..
+    } if object_id == &stat.object_id && version == &stat.version && replica_node_id == &replica),
+        "actual receiver repair: {event:?}"
+    );
+    assert!(
+        !runtime.rpc_observations()[before..]
+            .iter()
+            .any(|call| call.source == replica
+                && call.target == owner
+                && call.phase == crate::test_runtime::RpcPhase::BeforeDispatch),
+        "the receiver cannot deliver its notification over the absent return route"
+    );
+    let read = receiver
+        .read_local_object_with_state(&stat.object_id, false)
+        .unwrap();
+    assert!(
+        matches!(read, NetworkedDfsReadOutcome::Found {
+        data, freshness: NetworkedDfsReadFreshness::Current,
+    } if data.bytes == bytes && data.version == visible_version),
+        "the actual current metadata version must read the repaired bytes"
+    );
+    assert_eq!(
+        receiver
+            .content()
+            .read_object_version(stat.object_id.as_str(), stat.version.as_str(),)
+            .unwrap()
+            .1,
+        bytes
+    );
+    drop(receiver);
+    drop(source);
+    runtime.clear_faults();
+    runtime.close().unwrap();
+}
 
-    assert!(matches!(
-        event,
-        NetworkedDfsServiceEvent::ReplicaRepaired {
-            object_id: repaired_object_id,
-            version: repaired_version,
-            replica_node_id,
-            ..
-        } if repaired_object_id == object_id
-            && repaired_version == version
-            && replica_node_id == replica
-    ));
-    let read = dfs
-        .read_local_object_with_state(&object_id, false)
-        .expect("read repaired object");
-    assert!(matches!(
-        read,
-        NetworkedDfsReadOutcome::Found {
-            data,
-            freshness: NetworkedDfsReadFreshness::Current
-        } if data.version == version && data.bytes == bytes
-    ));
-
-    std::fs::remove_dir_all(root).ok();
+#[test]
+fn repair_replica_commits_when_response_target_is_unroutable() {
+    assert_native_repair_receiver(
+        "native-repair-unroutable-response",
+        b"repair committed despite lost requester",
+        false,
+    );
 }
 
 #[test]
 fn repair_replica_accepts_stale_base_when_content_hash_matches_current() {
-    // Regression: a metadata-only version bump (chmod/chown/utimes/hardlink/
-    // rename) advances an object past the version a queued content repair
-    // targets, while leaving content unchanged. The repair's base no longer
-    // matches current, but its content hash equals what the current version
-    // still references. Content is addressed by hash, so the repair must be
-    // accepted -- otherwise the only copy of the content never reaches the
-    // replica and reads fail with NotFound despite metadata being present.
-    let root = temp_root("repair-stale-base-matching-content");
-    let owner = NodeId::from_legacy_named("node_stale_base_owner").expect("node");
-    let replica = NodeId::from_legacy_named("node_stale_base_replica").expect("node");
-    let object_id = DfsObjectId::from_legacy_named("obj_stale_base").expect("object");
-    let base_version = DfsVersion::from_legacy_named("version_0").expect("version");
-    let content_version = DfsVersion::from_legacy_named("version_1").expect("version");
-    let current_version = DfsVersion::from_legacy_named("version_2").expect("version");
-    let bytes = b"content unchanged across a metadata-only version bump";
-    let hash = content_hash(bytes);
-
-    // The replica's view of the object has already advanced to the
-    // metadata-only bump (version_2), still referencing the same content. The
-    // queued content repair, however, still targets the content write
-    // (version_1) whose intent based off version_0.
-    let mut metadata = file_metadata(owner.clone());
-    metadata.object_id = object_id.clone();
-    metadata.policy = DfsObjectPolicy::ReplicatedEventual;
-    metadata.version = current_version.clone();
-    metadata.content_hash = Some(hash.clone());
-    metadata.current_locations = vec![owner.clone()];
-
-    let mut dfs = NetworkedDfsService::new(
-        crate::test_runtime::DfsTestRuntime::local_transport(replica.clone()),
-        LocalContentStore::new(root.join("content")).expect("content"),
+    assert_native_repair_receiver(
+        "native-repair-stale-base-same-content",
+        b"content unchanged across a metadata-only version bump",
+        true,
     );
-
-    let event = dfs
-        .handle_repair_replica(
-            owner,
-            DfsRepairReplicaCommand {
-                background_repair: false,
-                request_id: "dfs_net_req_stale_base".to_string(),
-                intent_id: "dfs_intent_stale_base".to_string(),
-                file_system_id: metadata.file_system_id.clone(),
-                object_id: object_id.clone(),
-                expected_base_version: Some(base_version),
-                version: content_version.clone(),
-                content_hash: hash.clone(),
-                bytes: bytes.to_vec(),
-                object_metadata: Some(metadata),
-                authority_shard: None,
-            },
-        )
-        .expect("repair with matching content hash should be accepted");
-
-    assert!(
-        matches!(event, NetworkedDfsServiceEvent::ReplicaRepaired { .. }),
-        "stale-base repair whose content matches current must commit"
-    );
-
-    let read = dfs
-        .read_local_object_with_state(&object_id, false)
-        .expect("read repaired object");
-    assert!(
-        matches!(read, NetworkedDfsReadOutcome::Found { data, .. } if data.bytes == bytes),
-        "replica must serve the repaired content-addressed blob"
-    );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
