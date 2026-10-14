@@ -917,13 +917,17 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
         }
         self.rebind_prepared_publication_instance_if_frozen(&payload)
             .map_err(|error| MetadataBackendError::Serde(error.to_string()))?;
-        let stored_file_system = self
+        let (stored_file_system, existing_prepare) = self
             .metadata_backend
             .as_ref()
             .ok_or_else(|| {
                 MetadataBackendError::Serde("prepare requires a current durable backend".into())
             })?
-            .get_file_system_on_shard(&payload.shard_id, &payload.file_system_id)?;
+            .prepared_operation_read_context(
+                &payload.shard_id,
+                &payload.file_system_id,
+                &payload.operation_id,
+            )?;
         let supersedes_original = payload.metadata_effects.iter().any(|effect| {
             matches!(
                 effect,
@@ -962,12 +966,7 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
                 before_prepare(&payload);
             }
         }
-        if let Some(existing) = self
-            .metadata_backend
-            .as_ref()
-            .expect("prepared backend")
-            .prepared_operation_record(&payload.operation_id)?
-        {
+        if let Some(existing) = existing_prepare {
             if existing.payload.as_ref() == &payload
                 && existing.digest.payload_digest == payload.canonical_digest()?
                 && existing.status == crate::DfsPreparedOperationStatus::Committed
@@ -1044,21 +1043,22 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
         &mut self,
         digest: &DfsPreparedOperationDigest,
     ) -> std::result::Result<DfsPreparedPublication, crate::DfsError> {
-        let payload = self
+        let record = self
             .metadata_backend
             .as_ref()
             .expect("prepared backend")
-            .prepared_operation_payload(&digest.operation_id)?
+            .prepared_operation_record(&digest.operation_id)?
             .ok_or_else(|| crate::DfsError::Metadata {
                 message: "durable prepare lost its immutable body".into(),
             })?;
-        if self
-            .metadata_backend
-            .as_ref()
-            .expect("prepared backend")
-            .committed_prepared_operation(digest)?
-            .is_some()
-        {
+        record.validate()?;
+        if record.digest != *digest {
+            return Err(crate::DfsError::Metadata {
+                message: "publication names no exact durable prepare".into(),
+            });
+        }
+        let payload = Arc::clone(&record.payload);
+        if record.status == crate::DfsPreparedOperationStatus::Committed {
             self.refresh_recorded_prepared_rows(&payload)?;
             return Ok(DfsPreparedPublication {
                 payload,
@@ -1071,7 +1071,7 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
             owner_epoch: digest.owner_epoch,
             operation_id: digest.operation_id.clone(),
         })?;
-        let guard = self.authorize_prepared_publication(digest)?;
+        let guard = self.authorize_prepared_publication_from_record(digest, record)?;
         let source_witness = guard.source_witness.clone();
         let data_dir = self
             .publication_execution
@@ -1144,20 +1144,30 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
             .ok_or_else(|| crate::DfsError::Metadata {
                 message: "prepared publication requires an actual durable backend".into(),
             })?;
-        if backend
-            .prepared_operation_digest(&digest.operation_id)?
-            .as_ref()
-            != Some(digest)
-        {
+        let record = backend
+            .prepared_operation_record(&digest.operation_id)?
+            .ok_or_else(|| crate::DfsError::Metadata {
+                message: "publication names no exact durable prepare".into(),
+            })?;
+        self.authorize_prepared_publication_from_record(digest, record)
+    }
+
+    // Both callers obtained this immutable body from the durable backend.
+    // Reusing the observation avoids a second snapshot; the writer session
+    // below still validates the current canonical record under its own gate.
+    fn authorize_prepared_publication_from_record(
+        &mut self,
+        digest: &DfsPreparedOperationDigest,
+        record: crate::DfsPreparedOperationRecord,
+    ) -> std::result::Result<DfsPublicationGuard, crate::DfsError> {
+        let backend = self.metadata_backend.as_ref().expect("prepared backend");
+        record.validate()?;
+        if record.digest != *digest {
             return Err(crate::DfsError::Metadata {
                 message: "publication names no exact durable prepare".into(),
             });
         }
-        let payload = backend
-            .prepared_operation_payload(&digest.operation_id)?
-            .ok_or_else(|| crate::DfsError::Metadata {
-                message: "publication payload is unavailable".into(),
-            })?;
+        let payload = record.payload;
         let scope = backend.publication_owner_scope(&digest.file_system_id, &digest.shard_id)?;
         let execution = self.publication_execution.current();
         let runtime_owner =

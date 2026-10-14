@@ -77,6 +77,25 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
     ) -> Result<Option<DfsPreparedOperationRecord>> {
         self.current_prepared_operation_record(operation_id)
     }
+    fn prepared_operation_read_context(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        file_system_id: &DfsFileSystemId,
+        operation_id: &str,
+    ) -> Result<(Option<DfsFileSystem>, Option<DfsPreparedOperationRecord>)> {
+        self.require_replication_source_shard(shard_id)?;
+        let tables = self.current_tables_snapshot()?;
+        let record = tables.prepared_operations_v7.get(operation_id).cloned();
+        if let Some(record) = &record {
+            record.validate()?;
+            if record.file_system_id != *file_system_id || record.shard_id != *shard_id {
+                return Err(MetadataBackendError::Serde(
+                    "prepare read context names a foreign operation scope".into(),
+                ));
+            }
+        }
+        Ok((tables.file_systems.get(file_system_id).cloned(), record))
+    }
     fn list_prepared_operations(&self) -> Result<Vec<DfsPreparedOperationRecord>> {
         let tables = self.current_tables_snapshot()?;
         Ok(tables

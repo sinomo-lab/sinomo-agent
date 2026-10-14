@@ -1651,68 +1651,124 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         )
     }
 
-    fn local_eventual_batch_commit_is_durable_replay(
+    fn local_eventual_batch_committed_replay(
         &self,
+        requester_node_id: &NodeId,
         transaction: &DfsNamespaceTransaction,
         writes: &[DfsLocalEventualBatchWriteProof],
         selected_shard: Option<&DfsMetadataShardConfig>,
-    ) -> Result<bool, DfsError> {
+    ) -> Result<Option<std::sync::Arc<DfsPreparedOperationPayload>>, DfsError> {
         let Some(backend) = self.metadata_backend.as_ref() else {
-            return Ok(false);
+            return Ok(None);
         };
-        let mut retained = backend
-            .list_prepared_operations()?
-            .into_iter()
-            .filter(|record| {
-                record.status == crate::DfsPreparedOperationStatus::Committed
-                    && record.payload.file_system_id == transaction.file_system_id
-                    && record.payload.transaction.transaction_id == transaction.transaction_id
-            });
-        let Some(prepare) = retained.next() else {
-            if backend
-                .get_namespace_transaction_receipt(&transaction.transaction_id)?
-                .is_some()
-            {
-                return Err(DfsError::Metadata { message: "local-eventual batch retained its receipt but lost its complete recorded body; reconcile instead of replaying".into() });
-            }
-            return Ok(false);
-        };
-        if retained.next().is_some() {
-            return Err(DfsError::Metadata {
-                message: "local-eventual batch has competing recorded operation identities".into(),
-            });
+        if backend
+            .get_namespace_transaction_receipt(&transaction.transaction_id)?
+            .is_none()
+        {
+            return Ok(None);
         }
-        let expected_receipts = writes
-            .iter()
-            .map(|write| &write.receipt)
-            .collect::<Vec<_>>();
-        if prepare.payload.transaction != *transaction
-            || backend
-                .committed_prepared_operation(&prepare.digest)?
-                .is_none()
+        // Match the same identities used by namespace publication. Routed
+        // completion uses its original request identity; direct batches use
+        // the transaction identity. Pending-only listings are not commit proof.
+        let mut operation_ids = Vec::new();
+        if let Some(request) = self.namespace_execution.request() {
+            operation_ids.push(format!(
+                "namespace-request:{}:{}",
+                request.operation_id, transaction.transaction_id,
+            ));
+        }
+        operation_ids.push(format!("namespace:{}", transaction.transaction_id));
+        let mut retained = None;
+        for operation_id in operation_ids {
+            if let Some(record) = backend.prepared_operation_record(&operation_id)? {
+                record.validate()?;
+                if record.status == crate::DfsPreparedOperationStatus::Committed {
+                    if retained.replace(record).is_some() {
+                        return Err(DfsError::Metadata {
+                            message:
+                                "local-eventual batch has competing recorded operation identities"
+                                    .into(),
+                        });
+                    }
+                }
+            }
+        }
+        let prepare = retained.ok_or_else(|| DfsError::Metadata {
+            message: "local-eventual batch retained its receipt but lost its complete recorded body; reconcile instead of replaying".into(),
+        })?;
+        let payload = &prepare.payload;
+        let mut replay_transaction = transaction.clone();
+        crate::metadata_records::normalize_namespace_transaction_in_place(&mut replay_transaction);
+        complete_recorded_namespace_carried_versions(&mut replay_transaction, &payload.transaction);
+        let mut proven_objects = BTreeSet::new();
+        let proofs_match = writes.iter().all(|write| {
+            let object_id = &write.receipt.receipt.object_id;
+            if !proven_objects.insert(object_id)
+                || write.receipt.replica_node_id != *requester_node_id
+                || !payload.content_receipts.iter().any(|existing| {
+                    crate::metadata_receipt::replay_receipt_matches_existing(
+                        existing,
+                        &write.receipt,
+                    )
+                })
+            {
+                return false;
+            }
+            let Some(object) = payload
+                .transaction
+                .objects
+                .iter()
+                .find(|object| &object.object_id == object_id)
+            else {
+                return false;
+            };
+            if object.owner_node_id != *requester_node_id {
+                return false;
+            }
+            match write.expected_base_version.as_ref() {
+                Some(version) => {
+                    payload.expected_object_versions.iter().any(|row| {
+                        row.object_id == *object_id
+                            && row.expected_version.as_ref() == Some(version)
+                    }) && write.expected_parent_object_id.is_none()
+                        && write.expected_parent_version.is_none()
+                }
+                None => {
+                    // Creates seal the exact parent generation, including
+                    // recreation over a tombstone. Never compare to today's head.
+                    let parent_path = crate::posix_path::parent_posix_path(&object.path);
+                    let parent = payload.transaction.objects.iter().find(|parent| {
+                        parent.kind == DfsObjectKind::Directory
+                            && parent_path.as_deref() == Some(parent.path.as_str())
+                    });
+                    parent.is_some_and(|parent| {
+                        write.expected_parent_object_id.as_ref() == Some(&parent.object_id)
+                            && write.expected_parent_version.is_some()
+                            && payload.expected_object_versions.iter().any(|row| {
+                                row.object_id == parent.object_id
+                                    && row.expected_version == write.expected_parent_version
+                            })
+                    })
+                }
+            }
+        });
+        if payload.file_system_id != transaction.file_system_id
+            || payload.transaction != replay_transaction
             || selected_shard.is_some_and(|shard| {
                 prepare.digest.shard_id.0 != shard.shard_id
                     || prepare.digest.file_system_id != shard.file_system_id
             })
-            || prepare.payload.content_receipts.len() != expected_receipts.len()
-            || !expected_receipts.iter().all(|expected| {
-                prepare.payload.content_receipts.iter().any(|existing| {
-                    crate::metadata_receipt::replay_receipt_matches_existing(existing, expected)
-                })
-            })
+            || payload.content_receipts.len() != writes.len()
+            || !proofs_match
         {
             return Err(DfsError::Distributed {
                 message: format!(
-                    "local-eventual batch {} does not match its exact recorded body and receipts",
-                    transaction.transaction_id
+                    "local-eventual batch {} does not match its exact recorded body, read set and receipts",
+                    transaction.transaction_id,
                 ),
             });
         }
-
-        // The original committed body retains its actual receipt evidence.
-        // A read-only replay does not depend on fresh replica ACKs or the
-        // later lifetime of auxiliary receipt rows.
-        Ok(true)
+        Ok(Some(prepare.payload))
     }
 
     fn materialize_namespace_transaction_in_memory(
@@ -1753,15 +1809,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         writes: Vec<DfsLocalEventualBatchWriteProof>,
         selected_shard: Option<DfsMetadataShardConfig>,
     ) -> Result<bool, posix_model::DfsPosixError> {
-        if self
-            .local_eventual_batch_commit_is_durable_replay(
+        if let Some(payload) = self
+            .local_eventual_batch_committed_replay(
+                requester_node_id,
                 &transaction,
                 &writes,
                 selected_shard.as_ref(),
             )
             .map_err(posix_model::DfsPosixError::from)?
         {
-            self.materialize_namespace_transaction_in_memory(&transaction)
+            self.refresh_recorded_prepared_rows(&payload)
                 .map_err(posix_model::DfsPosixError::from)?;
             return Ok(false);
         }

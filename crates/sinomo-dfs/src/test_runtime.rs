@@ -3944,7 +3944,31 @@ impl DfsTestRuntime {
         ),
         String,
     > {
-        let mut client = self.client(node)?;
+        Self::probe_actual_control_plane(self.client(node)?)
+    }
+
+    pub fn metadata_primary_service_with_control_plane_probe(
+        &self,
+        path: &str,
+    ) -> Result<
+        (
+            NetworkedDfsService<DfsNodeTransport>,
+            DfsTestControlPlaneProbe,
+        ),
+        String,
+    > {
+        Self::probe_actual_control_plane(self.metadata_primary_service(path)?)
+    }
+
+    fn probe_actual_control_plane(
+        mut client: NetworkedDfsService<DfsNodeTransport>,
+    ) -> Result<
+        (
+            NetworkedDfsService<DfsNodeTransport>,
+            DfsTestControlPlaneProbe,
+        ),
+        String,
+    > {
         let inner = client
             .control_plane
             .take()

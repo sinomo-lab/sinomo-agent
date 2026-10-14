@@ -3536,6 +3536,15 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         self.shard_backend(&digest.shard_id)?
             .prepared_operation_record(operation_id)
     }
+    fn prepared_operation_read_context(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        file_system_id: &DfsFileSystemId,
+        operation_id: &str,
+    ) -> Result<(Option<DfsFileSystem>, Option<DfsPreparedOperationRecord>)> {
+        self.shard_backend(shard_id)?
+            .prepared_operation_read_context(shard_id, file_system_id, operation_id)
+    }
     fn prepared_operation_reservations(
         &self,
         payload: &crate::DfsPreparedOperationPayload,

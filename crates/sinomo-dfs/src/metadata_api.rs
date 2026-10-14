@@ -386,6 +386,22 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         &self,
         operation_id: &str,
     ) -> Result<Option<crate::DfsPreparedOperationRecord>>;
+    /// Observe the filesystem and original operation from one physical shard.
+    /// These are read inputs; publication still requires the native writer guard.
+    fn prepared_operation_read_context(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        file_system_id: &DfsFileSystemId,
+        operation_id: &str,
+    ) -> Result<(
+        Option<DfsFileSystem>,
+        Option<crate::DfsPreparedOperationRecord>,
+    )> {
+        Ok((
+            self.get_file_system_on_shard(shard_id, file_system_id)?,
+            self.prepared_operation_record(operation_id)?,
+        ))
+    }
     fn list_prepared_operations(&self) -> Result<Vec<crate::DfsPreparedOperationRecord>>;
     /// Read only the prepared bodies reserving this operation's footprint.
     /// This grants no authority to resolve them; the native author must use

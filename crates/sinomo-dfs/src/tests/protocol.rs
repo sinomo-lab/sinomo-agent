@@ -2341,15 +2341,24 @@ fn local_eventual_batch_shard_selection_uses_one_current_snapshot_for_bulk_paths
     let name = "native-local-eventual-bulk-capture";
     let (runtime, service, config) =
         crate::test_support::current_native_metadata_service(name, 1, "/services").unwrap();
-    let owner = config.primary_node_id;
+    let owner = config.primary_node_id.clone();
     drop(service);
-    let (mut dfs, probe) = runtime.client_with_control_plane_probe(&owner).unwrap();
+    // These counters and the explicit publication replay belong to the actual
+    // owning Core lane, rather than a browser facade's sharded read projection.
+    let (mut dfs, probe) = runtime
+        .metadata_primary_service_with_control_plane_probe("/services")
+        .unwrap();
     dfs.posix_mkdir_all("/services/native-bulk").unwrap();
+    let parent_before = dfs.posix_stat("/services/native-bulk").unwrap();
+    let shard_id = DfsMetadataShardId::new(&config.shard_id);
     let before = dfs
         .metadata_backend()
         .unwrap()
-        .list_prepared_operations()
+        .export_shard_table_snapshot(&shard_id)
         .unwrap()
+        .unwrap()
+        .tables
+        .prepared_operations_v7
         .into_iter()
         .map(|record| record.digest.operation_id)
         .collect::<BTreeSet<_>>();
@@ -2367,6 +2376,10 @@ fn local_eventual_batch_shard_selection_uses_one_current_snapshot_for_bulk_paths
         .posix_create_files_local_eventual_with_known_parents(files.iter().copied())
         .unwrap();
     let snapshot_calls = crate::metadata_backend::metadata_current_tables_snapshot_calls();
+    eprintln!(
+        "64-file bulk: snapshots={snapshot_calls}, prepare_read_sets={}",
+        crate::service_metadata::namespace_prepare_expectation_capture_calls()
+    );
     assert_eq!(stats.len(), 64);
     assert!(
         snapshot_calls <= 10,
@@ -2385,8 +2398,11 @@ fn local_eventual_batch_shard_selection_uses_one_current_snapshot_for_bulk_paths
     let authored = dfs
         .metadata_backend()
         .unwrap()
-        .list_prepared_operations()
+        .export_shard_table_snapshot(&shard_id)
         .unwrap()
+        .unwrap()
+        .tables
+        .prepared_operations_v7
         .into_iter()
         .filter(|record| !before.contains(&record.digest.operation_id))
         .collect::<Vec<_>>();
@@ -2430,6 +2446,103 @@ fn local_eventual_batch_shard_selection_uses_one_current_snapshot_for_bulk_paths
             .map(|status| (status.shard_id, status.journal_last_sequence))
             .collect::<BTreeMap<_, _>>(),
         before_replay
+    );
+    // Exercise the batch entry too, with genuine original receipts and parent
+    // observations. An old exact batch must not roll back a later file head.
+    let proofs = replay_body
+        .content_receipts
+        .iter()
+        .map(|receipt| DfsLocalEventualBatchWriteProof {
+            expected_base_version: None,
+            expected_parent_object_id: Some(parent_before.object_id.clone()),
+            expected_parent_version: Some(parent_before.version.clone()),
+            receipt: receipt.clone(),
+        })
+        .collect::<Vec<_>>();
+    let newer = dfs
+        .posix_write_file(
+            &paths[0],
+            b"newer bytes",
+            DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
+        )
+        .unwrap();
+    let head_before_replay = dfs
+        .metadata_backend()
+        .unwrap()
+        .metadata_shard_statuses()
+        .unwrap();
+    assert!(
+        !dfs.apply_local_eventual_batch_commit(
+            &owner,
+            replay_body.transaction.clone(),
+            proofs.clone(),
+            Some(config.clone())
+        )
+        .unwrap()
+    );
+    assert_eq!(
+        dfs.metadata.object(&newer.object_id).unwrap().version,
+        newer.version
+    );
+    assert_eq!(dfs.posix_read_file(&paths[0]).unwrap(), b"newer bytes");
+    let mut changed_parent = proofs.clone();
+    changed_parent[0].expected_parent_version = Some(newer.version.clone());
+    assert!(
+        dfs.apply_local_eventual_batch_commit(
+            &owner,
+            replay_body.transaction.clone(),
+            changed_parent,
+            Some(config.clone())
+        )
+        .is_err()
+    );
+    let mut changed_body = replay_body.transaction.clone();
+    changed_body.created_at += time::Duration::seconds(1);
+    assert!(
+        dfs.apply_local_eventual_batch_commit(
+            &owner,
+            changed_body,
+            proofs.clone(),
+            Some(config.clone())
+        )
+        .is_err()
+    );
+    let mut changed_receipt = proofs.clone();
+    changed_receipt[0].receipt.content_hash = Some("blake3:changed-replay-proof".into());
+    assert!(
+        dfs.apply_local_eventual_batch_commit(
+            &owner,
+            replay_body.transaction.clone(),
+            changed_receipt,
+            Some(config.clone())
+        )
+        .is_err()
+    );
+    let mut duplicate_proof = proofs.clone();
+    duplicate_proof[1] = duplicate_proof[0].clone();
+    assert!(
+        dfs.apply_local_eventual_batch_commit(
+            &owner,
+            replay_body.transaction.clone(),
+            duplicate_proof,
+            Some(config)
+        )
+        .is_err()
+    );
+    assert_eq!(
+        dfs.metadata_backend()
+            .unwrap()
+            .metadata_shard_statuses()
+            .unwrap(),
+        head_before_replay
+    );
+    assert_eq!(
+        dfs.metadata_backend()
+            .unwrap()
+            .prepared_operation_record(&authored[0].digest.operation_id)
+            .unwrap()
+            .unwrap(),
+        authored[0]
     );
     drop(dfs);
     runtime.close().unwrap();
