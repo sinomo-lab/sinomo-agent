@@ -517,11 +517,78 @@ fn sync_path_response_object_updates_outsider_read_view_without_journal_batches(
     runtime.close().unwrap();
 }
 
+// Verify the actual replica's durable history, independently of a browser's
+// private read projection. This replays byte-prefix proofs only; it grants no
+// ingest permission and never writes metadata or manufactures acknowledgements.
+fn assert_native_backlog_cut(
+    runtime: &crate::test_runtime::DfsTestRuntime,
+    replica: &NodeId,
+    cut: &crate::DfsMetadataPrefixProof,
+    files: &[DfsStat],
+) {
+    assert_eq!(files.len(), 700);
+    let shard = DfsMetadataShardId::new("users");
+    let backend = LocalSobjMetadataBackend::open_for_inspection(
+        shard.clone(),
+        crate::default_dfs_metadata_shards_root(runtime.data_dir(replica))
+            .join(crate::metadata_keys::key_segment(&shard.0)),
+    )
+    .unwrap();
+    let mut proof = crate::metadata_records::dfs_metadata_prefix_proof_genesis(&shard);
+    let mut batches = 0;
+    while proof.journal_sequence < cut.journal_sequence {
+        let batch = backend
+            .journal_batch_for_shard_since_limited(
+                &shard,
+                proof.journal_sequence,
+                DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
+                DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT,
+            )
+            .unwrap()
+            .expect("the actual replica retains every captured corpus frame");
+        assert!(!batch.entries.is_empty());
+        assert!(batch.entries.len() <= DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT);
+        let frames = backend.journal_frames_for_batch(&batch).unwrap();
+        assert_eq!(frames.len(), batch.entries.len());
+        for (entry, frame) in batch.entries.iter().zip(&frames) {
+            if entry.sequence > cut.journal_sequence {
+                break;
+            }
+            assert_eq!(entry.sequence, proof.journal_sequence + 1);
+            assert_eq!(frame.sequence, entry.sequence);
+            proof = crate::metadata_journal::metadata_prefix_proof_after_exact_frame(
+                &proof,
+                entry,
+                &shard,
+                &frame.exact_bytes,
+            )
+            .unwrap();
+        }
+        batches += 1;
+    }
+    assert!(
+        batches > 1,
+        "the complete corpus must cross the unchanged journal batch limit"
+    );
+    assert_eq!(
+        &proof, cut,
+        "all exact replica bytes must reach the captured author prefix"
+    );
+    for file in files {
+        let actual = backend.get_object(&file.object_id).unwrap().unwrap();
+        assert_eq!(actual.path, file.path);
+        assert_eq!(actual.kind, DfsObjectKind::File);
+        assert_eq!(actual.version, file.version);
+        assert_eq!(actual.content_hash, file.content_hash);
+        assert_eq!(actual.content_size_bytes, file.size_bytes);
+    }
+}
+
 #[test]
 fn sifs_cluster_posix_routed_op_replays_deep_catch_up_across_batches() {
-    // A requester far behind the primary's journal (more entries than one
-    // batch carries) must still read its own routed mutation immediately:
-    // responses carry a bounded run of batches and the wrapper pulls more.
+    // A Main browser reads its routed result through current authority. Its
+    // private cache is not the replica owner. Preserve immediate public reads
+    // and independently verify all 700 files in the actual durable replica.
     let cluster = sifs_two_primary_cluster("sifs-xshard-deepsync");
     let SifsTwoPrimaryCluster {
         shared_kv,
@@ -529,7 +596,7 @@ fn sifs_cluster_posix_routed_op_replays_deep_catch_up_across_batches() {
         users_primary_node,
         _runtime,
         root,
-        replica_node: _,
+        replica_node,
         users_primary,
         services_primary,
         mut replica,
@@ -538,7 +605,7 @@ fn sifs_cluster_posix_routed_op_replays_deep_catch_up_across_batches() {
     drop(users_primary);
     let mut users_primary = _runtime.metadata_primary_service("/users").unwrap();
 
-    // Build a deep journal on the users primary locally (no publication).
+    // Build the full native corpus through its actual owning Core.
     let local_options = DfsWriteOptions {
         policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
         replica_candidates: vec![users_primary.node_id().clone()],
@@ -546,14 +613,16 @@ fn sifs_cluster_posix_routed_op_replays_deep_catch_up_across_batches() {
         foreground_replica_repair: true,
     };
     let mut checkpointed = 0;
+    let mut files = Vec::with_capacity(700);
     for index in 0..700 {
-        users_primary
+        let stat = users_primary
             .posix_write_file(
                 &format!("/users/bulk-{index:03}.txt"),
                 format!("bulk payload {index}").as_bytes(),
                 local_options.clone(),
             )
             .expect("bulk create");
+        files.push(stat);
         if (index + 1) % 100 == 0 {
             checkpointed += _runtime.checkpoint_rpc_observation_window().unwrap();
         }
@@ -563,25 +632,63 @@ fn sifs_cluster_posix_routed_op_replays_deep_catch_up_across_batches() {
         "full corpus observations exceed one buffer"
     );
 
-    // Main and its native carrier already run under the real runtime owner.
-    // Drop the corpus producer before exercising the remote requester.
+    let shard = DfsMetadataShardId::new("users");
+    let cut = users_primary
+        .metadata_backend()
+        .unwrap()
+        .metadata_prefix_proof(&shard)
+        .unwrap()
+        .unwrap();
+    let setup = users_primary.posix_sync_directory("/users").unwrap();
+    assert_eq!(
+        setup.metadata_certificate.target.journal_sequence,
+        cut.journal_sequence
+    );
+    assert_eq!(
+        setup
+            .metadata_certificate
+            .acknowledged_node_ids
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        [
+            users_primary_node.clone(),
+            services_primary_node.clone(),
+            replica_node.clone()
+        ]
+        .into_iter()
+        .collect()
+    );
+    assert!(
+        files
+            .iter()
+            .all(|file| replica.metadata().object(&file.object_id).is_none()),
+        "the browser starts without private copies of the corpus"
+    );
     drop(users_primary);
 
-    // One routed namespace op must catch the replica up through the entire
-    // backlog, not just the first bounded batch.
     replica
         .posix_mkdir("/users/deep-sync-marker")
         .expect("routed mkdir with deep catch-up");
     assert!(
-        replica.posix_stat("/users/bulk-000.txt").is_ok(),
+        replica
+            .posix_stat_distributed("/users/bulk-000.txt")
+            .is_ok(),
         "earliest backlog entry must be visible after the routed op"
     );
     assert!(
-        replica.posix_stat("/users/bulk-699.txt").is_ok(),
+        replica
+            .posix_stat_distributed("/users/bulk-699.txt")
+            .is_ok(),
         "latest backlog entry must be visible after the routed op"
     );
-    assert!(replica.posix_stat("/users/deep-sync-marker").is_ok());
+    assert!(
+        replica
+            .posix_stat_distributed("/users/deep-sync-marker")
+            .is_ok()
+    );
 
+    assert_native_backlog_cut(&_runtime, &replica_node, &cut, &files);
     assert_eq!(_runtime.observation_dropped_count(), 0);
     drop((services_primary, replica, shared_kv));
     _runtime
@@ -591,9 +698,9 @@ fn sifs_cluster_posix_routed_op_replays_deep_catch_up_across_batches() {
 
 #[test]
 fn sifs_cluster_posix_mkdir_all_replays_deep_catch_up_across_batches() {
-    // `mkdir_all` must provide the same immediate local visibility as `mkdir`.
-    // The routed primary can only include a bounded journal run in the first
-    // response, so the wrapper has to pull the rest before returning.
+    // A Main browser reads its routed result through current authority. Its
+    // private cache is not the replica owner. Preserve immediate public reads
+    // and independently verify all 700 files in the actual durable replica.
     let cluster = sifs_two_primary_cluster("sifs-xshard-mkdir-all-deepsync");
     let SifsTwoPrimaryCluster {
         shared_kv,
@@ -601,7 +708,7 @@ fn sifs_cluster_posix_mkdir_all_replays_deep_catch_up_across_batches() {
         users_primary_node,
         _runtime,
         root,
-        replica_node: _,
+        replica_node,
         users_primary,
         services_primary,
         mut replica,
@@ -617,14 +724,16 @@ fn sifs_cluster_posix_mkdir_all_replays_deep_catch_up_across_batches() {
         foreground_replica_repair: true,
     };
     let mut checkpointed = 0;
+    let mut files = Vec::with_capacity(700);
     for index in 0..700 {
-        users_primary
+        let stat = users_primary
             .posix_write_file(
                 &format!("/users/mkdir-all-backlog-{index:03}.txt"),
                 format!("bulk payload {index}").as_bytes(),
                 local_options.clone(),
             )
             .expect("bulk create");
+        files.push(stat);
         if (index + 1) % 100 == 0 {
             checkpointed += _runtime.checkpoint_rpc_observation_window().unwrap();
         }
@@ -634,8 +743,39 @@ fn sifs_cluster_posix_mkdir_all_replays_deep_catch_up_across_batches() {
         "full corpus observations exceed one buffer"
     );
 
-    // Main and its native carrier already run under the real runtime owner.
-    // Drop the corpus producer before exercising the remote requester.
+    let shard = DfsMetadataShardId::new("users");
+    let cut = users_primary
+        .metadata_backend()
+        .unwrap()
+        .metadata_prefix_proof(&shard)
+        .unwrap()
+        .unwrap();
+    let setup = users_primary.posix_sync_directory("/users").unwrap();
+    assert_eq!(
+        setup.metadata_certificate.target.journal_sequence,
+        cut.journal_sequence
+    );
+    assert_eq!(
+        setup
+            .metadata_certificate
+            .acknowledged_node_ids
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        [
+            users_primary_node.clone(),
+            services_primary_node.clone(),
+            replica_node.clone()
+        ]
+        .into_iter()
+        .collect()
+    );
+    assert!(
+        files
+            .iter()
+            .all(|file| replica.metadata().object(&file.object_id).is_none()),
+        "the browser starts without private copies of the corpus"
+    );
     drop(users_primary);
 
     replica
@@ -643,19 +783,28 @@ fn sifs_cluster_posix_mkdir_all_replays_deep_catch_up_across_batches() {
         .expect("routed mkdir_all with deep catch-up");
     assert!(
         replica
-            .posix_stat("/users/mkdir-all-backlog-000.txt")
+            .posix_stat_distributed("/users/mkdir-all-backlog-000.txt")
             .is_ok(),
         "earliest backlog entry must be visible after routed mkdir_all"
     );
     assert!(
         replica
-            .posix_stat("/users/mkdir-all-backlog-699.txt")
+            .posix_stat_distributed("/users/mkdir-all-backlog-699.txt")
             .is_ok(),
         "latest backlog entry must be visible after routed mkdir_all"
     );
-    assert!(replica.posix_stat("/users/deep-mkdir-all").is_ok());
-    assert!(replica.posix_stat("/users/deep-mkdir-all/leaf").is_ok());
+    assert!(
+        replica
+            .posix_stat_distributed("/users/deep-mkdir-all")
+            .is_ok()
+    );
+    assert!(
+        replica
+            .posix_stat_distributed("/users/deep-mkdir-all/leaf")
+            .is_ok()
+    );
 
+    assert_native_backlog_cut(&_runtime, &replica_node, &cut, &files);
     assert_eq!(_runtime.observation_dropped_count(), 0);
     drop((services_primary, replica, shared_kv));
     _runtime
