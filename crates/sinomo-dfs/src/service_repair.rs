@@ -4069,6 +4069,115 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(Some((actual, true)))
     }
 
+    /// Refresh only a queued current intent's derived receipt projection.
+    /// Another actual lane can finish its receipts while this coordinator stays
+    /// resident. Read the raw location row and exact byte receipts together;
+    /// receipt durability alone cannot finish an unpublished location effect.
+    fn refresh_current_repair_receipt_projection(
+        &mut self,
+        record: &DfsWriteIntentRecord,
+        scheduling: &[DfsRepairAttemptRecord],
+    ) -> Result<bool, DfsError> {
+        if !record.publication.is_current()
+            || record.status != DfsWriteIntentStatus::Committed
+            || self.coordinator.intent(&record.intent_id)
+                != Some(&crate::intent::distributed_intent_from_record(record))
+        {
+            return Ok(false);
+        }
+        let Some(backend) = self.metadata_backend.as_mut() else {
+            return Ok(false);
+        };
+        let Some(first) = backend.get_object(&record.object_id)? else {
+            return Ok(false);
+        };
+        backend.begin_consistent_read_snapshot_for_path(&first.file_system_id, &first.path)?;
+        let cut = (|| -> Result<_, DfsError> {
+            Ok((
+                backend.get_object(&record.object_id)?,
+                backend.get_version(&record.object_id, &record.target_version)?,
+                backend.receipts_for_version(&record.object_id, &record.target_version)?,
+            ))
+        })();
+        backend.end_consistent_read_snapshot_for_path(&first.file_system_id, &first.path);
+        let (Some(object), Some(version), receipts) = cut? else {
+            return Ok(false);
+        };
+        if object.file_system_id != record.file_system_id
+            || object.version != record.target_version
+            || object.content_hash != record.content_hash
+            || !version.visible
+            || version.file_system_id != record.file_system_id
+            || version.object_id != record.object_id
+            || version.version != record.target_version
+            || version.content_hash != record.content_hash
+            || object.content_size_bytes != version.size_bytes
+        {
+            return Ok(false);
+        }
+        let receipts = receipts
+            .into_iter()
+            .filter(|receipt| {
+                record
+                    .desired_replica_node_ids
+                    .contains(&receipt.replica_node_id)
+                    && crate::content_durability::receipt_matches_target_version(
+                        receipt,
+                        &version,
+                        &receipt.replica_node_id,
+                    )
+            })
+            .collect::<Vec<_>>();
+        let cached = self
+            .coordinator
+            .receipts_for_intent(&record.intent_id)
+            .into_iter()
+            .filter(|receipt| receipt.state == DfsReplicaReceiptState::Durable)
+            .map(|receipt| receipt.replica_node_id.clone())
+            .collect::<BTreeSet<_>>();
+        if !receipts.iter().any(|receipt| {
+            !cached.contains(&receipt.replica_node_id)
+                || (object.current_locations.contains(&receipt.replica_node_id)
+                    && self
+                        .coordinator
+                        .repair_job_for_target(&record.intent_id, &receipt.replica_node_id)
+                        .is_some())
+        }) {
+            return Ok(false);
+        }
+        if scheduling.iter().any(|row| {
+            row.intent_id != record.intent_id
+                || row.object_id != record.object_id
+                || row.version != record.target_version
+                || Some(row.content_hash.as_str()) != record.content_hash.as_deref()
+                || !record
+                    .desired_replica_node_ids
+                    .contains(&row.missing_replica_node_id)
+        }) {
+            return Err(DfsError::Metadata {
+                message: "current repair receipt projection differs from its queued identity"
+                    .into(),
+            });
+        }
+        // Join the existing carrier DATA while its logical target is still
+        // present. Settling a replica cannot erase UNKNOWN or named in-flight
+        // custody; the normal queue projection below retains those records.
+        self.restore_repair_attempt_records_merging(scheduling);
+        for receipt in receipts {
+            self.coordinator.restore_receipt_location_settlement(
+                &record.intent_id,
+                &receipt.replica_node_id,
+                !object.current_locations.contains(&receipt.replica_node_id),
+            );
+            self.coordinator
+                .restore_durable_receipt_deferring_repair_rebuild(
+                    &record.intent_id,
+                    receipt.replica_node_id,
+                )?;
+        }
+        Ok(true)
+    }
+
     #[tracing::instrument(target = "sinomo.perf", level = "trace", name = "dfs.repair.restore",
         skip_all, fields(stage = "dfs.repair.restore", node = %self.node_id,
             attempt_records = records.len(), distinct_intents = tracing::field::Empty,
@@ -4131,6 +4240,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         restored = true;
                         self.restore_metadata_successor_head(record)?;
                         self.restore_backend_receipt_pages_for_intent(record, false)?;
+                    } else if self.refresh_current_repair_receipt_projection(
+                        record,
+                        intents
+                            .get(&record.intent_id)
+                            .map(Vec::as_slice)
+                            .unwrap_or(&[]),
+                    )? {
+                        restored = true;
                     }
                 }
                 Ok::<_, DfsError>(())
@@ -5064,4 +5181,176 @@ pub(crate) fn enroll_prepared_repair_targets(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod receipt_projection_tests {
+    use super::*;
+
+    #[test]
+    fn bounded_repair_restore_observes_receipt_published_by_another_actual_owner_lane() {
+        let name = "native-repair-receipt-projection-refresh";
+        let path = "/services/receipt-projection-refresh.bin";
+        let bytes = b"actual two-holder receipt projection";
+        let (runtime, browser, config) =
+            crate::test_support::current_native_metadata_service(name, 2, path).unwrap();
+        drop(browser);
+        let owner = config.primary_node_id;
+        let peer = config.replica_node_ids[0].clone();
+        let mut writer = runtime.metadata_primary_service(path).unwrap();
+        let stat = writer
+            .posix_write_file(
+                path,
+                bytes,
+                crate::DfsWriteOptions {
+                    policy: crate::DfsReplicationPolicy::new(1, 2).unwrap(),
+                    replica_candidates: vec![owner.clone(), peer.clone()],
+                    wait_for_commit: true,
+                    foreground_replica_repair: true,
+                },
+            )
+            .unwrap();
+        let deadline = std::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+        loop {
+            if writer
+                .metadata_backend()
+                .unwrap()
+                .receipts_for_version(&stat.object_id, &stat.version)
+                .unwrap()
+                .len()
+                == 2
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "actual second receipt must arrive within the existing budget"
+            );
+            writer.retry_pending_repairs_bounded(1).unwrap();
+            writer.process_incoming().unwrap();
+        }
+        let background = runtime
+            .deny_background_replica_before_claim(&owner)
+            .unwrap();
+        let physical = runtime.client(&peer).unwrap();
+        assert_eq!(
+            physical
+                .content()
+                .read_blob(stat.content_hash.as_deref().unwrap())
+                .unwrap(),
+            bytes
+        );
+        drop(physical);
+        writer
+            .mark_remote_read_location_missing(
+                &stat.object_id,
+                &stat.version,
+                &stat.content_hash,
+                &peer,
+            )
+            .unwrap();
+        drop(writer);
+
+        let mut retained = runtime.metadata_primary_service(path).unwrap();
+        retained.hydrate_from_metadata_backend().unwrap();
+        let scheduling = retained.durable_repair_queue_records();
+        assert_eq!(scheduling.len(), 1);
+        assert_eq!(scheduling[0].missing_replica_node_id, peer);
+        assert!(
+            repair_transfer_custody_unresolved(&scheduling[0]),
+            "hydration provides no invented NotSent or completion witness"
+        );
+        let intent_id = scheduling[0].intent_id.clone();
+        assert_eq!(
+            retained.coordinator.receipts_for_intent(&intent_id).len(),
+            1
+        );
+        assert!(
+            retained
+                .coordinator
+                .repair_job_for_target(&intent_id, &peer)
+                .is_some()
+        );
+        let mut publisher = runtime.metadata_primary_service(path).unwrap();
+        assert!(
+            publisher
+                .put_metadata_receipt(
+                    &stat.file_system_id,
+                    &stat.object_id,
+                    &stat.version,
+                    &peer,
+                    stat.content_hash.as_deref().unwrap()
+                )
+                .unwrap()
+        );
+        let before = publisher
+            .metadata_backend()
+            .unwrap()
+            .export_shard_table_snapshot(&DfsMetadataShardId::new("services"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            publisher
+                .metadata_backend()
+                .unwrap()
+                .receipts_for_version(&stat.object_id, &stat.version)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            retained.coordinator.receipts_for_intent(&intent_id).len(),
+            1,
+            "the retained coordinator is genuinely behind the other real lane"
+        );
+        let rebuilds = retained.coordinator.repair_job_rebuild_count;
+        let restored = retained
+            .restore_pending_writes_for_repair_attempt_records(&scheduling)
+            .unwrap();
+        assert_eq!(
+            restored, scheduling,
+            "logical receipt refresh preserves every actual custody field"
+        );
+        assert_eq!(
+            retained
+                .repair_attempt_records
+                .get(&(intent_id.clone(), peer.clone())),
+            Some(&scheduling[0]),
+            "unresolved producer evidence survives logical settlement"
+        );
+        assert!(
+            retained
+                .coordinator
+                .repair_job_for_target(&intent_id, &peer)
+                .is_none(),
+            "a verified durable receipt and current location must settle the stale logical job before another dispatch"
+        );
+        assert_eq!(
+            retained.coordinator.receipts_for_intent(&intent_id).len(),
+            2
+        );
+        assert_eq!(retained.coordinator.repair_job_rebuild_count, rebuilds + 1);
+        retained
+            .restore_pending_writes_for_repair_attempt_records(&scheduling)
+            .unwrap();
+        assert_eq!(
+            retained.coordinator.repair_job_rebuild_count,
+            rebuilds + 1,
+            "an unchanged cut does not rebuild the complete repair list again"
+        );
+        assert_eq!(
+            publisher
+                .metadata_backend()
+                .unwrap()
+                .export_shard_table_snapshot(&DfsMetadataShardId::new("services"))
+                .unwrap()
+                .unwrap(),
+            before,
+            "repair projection refresh cannot publish or alter durable metadata"
+        );
+        drop(publisher);
+        drop(retained);
+        drop(background);
+        runtime.close().unwrap();
+    }
 }
