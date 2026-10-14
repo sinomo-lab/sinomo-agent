@@ -11379,12 +11379,16 @@ fn daemon_dfs_stamped_lookup_is_cold_global_warm_exact_and_read_only() {
         .root(&data_dir.root())
         .expect("actual root cache slot");
     let cache = cache_slot.lock().expect("message cache");
-    let entry = cache.as_ref().expect("cache entry");
-    let exact_lanes_after_cold_poll = entry.exact_shard_services.len();
-    let has_users_lane = entry
-        .exact_shard_services
-        .keys()
-        .any(|key| key.file_system_id == file_system.file_system_id && key.shard_id.0 == "users");
+    // A correctly rejected cold poll may leave the cache entry absent.
+    // That is an observed zero-lane state, not unavailable lane-count evidence.
+    let exact_lanes_after_cold_poll = cache
+        .as_ref()
+        .map_or(0, |entry| entry.exact_shard_services.len());
+    let has_users_lane = cache.as_ref().is_some_and(|entry| {
+        entry.exact_shard_services.keys().any(|key| {
+            key.file_system_id == file_system.file_system_id && key.shard_id.0 == "users"
+        })
+    });
     drop(cache);
     if cold_poll_rejected {
         assert_eq!(
@@ -11519,6 +11523,17 @@ fn daemon_owned_dfs_clients_reuse_and_track_shared_metadata_authority_generation
         Some(&runtime),
     )
     .unwrap();
+    // Retain and warm the actual shared generation before measuring warm
+    // clients. Merely obtaining its weak-registry handle is not a ready cut.
+    let ready = runtime
+        .block_on(warm_daemon_dfs_metadata_authority_for_identity_async(
+            &cluster_paths,
+            &state.cluster_id,
+            &local,
+            &runtime,
+        ))
+        .unwrap();
+    assert!(authority.current_complete_prefix().is_some());
     let key = metadata_shard_key(&initial.file_system_id, &initial.shard_id);
     let read = |client: &dyn crate::DfsControlPlaneKvClient| {
         client
@@ -11528,8 +11543,24 @@ fn daemon_owned_dfs_clients_reuse_and_track_shared_metadata_authority_generation
             .decode::<DfsMetadataShardConfig>()
             .unwrap()
     };
+    // An explicit authority client still performs its real exact-set read;
+    // the daemon-client constructor is the retained-observation contract below.
+    let explicit = DaemonDfsControlPlaneKvClient::new_on_runtime(&cluster_paths, &runtime);
+    assert_eq!(read(&explicit), initial);
+    assert_eq!(
+        explicit
+            .authoritative_exact_set_calls
+            .load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(
+        explicit.authoritative_prefix_calls.load(Ordering::Relaxed),
+        0
+    );
+    drop(explicit);
     for _ in 0..8 {
-        let client = DaemonDfsControlPlaneKvClient::new_on_runtime(&cluster_paths, &runtime);
+        let client =
+            DaemonDfsControlPlaneKvClient::new_daemon_client_on_runtime(&cluster_paths, &runtime);
         assert_eq!(read(&client), initial);
         assert_eq!(
             client.authoritative_exact_set_calls.load(Ordering::Relaxed),
@@ -11543,7 +11574,8 @@ fn daemon_owned_dfs_clients_reuse_and_track_shared_metadata_authority_generation
         assert_eq!(read(shell.control_plane.as_deref().unwrap()), initial);
         drop(shell);
     }
-    let cached = DaemonDfsControlPlaneKvClient::new_on_runtime(&cluster_paths, &runtime);
+    let cached =
+        DaemonDfsControlPlaneKvClient::new_daemon_client_on_runtime(&cluster_paths, &runtime);
     assert_eq!(read(&cached), initial);
     let next_primary = initial.replica_node_ids[0].clone();
     let activated = native
@@ -11600,6 +11632,7 @@ fn daemon_owned_dfs_clients_reuse_and_track_shared_metadata_authority_generation
     );
     assert_eq!(cached.authoritative_prefix_calls.load(Ordering::Relaxed), 0);
     drop(cached);
+    drop(ready);
     drop(authority);
     native.close().unwrap();
 }
