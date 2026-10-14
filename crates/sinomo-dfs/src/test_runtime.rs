@@ -3163,20 +3163,21 @@ impl DfsTestRuntime {
     }
     /// Dispatch the actual prepared call, including its owned native attachment,
     /// through the same authenticated Main endpoint and original caller budget.
-    pub fn rpc_call(
+    /// Preserve the actual semantic attachment so protocol tests can consume
+    /// it through the production decoder instead of a value-only adapter.
+    pub fn rpc_result(
         &self,
         source: &NodeId,
         target: &NodeId,
         call: ObjectRpcCall,
         timeout: Duration,
-    ) -> Result<ObjectRpcResponse, String> {
-        let deadline = std::time::Instant::now() + timeout;
+    ) -> Result<ObjectRpcResult, String> {
         let carrier = Carrier {
             source: source.clone(),
             fabric: self.fabric.clone(),
             origin: RpcOrigin::ExplicitFixtureRpc,
         };
-        let result = carrier
+        carrier
             .call(
                 target,
                 call,
@@ -3185,7 +3186,17 @@ impl DfsTestRuntime {
                     .cluster_rpc_options(),
                 true,
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())
+    }
+    pub fn rpc_call(
+        &self,
+        source: &NodeId,
+        target: &NodeId,
+        call: ObjectRpcCall,
+        timeout: Duration,
+    ) -> Result<ObjectRpcResponse, String> {
+        let deadline = std::time::Instant::now() + timeout;
+        let result = self.rpc_result(source, target, call, timeout)?;
         run_rpc(Box::pin(async {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             let response = tokio::time::timeout(

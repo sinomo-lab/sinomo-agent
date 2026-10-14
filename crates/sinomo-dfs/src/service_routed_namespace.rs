@@ -2628,6 +2628,42 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                     current_primary_node_id: None,
                                 }
                             }
+                            Some(DurableNamespaceRequestAdmission::Execute {
+                                persisted: false,
+                                replaying_pending: false,
+                                ..
+                            }) if self.control_plane.is_some()
+                                && shards.len() != 1
+                                && matches!(
+                                    &command.operation,
+                                    DfsNamespaceOperation::CommitLocalEventualBatch { .. }
+                                ) =>
+                            {
+                                // A fresh atomic batch cannot span physical
+                                // writers. Reject before publishing even a
+                                // request completion; retained outcomes and
+                                // pending recovery were handled separately.
+                                let DfsNamespaceOperation::CommitLocalEventualBatch {
+                                    transaction,
+                                    ..
+                                } = &command.operation
+                                else {
+                                    unreachable!()
+                                };
+                                DfsNamespaceResult::Rejected {
+                                    reason: format!(
+                                        "clustered local-eventual batch {} must resolve to exactly one metadata shard, found [{}]",
+                                        transaction.transaction_id,
+                                        shards
+                                            .iter()
+                                            .map(|shard| shard.shard_id.as_str())
+                                            .collect::<Vec<_>>()
+                                            .join(", "),
+                                    ),
+                                    posix_error: None,
+                                    current_primary_node_id: None,
+                                }
+                            }
                             durable_execute => {
                                 let replaying_pending_request = durable_execute.as_ref().and_then(
                                     |admission| match admission {

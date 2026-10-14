@@ -1315,7 +1315,7 @@ fn networked_dfs_async_send_uses_typed_object_message_path() {
             .iter()
             .any(|event| event.source == requester
                 && event.target == owner
-                && event.route == crate::DFS_DATA_READ_ROUTE
+                && event.route == crate::DFS_DIRECT_READ_ROUTE
                 && event.phase == crate::test_support::DfsTestRpcPhase::Completed)
     );
     drop(client);
@@ -2019,15 +2019,31 @@ fn malformed_dfs_object_rpc_message_does_not_block_following_valid_message() {
             range_max_bytes: None,
         }),
     );
+    let deadline = Instant::now() + Duration::from_secs(5);
     let reply = runtime
-        .rpc_request(
+        .rpc_result(
             &requester,
             &server,
-            dfs_message_rpc_request(&command).unwrap(),
+            sinomo_core::network::ObjectRpcCall::value(dfs_message_rpc_request(&command).unwrap()),
             Duration::from_secs(5),
         )
         .unwrap();
-    let response = decode_dfs_message_rpc_response(&reply).unwrap();
+    assert!(
+        !reply.body.is_empty(),
+        "actual data-read reply owns its attachment"
+    );
+    let head =
+        crate::body_rpc::decode_dfs_attachment_message_rpc_response(&reply.response).unwrap();
+    assert_eq!(head.attachment.total_size_bytes, bytes.len() as u64);
+    let response = runtime.runtime_handle().block_on(async {
+        tokio::time::timeout(
+            deadline.saturating_duration_since(Instant::now()),
+            crate::node_transport::dfs_message_response_from_rpc_result(reply),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+    });
     assert!(matches!(response.outbound_messages.as_slice(),
         [DfsRoutedMessage { message: DfsNetworkMessage::ReadResponse(DfsReadResponse {
             request_id, object_id, result: DfsReadResult::Found(data),
@@ -2238,11 +2254,10 @@ fn stage_command_accepts_metadata_shard_primary_for_transient_object() {
 
 #[test]
 fn visible_metadata_publication_is_idempotent() {
-    let root = temp_root("visible-metadata-publication-idempotent");
     let node_id = NodeId::from_legacy_named("node_visible_metadata_idempotent").expect("node");
     let file_path = "/services/sandbox/instances/sandbox_meta/work/site.py";
 
-    let (_runtime, mut dfs) = native_sifs_service(
+    let (runtime, mut dfs) = native_sifs_service(
         "visible_metadata_publication_is_idempotent",
         node_id.clone(),
     );
@@ -2258,9 +2273,11 @@ fn visible_metadata_publication_is_idempotent() {
     let object = dfs
         .current_read_object_metadata(&stat.object_id)
         .expect("current object");
-    let journal_count_before = std::fs::read_dir(root.join("metadata/journal"))
-        .expect("journal dir")
-        .count();
+    let journal_before = dfs
+        .metadata_backend()
+        .unwrap()
+        .metadata_shard_statuses()
+        .unwrap();
 
     dfs.put_visible_object_in_metadata_backend(&object)
         .expect("repeat visible object");
@@ -2269,15 +2286,26 @@ fn visible_metadata_publication_is_idempotent() {
     dfs.put_object_version_size_in_metadata_backend(&object, stat.size_bytes)
         .expect("repeat visible version size");
 
-    let journal_count_after = std::fs::read_dir(root.join("metadata/journal"))
-        .expect("journal dir")
-        .count();
+    let journal_after = dfs
+        .metadata_backend()
+        .unwrap()
+        .metadata_shard_statuses()
+        .unwrap();
     assert_eq!(
-        journal_count_after, journal_count_before,
+        journal_after, journal_before,
         "re-publishing unchanged object/version metadata should not emit journal entries"
     );
 
-    std::fs::remove_dir_all(root).ok();
+    assert_eq!(
+        dfs.current_read_object_metadata(&stat.object_id).unwrap(),
+        object
+    );
+    assert_eq!(
+        dfs.posix_read_file(file_path).unwrap(),
+        b"print('metadata')\n"
+    );
+    drop(dfs);
+    runtime.close().unwrap();
 }
 
 #[test]
@@ -2558,11 +2586,28 @@ fn bulk_local_eventual_splits_distinct_shards_owned_by_the_same_primary() {
     .unwrap();
     dfs.posix_mkdir_all("/users/native-bulk").unwrap();
     dfs.posix_mkdir_all("/services/native-bulk").unwrap();
-    let before = dfs
-        .metadata_backend()
-        .unwrap()
-        .list_prepared_operations()
-        .unwrap()
+    let committed = || {
+        ["users", "services"]
+            .into_iter()
+            .flat_map(|shard| {
+                // Snapshot the actual Core lane after the served operation has
+                // drained; a browser facade may retain its earlier projection.
+                let current = runtime
+                    .metadata_primary_service(&format!("/{shard}"))
+                    .unwrap();
+                current
+                    .metadata_backend()
+                    .unwrap()
+                    .export_shard_table_snapshot(&DfsMetadataShardId::new(shard))
+                    .unwrap()
+                    .unwrap()
+                    .tables
+                    .prepared_operations_v7
+            })
+            .filter(|record| record.status == crate::DfsPreparedOperationStatus::Committed)
+            .collect::<Vec<_>>()
+    };
+    let before = committed()
         .into_iter()
         .map(|record| record.digest.operation_id)
         .collect::<BTreeSet<_>>();
@@ -2580,13 +2625,13 @@ fn bulk_local_eventual_splits_distinct_shards_owned_by_the_same_primary() {
         .posix_create_files_local_eventual_with_known_parents(files)
         .unwrap();
     assert_eq!(stats.len(), 2);
-    let scopes = dfs
-        .metadata_backend()
-        .unwrap()
-        .list_prepared_operations()
-        .unwrap()
+    let authored = committed()
         .into_iter()
         .filter(|record| !before.contains(&record.digest.operation_id))
+        .collect::<Vec<_>>();
+    assert_eq!(authored.len(), 2, "one genuine committed batch per shard");
+    let scopes = authored
+        .into_iter()
         .map(|record| record.digest.shard_id)
         .collect::<BTreeSet<_>>();
     assert_eq!(
@@ -2635,12 +2680,29 @@ fn local_eventual_batch_rejects_multiple_shards_with_the_same_local_primary() {
             .unwrap()
             .unwrap()
     });
-    let before = backend
-        .metadata_shard_statuses()
-        .unwrap()
+    let actual_snapshots = || {
+        [
+            ("root", "/"),
+            ("services", "/services"),
+            ("users", "/users"),
+        ]
         .into_iter()
-        .map(|status| (status.shard_id, status.journal_last_sequence))
-        .collect::<BTreeMap<_, _>>();
+        .map(|(shard, path)| {
+            let current = runtime.metadata_primary_service(path).unwrap();
+            let id = DfsMetadataShardId::new(shard);
+            (
+                id.clone(),
+                current
+                    .metadata_backend()
+                    .unwrap()
+                    .export_shard_table_snapshot(&id)
+                    .unwrap()
+                    .unwrap(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>()
+    };
+    let before = actual_snapshots();
     let transaction = DfsNamespaceTransaction {
         content_reference_identity: None,
         extension_expectations: Vec::new(),
@@ -2653,6 +2715,31 @@ fn local_eventual_batch_rejects_multiple_shards_with_the_same_local_primary() {
         advisory_lock_states: Vec::new(),
         created_at: OffsetDateTime::now_utc(),
     };
+    let writes = [&a, &b]
+        .into_iter()
+        .map(|stat| DfsLocalEventualBatchWriteProof {
+            expected_base_version: Some(stat.version.clone()),
+            expected_parent_object_id: None,
+            expected_parent_version: None,
+            receipt: dfs
+                .backend_receipt_for_replica(&stat.object_id, &stat.version, &owner)
+                .unwrap()
+                .unwrap(),
+        })
+        .collect();
+    let operation = DfsNamespaceOperation::CommitLocalEventualBatch {
+        transaction,
+        writes,
+    };
+    let authority_shards = dfs
+        .affected_namespace_shards(&a.file_system_id, &operation)
+        .unwrap();
+    assert_eq!(authority_shards.len(), 2);
+    assert!(
+        authority_shards
+            .iter()
+            .all(|shard| shard.primary_node_id == owner)
+    );
     let event = dfs
         .handle_namespace_request(
             owner.clone(),
@@ -2662,29 +2749,18 @@ fn local_eventual_batch_rejects_multiple_shards_with_the_same_local_primary() {
                 requesting_node_id: owner,
                 include_metadata_journal_batches: false,
                 metadata_journal_after_sequences: Vec::new(),
-                authority_shards: Vec::new(),
-                operation: DfsNamespaceOperation::CommitLocalEventualBatch {
-                    transaction,
-                    writes: Vec::new(),
-                },
+                authority_shards,
+                operation,
             },
         )
         .unwrap();
     assert!(
         matches!(event, NetworkedDfsServiceEvent::RemoteNamespaceServed {
         result: DfsNamespaceResult::Rejected { ref reason, .. }, ..
-    } if reason.contains("must resolve to exactly one metadata shard"))
+    } if reason.contains("must resolve to exactly one metadata shard")),
+        "{event:?}"
     );
-    assert_eq!(
-        dfs.metadata_backend()
-            .unwrap()
-            .metadata_shard_statuses()
-            .unwrap()
-            .into_iter()
-            .map(|status| (status.shard_id, status.journal_last_sequence))
-            .collect::<BTreeMap<_, _>>(),
-        before
-    );
+    assert_eq!(actual_snapshots(), before);
     assert_eq!(
         dfs.metadata_backend()
             .unwrap()
