@@ -236,93 +236,128 @@ fn dfs_smoke_replica_candidates_preserve_routable_order() {
 
 #[test]
 fn reconnect_does_not_restore_local_replica_removed_by_managed_placement() {
-    let root = temp_root("reconnect-respects-managed-placement");
-    let local = NodeId::from_legacy_named("node_reconnect_placement_local").expect("local");
-    let remote = NodeId::from_legacy_named("node_reconnect_placement_remote").expect("remote");
-    let object_id =
-        DfsObjectId::from_legacy_named("obj_reconnect_placement_removed").expect("object");
-    let version = DfsVersion::from_legacy_named("version_reconnect_placement").expect("version");
-    let path = "/services/reconnect-placement.txt";
     let bytes = b"local bytes remain after replica removal";
-    let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
-    control_plane.with_client(|kv| {
-        let mut config = DfsFileSystemConfig::from(&file_system(local.clone()));
-        let mut policy = DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 1)
-            .expect("placement policy");
-        policy.forbidden_node_ids = vec![local.clone()];
-        config.subtree_policies.push(
-            normalize_placement_rule(path, DfsPlacementScope::SelfOnly, policy)
-                .expect("placement rule"),
-        );
-        let mut store = DfsControlPlaneStore::new(kv);
-        store
-            .put_file_system_config(&config)
-            .expect("filesystem config");
-    });
-
-    let (_runtime, mut dfs) = native_sifs_service(
-        "reconnect_does_not_restore_local_replica_removed_by_managed_placement",
-        local.clone(),
+    let (runtime, author, stat, removed) = super::repair::native_withdrawn_local_replica_fixture(
+        "reconnect-respects-managed-placement",
+        bytes,
     );
-    let manifest = dfs
-        .content
-        .put_object_version(object_id.as_str(), version.as_str(), bytes)
-        .expect("retain local manifest and blob");
-    let mut metadata = file_metadata(local.clone());
-    metadata.object_id = object_id.clone();
-    metadata.path = path.to_string();
-    metadata.policy = DfsObjectPolicy::ReplicatedEventual;
-    metadata.version = version.clone();
-    metadata.current_locations = vec![remote.clone()];
-    metadata.content_hash = Some(manifest.content_hash.clone());
-    metadata.content_size_bytes = Some(bytes.len() as u64);
-    dfs.add_object_metadata(metadata).expect("metadata");
-    // Once a control plane is attached, a config check cannot authorize a
-    // later receipt write: Apply could create or replace a rule in between.
-    // Reconnect must leave all clustered replica metadata to the permitted job.
-    let mut dfs = dfs.with_control_plane(control_plane);
+    let local = removed.replica_node_id.clone();
+    let current = author
+        .metadata_backend()
+        .unwrap()
+        .get_object(&stat.object_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.current_locations.len(), 1);
+    let remote = current.current_locations[0].clone();
+    assert_ne!(local, remote);
+    assert_eq!(
+        author
+            .content()
+            .read_blob(stat.content_hash.as_deref().unwrap())
+            .unwrap(),
+        bytes
+    );
+    drop(author);
+
+    let mut policy = DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 1).unwrap();
+    policy.forbidden_node_ids = vec![local.clone()];
+    policy.required_node_ids = vec![remote.clone()];
+    let accepted = runtime
+        .apply_placement_policy(&local, &stat.path, DfsPlacementScope::SelfOnly, policy)
+        .unwrap();
+    let control = runtime.shared_control_plane().unwrap();
+    let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    loop {
+        let job = control
+            .with_client(|kv| {
+                DfsControlPlaneStore::new(kv.as_mut())
+                    .placement_reconciliation(&accepted.file_system_id, &accepted.job_id)
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.accepted_config, accepted.accepted_config);
+        assert!(
+            job.last_error.is_none(),
+            "actual managed placement: {job:?}"
+        );
+        if job.state == DfsPlacementReconciliationState::Completed {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(!remaining.is_zero(), "normal managed placement must finish");
+        runtime
+            .maintenance_tick(&local, remaining)
+            .unwrap()
+            .outcome
+            .unwrap();
+    }
+    let mut dfs = runtime.metadata_primary_service(&stat.path).unwrap();
     assert!(
-        dfs.resolved_placement_policy_for_path(path, DfsObjectPolicy::ReplicatedEventual, 2)
-            .expect("resolved placement")
+        dfs.resolved_placement_policy_for_path(&stat.path, DfsObjectPolicy::ReplicatedEventual, 2)
+            .unwrap()
             .policy
             .forbidden_node_ids
             .contains(&local),
-        "test setup must explicitly forbid the reconnecting local node"
+        "the actual native rule must forbid this reconnecting holder"
     );
-
-    let reconciliation = dfs
-        .reconcile_local_manifests(&object_id)
-        .expect("reconcile local manifests");
-
+    assert_eq!(
+        dfs.content()
+            .read_blob(stat.content_hash.as_deref().unwrap())
+            .unwrap(),
+        bytes
+    );
+    // Re-establish an ordinary read cache from the genuine remaining holder.
+    // This is DATA only: neither the cache fill nor reconnect may enroll this
+    // forbidden node as a replica or restore its withdrawn durable receipt.
+    assert_eq!(
+        dfs.request_remote_object_read(&stat.object_id).unwrap(),
+        vec![remote.clone()]
+    );
+    let cache_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    while !dfs.reads.pending_reads.is_empty() {
+        dfs.process_incoming().unwrap();
+        assert!(
+            Instant::now() < cache_deadline,
+            "actual cache read must finish"
+        );
+    }
+    let reconciliation = dfs.reconcile_local_manifests(&stat.object_id).unwrap();
     assert_eq!(reconciliation.refreshed_receipts, 0);
     assert!(
         !reconciliation.missing_current,
-        "the local bytes still exist"
+        "the actual local bytes still exist"
     );
     assert!(
         dfs.metadata_backend()
-            .expect("backend")
-            .receipts_for_version(&object_id, &version)
-            .expect("receipts")
+            .unwrap()
+            .receipts_for_version(&stat.object_id, &stat.version)
+            .unwrap()
             .iter()
             .all(|receipt| receipt.replica_node_id != local),
         "reconnect must not recreate the removed local receipt"
     );
+    let current = dfs
+        .metadata_backend()
+        .unwrap()
+        .get_object(&stat.object_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.version, stat.version);
     assert_eq!(
-        dfs.metadata()
-            .object(&object_id)
-            .expect("object")
-            .current_locations,
+        current.current_locations,
         vec![remote],
         "reconnect must not recreate the removed local location"
     );
-    assert!(
+    assert_eq!(
         dfs.content()
-            .has_blob(&manifest.content_hash)
-            .expect("local blob lookup"),
-        "placement removal leaves the bytes available as a local cache"
+            .read_blob(stat.content_hash.as_deref().unwrap())
+            .unwrap(),
+        bytes,
+        "placement removal leaves the original bytes available as a local cache"
     );
-    std::fs::remove_dir_all(root).ok();
+    drop(dfs);
+    runtime.close().unwrap();
 }
 
 #[test]
