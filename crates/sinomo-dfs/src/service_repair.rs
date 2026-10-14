@@ -2185,6 +2185,28 @@ where
                     Some(execution_exclusions),
                 );
                 if stage_targets.is_empty() {
+                    // Local staging is not a StageBlob RPC target. After a
+                    // restart it may nevertheless be the only receipt missing
+                    // from W. Recover its bytes through the ordinary correlated
+                    // fetch, without inventing a receipt or transfer outcome.
+                    if intent.desired_replica_nodes.contains(&self.node_id)
+                        && !durable_nodes.contains(&self.node_id)
+                        && !execution_exclusions.contains(&self.node_id)
+                        && self.pending_stage_send_budget(
+                            &intent,
+                            &pending,
+                            &durable_nodes,
+                            Some(execution_exclusions),
+                        ) > 0
+                        && budget.reserve(1) == 1
+                    {
+                        self.request_stage_blob_from_alternate_async(
+                            &intent,
+                            &pending,
+                            execution_exclusions,
+                        )
+                        .await?;
+                    }
                     break;
                 }
                 let reserved = budget.reserve(stage_targets.len());
@@ -3270,6 +3292,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             let mut stage_targets =
                 self.pending_stage_targets(&intent, &pending, &durable_nodes, None);
             if stage_targets.is_empty() {
+                if intent.desired_replica_nodes.contains(&self.node_id)
+                    && !durable_nodes.contains(&self.node_id)
+                    && self.pending_stage_send_budget(&intent, &pending, &durable_nodes, None) > 0
+                    && budget.reserve(1) == 1
+                {
+                    self.request_stage_blob_from_alternate(&intent, &pending)?;
+                }
                 break;
             }
             let reserved = budget.reserve(stage_targets.len());

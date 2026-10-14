@@ -1290,8 +1290,24 @@ fn fetch_receipt_completion_sends_untracked_routed_write_response() {
             false,
             true,
         );
-    let NetworkedDfsWriteOutcome::Pending { ref intent_id, .. } = outcome else {
+    let NetworkedDfsWriteOutcome::Pending {
+        intent_id: ref route_id,
+        ..
+    } = outcome
+    else {
         panic!("actual primary Fetch denial must leave W2 pending: {outcome:?}");
+    };
+    // Consume the real primary's Pending response before inspecting its
+    // canonical intent; the caller's route identity is not a metadata key.
+    writer.process_incoming().unwrap();
+    let pending = writer.write_outcome(route_id).unwrap();
+    let NetworkedDfsWriteOutcome::Pending {
+        ref intent_id,
+        durable_receipts: 1,
+        required_receipts: 2,
+    } = pending
+    else {
+        panic!("actual canonical W2 progress: {pending:?}");
     };
     let mut inspect = runtime.client(&primary).unwrap();
     let native_intent = inspect
@@ -1301,6 +1317,10 @@ fn fetch_receipt_completion_sends_untracked_routed_write_response() {
         .unwrap()
         .unwrap();
     assert_ne!(native_intent.status, DfsWriteIntentStatus::Committed);
+    assert_eq!(
+        native_intent.operation_id.as_deref(),
+        Some(route_id.as_str())
+    );
     assert!(
         inspect
             .content()
@@ -1321,7 +1341,7 @@ fn fetch_receipt_completion_sends_untracked_routed_write_response() {
     drop(inspect);
     runtime.stop_node(&primary).unwrap();
     runtime.reopen_node(primary.clone()).unwrap();
-    let mut restored = runtime.client(&primary).unwrap();
+    let mut restored = runtime.metadata_primary_service("/services").unwrap();
     assert_eq!(
         restored
             .metadata_backend()
@@ -1335,14 +1355,55 @@ fn fetch_receipt_completion_sends_untracked_routed_write_response() {
     assert!(restored.writes.pending_writes.contains_key(intent_id));
     drop(restored);
     runtime.clear_faults();
-    runtime
-        .maintenance_tick(&primary, Duration::from_secs(5))
-        .unwrap()
-        .outcome
-        .unwrap();
-    let events = writer
-        .process_incoming_until_pending_routed_writes_ready(Duration::from_secs(5))
-        .unwrap();
+    runtime.request_repair_reconciliation(&primary).unwrap();
+    let recovery_start = runtime.rpc_observations().len();
+    let recovery_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let remaining = recovery_deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "normal bounded recovery did not settle the actual pending intent"
+        );
+        let tick = runtime.maintenance_tick(&primary, remaining).unwrap();
+        tick.outcome.unwrap();
+        if runtime.rpc_observations()[recovery_start..]
+            .iter()
+            .any(|event| {
+                event.source == primary
+                    && event.target == requester
+                    && event.route == DFS_DATA_DISTRIBUTED_WRITE_RESPONSE_ROUTE
+                    && event.phase == crate::test_support::DfsTestRpcPhase::Completed
+            })
+        {
+            break;
+        }
+    }
+    let events = writer.process_incoming_until_pending_routed_writes_ready(Duration::from_secs(5));
+    assert!(
+        events.is_ok(),
+        "late response result={events:?}; actual canonical intent={:?}; matching RPCs={:?}; queue={:?}",
+        runtime
+            .metadata_primary_service("/services")
+            .map(|core| core
+                .metadata_backend()
+                .unwrap()
+                .get_intent(&request.object_id, intent_id)),
+        runtime
+            .rpc_observations()
+            .into_iter()
+            .filter(|event| event.source == primary
+                && event.target == requester
+                && [
+                    DFS_DATA_FETCH_BLOB_ROUTE,
+                    DFS_DATA_DISTRIBUTED_WRITE_RESPONSE_ROUTE
+                ]
+                .contains(&event.route.as_str()))
+            .collect::<Vec<_>>(),
+        crate::read_dfs_repair_attempt_snapshot(&crate::default_dfs_repair_attempt_snapshot_path(
+            runtime.data_dir(&primary)
+        ))
+    );
+    let events = events.unwrap();
     assert!(events.iter().any(|event| matches!(event,
         NetworkedDfsServiceEvent::RemoteWriteCompleted { object_id, primary_node_id,
             result: DfsDistributedWriteResult::Outcome {
@@ -1394,6 +1455,101 @@ fn fetch_receipt_completion_sends_untracked_routed_write_response() {
             .1
     );
     drop(published);
+    drop(writer);
+    runtime.close().unwrap();
+}
+
+#[test]
+fn synchronous_recovery_fetches_the_only_missing_local_receipt_within_budget() {
+    let (mut runtime, primary, requester, _, mut writer, request, manifest, outcome) =
+        native_routed_manifest_write(
+            "native-sync-only-local-receipt",
+            2,
+            2,
+            true,
+            false,
+            false,
+            true,
+        );
+    let NetworkedDfsWriteOutcome::Pending {
+        intent_id: route_id,
+        ..
+    } = outcome
+    else {
+        panic!("actual W2 pending caller");
+    };
+    writer.process_incoming().unwrap();
+    let NetworkedDfsWriteOutcome::Pending {
+        intent_id,
+        durable_receipts: 1,
+        required_receipts: 2,
+    } = writer.write_outcome(&route_id).unwrap()
+    else {
+        panic!("actual pending native receipt");
+    };
+    runtime.stop_node(&primary).unwrap();
+    runtime.reopen_node(primary.clone()).unwrap();
+    let mut core = runtime.metadata_primary_service("/services").unwrap();
+    core.hydrate_from_metadata_backend().unwrap();
+    assert!(core.writes.pending_writes.contains_key(&intent_id));
+    runtime.clear_faults();
+    let before = runtime.rpc_observations().len();
+    assert!(core.retry_pending_repairs_bounded(0).unwrap().is_empty());
+    assert!(
+        !runtime.rpc_observations()[before..]
+            .iter()
+            .any(|event| event.source == primary
+                && event.target == requester
+                && event.route == DFS_DATA_FETCH_BLOB_ROUTE)
+    );
+    assert_ne!(
+        core.metadata_backend()
+            .unwrap()
+            .get_intent(&request.object_id, &intent_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        DfsWriteIntentStatus::Committed
+    );
+    core.retry_pending_repairs_bounded(1).unwrap();
+    core.process_incoming().unwrap();
+    let committed = core
+        .metadata_backend()
+        .unwrap()
+        .get_intent(&request.object_id, &intent_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(committed.status, DfsWriteIntentStatus::Committed);
+    assert_eq!(committed.target_version, request.target_version);
+    assert_eq!(
+        committed.content_hash.as_deref(),
+        Some(manifest.content_hash.as_str())
+    );
+    assert_eq!(
+        core.metadata_backend()
+            .unwrap()
+            .receipts_for_version(&request.object_id, &request.target_version)
+            .unwrap()
+            .into_iter()
+            .map(|receipt| receipt.replica_node_id)
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([primary.clone(), requester.clone()])
+    );
+    assert_eq!(
+        runtime.rpc_observations()[before..]
+            .iter()
+            .filter(|event| event.source == primary
+                && event.target == requester
+                && event.route == DFS_DATA_FETCH_BLOB_ROUTE
+                && event.phase == crate::test_support::DfsTestRpcPhase::BeforeDispatch)
+            .count(),
+        1
+    );
+    assert_eq!(
+        core.content().read_blob(&manifest.content_hash).unwrap(),
+        writer.content().read_blob(&manifest.content_hash).unwrap()
+    );
+    drop(core);
     drop(writer);
     runtime.close().unwrap();
 }
@@ -2523,6 +2679,32 @@ fn foreground_w1_postcommit_targets_use_repair_not_stage() {
             },
         )
         .unwrap();
+    // Main may return W1 before its normal N3 continuation. Observe the real
+    // delivery before judging the command kind or receiver bytes.
+    let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    loop {
+        let calls = runtime.rpc_observations();
+        if nodes.iter().filter(|node| **node != owner).all(|replica| {
+            calls[before..].iter().any(|event| {
+                event.source == owner
+                    && &event.target == replica
+                    && event.route == DFS_DATA_REPAIR_REPLICA_ROUTE
+                    && event.phase == crate::test_support::DfsTestRpcPhase::Completed
+            })
+        }) {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "normal N3 repair continuation did not complete"
+        );
+        runtime
+            .maintenance_tick(&owner, remaining)
+            .unwrap()
+            .outcome
+            .unwrap();
+    }
     let calls = runtime.rpc_observations()[before..].to_vec();
     for replica in nodes.iter().filter(|node| **node != owner) {
         assert!(calls.iter().any(|event| event.source == owner
@@ -2591,7 +2773,7 @@ fn background_local_fetch_crossing_w_preserves_deferred_repair_mode() {
                 && event.phase == crate::test_support::DfsTestRpcPhase::BeforeDispatch),
         "the real fetched W receipt cannot start background N-W work before the requester completion"
     );
-    let mut restored = runtime.client(&primary).unwrap();
+    let mut restored = runtime.metadata_primary_service("/services").unwrap();
     restored.hydrate_from_metadata_backend().unwrap();
     let job = restored
         .coordinator()
@@ -2611,17 +2793,22 @@ fn background_local_fetch_crossing_w_preserves_deferred_repair_mode() {
             .unwrap()
             .foreground_replica_repair
     );
+    let owned_shard = restored.local_prepared_operation_shard().unwrap();
     let body = restored
         .metadata_backend()
         .unwrap()
-        .list_prepared_operations()
+        .export_shard_table_snapshot(&owned_shard)
         .unwrap()
+        .unwrap()
+        .tables
+        .prepared_operations_v7
         .into_iter()
         .find(|record| {
-            record.terminal_intent.as_ref().is_some_and(|intent| {
-                intent.object_id == request.object_id
-                    && intent.target_version == request.target_version
-            })
+            record.status == crate::DfsPreparedOperationStatus::Committed
+                && record.terminal_intent.as_ref().is_some_and(|intent| {
+                    intent.object_id == request.object_id
+                        && intent.target_version == request.target_version
+                })
         })
         .unwrap();
     assert_eq!(
