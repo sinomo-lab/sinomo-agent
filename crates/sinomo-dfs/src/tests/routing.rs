@@ -2706,12 +2706,16 @@ fn sifs_cluster_bulk_local_eventual_remote_primary_large_batch_is_fully_visible(
         users_primary_node,
         _runtime,
         root,
-        mut users_primary,
+        users_primary,
         services_primary,
         mut replica,
         ..
     } = cluster;
 
+    // Read from the actual /users shard owner. The /services corpus is still
+    // remote, so bulk reads and every distributed stat cross the real carrier.
+    drop(users_primary);
+    let mut users_primary = _runtime.metadata_primary_service("/users").unwrap();
     let batch = (0..64)
         .map(|index| {
             (
@@ -2775,9 +2779,12 @@ fn sifs_cluster_bulk_local_eventual_remote_primary_large_batch_is_fully_visible(
         );
     }
 
+    // The final check is the authoritative local view, after the unchanged
+    // 64-file remote write/read/stat workload above has exercised Main routing.
+    let author = _runtime.metadata_primary_service(remote_dir).unwrap();
     for (path, bytes) in &batch {
         assert_eq!(
-            services_primary
+            author
                 .posix_stat(path)
                 .expect("remote primary local stat")
                 .content_hash
@@ -2787,6 +2794,8 @@ fn sifs_cluster_bulk_local_eventual_remote_primary_large_batch_is_fully_visible(
         );
     }
 
+    drop(author);
+    assert_eq!(_runtime.observation_dropped_count(), 0);
     drop(users_primary);
     drop(services_primary);
     drop(replica);
