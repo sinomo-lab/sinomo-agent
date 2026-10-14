@@ -960,21 +960,27 @@ fn sifs_cluster_posix_write_at_beyond_eof_reads_back_zero_filled_hole() {
     sifs_posix_cluster_pump_until(&mut cluster, "write_at hole commit", |cluster| {
         cluster
             .writer
-            .posix_stat(path)
+            .posix_stat_distributed(path)
             .is_ok_and(|stat| stat.content_hash.as_deref() == Some(expected_hash.as_str()))
     });
 
     // POSIX hole semantics: bytes between the old EOF and the write offset
     // must read back as zeros.
-    let read = cluster.writer.posix_read_file(path).expect("writer read");
+    let read = cluster
+        .writer
+        .posix_read_file_distributed(path)
+        .expect("writer read");
     assert_eq!(read, expected);
-    let stat = cluster.writer.posix_stat(path).expect("writer stat");
+    let stat = cluster
+        .writer
+        .posix_stat_distributed(path)
+        .expect("writer stat");
     assert_eq!(stat.size_bytes, Some(expected.len() as u64));
 
     // Range reads observe the same bytes (hole inclusive).
     let range = cluster
         .writer
-        .posix_read_file_range(path, base.len() as u64, expected.len())
+        .posix_read_file_range_distributed(path, base.len() as u64, expected.len())
         .expect("writer range read");
     assert_eq!(range, expected[base.len()..].to_vec());
 

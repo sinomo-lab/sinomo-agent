@@ -440,33 +440,50 @@ fn sifs_posix_rename_records_old_path_tombstone() {
         DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
     )
     .expect("write old");
-    let old_version = dfs.posix_stat(old_path).expect("old stat").version;
+    let old_version = dfs
+        .posix_stat_distributed(old_path)
+        .expect("old stat")
+        .version;
     dfs.posix_rename(old_path, new_path).expect("rename");
 
     assert!(matches!(
-        dfs.posix_stat(old_path),
+        dfs.posix_stat_distributed(old_path),
         Err(DfsPosixError::NotFound { .. })
     ));
-    assert_eq!(dfs.posix_read_file(new_path).expect("read new"), b"content");
-    let tombstone = dfs
-        .metadata
+    assert_eq!(
+        dfs.posix_read_file_distributed(new_path).expect("read new"),
+        b"content"
+    );
+    let owner = runtime.metadata_primary_service(new_path).unwrap();
+    let current = owner
+        .metadata_backend()
+        .unwrap()
+        .export_shard_table_snapshot(&DfsMetadataShardId::new("services"))
+        .unwrap()
+        .unwrap();
+    let tombstone = current
+        .tables
         .objects
-        .values()
+        .iter()
         .find(|object| object.path == old_path && object.kind == DfsObjectKind::Tombstone)
         .expect("old path tombstone");
     assert_ne!(tombstone.version, old_version);
 
-    let reloaded = runtime.client(&node_id).unwrap();
+    let mut reloaded = runtime.client(&node_id).unwrap();
     assert!(matches!(
-        reloaded.posix_stat(old_path),
+        reloaded.posix_stat_distributed(old_path),
         Err(DfsPosixError::NotFound { .. })
     ));
     assert_eq!(
         reloaded
-            .posix_read_file(new_path)
+            .posix_read_file_distributed(new_path)
             .expect("reloaded read new"),
         b"content"
     );
+    drop(reloaded);
+    drop(owner);
+    drop(dfs);
+    runtime.close().unwrap();
 }
 
 #[test]
