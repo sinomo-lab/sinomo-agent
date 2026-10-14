@@ -119,11 +119,33 @@ impl NativePlacementFixture {
                     .unwrap(),
             );
         }
+        if remote {
+            // A client facade never replays journal replies into Main's store.
+            // Certify the actual authored cut on both metadata participants
+            // before opening the replica view used by physical page checks.
+            let mut source = runtime.metadata_primary_service(path).unwrap();
+            let target = source
+                .capture_metadata_quorum_sync_target(objects.last().unwrap())
+                .unwrap();
+            let certificate = source
+                .sync_metadata_shard_to_quorum(
+                    &target,
+                    sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+                )
+                .unwrap();
+            assert_eq!(
+                certificate
+                    .acknowledged_node_ids
+                    .into_iter()
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from([primary.clone(), root_primary.clone()]),
+                "both actual metadata participants must acknowledge the authored cut"
+            );
+        }
         let mut service = runtime.client(&root_primary).unwrap();
         if remote {
-            // LookupPaths returns selected rows without hydrating this facade's
-            // durable replica. Receive the actual primary journal through the
-            // normal authority-checked route before testing physical pages.
+            // The ordinary lookup remains part of the fixture, but its reply
+            // cannot substitute for the physical acknowledgement above.
             let synced = service
                 .route_namespace_operation_to_metadata_primary_with_timeout_and_options(
                     sifs_file_system_id(),
