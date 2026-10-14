@@ -8471,12 +8471,43 @@ fn create_directory_with_replica_stopped_before_commit(
         digest
     });
     drop(hook);
-    let backend = crate::LocalSobjMetadataBackend::open_for_inspection(
+    let replica_root = crate::default_dfs_metadata_shards_root(runtime.data_dir(replica))
+        .join(crate::metadata_keys::key_segment(&digest.shard_id.0));
+    let inspected = crate::LocalSobjMetadataBackend::open_for_inspection(
         digest.shard_id.clone(),
-        crate::default_dfs_metadata_shards_root(runtime.data_dir(replica))
-            .join(crate::metadata_keys::key_segment(&digest.shard_id.0)),
+        &replica_root,
     )
     .unwrap();
+    let durable_head = digest.prepare_sequence;
+    assert!(
+        inspected
+            .journal_since_limited(durable_head, 1)
+            .unwrap()
+            .is_empty(),
+        "the paused author cannot have sent a later commit before the receiver stopped"
+    );
+    let frames = inspected
+        .journal_since_limited(digest.prepare_sequence - 1, 1)
+        .unwrap();
+    assert_eq!(
+        frames.len(),
+        1,
+        "the stopped receiver must retain its actual acknowledged Prepare"
+    );
+    assert_eq!(frames[0].sequence, digest.prepare_sequence);
+    assert!(matches!(&frames[0].mutation,
+        crate::DfsMetadataMutation::PrepareOperationV7 { record, .. } if record.digest == digest));
+    drop(inspected);
+    // A native ACK certifies the journal; its asynchronous table replay can
+    // still be pending when Main stops. Recover that same acknowledged log
+    // before asserting its materialized hidden record, without authoring work.
+    let backend =
+        crate::LocalSobjMetadataBackend::new(digest.shard_id.clone(), &replica_root).unwrap();
+    assert_eq!(
+        backend.journal_last_sequence(),
+        durable_head,
+        "materializing the acknowledged Prepare must not author another frame"
+    );
     let original = backend
         .prepared_operation_record(&digest.operation_id)
         .unwrap()

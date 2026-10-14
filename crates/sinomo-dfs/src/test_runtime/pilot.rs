@@ -353,16 +353,41 @@ fn embedded_runtime_journal_and_snapshot_roundtrip_survive_receiver_reopen() {
     assert!(snapshot_prefix.is_well_formed());
     assert_eq!(snapshot_prefix.journal_sequence, snapshot_head);
     runtime.stop_node(&replica).unwrap();
-    // Full-set preparation does not imply that every receiver has already
-    // replayed the later commit marker. Preserve its exact stopped cut as the
-    // pre-install state; the explicit snapshot RPC below must establish the
-    // source's complete committed image.
-    let before_install =
-        LocalSobjMetadataBackend::open_for_inspection(shard_id.clone(), &replica_root)
-            .unwrap()
+    // Recover the stopped receiver's complete durable journal before capturing
+    // its pre-install table cut. A read-only inspection can lag an already
+    // acknowledged marker which ordinary reopen would then materialize even
+    // while all background network traffic is held.
+    let before_install = {
+        let inspected =
+            LocalSobjMetadataBackend::open_for_inspection(shard_id.clone(), &replica_root).unwrap();
+        let materialized = inspected
+            .export_table_snapshot()
+            .materialized_through_sequence;
+        let tail = inspected
+            .journal_since_limited(
+                materialized,
+                crate::DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
+            )
+            .unwrap();
+        assert!(
+            tail.len() < crate::DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
+            "the complete stopped tail must fit the existing bounded journal page"
+        );
+        let durable_head = tail.last().map_or(materialized, |entry| entry.sequence);
+        drop(inspected);
+        let recovered = LocalSobjMetadataBackend::new(shard_id.clone(), &replica_root).unwrap();
+        assert_eq!(
+            recovered.journal_last_sequence(),
+            durable_head,
+            "stopped receiver replay must not author a new journal frame"
+        );
+        let cut = recovered
             .export_shard_table_snapshot(&shard_id)
             .unwrap()
             .unwrap();
+        assert_eq!(cut.materialized_through_sequence, durable_head);
+        cut
+    };
     let command = DfsMetadataSnapshotInstallCommand {
         request_id: "embedded-real-snapshot-roundtrip".to_string(),
         source_node_id: primary.clone(),
