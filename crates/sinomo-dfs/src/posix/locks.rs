@@ -605,31 +605,101 @@ mod tests {
     }
 
     #[test]
-    fn clustered_lock_partial_shard_uses_operation_bound_quorum_fallback() {
+    fn clustered_lock_waits_for_all_metadata_replicas_without_kv_fallback() {
         let nodes = DfsTestRuntime::ordered_node_ids("lock-partial-shard", 3);
         let primary = nodes[0].clone();
         let replica_a = nodes[1].clone();
         let replica_b = nodes[2].clone();
-        let (runtime, mut service, object, txn_calls) =
-            clustered_lock_fixture(primary, vec![replica_a.clone(), replica_b], vec![replica_a]);
-
+        let (mut runtime, mut service, object, txn_calls) = clustered_lock_fixture(
+            primary,
+            vec![replica_a.clone(), replica_b.clone()],
+            vec![replica_a],
+        );
+        let command = DfsAdvisoryLockCommand::Acquire {
+            request_id: DfsAdvisoryLockRequestId::new("fallback-acquire"),
+            session_id: DfsAdvisoryLockSessionId::new("fallback-session"),
+            mode: DfsAdvisoryLockMode::Exclusive,
+            blocking: false,
+            process_id: Some(8),
+        };
+        let error = service
+            .posix_apply_advisory_lock_local(
+                &object.path,
+                &object.object_id,
+                &command,
+                Duration::from_secs(5),
+            )
+            .expect_err("two acknowledgements cannot publish a three-member lock grant");
+        assert!(
+            matches!(
+                error,
+                DfsPosixError::Dfs(DfsError::MetadataRecoveryQuorumUnavailable {
+                    required: 3,
+                    verified: 2,
+                    ..
+                })
+            ),
+            "{error}"
+        );
+        assert_eq!(txn_calls.txn_calls(), 0);
+        let backend = service.metadata_backend().unwrap();
+        assert!(
+            backend
+                .get_advisory_lock_state(&object.file_system_id, &object.object_id)
+                .unwrap()
+                .is_none()
+        );
+        let pending = backend.list_prepared_operations().unwrap().into_iter().filter(|record| {
+            record.metadata_effects.iter().any(|effect| matches!(effect,
+                crate::DfsPreparedMetadataEffect::PutAdvisoryLockState { state } if state.object_id == object.object_id))
+        }).collect::<Vec<_>>();
+        assert_eq!(pending.len(), 1);
+        let original = &pending[0];
+        assert!(original.expected_journal_sequence.is_some());
+        runtime.reopen_node(replica_b).unwrap();
+        // Reconcile the exact saved body, including its original grant clock
+        // and read set, before retrying the caller's unchanged lock command.
+        let recovered = service
+            .commit_stored_prepared_operation(&original.digest)
+            .unwrap();
+        assert_eq!(recovered.payload, original.payload);
+        let before = service
+            .metadata_backend()
+            .unwrap()
+            .export_shard_table_snapshot(&original.shard_id)
+            .unwrap()
+            .unwrap();
         let outcome = service
             .posix_apply_advisory_lock_local(
                 &object.path,
                 &object.object_id,
-                &DfsAdvisoryLockCommand::Acquire {
-                    request_id: DfsAdvisoryLockRequestId::new("fallback-acquire"),
-                    session_id: DfsAdvisoryLockSessionId::new("fallback-session"),
-                    mode: DfsAdvisoryLockMode::Exclusive,
-                    blocking: false,
-                    process_id: Some(8),
-                },
+                &command,
                 Duration::from_secs(5),
             )
-            .expect("operation-bound fallback lock grant");
-
+            .expect("full-participant exact lock replay");
         assert!(matches!(outcome, DfsAdvisoryLockOutcome::Acquired { .. }));
-        assert_eq!(txn_calls.txn_calls(), 1);
+        assert_eq!(txn_calls.txn_calls(), 0);
+        assert_eq!(
+            service
+                .metadata_backend()
+                .unwrap()
+                .export_shard_table_snapshot(&original.shard_id)
+                .unwrap()
+                .unwrap(),
+            before
+        );
+        let committed = service
+            .metadata_backend()
+            .unwrap()
+            .prepared_operation_record(&original.operation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(committed.digest, original.digest);
+        assert_eq!(committed.payload, original.payload);
+        assert_eq!(
+            committed.status,
+            crate::DfsPreparedOperationStatus::Committed
+        );
         drop(service);
         runtime
             .close()
