@@ -393,9 +393,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         expected: &DfsMetadataShardConfig,
     ) -> Result<bool, DfsError> {
+        // An empty, quiescent lane has no prior operational projection to
+        // replace. Preserve its lazy state just as the fresh Core opener does;
+        // the exact instance rebind still validates the full completion proof.
+        let was_lazy =
+            self.metadata.objects.is_empty() && self.can_release_hydrated_metadata_projection();
         let rebound = self.rebind_completed_local_metadata_shard_instance_if_frozen(expected)?;
         if rebound {
-            self.hydrate_from_metadata_backend()?;
+            if was_lazy {
+                self.hydrate_file_systems_from_metadata_backend()?;
+            } else {
+                self.hydrate_from_metadata_backend()?;
+            }
         }
         Ok(rebound)
     }

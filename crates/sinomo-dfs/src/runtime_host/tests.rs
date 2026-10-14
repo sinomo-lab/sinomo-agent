@@ -4667,45 +4667,20 @@ fn run_daemon_dfs_maintenance_body_for_test(
     paths: &DaemonPaths,
     runtime: &tokio::runtime::Runtime,
 ) -> Result<(), DaemonError> {
-    let data_dir = SinomoDataDir::new(daemon_data_dir(paths)?);
-    let cluster_paths = ClusterPaths::new(&data_dir);
-    let cluster_state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)?;
-    let metadata_authority_preflight =
-        runtime.block_on(warm_daemon_dfs_metadata_authority_for_identity_async(
-            &cluster_paths,
-            &cluster_state.cluster_id,
-            &cluster_state.local_node_id,
+    // Enter the real owner/admission wrapper; calling the inner body cannot
+    // supply clustered publication custody.
+    runtime
+        .block_on(run_daemon_dfs_maintenance_tick_kind_on_runtime(
+            paths,
             runtime.handle(),
-        ))?;
-    let foreground_preemption =
-        daemon_dfs_mutation_scheduler(&data_dir)?.begin_maintenance_interest();
-    let mut deferred_work = None;
-    let result = runtime.block_on(run_daemon_dfs_maintenance_tick_with_admission(
-        data_dir,
-        cluster_paths.clone(),
-        runtime.handle(),
-        &metadata_authority_preflight,
-        DaemonDfsMaintenanceKind::AuthoritativeReconciliation {
-            content_gc_requested: true,
-            content_reservation_reconciliation_requested: true,
-            commit_promotion_recovery_requested: true,
-        },
-        sinomo_device::NodeResourceSnapshot::default(),
-        DfsCommittedWorkTracker::new(),
-        &mut deferred_work,
-        &mut None,
-        None,
-        &foreground_preemption,
-    ));
-    if let Some((detached_runtime, worker)) = deferred_work {
-        schedule_daemon_dfs_message_deferred_work(
-            runtime.handle(),
-            &cluster_paths,
-            detached_runtime,
-            worker,
-        );
-    }
-    result.map(|_| ())
+            DaemonDfsMaintenanceKind::AuthoritativeReconciliation {
+                content_gc_requested: true,
+                content_reservation_reconciliation_requested: true,
+                commit_promotion_recovery_requested: true,
+            },
+            sinomo_device::NodeResourceSnapshot::default(),
+        ))
+        .map(|_| ())
 }
 
 fn daemon_dfs_test_execution_scope(
@@ -9774,6 +9749,15 @@ fn daemon_dfs_distributed_write_skips_cold_full_metadata_hydrate() {
     let lane_opens_before_write = daemon_dfs_test_message_service_lane_open_count(&data_dir);
     let runtime = daemon_test_runtime("native-cold-write-lane-observer");
     let cache_key = data_dir.root();
+    let invoke_native = |command: crate::DfsMessageCommand| {
+        let response = native.rpc_call(
+            &remote,
+            &local,
+            crate::dfs_message_rpc_call(&command).unwrap(),
+            sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+        )?;
+        crate::decode_dfs_message_rpc_response(&response).map_err(|error| error.to_string())
+    };
     let mut routed_message = test_dfs_write_routed_message(
         &remote,
         &local,
@@ -9795,11 +9779,10 @@ fn daemon_dfs_distributed_write_skips_cold_full_metadata_hydrate() {
         .as_mut()
         .expect("write object metadata")
         .current_locations = vec![local.clone()];
-    let response = handle_daemon_dfs_message_on_runtime(
-        &paths,
-        test_dfs_message_command("dfs_message_write_skips_cold_hydrate", routed_message),
-        runtime.handle(),
-    )
+    let response = invoke_native(test_dfs_message_command(
+        "dfs_message_write_skips_cold_hydrate",
+        routed_message,
+    ))
     .expect("distributed write DFS message");
     assert_eq!(response.request_id, "dfs_message_write_skips_cold_hydrate");
     let written_object_id = first_object.object_id.clone();
@@ -10051,19 +10034,15 @@ fn daemon_dfs_distributed_write_skips_cold_full_metadata_hydrate() {
         entry.resident_metadata_initialized = true;
     }
 
-    handle_daemon_dfs_message_on_runtime(
-        &paths,
-        test_dfs_message_command(
-            "dfs_message_read_survives_maintenance",
-            test_dfs_lookup_routed_message(
-                &remote,
-                &local,
-                2,
-                "/services/daemon-write-skips-cold-hydrate.txt",
-            ),
+    invoke_native(test_dfs_message_command(
+        "dfs_message_read_survives_maintenance",
+        test_dfs_lookup_routed_message(
+            &remote,
+            &local,
+            2,
+            "/services/daemon-write-skips-cold-hydrate.txt",
         ),
-        runtime.handle(),
-    )
+    ))
     .expect("lightweight lookup DFS message");
     {
         let cache_slot = daemon_dfs_message_service_cache()
@@ -10137,11 +10116,10 @@ fn daemon_dfs_distributed_write_skips_cold_full_metadata_hydrate() {
         .as_mut()
         .expect("write object metadata")
         .current_locations = vec![local.clone()];
-    handle_daemon_dfs_message_on_runtime(
-        &paths,
-        test_dfs_message_command("dfs_message_write_after_maintenance", second_write),
-        runtime.handle(),
-    )
+    invoke_native(test_dfs_message_command(
+        "dfs_message_write_after_maintenance",
+        second_write,
+    ))
     .expect("distributed write after maintenance");
     assert_eq!(
         daemon_dfs_test_message_service_lane_open_count(&data_dir),
@@ -10156,9 +10134,31 @@ fn daemon_dfs_distributed_write_skips_cold_full_metadata_hydrate() {
             .expect("repair snapshot parent directory"),
     )
     .expect("create repair snapshot directory");
-    fs::write(&repair_snapshot, b"invalid repair snapshot").expect("corrupt repair snapshot");
+    // Corrupt the real queue after outer scheduling has observed it, at the
+    // existing admitted maintenance entry. This exercises failure while the
+    // body owns its lane, rather than an earlier preflight rejection.
+    let corrupted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let triggered = Arc::clone(&corrupted);
+    let corrupt_path = repair_snapshot.clone();
+    let failure = install_daemon_dfs_pre_dispatch_test_hook(
+        &data_dir,
+        Arc::new(move |point, command, _| {
+            if matches!(
+                point,
+                DaemonDfsPreDispatchTestPoint::BeforeResidentPreflight
+            ) && command.is_none()
+                && !triggered.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                fs::write(&corrupt_path, b"invalid repair snapshot")
+                    .expect("corrupt actual repair snapshot");
+            }
+            Ok(())
+        }),
+    );
     let error = run_daemon_dfs_maintenance_body_for_test(&paths, &runtime)
         .expect_err("corrupt repair state must fail maintenance");
+    drop(failure);
+    assert!(corrupted.load(std::sync::atomic::Ordering::SeqCst));
     assert!(
         error.to_string().contains("repair"),
         "unexpected maintenance error: {error}"
@@ -10173,8 +10173,8 @@ fn daemon_dfs_distributed_write_skips_cold_full_metadata_hydrate() {
                 .as_ref()
                 .expect("cache entry")
                 .primary_service
-                .is_none(),
-            "failed maintenance must drop its backend-bearing mutation lane"
+                .is_some(),
+            "failed maintenance must return its unchanged owner/storage lane without discarding live custody"
         );
     }
     fs::remove_file(&repair_snapshot).expect("remove corrupt repair snapshot");
@@ -10199,16 +10199,15 @@ fn daemon_dfs_distributed_write_skips_cold_full_metadata_hydrate() {
         .as_mut()
         .expect("write object metadata")
         .current_locations = vec![local.clone()];
-    handle_daemon_dfs_message_on_runtime(
-        &paths,
-        test_dfs_message_command("dfs_message_write_after_failed_maintenance", third_write),
-        runtime.handle(),
-    )
+    invoke_native(test_dfs_message_command(
+        "dfs_message_write_after_failed_maintenance",
+        third_write,
+    ))
     .expect("distributed write after failed maintenance");
     assert_eq!(
         daemon_dfs_test_message_service_lane_open_count(&data_dir),
-        lane_open_count_before_maintenance.saturating_add(1),
-        "the first mutation after failed maintenance must open a new lane"
+        lane_open_count_before_maintenance,
+        "the first mutation after failed maintenance must reuse the checked returned lane"
     );
 
     let current_state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
@@ -10228,11 +10227,21 @@ fn daemon_dfs_distributed_write_skips_cold_full_metadata_hydrate() {
         .iter_mut()
         .find(|member| member.node_id == added_peer)
         .unwrap();
-    let endpoint = member
-        .endpoints
-        .first_mut()
-        .expect("actual mounted peer endpoint");
-    endpoint.priority = endpoint.priority.saturating_add(1);
+    let before_endpoints = member.endpoints.clone();
+    if let Some(endpoint) = member.endpoints.first_mut() {
+        endpoint.priority = endpoint.priority.saturating_add(1);
+    } else {
+        // The native component carrier has no socket endpoint. Change only
+        // routing DATA to a deliberately unusable address, never live health.
+        member
+            .endpoints
+            .push(sinomo_core::network::daemon_lan_endpoint(
+                &added_peer,
+                "127.0.0.1:9".to_string(),
+                5,
+            ));
+    }
+    assert_ne!(member.endpoints, before_endpoints);
     let control = native.shared_control_plane().unwrap();
     control
         .with_client(|kv| {
@@ -10272,13 +10281,13 @@ fn daemon_dfs_distributed_write_skips_cold_full_metadata_hydrate() {
     }
     assert_eq!(
         daemon_dfs_test_message_service_lane_open_count(&data_dir),
-        lane_open_count_before_maintenance.saturating_add(1),
+        lane_open_count_before_maintenance,
         "peer-only maintenance refresh must retain the open metadata backend"
     );
 
     let current_state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
         .expect("current cluster state");
-    let retained = take_daemon_dfs_message_mutation_service_for_maintenance(
+    let mut retained = take_daemon_dfs_message_mutation_service_for_maintenance(
         &data_dir,
         &cluster_paths,
         &current_state,
@@ -10286,6 +10295,20 @@ fn daemon_dfs_distributed_write_skips_cold_full_metadata_hydrate() {
         None,
     )
     .expect("take mutation lane for authority-change validation");
+    assert!(
+        retained
+            .lane
+            .service
+            .can_release_hydrated_metadata_projection()
+    );
+    // Retain the old service/signature for the handback check, but release our
+    // own resident checkout before the actual handoff needs the same store.
+    retained
+        .lane
+        .service
+        .release_resident_metadata_backend()
+        .unwrap();
+
     let changed_root_shard = native
         .reassign_metadata_shard(
             &root_shard.file_system_id,
@@ -10303,6 +10326,26 @@ fn daemon_dfs_distributed_write_skips_cold_full_metadata_hydrate() {
         )
         .unwrap();
     assert_eq!(changed_root_shard.epoch, root_shard.epoch + 1);
+    // The real handoff serves work and installs its current lane. A delayed
+    // old handback must refuse reuse without removing or replacing that lane.
+    let (current_signature, current_lane) = {
+        let slot = daemon_dfs_message_service_cache().root(&cache_key).unwrap();
+        let cache = slot.lock().unwrap();
+        let entry = cache.as_ref().unwrap();
+        assert_ne!(
+            entry.signature.metadata_storage_generation,
+            retained.signature.metadata_storage_generation
+        );
+        (
+            entry.signature.clone(),
+            Arc::clone(
+                entry
+                    .primary_service
+                    .as_ref()
+                    .expect("actual handoff installed current lane"),
+            ),
+        )
+    };
     assert!(
         !restore_daemon_dfs_message_mutation_service_after_maintenance(
             &data_dir,
@@ -10313,18 +10356,17 @@ fn daemon_dfs_distributed_write_skips_cold_full_metadata_hydrate() {
         .expect("validate changed maintenance signature"),
         "authority changes must reject a maintenance lane captured from the old generation"
     );
-    assert!(
-        daemon_dfs_message_service_cache()
-            .root(&cache_key)
-            .expect("actual root cache slot")
-            .lock()
-            .expect("cache lock")
-            .as_ref()
-            .expect("cache entry")
-            .primary_service
-            .is_none(),
-        "a rejected authority generation must leave the mutation lane empty"
-    );
+    {
+        let slot = daemon_dfs_message_service_cache().root(&cache_key).unwrap();
+        let cache = slot.lock().unwrap();
+        let entry = cache.as_ref().unwrap();
+        assert_eq!(entry.signature, current_signature);
+        assert!(
+            Arc::ptr_eq(entry.primary_service.as_ref().unwrap(), &current_lane),
+            "rejected old authority cannot replace the actual handoff's current lane"
+        );
+    }
+    drop(current_lane);
     assert!(
         evict_daemon_dfs_message_service_cache(&data_dir).expect("evict message cache"),
         "shutdown must release the complete message cache"
