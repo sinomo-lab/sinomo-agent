@@ -1232,10 +1232,25 @@ impl LocalContentStore {
     // source. Keep one initializer and every current marker/intent/owner check.
     fn initialize_current(root: PathBuf) -> Result<Self> {
         let marker = root.join("content-reservations/00/batch-format-v1.sobj");
-        let has_current_marker = fs::read(&marker)
-            .ok()
-            .and_then(|bytes| decode_content_reservation_batch_sentinel(&bytes).ok())
-            .is_some_and(|sentinel| validate_content_reservation_batch_sentinel(&sentinel).is_ok());
+        let has_marker = || {
+            fs::read(&marker)
+                .ok()
+                .and_then(|bytes| decode_content_reservation_batch_sentinel(&bytes).ok())
+                .is_some_and(|sentinel| {
+                    validate_content_reservation_batch_sentinel(&sentinel).is_ok()
+                })
+        };
+        let mut has_current_marker = has_marker();
+        let _initialization = if has_current_marker {
+            None
+        } else {
+            create_dir_all(root.clone())?;
+            let guard = initialization::InitializationGuard::acquire(&root)?;
+            // A preceding initializer can finish while this opener waits.
+            // Never publish a new intent from an earlier empty-root read.
+            has_current_marker = has_marker();
+            Some(guard)
+        };
         if root.exists()
             && !has_current_marker
             && !initialization::pending(&root)?

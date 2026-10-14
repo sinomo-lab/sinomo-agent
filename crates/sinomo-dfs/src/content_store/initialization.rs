@@ -85,6 +85,47 @@ fn root_identity(root: &Path) -> Result<RootIdentity> {
         })
     }
 }
+/// Serializes only cold current initialization, including intent retirement.
+/// Keep this gate outside the empty root so a crash cannot leave an owner file
+/// inside an otherwise unidentifiable, uninitialized content layout. Never
+/// unlink the gate: another opener may already hold the same file identity.
+pub(super) struct InitializationGuard {
+    _file: fs::File,
+}
+impl InitializationGuard {
+    pub(super) fn acquire(root: &Path) -> Result<Self> {
+        let canonical = fs::canonicalize(root).map_err(|source| ContentStoreError::Io {
+            path: root.to_owned(),
+            source,
+        })?;
+        let parent = canonical
+            .parent()
+            .ok_or_else(|| invalid("root has no owned parent"))?;
+        let identity =
+            sinomo_object_serde::to_bytes(&root_identity(&canonical)?, 1, LengthMode::U32)
+                .map_err(|error| ContentStoreError::Serde(error.to_string()))?;
+        let path = parent.join(format!(
+            ".dfs-content-initialization-{}.lock",
+            blake3::hash(&identity).to_hex()
+        ));
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options
+            .open(&path)
+            .map_err(|source| ContentStoreError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        FileExt::lock_exclusive(&file).map_err(|source| ContentStoreError::Io { path, source })?;
+        Ok(Self { _file: file })
+    }
+}
+
 fn invalid(message: &str) -> ContentStoreError {
     ContentStoreError::InvalidContentLayout {
         message: format!("current content initialization: {message}"),
@@ -270,6 +311,55 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn concurrent_current_openers_keep_one_initialization_and_marker() {
+        let fixture = sinomo_testdir::TestDir::new("content-current-concurrent-open");
+        for case in 0..32 {
+            let root = fixture.join(format!("content-{case}"));
+            let start = std::sync::Arc::new(std::sync::Barrier::new(8));
+            let attempts = std::thread::scope(|scope| {
+                let threads = (0..8)
+                    .map(|_| {
+                        let root = root.clone();
+                        let start = std::sync::Arc::clone(&start);
+                        scope.spawn(move || {
+                            start.wait();
+                            let store = LocalContentStore::new(root)?;
+                            decode_content_reservation_batch_sentinel(&read_file(
+                                &store.content_reservation_batch_sentinel_path(),
+                            )?)
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                threads
+                    .into_iter()
+                    .map(|thread| thread.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            let errors = attempts
+                .iter()
+                .filter_map(|result| result.as_ref().err())
+                .collect::<Vec<_>>();
+            assert!(
+                errors.is_empty(),
+                "concurrent normal open failed in case {case}: {errors:?}"
+            );
+            let marker = attempts[0].as_ref().unwrap();
+            for actual in &attempts {
+                assert_eq!(actual.as_ref().unwrap(), marker);
+            }
+            assert!(!root.join(INTENT).exists());
+            let store = LocalContentStore::new(&root).unwrap();
+            assert_eq!(
+                decode_content_reservation_batch_sentinel(
+                    &read_file(&store.content_reservation_batch_sentinel_path()).unwrap(),
+                )
+                .unwrap(),
+                *marker
+            );
+        }
+    }
+
     #[test]
     fn copied_or_restamped_intent_cannot_admit_a_different_root_or_marker() {
         let fixture = sinomo_testdir::TestDir::new("content-current-initialization-binding");
