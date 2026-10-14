@@ -6171,6 +6171,18 @@ fn daemon_dfs_metadata_journal_batch_applies_to_local_backend() {
             )?;
             let response: crate::DfsMetadataJournalBatchResponse =
                 response.decode_body().map_err(|error| error.to_string())?;
+            let receiver = LocalSobjMetadataBackend::open_for_inspection(
+                shard_id.clone(),
+                crate::local_dfs_metadata_shard_path(runtime.data_dir(&replica), &shard_id),
+            )
+            .map_err(|error| error.to_string())?;
+            if receiver
+                .get_object_by_path(&shard.file_system_id, "/native-receiver-apply.bin")
+                .map_err(|error| error.to_string())?
+                .is_some()
+            {
+                return Err("a hidden Prepare must not expose the unpublished object".into());
+            }
             Ok(response)
         })();
         runtime.clear_faults();
@@ -6186,13 +6198,36 @@ fn daemon_dfs_metadata_journal_batch_applies_to_local_backend() {
             "one real complete Prepare frame first ingested"
         );
         let stat = published.expect("normal original RPC exact replay and commit complete");
-        let mut target = runtime.client(&replica).unwrap();
-        let object = target
-            .metadata_backend()
-            .unwrap()
-            .get_object(&stat.object_id)
-            .unwrap()
+        // The first ingest proved the hidden Prepare. Certify the actual
+        // subsequent Commit on every metadata member before inspecting it.
+        let mut source = runtime
+            .metadata_primary_service("/native-receiver-apply.bin")
             .unwrap();
+        let sync_target = source
+            .posix_capture_file_sync_target(
+                "/native-receiver-apply.bin",
+                crate::DfsPosixSyncKind::File,
+            )
+            .unwrap();
+        let synced = source
+            .posix_sync_file_local(&sync_target, sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
+            .unwrap();
+        assert_eq!(
+            synced
+                .metadata_certificate
+                .acknowledged_node_ids
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([shard.primary_node_id.clone(), replica.clone()])
+        );
+        drop(source);
+        let receiver = LocalSobjMetadataBackend::open_for_inspection(
+            shard_id.clone(),
+            crate::local_dfs_metadata_shard_path(runtime.data_dir(&replica), &shard_id),
+        )
+        .unwrap();
+        let object = receiver.get_object(&stat.object_id).unwrap().unwrap();
+        let mut target = runtime.client(&replica).unwrap();
         assert_eq!(object.version, stat.version);
         assert_eq!(
             target
