@@ -481,11 +481,32 @@ pub(super) fn try_take_daemon_dfs_message_mutation_service_for_maintenance(
             cross_shard_namespace_locks,
         )?,
     };
-    let handle = Arc::try_unwrap(handle).map_err(|_| sinomo_dfs::DfsError::Network {
-        message:
-            "daemon DFS mutation lane remained referenced after exclusive maintenance admission"
-                .to_string(),
-    })?;
+    let handle = match Arc::try_unwrap(handle) {
+        Ok(handle) => handle,
+        Err(handle) => {
+            // A rejected exclusive take has not consumed the live service.
+            // Restore that SAME handle before returning; dropping the cache
+            // reference here loses request custody and permits a replacement.
+            if let Some(slot) =
+                daemon_dfs_message_service_cache().existing_root(&data_dir.root())?
+            {
+                let mut cache = slot.lock().map_err(|_| daemon_dfs_cache_lock_error())?;
+                if let Some(entry) = cache.as_mut()
+                    && entry.signature.shares_metadata_storage(&signature)
+                    && Arc::ptr_eq(
+                        &entry.metadata_authority_generation,
+                        &metadata_authority_generation,
+                    )
+                    && entry.primary_service.is_none()
+                {
+                    entry.primary_service = Some(handle);
+                }
+            }
+            return Err(sinomo_dfs::DfsError::Network {
+                message: "daemon DFS mutation lane remained referenced after exclusive maintenance admission".to_string(),
+            }.into());
+        }
+    };
     let (lane, detached_send_runtime) = handle.into_parts();
     let mut lane = lane
         .into_inner()

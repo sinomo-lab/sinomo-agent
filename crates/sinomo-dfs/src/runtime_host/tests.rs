@@ -16878,3 +16878,102 @@ fn native_object_rpc_route_capability_tracks_both_endpoint_lifetimes() {
     drop(transport);
     native.close().unwrap();
 }
+
+#[test]
+fn rejected_shared_maintenance_take_keeps_the_actual_cached_service() {
+    let (native, nodes) =
+        crate::test_runtime::DfsTestRuntime::start_cluster("native-shared-maintenance-take", 1)
+            .unwrap();
+    let local = nodes[0].clone();
+    let data_dir = native.data_dir(&local).clone();
+    let paths = DaemonPaths::new(&data_dir);
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    let runtime = native.runtime_handle();
+    handle_daemon_dfs_message_on_runtime(
+        &paths,
+        test_dfs_message_command(
+            "native-shared-lane-warm",
+            test_dfs_lookup_routed_message(&local, &local, 1, "/services"),
+        ),
+        &runtime,
+    )
+    .unwrap();
+    let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths).unwrap();
+    let preflight = runtime
+        .block_on(warm_daemon_dfs_metadata_authority_for_identity_async(
+            &cluster_paths,
+            &state.cluster_id,
+            &local,
+            &runtime,
+        ))
+        .unwrap();
+    let scheduler = daemon_dfs_mutation_scheduler(&data_dir).unwrap();
+    let admission = runtime
+        .block_on(scheduler.admit(&DfsMessageExecutionScope::GlobalExclusive))
+        .unwrap();
+    let slot = daemon_dfs_message_service_cache()
+        .existing_root(&data_dir.root())
+        .unwrap()
+        .unwrap();
+    let observed = slot
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .primary_service
+        .as_ref()
+        .unwrap()
+        .clone();
+    let opens = daemon_dfs_test_message_service_lane_open_count(&data_dir);
+    let admitted = preflight.for_admission(&admission);
+    let error = match take_daemon_dfs_message_mutation_service_for_maintenance(
+        &data_dir,
+        &cluster_paths,
+        &state,
+        &runtime,
+        Some(&admitted),
+    ) {
+        Ok(_) => panic!("a shared actual service cannot be consumed exclusively"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("remained referenced"),
+        "{error:?}"
+    );
+    {
+        let cache = slot.lock().unwrap();
+        let retained = cache
+            .as_ref()
+            .unwrap()
+            .primary_service
+            .as_ref()
+            .expect("failed exclusive take must retain the original cached service");
+        assert!(Arc::ptr_eq(retained, &observed));
+    }
+    drop(observed);
+    let admitted = preflight.for_admission(&admission);
+    let taken = take_daemon_dfs_message_mutation_service_for_maintenance(
+        &data_dir,
+        &cluster_paths,
+        &state,
+        &runtime,
+        Some(&admitted),
+    )
+    .unwrap();
+    assert!(
+        restore_daemon_dfs_message_mutation_service_after_maintenance(
+            &data_dir,
+            &cluster_paths,
+            &runtime,
+            taken,
+        )
+        .unwrap()
+    );
+    assert_eq!(
+        daemon_dfs_test_message_service_lane_open_count(&data_dir),
+        opens
+    );
+    drop(admission);
+    drop(preflight);
+    native.close().unwrap();
+}
