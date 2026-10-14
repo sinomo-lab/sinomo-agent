@@ -915,6 +915,84 @@ mod tests {
     }
 
     #[test]
+    fn opened_lock_handle_uses_the_current_cut_for_an_external_close() {
+        let (_root, first, second, anchor) = two_services("advisory-current-cut");
+        let stale_cut = second
+            .lock()
+            .unwrap()
+            .metadata_backend()
+            .unwrap()
+            .export_table_snapshot()
+            .unwrap()
+            .prefix_proof;
+        let session_id = DfsAdvisoryLockSessionId::new("current-cut-holder");
+        let acquired = first
+            .lock()
+            .unwrap()
+            .posix_advisory_lock_for_object(
+                &anchor.path,
+                &anchor.object_id,
+                DfsAdvisoryLockCommand::Acquire {
+                    request_id: DfsAdvisoryLockRequestId::new("current-cut-acquire"),
+                    session_id: session_id.clone(),
+                    mode: DfsAdvisoryLockMode::Exclusive,
+                    blocking: false,
+                    process_id: Some(9001),
+                },
+            )
+            .unwrap();
+        assert!(matches!(acquired, DfsAdvisoryLockOutcome::Acquired { .. }));
+        let current_cut = first
+            .lock()
+            .unwrap()
+            .metadata_backend()
+            .unwrap()
+            .export_table_snapshot()
+            .unwrap()
+            .prefix_proof;
+        assert!(current_cut.journal_sequence > stale_cut.journal_sequence);
+        let close = DfsAdvisoryLockCommand::Close {
+            request_id: DfsAdvisoryLockRequestId::new("current-cut-close"),
+            session_id,
+        };
+        let mut closer = second.lock().unwrap();
+        let outcome = closer
+            .posix_advisory_lock_for_object(&anchor.path, &anchor.object_id, close.clone())
+            .expect("an already-open handle must plan from the current lock state and prefix");
+        assert!(matches!(
+            outcome,
+            DfsAdvisoryLockOutcome::Closed {
+                released_grant: true,
+                ..
+            }
+        ));
+        let after = closer
+            .metadata_backend()
+            .unwrap()
+            .export_table_snapshot()
+            .unwrap();
+        assert_eq!(
+            after.prefix_proof.journal_sequence,
+            current_cut.journal_sequence + 2
+        );
+        assert_eq!(
+            closer
+                .posix_advisory_lock_for_object(&anchor.path, &anchor.object_id, close)
+                .unwrap(),
+            outcome
+        );
+        assert_eq!(
+            closer
+                .metadata_backend()
+                .unwrap()
+                .export_table_snapshot()
+                .unwrap(),
+            after,
+            "the exact close retry must not append or change its saved result"
+        );
+    }
+
+    #[test]
     fn remote_session_close_marks_the_guard_lost_and_fences_use() {
         let (_root, first, second, anchor) = two_services("renewable-lease-loss");
         let session_id = DfsAdvisoryLockSessionId::new("lease-holder-lost");
