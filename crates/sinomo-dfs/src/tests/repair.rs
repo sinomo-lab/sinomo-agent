@@ -4530,9 +4530,19 @@ fn stale_repair_base_rejection_is_retryable() {
 #[test]
 fn active_repair_attempt_does_not_resurrect_cleared_resume_identity() {
     let (runtime, owner, replica, mut service, stat, intent_id, _background_interception) =
-        native_committed_repair_backlog("native-repair-clears-real-resume", false);
+        native_committed_repair_backlog("native-repair-clears-real-resume", true);
+    assert!(
+        _background_interception.is_some(),
+        "this case inspects the foreground producer's first native transfer"
+    );
     runtime.clear_faults();
-    assert_eq!(service.retry_pending_repairs_bounded(1).unwrap().len(), 1);
+    let prior_attempts = service.active_repair_attempt_records();
+    let scheduled = service.retry_pending_repairs_bounded(1).unwrap();
+    assert_eq!(
+        scheduled.len(),
+        1,
+        "actual prior transfer custody: {prior_attempts:#?}"
+    );
     let records = service.active_repair_attempt_records();
     assert_eq!(records.len(), 1);
     assert!(records[0].in_flight);
@@ -4589,10 +4599,20 @@ fn active_repair_attempt_does_not_resurrect_cleared_resume_identity() {
 #[test]
 fn repair_response_conflicting_receipt_preserves_retry_state() {
     let (runtime, owner, replica, mut service, stat, intent_id, _background_interception) =
-        native_committed_repair_backlog("native-repair-negative-reply-keeps-retry", false);
+        native_committed_repair_backlog("native-repair-negative-reply-keeps-retry", true);
+    assert!(
+        _background_interception.is_some(),
+        "this case inspects the foreground producer's first native transfer"
+    );
     runtime.clear_faults();
     let before = runtime.rpc_observations().len();
-    assert_eq!(service.retry_pending_repairs_bounded(1).unwrap().len(), 1);
+    let prior_attempts = service.active_repair_attempt_records();
+    let scheduled = service.retry_pending_repairs_bounded(1).unwrap();
+    assert_eq!(
+        scheduled.len(),
+        1,
+        "actual prior transfer custody: {prior_attempts:#?}"
+    );
     let original = service
         .transport
         .drain_incoming_messages()
