@@ -138,8 +138,8 @@ fn sharded_point_lookup_snapshot_refreshes_only_the_routed_path_shard() {
     let root = temp_root("sifs-sharded-point-lookup-snapshot");
     let node = NodeId::from_legacy_named("node_sifs_sharded_point_snapshot").expect("node");
     let shards = sifs_two_primary_shard_configs(&node, &node, 1, Vec::new(), Vec::new());
-    let mut backend =
-        open_local_sharded_metadata_backend(root.join("metadata"), shards).expect("metadata");
+    let mut backend = open_local_sharded_metadata_backend(root.join("metadata"), shards.clone())
+        .expect("metadata");
     let file_system_id = sifs_file_system_id();
 
     crate::metadata_sharded_backend::reset_sharded_consistent_read_snapshot_shards();
@@ -150,12 +150,34 @@ fn sharded_point_lookup_snapshot_refreshes_only_the_routed_path_shard() {
 
     assert_eq!(
         crate::metadata_sharded_backend::sharded_consistent_read_snapshot_shards(),
+        vec![DfsMetadataShardId::new("services")],
+        "a fresh routing generation has no historical Root fallback"
+    );
+    drop(backend);
+    let historical_root = root.join("historical-metadata");
+    let old = vec![
+        shards
+            .iter()
+            .find(|shard| shard.shard_id == "root")
+            .unwrap()
+            .clone(),
+    ];
+    drop(open_local_sharded_metadata_backend(&historical_root, old).unwrap());
+    let mut backend = open_local_sharded_metadata_backend(&historical_root, shards).unwrap();
+    crate::metadata_sharded_backend::reset_sharded_consistent_read_snapshot_shards();
+    backend
+        .begin_consistent_read_snapshot_for_path(&file_system_id, "/services/point-lookup-parent")
+        .unwrap();
+    backend.end_consistent_read_snapshot_for_path(&file_system_id, "/services/point-lookup-parent");
+    assert_eq!(
+        crate::metadata_sharded_backend::sharded_consistent_read_snapshot_shards(),
         vec![
             DfsMetadataShardId::new("services"),
-            DfsMetadataShardId::new("root"),
+            DfsMetadataShardId::new("root")
         ],
-        "one-path response hydration must retain the routing fallback without refreshing the unrelated users shard"
+        "actual retained Root routing must be included without refreshing unrelated users"
     );
+    drop(backend);
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -299,7 +321,7 @@ fn routed_namespace_without_local_replay_omits_response_journal_batches() {
     assert_eq!(
         cluster
             .replica
-            .posix_stat("/services/no-replay-batches")
+            .posix_stat_distributed("/services/no-replay-batches")
             .unwrap()
             .kind,
         DfsObjectKind::Directory
@@ -365,34 +387,57 @@ fn durable_namespace_exact_retry_replays_completed_rename_and_rejects_id_reuse()
 #[test]
 fn routed_namespace_cursor_snapshot_uses_cached_state_not_backend_status() {
     let mut cluster = sifs_two_primary_cluster("sifs-namespace-cached-cursors");
-    let services_shard = DfsMetadataShardId::new("services");
+    let shard = DfsMetadataShardId::new("services");
     cluster
         .replica
         .replication
         .local_metadata_journal_cursors
         .clear();
+    crate::metadata_sharded_backend::take_sharded_metadata_status_query_count();
     assert!(
         cluster
             .replica
             .local_metadata_shard_cursors()
-            .expect("cached cursors")
-            .is_empty(),
-        "routed namespace sends must not scan backend shard status when the cache is empty"
+            .unwrap()
+            .is_empty()
     );
-
-    cluster
+    assert_eq!(
+        crate::metadata_sharded_backend::take_sharded_metadata_status_query_count(),
+        0
+    );
+    let mut author = cluster
+        ._runtime
+        .metadata_primary_service("/services")
+        .unwrap();
+    author
+        .posix_mkdir_all("/services/actual-cursor-progress")
+        .unwrap();
+    let synced = author.posix_sync_directory("/services").unwrap();
+    let actual = synced.metadata_certificate.target.journal_sequence;
+    drop(author);
+    let cfg = cluster
+        ._runtime
+        .metadata_shards()
+        .unwrap()
+        .into_iter()
+        .find(|cfg| cfg.shard_id == shard.0)
+        .unwrap();
+    // Consume genuine native progress before testing the quiet cached read.
+    let initial = cluster
         .replica
-        .replication
-        .local_metadata_journal_cursors
-        .insert(services_shard.clone(), 42);
-    let cursors = cluster
-        .replica
-        .local_metadata_shard_cursors()
-        .expect("cached cursor snapshot");
-    assert_eq!(cursors.len(), 1);
-    assert_eq!(cursors[0].shard_id, services_shard);
-    assert_eq!(cursors[0].after_sequence, 42);
-
+        .local_metadata_shard_cursors_for(Some(&[cfg]))
+        .unwrap();
+    assert_eq!(initial.len(), 1);
+    assert_eq!(initial[0].after_sequence, actual);
+    crate::metadata_sharded_backend::take_sharded_metadata_status_query_count();
+    let cached = cluster.replica.local_metadata_shard_cursors().unwrap();
+    assert_eq!(cached, initial);
+    assert_eq!(cached[0].shard_id, shard);
+    assert_eq!(
+        crate::metadata_sharded_backend::take_sharded_metadata_status_query_count(),
+        0,
+        "quiet routed cursor reads must not scan backend shard status"
+    );
     cluster.close();
 }
 
@@ -482,6 +527,16 @@ fn sync_path_response_object_updates_outsider_read_view_without_journal_batches(
         )
         .unwrap();
     drop(writer);
+    let local_snapshot = || {
+        LocalSobjMetadataBackend::open_for_inspection(
+            DfsMetadataShardId::new("services"),
+            crate::default_dfs_metadata_shards_root(runtime.data_dir(&outsider))
+                .join(crate::metadata_keys::key_segment(&"services")),
+        )
+        .unwrap()
+        .export_table_snapshot()
+    };
+    let unchanged = local_snapshot();
     let before = runtime.rpc_observations().len();
     let response = reader
         .route_namespace_operation_to_metadata_primary_with_timeout_and_options(
@@ -500,11 +555,22 @@ fn sync_path_response_object_updates_outsider_read_view_without_journal_batches(
     assert_eq!(actual.version, stat.version);
     assert_eq!(actual.content_hash, stat.content_hash);
     assert_eq!(
+        local_snapshot(),
+        unchanged,
+        "a reply object does not grant outsider journal ingestion"
+    );
+    let public = reader.posix_stat_distributed(path).unwrap();
+    assert_eq!(public.object_id, actual.object_id);
+    assert_eq!(public.version, actual.version);
+    assert_eq!(public.content_hash, actual.content_hash);
+    assert!(
         reader
             .metadata()
-            .object_by_normalized_posix_path(&config.file_system_id, path),
-        Some(&actual)
+            .object_by_normalized_posix_path(&config.file_system_id, path)
+            .is_none(),
+        "Main owns persistence; public current reads do not invent a private replica"
     );
+    assert_eq!(local_snapshot(), unchanged);
     assert!(
         runtime.rpc_observations()[before..]
             .iter()
@@ -835,12 +901,14 @@ fn sifs_cluster_posix_mkdir_all_under_services_replays_created_chain() {
         .posix_mkdir_all("/services/cluster-tests/latency-regression")
         .expect("routed services mkdir_all");
     assert!(
-        replica.posix_stat("/services/cluster-tests").is_ok(),
+        replica
+            .posix_stat_distributed("/services/cluster-tests")
+            .is_ok(),
         "mkdir_all must sync the intermediate directory"
     );
     assert!(
         replica
-            .posix_stat("/services/cluster-tests/latency-regression")
+            .posix_stat_distributed("/services/cluster-tests/latency-regression")
             .is_ok(),
         "mkdir_all must sync the created leaf directory"
     );

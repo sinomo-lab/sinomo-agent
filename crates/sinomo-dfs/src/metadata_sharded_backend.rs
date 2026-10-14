@@ -89,10 +89,16 @@ const ROUTING_TOPOLOGY_HISTORY_LIMIT: usize = 4;
 
 #[cfg(test)]
 thread_local! {
+    static SHARDED_METADATA_STATUS_QUERY_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static SHARDED_METADATA_OBJECT_ID_LOOKUP_COUNT: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
     static SHARDED_CONSISTENT_READ_SNAPSHOT_SHARDS: std::cell::RefCell<Vec<DfsMetadataShardId>> =
         const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+pub(crate) fn take_sharded_metadata_status_query_count() -> usize {
+    SHARDED_METADATA_STATUS_QUERY_COUNT.replace(0)
 }
 
 #[cfg(test)]
@@ -6033,6 +6039,9 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
     }
 
     fn metadata_shard_statuses(&self) -> Result<Vec<DfsMetadataShardStatus>> {
+        #[cfg(test)]
+        SHARDED_METADATA_STATUS_QUERY_COUNT
+            .set(SHARDED_METADATA_STATUS_QUERY_COUNT.get().saturating_add(1));
         let mut statuses = Vec::new();
         for shard in self.shard_configs.values() {
             let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
