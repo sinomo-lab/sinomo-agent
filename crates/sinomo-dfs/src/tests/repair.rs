@@ -3478,6 +3478,10 @@ fn apply_committed_intent_tolerates_missing_local_repair_blob() {
             DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
         )
         .unwrap();
+    // The following apply/repair assertions belong to the actual producer,
+    // not the browser client's routed pending-request identity.
+    drop(dfs);
+    let mut dfs = runtime.metadata_primary_service(&path).unwrap();
     let request = DfsWriteRequest {
         file_system_id: base.file_system_id,
         object_id: base.object_id,
@@ -3623,8 +3627,52 @@ fn apply_committed_intent_tolerates_missing_local_repair_blob() {
 #[test]
 fn repair_blob_sources_use_backend_current_locations_over_stale_memory() {
     let name = "native-repair-sources-current-backend";
-    let (runtime, primary, missing, requester, base, _) =
-        native_read_fixture(name, 1, false, b"actual old source bytes".to_vec());
+    let (runtime, seed, config) =
+        crate::test_support::current_native_metadata_service(name, 3, "/services").unwrap();
+    drop(seed);
+    let primary = config.primary_node_id;
+    let peers = crate::test_runtime::DfsTestRuntime::ordered_node_ids(name, 3)
+        .into_iter()
+        .filter(|node| *node != primary)
+        .collect::<Vec<_>>();
+    let missing = peers[0].clone();
+    let requester = peers[1].clone();
+    let path = format!("/services/{name}.bin");
+    // This test performs an Eventual overwrite. The shared read fixture creates
+    // Confirmed objects, whose immutable policy cannot admit a W1/N2 write.
+    let mut initial = DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 1).unwrap();
+    initial.required_node_ids = vec![primary.clone()];
+    initial.forbidden_node_ids = peers;
+    runtime
+        .apply_placement_policy(&primary, &path, DfsPlacementScope::Subtree, initial)
+        .unwrap();
+    let mut seed = runtime.client(&primary).unwrap();
+    let (resolved, _, initial_replication) = seed
+        .managed_replication_policy_for_path(&path, DfsObjectPolicy::ReplicatedEventual, 1)
+        .unwrap();
+    assert_eq!(
+        resolved.policy.consistency,
+        DfsObjectPolicy::ReplicatedEventual
+    );
+    let base = seed
+        .posix_write_file(
+            &path,
+            b"actual old source bytes",
+            DfsWriteOptions {
+                replica_candidates: vec![primary.clone()],
+                policy: initial_replication,
+                wait_for_commit: true,
+                foreground_replica_repair: false,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        seed.current_read_object_metadata(&base.object_id)
+            .unwrap()
+            .policy,
+        DfsObjectPolicy::ReplicatedEventual
+    );
+    drop(seed);
     let mut stale = runtime.client(&primary).unwrap();
     stale.hydrate_from_metadata_backend().unwrap();
     let old_memory = stale.metadata().object(&base.object_id).unwrap().clone();
@@ -3633,6 +3681,7 @@ fn repair_blob_sources_use_backend_current_locations_over_stale_memory() {
     let nodes = vec![requester.clone(), missing.clone()];
     let mut placement = DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 2).unwrap();
     placement.required_node_ids = nodes.clone();
+    placement.forbidden_node_ids = vec![primary.clone()];
     runtime
         .apply_placement_policy(&primary, &base.path, DfsPlacementScope::Subtree, placement)
         .unwrap();
@@ -3647,6 +3696,7 @@ fn repair_blob_sources_use_backend_current_locations_over_stale_memory() {
     let bytes = vec![0x51; 2 * 1024 * 1024 + 11];
     let mut policy = DfsReplicationPolicy::new(1, 2).unwrap();
     policy.required_node_ids = nodes.clone();
+    policy.forbidden_node_ids = vec![primary.clone()];
     writer
         .write_distributed_bytes_with_base(
             request.clone(),
@@ -3678,7 +3728,7 @@ fn repair_blob_sources_use_backend_current_locations_over_stale_memory() {
         old_memory.version,
         "this is an actual retained old client projection across a normal new publication"
     );
-    let mut restored = runtime.client(&primary).unwrap();
+    let mut restored = runtime.metadata_primary_service(&path).unwrap();
     restored.hydrate_from_metadata_backend().unwrap();
     let job = restored
         .coordinator()
