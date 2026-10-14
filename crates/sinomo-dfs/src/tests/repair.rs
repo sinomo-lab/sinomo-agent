@@ -5179,6 +5179,20 @@ fn repair_command_accepts_current_replica_after_metadata_primary_moves() {
         .unwrap()
         .unwrap();
     assert_eq!(intent.status, DfsWriteIntentStatus::Committed);
+    // The attachment producer reads a live manifest. Materialize that exact
+    // already-committed local identity from the source's real stored blob.
+    let actual_bytes = writer.content().read_blob(&content_hash).unwrap();
+    assert_eq!(actual_bytes, bytes);
+    let manifest = writer
+        .content()
+        .put_object_version(
+            stat.object_id.as_str(),
+            stat.version.as_str(),
+            &actual_bytes,
+        )
+        .unwrap();
+    assert_eq!(manifest.content_hash, content_hash);
+
     assert_eq!(
         writer
             .content()
