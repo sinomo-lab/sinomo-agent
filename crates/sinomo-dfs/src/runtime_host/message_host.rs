@@ -442,8 +442,23 @@ pub(super) fn try_take_daemon_dfs_message_mutation_service_for_maintenance(
                 )?;
             entry.resident_metadata_initialized = true;
         }
+        // Extraction and rejected-take restoration share the cache lock. A
+        // reader must never observe an empty slot while the old service remains
+        // shared; only a successful exclusive take may expose that state.
+        let cached = match entry.primary_service.take() {
+            Some(handle) => match Arc::try_unwrap(handle) {
+                Ok(handle) => Some(handle),
+                Err(handle) => {
+                    entry.primary_service = Some(handle);
+                    return Err(sinomo_dfs::DfsError::Network {
+                        message: "daemon DFS mutation lane remained referenced after exclusive maintenance admission".to_string(),
+                    }.into());
+                }
+            },
+            None => None,
+        };
         (
-            entry.primary_service.take(),
+            cached,
             entry.content_store.clone(),
             entry.resident_metadata_backend.clone(),
             entry.cross_shard_namespace_locks.clone(),
@@ -460,7 +475,7 @@ pub(super) fn try_take_daemon_dfs_message_mutation_service_for_maintenance(
     ) = cached;
     let handle = match cached {
         Some(handle) => handle,
-        None => open_daemon_dfs_message_service_lane_with_content(
+        None => Arc::try_unwrap(open_daemon_dfs_message_service_lane_with_content(
             data_dir,
             cluster_paths,
             &signature.local_node_id,
@@ -479,33 +494,10 @@ pub(super) fn try_take_daemon_dfs_message_mutation_service_for_maintenance(
             ),
             resident_metadata_backend.map(DaemonDfsResidentMetadataScope::Global),
             cross_shard_namespace_locks,
-        )?,
-    };
-    let handle = match Arc::try_unwrap(handle) {
-        Ok(handle) => handle,
-        Err(handle) => {
-            // A rejected exclusive take has not consumed the live service.
-            // Restore that SAME handle before returning; dropping the cache
-            // reference here loses request custody and permits a replacement.
-            if let Some(slot) =
-                daemon_dfs_message_service_cache().existing_root(&data_dir.root())?
-            {
-                let mut cache = slot.lock().map_err(|_| daemon_dfs_cache_lock_error())?;
-                if let Some(entry) = cache.as_mut()
-                    && entry.signature.shares_metadata_storage(&signature)
-                    && Arc::ptr_eq(
-                        &entry.metadata_authority_generation,
-                        &metadata_authority_generation,
-                    )
-                    && entry.primary_service.is_none()
-                {
-                    entry.primary_service = Some(handle);
-                }
-            }
-            return Err(sinomo_dfs::DfsError::Network {
-                message: "daemon DFS mutation lane remained referenced after exclusive maintenance admission".to_string(),
-            }.into());
-        }
+        )?)
+        .map_err(|_| sinomo_dfs::DfsError::Network {
+            message: "newly constructed DFS mutation lane was unexpectedly shared".into(),
+        })?,
     };
     let (lane, detached_send_runtime) = handle.into_parts();
     let mut lane = lane

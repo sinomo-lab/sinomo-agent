@@ -16988,6 +16988,62 @@ fn rejected_shared_maintenance_take_keeps_the_actual_cached_service() {
             .expect("failed exclusive take must retain the original cached service");
         assert!(Arc::ptr_eq(retained, &observed));
     }
+    drop(admission);
+    let (empty_observations, replacements, shared_rejections) = std::thread::scope(|scope| {
+        let worker = scope.spawn(|| {
+            let mut shared_rejections = 0;
+            for _ in 0..64 {
+                let admission = runtime
+                    .block_on(scheduler.admit(&DfsMessageExecutionScope::GlobalExclusive))
+                    .unwrap();
+                let admitted = preflight.for_admission(&admission);
+                match try_take_daemon_dfs_message_mutation_service_for_maintenance(
+                    &data_dir,
+                    &cluster_paths,
+                    &state,
+                    &runtime,
+                    Some(&admitted),
+                ) {
+                    Ok(_) => panic!("observed actual service cannot be consumed exclusively"),
+                    Err(DaemonDfsAuthorityPreExecutionError::Failed(error))
+                        if error.to_string().contains("remained referenced") =>
+                    {
+                        shared_rejections += 1
+                    }
+                    Err(DaemonDfsAuthorityPreExecutionError::AuthorityPreflightStale(_)) => {}
+                    Err(error) => panic!("unexpected maintenance admission failure: {error:?}"),
+                }
+            }
+            shared_rejections
+        });
+        let mut empty_observations = 0;
+        let mut replacements = 0;
+        while !worker.is_finished() {
+            let cache = slot.lock().unwrap();
+            match cache.as_ref().unwrap().primary_service.as_ref() {
+                Some(retained) => replacements += usize::from(!Arc::ptr_eq(retained, &observed)),
+                None => empty_observations += 1,
+            }
+            drop(cache);
+            std::thread::yield_now();
+        }
+        (empty_observations, replacements, worker.join().unwrap())
+    });
+    assert!(
+        shared_rejections > 0,
+        "actual shared-owner rejection must be exercised"
+    );
+    assert_eq!(
+        empty_observations, 0,
+        "a rejected take must not expose an empty cache slot to another observer"
+    );
+    assert_eq!(
+        replacements, 0,
+        "the observed cached service identity must remain unchanged"
+    );
+    let admission = runtime
+        .block_on(scheduler.admit(&DfsMessageExecutionScope::GlobalExclusive))
+        .unwrap();
     drop(observed);
     let admitted = preflight.for_admission(&admission);
     let taken = take_daemon_dfs_message_mutation_service_for_maintenance(
