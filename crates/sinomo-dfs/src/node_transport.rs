@@ -7182,6 +7182,13 @@ impl DfsNodeTransport {
             self.served_mut().inbound_messages.push_back(message);
             return Ok(());
         }
+        if attachment.is_none() && dfs_network_message_is_committed_write_response(&message.message)
+        {
+            // The caller's own response was retained above. A different
+            // requester's completed write is replay-safe delivery work; it
+            // must not hold this served lane or maintenance admission over I/O.
+            return self.send_routed_message_to_peer_detached(target_node_id, message, true);
+        }
         self.send_routed_call_to_peer(
             target_node_id,
             DfsRoutedCall {
@@ -7240,6 +7247,11 @@ impl DfsNodeTransport {
                     .await?;
                 self.served_mut().inbound_messages.push_back(message);
                 return Ok(());
+            }
+            if attachment.is_none()
+                && dfs_network_message_is_committed_write_response(&message.message)
+            {
+                return self.send_routed_message_to_peer_detached(target_node_id, message, true);
             }
             self.send_routed_call_to_peer_async(
                 target_node_id,
@@ -7612,6 +7624,13 @@ impl DfsNodeTransport {
             .map(|state| state.inbound_messages.drain(..).collect())
             .unwrap_or_default()
     }
+}
+
+fn dfs_network_message_is_committed_write_response(message: &DfsNetworkMessage) -> bool {
+    matches!(message, DfsNetworkMessage::DistributedWriteResponse(response)
+    if matches!(&response.result, crate::DfsDistributedWriteResult::Outcome {
+        outcome: crate::NetworkedDfsWriteOutcome::Committed { .. }
+    }))
 }
 
 fn dfs_network_message_is_served_call_response(message: &DfsNetworkMessage) -> bool {

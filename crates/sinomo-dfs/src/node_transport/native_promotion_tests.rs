@@ -152,6 +152,66 @@ fn native_promotion_exact_ack_settles_and_suppresses_duplicate_identity() {
     case.finish();
 }
 
+#[test]
+fn native_deferred_worker_cancellation_releases_claim_and_preserves_real_outbox() {
+    let mut case = NativePromotions::new("native-promotion-worker-cancellation", 2, 2);
+    let runtime = Arc::new(crate::runtime_message::DfsDetachedSendRuntime::new());
+    case.transport.detached_send_state = runtime.detached_state();
+    case.enqueue(0, 0);
+    let worker = case.transport.fork_detached_send_worker();
+    let mut unpolled = None;
+    runtime.schedule_deferred_work(
+        worker.clone(),
+        BTreeSet::new(),
+        Duration::from_millis(10),
+        |task| unpolled = Some(task),
+    );
+    assert!(runtime.worker_is_active());
+    drop(
+        unpolled
+            .take()
+            .expect("the actual scheduled future has not been polled"),
+    );
+    assert!(
+        !runtime.worker_is_active(),
+        "unpolled cancellation releases the active claim"
+    );
+    assert_eq!(case.transport.pending_commit_promotion_count(), 1);
+    assert_eq!(case.transport.settled_commit_promotion_count(), 0);
+
+    let executor = case.runtime.runtime_handle();
+    for expected_settled in 1..=2 {
+        if expected_settled == 2 {
+            case.enqueue(1, 0);
+        }
+        let mut started = None;
+        runtime.schedule_deferred_work(
+            worker.clone(),
+            BTreeSet::new(),
+            Duration::from_millis(10),
+            |task| started = Some(executor.spawn(task)),
+        );
+        let task = started.expect("the cancelled worker cannot suppress a normal replacement");
+        executor.block_on(async {
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while case.transport.settled_commit_promotion_count() != expected_settled {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("actual receiver ACK settles the retained original promotion");
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+        });
+        assert!(
+            !runtime.worker_is_active(),
+            "polled cancellation also releases its claim"
+        );
+        assert_eq!(case.transport.pending_commit_promotion_count(), 0);
+    }
+    case.finish();
+}
+
 fn native_failed_promotion_retries_actual_receiver(action: FaultAction, label: &str) {
     let mut case = NativePromotions::new(label, 2, 1);
     case.fault(0, action);

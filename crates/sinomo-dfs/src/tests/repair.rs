@@ -778,6 +778,22 @@ fn served_receipt_returns_before_unrelated_completed_write_response_rpc() {
         .apply_placement_policy(&primary, &base.path, DfsPlacementScope::Subtree, placement)
         .unwrap();
     let captured = Arc::new(Mutex::new(Vec::<DfsRoutedMessage>::new()));
+    let captured_before_claim = Arc::clone(&captured);
+    let retry_hold = crate::runtime_host::install_daemon_dfs_pre_dispatch_test_hook(
+        runtime.data_dir(&primary),
+        Arc::new(move |point, _, _| {
+            if matches!(
+                point,
+                crate::runtime_host::DaemonDfsPreDispatchTestPoint::BeforeReplicaTransferClaim { .. }
+            ) && !captured_before_claim.lock().unwrap().is_empty()
+            {
+                return Err(DfsError::Cancelled {
+                    operation: "negative retry claim after original lost Stage",
+                });
+            }
+            Ok(())
+        }),
+    );
     runtime.install_fault(crate::test_runtime::FaultRule {
         source: Some(primary.clone()),
         target: Some(replica.clone()),
@@ -867,13 +883,40 @@ fn served_receipt_returns_before_unrelated_completed_write_response_rpc() {
     // The original lost send has genuinely expired its volatile reservation.
     // Reopen Main with the real durable unfinished intent before replaying its
     // owned reply, just as ordinary late-receipt recovery does.
+    let queue = LocalDfsRepairQueueStore::new(default_dfs_repair_attempt_snapshot_path(
+        runtime.data_dir(&primary),
+    ));
+    assert!(
+        !queue
+            .view()
+            .unwrap()
+            .records
+            .iter()
+            .any(|row| row.intent_id == intent_id),
+        "the expired precommit Stage has no durable named queue claim"
+    );
     runtime.stop_node(&primary).unwrap();
     runtime.reopen_node(primary.clone()).unwrap();
     let mut restored = runtime.client(&primary).unwrap();
     restored.hydrate_from_metadata_backend().unwrap();
+    assert!(
+        !queue
+            .view()
+            .unwrap()
+            .records
+            .iter()
+            .any(|row| row.intent_id == intent_id),
+        "the expired precommit Stage has no durable named queue claim"
+    );
     let retained = restored.writes.pending_writes.get(&intent_id).unwrap();
     assert!(retained.stage_retries.is_empty());
     assert!(retained.stage_inflight_request_ids.is_empty());
+    assert!(
+        restored
+            .ensure_stage_response_matches_pending(ack, &content_hash(&bytes))
+            .is_err(),
+        "the old ACK has no current same-kind request after restart"
+    );
     assert_ne!(
         restored
             .metadata_backend()
@@ -895,9 +938,96 @@ fn served_receipt_returns_before_unrelated_completed_write_response_rpc() {
         remaining_hits: 1,
         action: crate::test_runtime::FaultAction::PauseBeforeDispatch(Arc::clone(&gate)),
     });
+    let fresh_receiver = runtime.capture_served_work(&replica, 32).unwrap();
     let before = runtime.rpc_observations().len();
-    // Replay the exact owned acknowledgement through the real authenticated
-    // replica -> Main endpoint; the caller supplies no receipt or completion.
+    assert_eq!(
+        runtime.remove_faults_matching(|rule| rule.source.as_ref() == Some(&primary)
+            && rule.target.as_ref() == Some(&replica)
+            && rule.route.as_deref().is_some_and(|route| [
+                DFS_DATA_STAGE_BLOB_ROUTE,
+                DFS_DATA_REPAIR_REPLICA_ROUTE
+            ]
+            .contains(&route))),
+        2
+    );
+    // Recovery must produce a new real Stage; the expired ACK is never used
+    // as publication authority. Establish the blocked native completion before
+    // measuring the independent receipt RPC's original one-second budget.
+    let recovery_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    drop(retry_hold);
+    runtime.request_repair_reconciliation(&primary).unwrap();
+    let completion_ready = loop {
+        if runtime.rpc_observations()[before..].iter().any(|event| {
+            event.source == primary
+                && event.target == requester
+                && event.route == DFS_DATA_DISTRIBUTED_WRITE_RESPONSE_ROUTE
+                && event.phase == crate::test_runtime::RpcPhase::BeforeDispatch
+        }) {
+            break true;
+        }
+        if Instant::now() >= recovery_deadline {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    if !completion_ready {
+        gate.add_permits(1);
+    }
+    assert!(
+        completion_ready,
+        "normal fresh Stage recovery must reach its real completion; calls={:?}; receiver={:?}",
+        runtime.rpc_observations()[before..]
+            .iter()
+            .filter(|event| event.source == primary
+                && [
+                    DFS_DATA_STAGE_BLOB_ROUTE,
+                    DFS_DATA_DISTRIBUTED_WRITE_RESPONSE_ROUTE
+                ]
+                .contains(&event.route.as_str()))
+            .collect::<Vec<_>>(),
+        fresh_receiver.records()
+    );
+    let fresh_stages = fresh_receiver
+        .records()
+        .into_iter()
+        .filter_map(|record| {
+            if let DfsNetworkMessage::StageBlob(stage) = record.command.routed_message.message {
+                Some((
+                    stage.request_id,
+                    stage.intent_id,
+                    stage.object_id,
+                    stage.version,
+                    stage.content_hash,
+                    record.command.routed_message.source_node_id,
+                    record.command.routed_message.target_node_id,
+                    record.succeeded,
+                ))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        fresh_stages.iter().any(
+            |(request_id, stage_intent, object, version, hash, source, target, succeeded)| {
+                request_id != &receipt_rpc_id
+                    && stage_intent == &intent_id
+                    && object == &request.object_id
+                    && version == &request.target_version
+                    && hash == &content_hash(&bytes)
+                    && source == &primary
+                    && target == &replica
+                    && *succeeded
+            }
+        ),
+        "actual fresh Stage receiver reports: {fresh_stages:?}; carrier observations: {:?}",
+        runtime.rpc_observations()[before..]
+            .iter()
+            .filter(|event| event.source == primary && event.target == replica)
+            .collect::<Vec<_>>()
+    );
+    // This real expired receipt remains a negative control, while its handler
+    // must still be responsive during unrelated completion-delivery I/O.
     let started = Instant::now();
     let receipt = runtime.rpc_request(
         &replica,
