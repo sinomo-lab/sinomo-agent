@@ -757,6 +757,31 @@ fn sifs_replica_distributed_stat_prefers_primary_tombstone_over_stale_local_hit(
     );
     assert!(cluster.writer.posix_stat(path).is_ok());
 
+    // Pin an actual old read image in this browser only. Its mounted native
+    // replica stays available for every full-shard prepare and commit.
+    let root = default_dfs_metadata_shards_root(cluster._runtime.data_dir(&cluster.writer_node));
+    let mut inspection = LocalShardedMetadataBackend::open_for_inspection(
+        &root,
+        cluster._runtime.metadata_shards().unwrap(),
+    )
+    .unwrap();
+    inspection
+        .shard_backend_mut(&DfsMetadataShardId::new("users"))
+        .unwrap()
+        .begin_inspection_snapshot()
+        .unwrap();
+    let writer = cluster
+        ._runtime
+        .client(&cluster.writer_node)
+        .unwrap()
+        .with_boxed_metadata_backend_lazy(Box::new(inspection))
+        .unwrap();
+    let original_writer = std::mem::replace(&mut cluster.writer, writer);
+    drop(original_writer);
+    assert!(
+        cluster.writer.posix_stat(path).is_ok(),
+        "actual pinned live predecessor"
+    );
     cluster.primary.posix_unlink(path).expect("primary unlink");
     assert!(matches!(
         cluster.primary.posix_stat(path),
