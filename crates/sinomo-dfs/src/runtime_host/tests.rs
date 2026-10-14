@@ -7661,7 +7661,9 @@ fn daemon_dfs_offline_only_receipt_below_quorum_is_not_executable_work() {
     assert!(!pending.should_trigger_background_maintenance());
     drop(reader);
     fixture.native.reopen_node(fixture.primary.clone()).unwrap();
-    fixture.source = Some(fixture.native.client(&fixture.primary).unwrap());
+    let mut reopened = fixture.native.metadata_primary_service("/").unwrap();
+    reopened.hydrate_from_metadata_backend().unwrap();
+    fixture.source = Some(reopened);
     fixture.close();
 }
 
@@ -15802,7 +15804,7 @@ fn with_native_create_proposal(
             action: crate::test_runtime::FaultAction::BudgetExhausted,
         });
     }
-    let mut source = native.client(&primary).unwrap();
+    let mut source = native.metadata_primary_service("/").unwrap();
     let options = DfsWriteOptions {
         policy: DfsReplicationPolicy::new(1, nodes.len()).unwrap(),
         replica_candidates: nodes.clone(),
@@ -15883,7 +15885,7 @@ fn native_pending_source_fixture(name: &str, patch: bool) -> NativePendingSource
     let config = native.root_shard().unwrap();
     let primary = config.primary_node_id.clone();
     let remote = nodes.iter().find(|node| **node != primary).unwrap().clone();
-    let mut source = native.client(&primary).unwrap();
+    let mut source = native.metadata_primary_service("/").unwrap();
     let path = "/native-pending-source.bin";
     let original = source
         .posix_write_file(

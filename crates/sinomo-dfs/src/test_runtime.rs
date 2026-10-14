@@ -3750,7 +3750,21 @@ impl DfsTestRuntime {
                 return Err("DFS namespace observation window was empty or censored".into());
             }
             None if self.fabric.dropped_observations.load(Ordering::Relaxed) != 0 => {
-                return Err("DFS test observations were censored".into());
+                let records = self.rpc_observations();
+                let mut observed_routes = BTreeMap::<String, usize>::new();
+                for event in &records {
+                    *observed_routes
+                        .entry(format!(
+                            "{} {:?} {:?}",
+                            event.route, event.origin, event.phase
+                        ))
+                        .or_default() += 1;
+                }
+                return Err(format!(
+                    "DFS test observations were censored: retained={}, omitted={}, retained_routes={observed_routes:?}",
+                    records.len(),
+                    self.observation_dropped_count(),
+                ));
             }
             _ => {}
         }

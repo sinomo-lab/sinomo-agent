@@ -154,6 +154,7 @@ pub(super) fn native_routed_committed_backlog(
     let replica = peers[0].clone();
     let requester = peers[1].clone();
     let path = format!("/services/{name}.bin");
+    let initial_holder = requester.clone();
     let nodes = vec![requester.clone(), replica.clone()];
     let mut placement = DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 2).unwrap();
     placement.required_node_ids = nodes.clone();
@@ -200,12 +201,14 @@ pub(super) fn native_routed_committed_backlog(
     // The unrelated repair belongs to the genuine current Core producer,
     // while the requester below remains a browser client.
     let mut owner = runtime.metadata_primary_service(&unrelated_path).unwrap();
+    let mut unrelated_policy = DfsReplicationPolicy::new(1, 2).unwrap();
+    unrelated_policy.required_node_ids = vec![primary.clone(), replica.clone()];
     let unrelated = owner
         .posix_write_file(
             &unrelated_path,
             b"actual unrelated repair backlog",
             DfsWriteOptions {
-                policy: DfsReplicationPolicy::new(1, 2).unwrap(),
+                policy: unrelated_policy,
                 replica_candidates: vec![primary.clone(), replica.clone()],
                 wait_for_commit: true,
                 foreground_replica_repair: false,
@@ -232,24 +235,46 @@ pub(super) fn native_routed_committed_backlog(
     let mut policy = DfsReplicationPolicy::new(1, 2).unwrap();
     policy.required_node_ids = nodes;
     let operation = sinomo_core::Id::generate().to_string();
-    let outcome = client
-        .write_distributed_bytes_with_base(
+    let options = DfsDistributedWriteOptions {
+        operation_id: Some(operation.clone()),
+        repair: if foreground {
+            DfsWriteRepair::Foreground
+        } else {
+            DfsWriteRepair::Background
+        },
+        ..DfsDistributedWriteOptions::default()
+    };
+    let outcome = if foreground {
+        // The reader path durably captures on the selected requester before
+        // advertising its manifest. A primary-owned byte stream has no such
+        // requester receipt and cannot demonstrate an already-satisfied W1.
+        client.write_distributed_reader_with_base(
+            request.clone(),
+            Some(base.version),
+            std::io::Cursor::new(bytes.clone()),
+            policy.required_node_ids.clone(),
+            policy,
+            options,
+        )
+    } else {
+        client.write_distributed_bytes_with_base(
             request.clone(),
             Some(base.version),
             bytes.clone(),
             policy.required_node_ids.clone(),
             policy,
-            DfsDistributedWriteOptions {
-                operation_id: Some(operation.clone()),
-                repair: if foreground {
-                    DfsWriteRepair::Foreground
-                } else {
-                    DfsWriteRepair::Background
-                },
-                ..DfsDistributedWriteOptions::default()
-            },
+            options,
         )
-        .unwrap();
+    }
+    .unwrap();
+    assert_eq!(
+        client
+            .content()
+            .read_object_version(request.object_id.as_str(), request.target_version.as_str())
+            .unwrap()
+            .1,
+        bytes
+    );
     assert!(matches!(outcome, NetworkedDfsWriteOutcome::Pending { .. }));
     assert!(client.writes.pending_routed_writes.contains_key(&operation));
     let original = client
@@ -278,12 +303,25 @@ pub(super) fn native_routed_committed_backlog(
             },
     } = &response.result
     else {
-        panic!("normal W1 receiver must publish before N2 repair")
+        panic!("normal W1 receiver must publish before N2 repair: {response:?}")
     };
     assert_eq!(version, &request.target_version);
     assert_eq!(hash, &content_hash(&bytes));
-    assert_eq!(repair_jobs.len(), 1);
+    let author = runtime.metadata_primary_service(&path).unwrap();
+    let receipts = author
+        .metadata_backend()
+        .unwrap()
+        .receipts_for_version(&request.object_id, &request.target_version)
+        .unwrap();
+    assert_eq!(repair_jobs.len(), 1, "{response:?}");
     assert_eq!(repair_jobs[0].missing_replica_node_id, replica);
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].replica_node_id, initial_holder);
+    assert_eq!(
+        receipts[0].content_hash.as_deref(),
+        Some(content_hash(&bytes).as_str())
+    );
+    drop(author);
     assert!(
         runtime
             .rpc_observations()
@@ -611,7 +649,7 @@ fn native_broken_patch_wait(
             action: crate::test_runtime::FaultAction::BudgetExhausted,
         });
     }
-    let mut service = runtime.client(&owner).unwrap();
+    let mut service = runtime.metadata_primary_service(&path).unwrap();
     let patch = (0..80 * 1024 + 7)
         .map(|index| (index % 239) as u8)
         .collect::<Vec<_>>();
