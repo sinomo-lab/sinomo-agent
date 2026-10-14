@@ -2131,6 +2131,38 @@ mod tests {
                 },
             )
             .unwrap();
+        // The real write commits before its asynchronous metadata publisher
+        // necessarily reaches every member. Observe the physical inventory
+        // only after a genuine metadata barrier; content repairs stay faulted.
+        let mut author = runtime
+            .metadata_primary_service("/users/status-scope-file")
+            .unwrap();
+        let sync_object = author
+            .metadata_backend()
+            .unwrap()
+            .get_object(&object.object_id)
+            .unwrap()
+            .unwrap();
+        let sync_target = author
+            .capture_metadata_quorum_sync_target(&sync_object)
+            .unwrap();
+        let certificate = author
+            .sync_metadata_shard_to_quorum(
+                &sync_target,
+                sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+            )
+            .unwrap();
+        assert_eq!(
+            certificate
+                .acknowledged_node_ids
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::iter::once(users.primary_node_id.clone())
+                .chain(users.replica_node_ids.iter().cloned())
+                .collect(),
+            "the complete actual metadata membership must contain this committed inventory cut"
+        );
+        drop(author);
         let mut receiver = runtime.client(&target).unwrap();
         assert_eq!(
             receiver
