@@ -639,12 +639,43 @@ fn sync_path_response_object_updates_outsider_read_view_without_journal_batches(
     runtime.close().unwrap();
 }
 
+// Capture the actual equal native prefix before producing any corpus entry.
+// Native startup may already have checkpointed its genesis frames; those are
+// not the 700 writes whose complete byte lineage this fixture must retain.
+fn native_backlog_anchor(
+    runtime: &crate::test_runtime::DfsTestRuntime,
+    primary: &NetworkedDfsService<DfsNodeTransport>,
+    replica: &NodeId,
+) -> crate::DfsMetadataPrefixProof {
+    let shard = DfsMetadataShardId::new("users");
+    let anchor = primary
+        .metadata_backend()
+        .unwrap()
+        .metadata_prefix_proof(&shard)
+        .unwrap()
+        .unwrap();
+    let receiver = LocalSobjMetadataBackend::open_for_inspection(
+        shard.clone(),
+        crate::default_dfs_metadata_shards_root(runtime.data_dir(replica))
+            .join(crate::metadata_keys::key_segment(&shard.0)),
+    )
+    .unwrap();
+    assert_eq!(
+        receiver.metadata_prefix_proof().unwrap(),
+        anchor,
+        "all corpus replay starts at the actual common native prefix"
+    );
+    assert!(anchor.is_well_formed());
+    anchor
+}
+
 // Verify the actual replica's durable history, independently of a browser's
 // private read projection. This replays byte-prefix proofs only; it grants no
 // ingest permission and never writes metadata or manufactures acknowledgements.
 fn assert_native_backlog_cut(
     runtime: &crate::test_runtime::DfsTestRuntime,
     replica: &NodeId,
+    anchor: &crate::DfsMetadataPrefixProof,
     cut: &crate::DfsMetadataPrefixProof,
     files: &[DfsStat],
 ) {
@@ -656,7 +687,7 @@ fn assert_native_backlog_cut(
             .join(crate::metadata_keys::key_segment(&shard.0)),
     )
     .unwrap();
-    let mut proof = crate::metadata_records::dfs_metadata_prefix_proof_genesis(&shard);
+    let mut proof = anchor.clone();
     let mut batches = 0;
     while proof.journal_sequence < cut.journal_sequence {
         let batch = backend
@@ -726,6 +757,7 @@ fn sifs_cluster_posix_routed_op_replays_deep_catch_up_across_batches() {
     } = cluster;
     drop(users_primary);
     let mut users_primary = _runtime.metadata_primary_service("/users").unwrap();
+    let anchor = native_backlog_anchor(&_runtime, &users_primary, &replica_node);
 
     // Build the full native corpus through its actual owning Core.
     let local_options = DfsWriteOptions {
@@ -810,7 +842,7 @@ fn sifs_cluster_posix_routed_op_replays_deep_catch_up_across_batches() {
             .is_ok()
     );
 
-    assert_native_backlog_cut(&_runtime, &replica_node, &cut, &files);
+    assert_native_backlog_cut(&_runtime, &replica_node, &anchor, &cut, &files);
     assert_eq!(_runtime.observation_dropped_count(), 0);
     drop((services_primary, replica, shared_kv));
     _runtime
@@ -838,6 +870,7 @@ fn sifs_cluster_posix_mkdir_all_replays_deep_catch_up_across_batches() {
     } = cluster;
     drop(users_primary);
     let mut users_primary = _runtime.metadata_primary_service("/users").unwrap();
+    let anchor = native_backlog_anchor(&_runtime, &users_primary, &replica_node);
 
     let local_options = DfsWriteOptions {
         policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
@@ -926,7 +959,7 @@ fn sifs_cluster_posix_mkdir_all_replays_deep_catch_up_across_batches() {
             .is_ok()
     );
 
-    assert_native_backlog_cut(&_runtime, &replica_node, &cut, &files);
+    assert_native_backlog_cut(&_runtime, &replica_node, &anchor, &cut, &files);
     assert_eq!(_runtime.observation_dropped_count(), 0);
     drop((services_primary, replica, shared_kv));
     _runtime
