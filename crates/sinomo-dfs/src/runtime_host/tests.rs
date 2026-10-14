@@ -5978,6 +5978,19 @@ fn daemon_data_plane_replica_ingress_reuses_one_resident_shard() {
     let marker = source
         .posix_mkdir("/native-resident-ingress-marker")
         .unwrap();
+    drop(source);
+    let mut source = native.metadata_primary_service("/").unwrap();
+    let completed = source.posix_sync_directory("/").unwrap();
+    assert_eq!(
+        completed
+            .metadata_certificate
+            .acknowledged_node_ids
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        [primary.clone(), replica.clone()].into_iter().collect(),
+        "duplicate-ingress setup must be durably complete on both real participants"
+    );
     let backend = source.metadata_backend().unwrap();
     let mut subscription = backend.subscribe(before);
     let batch = backend.poll_subscription(&mut subscription).unwrap();
@@ -6077,10 +6090,13 @@ fn daemon_data_plane_replica_ingress_reuses_one_resident_shard() {
         sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
     )
     .unwrap();
-    assert!(matches!(
-        response.result,
-        crate::DfsMetadataSnapshotInstallResult::Installed { .. }
-    ));
+    assert!(
+        matches!(
+            response.result,
+            crate::DfsMetadataSnapshotInstallResult::Installed { .. }
+        ),
+        "actual native snapshot response: {response:?}"
+    );
     assert_eq!(native.observation_dropped_count(), 0);
     native.assert_fault_budgets().unwrap();
     drop(actual_handle);
@@ -6254,6 +6270,19 @@ fn daemon_dfs_metadata_journal_batch_uses_path_safe_shard_directory() {
     let shard_id = DfsMetadataShardId::new(config.shard_id.clone());
     let mut source = native.client(&primary).unwrap();
     source.posix_mkdir("/native-path-safe-marker").unwrap();
+    drop(source);
+    let mut source = native.metadata_primary_service("/").unwrap();
+    let setup = source.posix_sync_directory("/").unwrap();
+    assert_eq!(
+        setup
+            .metadata_certificate
+            .acknowledged_node_ids
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        [primary.clone(), replica.clone()].into_iter().collect(),
+        "finish the legitimate fixture publication before observing hostile input"
+    );
     let backend = source.metadata_backend().unwrap();
     let mut subscription = backend.subscribe(0);
     let batch = backend.poll_subscription(&mut subscription).unwrap();
