@@ -12,6 +12,15 @@ struct ContributionCluster {
 impl ContributionCluster {
     fn new(label: &str) -> Self {
         let cluster = sifs_two_primary_cluster(label);
+        // Owner-side contribution checks and outcome lookups must use that
+        // physical shard, not a facade also exposing replicated source shards.
+        let users_owner = cluster._runtime.metadata_primary_service("/users").unwrap();
+        let services_owner = cluster
+            ._runtime
+            .metadata_primary_service("/services")
+            .unwrap();
+        drop(cluster.users_primary);
+        drop(cluster.services_primary);
         Self {
             nodes: [
                 cluster.users_primary_node,
@@ -19,11 +28,32 @@ impl ContributionCluster {
                 cluster.replica_node,
             ],
             services: vec![
-                Some(cluster.users_primary),
-                Some(cluster.services_primary),
+                Some(users_owner),
+                Some(services_owner),
                 Some(cluster.replica),
             ],
             _runtime: cluster._runtime,
+        }
+    }
+
+    fn authority(&self, shard_id: &str) -> DfsContributionAuthorityExpectation {
+        let shard = self
+            ._runtime
+            .metadata_shards()
+            .unwrap()
+            .into_iter()
+            .find(|shard| shard.shard_id == shard_id)
+            .unwrap();
+        let expected_owner = match shard_id {
+            "users" => &self.nodes[0],
+            "services" => &self.nodes[1],
+            _ => unreachable!(),
+        };
+        assert_eq!(&shard.primary_node_id, expected_owner);
+        DfsContributionAuthorityExpectation {
+            shard_id: DfsMetadataShardId::new(shard.shard_id),
+            primary_node_id: shard.primary_node_id,
+            owner_epoch: shard.epoch,
         }
     }
 
@@ -80,8 +110,7 @@ fn generated_operation() -> (String, OffsetDateTime) {
 fn request(
     identity: DfsRevisionReference,
     head: &crate::posix_model::DfsStat,
-    owner: NodeId,
-    shard: &str,
+    authority: DfsContributionAuthorityExpectation,
     expected: Option<DfsModuleMetadataValue>,
     metadata: Option<DfsModuleMetadataValue>,
 ) -> DfsAtomicContribution {
@@ -96,11 +125,7 @@ fn request(
             version: head.version.clone(),
             path: head.path.clone(),
         }],
-        authority: Some(DfsContributionAuthorityExpectation {
-            shard_id: DfsMetadataShardId::new(shard),
-            primary_node_id: owner,
-            owner_epoch: 1,
-        }),
+        authority: Some(authority),
         updates: vec![DfsRevisionMetadataContribution {
             identity,
             expected_metadata: expected,
@@ -121,8 +146,7 @@ fn distributed_contribution_checks_authority_and_replays_before_stale_head() {
     let original = request(
         identity.clone(),
         &head,
-        cluster.nodes[0].clone(),
-        "users",
+        cluster.authority("users"),
         None,
         Some(value(1)),
     );
@@ -148,7 +172,7 @@ fn distributed_contribution_checks_authority_and_replays_before_stale_head() {
             ..original.authority.clone().unwrap()
         }),
         Some(DfsContributionAuthorityExpectation {
-            owner_epoch: 2,
+            owner_epoch: original.authority.as_ref().unwrap().owner_epoch + 1,
             ..original.authority.clone().unwrap()
         }),
     ] {
@@ -195,8 +219,7 @@ fn admitted_contribution_retry_rejects_disjoint_owner_without_original_outcome()
     let original = request(
         identity.clone(),
         &head,
-        cluster.nodes[0].clone(),
-        "users",
+        cluster.authority("users"),
         None,
         Some(value(1)),
     );
@@ -226,8 +249,7 @@ fn admitted_contribution_retry_rejects_disjoint_owner_without_original_outcome()
     let reset = request(
         identity.clone(),
         &moved,
-        cluster.nodes[1].clone(),
-        "services",
+        cluster.authority("services"),
         Some(value(1)),
         None,
     );
@@ -274,8 +296,7 @@ fn distributed_contribution_original_head_rejects_disjoint_move_aba_without_outc
     let original = request(
         identity.clone(),
         &head,
-        cluster.nodes[0].clone(),
-        "users",
+        cluster.authority("users"),
         None,
         Some(value(1)),
     );
@@ -297,8 +318,7 @@ fn distributed_contribution_original_head_rejects_disjoint_move_aba_without_outc
     let fresh = request(
         identity.clone(),
         &b_head,
-        cluster.nodes[1].clone(),
-        "services",
+        cluster.authority("services"),
         None,
         Some(value(2)),
     );

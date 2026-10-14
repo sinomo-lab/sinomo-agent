@@ -278,12 +278,32 @@ fn cluster_dfs_metadata_publish_after_events_uses_default_cluster_publish() {
 fn cold_sifs_scale_fixture_stays_preemptible() {
     let node =
         crate::test_runtime::DfsTestRuntime::ordered_node_ids("native-cold-scale", 1).remove(0);
-    let (mut runtime, mut writer) = native_sifs_service("native-cold-scale", node.clone());
+    let (mut runtime, browser) = native_sifs_service("native-cold-scale", node.clone());
+    drop(browser);
+    // Populate the real one-node corpus through its actual Core author. The
+    // boundary under test is cold hydration, not thousands of loopback RPCs.
+    let mut writer = runtime.metadata_primary_service("/services").unwrap();
+    let before_objects = writer
+        .metadata_backend()
+        .unwrap()
+        .metadata_summary()
+        .unwrap()
+        .object_count;
     for index in 0..2048 {
         writer
             .posix_mkdir(&format!("/services/scale-fixture-{index:04}"))
             .unwrap();
     }
+    assert_eq!(
+        writer
+            .metadata_backend()
+            .unwrap()
+            .metadata_summary()
+            .unwrap()
+            .object_count,
+        before_objects + 2048
+    );
+    assert_eq!(runtime.observation_dropped_count(), 0);
     let configs = runtime.metadata_shards().unwrap();
     let fs = runtime.file_system().file_system_id;
     let shard = select_metadata_shard_config_for_path(&fs, &configs, "/services")
