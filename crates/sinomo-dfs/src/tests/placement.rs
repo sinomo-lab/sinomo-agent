@@ -970,7 +970,23 @@ fn placement_reconciliation_resumes_durable_phase_and_updates_existing_file() {
             break;
         }
     }
-    let completed = completed.expect("durable reconciliation completes after restart");
+    let recorded = control_plane
+        .with_client(|kv| {
+            DfsControlPlaneStore::new(kv.as_mut())
+                .placement_reconciliation(&file_system.file_system_id, &job.job_id)
+        })
+        .unwrap();
+    let recorded = recorded.expect("the original durable placement job remains observable");
+    if let Some(manual_terminal) = completed {
+        assert_eq!(manual_terminal, recorded);
+    }
+    // Normal Main recovery may finish before the explicit driver runs. In
+    // either ordering require the SAME canonical durable terminal result.
+    let completed = recorded;
+    assert_eq!(completed.job_id, job.job_id);
+    assert_eq!(completed.accepted_config, first_page.accepted_config);
+    assert_eq!(completed.scanned_object_count, 1);
+    assert!(completed.last_error.is_none());
     assert_eq!(completed.state, DfsPlacementReconciliationState::Completed);
     assert_eq!(completed.matched_object_count, 1);
     assert_eq!(
