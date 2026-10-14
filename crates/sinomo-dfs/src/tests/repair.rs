@@ -4,7 +4,7 @@ use super::*;
 
 // Real configuration precedes each fixture producer. Candidate hints do not
 // create a managed W/N contract, and a browser owns no Core coordinator state.
-fn native_owned_repair_fixture(
+pub(super) fn native_owned_repair_fixture(
     name: &str,
     path: &str,
     min_commit: usize,

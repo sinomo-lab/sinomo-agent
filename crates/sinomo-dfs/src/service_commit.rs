@@ -1856,6 +1856,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.coordinator
             .commit_intent(&intent.intent_id)
             .map_err(DfsError::from)?;
+        // Publication can reach W while desired replicas are still missing.
+        // Hand off the work produced by this intent, without waking repair for
+        // a fully replicated write or unrelated coordinator jobs.
+        if intent.desired_replica_nodes.iter().any(|node| {
+            self.coordinator
+                .repair_job_for_target(&intent.intent_id, node)
+                .is_some()
+        }) {
+            self.record_message_committed_work(DfsMessageCommittedWork {
+                repair_maintenance: true,
+                ..Default::default()
+            });
+        }
         drop(coordinator_span);
         let coordinator_ms = coordinator_started.elapsed().as_millis();
         let memory_started = Instant::now();
