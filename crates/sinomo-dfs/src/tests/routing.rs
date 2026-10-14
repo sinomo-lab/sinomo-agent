@@ -385,6 +385,7 @@ fn native_routed_namespace_replays_a_bounded_actual_backlog() {
         .unwrap();
     let primary = shard.primary_node_id.clone();
     let mut source = runtime.client(&primary).unwrap();
+    let mut checkpointed = 0;
     for index in 0..(DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT / 2 + 8) {
         source
             .posix_write_file(
@@ -393,7 +394,12 @@ fn native_routed_namespace_replays_a_bounded_actual_backlog() {
                 DfsWriteOptions::replicated_eventual(vec![primary.clone()]),
             )
             .unwrap();
+        if (index + 1) % 32 == 0 {
+            checkpointed += runtime.checkpoint_rpc_observation_window().unwrap();
+        }
     }
+    checkpointed += runtime.checkpoint_rpc_observation_window().unwrap();
+    assert!(checkpointed > 0);
     drop(source);
     let current_shard = runtime
         .metadata_shards()
@@ -476,6 +482,11 @@ fn native_routed_namespace_replays_a_bounded_actual_backlog() {
     drop(client);
     let coverage = runtime.close_with_namespace_capture(capture).unwrap();
     assert_eq!(coverage.namespace_omitted, Some(0));
+    assert_eq!(global_dropped_before, 0);
+    assert_eq!(global_dropped_after, 0);
+    assert_eq!(coverage.lifetime_omitted, 0);
+    assert!(coverage.lifetime_records >= checkpointed);
+    assert_eq!(coverage.full_lifetime_coverage, "available");
     println!(
         "backlog observation coverage: before_records={global_observations_before} before_dropped={global_dropped_before} after_dropped={global_dropped_after} final={}",
         serde_json::to_string(&coverage).unwrap()

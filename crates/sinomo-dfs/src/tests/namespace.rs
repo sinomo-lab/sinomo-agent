@@ -558,15 +558,20 @@ fn sifs_posix_empty_directory_checks_are_bounded_for_large_directories() {
     let source = "/services/sandbox/instances/sandbox_bounded_empty_dir/work/source";
     let nonempty = "/services/sandbox/instances/sandbox_bounded_empty_dir/work/nonempty";
 
-    let (_runtime, mut dfs) = native_sifs_service(
+    let (runtime, mut dfs) = native_sifs_service(
         "sifs_posix_empty_directory_checks_are_bounded_for_large_directories",
         node_id.clone(),
     );
     dfs.posix_mkdir_all(source).expect("mkdir source");
+    let mut checkpointed = 0;
     for index in 0..160 {
         dfs.posix_mkdir_all(&format!("{nonempty}/child-{index:04}"))
             .expect("mkdir child");
+        if (index + 1) % 32 == 0 {
+            checkpointed += runtime.checkpoint_rpc_observation_window().unwrap();
+        }
     }
+    assert!(checkpointed > 0);
     let mut transient = file_metadata(node_id.clone());
     transient.file_system_id = sifs_file_system_id();
     transient.object_id =
@@ -601,6 +606,11 @@ fn sifs_posix_empty_directory_checks_are_bounded_for_large_directories() {
     );
     assert!(dfs.posix_stat(source).is_ok());
 
+    assert_eq!(runtime.observation_dropped_count(), 0);
+    drop(dfs);
+    runtime
+        .close()
+        .expect("all native observation windows and owners drain");
     std::fs::remove_dir_all(root).ok();
 }
 
