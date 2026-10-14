@@ -33,7 +33,15 @@ impl NativePromotions {
                 .posix_write_file(
                     &format!("/promotion-{index}"),
                     format!("native promotion body {index}").as_bytes(),
-                    DfsWriteOptions::replicated_eventual(roster.clone()),
+                    DfsWriteOptions {
+                        // This fixture later promotes on every listed receiver.
+                        // The convenience Eventual helper caps desired replicas
+                        // at two, which cannot seed the three/four-node cases.
+                        policy: crate::DfsReplicationPolicy::new(1, roster.len()).unwrap(),
+                        replica_candidates: roster.clone(),
+                        wait_for_commit: true,
+                        foreground_replica_repair: true,
+                    },
                 )
                 .unwrap();
             let backend = service.metadata_backend().unwrap();
@@ -47,6 +55,7 @@ impl NativePromotions {
                         && intent.status == DfsWriteIntentStatus::Committed
                 })
                 .unwrap();
+            assert_eq!(intent.policy.desired_replicas, roster.len());
             commands.push(crate::DfsCommitVersionCommand {
                 request_id: sinomo_core::Id::generate().to_string(),
                 intent_id: intent.intent_id,
