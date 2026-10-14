@@ -201,6 +201,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             let file_system_id = sifs_file_system_id();
             self.ensure_path_not_in_cross_shard_flight(&file_system_id, &from)?;
+            if destination_primary != self.node_id
+                && self
+                    .cross_shard_namespace_locks
+                    .blocks(&file_system_id, &to)
+            {
+                self.sync_remote_namespace_path_until_quiet(&to)?;
+            }
             self.ensure_path_not_in_cross_shard_flight(&file_system_id, &to)?;
             return self.coordinate_cross_shard_directory_rename(&from, &to, source);
         }
@@ -219,6 +226,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         let file_system_id = sifs_file_system_id();
         self.ensure_path_not_in_cross_shard_flight(&file_system_id, &from)?;
+        // A previous foreign mutation can already be complete on its author
+        // while this source's replica still retains its Running guard. Refresh
+        // through the existing authenticated journal path before deciding Busy;
+        // an actually running job keeps its guard and is still rejected below.
+        if destination_primary != self.node_id
+            && self
+                .cross_shard_namespace_locks
+                .blocks(&file_system_id, &to)
+        {
+            self.sync_remote_namespace_path_until_quiet(&to)?;
+        }
         self.ensure_path_not_in_cross_shard_flight(&file_system_id, &to)?;
         // Reject up front while writes are still settling so the caller sees
         // a clean retriable error with no job created.
