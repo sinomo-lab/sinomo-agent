@@ -3867,6 +3867,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         )>,
         DfsError,
     > {
+        #[cfg(test)]
+        let mut observation =
+            self.native_publication_owner_for_observation()
+                .and_then(|(root, owner)| {
+                    crate::test_runtime::observe_placement_authority_call(
+                        &root, &owner, job_id, path,
+                    )
+                });
         for attempt in 0..PLACEMENT_AUTHORITY_ACQUIRE_RETRIES {
             let Some((job, accepted_config, current_config)) =
                 self.authoritative_placement_reconciliation_for_path(file_system_id, job_id, path)?
@@ -3897,6 +3905,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     )?
             };
             if let Some(permit) = permit {
+                #[cfg(test)]
+                let permit = permit.with_native_observation(observation.take(), job.state.clone());
                 return Ok(Some((job, accepted_config, permit)));
             }
             if attempt + 1 < PLACEMENT_AUTHORITY_ACQUIRE_RETRIES {
@@ -3931,6 +3941,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     message: "control plane unavailable".to_string(),
                 }),
             };
+            #[cfg(test)]
+            permit.observe_native_release(result.is_ok());
             match result {
                 Ok(()) => return Ok(()),
                 Err(error) => {

@@ -141,6 +141,8 @@ pub(crate) struct DfsPlacementAuthorityPermit {
     file_system_id: DfsFileSystemId,
     record: DfsPlacementAuthorityPermitRecord,
     released: bool,
+    #[cfg(test)]
+    observation: Option<crate::test_runtime::PlacementAuthorityCallObservation>,
 }
 
 /// Opaque daemon-incarnation identity embedded in every new placement permit.
@@ -231,6 +233,26 @@ impl Drop for DfsPlacementAuthorityPermit {
             // that this bounded mutation's stack has exited. Preserve the
             // exact handle process-wide so a fresh service can finish release.
             queue_placement_authority_release(self);
+        }
+    }
+}
+
+#[cfg(test)]
+impl DfsPlacementAuthorityPermit {
+    pub(crate) fn with_native_observation(
+        mut self,
+        mut observation: Option<crate::test_runtime::PlacementAuthorityCallObservation>,
+        state: crate::DfsPlacementReconciliationState,
+    ) -> Self {
+        if let Some(observation) = observation.as_mut() {
+            observation.acquired(&self.record.holder_id, state);
+        }
+        self.observation = observation;
+        self
+    }
+    pub(crate) fn observe_native_release(&mut self, succeeded: bool) {
+        if let Some(observation) = self.observation.as_mut() {
+            observation.released(succeeded);
         }
     }
 }
@@ -2647,6 +2669,8 @@ impl<'a> DfsControlPlaneStore<'a> {
             file_system_id: expected_job.file_system_id.clone(),
             record,
             released: false,
+            #[cfg(test)]
+            observation: None,
         };
         let response = self.kv.txn(KvTxn {
             compares: vec![

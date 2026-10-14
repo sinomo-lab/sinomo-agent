@@ -886,21 +886,27 @@ fn native_placement_retirement(retain: bool, replay_after_handoff: bool) {
                 vec![case.primary.clone()],
             )
             .unwrap();
-        let mut owner = case.runtime.metadata_primary_service(&path).unwrap();
-        assert_eq!(owner.node_id(), &promoted);
         let (resolved, replication, placement) =
             reconciliation_placement_for_object(&one_copy, &job, &object).unwrap();
-        owner
-            .reconcile_object_placement_local(
-                &job.job_id,
-                &object.path,
-                &object.object_id,
-                &object.version,
-                resolved.policy.consistency,
-                replication,
-                &placement.plan.desired_replica_nodes,
+        // Let the real serving Main own admission; a direct Core invocation
+        // can race the normal reconciler's live placement transaction.
+        case.service.refresh_control_plane_latest().unwrap();
+        case.service
+            .route_namespace_operation(
+                promoted.clone(),
+                DfsNamespaceOperation::ReconcilePlacement {
+                    job_id: job.job_id.clone(),
+                    path: object.path.clone(),
+                    object_id: object.object_id.clone(),
+                    expected_version: object.version.clone(),
+                    object_policy: resolved.policy.consistency,
+                    replication_policy: replication,
+                    desired_replica_node_ids: placement.plan.desired_replica_nodes,
+                },
             )
             .expect("the actual new owner must replay the same immutable placement obligation");
+        let owner = case.runtime.metadata_primary_service(&path).unwrap();
+        assert_eq!(owner.node_id(), &promoted);
         assert_eq!(
             owner
                 .metadata_backend()
@@ -1520,10 +1526,11 @@ async fn native_routed_noop_revalidates_live_permit_without_namespace_journal_ch
 
 #[test]
 fn native_served_maintenance_skips_parked_job_for_tail_and_retires_superseded_head() {
-    let (runtime, nodes, jobs, gate, _) = super::native_repair_authority_tests::native_managed_work(
-        "native-parked-placement-tail",
-        &[("/", DfsPlacementScope::Subtree)],
-    );
+    let (runtime, nodes, jobs, gate, _, _) =
+        super::native_repair_authority_tests::native_managed_work(
+            "native-parked-placement-tail",
+            &[("/", DfsPlacementScope::Subtree)],
+        );
     let control = runtime.shared_control_plane().unwrap();
     let fs = runtime.file_system().file_system_id;
     let head = control.with_client(|kv| {

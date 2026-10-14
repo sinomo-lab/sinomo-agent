@@ -1385,6 +1385,211 @@ impl NativeServedWorkCapture {
     }
 }
 
+// These records are observations of an existing owner/permit, never authority.
+#[cfg(test)]
+mod placement_authority_observation {
+    use super::*;
+
+    #[derive(Clone, Debug)]
+    pub(crate) struct PlacementAuthorityCall {
+        pub job_id: String,
+        /// Copied from the existing acquisition caller: None covers the whole
+        /// job, while Some identifies an individual object's validation.
+        pub path: Option<String>,
+        pub holder_id: Option<String>,
+        pub job_state: Option<crate::DfsPlacementReconciliationState>,
+        pub released: Option<bool>,
+        pub finished: bool,
+    }
+
+    struct Observations {
+        owner: std::sync::Weak<crate::runtime_host::DfsDataOwnerLock>,
+        calls: Mutex<Vec<PlacementAuthorityCall>>,
+        omitted: AtomicUsize,
+    }
+
+    static OBSERVERS: OnceLock<Mutex<BTreeMap<std::path::PathBuf, std::sync::Weak<Observations>>>> =
+        OnceLock::new();
+
+    #[derive(Clone)]
+    pub(crate) struct NativePlacementAuthorityReader(Arc<Observations>);
+    impl NativePlacementAuthorityReader {
+        pub(crate) fn records(&self) -> Vec<PlacementAuthorityCall> {
+            assert_eq!(
+                self.0.omitted.load(Ordering::Acquire),
+                0,
+                "placement authority observations must be complete"
+            );
+            self.0
+                .calls
+                .lock()
+                .expect("placement authority observations")
+                .clone()
+        }
+        pub(crate) fn group_acquisition_is_open(&self, job_id: &str) -> bool {
+            self.records().iter().any(|call| {
+                call.job_id == job_id
+                    && call.path.is_none()
+                    && !call.finished
+                    && call.holder_id.is_none()
+            })
+        }
+        pub(crate) fn group_holder_ids(&self, job_id: &str) -> Vec<String> {
+            self.records()
+                .into_iter()
+                .filter(|call| call.job_id == job_id && call.path.is_none())
+                .filter_map(|call| call.holder_id)
+                .collect()
+        }
+    }
+
+    pub(crate) struct NativePlacementAuthorityCapture {
+        root: std::path::PathBuf,
+        reader: NativePlacementAuthorityReader,
+    }
+    impl NativePlacementAuthorityCapture {
+        pub(crate) fn reader(&self) -> NativePlacementAuthorityReader {
+            self.reader.clone()
+        }
+    }
+    impl Drop for NativePlacementAuthorityCapture {
+        fn drop(&mut self) {
+            let mut observers = OBSERVERS
+                .get()
+                .unwrap()
+                .lock()
+                .expect("placement observers");
+            if observers
+                .get(&self.root)
+                .and_then(std::sync::Weak::upgrade)
+                .is_some_and(|actual| Arc::ptr_eq(&actual, &self.reader.0))
+            {
+                observers.remove(&self.root);
+            }
+        }
+    }
+
+    pub(crate) struct PlacementAuthorityCallObservation {
+        observed: Arc<Observations>,
+        index: usize,
+    }
+    impl std::fmt::Debug for PlacementAuthorityCallObservation {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("PlacementAuthorityCallObservation")
+                .field("index", &self.index)
+                .finish_non_exhaustive()
+        }
+    }
+    impl PlacementAuthorityCallObservation {
+        pub(crate) fn acquired(
+            &mut self,
+            holder_id: &str,
+            state: crate::DfsPlacementReconciliationState,
+        ) {
+            let mut calls = self
+                .observed
+                .calls
+                .lock()
+                .expect("placement authority observations");
+            calls[self.index].holder_id = Some(holder_id.into());
+            calls[self.index].job_state = Some(state);
+        }
+        pub(crate) fn released(&mut self, succeeded: bool) {
+            self.observed
+                .calls
+                .lock()
+                .expect("placement authority observations")[self.index]
+                .released = Some(succeeded);
+        }
+    }
+    impl Drop for PlacementAuthorityCallObservation {
+        fn drop(&mut self) {
+            self.observed
+                .calls
+                .lock()
+                .expect("placement authority observations")[self.index]
+                .finished = true;
+        }
+    }
+
+    pub(crate) fn observe_placement_authority_call(
+        root: &std::path::Path,
+        owner: &Arc<crate::runtime_host::DfsDataOwnerLock>,
+        job_id: &str,
+        path: Option<&str>,
+    ) -> Option<PlacementAuthorityCallObservation> {
+        let observed = OBSERVERS
+            .get()?
+            .lock()
+            .expect("placement observers")
+            .get(root)?
+            .upgrade()?;
+        if !std::sync::Weak::ptr_eq(&observed.owner, &Arc::downgrade(owner)) {
+            return None;
+        }
+        let index = {
+            let mut calls = observed
+                .calls
+                .lock()
+                .expect("placement authority observations");
+            if calls.len() == MAX_OBSERVATIONS {
+                observed.omitted.fetch_add(1, Ordering::Release);
+                return None;
+            }
+            let index = calls.len();
+            calls.push(PlacementAuthorityCall {
+                job_id: job_id.into(),
+                path: path.map(str::to_owned),
+                holder_id: None,
+                job_state: None,
+                released: None,
+                finished: false,
+            });
+            index
+        };
+        Some(PlacementAuthorityCallObservation { observed, index })
+    }
+
+    impl DfsTestRuntime {
+        pub(crate) fn capture_placement_authority_calls(
+            &self,
+            node: &NodeId,
+        ) -> Result<NativePlacementAuthorityCapture, String> {
+            let context = self.component_context(node)?;
+            let owner = crate::runtime_host::retain_component_data_owner(&context)
+                .map_err(|error| error.to_string())?;
+            let root = context.data_dir().root();
+            let observed = Arc::new(Observations {
+                owner: Arc::downgrade(&owner),
+                calls: Mutex::new(Vec::new()),
+                omitted: AtomicUsize::new(0),
+            });
+            let mut observers = OBSERVERS
+                .get_or_init(Default::default)
+                .lock()
+                .map_err(|_| "placement observer registry poisoned")?;
+            if observers
+                .get(&root)
+                .and_then(std::sync::Weak::upgrade)
+                .is_some()
+            {
+                return Err("actual owner already has a placement authority observer".into());
+            }
+            observers.insert(root.clone(), Arc::downgrade(&observed));
+            Ok(NativePlacementAuthorityCapture {
+                root,
+                reader: NativePlacementAuthorityReader(observed),
+            })
+        }
+    }
+}
+#[cfg(test)]
+pub(crate) use placement_authority_observation::{
+    NativePlacementAuthorityCapture, NativePlacementAuthorityReader,
+    PlacementAuthorityCallObservation, observe_placement_authority_call,
+};
+
 #[cfg(test)]
 #[derive(Clone, Debug)]
 pub(crate) struct CapturedCheckpointedBackgroundRepair {
