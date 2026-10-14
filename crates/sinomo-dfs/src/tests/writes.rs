@@ -2243,13 +2243,30 @@ fn replica_stage_and_commit_do_not_append_authoritative_metadata() {
         )
         .expect("read-only actual replica metadata")
     }
+    fn complete_journal_tail(
+        backend: &LocalSobjMetadataBackend,
+        materialized: u64,
+    ) -> Vec<crate::DfsMetadataJournalEntry> {
+        let tail = backend
+            .journal_since_limited(materialized, DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT)
+            .unwrap();
+        assert!(
+            tail.len() < DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
+            "the complete native effect observation must not omit pending journal entries"
+        );
+        tail
+    }
     fn prefix(
         data_dir: &sinomo_core::local::SinomoDataDir,
         shard_id: &DfsMetadataShardId,
     ) -> (u64, DfsMetadataPrefixProof) {
         let backend = metadata(data_dir, shard_id);
+        let materialized = backend
+            .export_table_snapshot()
+            .materialized_through_sequence;
+        let tail = complete_journal_tail(&backend, materialized);
         (
-            backend.journal_last_sequence(),
+            tail.last().map_or(materialized, |entry| entry.sequence),
             backend.metadata_prefix_proof().unwrap(),
         )
     }
@@ -2257,6 +2274,7 @@ fn replica_stage_and_commit_do_not_append_authoritative_metadata() {
     struct ReplicaState {
         prefix: (u64, DfsMetadataPrefixProof),
         tables: DfsMetadataTableSnapshot,
+        journal_tail: Vec<crate::DfsMetadataJournalEntry>,
         storage_generation: u64,
         publish_requests: usize,
     }
@@ -2265,12 +2283,20 @@ fn replica_stage_and_commit_do_not_append_authoritative_metadata() {
         lane: &DfsMutationLaneKey,
     ) -> ReplicaState {
         let backend = metadata(data_dir, &lane.shard_id);
+        let tables = backend.export_table_snapshot();
+        // ACKed native entries may await the asynchronous table materializer.
+        // Capture the complete bounded durable tail under this actual receiver
+        // admission as well; observing it neither applies nor authors entries.
+        let journal_tail = complete_journal_tail(&backend, tables.materialized_through_sequence);
         ReplicaState {
             prefix: (
-                backend.journal_last_sequence(),
+                journal_tail
+                    .last()
+                    .map_or(tables.materialized_through_sequence, |entry| entry.sequence),
                 backend.metadata_prefix_proof().unwrap(),
             ),
-            tables: backend.export_table_snapshot(),
+            tables,
+            journal_tail,
             storage_generation:
                 crate::runtime_host::daemon_dfs_storage_environment_dirty_generation(data_dir),
             publish_requests: crate::runtime_host::daemon_dfs_metadata_publish_lane_request_count(
@@ -2487,6 +2513,10 @@ fn replica_stage_and_commit_do_not_append_authoritative_metadata() {
             "Stage cannot publish or change authoritative metadata records"
         );
         assert_eq!(
+            stage_observation.before.journal_tail, stage_after.journal_tail,
+            "Stage cannot author or change any acknowledged pending metadata entry"
+        );
+        assert_eq!(
             stage_observation.before.publish_requests,
             stage_after.publish_requests
         );
@@ -2618,7 +2648,14 @@ fn replica_stage_and_commit_do_not_append_authoritative_metadata() {
         .prepared_operations_v7
         .iter()
         .find(|record| record.digest == stored.digest)
-        .expect("the actual target holds the same primary-authored complete body");
+        .or_else(|| observation.before.journal_tail.iter().find_map(|entry| {
+            match &entry.mutation {
+                crate::DfsMetadataMutation::PrepareOperationV7 { record, .. }
+                    if record.digest == stored.digest => Some(record.as_ref()),
+                _ => None,
+            }
+        }))
+        .expect("the actual target holds the same primary-authored complete body in its acknowledged journal or materialized table");
     target_prepare.validate().unwrap();
     assert_eq!(target_prepare.payload, stored.payload);
     assert_eq!(
