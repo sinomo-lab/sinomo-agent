@@ -4160,7 +4160,25 @@ fn repair_blob_sources_use_backend_current_locations_over_stale_memory() {
         "this is an actual retained old client projection across a normal new publication"
     );
     let mut restored = runtime.metadata_primary_service(&path).unwrap();
-    restored.hydrate_from_metadata_backend().unwrap();
+    // Reconstruct the actual missing-target owner from Main's durable queue.
+    // Broad disaster recovery also executes unrelated prepared operations; it
+    // is not the observation boundary for this source-selection assertion.
+    let attempts = LocalDfsRepairQueueStore::new(default_dfs_repair_attempt_snapshot_path(
+        runtime.data_dir(&primary),
+    ))
+    .view()
+    .unwrap()
+    .records;
+    assert!(
+        attempts.iter().any(|row| row.object_id == request.object_id
+            && row.version == request.target_version
+            && row.content_hash == content_hash(&bytes)
+            && row.missing_replica_node_id == missing),
+        "normal Main owns the exact current missing-target repair"
+    );
+    restored
+        .retry_pending_repairs_bounded_with_attempts(0, &attempts)
+        .unwrap();
     let job = restored
         .coordinator()
         .repair_jobs()

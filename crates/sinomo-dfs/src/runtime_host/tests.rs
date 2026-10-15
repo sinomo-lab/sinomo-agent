@@ -8633,6 +8633,32 @@ fn daemon_dfs_status_reads_configured_sharded_metadata_backend() {
         services_status.journal_last_sequence - admitted.prepare_sequence,
         "reported lag equals the proven native prefix gap, not an assumed degraded-write frame count"
     );
+    // The prepare reached all participants; publication of its commit marker to
+    // the remaining live peer is asynchronous. Observe that actual durable ACK
+    // before asserting that the stopped participant is the only remaining work.
+    let publication_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    for target in services
+        .replica_node_ids
+        .iter()
+        .filter(|target| **target != offline_node)
+    {
+        loop {
+            let cursor = source
+                .metadata_backend()
+                .unwrap()
+                .metadata_replication_cursor(target, &services_id)
+                .unwrap();
+            if cursor >= services_status.journal_last_sequence {
+                break;
+            }
+            assert!(
+                Instant::now() < publication_deadline,
+                "live peer {target} must acknowledge the actual commit marker within the existing network budget; cursor={cursor}, head={}",
+                services_status.journal_last_sequence
+            );
+            std::thread::yield_now();
+        }
+    }
     let pending = daemon_dfs_pending_maintenance_work(&paths).expect("pending maintenance");
     assert_eq!(pending.pending_write_count, 0);
     assert_eq!(pending.pending_repair_count, 0);
