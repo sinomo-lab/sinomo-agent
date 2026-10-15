@@ -1292,6 +1292,18 @@ adoption, recovery proceeds forward; it does not roll back an already visible
 destination into an ambiguous state. Authority changes are re-resolved on
 resume, and both sides validate current epochs.
 
+A running rename coordinator reads its source through explicit metadata query
+variants carrying the complete recorded job and selected source frame or page
+cursor. The receiver checks the authenticated coordinator against current shard
+configuration, the source shard and epoch, and the canonical source path within
+the job's footprint. Only that job's read reservation is excluded; public reads,
+other reservations and all mutation guards retain their normal checks. The
+queries return canonical physical source rows without falling back to an older
+ancestor-shard copy. These rows are input data, not source/job writer custody or
+publication authority; capture and binding still verify the exact native bodies
+under their actual writers. Peers that do not implement these query variants
+reject them and must be upgraded before participating in this protocol.
+
 ## POSIX Synchronization and Partition Fencing
 
 The canonical DFS synchronization contract distinguishes advisory file locks,
