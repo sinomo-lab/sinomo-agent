@@ -875,6 +875,27 @@ impl DfsSourceAdoptionActor {
             || plan.request_id.is_empty()
             || plan.transfer_id.is_empty()
         {
+            #[cfg(test)]
+            eprintln!(
+                "SOURCE_PLAN_REJECT root={:?} closed={} sender_closed={} caller={} coordinator={} actor={} source={} status={:?} fs_source={} fs_target={} fs_job={} binds={} request_empty={} transfer_empty={} job={:?} destination={:?} path={}",
+                self.data_root,
+                *self.shutdown.borrow(),
+                self.shutdown.has_changed().is_err(),
+                caller,
+                plan.job_config.primary_node_id,
+                self.node,
+                plan.source_config.primary_node_id,
+                plan.job.status,
+                plan.job.file_system_id == plan.source_config.file_system_id,
+                plan.job.file_system_id == plan.target_config.file_system_id,
+                plan.job.file_system_id == plan.job_config.file_system_id,
+                job_custody::job_binds_destination(&plan.job, &plan.destination, &plan.source_path),
+                plan.request_id.is_empty(),
+                plan.transfer_id.is_empty(),
+                plan.job,
+                plan.destination,
+                plan.source_path,
+            );
             return Err(error(
                 "source preparation lacks its actual source/coordinator plan",
             ));
