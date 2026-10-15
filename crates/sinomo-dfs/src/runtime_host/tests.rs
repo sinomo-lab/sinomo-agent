@@ -6125,18 +6125,30 @@ fn daemon_dfs_metadata_journal_batch_applies_to_local_backend() {
             if !observed {
                 return Err("native prepare dispatch was not observed".into());
             }
-            let source = LocalSobjMetadataBackend::open_for_inspection(
-                shard_id.clone(),
-                crate::local_dfs_metadata_shard_path(
-                    runtime.data_dir(&shard.primary_node_id),
-                    &shard_id,
-                ),
-            )
-            .map_err(|error| error.to_string())?;
-            let batch = source
-                .journal_batch_for_shard_since_limited(&shard_id, before, 1, usize::MAX)
-                .map_err(|error| error.to_string())?
-                .ok_or("actual retained prepare frame missing")?;
+            // A peer dispatch can belong to an already queued publisher.
+            // Keep the original observation deadline and require the actual
+            // new source frame before constructing the native ingest request.
+            let (source, batch) = loop {
+                let source = LocalSobjMetadataBackend::open_for_inspection(
+                    shard_id.clone(),
+                    crate::local_dfs_metadata_shard_path(
+                        runtime.data_dir(&shard.primary_node_id),
+                        &shard_id,
+                    ),
+                )
+                .map_err(|error| error.to_string())?;
+                if let Some(batch) = source
+                    .journal_batch_for_shard_since_limited(&shard_id, before, 1, usize::MAX)
+                    .map_err(|error| error.to_string())?
+                {
+                    break (source, batch);
+                }
+                if Instant::now() >= deadline {
+                    return Err("actual new prepare frame did not appear within the original observation deadline".into());
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            };
+            assert_eq!(batch.entries[0].sequence, before + 1);
             assert!(matches!(
                 &batch.entries[0].mutation,
                 crate::DfsMetadataMutation::PrepareOperationV7 { .. }
@@ -15341,7 +15353,7 @@ fn default_cluster_metadata_shard_transfers_after_candidate_replays_current_jour
         crate::control_plane::topology_preserving_metadata_shard_replicas(&actual, &candidate)
             .expect("unchanged native member ring");
     desired.epoch += 1;
-    control
+    let handoff = control
         .with_client(|kv| {
             DfsControlPlaneStore::new(kv.as_mut())
                 .begin_metadata_shard_membership_handoff(&actual, &desired)
@@ -15366,9 +15378,17 @@ fn default_cluster_metadata_shard_transfers_after_candidate_replays_current_jour
     fixture
         .reopen_node(candidate.clone())
         .expect("normal candidate restart/replay");
-    source
-        .reconcile_pending_metadata_shard_membership_handoffs(&configs, Duration::from_secs(5))
-        .expect("real freeze/replay/joint activation");
+    let completion_deadline = Instant::now() + Duration::from_secs(5);
+    let explicit = source
+        .reconcile_pending_metadata_shard_membership_handoffs(&configs, Duration::from_secs(5));
+    let completed = fixture
+        .observe_completed_native_handoff(&control, &handoff, completion_deadline)
+        .expect("observe the original native handoff proof");
+    assert_eq!(
+        completed.as_ref(),
+        Some(&desired),
+        "real freeze/replay/joint activation must finish the original handoff; explicit caller={explicit:?}"
+    );
     let transferred = control
         .with_client(|kv| {
             DfsControlPlaneStore::new(kv.as_mut()).get_metadata_shard(&file_system_id, "services")
