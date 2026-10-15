@@ -1619,6 +1619,26 @@ fn synchronous_recovery_fetches_the_only_missing_local_receipt_within_budget() {
     };
     runtime.stop_node(&primary).unwrap();
     runtime.reopen_node(primary.clone()).unwrap();
+    // After normal startup completes with the original fetch denial active,
+    // select this synchronous Core recovery as the producer under test.
+    // A restarted Main can independently recover the same missing receipt;
+    // its autonomous work is outside this call's zero/one scheduling budget.
+    // Deny only maintenance before admission; keep normal RPC endpoints live.
+    let background = crate::runtime_host::install_daemon_dfs_pre_dispatch_test_hook(
+        runtime.data_dir(&primary),
+        Arc::new(|point, command, _| {
+            if matches!(
+                point,
+                crate::runtime_host::DaemonDfsPreDispatchTestPoint::BeforeResidentPreflight
+            ) && command.is_none()
+            {
+                return Err(DfsError::Cancelled {
+                    operation: "negative autonomous maintenance during synchronous recovery budget",
+                });
+            }
+            Ok(())
+        }),
+    );
     let mut core = runtime.metadata_primary_service("/services").unwrap();
     core.hydrate_from_metadata_backend().unwrap();
     assert!(core.writes.pending_writes.contains_key(&intent_id));
@@ -1681,6 +1701,7 @@ fn synchronous_recovery_fetches_the_only_missing_local_receipt_within_budget() {
     );
     drop(core);
     drop(writer);
+    drop(background);
     runtime.close().unwrap();
 }
 
