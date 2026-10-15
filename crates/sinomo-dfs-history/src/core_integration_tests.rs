@@ -2306,7 +2306,10 @@ fn file_history_repin_after_restart_does_not_rewind_a_canonical_write_intent() {
         3,
     );
     let remote = remotes[0].clone();
-    deny_history_content_targets(&runtime, &owner, &[remote.clone()]);
+    // Re-pin selects its repair target from the current eligible members.
+    // Keep every remote content target unavailable so background repair cannot
+    // satisfy the retained obligation before the canonical intent checks.
+    deny_history_content_targets(&runtime, &owner, &remotes);
     let first = dfs
         .posix_write_file(
             "/services/canonical-repin",
