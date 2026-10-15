@@ -3,6 +3,151 @@
 use super::*;
 
 #[test]
+fn native_explicit_primary_handoff_preserves_an_unfinished_metadata_prepare() {
+    let (mut runtime, requester, retiring) = crate::test_support::current_native_metadata_service(
+        "native-handoff-unfinished-prepare",
+        3,
+        "/services",
+    )
+    .unwrap();
+    drop(requester);
+    let control = runtime.shared_control_plane().unwrap();
+    let configs = runtime.metadata_shards().unwrap();
+    let promoted = retiring.replica_node_ids[0].clone();
+    let shard_id = DfsMetadataShardId::new(retiring.shard_id.clone());
+    let mut source = runtime.metadata_primary_service("/services").unwrap();
+    let filesystem = source
+        .metadata_backend()
+        .unwrap()
+        .get_file_system_on_shard(&shard_id, &retiring.file_system_id)
+        .unwrap()
+        .unwrap();
+    let scope = DfsPreparedOperationScope {
+        file_system_id: retiring.file_system_id.clone(),
+        shard_id: shard_id.clone(),
+        owner_epoch: retiring.epoch,
+        operation_id: format!("native-handoff-prepare:{}", sinomo_core::Id::generate()),
+    };
+    let payload = DfsPreparedOperationPayload::for_metadata_effects(
+        scope.clone(),
+        Vec::new(),
+        Vec::new(),
+        vec![DfsPreparedMetadataEffect::PutFileSystem {
+            file_system: filesystem.clone(),
+        }],
+        OffsetDateTime::now_utc(),
+    )
+    .unwrap();
+    // Stop at the ordinary producer's durable Prepare boundary. The SAME
+    // native provider owns admission and the physical writer; no receipt,
+    // authority probe, handoff proof or persisted packet is supplied by the test.
+    let execution = source.acquire_prepared_execution(&scope).unwrap();
+    let digest = source
+        .prepare_payload_for_publication(payload.clone())
+        .unwrap();
+    drop(execution);
+    let original = source
+        .metadata_backend()
+        .unwrap()
+        .prepared_operation_record(&digest.operation_id)
+        .unwrap()
+        .unwrap();
+    original.validate().unwrap();
+    assert_eq!(original.status, DfsPreparedOperationStatus::Prepared);
+    assert_eq!(original.payload.as_ref(), &payload);
+    let handoff = control
+        .with_client(|kv| {
+            DfsControlPlaneStore::new(kv.as_mut())
+                .request_metadata_shard_primary_handoff(&retiring, &promoted)
+        })
+        .unwrap()
+        .unwrap();
+    let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    let explicit = source.reconcile_pending_metadata_shard_membership_handoffs(
+        &configs,
+        sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+    );
+    loop {
+        if let Some(active) = runtime
+            .observe_completed_native_handoff(&control, &handoff, deadline)
+            .unwrap()
+        {
+            assert_eq!(active, handoff.desired_shard);
+            break;
+        }
+        let (active, pending) = control
+            .with_client(|kv| {
+                DfsControlPlaneStore::new(kv.as_mut()).retiring_metadata_shard_handoff_view_before(
+                    &retiring.file_system_id,
+                    &retiring.shard_id,
+                    deadline,
+                )
+            })
+            .unwrap();
+        assert!(
+            pending
+                .as_ref()
+                .is_some_and(|value| value.handoff_id == handoff.handoff_id)
+                || active.as_ref() == Some(&handoff.desired_shard),
+            "the exact requested transfer cannot disappear while draining a prepare: active={active:?}, pending={pending:?}, explicit={explicit:?}"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "the original native handoff must finish within its existing deadline: {explicit:?}"
+        );
+        std::thread::yield_now();
+    }
+    assert!(
+        source.commit_stored_prepared_operation(&digest).is_err(),
+        "the retiring writer cannot commit its original prepare after activation"
+    );
+    drop(source);
+    // Restart the actual promoted owner before its existing recovery executor
+    // reads the transferred durable prepares. This staged Core producer has no
+    // foreground request latch; opening a lazy service alone is not execution.
+    runtime.stop_node(&promoted).unwrap();
+    runtime.reopen_node(promoted.clone()).unwrap();
+    let mut successor = runtime.metadata_primary_service("/services").unwrap();
+    assert_eq!(successor.node_id(), &promoted);
+    successor.recover_durable_namespace_prepares().unwrap();
+    let backend = successor.metadata_backend().unwrap();
+    let old = backend
+        .prepared_operation_record(&digest.operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(old.digest, digest);
+    assert_eq!(old.payload, original.payload);
+    assert_eq!(old.status, DfsPreparedOperationStatus::Superseded);
+    let adopted_id = format!(
+        "recover:{}:{}",
+        digest.operation_id, handoff.desired_shard.epoch
+    );
+    let adopted = backend
+        .prepared_operation_record(&adopted_id)
+        .unwrap()
+        .unwrap();
+    let mut expected = payload;
+    expected.operation_id = adopted_id;
+    expected.owner_epoch = handoff.desired_shard.epoch;
+    expected
+        .metadata_effects
+        .push(DfsPreparedMetadataEffect::ResolvePreparedOperation {
+            digest,
+            status: DfsPreparedOperationStatus::Superseded,
+        });
+    assert_eq!(adopted.payload.as_ref(), &expected);
+    assert_eq!(adopted.status, DfsPreparedOperationStatus::Committed);
+    assert_eq!(
+        backend
+            .get_file_system_on_shard(&shard_id, &retiring.file_system_id)
+            .unwrap(),
+        Some(filesystem)
+    );
+    drop(successor);
+    runtime.close().unwrap();
+}
+
+#[test]
 fn ingested_manifest_counts_verified_local_copy_after_native_replanning() {
     let (runtime, mut requester, shard) = crate::test_support::current_native_metadata_service(
         "native-ingested-replan-local-receipt",

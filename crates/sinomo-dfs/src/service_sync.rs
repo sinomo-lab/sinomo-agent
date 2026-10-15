@@ -703,37 +703,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             if should_cancel() {
                 return Ok(None);
             }
-            let shard_id = DfsMetadataShardId::new(handoff.retiring_shard.shard_id.clone());
-            let cancelled_for_prepare_drain = if handoff.retiring_primary_fence.is_none()
-                && self.has_recoverable_standalone_namespace_prepare_on_shard(&shard_id)?
-            {
-                // Handoff creation can race recovery of a prepare that was
-                // already durable under the retiring assignment. Until the
-                // retiring-primary fence exists, the assignment has not
-                // changed and no successor can activate. Withdraw that exact
-                // decision under the publication guard, drain the prepare
-                // through normal canonical authorization, and let placement
-                // propose a fresh handoff from the resulting head.
-                let _publication_guard = self.metadata_shard_fence_guard(
-                    &handoff.retiring_shard.file_system_id,
-                    &handoff.retiring_shard.shard_id,
-                )?;
-                self.refresh_control_plane_latest()?;
-                let Some(control_plane) = self.control_plane.as_mut() else {
-                    return Ok(Some(completed));
-                };
-                DfsControlPlaneStore::new(control_plane.as_mut())
-                    .cancel_unfenced_metadata_shard_membership_handoff(&handoff)?
-            } else {
-                false
-            };
-            if cancelled_for_prepare_drain {
-                self.recover_durable_namespace_prepares()?;
-                if should_cancel() {
-                    return Ok(None);
-                }
-                continue;
-            }
+            // The accepted transfer is itself the durable desired assignment.
+            // Preserve it while freezing the complete prefix, including any
+            // unfinished prepares. The successor's normal epoch recovery
+            // re-certifies those exact bodies and retires their old reservations;
+            // deleting this proposal would lose an explicit operator request.
             if self.reconcile_metadata_shard_membership_handoff(&handoff, timeout)? {
                 completed += 1;
                 // An actual activation can invalidate the admitted owner cut.
