@@ -16047,14 +16047,33 @@ fn daemon_intent_scan_cursor_survives_dropped_maintenance_shell_and_resets_with_
     // Use the same retained ready generation selected under this actual global
     // admission, including a completed provider update while admission queued.
     let preflight = preflight.for_admission(&admission);
-    let retained = take_daemon_dfs_message_mutation_service_for_maintenance(
-        &data_dir,
-        &cluster_paths,
-        &cluster_state,
-        &runtime,
-        Some(&preflight),
-    )
-    .expect("take actual cached lane");
+    // Every independent lane selection consumes the generation currently
+    // retained by this same real global admission. Configuration can advance
+    // between selections even though competing metadata scans are excluded.
+    // As in normal Main, only a pre-effect stale-authority outcome can replan,
+    // at most twice; no guard error after execution is retried or accepted.
+    let take_current = || {
+        for replan in 0..=2 {
+            let current = preflight.for_admission(&admission);
+            match try_take_daemon_dfs_message_mutation_service_for_maintenance(
+                &data_dir,
+                &cluster_paths,
+                &cluster_state,
+                &runtime,
+                Some(&current),
+            ) {
+                Ok(retained) => return Ok(retained),
+                Err(DaemonDfsAuthorityPreExecutionError::AuthorityPreflightStale(_))
+                    if replan < 2 => {}
+                Err(DaemonDfsAuthorityPreExecutionError::AuthorityPreflightStale(stale)) => {
+                    return Err(stale.into_dfs_error());
+                }
+                Err(DaemonDfsAuthorityPreExecutionError::Failed(error)) => return Err(error),
+            }
+        }
+        unreachable!("bounded pre-effect selection returns its terminal result")
+    };
+    let retained = take_current().expect("take actual cached lane");
     let owner = Arc::clone(&retained.lane.service.write_intent_maintenance_scan);
     let key = |second| crate::DfsWriteIntentScanCursor {
         created_at: OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(second),
@@ -16100,14 +16119,7 @@ fn daemon_intent_scan_cursor_survives_dropped_maintenance_shell_and_resets_with_
             expected
         );
     }
-    let rebuilt = take_daemon_dfs_message_mutation_service_for_maintenance(
-        &data_dir,
-        &cluster_paths,
-        &cluster_state,
-        &runtime,
-        Some(&preflight),
-    )
-    .expect("rebuild a real maintenance service after cancellation");
+    let rebuilt = take_current().expect("rebuild a real maintenance service after cancellation");
     assert!(Arc::ptr_eq(
         &owner,
         &rebuilt.lane.service.write_intent_maintenance_scan
@@ -16126,14 +16138,7 @@ fn daemon_intent_scan_cursor_survives_dropped_maintenance_shell_and_resets_with_
     // Eviction is a real cache-owner replacement, unlike merely constructing
     // two services with a manually shared cursor. A fresh owner safely rewinds.
     assert!(evict_daemon_dfs_message_service_cache(&data_dir).unwrap());
-    let replaced = take_daemon_dfs_message_mutation_service_for_maintenance(
-        &data_dir,
-        &cluster_paths,
-        &cluster_state,
-        &runtime,
-        Some(&preflight),
-    )
-    .expect("new cache owner");
+    let replaced = take_current().expect("new cache owner");
     assert!(!Arc::ptr_eq(
         &owner,
         &replaced.lane.service.write_intent_maintenance_scan
