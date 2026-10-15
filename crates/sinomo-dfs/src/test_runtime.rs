@@ -286,8 +286,8 @@ struct Endpoint {
     registry: ServiceRegistry,
     kv_available: Arc<AtomicBool>,
     accepting: AtomicBool,
-    active: AtomicUsize,
-    idle: Notify,
+    active: Arc<AtomicUsize>,
+    idle: Arc<Notify>,
 }
 impl Endpoint {
     fn admits_route(&self, route: &str) -> bool {
@@ -413,19 +413,20 @@ impl Fabric {
     }
 }
 struct Invocation {
-    endpoint: Arc<Endpoint>,
+    active: Arc<AtomicUsize>,
+    idle: Arc<Notify>,
     fabric: Arc<Fabric>,
     observation: RpcObservation,
     completed: bool,
 }
 impl Drop for Invocation {
     fn drop(&mut self) {
-        self.endpoint.active.fetch_sub(1, Ordering::AcqRel);
-        self.endpoint.idle.notify_waiters();
         if !self.completed {
             self.observation.phase = RpcPhase::EndedWithoutResponse;
             self.fabric.record(self.observation.clone());
         }
+        self.active.fetch_sub(1, Ordering::AcqRel);
+        self.idle.notify_waiters();
     }
 }
 #[derive(Clone)]
@@ -513,6 +514,10 @@ impl Carrier {
         mut observation: RpcObservation,
         dispatch_started: Arc<AtomicBool>,
     ) -> Result<ObjectRpcResult, NetworkError> {
+        // Drop order is part of the drain contract: every service-bearing
+        // endpoint/reference below must end before this counter-only guard
+        // publishes idle. Its notification cannot itself pin the old owner.
+        let mut _invocation;
         let endpoint = {
             let nodes = self.fabric.nodes.lock().expect("DFS test nodes");
             let source = nodes
@@ -539,8 +544,9 @@ impl Carrier {
             endpoint.active.fetch_add(1, Ordering::AcqRel);
             endpoint
         };
-        let mut invocation = Invocation {
-            endpoint: endpoint.clone(),
+        _invocation = Invocation {
+            active: Arc::clone(&endpoint.active),
+            idle: Arc::clone(&endpoint.idle),
             fabric: self.fabric.clone(),
             observation: observation.clone(),
             completed: false,
@@ -1061,7 +1067,7 @@ impl Carrier {
             .transfer(target.clone(), self.source.clone(), response_transfer);
         observation.phase = RpcPhase::Completed;
         self.fabric.record(observation);
-        invocation.completed = true;
+        _invocation.completed = true;
         Ok(result)
     }
     async fn invoke(
@@ -2445,8 +2451,8 @@ impl DfsTestRuntime {
                 .clone(),
             kv_available: Arc::clone(&endpoint.kv_available),
             accepting: AtomicBool::new(false),
-            active: AtomicUsize::new(0),
-            idle: Notify::new(),
+            active: Arc::new(AtomicUsize::new(0)),
+            idle: Arc::new(Notify::new()),
         });
         self.fabric
             .nodes
@@ -2543,8 +2549,8 @@ impl DfsTestRuntime {
                 .clone(),
             kv_available: Arc::clone(&self.nodes[node].kv_available),
             accepting: AtomicBool::new(false),
-            active: AtomicUsize::new(0),
-            idle: Notify::new(),
+            active: Arc::new(AtomicUsize::new(0)),
+            idle: Arc::new(Notify::new()),
         });
         self.fabric
             .nodes
@@ -4912,5 +4918,101 @@ mod owned_fault_cleanup_tests {
                 if Arc::ptr_eq(capture, &unknown))
         });
         runtime.close().unwrap();
+    }
+    #[test]
+    fn native_cancelled_invocation_releases_endpoint_before_idle_notification() {
+        use std::task::{Context, Poll, Wake, Waker};
+        struct DrainObservation {
+            endpoint: std::sync::Weak<Endpoint>,
+            observed: Mutex<Option<(usize, usize)>>,
+        }
+        impl DrainObservation {
+            fn observe(&self) {
+                let references = self.endpoint.strong_count();
+                let active = self
+                    .endpoint
+                    .upgrade()
+                    .unwrap()
+                    .active
+                    .load(Ordering::Acquire);
+                *self.observed.lock().unwrap() = Some((active, references));
+            }
+        }
+        impl Wake for DrainObservation {
+            fn wake(self: Arc<Self>) {
+                self.observe();
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.observe();
+            }
+        }
+        let (native, nodes) =
+            DfsTestRuntime::start_cluster("native-invocation-idle-owner-order", 1).unwrap();
+        let node = nodes[0].clone();
+        let endpoint = Arc::clone(&native.fabric.nodes.lock().unwrap()[&node]);
+        assert!(endpoint.registry.owns(crate::DFS_STATUS_ROUTE));
+        let carrier = Carrier {
+            source: node.clone(),
+            fabric: Arc::clone(&native.fabric),
+            origin: RpcOrigin::RegisteredHost,
+        };
+        let call = ObjectRpcCall::value(
+            ObjectRpcRequest::encode_body(crate::DFS_STATUS_ROUTE, crate::DFS_RPC_CATEGORY, &())
+                .unwrap(),
+        );
+        let observation =
+            carrier.observation(&node, &call, ClusterObjectRpcOptions::default(), true);
+        native.install_fault(FaultRule {
+            source: Some(node.clone()),
+            target: Some(node.clone()),
+            route: Some(crate::DFS_STATUS_ROUTE.into()),
+            call_id: Some(observation.call_id),
+            origin: Some(RpcOrigin::RegisteredHost),
+            remaining_hits: 1,
+            action: FaultAction::PauseBeforeDispatch(Arc::new(Semaphore::new(0))),
+        });
+        let mut call =
+            Box::pin(carrier.deliver(&node, call, observation, Arc::new(AtomicBool::new(false))));
+        let mut pending_context = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            call.as_mut().poll(&mut pending_context),
+            Poll::Pending
+        ));
+        // Withdraw the real native endpoint exactly as stop does. No new peer
+        // invocation can obscure the one admitted, paused call's drain edge.
+        endpoint.accepting.store(false, Ordering::Release);
+        endpoint.kv_available.store(false, Ordering::Release);
+        run_unit(Box::pin(native.kv_peers.join(CLOSE_TIMEOUT))).unwrap();
+        native.join_transfers(Some(&node)).unwrap();
+        let deadline = std::time::Instant::now() + CLOSE_TIMEOUT;
+        while endpoint.active.load(Ordering::Acquire) != 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "other native ingress did not drain"
+            );
+            std::thread::yield_now();
+        }
+        let observer = Arc::new(DrainObservation {
+            endpoint: Arc::downgrade(&endpoint),
+            observed: Mutex::new(None),
+        });
+        let waker = Waker::from(Arc::clone(&observer));
+        let mut context = Context::from_waker(&waker);
+        let mut idle = Box::pin(endpoint.idle.notified());
+        assert!(matches!(idle.as_mut().poll(&mut context), Poll::Pending));
+        drop(call);
+        let actual = *observer.observed.lock().unwrap();
+        drop(idle);
+        drop(endpoint);
+        drop(carrier);
+        native.clear_faults();
+        native.close().unwrap();
+        // Only the mounted registry and this test's observer reference may
+        // remain when idle is published. No call may still own a service lease.
+        assert_eq!(
+            actual,
+            Some((0, 2)),
+            "native idle notification retained a per-call endpoint capability"
+        );
     }
 }
