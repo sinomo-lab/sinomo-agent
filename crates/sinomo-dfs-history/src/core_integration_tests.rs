@@ -2433,6 +2433,13 @@ fn file_history_expired_rule_retires_repairs_even_during_retry_backoff() {
     store.replace_records(&records).unwrap();
     let actual = store.view().unwrap().records;
     assert_eq!(actual, records);
+    let mut preserved_transfer = actual[0].clone();
+    preserved_transfer.attempts = original.attempts;
+    preserved_transfer.next_retry_unix_nanos = original.next_retry_unix_nanos;
+    assert_eq!(
+        preserved_transfer, original,
+        "the scheduling fixture preserves every actual native transfer fact"
+    );
     assert_eq!(
         actual[0].transfer_kind,
         Some(sinomo_api::dfs::maintenance::DfsRepairTransferKind::Repair)
@@ -2473,14 +2480,19 @@ fn file_history_expired_rule_retires_repairs_even_during_retry_backoff() {
     native_history_owner_tick(&runtime, &owner);
     assert!(native_history_repairs(&dfs).is_empty());
     let current = native_history_queue(&runtime, &owner);
-    if actual[0].transfer_delivery_state
-        == Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent)
-        && actual[0].transfer_request_id.is_none()
+    eprintln!(
+        "native expired repair: original={original:?} scheduled={actual:?} after={current:?}"
+    );
+    if actual[0].transfer_request_id.is_none()
         && !actual[0].in_flight
-        && actual[0].completed_transfer_request_id.is_none()
+        && actual[0].transfer_kind.is_some()
+        && (actual[0].transfer_delivery_state
+            == Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent)
+            || actual[0].completed_transfer_request_id.is_some())
     {
-        // Only this actual typed no-dispatch outcome permits the original
-        // expired-current retirement assertion. No count or absence proves it.
+        // Main's exact accepted terminal also settles the old carrier claim.
+        // PossiblyApplied remains its delivery history, not unresolved custody
+        // after that recorded completion. Neither outcome proves replica bytes.
         assert!(current.is_empty());
     } else {
         assert_eq!(
