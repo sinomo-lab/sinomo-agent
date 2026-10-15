@@ -706,16 +706,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             });
         }
         self.ensure_no_open_write_state_for_object(&current, &old_path)?;
-        let mut moved = current.clone();
-        moved.path = target_path;
-        moved.changed_at_unix_nanos = frame_object
-            .changed_at_unix_nanos
-            .max(moved.changed_at_unix_nanos.saturating_add(1));
-        // The durable job frame owns the target generation. Re-generating a
-        // version here would assign a different ULID on every retry, breaking
-        // both destination idempotency and the pin-transfer receipt identity.
-        moved.version = frame_object.version.clone();
-        self.adopt_moved_object_on_destination_primary(&moved, &old_path, Some(&current), None, job)
+        // The durable job frame owns the entire destination body, including
+        // timestamps and provenance. The independently captured current source
+        // remains an exact source precondition; it must not rebuild or rebase
+        // the destination that the actual Running job already reserved.
+        self.adopt_moved_object_on_destination_primary(
+            frame_object,
+            &old_path,
+            Some(&current),
+            None,
+            job,
+        )
     }
 
     /// Routes the adoption of a moved record to the destination path's
