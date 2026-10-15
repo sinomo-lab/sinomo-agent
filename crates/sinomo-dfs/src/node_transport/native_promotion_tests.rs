@@ -106,10 +106,21 @@ impl NativePromotions {
                     {
                         break;
                     }
+                    let remaining = deadline.saturating_duration_since(Instant::now());
                     assert!(
-                        Instant::now() < deadline,
+                        !remaining.is_zero(),
                         "normal foreground placement must finish before observing an exact promotion replay"
                     );
+                    // W=1 can return while the rest of the desired copies are
+                    // queued. Drive the same normal served owner inside the
+                    // original setup budget, without changing startup timers.
+                    let pass = runtime.maintenance_tick(&source, remaining).unwrap();
+                    assert!(
+                        pass.outcome.is_ok(),
+                        "native promotion setup: {:?}",
+                        pass.outcome
+                    );
+                    assert_eq!(pass.omitted_kv_event_count, 0);
                     std::thread::sleep(Duration::from_millis(1));
                 }
             }
