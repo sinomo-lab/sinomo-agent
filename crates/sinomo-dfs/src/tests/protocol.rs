@@ -2263,12 +2263,31 @@ fn stage_command_accepts_metadata_shard_primary_for_transient_object() {
             .is_none()
     );
     drop(before_replica);
-    let mut writer = runtime.client(&owner).unwrap();
-    let mut file_system = runtime.file_system();
     let mut policy = DfsSubtreePolicy::new(path, DfsObjectPolicy::ReplicatedConfirmed, 2, 2);
     policy.required_node_ids = vec![owner.clone(), replica.clone()];
-    file_system.subtree_policies.push(policy);
-    writer.add_file_system(file_system).unwrap();
+    let mut requested =
+        DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedConfirmed, 2, 2).unwrap();
+    requested.required_node_ids = policy.required_node_ids.clone();
+    runtime
+        .apply_placement_policy(&primary, path, DfsPlacementScope::Subtree, requested)
+        .unwrap();
+    let actual_config = runtime.shared_control_plane().unwrap().with_client(|kv| {
+        DfsControlPlaneStore::new(kv.as_mut())
+            .get_file_system_config(&sifs_file_system_id())
+            .unwrap()
+            .unwrap()
+    });
+    assert!(
+        actual_config.subtree_policies.contains(&policy),
+        "stage coverage requires its actual committed required-node rule: {actual_config:?}"
+    );
+    let mut writer = runtime.client(&owner).unwrap();
+    let (_, _, write_policy) = writer
+        .managed_replication_policy_for_path(path, DfsObjectPolicy::ReplicatedConfirmed, 2)
+        .unwrap();
+    assert_eq!(write_policy.min_commit_replicas, 2);
+    assert_eq!(write_policy.desired_replicas, 2);
+    assert_eq!(write_policy.required_node_ids, policy.required_node_ids);
     let before = runtime.rpc_observations().len();
     let bytes = b"actual metadata primary stages a requester's new object";
     let stat = writer
@@ -2277,12 +2296,13 @@ fn stage_command_accepts_metadata_shard_primary_for_transient_object() {
             bytes,
             DfsWriteOptions {
                 replica_candidates: vec![owner.clone(), replica.clone()],
-                policy: DfsReplicationPolicy::new(2, 2).unwrap(),
+                policy: write_policy,
                 wait_for_commit: true,
                 foreground_replica_repair: false,
             },
         )
         .unwrap();
+    assert_eq!(stat.policy, DfsObjectPolicy::ReplicatedConfirmed);
     let stage_observations = runtime.rpc_observations();
     assert!(
         stage_observations[before..]
