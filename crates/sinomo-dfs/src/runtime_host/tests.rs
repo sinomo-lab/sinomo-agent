@@ -8785,6 +8785,38 @@ fn late_native_hidden_suffix(
         .journal_last_sequence
 }
 
+fn late_native_publish_from_current_authority(
+    native: &crate::test_runtime::DfsTestRuntime,
+    local: &NodeId,
+    sender: DfsMetadataJournalBatchSender,
+    snapshot: crate::DfsMetadataSnapshotInstallSender,
+    options: crate::DfsMetadataJournalReplicationOptions,
+) -> Result<crate::DfsMetadataJournalReplicationReport, crate::DfsError> {
+    // Mounted owners lend their current configuration. The standalone cluster
+    // path reopens Raft state and can collide with this fixture's live KV owner.
+    // Keep the same normal publisher, physical journal, actual peer senders and
+    // per-attempt/target budgets; only obtain its inputs from the native owner.
+    let shards = native
+        .metadata_shards()
+        .expect("actual native shard projection");
+    let peers = shards
+        .iter()
+        .flat_map(|shard| {
+            std::iter::once(shard.primary_node_id.clone()).chain(shard.replica_node_ids.clone())
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut transport = crate::DfsMetadataNodeTransport::new(peers, sender, snapshot);
+    let mut host = crate::LocalDfsMetadataJournalPublisherHost::new(native.data_dir(local).clone());
+    crate::publish_dfs_metadata_journal_with_host(
+        crate::sifs_file_system_id(),
+        local,
+        shards,
+        &mut host,
+        &mut transport,
+        options,
+    )
+}
+
 fn late_native_publish_options() -> crate::DfsMetadataJournalReplicationOptions {
     crate::DfsMetadataJournalReplicationOptions {
         probe_caught_up_replicas: true,
@@ -8837,10 +8869,9 @@ fn daemon_dfs_metadata_journal_publish_replicates_all_local_primary_shards() {
         copied.lock().unwrap().push(command.batch.shard_id.clone());
         actual(node, command, budget)
     });
-    let data = native.data_dir(&local);
-    let report = crate::publish_cluster_dfs_metadata_journal(
-        data,
-        &ClusterPaths::new(data),
+    let report = late_native_publish_from_current_authority(
+        &native,
+        &local,
         sender,
         snapshot,
         late_native_publish_options(),
@@ -8887,10 +8918,9 @@ fn daemon_dfs_metadata_journal_publish_drains_bounded_batches() {
         }
         actual(node, command, budget)
     });
-    let data = native.data_dir(&local);
-    let report = crate::publish_cluster_dfs_metadata_journal(
-        data,
-        &ClusterPaths::new(data),
+    let report = late_native_publish_from_current_authority(
+        &native,
+        &local,
         sender,
         snapshot,
         late_native_publish_options(),
@@ -8968,10 +8998,9 @@ fn daemon_dfs_metadata_journal_publish_rejects_mismatched_ack_cursor() {
         }
         Ok(response)
     });
-    let data = native.data_dir(&local);
-    let report = crate::publish_cluster_dfs_metadata_journal(
-        data,
-        &ClusterPaths::new(data),
+    let report = late_native_publish_from_current_authority(
+        &native,
+        &local,
         sender,
         snapshot,
         late_native_publish_options(),
@@ -9038,10 +9067,9 @@ fn daemon_dfs_metadata_journal_publish_stops_after_replica_rejection() {
         invalid.authority_epoch = Some(shard.epoch.saturating_add(1));
         actual(node, &invalid, budget)
     });
-    let data = native.data_dir(&local);
-    let report = crate::publish_cluster_dfs_metadata_journal(
-        data,
-        &ClusterPaths::new(data),
+    let report = late_native_publish_from_current_authority(
+        &native,
+        &local,
         sender,
         snapshot,
         late_native_publish_options(),
@@ -9202,10 +9230,9 @@ fn daemon_dfs_metadata_journal_publish_bounds_endpoint_fallbacks_per_target() {
             .push((node.clone(), command.batch.shard_id.clone()));
         actual(node, command, budget)
     });
-    let data = native.data_dir(&local);
-    let report = crate::publish_cluster_dfs_metadata_journal(
-        data,
-        &ClusterPaths::new(data),
+    let report = late_native_publish_from_current_authority(
+        &native,
+        &local,
         sender,
         snapshot,
         late_native_publish_options(),
