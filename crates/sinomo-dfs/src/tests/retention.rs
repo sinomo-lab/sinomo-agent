@@ -750,7 +750,32 @@ fn sifs_replica_distributed_stat_prefers_primary_tombstone_over_stale_local_hit(
     let path = "/users/stat-stale-live.txt";
     let bytes = b"writer-local stale entry should lose to primary tombstone".to_vec();
 
+    // This case needs an actual writer-local predecessor, not just W1 commit
+    // on whichever node supplied the first receipt. Establish its intended
+    // one-copy placement through the normal managed Apply before writing.
+    let mut placement = DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 1).unwrap();
+    placement.required_node_ids = vec![cluster.writer_node.clone()];
+    let accepted = cluster
+        ._runtime
+        .apply_placement_policy(
+            &cluster.primary_node,
+            path,
+            DfsPlacementScope::Subtree,
+            placement,
+        )
+        .unwrap();
+    super::writes::finish_native_placement_fixture_apply(&cluster._runtime, &accepted);
+
     sifs_cluster_routed_posix_write(&mut cluster, path, &bytes);
+    assert_eq!(
+        cluster
+            .writer
+            .posix_stat_distributed(path)
+            .unwrap()
+            .current_locations,
+        vec![cluster.writer_node.clone()],
+        "the stale-local fixture owns an actual committed writer copy"
+    );
     assert_eq!(
         cluster.writer.posix_read_file(path).expect("writer read"),
         bytes

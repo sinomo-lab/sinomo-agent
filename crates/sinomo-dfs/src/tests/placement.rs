@@ -400,6 +400,20 @@ fn sifs_cluster_posix_routed_namespace_ops_converge_across_replicas() {
         _runtime,
     } = cluster;
 
+    // Both names must keep the writer as the real one-copy content target;
+    // namespace convergence alone does not promise a local content replica.
+    let mut placement = DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 1).unwrap();
+    placement.required_node_ids = vec![writer_node.clone()];
+    let accepted = _runtime
+        .apply_placement_policy(
+            &primary_node,
+            "/users/shared",
+            DfsPlacementScope::Subtree,
+            placement,
+        )
+        .unwrap();
+    super::writes::finish_native_placement_fixture_apply(&_runtime, &accepted);
+
     let stop_primary = Arc::new(AtomicBool::new(false));
     let primary_stop = Arc::clone(&stop_primary);
     let primary_thread = std::thread::spawn(move || {
@@ -423,6 +437,14 @@ fn sifs_cluster_posix_routed_namespace_ops_converge_across_replicas() {
             DfsWriteOptions::replicated_eventual(vec![writer_node.clone()]),
         )
         .expect("writer routed write");
+    assert_eq!(
+        writer
+            .posix_stat_distributed("/users/shared/from-writer.txt")
+            .unwrap()
+            .current_locations,
+        vec![writer_node.clone()],
+        "the namespace fixture owns an actual committed writer copy"
+    );
 
     // The observer mutates the same subtree it has never replayed: the
     // primary resolves authoritatively, so the routed ops still apply.
