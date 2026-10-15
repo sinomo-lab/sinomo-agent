@@ -39,7 +39,11 @@ mounts, a read-only filesystem and no added capabilities. It retains its owned
 container stopped. It verifies held-thread CPU against process CPU time, TCP/UDP
 IPv4/IPv6 loopback payloads and exact public/inside byte-counter agreement. A
 short-lived disposable namespace demonstrates why even successful adjacent
-censuses cannot certify continuous host completeness. Its actual timestamps,
+censuses cannot certify continuous host completeness; an observed birth/exit
+instead demonstrates interval rejection. Fixture work runs independently of
+the sampler, so Docker startup/removal cannot excuse a missed tick. The receipt
+distinguishes the full CLI lifetime from the active namespace observations;
+cleanup duration is never used to invent a tighter namespace lifetime. Actual timestamps,
 including a missed tick or inconclusive lifecycle demonstration, remain evidence.
 It neither stops nor throttles unrelated workloads. A positive fixture result
 cannot qualify a host or change any prior failure.

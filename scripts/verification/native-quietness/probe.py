@@ -7,6 +7,7 @@ changes capabilities/settings, enters a namespace, or controls a real daemon.
 Run only after the build slot is available, under the shared build lock.
 """
 import argparse
+import concurrent.futures
 import hashlib
 import json
 import os
@@ -99,6 +100,9 @@ def calibrate(collector, output):
     worker = None
     reader = None
     previous = None
+    ephemeral_future = None
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    executor.submit(lambda: None).result()  # Persistent owned fixture worker.
     before_usage = resource.getrusage(resource.RUSAGE_CHILDREN)
     started = time.monotonic_ns()
     try:
@@ -160,15 +164,22 @@ def calibrate(collector, output):
                 # BETWEEN two successful one-second censuses. Snapshot success
                 # cannot close this blind spot. No production isolation changes.
                 ephemeral = WORKER.split("stat=pathlib.Path('/proc/self/stat')")[0] + "\nbefore=counters();network(socket.AF_INET,socket.SOCK_STREAM,262144);print(json.dumps({'before':before,'after':counters()}))\n"
-                begin = time.monotonic_ns()
-                result = command(["docker", "run", "--rm", "--read-only", "--network", "none",
-                                  "--label", "sinomo.measurement.owner=main-20261015",
-                                  "--entrypoint", "python3", IMAGE, "-u", "-c", ephemeral])
-                receipt["ephemeral_namespace"] = dict(begin_ns=begin, end_ns=time.monotonic_ns(), data=json.loads(result))
+                def transfer():
+                    begin = time.monotonic_ns()
+                    result = command(["docker", "run", "--rm", "--read-only", "--network", "none",
+                                      "--cidfile", str(output / "ephemeral.cid"),
+                                      "--label", "sinomo.measurement.owner=main-20261015",
+                                      "--entrypoint", "python3", IMAGE, "-u", "-c", ephemeral])
+                    return dict(begin_ns=begin, end_ns=time.monotonic_ns(), data=json.loads(result))
+                # Docker startup/removal may exceed a tick. It MUST NOT delay
+                # sampling; even our negative fixtures keep the same cadence.
+                ephemeral_future = executor.submit(transfer)
             previous = row
             tick += c.CADENCE_NS
         assert not any(r["joint"]["covered_window"] for r in receipt["results"]), "coverage gap must never accept native host"
         assert receipt["results"][-1]["sent_ns"] - first_ack >= c.QUIET_NS
+        cadence_errors = [r["joint"]["error"] for r in receipt["results"] if "error" in r["joint"]]
+        assert not cadence_errors, f"controller cadence/barrier failure: {cadence_errors}"
         receipt["common_barrier_envelope_ns"] = receipt["results"][-1]["sent_ns"] - first_ack
         receipt["assertions"].append("A real >=30s controller barrier envelope remains BLOCKED by native host coverage; no independent-clock substitution")
         for index, probe in enumerate(receipt["network_fixtures"]):
@@ -180,25 +191,59 @@ def calibrate(collector, output):
             assert [v-u for u, v in zip(lo_a, lo_b)] == delta, "outside/public and inside loopback counter delta mismatch"
             probe["calibrated_delta_rx_tx"] = delta
         receipt["assertions"].append("TCP/UDP IPv4/IPv6 payloads verified; public loopback RX and TX deltas exactly match inside counters, including header cost")
+        receipt["ephemeral_namespace"] = ephemeral_future.result(timeout=5)
         ephemeral = receipt["ephemeral_namespace"]
         # This fixture proc mount may have another device number. Compare the
         # known owned inode against all HOST proc keys solely to establish that
         # no matching endpoint was observed, never to deduplicate a live group.
         inode = ephemeral["data"]["before"]["counter_file"].split(":")[1]
-        a, b = [receipt["results"][i] for i in (6, 7)]
-        between = a["response"]["received_ns"] <= ephemeral["begin_ns"] < ephemeral["end_ns"] < b["sent_ns"]
-        unseen = all(not any(k.split(":")[1] == inode for k in r["response"]["sample"]["groups"]) for r in (a, b))
-        receipt["ephemeral_counter_census_gap_demonstrated"] = between and unseen
-        if between and unseen:
-            receipt["assertions"].append("Controlled namespace loopback transfer escaped both adjacent censuses; coverage=false correctly prevents acceptance")
+        receipt["ephemeral_seen_sequences"] = [r["sequence"] for r in receipt["results"]
+            if any(k.split(":")[1] == inode for k in r["response"]["sample"]["groups"])]
+        # Retain both facts: the CLI lifetime may cross a tick even when its
+        # active namespace never appears in any live-thread census (cleanup is
+        # outside the active process lifetime). Do not invent a tighter bound.
+        receipt["ephemeral_full_cli_lifetime_between_adjacent_censuses"] = any(
+            a["response"]["received_ns"] <= ephemeral["begin_ns"] < ephemeral["end_ns"] < b["sent_ns"]
+            for a, b in zip(receipt["results"], receipt["results"][1:]))
+        receipt["ephemeral_counter_census_gap_demonstrated"] = not receipt["ephemeral_seen_sequences"]
+        if not receipt["ephemeral_seen_sequences"]:
+            receipt["assertions"].append("Controlled namespace transferred loopback bytes without appearing in any cadence-preserved census; coverage=false prevents acceptance")
         else:
-            receipt["qualifications"] = ["Ephemeral fixture exceeded the nominal tick or shared a reused counter key; this attempt does not prove an unseen lifetime"]
+            lifecycle_errors = [r["checks"].get("fixture-host", {}).get("error", "") for r in receipt["results"]]
+            assert any("inventory changed" in error for error in lifecycle_errors)
+            receipt["assertions"].append("Controlled namespace birth/exit was observed and its inventory discontinuity invalidated the interval")
         receipt["status"] = "FIXTURES_PASSED_NATIVE_ACCEPTANCE_BLOCKED"
     except Exception as e:
         receipt["status"] = "FIXTURE_FAILED_EVIDENCE_RETAINED"
         receipt["error"] = f"{type(e).__name__}: {e}"
     finally:
         cleanup_errors = []
+        # All submitted work uses a 30s subprocess deadline and only owned
+        # disposable resources. Do not leave a delayed fixture task behind.
+        executor.shutdown(wait=True, cancel_futures=True)
+        ephemeral_cid_path = output / "ephemeral.cid"
+        if ephemeral_cid_path.exists():
+            ephemeral_cid = ephemeral_cid_path.read_text().strip()
+            inspection = subprocess.run(["docker", "inspect", ephemeral_cid], capture_output=True, text=True, timeout=10)
+            if inspection.returncode == 0:
+                try:
+                    command(["docker", "stop", "--time", "5", ephemeral_cid])
+                    stopped = json.loads(command(["docker", "inspect", ephemeral_cid]))[0]["State"]
+                    if stopped["Running"]:cleanup_errors.append("owned ephemeral fixture still running")
+                except (OSError, ValueError, subprocess.SubprocessError) as e:
+                    cleanup_errors.append(f"owned ephemeral fixture stop proof unavailable: {e}")
+            else:
+                # CLI diagnostic wording/case is not an absence proof. Require
+                # a successful independent inventory query for this exact CID.
+                try:
+                    matches = command(["docker", "ps", "--all", "--no-trunc", "--filter",
+                                       "id=" + ephemeral_cid, "--format", "{{.ID}}"])
+                    receipt["ephemeral_removal_inventory"] = dict(container_id=ephemeral_cid,
+                                                                  matching_ids=matches.splitlines())
+                    if matches.strip():
+                        cleanup_errors.append("owned ephemeral fixture removal not proven by inventory")
+                except (OSError, subprocess.SubprocessError) as e:
+                    cleanup_errors.append(f"owned ephemeral fixture removal inventory unavailable: {e}")
         if worker is not None:
             try:
                 try:
