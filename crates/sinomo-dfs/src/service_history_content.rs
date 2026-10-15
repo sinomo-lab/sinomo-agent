@@ -610,6 +610,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 // target length or granting a content receipt/publication.
                 return Ok(());
             };
+            if record.status == DfsWriteIntentStatus::Committed {
+                self.coordinator
+                    .restore_committed_repair_active_deferring_rebuild(&record.intent_id);
+            }
             self.writes
                 .pending_writes
                 .entry(record.intent_id.clone())

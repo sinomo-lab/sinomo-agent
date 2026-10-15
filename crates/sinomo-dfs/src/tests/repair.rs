@@ -9521,6 +9521,197 @@ fn native_private_repair_reply_checkpoints_its_actual_terminal_against_queue_bir
 }
 
 #[test]
+fn native_retained_restore_preserves_a_live_repin_wake_over_its_old_parked_cache() {
+    let (runtime, owner, replica, mut stale, stat, _, background) =
+        native_committed_repair_backlog("native-retained-parked-cache-repin", true);
+    let mut client = runtime.client(&owner).unwrap();
+    let namespace = "vendor.native-repin-cache";
+    let reference_id = "actual-live-root";
+    let crate::DfsPreservedContentOutcome::Retained { identity } = client
+        .preserve_content_revision(
+            crate::DfsPreservedContentRequest {
+                path: stat.path.clone(),
+                file_system_id: stat.file_system_id.clone(),
+                object_id: stat.object_id.clone(),
+                operation_id: sinomo_core::Id::generate().to_string(),
+                publication: crate::DfsRetainedContentPublication {
+                    namespace: namespace.into(),
+                    reference_id: reference_id.into(),
+                    metadata: None,
+                },
+            },
+            &b"actual retained cache reactivation bytes"[..],
+            DfsWriteOptions {
+                replica_candidates: vec![owner.clone(), replica.clone()],
+                policy: DfsReplicationPolicy::new(1, 2).unwrap(),
+                wait_for_commit: true,
+                foreground_replica_repair: false,
+            },
+        )
+        .unwrap()
+    else {
+        panic!("native retained publication reaches W");
+    };
+    let reference = |operation| DfsContentReferenceRequest {
+        namespace: namespace.into(),
+        path: stat.path.clone(),
+        identity: identity.clone(),
+        operation,
+        operation_id: sinomo_core::Id::generate().to_string(),
+    };
+    client
+        .retain_content_revision(reference(DfsContentReferenceOperation::Release {
+            reference_id: reference_id.into(),
+        }))
+        .unwrap();
+    let record = stale
+        .metadata_backend()
+        .unwrap()
+        .object_write_intent_history(&stat.object_id)
+        .unwrap()
+        .intents
+        .into_iter()
+        .find(|row| {
+            row.target_version == identity.version
+                && !row.publication.is_current()
+                && row.status == DfsWriteIntentStatus::Committed
+        })
+        .expect("actual full retained owner");
+    stale.restore_retained_content_intent(&record).unwrap();
+    assert!(
+        !stale
+            .retained_file_content_is_live(
+                &identity.object_id,
+                &identity.version,
+                record.content_hash.as_deref().unwrap()
+            )
+            .unwrap()
+    );
+    assert!(
+        stale
+            .coordinator()
+            .repair_job_for_target(&record.intent_id, &replica)
+            .is_none()
+    );
+    let parked = stale
+        .durable_repair_queue_records()
+        .into_iter()
+        .find(|row| row.intent_id == record.intent_id && row.missing_replica_node_id == replica)
+        .unwrap();
+    assert_eq!(parked.next_retry_unix_nanos, u64::MAX);
+    assert!(!crate::service_repair::repair_transfer_custody_unresolved(
+        &parked
+    ));
+    let queue = LocalDfsRepairQueueStore::new(default_dfs_repair_attempt_snapshot_path(
+        runtime.data_dir(&owner),
+    ));
+    let mut all = queue.view().unwrap().records;
+    *all.iter_mut()
+        .find(|row| row.intent_id == record.intent_id && row.missing_replica_node_id == replica)
+        .unwrap() = parked.clone();
+    checkpoint_actual_native_custody(&runtime, &owner, &all);
+    // Select the retained Core generation for this interleaving. The negative
+    // cut denies only competing lifecycle/maintenance cache entry, before work;
+    // the real Main reference mutation still executes and owns its queue wake.
+    drop(background);
+    let background = crate::runtime_host::install_daemon_dfs_pre_dispatch_test_hook(
+        runtime.data_dir(&owner),
+        Arc::new(|point, command, _| {
+            if matches!(
+                point,
+                crate::runtime_host::DaemonDfsPreDispatchTestPoint::BeforeResidentPreflight
+            ) && command.is_none()
+            {
+                return Err(DfsError::Cancelled {
+                    operation: "negative native maintenance before retained-cache restore",
+                });
+            }
+            Ok(())
+        }),
+    );
+    client
+        .retain_content_revision(reference(DfsContentReferenceOperation::Retain {
+            reference_id: reference_id.into(),
+        }))
+        .unwrap();
+    let woken = queue
+        .records_for_targets(&record.intent_id, std::slice::from_ref(&replica))
+        .unwrap()
+        .remove(0);
+    assert_ne!(woken.next_retry_unix_nanos, u64::MAX);
+    let mut unchanged = woken.clone();
+    unchanged.next_retry_unix_nanos = parked.next_retry_unix_nanos;
+    assert_eq!(unchanged, parked, "real Retain changes scheduling only");
+    assert!(
+        stale
+            .retained_file_content_is_live(
+                &identity.object_id,
+                &identity.version,
+                record.content_hash.as_deref().unwrap()
+            )
+            .unwrap()
+    );
+    assert!(
+        stale
+            .retry_pending_repairs_bounded_with_attempts(0, std::slice::from_ref(&woken))
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        stale
+            .coordinator()
+            .repair_job_for_target(&record.intent_id, &replica)
+            .is_some(),
+        "a live root must replace this lane's old inactive projection before repair-job rebuild"
+    );
+    let exported = stale
+        .durable_repair_queue_records()
+        .into_iter()
+        .find(|row| row.intent_id == record.intent_id && row.missing_replica_node_id == replica)
+        .unwrap();
+    assert!(
+        exported.next_retry_unix_nanos <= crate::test_support::now_unix_nanos(),
+        "the old parked cache must not overwrite the actual due wake: {exported:?}"
+    );
+    let mut immutable = exported.clone();
+    immutable.next_retry_unix_nanos = woken.next_retry_unix_nanos;
+    assert_eq!(immutable, woken);
+    let mut all = queue.view().unwrap().records;
+    *all.iter_mut()
+        .find(|row| row.intent_id == record.intent_id && row.missing_replica_node_id == replica)
+        .unwrap() = exported;
+    checkpoint_actual_native_custody(&runtime, &owner, &all);
+    client
+        .retain_content_revision(reference(DfsContentReferenceOperation::Release {
+            reference_id: reference_id.into(),
+        }))
+        .unwrap();
+    stale.restore_retained_content_intent(&record).unwrap();
+    assert!(
+        stale
+            .coordinator()
+            .repair_job_for_target(&record.intent_id, &replica)
+            .is_none(),
+        "an actually released root remains inactive"
+    );
+    assert_eq!(
+        stale
+            .durable_repair_queue_records()
+            .into_iter()
+            .find(|row| row.intent_id == record.intent_id && row.missing_replica_node_id == replica)
+            .unwrap()
+            .next_retry_unix_nanos,
+        u64::MAX
+    );
+    drop(stale);
+    drop(client);
+    drop(background);
+    runtime.assert_fault_budgets().unwrap();
+    runtime.clear_faults();
+    runtime.close().unwrap();
+}
+
+#[test]
 fn native_terminal_queue_restore_does_not_rearm_its_stale_retained_producer() {
     let (runtime, owner, replica, mut service, stat, intent_id, background) =
         native_committed_repair_backlog("native-terminal-queue-stale-producer", true);
