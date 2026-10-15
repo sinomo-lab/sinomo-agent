@@ -7744,6 +7744,13 @@ fn native_browser_fresh_repair_custody_reaches_n2_after_healing() {
         observation.outcome
     );
     assert_eq!(observation.omitted_kv_event_count, 0);
+    let mut continue_owner = matches!(
+        &observation.outcome,
+        Ok(crate::DfsMaintenanceTickOutcome::Completed {
+            reached_limit: true
+        })
+    );
+    let mut continuation_passes = 0;
     // The ordinary tick checkpoints custody before its detached carrier runs.
     // Its exact terminal record can remain until ordinary queue retirement.
     let terminal_row = |row: &DfsRepairAttemptRecord| {
@@ -7776,12 +7783,22 @@ fn native_browser_fresh_repair_custody_reaches_n2_after_healing() {
         assert!(
             Instant::now() < original_deadline,
             "the current repair completes within its original five-second window; ready_intent={ready_intent}; tail={tail:?}; actual_queue={:?}; first_tick={observation:?}; calls={:?}",
-            queue.view(), runtime.rpc_observations()[first_observation..].iter().rev().take(32).collect::<Vec<_>>()
+            queue.view(),
+            runtime.rpc_observations()[first_observation..]
+                .iter()
+                .rev()
+                .take(32)
+                .collect::<Vec<_>>()
         );
-        let inspect = runtime.metadata_primary_service(&tail.path).unwrap();
+        // Observe the actual receipt table without requesting another effect
+        // admission, which would preempt the background repair being observed.
+        let shard_id = DfsMetadataShardId::new(&config.shard_id);
+        let inspect = LocalSobjMetadataBackend::open_for_inspection(
+            shard_id.clone(),
+            crate::local_dfs_metadata_shard_path(runtime.data_dir(&owner), &shard_id),
+        )
+        .unwrap();
         let receipts = inspect
-            .metadata_backend()
-            .unwrap()
             .receipts_for_version(&tail.object_id, &tail.version)
             .unwrap();
         drop(inspect);
@@ -7805,6 +7822,30 @@ fn native_browser_fresh_repair_custody_reaches_n2_after_healing() {
                 "a receipt observed after the original deadline is not completion"
             );
             break (receipts, after);
+        }
+        if continue_owner {
+            // This fixture invoked the served pass itself. Preserve the normal
+            // completion contract by driving its declared bounded continuation,
+            // rather than waiting for the component's unrelated startup timer.
+            let remaining = original_deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "continuation stays in the original completion window"
+            );
+            let continued = runtime.maintenance_tick(&owner, remaining).unwrap();
+            assert!(
+                continued.outcome.is_ok(),
+                "native bounded continuation: {:?}",
+                continued.outcome
+            );
+            assert_eq!(continued.omitted_kv_event_count, 0);
+            continuation_passes += 1;
+            continue_owner = matches!(
+                &continued.outcome,
+                Ok(crate::DfsMaintenanceTickOutcome::Completed {
+                    reached_limit: true
+                })
+            );
         }
         std::thread::yield_now();
     };
@@ -7853,6 +7894,9 @@ fn native_browser_fresh_repair_custody_reaches_n2_after_healing() {
     assert!(
         Instant::now() < original_deadline,
         "the same completion window includes close"
+    );
+    eprintln!(
+        "native Browser repair completed with {continuation_passes} declared continuation passes inside the original five-second window"
     );
 }
 
