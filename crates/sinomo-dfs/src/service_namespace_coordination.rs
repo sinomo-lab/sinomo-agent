@@ -224,11 +224,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 "operation",
             )?,
             DfsNamespaceOperation::CommitLocalEventualBatch { transaction, .. } => {
-                return Self::affected_namespace_transaction_shards_from_snapshot(
-                    file_system_id,
-                    transaction,
-                    shards,
-                );
+                // The batch already includes every parent record it changes.
+                // Adding those records' parents again would incorrectly pull
+                // the root shard into a batch touching the /services directory.
+                Self::normalized_namespace_paths(
+                    transaction
+                        .objects
+                        .iter()
+                        .map(|object| object.path.as_str()),
+                    false,
+                    "local-eventual batch",
+                )?
             }
             _ => Self::normalized_namespace_paths(operation.involved_paths(), true, "operation")?,
         };
