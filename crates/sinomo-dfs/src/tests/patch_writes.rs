@@ -1020,6 +1020,21 @@ fn sifs_cluster_posix_write_at_beyond_eof_reads_back_zero_filled_hole() {
 fn sifs_cluster_routed_posix_write_at_from_reader_streams_fallback_overlay() {
     let mut cluster = sifs_posix_cluster("sifs-cluster-routed-reader-overlay", "/users");
     let path = "/users/routed-reader-overlay.bin";
+    // The final assertion reads locally on the writer. Make its intended
+    // one-copy placement explicit for both the base and streamed replacement.
+    let mut placement = DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 1).unwrap();
+    placement.required_node_ids = vec![cluster.writer_node.clone()];
+    let accepted = cluster
+        ._runtime
+        .apply_placement_policy(
+            &cluster.primary_node,
+            path,
+            DfsPlacementScope::Subtree,
+            placement,
+        )
+        .unwrap();
+    super::writes::finish_native_placement_fixture_apply(&cluster._runtime, &accepted);
+
     let base = (0..256 * 1024 + 17)
         .map(|index| (index % 251) as u8)
         .collect::<Vec<_>>();
@@ -1091,6 +1106,16 @@ fn sifs_cluster_routed_posix_write_at_from_reader_streams_fallback_overlay() {
                 .posix_stat(path)
                 .is_ok_and(|stat| stat.content_hash.as_deref() == Some(expected_hash.as_str()))
     });
+
+    assert_eq!(
+        cluster
+            .writer
+            .posix_stat_distributed(path)
+            .unwrap()
+            .current_locations,
+        vec![cluster.writer_node.clone()],
+        "the streamed overlay has a committed writer copy"
+    );
 
     assert!(
         bulk_reads.load(Ordering::SeqCst) > 2,
