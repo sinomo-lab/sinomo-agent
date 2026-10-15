@@ -1419,16 +1419,10 @@ pub fn handle_cluster_join_registration_request_with_host(
         {
             break (prepared, lifecycle_change_id, admitted);
         }
-        // The failed quorum commit already carries the authoritative snapshot
-        // that defeated our compare. Re-prepare from it immediately so a
-        // legitimate concurrent member refresh or another join does not turn
-        // a still-valid invitation into a terminal rejection.
-        // Security-sensitive invite, issuer, membership, and config checks all
-        // run again against that newer snapshot.
-        authoritative = KvAuthoritativeRead {
-            value: admitted.snapshot,
-            authority: admitted.authority,
-        };
+        // A fresh quorum result can lend its snapshot to the next attempt.
+        // An exact committed replay needs a separate authority read below.
+        // Invite, issuer, membership and config checks run again for every
+        // re-preparation, within the original admission-attempt bound.
         if admission_attempt >= CLUSTER_JOIN_ADMISSION_MAX_ATTEMPTS {
             return Ok(ClusterJoinRegistrationResponse {
                 accepted: false,
@@ -1439,6 +1433,27 @@ pub fn handle_cluster_join_registration_request_with_host(
                 responder_node_id: None,
             });
         }
+        // A replay proves this exact failed compare, not authority for a new
+        // admission. Obtain a distinct current-term cut only for a marked,
+        // known failed replay; malformed proof combinations still reach the
+        // unchanged authority guard and fail closed.
+        authoritative = if admitted.replayed_committed_request
+            && matches!(
+                admitted.authority.basis,
+                sinomo_kv::KvAuthorityBasis::ExactCommittedRequest
+            )
+            && admitted
+                .txn_response
+                .as_ref()
+                .is_some_and(|response| !response.succeeded)
+        {
+            host.authoritative_cluster_kv_snapshot(paths, &mut commit_state)?
+        } else {
+            KvAuthoritativeRead {
+                value: admitted.snapshot,
+                authority: admitted.authority,
+            }
+        };
         let retry_backoff = cluster_join_admission_retry_backoff(admission_attempt);
         join_registration_trace(format_args!(
             "atomic join admission compare raced with another cluster mutation; retrying after {retry_backoff:?}"
@@ -1948,10 +1963,6 @@ pub async fn handle_cluster_join_registration_request_async_with_host(
         {
             break (prepared, lifecycle_change_id, admitted);
         }
-        authoritative = KvAuthoritativeRead {
-            value: admitted.snapshot,
-            authority: admitted.authority,
-        };
         if admission_attempt >= CLUSTER_JOIN_ADMISSION_MAX_ATTEMPTS {
             return Ok(ClusterJoinRegistrationResponse {
                 accepted: false,
@@ -1962,6 +1973,28 @@ pub async fn handle_cluster_join_registration_request_async_with_host(
                 responder_node_id: None,
             });
         }
+        // A replay proves this exact failed compare, not authority for a new
+        // admission. Obtain a distinct current-term cut only for a marked,
+        // known failed replay; malformed proof combinations still reach the
+        // unchanged authority guard and fail closed.
+        authoritative = if admitted.replayed_committed_request
+            && matches!(
+                admitted.authority.basis,
+                sinomo_kv::KvAuthorityBasis::ExactCommittedRequest
+            )
+            && admitted
+                .txn_response
+                .as_ref()
+                .is_some_and(|response| !response.succeeded)
+        {
+            host.authoritative_cluster_kv_snapshot_async(paths, &mut commit_state)
+                .await?
+        } else {
+            KvAuthoritativeRead {
+                value: admitted.snapshot,
+                authority: admitted.authority,
+            }
+        };
         let retry_backoff = cluster_join_admission_retry_backoff(admission_attempt);
         join_registration_trace(format_args!(
             "async atomic join admission compare raced with another cluster mutation; retrying after {retry_backoff:?}"

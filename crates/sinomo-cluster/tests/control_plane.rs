@@ -14481,7 +14481,9 @@ struct RecordingJoinRegistrationHost {
     compare_failure_on_commit: Option<usize>,
     compare_failures_starting_at_commit: Option<usize>,
     authoritative_read_basis: Option<sinomo_kv::KvAuthorityBasis>,
+    authoritative_read_basis_after_first: Option<sinomo_kv::KvAuthorityBasis>,
     compare_failure_basis: Option<sinomo_kv::KvAuthorityBasis>,
+    replay_failed_compare: bool,
     successful_commit_basis: Option<sinomo_kv::KvAuthorityBasis>,
     first_commit_barrier: Option<Arc<Barrier>>,
     commit_attempt_barriers: Vec<Arc<Barrier>>,
@@ -14571,6 +14573,10 @@ impl RecordingJoinRegistrationHost {
             if let Some(basis) = self.compare_failure_basis {
                 result.authority.basis = basis;
             }
+            if self.replay_failed_compare {
+                result.authority.basis = sinomo_kv::KvAuthorityBasis::ExactCommittedRequest;
+                result.replayed_committed_request = true;
+            }
             return Ok(result);
         }
         if self.committed.is_empty() && !request.txn.success.is_empty() {
@@ -14583,6 +14589,15 @@ impl RecordingJoinRegistrationHost {
         )?;
         let mut result =
             test_cluster_kv_txn_commit_result_for_request(request_id, snapshot, response);
+        if self.replay_failed_compare
+            && result
+                .txn_response
+                .as_ref()
+                .is_some_and(|response| !response.succeeded)
+        {
+            result.authority.basis = sinomo_kv::KvAuthorityBasis::ExactCommittedRequest;
+            result.replayed_committed_request = true;
+        }
         if let Some(basis) = self.successful_commit_basis {
             result.authority.basis = basis;
         }
@@ -14617,7 +14632,13 @@ impl ClusterJoinRegistrationHost for RecordingJoinRegistrationHost {
         self.authoritative_reads += 1;
         Self::ensure_authoritative_test_state(paths, state)?;
         let mut authoritative = test_authoritative_cluster_kv_snapshot(paths)?;
-        if let Some(basis) = self.authoritative_read_basis {
+        let basis = if self.authoritative_reads > 1 {
+            self.authoritative_read_basis_after_first
+                .or(self.authoritative_read_basis)
+        } else {
+            self.authoritative_read_basis
+        };
+        if let Some(basis) = basis {
             authoritative.authority.basis = basis;
         }
         Ok(authoritative)
@@ -15723,6 +15744,150 @@ fn cluster_join_registration_retries_benign_atomic_admission_compare_race() {
         1,
         "the failed attempt must not leave a partial or duplicate plan"
     );
+}
+
+fn exercise_join_exact_failed_compare_replay(asynchronous: bool, invalid_refresh: bool) {
+    let fixture = join_authority_fixture(&format!(
+        "join_exact_failed_compare_{asynchronous}_{invalid_refresh}"
+    ));
+    let mut host = RecordingJoinRegistrationHost {
+        compare_failure_on_commit: Some(1),
+        replay_failed_compare: true,
+        authoritative_read_basis_after_first: invalid_refresh
+            .then_some(sinomo_kv::KvAuthorityBasis::ExactCommittedRequest),
+        ..Default::default()
+    };
+    let request = join_authority_fixture_request(&fixture);
+    let result = if asynchronous {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(handle_cluster_join_registration_request_async_with_host(
+            runtime.handle(),
+            &fixture.paths,
+            request,
+            fixture.now,
+            &mut host,
+        ))
+    } else {
+        handle_cluster_join_registration_request_with_host(
+            &fixture.paths,
+            request,
+            fixture.now,
+            &mut host,
+        )
+    };
+    assert_eq!(
+        host.authoritative_reads, 2,
+        "an exact failed-request replay requires a distinct current-term read before re-preparation"
+    );
+    if invalid_refresh {
+        assert!(
+            matches!(result, Err(NetworkError::ClusterReadOnly { detail })
+            if detail.contains("current-term quorum authority proof"))
+        );
+        assert_eq!(
+            host.quorum_commits, 1,
+            "an invalid refresh cannot authorize another admission attempt"
+        );
+        assert!(
+            read_cluster_kv_current_snapshot(&fixture.paths)
+                .unwrap()
+                .get(&cluster_member_key(&fixture.joined_node_id))
+                .is_none()
+        );
+    } else {
+        let response = result.expect("fresh authority permits the bounded admission retry");
+        assert!(response.accepted, "{}", response.detail);
+        assert_eq!(host.quorum_commits, 3);
+        let snapshot = response.kv_snapshot.unwrap();
+        assert_eq!(
+            snapshot
+                .range_prefix_limited("/cluster/raft/config-changes/", 8)
+                .unwrap()
+                .len(),
+            1
+        );
+        let member: ClusterMemberRecord = snapshot
+            .get(&cluster_member_key(&fixture.joined_node_id))
+            .unwrap()
+            .decode()
+            .unwrap();
+        assert_eq!(member.state, ClusterMemberState::Learner);
+        assert_eq!(member.role, ClusterMemberRole::Learner);
+    }
+}
+
+#[test]
+fn cluster_join_registration_refreshes_exact_failed_compare_replay() {
+    exercise_join_exact_failed_compare_replay(false, false);
+}
+
+#[test]
+fn cluster_join_registration_async_refreshes_exact_failed_compare_replay() {
+    exercise_join_exact_failed_compare_replay(true, false);
+}
+
+#[test]
+fn cluster_join_registration_exact_failed_compare_replay_rejects_invalid_refresh() {
+    exercise_join_exact_failed_compare_replay(true, true);
+}
+
+#[test]
+fn cluster_join_registration_exact_failed_compare_replay_keeps_attempt_limit() {
+    for asynchronous in [false, true] {
+        let fixture = join_authority_fixture(&format!("join_exact_replay_cap_{asynchronous}"));
+        let mut host = RecordingJoinRegistrationHost {
+            compare_failures_starting_at_commit: Some(1),
+            replay_failed_compare: true,
+            ..Default::default()
+        };
+        let request = join_authority_fixture_request(&fixture);
+        let response = if asynchronous {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(handle_cluster_join_registration_request_async_with_host(
+                runtime.handle(),
+                &fixture.paths,
+                request,
+                fixture.now,
+                &mut host,
+            ))
+        } else {
+            handle_cluster_join_registration_request_with_host(
+                &fixture.paths,
+                request,
+                fixture.now,
+                &mut host,
+            )
+        }
+        .unwrap();
+        assert!(!response.accepted);
+        assert!(response.detail.contains("changed during join admission"));
+        assert_eq!(
+            host.quorum_commits, 16,
+            "the existing admission-attempt cap is unchanged"
+        );
+        assert_eq!(
+            host.authoritative_reads, 16,
+            "one initial cut plus one fresh cut per remaining retry; no read after exhaustion"
+        );
+        let snapshot = read_cluster_kv_current_snapshot(&fixture.paths).unwrap();
+        assert!(
+            snapshot
+                .get(&cluster_member_key(&fixture.joined_node_id))
+                .is_none()
+        );
+        assert!(
+            snapshot
+                .range_prefix_limited("/cluster/raft/config-changes/", 8)
+                .unwrap()
+                .is_empty()
+        );
+    }
 }
 
 #[test]
