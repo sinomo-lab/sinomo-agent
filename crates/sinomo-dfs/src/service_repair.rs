@@ -4663,6 +4663,33 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 repair_retry_delay_ticks(state.attempts)
                     .max(repair_transfer_inflight_timeout_ticks(pending.size_bytes)),
             );
+            // Record the actual started attempt in the same carrier row that
+            // begin_replica_transfer_attempt claimed. Export and replay must
+            // retain one counter and timestamp history for that exact request.
+            if let Some(record) = self
+                .repair_attempt_records
+                .get_mut(&(intent_id.to_string(), replica_node_id.clone()))
+                && record.object_id == pending.object_id
+                && record.version == pending.version
+                && record.content_hash == pending.content_hash
+                && record.missing_replica_node_id == *replica_node_id
+                && record.transfer_kind
+                    == Some(sinomo_api::dfs::maintenance::DfsRepairTransferKind::Repair)
+                && record.transfer_request_id.as_deref() == Some(request_id.as_str())
+                && record.in_flight
+                && record.completed_transfer_request_id.is_none()
+            {
+                let now = dfs_now_unix_nanos();
+                record.attempts = state.attempts;
+                record.last_attempt_unix_nanos = now;
+                record.transfer_delivery_state = state.transfer_delivery_state;
+                if record.next_retry_unix_nanos != u64::MAX {
+                    record.next_retry_unix_nanos =
+                        now.saturating_add(repair_retry_delay_nanos_for_ticks(
+                            state.next_retry_tick.saturating_sub(tick),
+                        ));
+                }
+            }
             pending
                 .repair_inflight_request_ids
                 .insert(replica_node_id.clone(), request_id);

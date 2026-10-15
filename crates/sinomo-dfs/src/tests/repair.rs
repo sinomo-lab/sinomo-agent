@@ -5256,6 +5256,24 @@ fn repair_response_conflicting_receipt_preserves_retry_state() {
             .iter()
             .any(|receipt| receipt.replica_node_id == replica)
     );
+    // The actual started carrier retains its physical cooldown even after a
+    // corrupt reply. Wait for that unchanged producer deadline before driving
+    // the same bounded eight retry ticks; wall time is not a synthetic tick.
+    let retry_due = service
+        .repair_attempt_records
+        .get(&(intent_id.clone(), replica.clone()))
+        .unwrap()
+        .next_retry_unix_nanos;
+    let wait = std::time::Duration::from_nanos(
+        retry_due.saturating_sub(crate::test_support::now_unix_nanos()),
+    );
+    assert_ne!(
+        retry_due,
+        u64::MAX,
+        "the actual carrier has finite eligibility"
+    );
+    std::thread::sleep(wait);
+    assert!(retry_due <= crate::test_support::now_unix_nanos());
     // The normal timeout/retry producer obtains the unchanged genuine receipt.
     for _ in 0..8 {
         service.retry_pending_repairs_bounded(1).unwrap();
@@ -9328,4 +9346,50 @@ fn native_connectivity_park_returns_through_actual_main_repair() {
     );
     runtime.clear_faults();
     runtime.close().unwrap();
+}
+
+#[test]
+fn native_started_repair_keeps_cached_and_exported_carrier_attempt_identical() {
+    let (runtime, owner, replica, mut service, _stat, intent_id, background) =
+        native_committed_repair_backlog("native-started-repair-cached-carrier", true);
+    runtime.clear_faults();
+    let before = runtime.rpc_observations().len();
+    let scheduled = service.retry_pending_repairs_bounded(1).unwrap();
+    let exported = service
+        .durable_repair_queue_records()
+        .into_iter()
+        .find(|row| row.intent_id == intent_id && row.missing_replica_node_id == replica)
+        .expect("actual started native repair export");
+    let cached = service
+        .repair_attempt_records
+        .get(&(intent_id.clone(), replica.clone()))
+        .unwrap()
+        .clone();
+    let actual_dispatch = runtime.rpc_observations()[before..].iter().any(|event| {
+        event.source == owner
+            && event.target == replica
+            && event.route == DFS_DATA_REPAIR_REPLICA_ROUTE
+            && event.phase == crate::test_runtime::RpcPhase::BeforeDispatch
+            && event.dfs_intent_id.as_deref() == Some(intent_id.as_str())
+            && event.dfs_request_id == exported.transfer_request_id
+    });
+    // The native RPC has returned; leave its queued reply unconsumed while
+    // comparing the producer's own carrier DATA, then drain all owned scopes.
+    drop(service);
+    drop(background);
+    runtime.close().unwrap();
+    assert_eq!(scheduled.len(), 1);
+    assert!(
+        actual_dispatch,
+        "the captured request really crossed the native carrier boundary"
+    );
+    assert!(exported.in_flight && exported.attempts > 0 && exported.last_attempt_unix_nanos > 0);
+    assert_eq!(
+        exported.transfer_delivery_state,
+        Some(sinomo_core::network::NetworkDeliveryState::PossiblyApplied)
+    );
+    assert_eq!(
+        cached, exported,
+        "one actual started carrier must not have two attempt counters or timestamp histories"
+    );
 }
