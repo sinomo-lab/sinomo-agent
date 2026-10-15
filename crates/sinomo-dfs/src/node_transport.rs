@@ -1034,6 +1034,8 @@ impl DfsPreparedMetadataJournalBatchRpc {
 pub struct DfsNodeTransport {
     #[cfg(test)]
     test_metadata_direct_probe: Option<DfsTestMetadataDirectRpcProbe>,
+    #[cfg(test)]
+    test_routed_call_attempts: Option<Arc<StdAtomicUsize>>,
     local_node_id: NodeId,
     known_remote_nodes: BTreeSet<NodeId>,
     incoming_messages: VecDeque<DfsRoutedMessage>,
@@ -1606,6 +1608,8 @@ impl Clone for DfsNodeTransport {
         Self {
             #[cfg(test)]
             test_metadata_direct_probe: self.test_metadata_direct_probe.clone(),
+            #[cfg(test)]
+            test_routed_call_attempts: self.test_routed_call_attempts.clone(),
             local_node_id: self.local_node_id.clone(),
             known_remote_nodes: self.known_remote_nodes.clone(),
             incoming_messages: if self.served_message.is_some() {
@@ -2088,6 +2092,8 @@ impl DfsNodeTransport {
         Self {
             #[cfg(test)]
             test_metadata_direct_probe: None,
+            #[cfg(test)]
+            test_routed_call_attempts: None,
             local_node_id,
             known_remote_nodes,
             incoming_messages: VecDeque::new(),
@@ -4673,6 +4679,10 @@ impl DfsMessageTransport for DfsNodeTransport {
         target_node_id: &NodeId,
         call: DfsRoutedCall,
     ) -> Result<(), NetworkError> {
+        #[cfg(test)]
+        if let Some(attempts) = &self.test_routed_call_attempts {
+            attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         if self.served_message.is_some() {
             return self.send_served_routed_call(target_node_id, call);
         }
@@ -8219,6 +8229,12 @@ mod response_delivery_tests;
 
 #[cfg(test)]
 impl DfsNodeTransport {
+    pub(crate) fn observe_routed_calls_for_test(&mut self) -> Arc<StdAtomicUsize> {
+        let attempts = Arc::new(StdAtomicUsize::new(0));
+        self.test_routed_call_attempts = Some(Arc::clone(&attempts));
+        attempts
+    }
+
     pub(crate) fn metadata_direct_rpc_probe_for_test(&mut self) -> DfsTestMetadataDirectRpcProbe {
         let probe = DfsTestMetadataDirectRpcProbe::default();
         self.test_metadata_direct_probe = Some(probe.clone());

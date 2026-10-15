@@ -3693,6 +3693,8 @@ mod tests {
                 &target.state_fingerprint,
             )
             .expect("build valid supplied checkpoint");
+            let mut valid_target = target.clone();
+            valid_target.checkpoint_snapshot = Some(snapshot.clone());
             match invalidity {
                 "sequence" => {
                     target.journal_sequence = target.journal_sequence.saturating_add(1);
@@ -3709,16 +3711,7 @@ mod tests {
                 _ => unreachable!(),
             }
             target.checkpoint_snapshot = Some(snapshot);
-            let before_calls = fixture
-                .runtime
-                .rpc_observations()
-                .iter()
-                .filter(|observation| {
-                    observation.origin == crate::test_runtime::RpcOrigin::RegisteredHost
-                        && observation.source == fixture.shard.primary_node_id
-                        && observation.target == replica
-                })
-                .count();
+            let owned_attempts = fixture.service.transport.observe_routed_calls_for_test();
             let rejected = BTreeSet::from([replica.clone()]);
             let mut attempts = BTreeMap::new();
             reset_metadata_sync_snapshot_build_calls();
@@ -3744,18 +3737,9 @@ mod tests {
             );
             assert_eq!(metadata_sync_snapshot_build_calls(), 0);
             assert_eq!(
-                fixture
-                    .runtime
-                    .rpc_observations()
-                    .iter()
-                    .filter(|observation| {
-                        observation.origin == crate::test_runtime::RpcOrigin::RegisteredHost
-                            && observation.source == fixture.shard.primary_node_id
-                            && observation.target == replica
-                    })
-                    .count(),
-                before_calls,
-                "invalid supplied snapshot cannot dispatch a peer call"
+                owned_attempts.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "invalid supplied snapshot cannot dispatch through its own transport"
             );
             assert!(attempts.is_empty());
             assert!(
@@ -3769,6 +3753,21 @@ mod tests {
                 fixture.service.transport.pending_incoming_count().unwrap(),
                 Some(0)
             );
+            // Calibrate the same observer against a valid native snapshot call.
+            // Other host clients retain their own transports and cannot affect it.
+            fixture
+                .service
+                .send_metadata_sync_checkpoint_snapshots(
+                    &valid_target,
+                    "valid-owned-observation-control",
+                    &rejected,
+                    &BTreeSet::new(),
+                    &mut BTreeMap::new(),
+                    &MetadataQuorumSyncPurpose::OrdinaryDurability,
+                )
+                .unwrap();
+            assert_eq!(owned_attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+            fixture.service.process_incoming().unwrap();
             fixture.finish();
         }
     }
