@@ -2305,11 +2305,32 @@ mod provider_lifecycle_tests {
         native_released_namespace_source_reopens(false, false, false, true);
     }
 
+    #[test]
+    fn native_metadata_preparation_advances_multiple_batches_before_ready() {
+        native_released_namespace_source_reopens_scaled(false, false, false, false, 256);
+    }
+
     fn native_released_namespace_source_reopens(
         omit_source_durability: bool,
         same_version_placement: bool,
         interrupt_metadata_confirmation: bool,
         retained_root_exchange: bool,
+    ) {
+        native_released_namespace_source_reopens_scaled(
+            omit_source_durability,
+            same_version_placement,
+            interrupt_metadata_confirmation,
+            retained_root_exchange,
+            0,
+        );
+    }
+
+    fn native_released_namespace_source_reopens_scaled(
+        omit_source_durability: bool,
+        same_version_placement: bool,
+        interrupt_metadata_confirmation: bool,
+        retained_root_exchange: bool,
+        additional_source_files: usize,
     ) {
         use sinomo_core::object::{LengthMode, serde_ext};
         use sinomo_dfs::{
@@ -2317,7 +2338,9 @@ mod provider_lifecycle_tests {
             DfsNamespacePathOccupantExpectation, DfsNamespaceTransaction,
             DfsPreparedOperationStatus, test_support::DfsTestRuntime,
         };
-        let name = if retained_root_exchange {
+        let name = if additional_source_files > 0 {
+            "native-metadata-preparation-multiple-batches"
+        } else if retained_root_exchange {
             "native-certified-retained-root-exchange-cold"
         } else if interrupt_metadata_confirmation {
             "native-interrupted-metadata-prepare-cold-conversion"
@@ -2338,14 +2361,31 @@ mod provider_lifecycle_tests {
         );
         let node = nodes[0].clone();
         let mut native = DfsTestRuntime::new(name, node.clone()).unwrap();
+        let pending_batches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observe_pending = Arc::clone(&pending_batches);
+        let builder: sinomo_dfs::DfsStoragePreparationProviderBuilder =
+            Arc::new(move |context, lifecycle| {
+                let provider = storage_preparation_provider(context, lifecycle)?;
+                let pending = Arc::clone(&observe_pending);
+                Ok(Arc::new(move |root, scope, budget| {
+                    let result = provider(root, scope, budget)?;
+                    if matches!(scope, sinomo_dfs::DfsStoragePreparationScope::Metadata(_)) {
+                        if let sinomo_dfs::DfsStoragePreparation::Pending { processed_records } =
+                            result
+                        {
+                            assert_eq!(budget, sinomo_dfs::DFS_STORAGE_PREPARATION_RECORD_BUDGET);
+                            assert!(processed_records <= budget);
+                            if processed_records > 0 {
+                                pending.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            }
+                        }
+                    }
+                    Ok(result)
+                }))
+            });
         native
             .configure_component_factories(vec![
-                Arc::new(
-                    sinomo_dfs::component_factory_with_storage_preparation(Arc::new(
-                        storage_preparation_provider,
-                    ))
-                    .unwrap(),
-                ),
+                Arc::new(sinomo_dfs::component_factory_with_storage_preparation(builder).unwrap()),
                 Arc::new(staged_import_component_factory().unwrap()),
             ])
             .unwrap();
@@ -2401,6 +2441,24 @@ mod provider_lifecycle_tests {
         let object = client
             .posix_write_file(path, first, options.clone())
             .unwrap();
+        if additional_source_files > 0 {
+            client.posix_mkdir_all("/preparation-records").unwrap();
+            let paths = (0..additional_source_files)
+                .map(|index| format!("/preparation-records/file-{index:04}"))
+                .collect::<Vec<_>>();
+            for chunk in paths.chunks(64) {
+                let committed = client
+                    .posix_write_files_local_eventual_with_known_parents(chunk.iter().map(|path| {
+                        (
+                            path.as_str(),
+                            b"native bounded-preparation source".as_slice(),
+                        )
+                    }))
+                    .unwrap();
+                assert_eq!(committed.len(), chunk.len());
+            }
+        }
+
         if same_version_placement {
             client
                 .posix_sync_file(path, sinomo_dfs::DfsPosixSyncKind::File)
@@ -2527,6 +2585,17 @@ mod provider_lifecycle_tests {
         )
         .unwrap();
         let snapshot = observed.export_table_snapshot();
+        if additional_source_files > 0 {
+            assert!(snapshot.tables.objects.len() >= additional_source_files);
+            assert!(snapshot.tables.versions.len() >= additional_source_files);
+            eprintln!(
+                "ACTUAL_METADATA_SOURCE objects={} versions={} receipts={}",
+                snapshot.tables.objects.len(),
+                snapshot.tables.versions.len(),
+                snapshot.tables.receipts.len()
+            );
+        }
+
         let exchange_source_checkpoint = retained_root_exchange.then(|| {
             // An image owns a staged file at the original root pathname. Copy
             // it while this stopped-source kernel and its real export are live,
@@ -3288,6 +3357,12 @@ mod provider_lifecycle_tests {
         drop(client);
         drop(install_hook);
         drop(exchange_facts);
+        if additional_source_files > 0 {
+            assert!(
+                pending_batches.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+                "actual metadata source must require multiple unchanged preparation batches"
+            );
+        }
         native.close().unwrap();
     }
 
