@@ -16581,6 +16581,7 @@ fn native_cold_root_cache_does_not_block_another_ready_root() {
     let first_node = first_nodes[0].clone();
     let second_node = second_nodes[0].clone();
     let mut ready = second.client(&second_node).unwrap();
+    let ready_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
     ready
         .posix_write_file(
             "/ready-cache-before",
@@ -16592,7 +16593,22 @@ fn native_cold_root_cache_does_not_block_another_ready_root() {
     let second_peer = read_daemon_dfs_message_peer_snapshot(&second_paths)
         .unwrap()
         .unwrap();
-    drop(daemon_dfs_bounded_status_resident(second.data_dir(&second_node), &second_peer).unwrap());
+    let observe_ready = |deadline: Instant| {
+        loop {
+            let observed =
+                daemon_dfs_bounded_status_resident(second.data_dir(&second_node), &second_peer);
+            let updating = observed.as_ref().is_err_and(|error| matches!(error,
+                sinomo_dfs::DfsError::Network { message }
+                if message == "bounded DFS status unavailable while the resident generation cache is being updated"
+                    || message == "DFS runtime network error at DFS message cache root identity: bounded DFS status unavailable while the resident generation cache is being updated"));
+            if updating && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+            break observed;
+        }
+    };
+    drop(observe_ready(ready_deadline).unwrap());
 
     let gate = Arc::new((Mutex::new(false), Condvar::new()));
     struct ReleaseOnDrop(Arc<(Mutex<bool>, Condvar)>);
@@ -16649,6 +16665,7 @@ fn native_cold_root_cache_does_not_block_another_ready_root() {
         (written, read)
     });
     let entered = entered_rx.recv_timeout(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT);
+    let independent_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
     let written = ready.posix_write_file(
         "/ready-cache-during",
         b"independent ready root",
@@ -16658,7 +16675,7 @@ fn native_cold_root_cache_does_not_block_another_ready_root() {
         .as_ref()
         .ok()
         .map(|_| ready.posix_read_file("/ready-cache-during"));
-    let resident = daemon_dfs_bounded_status_resident(second.data_dir(&second_node), &second_peer);
+    let resident = observe_ready(independent_deadline);
     // Resume before assertions or close so a failed independent-root check
     // cannot strand a genuine started child behind this negative test gate.
     drop(release);
