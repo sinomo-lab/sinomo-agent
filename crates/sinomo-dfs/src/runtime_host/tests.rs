@@ -10578,15 +10578,24 @@ fn daemon_dfs_distributed_write_skips_cold_full_metadata_hydrate() {
         )
         .unwrap();
     assert_eq!(changed_root_shard.epoch, root_shard.epoch + 1);
+    // A completed handoff may leave a cold cache. Establish a real current
+    // mutation lane through ordinary Main ingress on this node's remaining
+    // Root authority before checking the delayed old service's handback.
+    let mut current_requester = native.client(&remote).unwrap();
+    current_requester
+        .posix_mkdir("/current-handoff-lane")
+        .unwrap();
+    drop(current_requester);
     // Hold the same ordinary global admission as the handback owner. Native
     // reactive maintenance can otherwise temporarily take this optional lane
     // between the handoff and these pointer-identity observations.
     let handback_admission = runtime
         .block_on(scheduler.admit(&DfsMessageExecutionScope::GlobalExclusive))
         .unwrap();
-    // The real handoff serves work and installs its current lane. A delayed
-    // old handback must refuse reuse without removing or replacing that lane.
-    let (current_signature, current_lane) = {
+    // The actual handoff can retain exact-shard lanes while leaving the global
+    // maintenance lane absent. Preserve every current lane and that absence:
+    // an old handback must neither replace an exact lane nor install itself.
+    let (current_signature, current_primary, current_exact) = {
         let slot = daemon_dfs_message_service_cache().root(&cache_key).unwrap();
         let cache = slot.lock().unwrap();
         let entry = cache.as_ref().unwrap();
@@ -10594,14 +10603,14 @@ fn daemon_dfs_distributed_write_skips_cold_full_metadata_hydrate() {
             entry.signature.metadata_storage_generation,
             retained.signature.metadata_storage_generation
         );
+        assert!(
+            entry.primary_service.is_some() || !entry.exact_shard_services.is_empty(),
+            "actual handoff must retain a current served lane"
+        );
         (
             entry.signature.clone(),
-            Arc::clone(
-                entry
-                    .primary_service
-                    .as_ref()
-                    .expect("actual handoff installed current lane"),
-            ),
+            entry.primary_service.clone(),
+            entry.exact_shard_services.clone(),
         )
     };
     assert!(
@@ -10619,12 +10628,24 @@ fn daemon_dfs_distributed_write_skips_cold_full_metadata_hydrate() {
         let cache = slot.lock().unwrap();
         let entry = cache.as_ref().unwrap();
         assert_eq!(entry.signature, current_signature);
-        assert!(
-            Arc::ptr_eq(entry.primary_service.as_ref().unwrap(), &current_lane),
-            "rejected old authority cannot replace the actual handoff's current lane"
+        match (&entry.primary_service, &current_primary) {
+            (Some(actual), Some(expected)) => assert!(Arc::ptr_eq(actual, expected)),
+            (None, None) => {}
+            _ => panic!("rejected old authority changed the current global lane"),
+        }
+        assert_eq!(
+            entry.exact_shard_services.keys().collect::<Vec<_>>(),
+            current_exact.keys().collect::<Vec<_>>(),
+            "rejected old authority changed the current exact-shard lane set"
         );
+        for (key, expected) in &current_exact {
+            assert!(
+                Arc::ptr_eq(&entry.exact_shard_services[key], expected),
+                "rejected old authority replaced current exact-shard lane {key:?}"
+            );
+        }
     }
-    drop(current_lane);
+    drop((current_primary, current_exact));
     drop(handback_admission);
     assert!(
         evict_daemon_dfs_message_service_cache(&data_dir).expect("evict message cache"),
@@ -17014,18 +17035,33 @@ fn rejected_shared_maintenance_take_keeps_the_actual_cached_service() {
             .unwrap();
     let local = nodes[0].clone();
     let data_dir = native.data_dir(&local).clone();
-    let paths = DaemonPaths::new(&data_dir);
     let cluster_paths = ClusterPaths::new(&data_dir);
     let runtime = native.runtime_handle();
-    handle_daemon_dfs_message_on_runtime(
-        &paths,
-        test_dfs_message_command(
-            "native-shared-lane-warm",
-            test_dfs_lookup_routed_message(&local, &local, 1, "/services"),
-        ),
-        &runtime,
-    )
-    .unwrap();
+    let command = test_dfs_message_command(
+        "native-shared-lane-warm",
+        test_dfs_lookup_routed_message(&local, &local, 1, "/services"),
+    );
+    let response = native
+        .rpc_call(
+            &local,
+            &local,
+            crate::dfs_message_rpc_call(&command).unwrap(),
+            sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+        )
+        .unwrap();
+    assert_eq!(
+        crate::decode_dfs_message_rpc_response(&response)
+            .unwrap()
+            .request_id,
+        command.request_id
+    );
+    let warm = native
+        .maintenance_tick(&local, Duration::from_secs(5))
+        .unwrap();
+    assert!(
+        warm.outcome.is_ok(),
+        "actual native global lane warmup: {warm:?}"
+    );
     let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths).unwrap();
     let preflight = runtime
         .block_on(warm_daemon_dfs_metadata_authority_for_identity_async(
