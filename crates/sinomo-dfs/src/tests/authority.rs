@@ -2208,12 +2208,32 @@ fn repair_command_accepts_newer_authority_shard_when_receiver_view_is_stale() {
     // The third receiver owns no fabricated replacement view. Normal joint
     // handoff can activate through the two actual assignment majorities and
     // both real primaries while its configuration rebuild remains withheld.
-    source
-        .reconcile_pending_metadata_shard_membership_handoffs(
-            &configs,
-            sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
-        )
+    let handoff_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    let reconciled = source.reconcile_pending_metadata_shard_membership_handoffs(
+        &configs,
+        sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+    );
+    let completed = runtime
+        .observe_completed_native_handoff(&control, &handoff, handoff_deadline)
         .unwrap();
+    assert_eq!(
+        completed.as_ref(),
+        Some(&handoff.desired_shard),
+        "the exact original handoff must have native proof and activated retiring-owner freeze; explicit caller={reconciled:?}"
+    );
+    let mut divergent_request_head = handoff.clone();
+    divergent_request_head
+        .required_head_watermark
+        .as_mut()
+        .unwrap()
+        .state_fingerprint = format!("dfs-metadata-prefix-v2:blake3:{}", "0".repeat(64));
+    assert!(
+        runtime
+            .observe_completed_native_handoff(&control, &divergent_request_head, handoff_deadline,)
+            .unwrap()
+            .is_none(),
+        "a later sequence cannot conceal a forked original prefix"
+    );
     gap.wait_rebuild(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
         .unwrap();
     assert!(

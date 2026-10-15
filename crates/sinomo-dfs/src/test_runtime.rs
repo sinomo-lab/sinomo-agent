@@ -3160,6 +3160,138 @@ impl DfsTestRuntime {
         Ok(actual)
     }
 
+    /// Observe only the exact original completed native handoff, including
+    /// its full proof and the retained retiring owner's activated freeze.
+    /// Reuse an already-open control client so a deliberately withheld peer
+    /// projection cannot turn this read into unrelated startup admission.
+    pub(crate) fn observe_completed_native_handoff(
+        &self,
+        control: &SharedDfsControlPlaneKvClient<Box<dyn DfsControlPlaneKvClient>>,
+        handoff: &DfsMetadataShardMembershipHandoff,
+        phase_deadline: std::time::Instant,
+    ) -> Result<Option<DfsMetadataShardConfig>, crate::DfsError> {
+        let file_system_id = &handoff.retiring_shard.file_system_id;
+        let shard_id = handoff.retiring_shard.shard_id.as_str();
+
+        let keys = [
+            crate::metadata_shard_key(file_system_id, shard_id),
+            crate::metadata_shard_membership_handoff_key(file_system_id, shard_id),
+            crate::metadata_shard_membership_handoff_proof_key(file_system_id, shard_id),
+        ];
+        let entries = control
+            .with_client(|kv| kv.get_authoritative_consistent_before(&keys, phase_deadline))?;
+        let [Some(active), None, Some(proof)] = entries.as_slice() else {
+            return Ok(None);
+        };
+        if entries
+            .iter()
+            .zip(&keys)
+            .any(|(entry, key)| entry.as_ref().is_some_and(|entry| &entry.key != key))
+        {
+            return Ok(None);
+        }
+        let active = active.decode::<DfsMetadataShardConfig>()?;
+        let proof = proof.decode::<crate::DfsMetadataShardMembershipHandoffProof>()?;
+        let Some(head) = handoff.required_head_watermark.as_ref() else {
+            return Ok(None);
+        };
+        if active != handoff.desired_shard
+            || proof.handoff_id != handoff.handoff_id
+            || proof.cause != handoff.cause
+            || proof.retiring_shard != handoff.retiring_shard
+            || proof.desired_shard != handoff.desired_shard
+            || head.file_system_id != handoff.retiring_shard.file_system_id
+            || head.shard_id != handoff.retiring_shard.shard_id
+            || head.primary_node_id != handoff.retiring_shard.primary_node_id
+            || head.epoch != handoff.retiring_shard.epoch
+            || proof.journal_sequence < head.journal_sequence
+            || proof.journal_sequence < handoff.required_prepared_sequence
+            || proof.state_fingerprint.is_empty()
+            || !crate::control_plane::metadata_shard_membership_handoff_acknowledgements_are_safe(
+                &proof.retiring_shard,
+                &proof.desired_shard,
+                &proof.acknowledged_node_ids.iter().cloned().collect(),
+            )
+        {
+            return Ok(None);
+        }
+        // The cold opener may reject after this exact original
+        // handoff activates. Observe its marker without reopening
+        // a metadata backend or acquiring a publication lane.
+        let context = self
+            .component_context(&handoff.retiring_shard.primary_node_id)
+            .map_err(|message| crate::DfsError::Metadata { message })?;
+        let owner =
+            crate::runtime_host::retain_component_data_owner(&context).map_err(|error| {
+                crate::DfsError::Metadata {
+                    message: error.to_string(),
+                }
+            })?;
+        let shard = DfsMetadataShardId::new(shard_id);
+        let root = crate::local_dfs_metadata_shard_path(context.data_dir(), &shard)
+            .canonicalize()
+            .map_err(|error| crate::DfsError::Metadata {
+                message: error.to_string(),
+            })?;
+        if context.data_dir().root()
+            != self
+                .data_dir(&handoff.retiring_shard.primary_node_id)
+                .root()
+            || !owner.owns_backend_root(&root)
+        {
+            return Ok(None);
+        }
+        let Some(marker) =
+            crate::read_local_dfs_metadata_shard_write_freeze(context.data_dir(), &shard)?
+        else {
+            return Ok(None);
+        };
+        if marker.handoff_id != handoff.handoff_id
+            || marker.retiring_epoch != handoff.retiring_shard.epoch
+            || marker.activated_epoch != Some(handoff.desired_shard.epoch)
+            || marker.journal_sequence != proof.journal_sequence
+            || marker.state_fingerprint != proof.state_fingerprint
+            || std::time::Instant::now() > phase_deadline
+        {
+            return Ok(None);
+        }
+        // The request's published watermark can precede the actual freeze.
+        // Authenticate every intervening immutable native frame; sequence
+        // advancement alone cannot prove that the frozen head extends it.
+        let Some(mut prefix) = DfsMetadataPrefixProof::from_digest(
+            head.journal_sequence,
+            head.state_fingerprint.clone(),
+        ) else {
+            return Ok(None);
+        };
+        while prefix.journal_sequence < proof.journal_sequence {
+            if std::time::Instant::now() > phase_deadline {
+                return Ok(None);
+            }
+            let end = proof
+                .journal_sequence
+                .min(prefix.journal_sequence.saturating_add(64));
+            let sequences = (prefix.journal_sequence + 1..=end).collect::<Vec<_>>();
+            for frame in crate::metadata_journal::read_segmented_journal_frames_at_sequences(
+                &root, &sequences,
+            )? {
+                let Some(frame) = frame else {
+                    return Ok(None);
+                };
+                prefix = crate::metadata_journal::metadata_prefix_proof_after_exact_frame(
+                    &prefix,
+                    frame.entry(),
+                    &shard,
+                    frame.exact_bytes(),
+                )?;
+            }
+        }
+        if prefix.digest != proof.state_fingerprint || std::time::Instant::now() > phase_deadline {
+            return Ok(None);
+        }
+        Ok(Some(active))
+    }
+
     /// Move an actual native assignment through ordinary freeze, receiver
     /// acknowledgement and joint activation. This does not seed configurations.
     pub fn reassign_metadata_shard(
@@ -3270,96 +3402,8 @@ impl DfsTestRuntime {
             let installed = if let Err(error) = reconciliation {
                 // The same normal Main owner can complete this original request
                 // while its explicit caller queues. No new effect is authorized.
-                let completed = (|| -> Result<Option<DfsMetadataShardConfig>, crate::DfsError> {
-                    let keys = [
-                        crate::metadata_shard_key(file_system_id, shard_id),
-                        crate::metadata_shard_membership_handoff_key(file_system_id, shard_id),
-                        crate::metadata_shard_membership_handoff_proof_key(
-                            file_system_id,
-                            shard_id,
-                        ),
-                    ];
-                    let entries = control.with_client(|kv| {
-                        kv.get_authoritative_consistent_before(&keys, phase_deadline)
-                    })?;
-                    let [Some(active), None, Some(proof)] = entries.as_slice() else {
-                        return Ok(None);
-                    };
-                    if entries
-                        .iter()
-                        .zip(&keys)
-                        .any(|(entry, key)| entry.as_ref().is_some_and(|entry| &entry.key != key))
-                    {
-                        return Ok(None);
-                    }
-                    let active = active.decode::<DfsMetadataShardConfig>()?;
-                    let proof = proof.decode::<crate::DfsMetadataShardMembershipHandoffProof>()?;
-                    let Some(head) = handoff.required_head_watermark.as_ref() else {
-                        return Ok(None);
-                    };
-                    if active != handoff.desired_shard
-                        || proof.handoff_id != handoff.handoff_id
-                        || proof.cause != handoff.cause
-                        || proof.retiring_shard != handoff.retiring_shard
-                        || proof.desired_shard != handoff.desired_shard
-                        || head.file_system_id != handoff.retiring_shard.file_system_id
-                        || head.shard_id != handoff.retiring_shard.shard_id
-                        || head.primary_node_id != handoff.retiring_shard.primary_node_id
-                        || head.epoch != handoff.retiring_shard.epoch
-                        || proof.journal_sequence != head.journal_sequence
-                        || proof.journal_sequence < handoff.required_prepared_sequence
-                        || proof.state_fingerprint != head.state_fingerprint
-                        || proof.state_fingerprint.is_empty()
-                        || !crate::control_plane::metadata_shard_membership_handoff_acknowledgements_are_safe(
-                            &proof.retiring_shard,
-                            &proof.desired_shard,
-                            &proof.acknowledged_node_ids.iter().cloned().collect(),
-                        )
-                    {
-                        return Ok(None);
-                    }
-                    // The cold opener may reject after this exact original
-                    // handoff activates. Observe its marker without reopening
-                    // a metadata backend or acquiring a publication lane.
-                    let context = self
-                        .component_context(&handoff.retiring_shard.primary_node_id)
-                        .map_err(|message| crate::DfsError::Metadata { message })?;
-                    let owner = crate::runtime_host::retain_component_data_owner(&context)
-                        .map_err(|error| crate::DfsError::Metadata {
-                            message: error.to_string(),
-                        })?;
-                    let shard = DfsMetadataShardId::new(shard_id);
-                    let root = crate::local_dfs_metadata_shard_path(context.data_dir(), &shard)
-                        .canonicalize()
-                        .map_err(|error| crate::DfsError::Metadata {
-                            message: error.to_string(),
-                        })?;
-                    if context.data_dir().root()
-                        != self
-                            .data_dir(&handoff.retiring_shard.primary_node_id)
-                            .root()
-                        || !owner.owns_backend_root(&root)
-                    {
-                        return Ok(None);
-                    }
-                    let Some(marker) = crate::read_local_dfs_metadata_shard_write_freeze(
-                        context.data_dir(),
-                        &shard,
-                    )?
-                    else {
-                        return Ok(None);
-                    };
-                    if marker.handoff_id != handoff.handoff_id
-                        || marker.retiring_epoch != handoff.retiring_shard.epoch
-                        || marker.activated_epoch != Some(handoff.desired_shard.epoch)
-                        || marker.journal_sequence != proof.journal_sequence
-                        || marker.state_fingerprint != proof.state_fingerprint
-                        || std::time::Instant::now() > phase_deadline
-                    {
-                        return Ok(None);
-                    }
-                    Ok(Some(active))
-                })();
+                let completed =
+                    self.observe_completed_native_handoff(&control, &handoff, phase_deadline);
                 match completed {
                     Ok(Some(active)) => active,
                     Ok(None) | Err(_) => return Err(error.to_string()),

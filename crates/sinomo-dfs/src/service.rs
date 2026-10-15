@@ -2031,6 +2031,14 @@ mod tests {
             let inventory = backend.metadata_summary().unwrap();
             let owned = backend.metadata_summary_for_local_primary_shards().unwrap();
             drop(observer);
+            // As with the exact metadata inventory above, establish the real
+            // durable queue view outside the bounded status route. An idle
+            // replica need not have run repair maintenance before this query.
+            crate::LocalDfsRepairQueueStore::new(crate::default_dfs_repair_attempt_snapshot_path(
+                runtime.data_dir(target),
+            ))
+            .view()
+            .unwrap();
             let request =
                 ObjectRpcRequest::encode_body(DFS_STATUS_ROUTE, crate::DFS_RPC_CATEGORY, &())
                     .unwrap();

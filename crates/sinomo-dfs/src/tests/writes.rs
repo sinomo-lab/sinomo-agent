@@ -653,15 +653,17 @@ fn posix_non_foreground_write_reports_only_durable_locations() {
     runtime
         .apply_placement_policy(&local, path, DfsPlacementScope::SelfOnly, placement.clone())
         .unwrap();
-    runtime.install_fault(crate::test_runtime::FaultRule {
-        source: Some(local.clone()),
-        target: Some(remote.clone()),
-        route: Some(DFS_DATA_STAGE_BLOB_ROUTE.into()),
-        call_id: None,
-        origin: None,
-        remaining_hits: 32,
-        action: crate::test_runtime::FaultAction::BudgetExhausted,
-    });
+    for route in [DFS_DATA_STAGE_BLOB_ROUTE, DFS_DATA_REPAIR_REPLICA_ROUTE] {
+        runtime.install_fault(crate::test_runtime::FaultRule {
+            source: Some(local.clone()),
+            target: Some(remote.clone()),
+            route: Some(route.into()),
+            call_id: None,
+            origin: None,
+            remaining_hits: 32,
+            action: crate::test_runtime::FaultAction::BudgetExhausted,
+        });
+    }
     let mut dfs = runtime.client(&local).unwrap();
     let stat = dfs
         .posix_write_file(
@@ -669,7 +671,7 @@ fn posix_non_foreground_write_reports_only_durable_locations() {
             b"commit locally and repair the remote replica later",
             DfsWriteOptions {
                 policy: placement.replication_policy(Default::default()).unwrap(),
-                replica_candidates: vec![local.clone(), remote],
+                replica_candidates: vec![local.clone(), remote.clone()],
                 wait_for_commit: true,
                 foreground_replica_repair: false,
             },
@@ -677,21 +679,38 @@ fn posix_non_foreground_write_reports_only_durable_locations() {
         .expect("non-foreground write");
     assert_eq!(
         stat.current_locations,
-        vec![local],
+        vec![local.clone()],
         "the returned POSIX stat must not claim an async repair target is durable"
     );
-    let mut owner = runtime.metadata_primary_service(path).unwrap();
-    owner
-        .hydrate_from_metadata_backend()
-        .expect("restore actual committed repair obligation");
+    let owner = runtime.metadata_primary_service(path).unwrap();
+    let owned = owner
+        .metadata_backend()
+        .unwrap()
+        .metadata_summary_for_local_primary_shards()
+        .unwrap();
     assert_eq!(
-        owner
-            .operational_metrics()
-            .expect("actual owner metrics")
-            .repair_job_count,
-        1,
-        "the remote desired replica should remain queued for repair"
+        owned.pending_repair_count, 1,
+        "the actual committed metadata must retain its missing desired replica"
     );
+    let queued = LocalDfsRepairQueueStore::new(default_dfs_repair_attempt_snapshot_path(
+        runtime.data_dir(&local),
+    ))
+    .view()
+    .unwrap()
+    .records
+    .into_iter()
+    .filter(|row| {
+        row.object_id == stat.object_id
+            && row.version == stat.version
+            && row.missing_replica_node_id == remote
+    })
+    .collect::<Vec<_>>();
+    assert_eq!(
+        queued.len(),
+        1,
+        "the remote desired replica must remain in the actual native durable repair queue"
+    );
+    assert!(queued[0].completed_transfer_request_id.is_none());
     drop(owner);
     drop(dfs);
     runtime.clear_faults();
