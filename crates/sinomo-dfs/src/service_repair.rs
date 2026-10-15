@@ -3929,6 +3929,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     .repair_attempt_records
                     .get(&key)
                     .and_then(|record| record.last_error.clone());
+                // Exporting a due restored row is not a new physical attempt.
+                // Preserve its native attempt time when the producer's exact
+                // attempt and custody facts have not changed; only the retry
+                // deadline below is reconstructed from the scheduler ticks.
+                let unchanged_attempt = self.repair_attempt_records.get(&key).filter(|record| {
+                    record.attempts == state.attempts
+                        && record.in_flight == state.inflight
+                        && record.transfer_request_id == transfer_request_id
+                        && record.transfer_delivery_state == state.transfer_delivery_state
+                        && record.completed_transfer_request_id
+                            == state.completed_transfer_request_id
+                        && record.transfer_kind == Some(transfer_kind)
+                });
                 records.push(DfsRepairAttemptRecord {
                     intent_id: intent_id.clone(),
                     object_id: pending.object_id.clone(),
@@ -3937,7 +3950,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     missing_replica_node_id: replica_node_id.clone(),
                     attempts: state.attempts,
                     in_flight: state.inflight,
-                    last_attempt_unix_nanos: if state.attempts == 0 { 0 } else { now },
+                    last_attempt_unix_nanos: unchanged_attempt.map_or_else(
+                        || if state.attempts == 0 { 0 } else { now },
+                        |record| record.last_attempt_unix_nanos,
+                    ),
                     next_retry_unix_nanos: if state.attempts == 0 {
                         now
                     } else {
