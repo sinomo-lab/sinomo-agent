@@ -9074,8 +9074,10 @@ fn native_retained_owner_prepublication_interruption_and_queue_cas_recover_witho
                 "actual normal Main must prepare and dispatch this retained owner within its existing network budget"
             );
             let pass = runtime.maintenance_tick(&owner, remaining).unwrap();
-            pass.outcome
-                .expect("actual normal maintenance owner outcome");
+            assert!(
+                pass.outcome.is_ok(),
+                "actual normal maintenance owner outcome: {pass:#?}"
+            );
         }
         assert_eq!(background.omitted_count(), 0);
         drop(background);

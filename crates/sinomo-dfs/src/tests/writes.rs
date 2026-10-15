@@ -291,8 +291,7 @@ fn restored_pending_stage_rejects_old_ack_and_commits_exact_fresh_transfer() {
         let tick = runtime.maintenance_tick(&owner, remaining).unwrap();
         assert!(
             tick.outcome.is_ok(),
-            "actual normal setup maintenance failed: {:?}",
-            tick.outcome
+            "actual normal setup maintenance failed: {tick:#?}"
         );
         std::thread::yield_now();
     }

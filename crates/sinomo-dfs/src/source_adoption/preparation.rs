@@ -1527,7 +1527,13 @@ mod genuine_source_first_tests {
             )
             .unwrap();
         std::thread::scope(|scope| {
-            let foreground = scope.spawn(move || requester.posix_rename(from, to));
+            let foreground = scope.spawn(move || {
+                let result = requester.posix_rename(from, to);
+                if result.is_err() {
+                    eprintln!("SOURCE_FIRST_OPERATION_RESULT from={from} result={result:?}");
+                }
+                result
+            });
             let captured = source_pause
                 .wait_preparation(Duration::from_secs(5))
                 .unwrap();
@@ -1691,8 +1697,15 @@ mod genuine_source_first_tests {
         let operation = sinomo_core::Id::generate().to_string();
         std::thread::scope(|scope| {
             let op = operation.clone();
-            let foreground =
-                scope.spawn(move || requester.posix_rename_with_operation_id(from, to, &op));
+            let foreground = scope.spawn(move || {
+                let result = requester.posix_rename_with_operation_id(from, to, &op);
+                if result.is_err() {
+                    eprintln!(
+                        "SOURCE_FIRST_OPERATION_RESULT from={from} op={op} result={result:?}"
+                    );
+                }
+                result
+            });
             let captured = source_pause
                 .wait_preparation(Duration::from_secs(5))
                 .unwrap();
@@ -1837,8 +1850,15 @@ mod genuine_source_first_tests {
         let mut revoked_first = false;
         std::thread::scope(|scope| {
             let op = operation.clone();
-            let foreground =
-                scope.spawn(move || requester.posix_rename_with_operation_id(from, to, &op));
+            let foreground = scope.spawn(move || {
+                let result = requester.posix_rename_with_operation_id(from, to, &op);
+                if result.is_err() {
+                    eprintln!(
+                        "SOURCE_FIRST_OPERATION_RESULT from={from} op={op} result={result:?}"
+                    );
+                }
+                result
+            });
             let captured = source_pause
                 .wait_preparation(Duration::from_secs(5))
                 .unwrap();

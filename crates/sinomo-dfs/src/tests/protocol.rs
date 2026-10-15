@@ -2283,13 +2283,17 @@ fn stage_command_accepts_metadata_shard_primary_for_transient_object() {
             },
         )
         .unwrap();
+    let stage_observations = runtime.rpc_observations();
     assert!(
-        runtime.rpc_observations()[before..]
+        stage_observations[before..]
             .iter()
             .any(|event| event.source == primary
                 && event.target == replica
                 && event.route == DFS_DATA_STAGE_BLOB_ROUTE
-                && event.phase == crate::test_support::DfsTestRpcPhase::Completed)
+                && event.phase == crate::test_support::DfsTestRpcPhase::Completed),
+        "actual completed write={stat:?}; first actual RPC cut={:?}; subsequent actual RPC cut={:?}",
+        &stage_observations[before..],
+        &runtime.rpc_observations()[before..]
     );
     let publisher = runtime.client(&primary).unwrap();
     let metadata = publisher

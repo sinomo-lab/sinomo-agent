@@ -1914,7 +1914,7 @@ mod tests {
         let status: DfsOperatorStatus =
             response.decode_body().expect("decode actual hosted status");
         assert!(status.file_system_count > 0);
-        assert!(status.object_count > 0);
+        assert!(status.object_count > 0, "actual hosted status={status:#?}");
         runtime.stop_node(&node).expect("stop actual data owner");
         let unavailable = dispatch_with_signer(
             &registry,

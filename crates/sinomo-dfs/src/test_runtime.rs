@@ -4150,6 +4150,31 @@ impl DfsTestRuntime {
 }
 impl Drop for DfsTestRuntime {
     fn drop(&mut self) {
+        #[cfg(test)]
+        let preserve_panic = std::thread::panicking()
+            && std::env::var("SINOMO_DFS_TEST_PANIC_CAPTURE").is_ok_and(|value| value == "1");
+        #[cfg(test)]
+        if preserve_panic && let Some(root) = self.root.as_ref() {
+            let observations = match self.fabric.observations.try_lock() {
+                Ok(records) => format!("{records:#?}"),
+                Err(error) => format!("observations unavailable: {error:?}"),
+            };
+            let capture = format!(
+                "thread={:?}\nprimary={}\nomitted={}\nRPC observations BEFORE ordinary cleanup:\n{}",
+                std::thread::current().name(),
+                self.primary,
+                self.observation_dropped_count(),
+                observations
+            );
+            let result = std::fs::write(
+                root.path().join("native-panic-rpc-observations.txt"),
+                capture,
+            );
+            eprintln!(
+                "NATIVE_PANIC_CAPTURE root={:?} write={result:?}",
+                root.path()
+            );
+        }
         if !self.closed {
             if let Err(error) = self.close_inner(None) {
                 eprintln!("shared DFS test cleanup failed: {error}");
@@ -4161,6 +4186,14 @@ impl Drop for DfsTestRuntime {
                     eprintln!("retained DFS test root: {}", root.keep().display())
                 }
             }
+        }
+        #[cfg(test)]
+        if preserve_panic && let Some(root) = self.root.take() {
+            eprintln!(
+                "NATIVE_PANIC_RETAINED closed={} root={:?}",
+                self.closed,
+                root.keep()
+            );
         }
     }
 }
