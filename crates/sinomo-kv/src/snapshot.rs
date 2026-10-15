@@ -726,6 +726,36 @@ pub fn read_cluster_kv_resident_local_prefix(
     result
 }
 
+/// Observe a complete key-selected subset of one canonical resident prefix.
+///
+/// Every examined key counts against the ordinary prefix entry bound. Only
+/// matching entries are copied and charged to the unchanged response payload
+/// bound. The key predicate must be a pure local classification. Missing or
+/// checked-out resident state fails closed; this neither opens durable state
+/// nor supplies quorum authority. No partial selection is returned on error.
+pub fn read_cluster_kv_resident_local_prefix_matching(
+    paths: &ClusterKvPaths,
+    node_id: &NodeId,
+    prefix: &str,
+    matches_key: fn(&str) -> bool,
+) -> Result<KvLocalRead<Vec<KvEntry>>, KvError> {
+    let started = Instant::now();
+    let wal_paths = paths.raft_wal_paths(node_id);
+    let result = read_resident_raft_local_prefix_matching(&wal_paths, node_id, prefix, matches_key)
+        .unwrap_or_else(|| {
+            Err(KvError::Busy {
+                path: wal_paths.root.display().to_string(),
+            })
+        });
+    record_kv_read(
+        "local",
+        "resident_raft_matching_prefix_strict",
+        if result.is_ok() { "ok" } else { "busy" },
+        started,
+    );
+    result
+}
+
 pub fn read_cluster_kv_local_prefix_with_deadline(
     paths: &ClusterKvPaths,
     node_id: &NodeId,

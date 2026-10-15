@@ -1966,6 +1966,45 @@ pub(crate) fn read_resident_raft_local_prefix_limited_by_payload_bytes(
     })
 }
 
+pub(crate) fn read_resident_raft_local_prefix_matching(
+    paths: &KvWalPaths,
+    node_id: &NodeId,
+    prefix: &str,
+    matches_key: fn(&str) -> bool,
+) -> Option<Result<KvLocalRead<Vec<KvEntry>>, KvError>> {
+    with_idle_resident_raft_node(paths, node_id, |node| {
+        let mut selected = Vec::new();
+        let mut payload_bytes = 0_usize;
+        for (scanned, entry) in node.store.prefix_entries(prefix).enumerate() {
+            // Bound every examined key, including records outside the query.
+            // Filtering never turns a truncated scan into a complete result.
+            if scanned >= CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES {
+                return Err(KvError::RangeLimit {
+                    prefix: prefix.to_owned(),
+                    max_entries: CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES,
+                });
+            }
+            if !matches_key(&entry.key) {
+                continue;
+            }
+            payload_bytes = payload_bytes.saturating_add(kv_entry_payload_bytes(entry));
+            if payload_bytes > CLUSTER_KV_RANGE_PREFIX_MAX_PAYLOAD_BYTES {
+                return Err(KvError::RangePayloadLimit {
+                    prefix: prefix.to_owned(),
+                    observed_bytes: payload_bytes,
+                    max_bytes: CLUSTER_KV_RANGE_PREFIX_MAX_PAYLOAD_BYTES,
+                });
+            }
+            try_reserve_kv_items(&mut selected, 1, "collect matching resident prefix")?;
+            selected.push(try_clone_kv_entry(
+                entry,
+                "collect matching resident prefix",
+            )?);
+        }
+        Ok(selected)
+    })
+}
+
 pub(crate) fn read_resident_raft_local_snapshot(
     paths: &KvWalPaths,
     node_id: &NodeId,
