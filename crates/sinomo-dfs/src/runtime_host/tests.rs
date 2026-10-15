@@ -10578,6 +10578,12 @@ fn daemon_dfs_distributed_write_skips_cold_full_metadata_hydrate() {
         )
         .unwrap();
     assert_eq!(changed_root_shard.epoch, root_shard.epoch + 1);
+    // Hold the same ordinary global admission as the handback owner. Native
+    // reactive maintenance can otherwise temporarily take this optional lane
+    // between the handoff and these pointer-identity observations.
+    let handback_admission = runtime
+        .block_on(scheduler.admit(&DfsMessageExecutionScope::GlobalExclusive))
+        .unwrap();
     // The real handoff serves work and installs its current lane. A delayed
     // old handback must refuse reuse without removing or replacing that lane.
     let (current_signature, current_lane) = {
@@ -10619,6 +10625,7 @@ fn daemon_dfs_distributed_write_skips_cold_full_metadata_hydrate() {
         );
     }
     drop(current_lane);
+    drop(handback_admission);
     assert!(
         evict_daemon_dfs_message_service_cache(&data_dir).expect("evict message cache"),
         "shutdown must release the complete message cache"
