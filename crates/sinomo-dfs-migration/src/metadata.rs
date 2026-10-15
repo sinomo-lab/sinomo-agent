@@ -608,14 +608,15 @@ struct RootSlot {
     session: Mutex<Option<Session>>,
 }
 impl RootSlot {
-    fn lock_session(&self) -> std::sync::MutexGuard<'_, Option<Session>> {
-        match self.session.lock() {
-            Ok(session) => session,
-            Err(poisoned) => {
+    fn try_lock_session(&self) -> Option<std::sync::MutexGuard<'_, Option<Session>>> {
+        match self.session.try_lock() {
+            Ok(session) => Some(session),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
                 let mut session = poisoned.into_inner();
                 session.take();
                 self.session.clear_poison();
-                session
+                Some(session)
             }
         }
     }
@@ -716,7 +717,14 @@ impl MetadataConverter {
                 "one physical metadata destination was requested under different shard identities",
             ));
         }
-        let mut session = slot.lock_session();
+        // A lifecycle caller can retain admission/cache state needed by the
+        // active owner. Yield without waiting, advancing or replacing its slot.
+        // The same owner retains physical source custody and the exact cursor.
+        let Some(mut session) = slot.try_lock_session() else {
+            return Ok(DfsStoragePreparation::Pending {
+                processed_records: 0,
+            });
+        };
         // Resolve both persisted stage roles once under this destination's
         // custody. The exact validated DATA is local to this bounded call.
         let goals = (|| {
@@ -5031,6 +5039,75 @@ mod recovery_session_tests {
     }
 
     #[test]
+    fn busy_preparation_session_returns_pending_without_waiting_or_releasing_custody() {
+        let root = sinomo_testdir::TestDir::new("metadata-conversion-busy-session");
+        let source = root.path().join("source");
+        fs::create_dir_all(&source).unwrap();
+        let destination = canonical_destination(&root.path().join("destination")).unwrap();
+        let shard = DfsMetadataShardId::new("current");
+        let slot = Arc::new(RootSlot {
+            shard: shard.clone(),
+            session: Mutex::new(Some(open_session(&destination, &source, &shard).unwrap())),
+        });
+        let converter = Arc::new(MetadataConverter::default());
+        converter
+            .roots
+            .lock()
+            .unwrap()
+            .insert(destination.clone(), Arc::clone(&slot));
+        let custody = slot.session.lock().unwrap();
+        let source_handle = Arc::as_ptr(&custody.as_ref().unwrap()._source_lock);
+        let cursor = serde_json::to_value(&custody.as_ref().unwrap().progress).unwrap();
+        let checkpoint_path = custody.as_ref().unwrap().staged_root.join("progress.json");
+        let checkpoint = fs::read(&checkpoint_path).unwrap();
+        let competing = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(source.join("journal/write.lock"))
+            .unwrap();
+        assert!(competing.try_lock_exclusive().is_err());
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let queued = Arc::clone(&converter);
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            result_tx
+                .send(queued.prepare_with_source(&destination, &source, &shard, 256))
+                .unwrap();
+        });
+        started_rx.recv().unwrap();
+        let result = result_rx.recv_timeout(std::time::Duration::from_secs(1));
+        assert!(
+            custody.is_some(),
+            "contention cannot discard the active source cursor"
+        );
+        assert!(
+            competing.try_lock_exclusive().is_err(),
+            "source custody must remain held"
+        );
+        // Drain the worker even on the old blocking implementation before asserting.
+        drop(custody);
+        worker.join().unwrap();
+        assert!(
+            matches!(
+                result,
+                Ok(Ok(DfsStoragePreparation::Pending {
+                    processed_records: 0
+                }))
+            ),
+            "a competing owner must receive honest no-progress Pending, not wait: {result:?}"
+        );
+        let retained = slot.session.lock().unwrap();
+        let retained = retained
+            .as_ref()
+            .expect("the original owned session is retained");
+        assert_eq!(Arc::as_ptr(&retained._source_lock), source_handle);
+        assert_eq!(serde_json::to_value(&retained.progress).unwrap(), cursor);
+        assert_eq!(fs::read(&checkpoint_path).unwrap(), checkpoint);
+        assert!(competing.try_lock_exclusive().is_err());
+    }
+
+    #[test]
     fn poisoned_projection_is_discarded_before_releasing_source_custody() {
         let root = sinomo_testdir::TestDir::new("metadata-conversion-poisoned-session");
         let source = root.path().join("source");
@@ -5044,7 +5121,7 @@ mod recovery_session_tests {
         let queued = Arc::clone(&slot);
         assert!(
             std::thread::spawn(move || {
-                let mut state = queued.lock_session();
+                let mut state = queued.try_lock_session().unwrap();
                 state.as_mut().unwrap().replayed_events = 11;
                 panic!("unwind after partial scratch projection");
             })
@@ -5061,7 +5138,7 @@ mod recovery_session_tests {
             competing.try_lock_exclusive().is_err(),
             "source custody must survive until the poisoned state is discarded"
         );
-        let state = slot.lock_session();
+        let state = slot.try_lock_session().unwrap();
         assert!(
             state.is_none(),
             "a queued caller must not receive the partial projection"
@@ -5078,28 +5155,50 @@ mod recovery_session_tests {
         std::os::unix::fs::symlink(root.path(), &alias).unwrap();
         let destination = root.path().join("new-current-root");
         let aliased = alias.join("new-current-root");
-        assert_eq!(
-            canonical_destination(&destination).unwrap(),
-            canonical_destination(&aliased).unwrap()
-        );
+        let physical = canonical_destination(&destination).unwrap();
+        assert_eq!(physical, canonical_destination(&aliased).unwrap());
         let converter = Arc::new(MetadataConverter::default());
-        let first = Arc::clone(&converter);
         let shard = DfsMetadataShardId::new("current");
-        let first_shard = shard.clone();
-        let worker = std::thread::spawn(move || first.prepare(&destination, &first_shard, 1));
-        // An empty storage path needs no conversion. This is not publication
-        // authorization; normal DFS genesis still requires its native guard.
+        // An empty root needs no conversion. Actual preparation establishes the
+        // slot; no fabricated source data, certificate or Ready callback exists.
         assert_eq!(
-            converter.prepare(&aliased, &shard, 1).unwrap(),
+            converter.prepare(&destination, &shard, 1).unwrap(),
             DfsStoragePreparation::Ready
         );
-        assert_eq!(
-            worker.join().unwrap().unwrap(),
-            DfsStoragePreparation::Ready
+        let slot = Arc::clone(converter.roots.lock().unwrap().get(&physical).unwrap());
+        let owner = slot.session.lock().unwrap();
+        let queued = Arc::clone(&converter);
+        let queued_alias = aliased.clone();
+        let queued_shard = shard.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            tx.send(queued.prepare(&queued_alias, &queued_shard, 1))
+                .unwrap();
+        });
+        let waiting = rx.recv_timeout(std::time::Duration::from_secs(1));
+        // Always drain the old blocking implementation before failing a test.
+        drop(owner);
+        worker.join().unwrap();
+        assert!(
+            matches!(
+                waiting,
+                Ok(Ok(DfsStoragePreparation::Pending {
+                    processed_records: 0
+                }))
+            ),
+            "an alias must yield without claiming progress while the owner is active: {waiting:?}"
         );
-        let slots = converter.roots.lock().unwrap();
-        assert_eq!(slots.len(), 1);
-        assert!(slots.values().next().unwrap().lock_session().is_none());
+        for path in [&aliased, &destination] {
+            assert_eq!(
+                converter.prepare(path, &shard, 1).unwrap(),
+                DfsStoragePreparation::Ready,
+                "the same bounded lifecycle must finish after the owner releases its turn"
+            );
+            let slots = converter.roots.lock().unwrap();
+            assert_eq!(slots.len(), 1);
+            assert!(Arc::ptr_eq(slots.get(&physical).unwrap(), &slot));
+        }
+        assert!(slot.session.lock().unwrap().is_none());
     }
 }
 

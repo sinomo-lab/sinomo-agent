@@ -97,6 +97,16 @@ at most `DFS_STORAGE_PREPARATION_RECORD_BUDGET` (256) records. Unfinished work
 returns `StoragePreparationPending`; the component's initial startup recovery
 resumes it under the same data owner instead of failing the mount.
 
+A contended metadata destination returns `Pending { processed_records: 0 }`
+without waiting on its active preparation session. Physical aliases share one
+stable slot. The current owner retains its source lock, validated cursor and
+checkpoint; another caller cannot replace or advance them. After that turn
+releases the session, callers resume through the same bounded preparation entry
+and must still obtain actual `Ready` before opening storage. Cancellation of a
+waiting caller does not cancel the owner or release source custody. A poisoned
+session is discarded under the same slot before the source can be reacquired;
+reconstruction still validates the last durable checkpoint.
+
 The converter retains original source bytes and digests, synchronizes output
 before progress, and discards only an uncheckpointed staging suffix on restart.
 It stages a hidden current candidate. Installation binds the captured source
