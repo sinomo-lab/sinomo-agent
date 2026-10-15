@@ -277,16 +277,35 @@ fn native_staged_overwrite_keeps_captured_metadata_after_real_prior_version_repa
                             && receipt.content_hash == written.content_hash)
                 );
             }
-            let history = backend
-                .object_write_intent_history(&written.object_id)
+            // Intent compaction can retain a terminal receipt while removing
+            // the live intent row. The original committed preparation still
+            // seals its exact terminal body and must remain the proof here.
+            let snapshot = backend
+                .export_shard_table_snapshot(&DfsMetadataShardId::new(&shard.shard_id))
+                .unwrap()
                 .unwrap();
-            let mut original = history
-                .intents
+            let mut original = snapshot
+                .tables
+                .prepared_operations_v7
                 .iter()
-                .filter(|record| record.operation_id.as_deref() == Some(operation.as_str()));
-            let terminal = original
+                .filter(|record| {
+                    record
+                        .payload
+                        .terminal_intent
+                        .as_ref()
+                        .is_some_and(|intent| {
+                            intent.operation_id.as_deref() == Some(operation.as_str())
+                        })
+                });
+            let prepared = original
                 .next()
-                .expect("the original intent has a durable terminal record");
+                .expect("the original committed preparation retains its exact terminal body");
+            prepared.validate().unwrap();
+            assert_eq!(
+                prepared.status,
+                sinomo_dfs::DfsPreparedOperationStatus::Committed
+            );
+            let terminal = prepared.payload.terminal_intent.as_ref().unwrap();
             assert!(
                 original.next().is_none(),
                 "one original mutation owns the terminal body"
