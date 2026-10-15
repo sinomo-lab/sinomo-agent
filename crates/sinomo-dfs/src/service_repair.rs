@@ -3698,11 +3698,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .repair_job_for_target(&record.intent_id, &record.missing_replica_node_id)
                 .is_none()
             {
+                let key = (
+                    record.intent_id.clone(),
+                    record.missing_replica_node_id.clone(),
+                );
                 if repair_transfer_custody_unresolved(record) {
-                    let key = (
-                        record.intent_id.clone(),
-                        record.missing_replica_node_id.clone(),
-                    );
                     let mut current = record.clone();
                     if self
                         .repair_attempt_records
@@ -3712,6 +3712,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         current.next_retry_unix_nanos = u64::MAX;
                     }
                     self.repair_attempt_records.insert(key, current);
+                } else if !record.in_flight
+                    && record.transfer_request_id.is_none()
+                    && record.transfer_kind.is_some()
+                    && let Some(completed) = record.completed_transfer_request_id.as_ref()
+                    && self.repair_attempt_records.get(&key).is_some_and(|cached| {
+                        cached.object_id == record.object_id
+                            && cached.version == record.version
+                            && cached.content_hash == record.content_hash
+                            && cached.transfer_kind == record.transfer_kind
+                            && cached.transfer_request_id.as_ref() == Some(completed)
+                            && cached.completed_transfer_request_id.is_none()
+                    })
+                {
+                    // Another admitted lane consumed this exact native reply.
+                    // Its durable terminal settles our older carrier DATA even
+                    // after the canonical receipt removed the repair job. Do
+                    // not export that stale in-flight row over the terminal.
+                    // A different or unknown request/kind remains unresolved.
+                    self.repair_attempt_records.remove(&key);
                 }
                 // The durable queue is a restart cursor for an authoritative
                 // repair job, not an independent source of repair authority.

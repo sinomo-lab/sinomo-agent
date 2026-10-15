@@ -9501,3 +9501,110 @@ fn native_private_repair_reply_checkpoints_its_actual_terminal_against_queue_bir
         Some(sinomo_core::network::NetworkDeliveryState::PossiblyApplied)
     );
 }
+
+#[test]
+fn native_terminal_queue_restore_does_not_rearm_its_stale_retained_producer() {
+    let (runtime, owner, replica, mut service, stat, intent_id, background) =
+        native_committed_repair_backlog("native-terminal-queue-stale-producer", true);
+    let queue = LocalDfsRepairQueueStore::new(default_dfs_repair_attempt_snapshot_path(
+        runtime.data_dir(&owner),
+    ));
+    runtime.clear_faults();
+    assert_eq!(service.retry_pending_repairs_bounded(1).unwrap().len(), 1);
+    let stale = service.durable_repair_queue_records();
+    let key = (intent_id.clone(), replica.clone());
+    let original = stale
+        .iter()
+        .find(|row| row.intent_id == intent_id && row.missing_replica_node_id == replica)
+        .unwrap()
+        .clone();
+    assert!(original.in_flight && original.transfer_request_id.is_some());
+    let reply = service
+        .transport
+        .drain_incoming_messages()
+        .unwrap()
+        .into_iter()
+        .find(|message| {
+            matches!(&message.message, DfsNetworkMessage::RepairReplicaResponse(response)
+            if response.intent_id == intent_id)
+        })
+        .expect("actual native repair receiver reply");
+    assert_eq!(reply.source_node_id, replica);
+    assert_eq!(reply.target_node_id, owner);
+    let DfsNetworkMessage::RepairReplicaResponse(response) = reply.message else {
+        unreachable!()
+    };
+    assert!(matches!(
+        service
+            .handle_repair_replica_response(replica.clone(), response)
+            .unwrap(),
+        NetworkedDfsServiceEvent::ReplicaRepaired { .. }
+    ));
+    assert!(
+        service
+            .coordinator()
+            .repair_job_for_target(&intent_id, &replica)
+            .is_none()
+    );
+    let terminal = queue
+        .records_for_targets(&intent_id, std::slice::from_ref(&replica))
+        .unwrap()
+        .remove(0);
+    assert_eq!(
+        terminal.completed_transfer_request_id,
+        original.transfer_request_id
+    );
+    assert!(terminal.transfer_request_id.is_none() && !terminal.in_flight);
+    assert!(
+        service
+            .metadata_backend()
+            .unwrap()
+            .receipts_for_version(&stat.object_id, &stat.version)
+            .unwrap()
+            .iter()
+            .any(|row| row.replica_node_id == replica && row.content_hash == stat.content_hash)
+    );
+
+    // Retain only genuine earlier producer DATA, as a separate maintenance
+    // lane can do while Main accepts the reply and persists its terminal row.
+    service.restore_repair_attempt_records_merging(std::slice::from_ref(&original));
+    assert_eq!(service.repair_attempt_records.get(&key), Some(&original));
+    let mut foreign = terminal.clone();
+    foreign.completed_transfer_request_id = Some("wrong-native-request-negative-control".into());
+    service.restore_repair_attempt_records_merging(std::slice::from_ref(&foreign));
+    assert_eq!(service.repair_attempt_records.get(&key), Some(&original));
+    let mut foreign_kind = terminal.clone();
+    foreign_kind.transfer_kind = Some(sinomo_api::dfs::maintenance::DfsRepairTransferKind::Stage);
+    service.restore_repair_attempt_records_merging(std::slice::from_ref(&foreign_kind));
+    assert_eq!(service.repair_attempt_records.get(&key), Some(&original));
+
+    let mut foreign_version = terminal.clone();
+    foreign_version.version = DfsVersion::generate();
+    service.restore_repair_attempt_records_merging(std::slice::from_ref(&foreign_version));
+    assert_eq!(service.repair_attempt_records.get(&key), Some(&original));
+
+    service.restore_repair_attempt_records_merging(std::slice::from_ref(&terminal));
+    let desired = service.durable_repair_queue_records();
+    let (page, observed) = queue.maintenance_page(1, &[], None).unwrap();
+    queue
+        .reconcile_maintenance_page(
+            &observed,
+            page.records.len(),
+            &page.records,
+            &desired,
+            &[],
+            &[],
+        )
+        .unwrap();
+    let durable = queue.view().unwrap();
+    drop(service);
+    drop(background);
+    runtime.close().unwrap();
+    assert!(
+        !durable
+            .records
+            .iter()
+            .any(|row| row.intent_id == intent_id && row.missing_replica_node_id == replica),
+        "normal page reconciliation must consume the actual terminal, not republish its old in-flight producer: {durable:?}"
+    );
+}
