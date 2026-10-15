@@ -9064,10 +9064,25 @@ mod cursor_update_tests {
                     )
                     .unwrap()
                     .unwrap();
-                    let resident = crate::runtime_host::daemon_dfs_bounded_status_resident(
-                        &receiver_data,
-                        &peer,
-                    )
+                    // The bounded cache observation can yield to another root's
+                    // registry update. Join only that exact transient within
+                    // this recovery action's existing remaining budget.
+                    let resident = loop {
+                        match crate::runtime_host::daemon_dfs_bounded_status_resident(
+                            &receiver_data,
+                            &peer,
+                        ) {
+                            Err(DfsError::Network { ref message })
+                                if (message == "bounded DFS status unavailable while the resident generation cache is being updated"
+                                    || message == "DFS runtime network error at DFS message cache root identity: bounded DFS status unavailable while the resident generation cache is being updated")
+                                    && began.elapsed() < remaining =>
+                            {
+                                std::thread::sleep(Duration::from_millis(2)
+                                    .min(remaining.saturating_sub(began.elapsed())));
+                            }
+                            result => break result,
+                        }
+                    }
                     .expect("actual corrupt receiver resident generation");
                     let status = resident.bounded_status_snapshot().unwrap();
                     assert!(
