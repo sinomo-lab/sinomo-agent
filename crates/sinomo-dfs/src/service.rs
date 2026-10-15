@@ -1908,11 +1908,35 @@ mod tests {
         let (mut runtime, node, data_dir, host) = native_surface_fixture("native-host-status");
         let registry =
             register_services_with_data_plane_host(ServiceRegistry::builder(), host).build();
-        let (disposition, response) =
-            dispatch_local(&registry, data_dir.clone(), DFS_STATUS_ROUTE, &()).await;
-        assert_eq!(disposition, ServiceDisposition::Continue);
-        let status: DfsOperatorStatus =
-            response.decode_body().expect("decode actual hosted status");
+        let deadline = tokio::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+        let status = loop {
+            let (disposition, response) = tokio::time::timeout_at(
+                deadline,
+                dispatch_local(&registry, data_dir.clone(), DFS_STATUS_ROUTE, &()),
+            )
+            .await
+            .expect("hosted status completes within its original request window");
+            assert_eq!(disposition, ServiceDisposition::Continue);
+            let status: DfsOperatorStatus =
+                response.decode_body().expect("decode actual hosted status");
+            let updating = !status.incomplete_reasons.is_empty()
+                && status.incomplete_reasons.iter().all(|reason|
+                    reason == "network error: DFS runtime network error at DFS message cache root identity: bounded DFS status unavailable while the resident generation cache is being updated"
+                    || reason == "network error: bounded DFS status unavailable while the resident generation cache is being updated");
+            if updating {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "hosted status remained incomplete: {status:#?}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                continue;
+            }
+            break status;
+        };
+        assert!(
+            status.blocking_incomplete_reasons().is_empty(),
+            "actual hosted status={status:#?}"
+        );
         assert!(status.file_system_count > 0);
         assert!(status.object_count > 0, "actual hosted status={status:#?}");
         runtime.stop_node(&node).expect("stop actual data owner");
