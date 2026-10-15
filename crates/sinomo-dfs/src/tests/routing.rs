@@ -1536,6 +1536,20 @@ fn sifs_cluster_retried_pending_routed_create_preserves_parent_mtime_touch() {
         "only the verified single lost Stage rule is owned here"
     );
     cluster._runtime.assert_fault_budgets().unwrap();
+    // Keep the missing receipt unavailable while exercising Pending replay.
+    // Normal recovery may otherwise obtain another real acknowledgement as
+    // soon as the one-shot loss rule is removed.
+    cluster
+        ._runtime
+        .install_fault(crate::test_runtime::FaultRule {
+            source: Some(cluster.primary_node.clone()),
+            target: Some(cluster.observer_node.clone()),
+            route: Some(DFS_DATA_STAGE_BLOB_ROUTE.into()),
+            call_id: None,
+            origin: Some(crate::test_runtime::RpcOrigin::RegisteredHost),
+            remaining_hits: 32,
+            action: crate::test_runtime::FaultAction::BudgetExhausted,
+        });
     let intent_id = stage.intent_id.clone();
     // The pre-W3 owned DATA is the real durable write reservation. The
     // committed repair queue does not promise a pre-commit Stage row.
@@ -1694,6 +1708,23 @@ fn sifs_cluster_retried_pending_routed_create_preserves_parent_mtime_touch() {
     assert!(
         Instant::now() < deadline,
         "the pending/retry phase exhausted its original window"
+    );
+    cluster._runtime.assert_fault_budgets().unwrap();
+    let released = cluster._runtime.remove_faults_matching(|rule| {
+        rule.source.as_ref() == Some(&cluster.primary_node)
+            && rule.target.as_ref() == Some(&cluster.observer_node)
+            && rule.route.as_deref() == Some(DFS_DATA_STAGE_BLOB_ROUTE)
+            && rule.origin == Some(crate::test_runtime::RpcOrigin::RegisteredHost)
+            && rule.call_id.is_none()
+            && rule.remaining_hits <= 32
+            && matches!(
+                rule.action,
+                crate::test_runtime::FaultAction::BudgetExhausted
+            )
+    });
+    assert_eq!(
+        released, 1,
+        "release only this Pending phase's owned no-send rule"
     );
     // Only the real receiver resends its unchanged actual healthy reply through
     // ordinary native admission. No receipt, ACK, pending job or state is made up.
