@@ -5,6 +5,11 @@ use sinomo_core::node::NodeId;
 use std::collections::BTreeSet;
 use time::OffsetDateTime;
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static SMOKE_CONFIGURATION_CAPTURED: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
 use crate::DfsMessageTransport;
 use crate::{
     DfsError, DfsFileSystemId, DfsMetadataJournalBatchSender, DfsMetadataJournalPublisherHost,
@@ -127,6 +132,12 @@ pub(crate) fn run_cluster_dfs_smoke_with_runtime_client(
         .ok_or_else(|| DfsError::Metadata {
             message: "DFS smoke current configuration is not ready".into(),
         })?;
+    #[cfg(test)]
+    SMOKE_CONFIGURATION_CAPTURED.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
     let content_nodes = dfs_smoke_content_node_ids(
         &local_node_id,
         projection.content_advertisements()?,

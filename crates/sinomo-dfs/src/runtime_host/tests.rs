@@ -17154,3 +17154,73 @@ fn rejected_shared_maintenance_take_keeps_the_actual_cached_service() {
     drop(preflight);
     native.close().unwrap();
 }
+
+#[test]
+fn daemon_smoke_revalidates_a_concurrently_advanced_metadata_cache() {
+    let local =
+        crate::test_runtime::DfsTestRuntime::ordered_node_ids("native-smoke-coherent-cut", 1)
+            .remove(0);
+    let mut fixture =
+        crate::test_runtime::DfsTestRuntime::new("native-smoke-coherent-cut", local.clone())
+            .unwrap();
+    fixture.start_nodes().unwrap();
+    let data_dir = fixture.data_dir(&local).clone();
+    let paths = ClusterPaths::new(&data_dir);
+    let runtime = fixture.runtime_handle();
+    let peers = read_daemon_dfs_message_peer_snapshot(&paths)
+        .unwrap()
+        .unwrap();
+    let preflight = runtime
+        .block_on(warm_daemon_dfs_metadata_authority_for_peer_snapshot_async(
+            &paths, &peers, &runtime,
+        ))
+        .unwrap();
+    let control = fixture.shared_control_plane().unwrap();
+    let changed = Arc::new(AtomicBool::new(false));
+    let observed = Arc::clone(&changed);
+    let changed_node = local.clone();
+    crate::smoke::SMOKE_CONFIGURATION_CAPTURED.with(|hook| {
+        assert!(hook.borrow().is_none());
+        *hook.borrow_mut() = Some(Box::new(move || {
+            super::control_plane::AFTER_CACHED_METADATA_SYNC.with(|slot| {
+                assert!(slot.borrow().is_none());
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    control.with_client(|kv| {
+                        let mut store = sinomo_dfs::DfsControlPlaneStore::new(kv.as_mut());
+                        let mut advertisement =
+                            store.content_service(&changed_node).unwrap().unwrap();
+                        advertisement.advertisement_generation += 1;
+                        store.advertise_content_service(&advertisement).unwrap();
+                    });
+                    observed.store(true, Ordering::SeqCst);
+                }));
+            });
+        }));
+    });
+    let (peer, _) = fixture.peer_transports(&local).unwrap();
+    let result = {
+        let _entered = runtime.enter();
+        sinomo_dfs::run_default_cluster_dfs_smoke_with_peer_transport(
+            &data_dir,
+            &paths,
+            peer,
+            super::publish_host::daemon_dfs_smoke_options(),
+        )
+    };
+    crate::smoke::SMOKE_CONFIGURATION_CAPTURED.with(|hook| {
+        assert!(
+            hook.borrow().is_none(),
+            "smoke returned before capture: {result:?}"
+        )
+    });
+    drop(preflight);
+    fixture.close().unwrap();
+    assert!(changed.load(Ordering::SeqCst));
+    let report = result
+        .expect("the retained smoke cut remains complete across the actual provider update")
+        .unwrap();
+    assert_eq!(report.requested_replica_node_ids, vec![local.clone()]);
+    assert_eq!(report.committed_replica_node_ids, vec![local]);
+    assert_eq!(report.attempts.len(), 1);
+    assert!(report.attempts[0].committed);
+}

@@ -1,6 +1,10 @@
 use super::*;
 
 const DAEMON_DFS_AUTHORITY_PROJECTION_REPLAN_MAX_ATTEMPTS: usize = 8;
+#[cfg(test)]
+std::thread_local! {
+    pub(super) static AFTER_CACHED_METADATA_SYNC: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
 
 #[cfg(test)]
 #[derive(Debug)]
@@ -1050,11 +1054,31 @@ impl sinomo_dfs::DfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient {
         {
             return Ok(None);
         }
-        authority.cached_metadata_shards(
-            file_system_id,
-            self.retained_metadata_projection_generation
-                .load(Ordering::Acquire),
-        )
+        for _ in 0..DAEMON_DFS_AUTHORITY_PROJECTION_REPLAN_MAX_ATTEMPTS {
+            let generation = self
+                .retained_metadata_projection_generation
+                .load(Ordering::Acquire);
+            #[cfg(test)]
+            {
+                let hook = AFTER_CACHED_METADATA_SYNC.with(|slot| slot.borrow_mut().take());
+                if let Some(hook) = hook {
+                    hook();
+                }
+            }
+            let shards = authority.cached_metadata_shards(file_system_id, generation)?;
+            if authority.projection_generation() == generation {
+                return Ok(shards);
+            }
+            // A complete committed delta can advance between synchronization
+            // and the indexed read. Rebind only an already-complete local cut;
+            // do not restart the original synchronization's I/O or timeout.
+            if self.try_synchronize_retained_configuration()?
+                != Some(DaemonDfsRetainedMetadataSync::Current)
+            {
+                return Ok(None);
+            }
+        }
+        Err(self.superseded_authority_error("cached metadata shard index"))
     }
 
     fn refresh_latest(&mut self) -> Result<(), KvError> {
