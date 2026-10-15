@@ -997,34 +997,46 @@ impl sinomo_dfs::DfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient {
                 detail: "daemon write configuration owner is unavailable".into(),
             });
         };
-        let generation = authority.generation();
-        let readiness = authority.write_configuration_readiness().map_err(|error| {
-            KvError::AuthorityUnavailable {
-                detail: error.to_string(),
+        for _ in 0..DAEMON_DFS_AUTHORITY_PROJECTION_REPLAN_MAX_ATTEMPTS {
+            let generation = authority.generation();
+            let readiness = authority.write_configuration_readiness().map_err(|error| {
+                KvError::AuthorityUnavailable {
+                    detail: error.to_string(),
+                }
+            })?;
+            if matches!(
+                &readiness,
+                crate::DfsWriteConfigurationReadiness::Ready(Some(_))
+            ) {
+                if !matches!(
+                    self.try_synchronize_retained_metadata_authority()?,
+                    Some(DaemonDfsRetainedMetadataSync::Current)
+                ) {
+                    return Ok(crate::DfsWriteConfigurationReadiness::Pending);
+                }
+                if authority.generation() != generation {
+                    // A complete committed delta can change the generation
+                    // during the floor read without withdrawing configuration.
+                    // Re-read that same owner's cut and validate its native
+                    // floor again; never lend the superseded view or turn this
+                    // local observation race into an unavailable projection.
+                    continue;
+                }
             }
-        })?;
-        if matches!(
-            &readiness,
-            crate::DfsWriteConfigurationReadiness::Ready(Some(_))
-        ) && (!matches!(
-            self.try_synchronize_retained_metadata_authority()?,
-            Some(DaemonDfsRetainedMetadataSync::Current)
-        ) || authority.generation() != generation)
-        {
-            return Ok(crate::DfsWriteConfigurationReadiness::Pending);
-        }
-        #[cfg(any(test, feature = "test-support"))]
-        if let crate::DfsWriteConfigurationReadiness::Ready(Some(view)) = &readiness {
-            if let Some(root) = self.cluster_paths.root.parent() {
-                crate::native_shard_trace::record_configuration_cut(
-                    root,
-                    self.data_owner_lock().as_ref(),
-                    view,
-                    generation,
-                );
+            #[cfg(any(test, feature = "test-support"))]
+            if let crate::DfsWriteConfigurationReadiness::Ready(Some(view)) = &readiness {
+                if let Some(root) = self.cluster_paths.root.parent() {
+                    crate::native_shard_trace::record_configuration_cut(
+                        root,
+                        self.data_owner_lock().as_ref(),
+                        view,
+                        generation,
+                    );
+                }
             }
+            return Ok(readiness);
         }
-        Ok(readiness)
+        Ok(crate::DfsWriteConfigurationReadiness::Pending)
     }
 
     fn cached_metadata_shards(
@@ -1890,4 +1902,16 @@ pub(crate) async fn test_retained_client_configuration_sync(
         .synchronize_retained_metadata_authority_async()
         .await?;
     sinomo_dfs::DfsControlPlaneKvClient::write_configuration_projection(&client).map(|_| ())
+}
+
+#[cfg(test)]
+pub(crate) fn test_retained_client_configuration_projection(
+    authority: Arc<DaemonDfsMetadataAuthorityGeneration>,
+    paths: &ClusterPaths,
+) -> Result<Option<Arc<crate::DfsWriteConfigurationProjection>>, KvError> {
+    let mut client =
+        DaemonDfsControlPlaneKvClient::new_on_runtime(paths, &tokio::runtime::Handle::current());
+    client.retained_metadata_authority = Some(authority);
+    client.write_configuration_projection_required = true;
+    sinomo_dfs::DfsControlPlaneKvClient::write_configuration_projection(&client)
 }

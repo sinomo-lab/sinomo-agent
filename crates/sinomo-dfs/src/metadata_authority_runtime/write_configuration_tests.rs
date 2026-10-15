@@ -31,6 +31,7 @@ struct NativeProjectionHost {
     tasks: Mutex<VecDeque<DfsMetadataAuthorityTask>>,
     spawned: AtomicUsize,
     content_gate: PrefixGate,
+    floor_observer: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 fn fixture_entry(key: &str, value: Vec<u8>, revision: u64) -> KvEntry {
@@ -101,6 +102,7 @@ impl NativeProjectionHost {
             tasks: Mutex::new(VecDeque::new()),
             spawned: AtomicUsize::new(0),
             content_gate: PrefixGate::default(),
+            floor_observer: Mutex::new(None),
         });
         if configured {
             host.set_configuration(10);
@@ -219,6 +221,10 @@ impl DfsMetadataAuthorityHost for NativeProjectionHost {
     }
 
     fn write_configuration_floor(&self) -> Result<KvLocalRead<Option<KvEntry>>, DfsError> {
+        let observer = self.floor_observer.lock().unwrap().take();
+        if let Some(observer) = observer {
+            observer();
+        }
         let inputs = self.inputs.lock().unwrap();
         if inputs.floor_unavailable {
             return Err(DfsError::Network {
@@ -1887,4 +1893,90 @@ async fn queued_refresh_preserves_configuration_completed_by_committed_delta() {
     assert_eq!(runtime.storage_generation(), storage_generation);
     assert_eq!(host.spawned.load(Ordering::Acquire), 1);
     assert_eq!(host.queued_count(), 0);
+}
+
+#[tokio::test]
+async fn retained_control_client_revalidates_a_ready_generation_changed_during_floor_read() {
+    let host = NativeProjectionHost::new(true);
+    let runtime = attach(&host);
+    runtime.request_authoritative_refresh();
+    host.run_next().await;
+    assert_eq!(
+        runtime
+            .write_configuration_projection()
+            .unwrap()
+            .unwrap()
+            .revision(),
+        KvRevision(10)
+    );
+    let generation = runtime.generation();
+    let weak_host = Arc::downgrade(&host);
+    let weak_runtime = Arc::downgrade(&runtime);
+    *host.floor_observer.lock().unwrap() = Some(Box::new(move || {
+        let host = weak_host.upgrade().unwrap();
+        let runtime = weak_runtime.upgrade().unwrap();
+        let mut advertisement = crate::DfsNodeAdvertisement::content(host.local.clone());
+        advertisement.zone = Some("updated-during-floor-read".into());
+        let entry = fixture_entry(
+            &crate::content_service_key(&host.local),
+            encode_kv_value(&advertisement).unwrap(),
+            11,
+        );
+        {
+            let mut inputs = host.inputs.lock().unwrap();
+            inputs.authority.revision = KvRevision(11);
+            inputs.authority.commit_index = 111;
+            inputs.floor.revision = KvRevision(11);
+            inputs.floor.applied_index = 111;
+            inputs.scopes[1] = vec![entry.clone()];
+        }
+        runtime.observe_delta(&ClusterKvCommittedDelta {
+            revision: KvRevision(11),
+            compacted_revision: KvRevision::ZERO,
+            events: vec![KvEvent {
+                revision: KvRevision(11),
+                key: entry.key.clone(),
+                kind: KvEventKind::Put {
+                    value: entry.value.clone(),
+                },
+            }]
+            .into(),
+            final_key_states: vec![ClusterKvCommittedKeyState {
+                key: entry.key.clone(),
+                entry: Some(entry),
+            }]
+            .into(),
+        });
+        assert!(runtime.generation() > generation);
+    }));
+    let directory = sinomo_testdir::TestDir::new("retained-client-ready-generation-change");
+    let paths = sinomo_core::network::ClusterPaths::new(&sinomo_core::local::SinomoDataDir::new(
+        directory.path(),
+    ));
+    let view = crate::runtime_host::test_retained_client_configuration_projection(
+        Arc::clone(&runtime),
+        &paths,
+    )
+    .expect(
+        "a complete changed generation must be revalidated within the existing local replan bound",
+    )
+    .unwrap();
+    assert_eq!(view.revision(), KvRevision(11));
+    let entry = &view.entries(DFS_WRITE_CONFIGURATION_PREFIXES[1]).unwrap()[0];
+    let advertisement: crate::DfsNodeAdvertisement = entry.decode().unwrap();
+    assert_eq!(
+        advertisement.zone.as_deref(),
+        Some("updated-during-floor-read")
+    );
+    assert_eq!(
+        host.read_count(),
+        3,
+        "revalidation uses the already-owned complete bundle"
+    );
+    assert_eq!(host.queued_count(), 0);
+    host.inputs.lock().unwrap().floor_unavailable = true;
+    assert!(
+        crate::runtime_host::test_retained_client_configuration_projection(runtime, &paths)
+            .is_err()
+    );
 }

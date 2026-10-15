@@ -2954,8 +2954,6 @@ pub(crate) use browser_host::RuntimeDfsBrowserServiceHost;
 pub(crate) use component_runtime::mount_dfs_runtime_tasks;
 use control_plane::recover_prior_process_default_dfs_placement_authority_from_observation;
 #[cfg(test)]
-pub(crate) use control_plane::test_retained_client_configuration_sync;
-#[cfg(test)]
 use control_plane::*;
 pub(crate) use control_plane::{
     DaemonDfsControlPlaneKvClient, break_glass_recover_dfs_placement_authority_permit,
@@ -2964,6 +2962,10 @@ pub(crate) use control_plane::{
 #[cfg(test)]
 pub(crate) use control_plane::{
     NativePlacementProgressRpcGate, gated_native_placement_control_plane_for_test,
+};
+#[cfg(test)]
+pub(crate) use control_plane::{
+    test_retained_client_configuration_projection, test_retained_client_configuration_sync,
 };
 
 mod data_plane;
