@@ -7,8 +7,8 @@
 
 use super::{
     POSIX_LIST_DIR_COLLECT_PAGE_SIZE, POSIX_NAMESPACE_JOB_MAINTENANCE_PAGE_SIZE,
-    POSIX_RECURSIVE_CLEAR_JOB_BATCH_STEPS, POSIX_RECURSIVE_CLEAR_JOB_PAGE_SIZE, namespace_job_id,
-    now_unix_nanos,
+    POSIX_READ_FRESHNESS_SYNC_TIMEOUT, POSIX_RECURSIVE_CLEAR_JOB_BATCH_STEPS,
+    POSIX_RECURSIVE_CLEAR_JOB_PAGE_SIZE, namespace_job_id, now_unix_nanos,
 };
 use crate::metadata_pages::{try_walk_metadata_pages, walk_metadata_pages};
 use crate::namespace::{
@@ -402,13 +402,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<()> {
         let source_prefix = subtree_prefix(source_path);
         let target_prefix = subtree_prefix(target_path);
+        let recorded_job = self.namespace_job(&job.job_id)?.ok_or_else(|| {
+            DfsPosixError::Dfs(DfsError::Metadata {
+                message: "source directory scan has no original durable namespace job".into(),
+            })
+        })?;
         // Enumeration selects identities, not the original head of a nested
         // authority. Record only the owning shard's selected object below.
         let speculative = self.namespace_execution.begin_independent_planning();
         let page = if let Some(source) = self.routed_namespace_shard_for_path(source_path)? {
             match self.query_metadata_authority_impl(
                 &source,
-                crate::DfsMetadataSelection::DirectoryPage {
+                crate::DfsMetadataSelection::DirectoryPageForNamespaceJob {
+                    job: Box::new(recorded_job.clone()),
                     path: source_path.to_string(),
                     after: cursor.cloned(),
                     limit: POSIX_RECURSIVE_CLEAR_JOB_PAGE_SIZE,
@@ -441,8 +447,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 continue;
             };
             let new_path = format!("{target_prefix}{suffix}");
-            let current = if self.routed_namespace_primary_for_path(&old_path)?.is_some() {
-                self.lookup_sifs_path_direct_distributed_synced(&old_path)?
+            let current = if let Some(source) = self.routed_namespace_shard_for_path(&old_path)? {
+                self.namespace_job_source_object(
+                    &source,
+                    &recorded_job,
+                    &object.object_id,
+                    &old_path,
+                )?
             } else {
                 self.object_by_id(&object.object_id)?
             };
@@ -491,6 +502,46 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             self.schedule_cross_shard_move(job, moved, &old_path)?;
         }
         Ok(())
+    }
+
+    fn namespace_job_source_object(
+        &mut self,
+        source: &crate::DfsMetadataShardConfig,
+        job: &DfsNamespaceJobRecord,
+        object_id: &DfsObjectId,
+        path: &str,
+    ) -> Result<Option<DfsObjectMetadata>> {
+        // Retain the previous source-lookup budget and the enclosing operation
+        // deadline. A rejected source read never becomes a replica fallback.
+        let previous = self.transport.operation_deadline();
+        let requested = std::time::Instant::now() + POSIX_READ_FRESHNESS_SYNC_TIMEOUT;
+        self.transport
+            .set_operation_deadline(Some(previous.map_or(requested, |old| old.min(requested))));
+        let response = self.query_metadata_authority_impl(
+            source,
+            crate::DfsMetadataSelection::CurrentObjectForNamespaceJob {
+                job: Box::new(job.clone()),
+                source_path: path.to_owned(),
+                object_id: object_id.clone(),
+            },
+        );
+        self.transport.set_operation_deadline(previous);
+        let crate::DfsMetadataQueryResult::CurrentObject { object } = response? else {
+            return Err(DfsPosixError::Dfs(DfsError::Metadata {
+                message: "namespace source authority returned another query kind".into(),
+            }));
+        };
+        let object = object.map(|object| *object);
+        if object.as_ref().is_some_and(|object| {
+            object.object_id != *object_id
+                || object.file_system_id != source.file_system_id
+                || object.path != path
+        }) {
+            return Err(DfsPosixError::Dfs(DfsError::Metadata {
+                message: "namespace source authority changed the selected identity or path".into(),
+            }));
+        }
+        Ok(self.record_selected_synced_path(path, object))
     }
 
     fn schedule_cross_shard_move(
@@ -650,10 +701,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             let speculative = self.namespace_execution.begin_independent_planning();
             let candidate = self.object_by_id(&frame_object.object_id)?;
             drop(speculative);
-            if candidate.as_ref().is_none_or(|object| {
+            let needs_source = candidate.as_ref().is_none_or(|object| {
                 object.path == old_path || object.kind == DfsObjectKind::Tombstone
-            }) && self.routed_namespace_primary_for_path(&old_path)?.is_some()
+            });
+            if needs_source
+                && let Some(job) = job
+                && let Some(source) = self.routed_namespace_shard_for_path(&old_path)?
             {
+                let recorded = self.namespace_job(&job.job_id)?.ok_or_else(|| {
+                    DfsPosixError::Dfs(DfsError::Metadata {
+                        message: "source adoption read has no full durable namespace job".into(),
+                    })
+                })?;
+                self.namespace_job_source_object(
+                    &source,
+                    &recorded,
+                    &frame_object.object_id,
+                    &old_path,
+                )?
+            } else if needs_source && self.routed_namespace_primary_for_path(&old_path)?.is_some() {
                 // An ancestor shard may retain the original genesis row of a
                 // nested shard root. Select this phase's input from its actual
                 // source authority before constructing the immutable prepare.

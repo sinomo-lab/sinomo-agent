@@ -2828,6 +2828,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                         )
                                         .map(|()| None)
                                     }
+                                    (None, DfsNamespaceOperation::MetadataQuery { query }) => self
+                                        .serve_metadata_query_for_requester(
+                                            query,
+                                            &requester_node_id,
+                                        )
+                                        .map(DfsPosixCoordinationResult::MetadataQuery)
+                                        .map(Some)
+                                        .map_err(posix_model::DfsPosixError::from),
                                     (None, operation) => {
                                         self.execute_posix_coordination_operation_local(operation)
                                     }

@@ -568,7 +568,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     /// Record only the lookup result used by the caller. A speculative local
     /// fallback does not replace the original predicate of a previous read.
-    fn record_selected_synced_path(
+    pub(super) fn record_selected_synced_path(
         &self,
         path: &str,
         object: Option<DfsObjectMetadata>,

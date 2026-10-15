@@ -1702,6 +1702,14 @@ mod genuine_source_first_tests {
         drop(seed);
         let (coordinator, target) = source_first_coordinator_and_target(&native, &nested, &nodes);
         assert!(nested.primary_node_id < coordinator);
+        // Construct observer clients before pinning the coordinator admission.
+        // Their normal startup/open path is outside the read-only RPC boundary.
+        let mut coordinator_reader = native.client(&coordinator).unwrap();
+        let outsider = nodes
+            .iter()
+            .find(|node| **node != coordinator && **node != nested.primary_node_id)
+            .unwrap();
+        let mut unrelated = native.client(outsider).unwrap();
         let mut requester = native.client(&nodes[0]).unwrap();
         let source_pause = native
             .pause_source_preparation(
@@ -1716,7 +1724,7 @@ mod genuine_source_first_tests {
             )
             .unwrap();
         let operation = sinomo_core::Id::generate().to_string();
-        std::thread::scope(|scope| {
+        let (captured_job, captured_source, read_scope) = std::thread::scope(|scope| {
             let op = operation.clone();
             let foreground = scope.spawn(move || {
                 let result = requester.posix_rename_with_operation_id(from, to, &op);
@@ -1770,6 +1778,30 @@ mod genuine_source_first_tests {
             assert!(
                 matches!(revoked, DfsSourceAdoptionRpcResponse::SourcePreparationRevoked(SourcePreparationRevocation::Revoked(actual)) if actual == held.token)
             );
+            // Pin the ordinary coordinator admission before releasing its
+            // rejected source phase. Read-only peer queries remain available;
+            // a separate maintenance pass cannot finish the job during these
+            // input/authorization observations.
+            let scheduler =
+                crate::runtime_host::daemon_dfs_mutation_scheduler(native.data_dir(&coordinator))
+                    .unwrap();
+            let admission = native.runtime_handle().block_on(async {
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    scheduler.admit(&crate::DfsMessageExecutionScope::GlobalExclusive),
+                )
+                .await
+                .map_err(|_| "native coordinator admission deadline".to_string())?
+                .map_err(|error| error.to_string())
+            });
+            let read_scope = match admission {
+                Ok(scope) => scope,
+                Err(error) => {
+                    bind_pause.release();
+                    let outcome = foreground.join();
+                    panic!("native coordinator scope: {error}; drained={outcome:?}");
+                }
+            };
             bind_pause.release();
             assert!(foreground.join().unwrap().is_err());
             let coordinator_actor = actor_for_root(&native.data_dir(&coordinator).root()).unwrap();
@@ -1779,9 +1811,207 @@ mod genuine_source_first_tests {
                     .is_err(),
                 "known revoked bind must release exact coordinator job writer"
             );
+            (
+                captured.plan.job,
+                captured.plan.expected_source.unwrap(),
+                read_scope,
+            )
         });
         drop(source_pause);
         drop(bind_pause);
+        // Rebuild only restrictive guard DATA from this real replica's
+        // committed Running job, through the production projection helpers.
+        let source_inspector = native.client(&nested.primary_node_id).unwrap();
+        let root_shard = crate::DfsMetadataShardId::new("root");
+        let guards = source_inspector
+            .replica_namespace_guard_projection(&root_shard)
+            .unwrap();
+        assert!(
+            guards
+                .iter()
+                .any(|(id, fs, paths)| id == &captured_job.job_id
+                    && fs == &captured_job.file_system_id
+                    && paths.contains(&captured_job.root_path))
+        );
+        drop(source_inspector);
+        let cache_slot = crate::runtime_host::daemon_dfs_message_service_cache()
+            .root(&native.data_dir(&nested.primary_node_id).root())
+            .unwrap();
+        let registry = cache_slot
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .cross_shard_namespace_locks
+            .clone();
+        registry.replace_shard_jobs(&root_shard, guards);
+        assert!(registry.blocks(&nested.file_system_id, &source_path));
+        eprintln!(
+            "NATIVE_CURRENT_SOURCE_JOB_GUARD job={} registry={registry:?}",
+            captured_job.job_id
+        );
+        let source_read = crate::DfsMetadataSelection::DirectoryPageForNamespaceJob {
+            job: Box::new(captured_job.clone()),
+            path: source_path.clone(),
+            after: None,
+            limit: 64,
+        };
+
+        let public = coordinator_reader.query_metadata_authority_impl(
+            &nested,
+            crate::DfsMetadataSelection::DirectoryPage {
+                path: source_path.clone(),
+                after: None,
+                limit: 64,
+            },
+        );
+        assert!(
+            public
+                .unwrap_err()
+                .to_string()
+                .contains("moving between metadata shards")
+        );
+
+        let denied = unrelated.query_metadata_authority_impl(&nested, source_read.clone());
+        assert!(
+            denied
+                .unwrap_err()
+                .to_string()
+                .contains("authenticated current coordinator")
+        );
+        let mut wrong_job = captured_job.clone();
+        wrong_job.job_id.push_str("-other-job-negative-control");
+        let denied = coordinator_reader.query_metadata_authority_impl(
+            &nested,
+            crate::DfsMetadataSelection::DirectoryPageForNamespaceJob {
+                job: Box::new(wrong_job),
+                path: source_path.clone(),
+                after: None,
+                limit: 64,
+            },
+        );
+        assert!(
+            denied
+                .unwrap_err()
+                .to_string()
+                .contains("moving between metadata shards")
+        );
+        let denied = coordinator_reader.query_metadata_authority_impl(
+            &nested,
+            crate::DfsMetadataSelection::DirectoryPageForNamespaceJob {
+                job: Box::new(captured_job.clone()),
+                path: "/outside-recorded-frame".into(),
+                after: None,
+                limit: 64,
+            },
+        );
+        assert!(
+            denied
+                .unwrap_err()
+                .to_string()
+                .contains("recorded job cursor")
+        );
+        let mut outside_job = captured_job.clone();
+        outside_job
+            .pending_frames
+            .push(crate::DfsNamespaceJobFrame::CrossShardDirScan {
+                source_path: "/outside-recorded-frame".into(),
+                target_path: "/users/outside".into(),
+                cursor: None,
+            });
+        let denied = coordinator_reader.query_metadata_authority_impl(
+            &nested,
+            crate::DfsMetadataSelection::DirectoryPageForNamespaceJob {
+                job: Box::new(outside_job),
+                path: "/outside-recorded-frame".into(),
+                after: None,
+                limit: 64,
+            },
+        );
+        assert!(
+            denied
+                .unwrap_err()
+                .to_string()
+                .contains("valid original Running rename job")
+        );
+        let mut wrong_source_shard = captured_job.clone();
+        wrong_source_shard
+            .pending_frames
+            .push(crate::DfsNamespaceJobFrame::CrossShardDirScan {
+                source_path: captured_job.root_path.clone(),
+                target_path: "/users/source-first".into(),
+                cursor: None,
+            });
+        let denied = coordinator_reader.query_metadata_authority_impl(
+            &nested,
+            crate::DfsMetadataSelection::DirectoryPageForNamespaceJob {
+                job: Box::new(wrong_source_shard),
+                path: captured_job.root_path.clone(),
+                after: None,
+                limit: 64,
+            },
+        );
+        assert!(
+            denied
+                .unwrap_err()
+                .to_string()
+                .contains("current queried shard")
+        );
+        // A separate restrictive guard can never be borrowed as this job's
+        // authority. This negative-only fault is removed by its exact key.
+        registry.upsert_job(
+            Some(root_shard.clone()),
+            "negative-other-job".into(),
+            nested.file_system_id.clone(),
+            source_path.clone(),
+        );
+        let denied = coordinator_reader.query_metadata_authority_impl(&nested, source_read.clone());
+        registry.remove_job("negative-other-job");
+        assert!(
+            denied
+                .unwrap_err()
+                .to_string()
+                .contains("moving between metadata shards")
+        );
+        let page = coordinator_reader
+            .query_metadata_authority_impl(&nested, source_read)
+            .unwrap();
+        let crate::DfsMetadataQueryResult::DirectoryPage { entries, after } = page else {
+            panic!("actual source directory page")
+        };
+        assert!(after.is_none());
+        assert_eq!(
+            entries
+                .iter()
+                .map(|(object, _)| &object.object_id)
+                .collect::<Vec<_>>(),
+            vec![&original.object_id]
+        );
+        let current = coordinator_reader
+            .query_metadata_authority_impl(
+                &nested,
+                crate::DfsMetadataSelection::CurrentObjectForNamespaceJob {
+                    job: Box::new(captured_job.clone()),
+                    source_path: source_path.clone(),
+                    object_id: captured_source.object_id.clone(),
+                },
+            )
+            .unwrap();
+        let crate::DfsMetadataQueryResult::CurrentObject {
+            object: Some(actual),
+        } = current
+        else {
+            panic!("actual physical source")
+        };
+        assert_eq!(
+            *actual, captured_source,
+            "source preparation must retain the exact physical source body"
+        );
+        assert!(
+            registry.blocks(&nested.file_system_id, &source_path),
+            "coordinator reads cannot clear any reservation"
+        );
+        drop((coordinator_reader, unrelated, read_scope));
         let mut reader = native.client(&nodes[0]).unwrap();
         reader
             .posix_mkdir("/source-capture-progress/after")
@@ -1803,6 +2033,7 @@ mod genuine_source_first_tests {
             b"actual source-first bytes"
         );
         drop(reader);
+        drop((registry, cache_slot));
         assert_eq!(native.observation_dropped_count(), 0);
         native.close().unwrap();
     }
