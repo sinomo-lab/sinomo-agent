@@ -9395,3 +9395,109 @@ fn native_started_repair_keeps_cached_and_exported_carrier_attempt_identical() {
         "one actual started carrier must not have two attempt counters or timestamp histories"
     );
 }
+
+#[test]
+fn native_private_repair_reply_checkpoints_its_actual_terminal_against_queue_birth() {
+    let (runtime, owner, replica, mut service, stat, intent_id, background) =
+        native_committed_repair_backlog("native-private-repair-terminal-birth", true);
+    let queue = LocalDfsRepairQueueStore::new(default_dfs_repair_attempt_snapshot_path(
+        runtime.data_dir(&owner),
+    ));
+    let birth = queue
+        .records_for_targets(&intent_id, std::slice::from_ref(&replica))
+        .unwrap()
+        .remove(0);
+    assert_eq!(
+        birth.transfer_delivery_state,
+        Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent)
+    );
+    assert!(birth.transfer_request_id.is_none() && birth.completed_transfer_request_id.is_none());
+    runtime.clear_faults();
+    assert_eq!(service.retry_pending_repairs_bounded(1).unwrap().len(), 1);
+    let original = service
+        .transport
+        .drain_incoming_messages()
+        .unwrap()
+        .into_iter()
+        .find(|message| {
+            matches!(&message.message,
+        DfsNetworkMessage::RepairReplicaResponse(response) if response.intent_id == intent_id)
+        })
+        .expect("the actual native receiver reply");
+    assert_eq!(original.source_node_id, replica);
+    assert_eq!(original.target_node_id, owner);
+    let DfsNetworkMessage::RepairReplicaResponse(response) = original.message else {
+        unreachable!()
+    };
+    assert!(
+        matches!(&response.result, DfsBlobTransferResult::Committed { content_hash } | DfsBlobTransferResult::Durable { content_hash } if Some(content_hash.as_str()) == stat.content_hash.as_deref())
+    );
+    let request_id = response.request_id.clone();
+    let before = queue
+        .records_for_targets(&intent_id, std::slice::from_ref(&replica))
+        .unwrap()
+        .remove(0);
+    assert_eq!(
+        before, birth,
+        "the private producer has not replaced the durable unclaimed birth"
+    );
+    let stale_producer_snapshot = service.durable_repair_queue_records();
+    let event = service
+        .handle_repair_replica_response(replica.clone(), response)
+        .unwrap();
+    let receipts = service
+        .metadata_backend()
+        .unwrap()
+        .receipts_for_version(&stat.object_id, &stat.version)
+        .unwrap();
+    let after = queue
+        .records_for_targets(&intent_id, std::slice::from_ref(&replica))
+        .unwrap();
+    assert_eq!(
+        persist_default_dfs_repair_queue_records(
+            runtime.data_dir(&owner),
+            stale_producer_snapshot.clone()
+        )
+        .unwrap(),
+        0
+    );
+    let after_late_enqueue = queue
+        .records_for_targets(&intent_id, std::slice::from_ref(&replica))
+        .unwrap();
+    drop(service);
+    drop(background);
+    runtime.close().unwrap();
+    assert!(matches!(
+        event,
+        NetworkedDfsServiceEvent::ReplicaRepaired { .. }
+    ));
+    assert!(
+        receipts
+            .iter()
+            .any(|row| row.replica_node_id == replica && row.content_hash == stat.content_hash)
+    );
+    assert_eq!(after.len(), 1);
+    assert_eq!(
+        after[0].completed_transfer_request_id.as_deref(),
+        Some(request_id.as_str()),
+        "the actual accepted private reply must leave durable terminal evidence, not a false unattempted birth"
+    );
+    assert!(!after[0].in_flight && after[0].transfer_request_id.is_none());
+    assert_eq!(
+        after_late_enqueue, after,
+        "a late captured producer enqueue cannot resurrect the completed request"
+    );
+    let actual = stale_producer_snapshot
+        .iter()
+        .find(|row| row.intent_id == intent_id && row.missing_replica_node_id == replica)
+        .unwrap();
+    assert_eq!(after[0].attempts, actual.attempts);
+    assert_eq!(
+        after[0].last_attempt_unix_nanos,
+        actual.last_attempt_unix_nanos
+    );
+    assert_eq!(
+        after[0].transfer_delivery_state,
+        Some(sinomo_core::network::NetworkDeliveryState::PossiblyApplied)
+    );
+}

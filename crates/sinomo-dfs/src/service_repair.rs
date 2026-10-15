@@ -1366,7 +1366,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<(), DfsError> {
         let mut completed_retry_due = None;
         if let Some(store) = self.owned_repair_queue_store()? {
-            let (records, _) = store.observe_transfer_targets(
+            let (records, observation) = store.observe_transfer_targets(
                 &response.intent_id,
                 std::slice::from_ref(&response.replica_node_id),
             )?;
@@ -1393,12 +1393,48 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 {
                     return Err(invalid());
                 }
+                let private_birth = before.transfer_request_id.is_none()
+                    && !before.in_flight
+                    && before.completed_transfer_request_id.is_none()
+                    && before.transfer_delivery_state
+                        == Some(NetworkDeliveryState::DefinitelyNotSent)
+                    && pending
+                        .repair_inflight_request_ids
+                        .get(&response.replica_node_id)
+                        == Some(&response.request_id);
                 match before.transfer_request_id.as_deref() {
-                    Some(current)
-                        if current == response.request_id
-                            && before.completed_transfer_request_id.is_none() =>
+                    current
+                        if before.completed_transfer_request_id.is_none()
+                            && (current == Some(response.request_id.as_str()) || private_birth) =>
                     {
-                        let mut desired = before.clone();
+                        // A private producer can finish while the durable row
+                        // still holds its unclaimed birth. Keep the real named
+                        // producer's history and checkpoint this accepted reply
+                        // before a later producer snapshot can republish it.
+                        let mut desired = if private_birth {
+                            self.repair_attempt_records
+                                .get(&(
+                                    response.intent_id.clone(),
+                                    response.replica_node_id.clone(),
+                                ))
+                                .filter(|actual| {
+                                    actual.intent_id == before.intent_id
+                                        && actual.object_id == before.object_id
+                                        && actual.version == before.version
+                                        && actual.content_hash == before.content_hash
+                                        && actual.missing_replica_node_id
+                                            == before.missing_replica_node_id
+                                        && actual.transfer_kind
+                                            == Some(DfsRepairTransferKind::Repair)
+                                        && actual.transfer_request_id.as_ref()
+                                            == Some(&response.request_id)
+                                        && actual.completed_transfer_request_id.is_none()
+                                })
+                                .cloned()
+                                .ok_or_else(invalid)?
+                        } else {
+                            before.clone()
+                        };
                         desired.in_flight = false;
                         desired.transfer_request_id = None;
                         desired.completed_transfer_request_id = Some(response.request_id.clone());
@@ -1438,7 +1474,27 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             // Existing lost-authority suppression is unchanged.
                             DfsBlobTransferResult::Rejected { .. } => {}
                         }
-                        if !store.checkpoint_transfer_record(before, &desired)? {
+                        let checkpointed = if private_birth {
+                            // The generic transfer checkpoint requires a
+                            // durable named claim. This branch instead owns
+                            // the exact private producer checked above and an
+                            // actual accepted reply. CAS only its observed
+                            // unclaimed birth through the existing page log.
+                            matches!(
+                                store.reconcile_maintenance_page(
+                                    &observation,
+                                    0,
+                                    std::slice::from_ref(before),
+                                    std::slice::from_ref(&desired),
+                                    &[],
+                                    &[],
+                                )?,
+                                crate::repair_queue_store::DfsRepairQueuePageReconcileOutcome::Applied { .. }
+                            )
+                        } else {
+                            store.checkpoint_transfer_record(before, &desired)?
+                        };
+                        if !checkpointed {
                             return Err(DfsError::Metadata {
                                 message:
                                     "repair completion queue changed before its owned checkpoint"
@@ -1448,11 +1504,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         completed_retry_due = Some(desired.next_retry_unix_nanos);
                     }
                     None if !before.in_flight
-                        && (before.completed_transfer_request_id.as_deref()
-                            == Some(response.request_id.as_str())
-                            || (before.completed_transfer_request_id.is_none()
-                                && before.transfer_delivery_state
-                                    == Some(NetworkDeliveryState::DefinitelyNotSent))) =>
+                        && before.completed_transfer_request_id.as_deref()
+                            == Some(response.request_id.as_str()) =>
                     {
                         completed_retry_due = Some(before.next_retry_unix_nanos);
                     }
