@@ -469,6 +469,13 @@ fn native_sifs_bootstrap_keeps_one_complete_current_image_after_restart() {
         );
     }
     let configs = runtime.metadata_shards().unwrap();
+    // Pin a fresh complete cut after the routed write, not the browser handle's
+    // earlier exported snapshot. The whole image comparison remains exact.
+    service
+        .metadata_backend_mut()
+        .unwrap()
+        .begin_consistent_read_snapshot()
+        .unwrap();
     let mut initial = BTreeMap::new();
     for shard in &configs {
         let id = DfsMetadataShardId::new(shard.shard_id.clone());
@@ -482,10 +489,26 @@ fn native_sifs_bootstrap_keeps_one_complete_current_image_after_restart() {
                 .unwrap(),
         );
     }
+    service
+        .metadata_backend_mut()
+        .unwrap()
+        .end_consistent_read_snapshot();
     drop(service);
     runtime.stop_node(&node).unwrap();
     runtime.reopen_node(node.clone()).unwrap();
     let mut service = runtime.client(&node).unwrap();
+    for (id, before) in initial {
+        assert_eq!(
+            service
+                .metadata_backend()
+                .unwrap()
+                .export_shard_table_snapshot(&id)
+                .unwrap()
+                .unwrap(),
+            before,
+            "normal startup does not re-seed retained current data"
+        );
+    }
     assert_eq!(
         service
             .posix_read_file("/services/native-bootstrap-restart.bin")
@@ -499,18 +522,6 @@ fn native_sifs_bootstrap_keeps_one_complete_current_image_after_restart() {
             .object_id,
         file.object_id
     );
-    for (id, before) in initial {
-        assert_eq!(
-            service
-                .metadata_backend()
-                .unwrap()
-                .export_shard_table_snapshot(&id)
-                .unwrap()
-                .unwrap(),
-            before,
-            "normal startup does not re-seed retained current data"
-        );
-    }
     drop(service);
     runtime.close().unwrap();
 }

@@ -1,6 +1,232 @@
 //! Cross shard regression tests.
 
 use super::*;
+
+// Read-only physical DATA inspection; no opener recovery or publication guard.
+fn hardlink_read_set_snapshot(
+    runtime: &crate::test_runtime::DfsTestRuntime,
+    node: &NodeId,
+    shard: &str,
+) -> std::result::Result<DfsMetadataTableSnapshot, MetadataBackendError> {
+    let shard = DfsMetadataShardId::new(shard);
+    let root = crate::local_dfs_metadata_shard_path(runtime.data_dir(node), &shard);
+    Ok(LocalSobjMetadataBackend::open_for_inspection(shard, root)?.export_table_snapshot())
+}
+
+fn recorded_hardlink_alias_frame(
+    snapshot: &DfsMetadataTableSnapshot,
+    request_id: &str,
+) -> DfsNamespaceJobFrame {
+    let frames = snapshot
+        .tables
+        .prepared_operations_v7
+        .iter()
+        .flat_map(|record| record.payload.metadata_effects.iter())
+        .filter_map(|effect| match effect {
+            DfsPreparedMetadataEffect::PutNamespaceJob { job }
+                if job
+                    .origin
+                    .as_ref()
+                    .is_some_and(|origin| origin.request_id == request_id) =>
+            {
+                Some(job)
+            }
+            _ => None,
+        })
+        .flat_map(|job| job.pending_frames.iter())
+        .filter(|frame| {
+            matches!(
+                frame,
+                DfsNamespaceJobFrame::CrossShardHardlinkAliasCommit { .. }
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let first = frames
+        .first()
+        .expect("original durable alias frame remains in its immutable prepares");
+    assert!(
+        frames.iter().all(|frame| frame == first),
+        "every saved occurrence carries the same original comparisons"
+    );
+    first.clone()
+}
+
+#[test]
+fn durable_hardlink_alias_job_fences_parent_changes_and_preserves_original_read_set() {
+    let mut cluster = sifs_two_primary_cluster("native-hardlink-original-parent-conflict");
+    let canonical_path = "/users/original-parent-canonical";
+    let alias_path = "/services/original-parent-alias";
+    cluster
+        .replica
+        .posix_write_file(
+            canonical_path,
+            b"original parent bytes",
+            DfsWriteOptions::replicated_eventual(vec![cluster.replica_node.clone()]),
+        )
+        .unwrap();
+    cluster
+        .replica
+        .posix_hardlink(canonical_path, alias_path)
+        .unwrap();
+    let alias = cluster
+        .replica
+        .posix_namespace_lstat_distributed(alias_path)
+        .unwrap();
+    let parent = hardlink_read_set_snapshot(
+        &cluster._runtime,
+        &cluster.services_primary_node,
+        "services",
+    )
+    .unwrap()
+    .tables
+    .objects
+    .into_iter()
+    .find(|row| row.path == "/services")
+    .unwrap();
+    let original_canonical = cluster
+        .replica
+        .posix_lstat_distributed(canonical_path)
+        .unwrap();
+    let operation_id = sinomo_core::Id::generate().to_string();
+    let pause = cluster
+        ._runtime
+        .pause_remote_namespace_phase(&cluster.services_primary_node)
+        .unwrap();
+    let mut requester = cluster._runtime.client(&cluster.replica_node).unwrap();
+    std::thread::scope(|scope| {
+        let request_id = operation_id.clone();
+        let expected = DfsNamespaceObjectPrecondition {
+            object_id: alias.object_id.clone(),
+            version: alias.version.clone(),
+        };
+        let pending = scope
+            .spawn(move || requester.posix_unlink_if_generation(alias_path, request_id, expected));
+        // Preserve all errors and release the genuine invocation before any assertion.
+        let captured = pause.wait_captured(Duration::from_secs(5));
+        let observation = (|| -> std::result::Result<_, String> {
+            let command = captured.as_ref().map_err(Clone::clone)?.clone();
+            let before = hardlink_read_set_snapshot(
+                &cluster._runtime,
+                &cluster.services_primary_node,
+                "services",
+            )
+            .map_err(|error| error.to_string())?;
+            let mutation = cluster
+                .users_primary
+                .posix_mkdir("/services/independent-parent-change");
+            let after = hardlink_read_set_snapshot(
+                &cluster._runtime,
+                &cluster.services_primary_node,
+                "services",
+            )
+            .map_err(|error| error.to_string())?;
+            Ok((command, before, mutation, after))
+        })();
+        pause.release();
+        let outcome = pending.join().unwrap();
+        let (command, before, mutation, after) = observation.unwrap();
+        let DfsNetworkMessage::NamespaceRequest(command) = command.routed_message.message else {
+            panic!("captured actual namespace target frame");
+        };
+        assert!(matches!(
+            command.operation,
+            DfsNamespaceOperation::InstallHardlinkTargetFence { .. }
+        ));
+        assert!(
+            matches!(&mutation, Err(DfsPosixError::Dfs(DfsError::Busy { path })) if path == "/services"),
+            "the actual parent-touching mutation must be fenced: {mutation:?}"
+        );
+        let recorded = recorded_hardlink_alias_frame(&before, &operation_id);
+        let DfsNamespaceJobFrame::CrossShardHardlinkAliasCommit {
+            expected_object_versions,
+            expected_path_occupants,
+            shard_id,
+            ..
+        } = &recorded
+        else {
+            unreachable!()
+        };
+        assert_eq!(shard_id, &DfsMetadataShardId::new("services"));
+        assert!(
+            expected_object_versions
+                .iter()
+                .any(|row| row.object_id == parent.object_id
+                    && row.expected_version.as_ref() == Some(&parent.version))
+        );
+        assert!(
+            expected_path_occupants
+                .iter()
+                .any(|row| crate::namespace::metadata_path(&row.path)
+                    == crate::namespace::metadata_path("/services")
+                    && row.expected_object_id.as_ref() == Some(&parent.object_id))
+        );
+        let observed_parent = after
+            .tables
+            .objects
+            .iter()
+            .find(|row| row.object_id == parent.object_id)
+            .unwrap();
+        assert_eq!(
+            observed_parent, &parent,
+            "denied sibling creation leaves the complete original parent untouched"
+        );
+        assert_eq!(
+            recorded_hardlink_alias_frame(&after, &operation_id),
+            recorded
+        );
+        assert_eq!(outcome.unwrap().kind, DfsObjectKind::Tombstone);
+        let completed = hardlink_read_set_snapshot(
+            &cluster._runtime,
+            &cluster.services_primary_node,
+            "services",
+        )
+        .unwrap();
+        assert_eq!(
+            recorded_hardlink_alias_frame(&completed, &operation_id),
+            recorded
+        );
+        let current_alias = completed
+            .tables
+            .objects
+            .iter()
+            .find(|row| row.object_id == alias.object_id)
+            .unwrap();
+        assert_eq!(current_alias.kind, DfsObjectKind::Tombstone);
+        assert_ne!(current_alias.version, alias.version);
+        let completed_parent = completed
+            .tables
+            .objects
+            .iter()
+            .find(|row| row.object_id == parent.object_id)
+            .unwrap();
+        assert_ne!(
+            completed_parent.version, parent.version,
+            "only the original successful alias mutation advances its parent"
+        );
+        let canonical =
+            hardlink_read_set_snapshot(&cluster._runtime, &cluster.users_primary_node, "users")
+                .unwrap();
+        let current_canonical = canonical
+            .tables
+            .objects
+            .iter()
+            .find(|row| row.object_id == original_canonical.object_id)
+            .unwrap();
+        assert_ne!(current_canonical.version, original_canonical.version);
+        assert!(current_canonical.changed_at_unix_nanos > original_canonical.changed_at_unix_nanos);
+        assert_eq!(
+            cluster
+                .replica
+                .posix_stat_distributed(canonical_path)
+                .unwrap()
+                .link_count,
+            1
+        );
+    });
+    drop(pause);
+    cluster.close();
+}
 #[test]
 fn returning_adoption_checks_the_physical_eviction_head_before_publication() {
     let node = NodeId::generate();
@@ -26,9 +252,135 @@ fn returning_adoption_checks_the_physical_eviction_head_before_publication() {
         eviction.tombstone_provenance,
         Some(DfsTombstoneProvenance::SourceEviction { .. })
     ));
+    let original_cut = hardlink_read_set_snapshot(&runtime, &node, "services").unwrap();
+    let old_path_occupant = original_cut
+        .tables
+        .objects
+        .iter()
+        .find(|row| row.path == "/services/old-location" && row.object_id != original.object_id)
+        .expect("the first move durably tombstones its original path with a separate identity")
+        .clone();
+    assert_eq!(old_path_occupant.kind, DfsObjectKind::Tombstone);
     let returned = service
         .posix_rename("/users/returning-source", "/services/returned-location")
         .unwrap();
+    let returned_cut = hardlink_read_set_snapshot(&runtime, &node, "services").unwrap();
+    let adoption = returned_cut
+        .tables
+        .prepared_operations_v7
+        .iter()
+        .find(|record| {
+            record.status == DfsPreparedOperationStatus::Committed
+                && record.payload.transaction.objects.iter().any(|row| {
+                    row.object_id == original.object_id
+                        && row.version == returned.version
+                        && row.path == "/services/returned-location"
+                })
+        })
+        .expect("actual committed returning adoption retains its complete original read set");
+    for original_head in [&eviction, &old_path_occupant] {
+        assert!(
+            adoption
+                .payload
+                .expected_object_versions
+                .iter()
+                .any(|expected| {
+                    expected.object_id == original_head.object_id
+                        && expected.expected_version.as_ref() == Some(&original_head.version)
+                })
+        );
+    }
+    assert!(
+        adoption
+            .payload
+            .expected_path_occupants
+            .iter()
+            .any(|expected| {
+                crate::namespace::metadata_path(&expected.path)
+                    == crate::namespace::metadata_path("/services/old-location")
+                    && expected.expected_object_id.as_ref() == Some(&old_path_occupant.object_id)
+            })
+    );
+    assert!(
+        adoption
+            .payload
+            .expected_path_occupants
+            .iter()
+            .any(|expected| {
+                crate::namespace::metadata_path(&expected.path)
+                    == crate::namespace::metadata_path("/services/returned-location")
+                    && expected.expected_object_id.is_none()
+            })
+    );
+    let current_head = returned_cut
+        .tables
+        .objects
+        .iter()
+        .find(|row| row.object_id == original.object_id)
+        .unwrap()
+        .clone();
+    assert_eq!(current_head.version, returned.version);
+    // A native kernel attempt carrying the genuine earlier physical eviction
+    // head must still reject after the ordinary return advanced that head.
+    // Its body is the actual current row; no receipt, source witness or
+    // authority is invented, and the unchanged CAS must reject before append.
+    let config = runtime
+        .metadata_shards()
+        .unwrap()
+        .into_iter()
+        .find(|cfg| cfg.shard_id == "services")
+        .unwrap();
+    let mut owner = runtime.metadata_primary_service("/services").unwrap();
+    let stale_payload = DfsPreparedOperationPayload::for_namespace_transaction(
+        DfsPreparedOperationScope {
+            file_system_id: original.file_system_id.clone(),
+            shard_id: DfsMetadataShardId::new("services"),
+            owner_epoch: config.epoch,
+            operation_id: format!("returning-old-eviction:{}", sinomo_core::Id::generate()),
+        },
+        vec![DfsNamespaceObjectVersionExpectation {
+            object_id: original.object_id.clone(),
+            expected_version: Some(eviction.version.clone()),
+        }],
+        vec![DfsNamespacePathOccupantExpectation {
+            path: current_head.path.clone(),
+            expected_object_id: Some(current_head.object_id.clone()),
+        }],
+        DfsNamespaceTransaction {
+            content_reference_identity: None,
+            contribution_digest: None,
+            extension_expectations: Vec::new(),
+            file_version_pins: None,
+            transaction_id: format!("returning-current-row:{}", sinomo_core::Id::generate()),
+            file_system_id: original.file_system_id.clone(),
+            objects: vec![current_head],
+            versions: Vec::new(),
+            advisory_lock_states: Vec::new(),
+            created_at: OffsetDateTime::now_utc(),
+        },
+        Vec::new(),
+        None,
+        None,
+        Vec::new(),
+        None,
+        None,
+    )
+    .unwrap();
+    let denied = owner
+        .metadata_backend_mut()
+        .unwrap()
+        .prepare_operation(stale_payload, None)
+        .unwrap_err();
+    assert!(
+        matches!(denied, MetadataBackendError::Conflict { object_id, expected, current }
+        if object_id == original.object_id && expected == eviction.version && current == returned.version)
+    );
+    drop(owner);
+    assert_eq!(
+        hardlink_read_set_snapshot(&runtime, &node, "services").unwrap(),
+        returned_cut,
+        "rejected old physical head must not append or change any table/prepare/prefix"
+    );
     assert_eq!(returned.object_id, original.object_id);
     assert_ne!(returned.version, eviction.version);
     assert_eq!(
@@ -37,17 +389,19 @@ fn returning_adoption_checks_the_physical_eviction_head_before_publication() {
             .unwrap(),
         b"returning object"
     );
-    assert!(matches!(
-        service.posix_stat("/services/old-location"),
-        Err(DfsPosixError::NotFound { .. })
-    ));
+    let local_old_path = service.posix_stat("/services/old-location");
+    let current_old_path = service.posix_stat_distributed("/services/old-location");
+    assert!(
+        matches!(&current_old_path, Err(DfsPosixError::NotFound { .. })),
+        "the current owner must reject the evicted path: {current_old_path:?}; local observation: {local_old_path:?}"
+    );
     drop(service);
     runtime.stop_node(&node).unwrap();
     runtime.reopen_node(node.clone()).unwrap();
     let mut reopened = runtime.client(&node).unwrap();
     assert_eq!(
         reopened
-            .posix_stat("/services/returned-location")
+            .posix_stat_distributed("/services/returned-location")
             .unwrap()
             .object_id,
         original.object_id
@@ -1455,17 +1809,14 @@ fn sifs_cluster_metadata_less_bulk_overwrite_follows_revalidated_hardlink_target
         shared_kv,
         services_primary_node,
         users_primary_node,
-        root,
+        root: _,
         _runtime,
+        users_primary,
         services_primary,
         replica_node,
         mut replica,
         ..
     } = cluster;
-    let stop = Arc::new(AtomicBool::new(false));
-    let services_stop = Arc::clone(&stop);
-    let services_thread =
-        std::thread::spawn(move || pump_sifs_service_until_stop(services_primary, services_stop));
     let options = DfsWriteOptions::replicated_eventual(vec![replica_node]);
     replica
         .posix_write_file(target, b"before", options)
@@ -1504,8 +1855,6 @@ fn sifs_cluster_metadata_less_bulk_overwrite_follows_revalidated_hardlink_target
             .expect("read hardlink target"),
         b"through authoritative hardlink"
     );
-    stop.store(true, Ordering::SeqCst);
-    let services_primary = services_thread.join().expect("services primary thread");
     let link_after = services_primary
         .posix_namespace_lstat(link)
         .expect("authoritative hardlink after overwrite");
@@ -1519,7 +1868,10 @@ fn sifs_cluster_metadata_less_bulk_overwrite_follows_revalidated_hardlink_target
             .as_deref(),
         Some(content_hash(b"through authoritative hardlink").as_str())
     );
-    std::fs::remove_dir_all(&root).ok();
+    drop((users_primary, services_primary, replica, shared_kv));
+    _runtime
+        .close()
+        .expect("normal embedded DFS fixture shutdown");
 }
 
 #[test]
@@ -1540,22 +1892,6 @@ fn sifs_cluster_posix_rename_across_shard_primaries_moves_object_transactionally
     let bytes = b"bytes that move between shard primaries".to_vec();
     let moved_bytes = b"rewritten at the new shard authority".to_vec();
 
-    let stop = Arc::new(AtomicBool::new(false));
-    let users_stop = Arc::clone(&stop);
-    let users_thread = std::thread::spawn(move || {
-        let mut users_primary = users_primary;
-        while !users_stop.load(Ordering::SeqCst) {
-            users_primary
-                .process_incoming()
-                .expect("users primary pump");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        users_primary
-    });
-    let services_stop = Arc::clone(&stop);
-    let services_thread =
-        std::thread::spawn(move || pump_sifs_service_until_stop(services_primary, services_stop));
-
     // Create under /users (routed to the users primary).
     replica
         .posix_write_file(
@@ -1565,7 +1901,9 @@ fn sifs_cluster_posix_rename_across_shard_primaries_moves_object_transactionally
         )
         .expect("replica routed create");
     assert_eq!(
-        replica.posix_read_file("/users/move-me.txt").expect("read"),
+        replica
+            .posix_read_file_distributed("/users/move-me.txt")
+            .expect("read"),
         bytes
     );
 
@@ -1587,7 +1925,7 @@ fn sifs_cluster_posix_rename_across_shard_primaries_moves_object_transactionally
     ));
     assert_eq!(
         replica
-            .posix_read_file("/services/moved.txt")
+            .posix_read_file_distributed("/services/moved.txt")
             .expect("read moved"),
         bytes
     );
@@ -1603,14 +1941,11 @@ fn sifs_cluster_posix_rename_across_shard_primaries_moves_object_transactionally
         .expect("write at new shard authority");
     assert_eq!(
         replica
-            .posix_read_file("/services/moved.txt")
+            .posix_read_file_distributed("/services/moved.txt")
             .expect("read rewritten"),
         moved_bytes
     );
 
-    stop.store(true, Ordering::SeqCst);
-    let users_primary = users_thread.join().expect("users thread");
-    let services_primary = services_thread.join().expect("services thread");
     assert!(matches!(
         users_primary.posix_stat("/users/move-me.txt"),
         Err(DfsPosixError::NotFound { .. })
@@ -1689,16 +2024,10 @@ fn sifs_cluster_posix_rename_across_shard_primaries_moves_object_transactionally
         replica,
         rejections,
     } = cluster;
-    let unlink_stop = Arc::new(AtomicBool::new(false));
-    let services_stop = Arc::clone(&unlink_stop);
-    let services_thread =
-        std::thread::spawn(move || pump_sifs_service_until_stop(services_primary, services_stop));
     let unlinked = users_primary
         .posix_unlink("/services/moved.txt")
         .expect("users primary routes unlink to services primary after cross-shard move");
     assert_eq!(unlinked.kind, DfsObjectKind::Tombstone);
-    unlink_stop.store(true, Ordering::SeqCst);
-    let services_primary = services_thread.join().expect("services thread");
     let mut cluster = SifsTwoPrimaryCluster {
         _runtime,
         root,
@@ -1731,7 +2060,7 @@ fn sifs_cluster_cross_shard_rename_replays_caller_owned_operation_id() {
         shared_kv,
         services_primary_node,
         users_primary_node,
-        root,
+        root: _,
         _runtime,
         replica_node,
         users_primary,
@@ -1742,14 +2071,6 @@ fn sifs_cluster_cross_shard_rename_replays_caller_owned_operation_id() {
     let source_path = "/users/stable-replay-source.txt";
     let target_path = "/services/stable-replay-target.txt";
     let operation_id = "dfs_test_cross_shard_stable_rename";
-
-    let stop = Arc::new(AtomicBool::new(false));
-    let users_stop = Arc::clone(&stop);
-    let users_thread =
-        std::thread::spawn(move || pump_sifs_service_until_stop(users_primary, users_stop));
-    let services_stop = Arc::clone(&stop);
-    let services_thread =
-        std::thread::spawn(move || pump_sifs_service_until_stop(services_primary, services_stop));
 
     replica
         .posix_write_file(
@@ -1769,7 +2090,7 @@ fn sifs_cluster_cross_shard_rename_replays_caller_owned_operation_id() {
     assert_eq!(replay.version, first.version);
     assert_eq!(
         replica
-            .posix_read_file(target_path)
+            .posix_read_file_distributed(target_path)
             .expect("target remains readable after exact replay"),
         b"stable cross-shard rename replay"
     );
@@ -1778,9 +2099,7 @@ fn sifs_cluster_cross_shard_rename_replays_caller_owned_operation_id() {
         Err(DfsPosixError::NotFound { .. })
     ));
 
-    stop.store(true, Ordering::SeqCst);
-    users_thread.join().expect("users service thread");
-    services_thread.join().expect("services service thread");
+    drop((users_primary, services_primary, replica, shared_kv));
     _runtime
         .close()
         .expect("normal embedded DFS fixture shutdown");
@@ -1806,11 +2125,11 @@ fn cross_shard_rename_preserves_pin_and_durability(with_durability: bool) {
         shared_kv,
         services_primary_node,
         users_primary_node,
-        root,
+        root: _,
         _runtime,
         replica_node,
         mut users_primary,
-        services_primary,
+        mut services_primary,
         mut replica,
         ..
     } = cluster;
@@ -1818,13 +2137,6 @@ fn cross_shard_rename_preserves_pin_and_durability(with_durability: bool) {
     let target_path = "/services/pinned-moved.txt";
     let bytes = b"pinned metadata version crosses shard primaries".to_vec();
 
-    let create_stop = Arc::new(AtomicBool::new(false));
-    let users_stop = Arc::clone(&create_stop);
-    let users_thread =
-        std::thread::spawn(move || pump_sifs_service_until_stop(users_primary, users_stop));
-    let services_stop = Arc::clone(&create_stop);
-    let services_thread =
-        std::thread::spawn(move || pump_sifs_service_until_stop(services_primary, services_stop));
     replica
         .posix_write_file(
             source_path,
@@ -1832,9 +2144,6 @@ fn cross_shard_rename_preserves_pin_and_durability(with_durability: bool) {
             DfsWriteOptions::replicated_eventual(vec![replica_node.clone()]),
         )
         .expect("create pinned source");
-    create_stop.store(true, Ordering::SeqCst);
-    users_primary = users_thread.join().expect("users create pump");
-    let services_primary = services_thread.join().expect("services create pump");
 
     let source = users_primary
         .posix_stat(source_path)
@@ -1881,19 +2190,9 @@ fn cross_shard_rename_preserves_pin_and_durability(with_durability: bool) {
         })
         .expect("the source capture persisted its genuine pin");
 
-    let rename_stop = Arc::new(AtomicBool::new(false));
-    let users_stop = Arc::clone(&rename_stop);
-    let users_thread =
-        std::thread::spawn(move || pump_sifs_service_until_stop(users_primary, users_stop));
-    let services_stop = Arc::clone(&rename_stop);
-    let services_thread =
-        std::thread::spawn(move || pump_sifs_service_until_stop(services_primary, services_stop));
     replica
         .posix_rename(source_path, target_path)
         .expect("pinned cross-primary rename");
-    rename_stop.store(true, Ordering::SeqCst);
-    let mut users_primary = users_thread.join().expect("users rename pump");
-    let mut services_primary = services_thread.join().expect("services rename pump");
 
     let adopted_target = services_primary
         .posix_stat(target_path)
@@ -1948,13 +2247,6 @@ fn cross_shard_rename_preserves_pin_and_durability(with_durability: bool) {
     );
 
     if with_durability {
-        let stop = Arc::new(AtomicBool::new(false));
-        let users_stop = stop.clone();
-        let users =
-            std::thread::spawn(move || pump_sifs_service_until_stop(users_primary, users_stop));
-        let replica_stop = stop.clone();
-        let replica =
-            std::thread::spawn(move || pump_sifs_service_until_stop(replica, replica_stop));
         let result = services_primary.retain_content_revision(DfsContentReferenceRequest {
             namespace: "org.example.cross-shard".into(),
             path: target_path.into(),
@@ -1969,9 +2261,6 @@ fn cross_shard_rename_preserves_pin_and_durability(with_durability: bool) {
             },
             operation_id: sinomo_core::Id::generate().to_string(),
         });
-        stop.store(true, Ordering::SeqCst);
-        users.join().unwrap();
-        replica.join().unwrap();
         result.unwrap();
         let captured = services_primary
             .metadata_backend()
@@ -1991,6 +2280,7 @@ fn cross_shard_rename_preserves_pin_and_durability(with_durability: bool) {
         );
     }
 
+    drop((users_primary, services_primary, replica, shared_kv));
     _runtime
         .close()
         .expect("normal embedded DFS fixture shutdown");
@@ -2003,30 +2293,14 @@ fn sifs_cluster_posix_rename_across_shard_primaries_rejects_invalid_destinations
         shared_kv,
         services_primary_node,
         users_primary_node,
-        root,
+        root: _,
         _runtime,
         replica_node,
-        users_primary,
+        mut users_primary,
         services_primary,
         mut replica,
         ..
     } = cluster;
-
-    let stop = Arc::new(AtomicBool::new(false));
-    let users_stop = Arc::clone(&stop);
-    let users_thread = std::thread::spawn(move || {
-        let mut users_primary = users_primary;
-        while !users_stop.load(Ordering::SeqCst) {
-            users_primary
-                .process_incoming()
-                .expect("users primary pump");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        users_primary
-    });
-    let services_stop = Arc::clone(&stop);
-    let services_thread =
-        std::thread::spawn(move || pump_sifs_service_until_stop(services_primary, services_stop));
 
     let bytes = b"survives every failed rename".to_vec();
     replica
@@ -2049,10 +2323,11 @@ fn sifs_cluster_posix_rename_across_shard_primaries_rejects_invalid_destinations
         .posix_rename("/users/srcdir", "/services/srcdir")
         .expect("cross-primary directory rename");
     assert_eq!(dir_stat.kind, DfsObjectKind::Directory);
-    assert!(matches!(
-        replica.posix_rename("/services/srcdir", "/services/srcdir/inner"),
-        Err(DfsPosixError::InvalidPath { .. })
-    ));
+    let invalid_subtree = replica.posix_rename("/services/srcdir", "/services/srcdir/inner");
+    assert!(
+        matches!(&invalid_subtree, Err(DfsPosixError::InvalidPath { .. })),
+        "renaming the actual directory into its own subtree must be rejected: {invalid_subtree:?}"
+    );
     // Missing destination parent: validated by the destination primary and
     // round-tripped through two hops.
     assert!(matches!(
@@ -2063,15 +2338,21 @@ fn sifs_cluster_posix_rename_across_shard_primaries_rejects_invalid_destinations
     replica
         .posix_mkdir("/services/destdir")
         .expect("mkdir destdir");
-    assert!(matches!(
-        replica.posix_rename("/users/keep-me.txt", "/services/destdir"),
-        Err(DfsPosixError::IsDirectory { .. })
-    ));
+    let directory_destination = replica.posix_rename("/users/keep-me.txt", "/services/destdir");
+    assert!(
+        matches!(
+            &directory_destination,
+            Err(DfsPosixError::IsDirectory { .. })
+        ),
+        "an existing directory destination must be rejected: {directory_destination:?}"
+    );
 
     // Aborted sagas must release their locks and leave the source intact:
     // the source is still readable and writable.
     assert_eq!(
-        replica.posix_read_file("/users/keep-me.txt").expect("read"),
+        replica
+            .posix_read_file_distributed("/users/keep-me.txt")
+            .expect("read the current source through its owner"),
         bytes
     );
     let updated = b"still writable after aborted moves".to_vec();
@@ -2084,14 +2365,10 @@ fn sifs_cluster_posix_rename_across_shard_primaries_rejects_invalid_destinations
         .expect("source writable after aborts");
     assert_eq!(
         replica
-            .posix_read_file("/users/keep-me.txt")
+            .posix_read_file_distributed("/users/keep-me.txt")
             .expect("read updated"),
         updated
     );
-
-    stop.store(true, Ordering::SeqCst);
-    let mut users_primary = users_thread.join().expect("users thread");
-    services_thread.join().expect("services thread");
 
     // No saga may be left running on the coordinator.
     let report = users_primary
@@ -2102,7 +2379,10 @@ fn sifs_cluster_posix_rename_across_shard_primaries_rejects_invalid_destinations
         "aborted cross-shard renames must not leave running jobs: {report:?}"
     );
 
-    std::fs::remove_dir_all(&root).ok();
+    drop((users_primary, services_primary, replica, shared_kv));
+    _runtime
+        .close()
+        .expect("normal embedded DFS fixture shutdown");
 }
 
 #[test]
@@ -2122,22 +2402,6 @@ fn sifs_cluster_posix_hardlink_across_shard_primaries_links_and_promotes() {
     } = cluster;
     let bytes = b"content shared across shard primaries".to_vec();
 
-    let stop = Arc::new(AtomicBool::new(false));
-    let users_stop = Arc::clone(&stop);
-    let users_thread = std::thread::spawn(move || {
-        let mut users_primary = users_primary;
-        while !users_stop.load(Ordering::SeqCst) {
-            users_primary
-                .process_incoming()
-                .expect("users primary pump");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        users_primary
-    });
-    let services_stop = Arc::clone(&stop);
-    let services_thread =
-        std::thread::spawn(move || pump_sifs_service_until_stop(services_primary, services_stop));
-
     replica
         .posix_write_file(
             "/users/canonical.txt",
@@ -2155,13 +2419,13 @@ fn sifs_cluster_posix_hardlink_across_shard_primaries_links_and_promotes() {
     assert_eq!(link_stat.link_count, 2);
     assert_eq!(
         replica
-            .posix_read_file("/services/alias")
+            .posix_read_file_distributed("/services/alias")
             .expect("read through alias"),
         bytes
     );
     assert_eq!(
         replica
-            .posix_stat("/users/canonical.txt")
+            .posix_stat_distributed("/users/canonical.txt")
             .expect("canonical stat")
             .link_count,
         2
@@ -2172,7 +2436,7 @@ fn sifs_cluster_posix_hardlink_across_shard_primaries_links_and_promotes() {
     // canonical ctime transition on that authority before tombstoning the
     // alias generation locally.
     let canonical_before_alias_unlink = replica
-        .posix_stat("/users/canonical.txt")
+        .posix_stat_distributed("/users/canonical.txt")
         .expect("canonical before alias unlink");
     let alias_unlinked = replica
         .posix_unlink("/services/alias")
@@ -2196,11 +2460,68 @@ fn sifs_cluster_posix_hardlink_across_shard_primaries_links_and_promotes() {
         .posix_hardlink("/users/canonical.txt", "/services/alias-for-rename")
         .expect("recreate cross-primary alias");
     let canonical_before_alias_rename = replica
-        .posix_stat("/users/canonical.txt")
+        .posix_stat_distributed("/users/canonical.txt")
         .expect("canonical before alias rename");
+    let physical_alias_scope =
+        hardlink_read_set_snapshot(&_runtime, &services_primary_node, "services").unwrap();
+    assert!(
+        physical_alias_scope
+            .tables
+            .objects
+            .iter()
+            .any(|object| object.path == "/services/alias-for-rename"
+                && object.kind == DfsObjectKind::Hardlink)
+    );
+    assert!(
+        !physical_alias_scope
+            .tables
+            .objects
+            .iter()
+            .any(|object| object.object_id == canonical_before_alias_rename.object_id),
+        "the alias-only physical writer must not contain a fabricated canonical inode"
+    );
+    let rename_entry = Arc::new(Mutex::new(Vec::new()));
+    let observed_rename = Arc::clone(&rename_entry);
+    let rename_hook = crate::runtime_host::install_daemon_dfs_pre_dispatch_test_hook(
+        _runtime.data_dir(&services_primary_node),
+        Arc::new(move |point, command, _| {
+            if let crate::runtime_host::DaemonDfsPreDispatchTestPoint::BeforeExecute {
+                admission_held,
+            } = point
+                && let Some(command) = command
+                && matches!(&command.routed_message.message,
+                    DfsNetworkMessage::NamespaceRequest(request)
+                        if matches!(&request.operation, DfsNamespaceOperation::Rename { from, to }
+                            if from == "/services/alias-for-rename" && to == "/services/renamed-alias"))
+            {
+                observed_rename
+                    .lock()
+                    .unwrap()
+                    .push((admission_held, command.clone()));
+            }
+            Ok(())
+        }),
+    );
     let renamed_alias = replica
         .posix_rename("/services/alias-for-rename", "/services/renamed-alias")
         .expect("rename alias through alias primary");
+    drop(rename_hook);
+    let rename_entries = rename_entry.lock().unwrap();
+    assert!(
+        !rename_entries.is_empty(),
+        "actual owning Main must execute the rename"
+    );
+    for (admission_held, command) in rename_entries.iter() {
+        assert!(*admission_held);
+        assert_eq!(command.routed_message.source_node_id, replica_node);
+        assert_eq!(command.routed_message.target_node_id, services_primary_node);
+        assert_eq!(
+            crate::dfs_message_execution_scope(command),
+            crate::DfsMessageExecutionScope::GlobalExclusive,
+            "the received alias path stamps do not cover its foreign canonical inode"
+        );
+    }
+    drop(rename_entries);
     assert_eq!(renamed_alias.object_id, recreated_alias.object_id);
     assert_eq!(renamed_alias.link_count, 2);
     let canonical_after_alias_rename = replica
@@ -2224,13 +2545,9 @@ fn sifs_cluster_posix_hardlink_across_shard_primaries_links_and_promotes() {
         .expect("unlink canonical with foreign alias");
     assert_eq!(unlinked.kind, DfsObjectKind::Tombstone);
     assert!(matches!(
-        replica.posix_stat("/users/canonical.txt"),
+        replica.posix_stat_distributed("/users/canonical.txt"),
         Err(DfsPosixError::NotFound { .. })
     ));
-
-    stop.store(true, Ordering::SeqCst);
-    let users_primary = users_thread.join().expect("users thread");
-    let services_primary = services_thread.join().expect("services thread");
 
     // Convergence: the alias becomes the canonical record everywhere with
     // the content intact and a link count of one.
@@ -2250,14 +2567,16 @@ fn sifs_cluster_posix_hardlink_across_shard_primaries_links_and_promotes() {
     sifs_two_primary_publish_until(&mut cluster, "post-promotion convergence", |cluster| {
         let replica_alias = cluster
             .replica
-            .posix_stat("/services/renamed-alias")
+            .posix_stat_distributed("/services/renamed-alias")
             .is_ok_and(|stat| {
                 stat.content_hash.as_deref() == Some(expected_hash.as_str())
                     && stat.kind == DfsObjectKind::File
                     && stat.link_count == 1
             });
         let canonical_gone = matches!(
-            cluster.replica.posix_stat("/users/canonical.txt"),
+            cluster
+                .replica
+                .posix_stat_distributed("/users/canonical.txt"),
             Err(DfsPosixError::NotFound { .. })
         );
         replica_alias && canonical_gone
@@ -2265,7 +2584,7 @@ fn sifs_cluster_posix_hardlink_across_shard_primaries_links_and_promotes() {
     assert_eq!(
         cluster
             .replica
-            .posix_read_file("/services/renamed-alias")
+            .posix_read_file_distributed("/services/renamed-alias")
             .expect("read promoted alias"),
         bytes
     );
@@ -2307,6 +2626,17 @@ fn cross_primary_hardlink_alias_unlink_fences_the_crash_gap_and_recovers_exactly
         .users_primary
         .posix_lstat_distributed(canonical_path)
         .unwrap();
+    let original_parent = hardlink_read_set_snapshot(
+        &cluster._runtime,
+        &cluster.services_primary_node,
+        "services",
+    )
+    .unwrap()
+    .tables
+    .objects
+    .into_iter()
+    .find(|row| row.path == "/services")
+    .unwrap();
     let operation_id = sinomo_core::Id::generate().to_string();
     let operation = DfsNamespaceOperation::ConditionalUnlink {
         path: alias_path.into(),
@@ -2332,30 +2662,42 @@ fn cross_primary_hardlink_alias_unlink_fences_the_crash_gap_and_recovers_exactly
         });
         let observed = observed_rx.recv_timeout(Duration::from_secs(5));
         // Always release the actual native request before propagating a failed assertion.
-        let state = observed.as_ref().ok().map(|_| {
-            let alias = cluster
-                .services_primary
-                .metadata_backend()
-                .unwrap()
-                .get_object_by_path(&sifs_file_system_id(), alias_path)
-                .unwrap()
-                .unwrap();
-            let canonical = cluster
-                .users_primary
-                .metadata_backend()
-                .unwrap()
-                .get_object_by_path(&sifs_file_system_id(), canonical_path)
-                .unwrap()
-                .unwrap();
-            let request = cluster
-                .services_primary
-                .metadata_backend()
-                .unwrap()
-                .get_namespace_request(&cluster.replica_node, &operation_id)
-                .unwrap()
-                .unwrap();
-            (alias, canonical, request)
-        });
+        let state = (|| -> std::result::Result<_, String> {
+            observed.as_ref().map_err(|error| error.to_string())?;
+            let alias_cut = hardlink_read_set_snapshot(
+                &cluster._runtime,
+                &cluster.services_primary_node,
+                "services",
+            )
+            .map_err(|error| error.to_string())?;
+            let canonical_cut =
+                hardlink_read_set_snapshot(&cluster._runtime, &cluster.users_primary_node, "users")
+                    .map_err(|error| error.to_string())?;
+            let alias = alias_cut
+                .tables
+                .objects
+                .iter()
+                .find(|row| row.path == alias_path)
+                .ok_or("actual alias physical row missing")?
+                .clone();
+            let canonical = canonical_cut
+                .tables
+                .objects
+                .iter()
+                .find(|row| row.path == canonical_path)
+                .ok_or("actual canonical physical row missing")?
+                .clone();
+            let request = alias_cut
+                .tables
+                .namespace_requests
+                .iter()
+                .find(|row| {
+                    row.requester_node_id == cluster.replica_node && row.request_id == operation_id
+                })
+                .ok_or("actual outer Pending receipt missing")?
+                .clone();
+            Ok((alias, canonical, request))
+        })();
         release_tx.send(()).ok();
         let outcome = pending.join().unwrap();
         observed.expect("real guarded alias commit reached");
@@ -2369,6 +2711,53 @@ fn cross_primary_hardlink_alias_unlink_fences_the_crash_gap_and_recovers_exactly
         );
     });
     drop(hook);
+    let source_before_cold = hardlink_read_set_snapshot(
+        &cluster._runtime,
+        &cluster.services_primary_node,
+        "services",
+    )
+    .unwrap();
+    let original_frame = recorded_hardlink_alias_frame(&source_before_cold, &operation_id);
+    let DfsNamespaceJobFrame::CrossShardHardlinkAliasCommit {
+        transaction,
+        shard_id,
+        expected_object_versions,
+        expected_path_occupants,
+    } = &original_frame
+    else {
+        unreachable!()
+    };
+    assert_eq!(shard_id, &DfsMetadataShardId::new("services"));
+    assert!(
+        expected_object_versions
+            .iter()
+            .any(|row| row.object_id == original_parent.object_id
+                && row.expected_version.as_ref() == Some(&original_parent.version))
+    );
+    let prepared_operation_id = crate::metadata_records::compound_prepared_operation_id(
+        &operation_id,
+        &transaction.transaction_id,
+    );
+    let original_prepare = source_before_cold
+        .tables
+        .prepared_operations_v7
+        .iter()
+        .find(|record| record.payload.operation_id == prepared_operation_id)
+        .unwrap()
+        .clone();
+    original_prepare.validate().unwrap();
+    assert_eq!(
+        original_prepare.status,
+        DfsPreparedOperationStatus::Committed
+    );
+    assert_eq!(
+        &original_prepare.payload.expected_object_versions,
+        expected_object_versions
+    );
+    assert_eq!(
+        &original_prepare.payload.expected_path_occupants,
+        expected_path_occupants
+    );
     // Restart both actual authorities, retaining their volumes and native frames.
     let users = cluster.users_primary_node.clone();
     let services = cluster.services_primary_node.clone();
@@ -2380,6 +2769,21 @@ fn cross_primary_hardlink_alias_unlink_fences_the_crash_gap_and_recovers_exactly
     cluster._runtime.reopen_node(services.clone()).unwrap();
     cluster.users_primary = cluster._runtime.client(&users).unwrap();
     cluster.services_primary = cluster._runtime.client(&services).unwrap();
+    let restored_cut =
+        hardlink_read_set_snapshot(&cluster._runtime, &services, "services").unwrap();
+    assert_eq!(
+        recorded_hardlink_alias_frame(&restored_cut, &operation_id),
+        original_frame
+    );
+    assert_eq!(
+        restored_cut
+            .tables
+            .prepared_operations_v7
+            .iter()
+            .find(|record| record.payload.operation_id == prepared_operation_id)
+            .unwrap(),
+        &original_prepare
+    );
     let replay = cluster
         .replica
         .posix_unlink_if_generation(alias_path, operation_id.clone(), expected.clone())
@@ -2392,6 +2796,21 @@ fn cross_primary_hardlink_alias_unlink_fences_the_crash_gap_and_recovers_exactly
             .unwrap(),
         DfsStableNamespaceOperationReconciliation::Applied { .. }
     ));
+    let completed_cut =
+        hardlink_read_set_snapshot(&cluster._runtime, &services, "services").unwrap();
+    assert_eq!(
+        recorded_hardlink_alias_frame(&completed_cut, &operation_id),
+        original_frame
+    );
+    assert_eq!(
+        completed_cut
+            .tables
+            .prepared_operations_v7
+            .iter()
+            .find(|record| record.payload.operation_id == prepared_operation_id)
+            .unwrap(),
+        &original_prepare
+    );
     let mut changed = expected;
     changed.version = DfsVersion::generate();
     assert!(matches!(
@@ -2400,15 +2819,21 @@ fn cross_primary_hardlink_alias_unlink_fences_the_crash_gap_and_recovers_exactly
             .posix_unlink_if_generation(alias_path, operation_id, changed),
         Err(DfsPosixError::Conflict { .. })
     ));
-    let canonical = cluster.users_primary.posix_stat(canonical_path).unwrap();
+    let canonical = cluster
+        .users_primary
+        .posix_stat_distributed(canonical_path)
+        .unwrap();
     assert_eq!(canonical.link_count, 1);
     assert_ne!(canonical.version, before.version);
     assert_eq!(
-        cluster.replica.posix_read_file(canonical_path).unwrap(),
+        cluster
+            .replica
+            .posix_read_file_distributed(canonical_path)
+            .unwrap(),
         b"fenced hardlink payload"
     );
     assert!(matches!(
-        cluster.replica.posix_stat(alias_path),
+        cluster.replica.posix_stat_distributed(alias_path),
         Err(DfsPosixError::NotFound { .. })
     ));
     cluster.close();
@@ -2451,7 +2876,7 @@ fn sifs_cluster_posix_directory_rename_across_shard_primaries_moves_subtree() {
         root,
         _runtime,
         replica_node,
-        users_primary,
+        mut users_primary,
         services_primary,
         mut replica,
         ..
@@ -2459,22 +2884,6 @@ fn sifs_cluster_posix_directory_rename_across_shard_primaries_moves_subtree() {
     let bytes_a = b"alpha child crossing shard authorities".to_vec();
     let bytes_b = b"nested child content".to_vec();
     let bytes_a2 = b"rewritten under the new shard authority".to_vec();
-
-    let stop = Arc::new(AtomicBool::new(false));
-    let users_stop = Arc::clone(&stop);
-    let users_thread = std::thread::spawn(move || {
-        let mut users_primary = users_primary;
-        while !users_stop.load(Ordering::SeqCst) {
-            users_primary
-                .process_incoming()
-                .expect("users primary pump");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        users_primary
-    });
-    let services_stop = Arc::clone(&stop);
-    let services_thread =
-        std::thread::spawn(move || pump_sifs_service_until_stop(services_primary, services_stop));
 
     // Build a small subtree under /users from the replica.
     replica.posix_mkdir("/users/proj").expect("mkdir proj");
@@ -2511,13 +2920,13 @@ fn sifs_cluster_posix_directory_rename_across_shard_primaries_moves_subtree() {
     ));
     assert_eq!(
         replica
-            .posix_read_file("/services/proj/a.txt")
+            .posix_read_file_distributed("/services/proj/a.txt")
             .expect("read a"),
         bytes_a
     );
     assert_eq!(
         replica
-            .posix_read_file("/services/proj/sub/b.txt")
+            .posix_read_file_distributed("/services/proj/sub/b.txt")
             .expect("read b"),
         bytes_b
     );
@@ -2540,14 +2949,10 @@ fn sifs_cluster_posix_directory_rename_across_shard_primaries_moves_subtree() {
         .expect("write at new authority");
     assert_eq!(
         replica
-            .posix_read_file("/services/proj/a.txt")
+            .posix_read_file_distributed("/services/proj/a.txt")
             .expect("read rewritten"),
         bytes_a2
     );
-
-    stop.store(true, Ordering::SeqCst);
-    let mut users_primary = users_thread.join().expect("users thread");
-    let services_primary = services_thread.join().expect("services thread");
 
     // No saga may be left running on the coordinator.
     let report = users_primary
@@ -2752,7 +3157,7 @@ fn sifs_cluster_posix_cross_shard_move_fences_open_write_intents() {
     }
     cluster.users_primary.posix_rename(from, to).unwrap();
     assert_eq!(
-        cluster.replica.posix_read_file(to).unwrap(),
+        cluster.replica.posix_read_file_distributed(to).unwrap(),
         b"pending actual W2 replacement"
     );
     cluster._runtime.assert_fault_budgets().unwrap();
@@ -2764,6 +3169,12 @@ fn sifs_cluster_posix_cross_shard_move_allows_committed_pending_repair() {
     let mut cluster = sifs_two_primary_cluster("native-move-with-real-repair");
     let from = "/users/repair-pending";
     let to = "/services/repair-pending";
+    // The repair queue belongs to the actual effect producer, not the routed
+    // Main requester shell held by the common fixture.
+    cluster.users_primary = cluster
+        ._runtime
+        .metadata_primary_service(from)
+        .expect("actual users Core repair producer");
     cluster
         ._runtime
         .install_fault(crate::test_runtime::FaultRule {
@@ -2799,12 +3210,12 @@ fn sifs_cluster_posix_cross_shard_move_allows_committed_pending_repair() {
             .iter()
             .any(|job| job.object_id == source.object_id)
     );
-    let moved = cluster.users_primary.posix_rename(from, to).unwrap();
+    let moved = cluster.replica.posix_rename(from, to).unwrap();
     assert_eq!(moved.object_id, source.object_id);
     assert_eq!(moved.content_hash, source.content_hash);
     cluster._runtime.clear_faults();
     assert_eq!(
-        cluster.replica.posix_read_file(to).unwrap(),
+        cluster.replica.posix_read_file_distributed(to).unwrap(),
         b"committed repair-pending bytes"
     );
     assert!(matches!(
@@ -2877,14 +3288,13 @@ fn sifs_cluster_posix_rejects_adoption_from_non_source_primary() {
         pause.release();
         let completed = original.join().unwrap();
         captured.expect("original native job/source offer captured");
-        let response: DfsMessageResponse = outcome
+        let rejected = outcome
             .unwrap()
-            .expect("actual rogue-signer route reply")
-            .decode_body()
-            .unwrap();
-        assert!(response.outbound_messages.iter().any(|message| matches!(&message.message,
-            DfsNetworkMessage::NamespaceResponse(response) if matches!(&response.result,
-                DfsNamespaceResult::Rejected { reason, .. } if reason.contains("primary of source shard")))));
+            .expect_err("the actual source offer rejects a different authenticated coordinator");
+        assert_eq!(
+            rejected,
+            "network I/O error during shared DFS native service dispatch: invalid DFS runtime operation: metadata backend error: source adoption requester is not its original coordinator"
+        );
         assert_eq!(
             unchanged, before,
             "rejected signer cannot consume the real source/job offer or publish a destination"
@@ -2892,7 +3302,7 @@ fn sifs_cluster_posix_rejects_adoption_from_non_source_primary() {
         assert_eq!(completed.unwrap().object_id, source.object_id);
     });
     assert_eq!(
-        cluster.replica.posix_read_file(to).unwrap(),
+        cluster.replica.posix_read_file_distributed(to).unwrap(),
         b"actual source bytes"
     );
     assert_eq!(cluster._runtime.observation_dropped_count(), 0);
@@ -2916,6 +3326,10 @@ fn native_namespace_job_resume_honors_step_budget() {
             )
             .unwrap();
     }
+    drop(service);
+    let mut service = runtime
+        .metadata_primary_service(from)
+        .expect("actual services Core bounded namespace producer");
     let mut job = service.posix_rename_directory_bounded(from, to, 1).unwrap();
     assert_eq!(job.status, DfsNamespaceJobStatus::Running);
     let mut rounds = 1;
@@ -3142,7 +3556,7 @@ fn native_cross_shard_move_recovers_from_real_carrier_failure(
     if explicit_resume {
         let terminal = cluster
             .users_primary
-            .posix_resume_namespace_job_bounded(&parked.job_id, 512)
+            .posix_resume_namespace_job_bounded_routed(&parked.job_id, from, 512)
             .unwrap();
         assert_eq!(terminal.status, DfsNamespaceJobStatus::Completed);
     }
@@ -3179,4 +3593,341 @@ fn native_cross_shard_move_recovers_from_real_carrier_failure(
     cluster._runtime.assert_fault_budgets().unwrap();
     assert_eq!(cluster._runtime.observation_dropped_count(), 0);
     cluster.close();
+}
+
+#[test]
+fn same_node_distinct_shard_hardlink_alias_uses_durable_saga_and_survives_cold_replay() {
+    let node = NodeId::generate();
+    let (mut runtime, mut service) =
+        native_sifs_service("native-same-node-alias-original-readset", node.clone());
+    let canonical_path = "/users/local-physical-canonical";
+    let alias_path = "/services/local-physical-alias";
+    let renamed_path = "/services/local-physical-renamed";
+    let configs = runtime.metadata_shards().unwrap();
+    let source = crate::select_metadata_shard_config_for_path(
+        &sifs_file_system_id(),
+        &configs,
+        canonical_path,
+    )
+    .unwrap()
+    .unwrap();
+    let destination =
+        crate::select_metadata_shard_config_for_path(&sifs_file_system_id(), &configs, alias_path)
+            .unwrap()
+            .unwrap();
+    assert_ne!(source.shard_id, destination.shard_id);
+    assert_eq!(source.primary_node_id, node);
+    assert_eq!(destination.primary_node_id, node);
+    let canonical = service
+        .posix_write_file(
+            canonical_path,
+            b"co-located distinct writer bytes",
+            DfsWriteOptions::replicated_eventual(vec![node.clone()]),
+        )
+        .unwrap();
+    let cursor = runtime
+        .rpc_observations()
+        .iter()
+        .map(|event| event.call_id)
+        .max()
+        .unwrap_or(0);
+    let actual_namespace_heads = runtime.capture_namespace_requests(&node, 32).unwrap();
+    service.posix_hardlink(canonical_path, alias_path).unwrap();
+    assert_eq!(
+        service
+            .posix_stat_distributed(canonical_path)
+            .unwrap()
+            .link_count,
+        2
+    );
+    let alias = service
+        .posix_namespace_lstat_distributed(alias_path)
+        .unwrap();
+    assert_eq!(alias.kind, DfsObjectKind::Hardlink);
+    let alias_only = hardlink_read_set_snapshot(&runtime, &node, "services").unwrap();
+    assert!(
+        alias_only
+            .tables
+            .objects
+            .iter()
+            .any(|object| object.path == alias_path && object.kind == DfsObjectKind::Hardlink)
+    );
+    assert!(
+        !alias_only
+            .tables
+            .objects
+            .iter()
+            .any(|object| object.path == canonical_path),
+        "co-located primaries retain separate physical writers"
+    );
+    let renamed = service.posix_rename(alias_path, renamed_path).unwrap();
+    assert_eq!(renamed.object_id, canonical.object_id);
+    let renamed_alias = service
+        .posix_namespace_lstat_distributed(renamed_path)
+        .unwrap();
+    assert_eq!(renamed_alias.object_id, alias.object_id);
+    assert_ne!(renamed_alias.version, alias.version);
+    let operation_id = sinomo_core::Id::generate().to_string();
+    let expected = DfsNamespaceObjectPrecondition {
+        object_id: renamed_alias.object_id.clone(),
+        version: renamed_alias.version.clone(),
+    };
+    let deleted = service
+        .posix_unlink_if_generation(renamed_path, operation_id.clone(), expected.clone())
+        .unwrap();
+    assert_eq!(deleted.kind, DfsObjectKind::Tombstone);
+    assert_eq!(
+        service
+            .posix_stat_distributed(canonical_path)
+            .unwrap()
+            .link_count,
+        1
+    );
+    let source_cut = hardlink_read_set_snapshot(&runtime, &node, "services").unwrap();
+    let original_frame = recorded_hardlink_alias_frame(&source_cut, &operation_id);
+    let DfsNamespaceJobFrame::CrossShardHardlinkAliasCommit {
+        transaction,
+        shard_id,
+        ..
+    } = &original_frame
+    else {
+        unreachable!()
+    };
+    assert_eq!(shard_id, &DfsMetadataShardId::new(destination.shard_id));
+    let prepared_id = crate::metadata_records::compound_prepared_operation_id(
+        &operation_id,
+        &transaction.transaction_id,
+    );
+    let original = source_cut
+        .tables
+        .prepared_operations_v7
+        .iter()
+        .find(|record| record.payload.operation_id == prepared_id)
+        .unwrap()
+        .clone();
+    original.validate().unwrap();
+    assert_eq!(original.status, DfsPreparedOperationStatus::Committed);
+    let heads = actual_namespace_heads.records();
+    drop(actual_namespace_heads);
+    let observations = runtime.rpc_observations();
+    let window = observations
+        .iter()
+        .filter(|event| event.call_id > cursor)
+        .collect::<Vec<_>>();
+    // Preserve actual calls and native command bodies BEFORE classification.
+    // RegisteredHost includes ordinary same-node caller delivery to local Main;
+    // source==target alone does not identify a saga mutation or a peer socket.
+    let evidence = serde_json::json!({
+        "cursor": cursor,
+        "node": node,
+        "omitted_rpc_observations": runtime.observation_dropped_count(),
+        "native_namespace_heads": heads,
+        "calls": window.iter().map(|event| serde_json::json!({
+            "call_id": event.call_id, "source": event.source, "target": event.target,
+            "route": event.route, "origin": format!("{:?}", event.origin),
+            "phase": format!("{:?}", event.phase), "frame_id": event.dfs_frame_id,
+            "request_id": event.dfs_request_id, "file_system_id": event.dfs_file_system_id,
+            "streamed_value": event.streamed_value, "body_bytes": event.body_bytes,
+            "options": format!("{:?}", event.options),
+            "observe_connectivity": event.observe_connectivity,
+        })).collect::<Vec<_>>(),
+    });
+    let evidence_path = runtime
+        .data_dir(&node)
+        .root()
+        .join("same-node-alias-call-boundaries.json");
+    let mut evidence_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&evidence_path)
+        .unwrap();
+    std::io::Write::write_all(
+        &mut evidence_file,
+        &serde_json::to_vec_pretty(&evidence).unwrap(),
+    )
+    .unwrap();
+    evidence_file.sync_all().unwrap();
+    drop(evidence_file);
+    eprintln!(
+        "actual same-node alias call boundaries: {}",
+        evidence_path.display()
+    );
+    let self_calls = window
+        .iter()
+        .copied()
+        .filter(|event| {
+            event.origin == crate::test_runtime::RpcOrigin::RegisteredHost
+                && event.route == DFS_DATA_NAMESPACE_ROUTE
+                && event.phase == crate::test_runtime::RpcPhase::Constructed
+                && event.source == event.target
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !self_calls.is_empty(),
+        "normal caller/read delivery reaches the actual local Main"
+    );
+    let mut caller_hardlink = false;
+    let mut caller_rename = false;
+    let mut caller_unlink = false;
+    let mut owner_read = false;
+    for event in &self_calls {
+        assert_eq!(event.source, node);
+        let decoded = window
+            .iter()
+            .filter(|phase| {
+                phase.call_id == event.call_id
+                    && phase.phase == crate::test_runtime::RpcPhase::Decoded
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        let decoded_head = decoded
+            .first()
+            .expect("same carrier invocation has an actual decoded native namespace head");
+        assert!(
+            decoded
+                .iter()
+                .all(|head| head.dfs_frame_id == decoded_head.dfs_frame_id
+                    && head.dfs_request_id == decoded_head.dfs_request_id
+                    && head.dfs_file_system_id == decoded_head.dfs_file_system_id),
+            "one actual call changes its decoded identity"
+        );
+        let request_id = decoded_head
+            .dfs_request_id
+            .as_ref()
+            .expect("actual decoded namespace request id");
+        let frame_id = decoded_head
+            .dfs_frame_id
+            .expect("actual decoded namespace frame id");
+        let fs = decoded_head
+            .dfs_file_system_id
+            .as_ref()
+            .expect("actual decoded namespace filesystem");
+        let matched = heads
+            .iter()
+            .filter(|head| {
+                head.source_node_id == event.source
+                    && head.target_node_id == event.target
+                    && head.frame_id == frame_id
+                    && matches!(&head.message, DfsNetworkMessage::NamespaceRequest(request)
+                    if &request.request_id == request_id && &request.file_system_id == fs)
+            })
+            .collect::<Vec<_>>();
+        let first = matched
+            .first()
+            .expect("same actual call has a native BeforeExecute head");
+        assert!(
+            matched.iter().all(|head| *head == *first),
+            "one incoming identity changes its full native command"
+        );
+        let DfsNetworkMessage::NamespaceRequest(request) = &first.message else {
+            unreachable!()
+        };
+        assert_eq!(request.requesting_node_id, node);
+        assert!(window.iter().any(|phase| phase.call_id == event.call_id
+            && phase.phase == crate::test_runtime::RpcPhase::BeforeDispatch));
+        assert!(window.iter().any(|phase| phase.call_id == event.call_id
+            && phase.phase == crate::test_runtime::RpcPhase::Completed));
+        match &request.operation {
+            DfsNamespaceOperation::LookupPath { .. }
+            | DfsNamespaceOperation::LookupPaths { .. }
+            | DfsNamespaceOperation::PollNamespaceChanges { .. } => owner_read = true,
+            DfsNamespaceOperation::Hardlink {
+                existing_path,
+                link_path,
+            } if existing_path == canonical_path && link_path == alias_path => {
+                caller_hardlink = true
+            }
+            DfsNamespaceOperation::Rename { from, to }
+                if from == alias_path && to == renamed_path =>
+            {
+                caller_rename = true
+            }
+            DfsNamespaceOperation::ConditionalUnlink {
+                path,
+                expected: actual,
+            } if path == renamed_path
+                && actual == &expected
+                && request.request_id == operation_id =>
+            {
+                caller_unlink = true
+            }
+            operation => panic!(
+                "unexpected self carrier mutation phase: call {} {:?}",
+                event.call_id, operation
+            ),
+        }
+    }
+    assert!(
+        caller_hardlink && caller_rename && caller_unlink && owner_read,
+        "observe exact normal caller effects and read-only local Main dispatch separately"
+    );
+    // These actual durable mutation phase commands must remain local Core work;
+    // an RPC origin label or successful outcome cannot exempt a self carrier call.
+    for head in &heads {
+        if matches!(&head.message, DfsNetworkMessage::NamespaceRequest(request)
+            if matches!(request.operation,
+                DfsNamespaceOperation::InstallHardlinkTargetFence { .. }
+                    | DfsNamespaceOperation::CommitHardlinkTargetFence { .. }
+                    | DfsNamespaceOperation::AdoptHardlinkAlias { .. }
+                    | DfsNamespaceOperation::AdoptObjectAtPath { .. }))
+        {
+            assert!(
+                !self_calls
+                    .iter()
+                    .any(|event| event.source == head.source_node_id
+                        && event.target == head.target_node_id
+                        && window.iter().any(|decoded| decoded.call_id == event.call_id
+                            && decoded.phase == crate::test_runtime::RpcPhase::Decoded
+                            && decoded.dfs_frame_id == Some(head.frame_id)
+                            && matches!(&head.message, DfsNetworkMessage::NamespaceRequest(request)
+                            if decoded.dfs_request_id.as_ref() == Some(&request.request_id)))),
+                "co-located saga mutation phases cannot dispatch through the self carrier"
+            );
+        }
+    }
+    assert_eq!(runtime.observation_dropped_count(), 0);
+    drop(service);
+    runtime.stop_node(&node).unwrap();
+    runtime.reopen_node(node.clone()).unwrap();
+    let restored = hardlink_read_set_snapshot(&runtime, &node, "services").unwrap();
+    assert_eq!(
+        recorded_hardlink_alias_frame(&restored, &operation_id),
+        original_frame
+    );
+    assert_eq!(
+        restored
+            .tables
+            .prepared_operations_v7
+            .iter()
+            .find(|record| record.payload.operation_id == prepared_id)
+            .unwrap(),
+        &original
+    );
+    let mut reopened = runtime.client(&node).unwrap();
+    assert_eq!(
+        reopened
+            .posix_unlink_if_generation(renamed_path, operation_id, expected)
+            .unwrap()
+            .kind,
+        DfsObjectKind::Tombstone
+    );
+    assert_eq!(
+        reopened
+            .posix_stat_distributed(canonical_path)
+            .unwrap()
+            .link_count,
+        1
+    );
+    assert_eq!(
+        reopened
+            .posix_read_file_distributed(canonical_path)
+            .unwrap(),
+        b"co-located distinct writer bytes"
+    );
+    assert!(matches!(
+        reopened.posix_stat_distributed(renamed_path),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+    drop(reopened);
+    runtime.close().unwrap();
 }

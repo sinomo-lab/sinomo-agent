@@ -101,8 +101,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     /// Adoption operations install records minted by another shard authority;
-    /// only the source path's configured primary may send them. Returns the
-    /// rejection reason for an unauthorized sender, `None` when authorized or
+    /// the source primary or the exact bound source offer's coordinator sends
+    /// them. The offer still needs native source/job custody at publication.
+    /// Returns the rejection reason for an unauthorized sender, `None` when authorized or
     /// for non-adoption operations.
     pub(crate) fn adoption_source_authority_rejection(
         &mut self,
@@ -111,9 +112,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         requester_node_id: &NodeId,
     ) -> Result<Option<String>, DfsError> {
         let source_path = match operation {
+            // This validates only the exact already-published destination and
+            // absence of active transfers. It cannot install or finalize data.
+            DfsNamespaceOperation::VerifyObjectFamilyAdoption { .. } => return Ok(None),
             DfsNamespaceOperation::AdoptObjectAtPath { source_path, .. }
             | DfsNamespaceOperation::FinalizeObjectFamilyAdoption { source_path, .. }
-            | DfsNamespaceOperation::VerifyObjectFamilyAdoption { source_path, .. }
             | DfsNamespaceOperation::InstallHardlinkTargetFence { source_path, .. }
             | DfsNamespaceOperation::CommitHardlinkTargetFence { source_path, .. }
             | DfsNamespaceOperation::AdoptHardlinkAlias { source_path, .. } => source_path,
@@ -140,6 +143,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             )));
         };
         if &shard.primary_node_id != requester_node_id {
+            if let DfsNamespaceOperation::AdoptObjectAtPath {
+                object,
+                source_offer,
+                ..
+            } = operation
+                && source_offer.source_config == shard
+                && source_offer.source_node_id == shard.primary_node_id
+                && source_offer.object_id == object.object_id
+                && source_offer.destination == *object
+                && &source_offer.job_offer.coordinator_node_id == requester_node_id
+                && source_offer.job_offer.job_config.primary_node_id == *requester_node_id
+                && source_offer.job_offer.job_config.file_system_id == *file_system_id
+                && source_offer.job_id == source_offer.job_offer.job_id
+            {
+                // This is only sender admission. The target's ordinary prepare
+                // must claim the live source offer and validate its full original
+                // job, payload, epoch, and held writers before any effect.
+                return Ok(None);
+            }
             return Ok(Some(format!(
                 "adoption sender {requester_node_id} is not the primary of source shard {} (primary {}, epoch {})",
                 shard.shard_id, shard.primary_node_id, shard.epoch
@@ -202,11 +224,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 "operation",
             )?,
             DfsNamespaceOperation::CommitLocalEventualBatch { transaction, .. } => {
-                return Self::affected_namespace_transaction_shards_from_snapshot(
-                    file_system_id,
-                    transaction,
-                    shards,
-                );
+                // The batch already includes every parent record it changes.
+                // Adding those records' parents again would incorrectly pull
+                // the root shard into a batch touching the /services directory.
+                Self::normalized_namespace_paths(
+                    transaction
+                        .objects
+                        .iter()
+                        .map(|object| object.path.as_str()),
+                    false,
+                    "local-eventual batch",
+                )?
             }
             _ => Self::normalized_namespace_paths(operation.involved_paths(), true, "operation")?,
         };

@@ -48,52 +48,38 @@ fn dfs_metadata_replication_retry_gate_tracks_incomplete_outcomes() {
 
 #[test]
 fn missing_current_manifest_blob_returns_pending_replication() {
-    let root = temp_root("read-missing-current-manifest-blob");
-    let node_id = NodeId::from_legacy_named("node_missing_blob").expect("node");
-    let replica = NodeId::from_legacy_named("node_missing_blob_replica").expect("node");
-    let object_id = DfsObjectId::from_legacy_named("obj_missing_blob").expect("object");
-    let version = DfsVersion::from_legacy_named("version_2").expect("version");
     let bytes = vec![b'm'; 17 * 1024];
-    let (_runtime, mut dfs) = native_sifs_service(
-        "missing_current_manifest_blob_returns_pending_replication",
-        node_id.clone(),
+    let (runtime, mut dfs, stat, withdrawn) = super::repair::native_withdrawn_local_replica_fixture(
+        "native-read-missing-current-blob",
+        &bytes,
     );
-    let manifest = dfs
-        .content
-        .put_object_version(object_id.as_str(), version.as_str(), &bytes)
-        .expect("seed manifest");
-    let hex = manifest
-        .content_hash
-        .strip_prefix("blake3:")
-        .expect("blake3 hash");
-    std::fs::remove_file(root.join("content").join("blobs").join(&hex[..2]).join(hex))
-        .expect("remove blob");
-    let mut metadata = file_metadata(node_id);
-    metadata.object_id = object_id.clone();
-    metadata.policy = DfsObjectPolicy::ReplicatedEventual;
-    metadata.version = version.clone();
-    metadata.current_locations = vec![replica.clone()];
-    metadata.content_hash = Some(manifest.content_hash.clone());
-    metadata.content_size_bytes = Some(bytes.len() as u64);
-    dfs.add_object_metadata(metadata).expect("metadata");
-
+    let remaining = dfs
+        .metadata_backend()
+        .unwrap()
+        .receipts_for_version(&stat.object_id, &stat.version)
+        .unwrap();
+    assert_eq!(remaining.len(), 1);
+    let replica = remaining[0].replica_node_id.clone();
+    assert_ne!(replica, withdrawn.replica_node_id);
+    let hash = stat.content_hash.as_deref().unwrap();
+    dfs.content()
+        .debug_remove_loose_blob(hash)
+        .expect("damage actual native cached bytes");
+    assert!(dfs.content().read_blob(hash).is_err());
+    let holder = runtime.client(&replica).unwrap();
+    assert_eq!(holder.content().read_blob(hash).unwrap(), bytes);
+    drop(holder);
     let outcome = dfs
-        .read_local_object_with_state(&object_id, false)
+        .read_local_object_with_state(&stat.object_id, false)
         .expect("missing blob is treated as cache miss");
-
-    assert!(matches!(
-        outcome,
-        NetworkedDfsReadOutcome::PendingReplication {
-            object_id: pending_object_id,
-            version: pending_version,
-            content_hash,
-            current_locations,
-        } if pending_object_id == object_id
-            && pending_version == version
-            && content_hash.as_deref() == Some(manifest.content_hash.as_str())
-            && current_locations == vec![replica]
-    ));
-    std::fs::remove_dir_all(root).ok();
+    assert!(
+        matches!(outcome, NetworkedDfsReadOutcome::PendingReplication {
+        object_id, version, content_hash, current_locations,
+    } if object_id == stat.object_id && version == stat.version
+        && content_hash == stat.content_hash && current_locations == vec![replica])
+    );
+    drop(dfs);
+    runtime.close().unwrap();
 }
 
 #[test]
@@ -152,8 +138,8 @@ fn sharded_point_lookup_snapshot_refreshes_only_the_routed_path_shard() {
     let root = temp_root("sifs-sharded-point-lookup-snapshot");
     let node = NodeId::from_legacy_named("node_sifs_sharded_point_snapshot").expect("node");
     let shards = sifs_two_primary_shard_configs(&node, &node, 1, Vec::new(), Vec::new());
-    let mut backend =
-        open_local_sharded_metadata_backend(root.join("metadata"), shards).expect("metadata");
+    let mut backend = open_local_sharded_metadata_backend(root.join("metadata"), shards.clone())
+        .expect("metadata");
     let file_system_id = sifs_file_system_id();
 
     crate::metadata_sharded_backend::reset_sharded_consistent_read_snapshot_shards();
@@ -164,12 +150,34 @@ fn sharded_point_lookup_snapshot_refreshes_only_the_routed_path_shard() {
 
     assert_eq!(
         crate::metadata_sharded_backend::sharded_consistent_read_snapshot_shards(),
+        vec![DfsMetadataShardId::new("services")],
+        "a fresh routing generation has no historical Root fallback"
+    );
+    drop(backend);
+    let historical_root = root.join("historical-metadata");
+    let old = vec![
+        shards
+            .iter()
+            .find(|shard| shard.shard_id == "root")
+            .unwrap()
+            .clone(),
+    ];
+    drop(open_local_sharded_metadata_backend(&historical_root, old).unwrap());
+    let mut backend = open_local_sharded_metadata_backend(&historical_root, shards).unwrap();
+    crate::metadata_sharded_backend::reset_sharded_consistent_read_snapshot_shards();
+    backend
+        .begin_consistent_read_snapshot_for_path(&file_system_id, "/services/point-lookup-parent")
+        .unwrap();
+    backend.end_consistent_read_snapshot_for_path(&file_system_id, "/services/point-lookup-parent");
+    assert_eq!(
+        crate::metadata_sharded_backend::sharded_consistent_read_snapshot_shards(),
         vec![
             DfsMetadataShardId::new("services"),
-            DfsMetadataShardId::new("root"),
+            DfsMetadataShardId::new("root")
         ],
-        "one-path response hydration must retain the routing fallback without refreshing the unrelated users shard"
+        "actual retained Root routing must be included without refreshing unrelated users"
     );
+    drop(backend);
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -178,78 +186,134 @@ fn sifs_cluster_posix_replica_catches_up_after_journal_publish() {
     let mut cluster = sifs_posix_cluster("sifs-cluster-catchup", "/users");
     let path = "/users/replicated.txt";
     let bytes = b"observer should converge to this content";
-
-    sifs_cluster_routed_posix_write(&mut cluster, path, bytes);
-
-    // The observer never participated in the write; it learns the namespace
-    // through the primary's metadata journal publication.
+    let original = cluster
+        ._runtime
+        .metadata_shards()
+        .unwrap()
+        .into_iter()
+        .find(|shard| shard.shard_id == "users")
+        .unwrap();
+    // A configured participant must ACK every prepare. Establish the intended
+    // initially uninvolved observer through a real membership transition.
+    let initial = cluster
+        ._runtime
+        .reassign_metadata_shard(
+            &original.file_system_id,
+            &original.shard_id,
+            cluster.primary_node.clone(),
+            vec![cluster.writer_node.clone()],
+        )
+        .unwrap();
+    assert!(!initial.replica_node_ids.contains(&cluster.observer_node));
+    let mut policy = DfsReplicationPolicy::new(1, 1).unwrap();
+    policy.required_node_ids = vec![cluster.primary_node.clone()];
+    policy.forbidden_node_ids = vec![cluster.observer_node.clone()];
+    cluster
+        .writer
+        .posix_write_file(
+            path,
+            bytes,
+            DfsWriteOptions {
+                policy,
+                replica_candidates: vec![cluster.primary_node.clone()],
+                wait_for_commit: true,
+                foreground_replica_repair: true,
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        cluster.observer.posix_stat(path),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+    let observer_root =
+        crate::default_dfs_metadata_shards_root(cluster._runtime.data_dir(&cluster.observer_node))
+            .join(crate::metadata_keys::key_segment(&original.shard_id));
+    let before = LocalSobjMetadataBackend::open_for_inspection(
+        DfsMetadataShardId::new(&original.shard_id),
+        &observer_root,
+    )
+    .unwrap();
     assert!(
-        matches!(
-            cluster.observer.posix_stat(path),
-            Err(DfsPosixError::NotFound { .. })
-        ),
-        "observer must not see the path before metadata publication"
+        before
+            .get_object_by_path(&original.file_system_id, path)
+            .unwrap()
+            .is_none(),
+        "the actual unassigned observer must not have the unpublished-to-it path"
     );
-
-    let expected_hash = content_hash(bytes);
-    sifs_cluster_publish_metadata_until(&mut cluster, path, |cluster| {
-        cluster
+    drop(before);
+    assert!(
+        !cluster
             .observer
-            .posix_stat(path)
-            .is_ok_and(|stat| stat.content_hash.as_deref() == Some(expected_hash.as_str()))
-    });
-
-    let stat = cluster.observer.posix_stat(path).expect("observer stat");
-    assert_eq!(stat.kind, DfsObjectKind::File);
-    assert_eq!(stat.size_bytes, Some(bytes.len() as u64));
-    let entries = cluster
-        .observer
-        .posix_list_dir("/users")
-        .expect("observer list /users");
-    assert!(
-        entries.iter().any(|entry| entry.path == path),
-        "observer directory listing must contain the replicated path: {entries:?}"
+            .content()
+            .has_blob(&content_hash(bytes))
+            .unwrap()
     );
 
-    // Content follows metadata on demand.
+    // The existing native catch-up protocol publishes the real prefix before
+    // joint activation adds this observer to the metadata participant set.
+    let joined = cluster
+        ._runtime
+        .reassign_metadata_shard(
+            &initial.file_system_id,
+            &initial.shard_id,
+            cluster.primary_node.clone(),
+            vec![cluster.writer_node.clone(), cluster.observer_node.clone()],
+        )
+        .unwrap();
+    assert_eq!(joined.epoch, initial.epoch + 1);
+    assert!(joined.replica_node_ids.contains(&cluster.observer_node));
+    drop(cluster.observer);
+    cluster.observer = cluster._runtime.client(&cluster.observer_node).unwrap();
+    let expected_hash = content_hash(bytes);
+    let stat = cluster
+        .observer
+        .posix_stat(path)
+        .expect("actual caught-up replica stat");
+    assert_eq!(stat.kind, DfsObjectKind::File);
+    assert_eq!(stat.content_hash.as_deref(), Some(expected_hash.as_str()));
+    assert_eq!(stat.size_bytes, Some(bytes.len() as u64));
+    let entries = cluster.observer.posix_list_dir("/users").unwrap();
+    assert!(entries.iter().any(|entry| entry.path == path));
+    assert!(
+        !cluster.observer.content().has_blob(&expected_hash).unwrap(),
+        "metadata catch-up must not invent a content replica"
+    );
     let read = sifs_cluster_fetch_for_local_read(&mut cluster, |c| &mut c.observer, path);
     assert_eq!(read, bytes.to_vec());
-
-    // Publication is idempotent: republishing must not error or regress state.
     let publication = cluster
         ._runtime
         .maintenance_tick(
             &cluster.primary_node,
             sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
         )
-        .expect("ordinary idempotent Main metadata publication");
+        .unwrap();
     assert!(publication.outcome.is_ok(), "{:?}", publication.outcome);
     assert_eq!(publication.omitted_kv_event_count, 0);
     sifs_posix_cluster_pump_round(&mut cluster);
-    let stat = cluster
-        .observer
-        .posix_stat(path)
-        .expect("observer stat after republish");
     assert_eq!(
-        stat.content_hash.as_deref(),
+        cluster
+            .observer
+            .posix_stat(path)
+            .unwrap()
+            .content_hash
+            .as_deref(),
         Some(expected_hash.as_str()),
-        "republishing the journal must not regress replicated metadata"
+        "idempotent publication must not regress the actual replica"
     );
-
-    // The writer is also a configured replica. Normal Main replication must
-    // preserve its current namespace and readable body as well.
     assert_eq!(
-        cluster.writer.posix_read_file(path).expect("writer read"),
-        bytes.to_vec()
+        cluster.writer.posix_read_file_distributed(path).unwrap(),
+        bytes
     );
-
-    assert!(
-        cluster.rejections.is_empty(),
-        "no journal batch may be rejected during routed writes and catch-up: {:?}",
-        cluster.rejections
-    );
-
-    drop(cluster);
+    assert!(cluster.rejections.is_empty(), "{:?}", cluster.rejections);
+    let SifsPosixCluster {
+        primary,
+        writer,
+        observer,
+        _runtime,
+        ..
+    } = cluster;
+    drop((primary, writer, observer));
+    _runtime.close().unwrap();
 }
 
 #[test]
@@ -313,7 +377,7 @@ fn routed_namespace_without_local_replay_omits_response_journal_batches() {
     assert_eq!(
         cluster
             .replica
-            .posix_stat("/services/no-replay-batches")
+            .posix_stat_distributed("/services/no-replay-batches")
             .unwrap()
             .kind,
         DfsObjectKind::Directory
@@ -379,34 +443,57 @@ fn durable_namespace_exact_retry_replays_completed_rename_and_rejects_id_reuse()
 #[test]
 fn routed_namespace_cursor_snapshot_uses_cached_state_not_backend_status() {
     let mut cluster = sifs_two_primary_cluster("sifs-namespace-cached-cursors");
-    let services_shard = DfsMetadataShardId::new("services");
+    let shard = DfsMetadataShardId::new("services");
     cluster
         .replica
         .replication
         .local_metadata_journal_cursors
         .clear();
+    crate::metadata_sharded_backend::take_sharded_metadata_status_query_count();
     assert!(
         cluster
             .replica
             .local_metadata_shard_cursors()
-            .expect("cached cursors")
-            .is_empty(),
-        "routed namespace sends must not scan backend shard status when the cache is empty"
+            .unwrap()
+            .is_empty()
     );
-
-    cluster
+    assert_eq!(
+        crate::metadata_sharded_backend::take_sharded_metadata_status_query_count(),
+        0
+    );
+    let mut author = cluster
+        ._runtime
+        .metadata_primary_service("/services")
+        .unwrap();
+    author
+        .posix_mkdir_all("/services/actual-cursor-progress")
+        .unwrap();
+    let synced = author.posix_sync_directory("/services").unwrap();
+    let actual = synced.metadata_certificate.target.journal_sequence;
+    drop(author);
+    let cfg = cluster
+        ._runtime
+        .metadata_shards()
+        .unwrap()
+        .into_iter()
+        .find(|cfg| cfg.shard_id == shard.0)
+        .unwrap();
+    // Consume genuine native progress before testing the quiet cached read.
+    let initial = cluster
         .replica
-        .replication
-        .local_metadata_journal_cursors
-        .insert(services_shard.clone(), 42);
-    let cursors = cluster
-        .replica
-        .local_metadata_shard_cursors()
-        .expect("cached cursor snapshot");
-    assert_eq!(cursors.len(), 1);
-    assert_eq!(cursors[0].shard_id, services_shard);
-    assert_eq!(cursors[0].after_sequence, 42);
-
+        .local_metadata_shard_cursors_for(Some(&[cfg]))
+        .unwrap();
+    assert_eq!(initial.len(), 1);
+    assert_eq!(initial[0].after_sequence, actual);
+    crate::metadata_sharded_backend::take_sharded_metadata_status_query_count();
+    let cached = cluster.replica.local_metadata_shard_cursors().unwrap();
+    assert_eq!(cached, initial);
+    assert_eq!(cached[0].shard_id, shard);
+    assert_eq!(
+        crate::metadata_sharded_backend::take_sharded_metadata_status_query_count(),
+        0,
+        "quiet routed cursor reads must not scan backend shard status"
+    );
     cluster.close();
 }
 
@@ -496,6 +583,16 @@ fn sync_path_response_object_updates_outsider_read_view_without_journal_batches(
         )
         .unwrap();
     drop(writer);
+    let local_snapshot = || {
+        LocalSobjMetadataBackend::open_for_inspection(
+            DfsMetadataShardId::new("services"),
+            crate::default_dfs_metadata_shards_root(runtime.data_dir(&outsider))
+                .join(crate::metadata_keys::key_segment(&"services")),
+        )
+        .unwrap()
+        .export_table_snapshot()
+    };
+    let unchanged = local_snapshot();
     let before = runtime.rpc_observations().len();
     let response = reader
         .route_namespace_operation_to_metadata_primary_with_timeout_and_options(
@@ -514,11 +611,22 @@ fn sync_path_response_object_updates_outsider_read_view_without_journal_batches(
     assert_eq!(actual.version, stat.version);
     assert_eq!(actual.content_hash, stat.content_hash);
     assert_eq!(
+        local_snapshot(),
+        unchanged,
+        "a reply object does not grant outsider journal ingestion"
+    );
+    let public = reader.posix_stat_distributed(path).unwrap();
+    assert_eq!(public.object_id, actual.object_id);
+    assert_eq!(public.version, actual.version);
+    assert_eq!(public.content_hash, actual.content_hash);
+    assert!(
         reader
             .metadata()
-            .object_by_normalized_posix_path(&config.file_system_id, path),
-        Some(&actual)
+            .object_by_normalized_posix_path(&config.file_system_id, path)
+            .is_none(),
+        "Main owns persistence; public current reads do not invent a private replica"
     );
+    assert_eq!(local_snapshot(), unchanged);
     assert!(
         runtime.rpc_observations()[before..]
             .iter()
@@ -531,11 +639,109 @@ fn sync_path_response_object_updates_outsider_read_view_without_journal_batches(
     runtime.close().unwrap();
 }
 
+// Capture the actual equal native prefix before producing any corpus entry.
+// Native startup may already have checkpointed its genesis frames; those are
+// not the 700 writes whose complete byte lineage this fixture must retain.
+fn native_backlog_anchor(
+    runtime: &crate::test_runtime::DfsTestRuntime,
+    primary: &NetworkedDfsService<DfsNodeTransport>,
+    replica: &NodeId,
+) -> crate::DfsMetadataPrefixProof {
+    let shard = DfsMetadataShardId::new("users");
+    let anchor = primary
+        .metadata_backend()
+        .unwrap()
+        .metadata_prefix_proof(&shard)
+        .unwrap()
+        .unwrap();
+    let receiver = LocalSobjMetadataBackend::open_for_inspection(
+        shard.clone(),
+        crate::default_dfs_metadata_shards_root(runtime.data_dir(replica))
+            .join(crate::metadata_keys::key_segment(&shard.0)),
+    )
+    .unwrap();
+    assert_eq!(
+        receiver.metadata_prefix_proof().unwrap(),
+        anchor,
+        "all corpus replay starts at the actual common native prefix"
+    );
+    assert!(anchor.is_well_formed());
+    anchor
+}
+
+// Verify the actual replica's durable history, independently of a browser's
+// private read projection. This replays byte-prefix proofs only; it grants no
+// ingest permission and never writes metadata or manufactures acknowledgements.
+fn assert_native_backlog_cut(
+    runtime: &crate::test_runtime::DfsTestRuntime,
+    replica: &NodeId,
+    anchor: &crate::DfsMetadataPrefixProof,
+    cut: &crate::DfsMetadataPrefixProof,
+    files: &[DfsStat],
+) {
+    assert_eq!(files.len(), 700);
+    let shard = DfsMetadataShardId::new("users");
+    let backend = LocalSobjMetadataBackend::open_for_inspection(
+        shard.clone(),
+        crate::default_dfs_metadata_shards_root(runtime.data_dir(replica))
+            .join(crate::metadata_keys::key_segment(&shard.0)),
+    )
+    .unwrap();
+    let mut proof = anchor.clone();
+    let mut batches = 0;
+    while proof.journal_sequence < cut.journal_sequence {
+        let batch = backend
+            .journal_batch_for_shard_since_limited(
+                &shard,
+                proof.journal_sequence,
+                DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
+                DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT,
+            )
+            .unwrap()
+            .expect("the actual replica retains every captured corpus frame");
+        assert!(!batch.entries.is_empty());
+        assert!(batch.entries.len() <= DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT);
+        let frames = backend.journal_frames_for_batch(&batch).unwrap();
+        assert_eq!(frames.len(), batch.entries.len());
+        for (entry, frame) in batch.entries.iter().zip(&frames) {
+            if entry.sequence > cut.journal_sequence {
+                break;
+            }
+            assert_eq!(entry.sequence, proof.journal_sequence + 1);
+            assert_eq!(frame.sequence, entry.sequence);
+            proof = crate::metadata_journal::metadata_prefix_proof_after_exact_frame(
+                &proof,
+                entry,
+                &shard,
+                &frame.exact_bytes,
+            )
+            .unwrap();
+        }
+        batches += 1;
+    }
+    assert!(
+        batches > 1,
+        "the complete corpus must cross the unchanged journal batch limit"
+    );
+    assert_eq!(
+        &proof, cut,
+        "all exact replica bytes must reach the captured author prefix"
+    );
+    for file in files {
+        let actual = backend.get_object(&file.object_id).unwrap().unwrap();
+        assert_eq!(actual.path, file.path);
+        assert_eq!(actual.kind, DfsObjectKind::File);
+        assert_eq!(actual.version, file.version);
+        assert_eq!(actual.content_hash, file.content_hash);
+        assert_eq!(actual.content_size_bytes, file.size_bytes);
+    }
+}
+
 #[test]
 fn sifs_cluster_posix_routed_op_replays_deep_catch_up_across_batches() {
-    // A requester far behind the primary's journal (more entries than one
-    // batch carries) must still read its own routed mutation immediately:
-    // responses carry a bounded run of batches and the wrapper pulls more.
+    // A Main browser reads its routed result through current authority. Its
+    // private cache is not the replica owner. Preserve immediate public reads
+    // and independently verify all 700 files in the actual durable replica.
     let cluster = sifs_two_primary_cluster("sifs-xshard-deepsync");
     let SifsTwoPrimaryCluster {
         shared_kv,
@@ -543,73 +749,112 @@ fn sifs_cluster_posix_routed_op_replays_deep_catch_up_across_batches() {
         users_primary_node,
         _runtime,
         root,
-        replica_node: _,
+        replica_node,
         users_primary,
         services_primary,
         mut replica,
         ..
     } = cluster;
-    let mut users_primary = users_primary;
+    drop(users_primary);
+    let mut users_primary = _runtime.metadata_primary_service("/users").unwrap();
+    let anchor = native_backlog_anchor(&_runtime, &users_primary, &replica_node);
 
-    // Build a deep journal on the users primary locally (no publication).
+    // Build the full native corpus through its actual owning Core.
     let local_options = DfsWriteOptions {
         policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
         replica_candidates: vec![users_primary.node_id().clone()],
         wait_for_commit: true,
         foreground_replica_repair: true,
     };
+    let mut checkpointed = 0;
+    let mut files = Vec::with_capacity(700);
     for index in 0..700 {
-        users_primary
+        let stat = users_primary
             .posix_write_file(
                 &format!("/users/bulk-{index:03}.txt"),
                 format!("bulk payload {index}").as_bytes(),
                 local_options.clone(),
             )
             .expect("bulk create");
-    }
-
-    let stop = Arc::new(AtomicBool::new(false));
-    let users_stop = Arc::clone(&stop);
-    let users_thread = std::thread::spawn(move || {
-        let mut users_primary = users_primary;
-        while !users_stop.load(Ordering::SeqCst) {
-            users_primary
-                .process_incoming()
-                .expect("users primary pump");
-            std::thread::sleep(Duration::from_millis(1));
+        files.push(stat);
+        if (index + 1) % 100 == 0 {
+            checkpointed += _runtime.checkpoint_rpc_observation_window().unwrap();
         }
-        users_primary
-    });
-    let services_stop = Arc::clone(&stop);
-    let services_thread =
-        std::thread::spawn(move || pump_sifs_service_until_stop(services_primary, services_stop));
+    }
+    assert!(
+        checkpointed > 4096,
+        "full corpus observations exceed one buffer"
+    );
 
-    // One routed namespace op must catch the replica up through the entire
-    // backlog, not just the first bounded batch.
+    let shard = DfsMetadataShardId::new("users");
+    let cut = users_primary
+        .metadata_backend()
+        .unwrap()
+        .metadata_prefix_proof(&shard)
+        .unwrap()
+        .unwrap();
+    let setup = users_primary.posix_sync_directory("/users").unwrap();
+    assert_eq!(
+        setup.metadata_certificate.target.journal_sequence,
+        cut.journal_sequence
+    );
+    assert_eq!(
+        setup
+            .metadata_certificate
+            .acknowledged_node_ids
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        [
+            users_primary_node.clone(),
+            services_primary_node.clone(),
+            replica_node.clone()
+        ]
+        .into_iter()
+        .collect()
+    );
+    assert!(
+        files
+            .iter()
+            .all(|file| replica.metadata().object(&file.object_id).is_none()),
+        "the browser starts without private copies of the corpus"
+    );
+    drop(users_primary);
+
     replica
         .posix_mkdir("/users/deep-sync-marker")
         .expect("routed mkdir with deep catch-up");
     assert!(
-        replica.posix_stat("/users/bulk-000.txt").is_ok(),
+        replica
+            .posix_stat_distributed("/users/bulk-000.txt")
+            .is_ok(),
         "earliest backlog entry must be visible after the routed op"
     );
     assert!(
-        replica.posix_stat("/users/bulk-699.txt").is_ok(),
+        replica
+            .posix_stat_distributed("/users/bulk-699.txt")
+            .is_ok(),
         "latest backlog entry must be visible after the routed op"
     );
-    assert!(replica.posix_stat("/users/deep-sync-marker").is_ok());
+    assert!(
+        replica
+            .posix_stat_distributed("/users/deep-sync-marker")
+            .is_ok()
+    );
 
-    stop.store(true, Ordering::SeqCst);
-    users_thread.join().expect("users thread");
-    services_thread.join().expect("services thread");
-    std::fs::remove_dir_all(&root).ok();
+    assert_native_backlog_cut(&_runtime, &replica_node, &anchor, &cut, &files);
+    assert_eq!(_runtime.observation_dropped_count(), 0);
+    drop((services_primary, replica, shared_kv));
+    _runtime
+        .close()
+        .expect("normal Main and native owner drain");
 }
 
 #[test]
 fn sifs_cluster_posix_mkdir_all_replays_deep_catch_up_across_batches() {
-    // `mkdir_all` must provide the same immediate local visibility as `mkdir`.
-    // The routed primary can only include a bounded journal run in the first
-    // response, so the wrapper has to pull the rest before returning.
+    // A Main browser reads its routed result through current authority. Its
+    // private cache is not the replica owner. Preserve immediate public reads
+    // and independently verify all 700 files in the actual durable replica.
     let cluster = sifs_two_primary_cluster("sifs-xshard-mkdir-all-deepsync");
     let SifsTwoPrimaryCluster {
         shared_kv,
@@ -617,13 +862,15 @@ fn sifs_cluster_posix_mkdir_all_replays_deep_catch_up_across_batches() {
         users_primary_node,
         _runtime,
         root,
-        replica_node: _,
+        replica_node,
         users_primary,
         services_primary,
         mut replica,
         ..
     } = cluster;
-    let mut users_primary = users_primary;
+    drop(users_primary);
+    let mut users_primary = _runtime.metadata_primary_service("/users").unwrap();
+    let anchor = native_backlog_anchor(&_runtime, &users_primary, &replica_node);
 
     let local_options = DfsWriteOptions {
         policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
@@ -631,54 +878,93 @@ fn sifs_cluster_posix_mkdir_all_replays_deep_catch_up_across_batches() {
         wait_for_commit: true,
         foreground_replica_repair: true,
     };
+    let mut checkpointed = 0;
+    let mut files = Vec::with_capacity(700);
     for index in 0..700 {
-        users_primary
+        let stat = users_primary
             .posix_write_file(
                 &format!("/users/mkdir-all-backlog-{index:03}.txt"),
                 format!("bulk payload {index}").as_bytes(),
                 local_options.clone(),
             )
             .expect("bulk create");
-    }
-
-    let stop = Arc::new(AtomicBool::new(false));
-    let users_stop = Arc::clone(&stop);
-    let users_thread = std::thread::spawn(move || {
-        let mut users_primary = users_primary;
-        while !users_stop.load(Ordering::SeqCst) {
-            users_primary
-                .process_incoming()
-                .expect("users primary pump");
-            std::thread::sleep(Duration::from_millis(1));
+        files.push(stat);
+        if (index + 1) % 100 == 0 {
+            checkpointed += _runtime.checkpoint_rpc_observation_window().unwrap();
         }
-        users_primary
-    });
-    let services_stop = Arc::clone(&stop);
-    let services_thread =
-        std::thread::spawn(move || pump_sifs_service_until_stop(services_primary, services_stop));
+    }
+    assert!(
+        checkpointed > 4096,
+        "full corpus observations exceed one buffer"
+    );
+
+    let shard = DfsMetadataShardId::new("users");
+    let cut = users_primary
+        .metadata_backend()
+        .unwrap()
+        .metadata_prefix_proof(&shard)
+        .unwrap()
+        .unwrap();
+    let setup = users_primary.posix_sync_directory("/users").unwrap();
+    assert_eq!(
+        setup.metadata_certificate.target.journal_sequence,
+        cut.journal_sequence
+    );
+    assert_eq!(
+        setup
+            .metadata_certificate
+            .acknowledged_node_ids
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        [
+            users_primary_node.clone(),
+            services_primary_node.clone(),
+            replica_node.clone()
+        ]
+        .into_iter()
+        .collect()
+    );
+    assert!(
+        files
+            .iter()
+            .all(|file| replica.metadata().object(&file.object_id).is_none()),
+        "the browser starts without private copies of the corpus"
+    );
+    drop(users_primary);
 
     replica
         .posix_mkdir_all("/users/deep-mkdir-all/leaf")
         .expect("routed mkdir_all with deep catch-up");
     assert!(
         replica
-            .posix_stat("/users/mkdir-all-backlog-000.txt")
+            .posix_stat_distributed("/users/mkdir-all-backlog-000.txt")
             .is_ok(),
         "earliest backlog entry must be visible after routed mkdir_all"
     );
     assert!(
         replica
-            .posix_stat("/users/mkdir-all-backlog-699.txt")
+            .posix_stat_distributed("/users/mkdir-all-backlog-699.txt")
             .is_ok(),
         "latest backlog entry must be visible after routed mkdir_all"
     );
-    assert!(replica.posix_stat("/users/deep-mkdir-all").is_ok());
-    assert!(replica.posix_stat("/users/deep-mkdir-all/leaf").is_ok());
+    assert!(
+        replica
+            .posix_stat_distributed("/users/deep-mkdir-all")
+            .is_ok()
+    );
+    assert!(
+        replica
+            .posix_stat_distributed("/users/deep-mkdir-all/leaf")
+            .is_ok()
+    );
 
-    stop.store(true, Ordering::SeqCst);
-    users_thread.join().expect("users thread");
-    services_thread.join().expect("services thread");
-    std::fs::remove_dir_all(&root).ok();
+    assert_native_backlog_cut(&_runtime, &replica_node, &anchor, &cut, &files);
+    assert_eq!(_runtime.observation_dropped_count(), 0);
+    drop((services_primary, replica, shared_kv));
+    _runtime
+        .close()
+        .expect("normal Main and native owner drain");
 }
 
 #[test]
@@ -704,12 +990,14 @@ fn sifs_cluster_posix_mkdir_all_under_services_replays_created_chain() {
         .posix_mkdir_all("/services/cluster-tests/latency-regression")
         .expect("routed services mkdir_all");
     assert!(
-        replica.posix_stat("/services/cluster-tests").is_ok(),
+        replica
+            .posix_stat_distributed("/services/cluster-tests")
+            .is_ok(),
         "mkdir_all must sync the intermediate directory"
     );
     assert!(
         replica
-            .posix_stat("/services/cluster-tests/latency-regression")
+            .posix_stat_distributed("/services/cluster-tests/latency-regression")
             .is_ok(),
         "mkdir_all must sync the created leaf directory"
     );

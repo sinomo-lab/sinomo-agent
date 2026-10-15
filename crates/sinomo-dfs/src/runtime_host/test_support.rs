@@ -899,11 +899,9 @@ pub(super) struct DaemonDfsMaintenanceMetadataObservation {
 pub(super) fn daemon_dfs_maintenance_metadata_observation(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
+    topology: Option<crate::DfsAuthoritativePrefixProjection>,
 ) -> Result<DaemonDfsMaintenanceMetadataObservation, DaemonError> {
-    sinomo_dfs::with_cached_cluster_aware_dfs_metadata_inspection(
-        data_dir,
-        cluster_paths,
-        |metadata| {
+    let inspect = |metadata: &dyn crate::DfsMetadataBackend| -> Result<DaemonDfsMaintenanceMetadataObservation, crate::DfsError> {
             let summary = metadata.metadata_summary()?;
             let metadata_shard_statuses = metadata.metadata_shard_statuses()?;
             let write_intents = if summary.pending_write_count > 0 {
@@ -972,7 +970,22 @@ pub(super) fn daemon_dfs_maintenance_metadata_observation(
                 receipt_records,
                 lookups,
             })
-        },
-    )
+    };
+    match topology {
+        Some(topology) => {
+            let state = sinomo_core::cluster::read_cluster_state_without_kv(cluster_paths)?;
+            sinomo_dfs::with_cached_cluster_aware_dfs_metadata_inspection_with_topology(
+                data_dir,
+                state.local_node_id,
+                topology,
+                inspect,
+            )
+        }
+        None => sinomo_dfs::with_cached_cluster_aware_dfs_metadata_inspection(
+            data_dir,
+            cluster_paths,
+            inspect,
+        ),
+    }
     .map_err(Into::into)
 }

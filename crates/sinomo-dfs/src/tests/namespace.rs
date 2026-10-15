@@ -558,15 +558,20 @@ fn sifs_posix_empty_directory_checks_are_bounded_for_large_directories() {
     let source = "/services/sandbox/instances/sandbox_bounded_empty_dir/work/source";
     let nonempty = "/services/sandbox/instances/sandbox_bounded_empty_dir/work/nonempty";
 
-    let (_runtime, mut dfs) = native_sifs_service(
+    let (runtime, mut dfs) = native_sifs_service(
         "sifs_posix_empty_directory_checks_are_bounded_for_large_directories",
         node_id.clone(),
     );
     dfs.posix_mkdir_all(source).expect("mkdir source");
+    let mut checkpointed = 0;
     for index in 0..160 {
         dfs.posix_mkdir_all(&format!("{nonempty}/child-{index:04}"))
             .expect("mkdir child");
+        if (index + 1) % 32 == 0 {
+            checkpointed += runtime.checkpoint_rpc_observation_window().unwrap();
+        }
     }
+    assert!(checkpointed > 0);
     let mut transient = file_metadata(node_id.clone());
     transient.file_system_id = sifs_file_system_id();
     transient.object_id =
@@ -601,6 +606,11 @@ fn sifs_posix_empty_directory_checks_are_bounded_for_large_directories() {
     );
     assert!(dfs.posix_stat(source).is_ok());
 
+    assert_eq!(runtime.observation_dropped_count(), 0);
+    drop(dfs);
+    runtime
+        .close()
+        .expect("all native observation windows and owners drain");
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -663,6 +673,13 @@ fn sifs_posix_rename_directory_batches_child_moves_per_job_batch() {
         old_paths.push(old_path);
         new_paths.push(new_path);
     }
+    // The bounded producer runs inside its actual owning Core. Fixture setup
+    // above used normal Main routing; that delegating shell cannot run the
+    // private directory-job algorithm or supply its current journal baseline.
+    drop(dfs);
+    let mut dfs = runtime
+        .metadata_primary_service(old_dir)
+        .expect("actual owning Core for the bounded directory rename");
     let journal_after_sequence = dfs
         .metadata_backend()
         .expect("metadata backend")
@@ -764,7 +781,7 @@ fn sifs_posix_rename_directory_caps_child_move_transactions_above_step_budget() 
     let child_count = transaction_cap + 1;
     let max_steps = transaction_cap * 2;
 
-    let (_runtime, mut dfs) = native_sifs_service(
+    let (runtime, mut dfs) = native_sifs_service(
         "sifs_posix_rename_directory_caps_child_move_transactions_above_step_budget",
         node_id.clone(),
     );
@@ -784,6 +801,13 @@ fn sifs_posix_rename_directory_caps_child_move_transactions_above_step_budget() 
         .collect::<BTreeSet<_>>();
     dfs.add_object_metadata_batch(children)
         .expect("populate child metadata");
+    // The bounded producer runs inside its actual owning Core. Fixture setup
+    // above used normal Main routing; that delegating shell cannot run the
+    // private directory-job algorithm or supply its current journal baseline.
+    drop(dfs);
+    let mut dfs = runtime
+        .metadata_primary_service(old_dir)
+        .expect("actual owning Core for the bounded directory rename");
     let journal_after_sequence = dfs
         .metadata_backend()
         .expect("metadata backend")
@@ -1044,7 +1068,7 @@ fn sifs_posix_metadata_only_versions_preserve_content_size() {
     let renamed = "/services/sandbox/instances/sandbox_metadata_size/work/renamed.txt";
     let link = "/services/sandbox/instances/sandbox_metadata_size/work/link.txt";
 
-    let (_runtime, mut dfs) = native_sifs_service(
+    let (runtime, mut dfs) = native_sifs_service(
         "sifs_posix_metadata_only_versions_preserve_content_size",
         node_id.clone(),
     );
@@ -1055,6 +1079,12 @@ fn sifs_posix_metadata_only_versions_preserve_content_size() {
         DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
     )
     .expect("write file");
+    // Main owns setup; immutable-body retries run in the actual owning Core,
+    // rather than a delegating public client's optional cached backend.
+    drop(dfs);
+    let mut dfs = runtime
+        .metadata_primary_service(file)
+        .expect("actual metadata owner for metadata successors");
     let original = dfs.posix_stat(file).expect("original head");
     let original_version = dfs
         .metadata_backend()
@@ -1116,13 +1146,44 @@ fn sifs_posix_metadata_only_versions_preserve_content_size() {
         &moved.version,
         renamed,
     );
-    let payload = dfs
+    let rename_snapshot = dfs
         .metadata_backend()
         .unwrap()
-        .prepared_operation_payload(&format!("namespace:{transaction_id}"))
-        .unwrap()
-        .expect("actual immutable rename body");
-    let mut original_transaction = payload.transaction.clone();
+        .export_table_snapshot()
+        .expect("actual immutable rename snapshot");
+    let rename_records = rename_snapshot
+        .tables
+        .prepared_operations_v7
+        .iter()
+        .filter(|record| {
+            record.transaction.transaction_id == transaction_id
+                && record.transaction.objects.iter().any(|object| {
+                    object.object_id == moved.object_id && object.version == moved.version
+                })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(rename_records.len(), 1, "one actual immutable rename body");
+    let rename_record = (*rename_records[0]).clone();
+    rename_record
+        .validate()
+        .expect("complete original rename digest");
+    assert_eq!(
+        rename_record.status,
+        crate::DfsPreparedOperationStatus::Committed
+    );
+    assert!(rename_record.completed_request.is_none());
+    assert!(rename_record.completed_request_completion.is_none());
+    assert_eq!(
+        dfs.metadata_backend()
+            .unwrap()
+            .committed_prepared_operation(&rename_record.digest)
+            .unwrap(),
+        rename_record
+            .committed_entry
+            .as_ref()
+            .map(|entry| entry.journal_entry())
+    );
+    let mut original_transaction = rename_record.transaction.clone();
     original_transaction
         .versions
         .retain(|version| version.object_id != moved.object_id);
@@ -1144,6 +1205,20 @@ fn sifs_posix_metadata_only_versions_preserve_content_size() {
         "the recorded version completion cannot hide a changed retry body"
     );
     assert_eq!(dfs.posix_stat(renamed).unwrap().version, later.version);
+    let after_retry = dfs
+        .metadata_backend()
+        .unwrap()
+        .export_table_snapshot()
+        .expect("original rename body after exact and changed retries");
+    assert_eq!(
+        after_retry
+            .tables
+            .prepared_operations_v7
+            .iter()
+            .find(|record| { record.operation_id == rename_record.operation_id }),
+        Some(&rename_record),
+        "retries retain the entire original digest, body, and terminal receipt"
+    );
 
     dfs.posix_symlink(
         "renamed.txt",
@@ -1158,6 +1233,10 @@ fn sifs_posix_metadata_only_versions_preserve_content_size() {
         Some("renamed.txt".len() as u64)
     );
 
+    drop(dfs);
+    runtime
+        .close()
+        .expect("normal metadata-size runtime shutdown");
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -1823,7 +1902,7 @@ fn sifs_cluster_posix_contract_rmdir_vs_child_create() {
         rmdir.as_ref().ok(),
     );
     sifs_posix_cluster_pump_until(&mut cluster, "rmdir/create settle", |cluster| {
-        cluster.writer.writes.pending_routed_writes.is_empty()
+        sifs_routed_writes_settled(&cluster.writer)
     });
     let dir_present = cluster.primary.posix_stat(dir).is_ok();
     let child_present = cluster.primary.posix_stat(child).is_ok();
@@ -1950,13 +2029,6 @@ fn sifs_cluster_posix_contract_directory_rename_while_child_mutations_run() {
         ..
     } = cluster;
     let mut observations = Vec::new();
-    let stop = Arc::new(AtomicBool::new(false));
-    let users_stop = Arc::clone(&stop);
-    let users_thread =
-        std::thread::spawn(move || pump_sifs_service_until_stop(users_primary, users_stop));
-    let services_stop = Arc::clone(&stop);
-    let services_thread =
-        std::thread::spawn(move || pump_sifs_service_until_stop(services_primary, services_stop));
 
     replica.posix_mkdir("/users/contract-proj").expect("mkdir");
     replica
@@ -2007,9 +2079,6 @@ fn sifs_cluster_posix_contract_directory_rename_while_child_mutations_run() {
         "child mutation must resolve under exactly one subtree"
     );
 
-    stop.store(true, Ordering::SeqCst);
-    let users_primary = users_thread.join().expect("users thread");
-    let services_primary = services_thread.join().expect("services thread");
     let mut cluster = SifsTwoPrimaryCluster {
         _runtime,
         root,
@@ -2273,51 +2342,100 @@ fn sifs_cluster_posix_concurrent_creates_serialize_with_explicit_conflict() {
     let observer_bytes = b"observer candidate bytes!".to_vec();
     assert_ne!(content_hash(&writer_bytes), content_hash(&observer_bytes));
 
-    // Both replicas race to create the same path before any frames are pumped.
+    // Native Main processes real frames while callers run. Race two exclusive
+    // creates with independent durable identities, rather than assuming the
+    // old manual pump prevents the first blind overwrite from becoming visible.
+    let writer_operation = sinomo_core::Id::generate().to_string();
+    let observer_operation = sinomo_core::Id::generate().to_string();
+    assert_ne!(writer_operation, observer_operation);
     let writer_options = sifs_cluster_write_options(&cluster.writer_node.clone());
-    let writer_request = match cluster
-        .writer
-        .posix_write_file(path, &writer_bytes, writer_options)
-    {
-        Err(DfsPosixError::PendingWrite { intent_id, .. }) => intent_id,
-        other => panic!("expected pending routed write from writer, got {other:?}"),
-    };
     let observer_options = sifs_cluster_write_options(&cluster.observer_node.clone());
-    let observer_request =
-        match cluster
-            .observer
-            .posix_write_file(path, &observer_bytes, observer_options)
-        {
-            Err(DfsPosixError::PendingWrite { intent_id, .. }) => intent_id,
-            other => panic!("expected pending routed write from observer, got {other:?}"),
-        };
+    let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let (writer_initial, observer_initial) = std::thread::scope(|scope| {
+        let writer = &mut cluster.writer;
+        let observer = &mut cluster.observer;
+        let writer_start = std::sync::Arc::clone(&start);
+        let observer_start = std::sync::Arc::clone(&start);
+        let writer_operation = &writer_operation;
+        let observer_operation = &observer_operation;
+        let writer_bytes = &writer_bytes;
+        let observer_bytes = &observer_bytes;
+        let writer = scope.spawn(move || {
+            writer_start.wait();
+            writer.posix_create_file_with_operation_id(
+                path,
+                writer_bytes,
+                writer_options,
+                writer_operation,
+            )
+        });
+        let observer = scope.spawn(move || {
+            observer_start.wait();
+            observer.posix_create_file_with_operation_id(
+                path,
+                observer_bytes,
+                observer_options,
+                observer_operation,
+            )
+        });
+        (writer.join().unwrap(), observer.join().unwrap())
+    });
+    let pending_request = |result: &Result<DfsStat, DfsPosixError>| match result {
+        Err(DfsPosixError::PendingWrite { intent_id, .. }) => Some(intent_id.clone()),
+        // A native exclusive-create loser may be rejected before its first
+        // effect. This is an actual typed result, not a fabricated write intent.
+        Err(DfsPosixError::AlreadyExists { path: rejected }) if rejected == path => None,
+        other => {
+            panic!("exclusive create must be pending or explicitly already exists, got {other:?}")
+        }
+    };
+    let writer_request = pending_request(&writer_initial);
+    let observer_request = pending_request(&observer_initial);
 
     sifs_posix_cluster_pump_until(&mut cluster, "racing writes settle", |cluster| {
-        let writer_settled = !matches!(
-            cluster.writer.write_outcome(&writer_request),
-            Ok(NetworkedDfsWriteOutcome::Pending { .. })
-        );
-        let observer_settled = !matches!(
-            cluster.observer.write_outcome(&observer_request),
-            Ok(NetworkedDfsWriteOutcome::Pending { .. })
-        );
+        let writer_settled = writer_request.as_ref().is_none_or(|request| {
+            !matches!(
+                cluster.writer.write_outcome(request),
+                Ok(NetworkedDfsWriteOutcome::Pending { .. })
+            )
+        });
+        let observer_settled = observer_request.as_ref().is_none_or(|request| {
+            !matches!(
+                cluster.observer.write_outcome(request),
+                Ok(NetworkedDfsWriteOutcome::Pending { .. })
+            )
+        });
         writer_settled && observer_settled
     });
 
-    let writer_outcome = cluster.writer.write_outcome(&writer_request);
-    let observer_outcome = cluster.observer.write_outcome(&observer_request);
+    let writer_outcome = writer_request
+        .as_ref()
+        .map(|request| cluster.writer.write_outcome(request));
+    let observer_outcome = observer_request
+        .as_ref()
+        .map(|request| cluster.observer.write_outcome(request));
     let mut committed_hashes = Vec::new();
     let mut surfaced_failures = 0usize;
-    for outcome in [&writer_outcome, &observer_outcome] {
+    for (initial, outcome) in [
+        (&writer_initial, &writer_outcome),
+        (&observer_initial, &observer_outcome),
+    ] {
         match outcome {
-            Ok(NetworkedDfsWriteOutcome::Committed { content_hash, .. }) => {
+            Some(Ok(NetworkedDfsWriteOutcome::Committed { content_hash, .. })) => {
                 committed_hashes.push(content_hash.clone());
             }
-            Err(_) => {
+            Some(Err(DfsError::AlreadyExists { path: rejected })) if rejected == path => {
                 surfaced_failures += 1;
             }
-
-            Ok(NetworkedDfsWriteOutcome::Pending { .. }) => {
+            Some(Err(error)) => {
+                panic!("racing exclusive create returned a non-conflict failure: {error:?}")
+            }
+            None => {
+                assert!(matches!(initial,
+                    Err(DfsPosixError::AlreadyExists { path: rejected }) if rejected == path));
+                surfaced_failures += 1;
+            }
+            Some(Ok(NetworkedDfsWriteOutcome::Pending { .. })) => {
                 panic!("racing write left pending after settle")
             }
         }
@@ -2326,7 +2444,8 @@ fn sifs_cluster_posix_concurrent_creates_serialize_with_explicit_conflict() {
         (committed_hashes.len(), surfaced_failures),
         (1, 1),
         "exactly one racing create must commit and the other must reject without a conflict; \
-         writer: {writer_outcome:?}, observer: {observer_outcome:?}"
+         writer operation {writer_operation}: initial={writer_initial:?}, outcome={writer_outcome:?}; \
+         observer operation {observer_operation}: initial={observer_initial:?}, outcome={observer_outcome:?}"
     );
     let winner_hash = committed_hashes.remove(0);
     assert!(
@@ -2394,7 +2513,10 @@ fn sifs_cluster_posix_truncate_shrinks_and_extends_with_zeros() {
             .is_ok_and(|stat| stat.content_hash.as_deref() == Some(shrunk_hash.as_str()))
     });
     assert_eq!(
-        cluster.writer.posix_read_file(path).expect("shrunk read"),
+        cluster
+            .writer
+            .posix_read_file_distributed(path)
+            .expect("shrunk read"),
         shrunk
     );
     assert_eq!(
@@ -2422,7 +2544,10 @@ fn sifs_cluster_posix_truncate_shrinks_and_extends_with_zeros() {
             .is_ok_and(|stat| stat.content_hash.as_deref() == Some(extended_hash.as_str()))
     });
     assert_eq!(
-        cluster.writer.posix_read_file(path).expect("extended read"),
+        cluster
+            .writer
+            .posix_read_file_distributed(path)
+            .expect("extended read"),
         extended
     );
 
@@ -2581,13 +2706,11 @@ fn sifs_cluster_posix_namespace_and_stats_agree_across_nodes() {
     cluster.primary.posix_mkdir(dir).expect("primary mkdir");
     sifs_cluster_primary_posix_write(&mut cluster, file_a, &a_bytes);
     sifs_cluster_primary_posix_write(&mut cluster, file_b, &b_bytes);
+    let mut link_options = sifs_cluster_write_options(&cluster.primary_node);
+    link_options.wait_for_commit = true;
     cluster
         .primary
-        .posix_symlink(
-            "a.txt",
-            link,
-            sifs_cluster_write_options(&cluster.primary_node.clone()),
-        )
+        .posix_symlink("a.txt", link, link_options)
         .expect("primary symlink");
 
     sifs_cluster_publish_metadata_until(&mut cluster, "namespace agreement", |cluster| {
@@ -2781,115 +2904,167 @@ fn sifs_cluster_posix_error_mapping_matches_posix_contract() {
 
 #[test]
 fn clustered_mkdir_all_fuses_request_admission_with_prepare() {
-    let cluster = sifs_two_primary_cluster("sifs-mkdir-all-fused-admission");
-    let SifsTwoPrimaryCluster {
-        shared_kv,
-        services_primary_node,
-        users_primary_node,
-        _runtime,
-        root,
-        replica_node,
-        mut services_primary,
-        replica,
-        ..
-    } = cluster;
+    let mut cluster = sifs_two_primary_cluster("sifs-mkdir-all-fused-admission");
     let path = "/services/fused-admission/child";
-    let request_id = "dfs_net_req_mkdir_all_fused_admission".to_string();
-    let command = DfsNamespaceCommand {
-        request_id: request_id.clone(),
-        file_system_id: sifs_file_system_id(),
-        requesting_node_id: replica_node.clone(),
-        include_metadata_journal_batches: false,
-        metadata_journal_after_sequences: Vec::new(),
-        authority_shards: Vec::new(),
-        operation: DfsNamespaceOperation::MkdirAll {
-            path: path.to_string(),
-        },
+    let operation = DfsNamespaceOperation::MkdirAll {
+        path: path.to_string(),
     };
+    let requester = cluster.replica_node.clone();
+    let primary = cluster.services_primary_node.clone();
+    for (no_op, request_id) in [
+        (false, "dfs_net_req_mkdir_all_fused_admission"),
+        (true, "dfs_net_req_mkdir_all_fused_admission_noop"),
+    ] {
+        let owner_before = cluster
+            ._runtime
+            .metadata_primary_service(path)
+            .expect("actual owner before the namespace RPC");
+        assert_eq!(owner_before.node_id, primary);
+        let before_sequence = owner_before
+            .metadata_backend()
+            .expect("actual owning backend")
+            .journal_last_sequence()
+            .expect("actual journal baseline");
+        drop(owner_before);
 
-    crate::metadata_backend::reset_metadata_journal_write_count();
-    let event = services_primary
-        .handle_namespace_request(replica_node.clone(), command)
-        .expect("serve fused-admission mkdir-all");
-    assert!(
-        matches!(
-            &event,
-            NetworkedDfsServiceEvent::RemoteNamespaceServed {
-                result: DfsNamespaceResult::Applied,
-                ..
-            }
-        ),
-        "unexpected fused-admission event: {event:?}"
-    );
-    assert_eq!(
-        crate::metadata_backend::metadata_journal_write_count(),
-        2,
-        "the common clustered mkdir-all path should write prepare + commit, not Pending + prepare + commit"
-    );
-    let completed = services_primary
-        .metadata_backend
-        .as_ref()
-        .expect("metadata backend")
-        .get_namespace_request(&replica_node, &request_id)
-        .expect("request lookup")
-        .expect("completed request");
-    assert_eq!(completed.status, DfsNamespaceRequestStatus::Completed);
-    assert_eq!(completed.result, Some(DfsNamespaceResult::Applied));
-    assert_eq!(
-        services_primary
-            .posix_stat(path)
-            .expect("created directory")
-            .kind,
-        DfsObjectKind::Directory
-    );
+        // The normal stable-ID route stamps the coherent configuration, and the
+        // registered receiver supplies its real CurrentExecutionContext.
+        let response = cluster
+            .replica
+            .route_namespace_operation_to_metadata_primary_with_request_id_and_options(
+                request_id.to_string(),
+                sifs_file_system_id(),
+                primary.clone(),
+                operation.clone(),
+                crate::DFS_ROUTED_NAMESPACE_OP_TIMEOUT,
+                false,
+                false,
+            )
+            .expect("normal stamped mkdir-all RPC");
+        assert_eq!(response.result, DfsNamespaceResult::Applied);
 
-    let no_op_request_id = "dfs_net_req_mkdir_all_fused_admission_noop".to_string();
-    crate::metadata_backend::reset_metadata_journal_write_count();
-    let no_op = services_primary
-        .handle_namespace_request(
-            replica_node.clone(),
-            DfsNamespaceCommand {
-                request_id: no_op_request_id.clone(),
-                file_system_id: sifs_file_system_id(),
-                requesting_node_id: replica_node.clone(),
-                include_metadata_journal_batches: false,
-                metadata_journal_after_sequences: Vec::new(),
-                authority_shards: Vec::new(),
-                operation: DfsNamespaceOperation::MkdirAll {
-                    path: path.to_string(),
-                },
-            },
-        )
-        .expect("serve already-satisfied mkdir-all");
-    assert!(
-        matches!(
-            &no_op,
-            NetworkedDfsServiceEvent::RemoteNamespaceServed {
-                result: DfsNamespaceResult::Applied,
-                ..
-            }
-        ),
-        "unexpected fused-admission no-op event: {no_op:?}"
-    );
-    assert_eq!(
-        crate::metadata_backend::metadata_journal_write_count(),
-        1,
-        "an already-satisfied mkdir-all should record Completed directly"
-    );
-    assert_eq!(
-        services_primary
-            .metadata_backend
-            .as_ref()
-            .expect("metadata backend")
-            .get_namespace_request(&replica_node, &no_op_request_id)
-            .expect("no-op request lookup")
-            .expect("completed no-op request")
-            .status,
-        DfsNamespaceRequestStatus::Completed
-    );
-
-    drop(replica);
-    std::fs::remove_dir_all(&root).ok();
+        let mut owner = cluster
+            ._runtime
+            .metadata_primary_service(path)
+            .expect("actual owner after the namespace RPC");
+        assert_eq!(owner.node_id, primary);
+        let backend = owner.metadata_backend().expect("actual owning backend");
+        let completed = backend
+            .get_namespace_request(&requester, request_id)
+            .expect("actual owner request lookup")
+            .expect("completed request");
+        assert_eq!(completed.status, DfsNamespaceRequestStatus::Completed);
+        assert_eq!(completed.result, Some(DfsNamespaceResult::Applied));
+        assert_eq!(completed.file_system_id, sifs_file_system_id());
+        assert_eq!(completed.requester_node_id, requester);
+        assert_eq!(completed.request_id, request_id);
+        assert_eq!(completed.operation, operation);
+        let matches_request = |request: &crate::DfsNamespaceRequestRecord| {
+            request.file_system_id == completed.file_system_id
+                && request.requester_node_id == requester
+                && request.request_id == request_id
+        };
+        let journal = backend
+            .journal_since(before_sequence)
+            .expect("actual owner journal for this RPC");
+        let prepares = journal
+            .iter()
+            .filter_map(|entry| match &entry.mutation {
+                DfsMetadataMutation::PrepareOperationV7 { record, .. }
+                    if record
+                        .completed_request
+                        .as_ref()
+                        .is_some_and(matches_request)
+                        || record.completed_request_completion.as_ref().is_some_and(
+                            |completion| {
+                                completion.file_system_id == completed.file_system_id
+                                    && completion.requester_node_id == requester
+                                    && completion.request_id == request_id
+                            },
+                        )
+                        || record.metadata_effects.iter().any(|effect| {
+                            matches!(effect,
+                        crate::DfsPreparedMetadataEffect::PutNamespaceRequest { request }
+                        if matches_request(request))
+                        }) =>
+                {
+                    Some(record.as_ref())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            prepares.len(),
+            1,
+            "one request-owned publication, without a separate Pending admission"
+        );
+        let prepare = prepares[0];
+        prepare
+            .validate()
+            .expect("complete original request prepare");
+        assert_eq!(prepare.file_system_id, completed.file_system_id);
+        assert_eq!(prepare.shard_id, completed.authority_shard_id);
+        assert!(
+            backend
+                .prepared_operation_for_request(&requester, request_id)
+                .unwrap()
+                .is_none()
+        );
+        if no_op {
+            // Every current v7 semantic effect is sealed in prepare + commit.
+            // The no-op has one direct Completed effect and no namespace body.
+            assert!(prepare.transaction.objects.is_empty());
+            assert!(prepare.transaction.versions.is_empty());
+            assert!(prepare.completed_request.is_none());
+            assert!(prepare.completed_request_completion.is_none());
+            assert!(matches!(prepare.metadata_effects.as_slice(),
+                [crate::DfsPreparedMetadataEffect::PutNamespaceRequest { request }]
+                if request.as_ref() == &completed));
+        } else {
+            assert_eq!(prepare.completed_request.as_ref(), Some(&completed));
+            assert!(prepare.completed_request_completion.is_none());
+            assert!(prepare.metadata_effects.iter().all(|effect| !matches!(
+                effect,
+                crate::DfsPreparedMetadataEffect::PutNamespaceRequest { .. }
+            )));
+            let object = backend
+                .get_object_by_path(&sifs_file_system_id(), &crate::metadata_path(path))
+                .unwrap()
+                .expect("actually created directory");
+            assert!(prepare.transaction.objects.contains(&object));
+        }
+        let request_entries = journal
+            .iter()
+            .filter(|entry| match &entry.mutation {
+                DfsMetadataMutation::PrepareOperationV7 { record, .. } => {
+                    record.digest == prepare.digest
+                }
+                DfsMetadataMutation::CommitPreparedOperationV7 { digest, .. } => {
+                    digest == &prepare.digest
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            request_entries.len(),
+            2,
+            "exact prepare + commit for this request"
+        );
+        assert_eq!(request_entries[0].sequence, prepare.digest.prepare_sequence);
+        let terminal = backend
+            .committed_prepared_operation(&prepare.digest)
+            .unwrap()
+            .expect("actual committed request digest");
+        assert_eq!(&terminal, request_entries[1]);
+        assert!(matches!(&terminal.mutation,
+            DfsMetadataMutation::CommitPreparedOperationV7 { digest, .. }
+            if digest == &prepare.digest));
+        assert_eq!(
+            owner.posix_stat(path).expect("created directory").kind,
+            DfsObjectKind::Directory
+        );
+        drop(owner);
+    }
+    cluster.close();
 }
 
 #[test]
@@ -2982,8 +3157,9 @@ fn compound_posix_routing_refresh_invalidates_prior_config_revision() {
 fn sifs_non_replica_directory_pull_captures_durable_replica_progress() {
     let cluster = sifs_outsider_cluster("sifs-outsider-directory-pull-capture");
     let SifsPosixCluster {
-        root,
         primary_node,
+        writer_node,
+        observer_node,
         mut primary,
         mut observer,
         _runtime,
@@ -2997,20 +3173,41 @@ fn sifs_non_replica_directory_pull_captures_durable_replica_progress() {
         .posix_write_file(
             path,
             b"remote directory entry",
-            DfsWriteOptions::replicated_eventual(vec![primary_node]),
+            DfsWriteOptions::replicated_eventual(vec![primary_node.clone()]),
         )
         .expect("primary file");
 
-    let stop_primary = Arc::new(AtomicBool::new(false));
-    let primary_stop = Arc::clone(&stop_primary);
-    let primary_thread = std::thread::spawn(move || {
-        while !primary_stop.load(Ordering::SeqCst) {
-            primary.process_incoming().expect("primary pump");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        primary
-    });
-
+    let configs = _runtime
+        .metadata_shards()
+        .expect("actual current assignment");
+    let config = select_metadata_shard_config_for_path(&sifs_file_system_id(), &configs, dir)
+        .unwrap()
+        .unwrap();
+    assert_eq!(config.primary_node_id, primary_node);
+    assert!(!config.replica_node_ids.contains(&observer_node));
+    assert_ne!(observer_node, primary_node);
+    // Public Main clients page through their owner and deliberately do not
+    // ingest reply journals. Exercise the ordinary embedded Core pull with
+    // the same native backend, owner, provider and daemon peer transport.
+    observer.transport = crate::runtime_host::daemon_dfs_node_transport_on_runtime(
+        observer_node.clone(),
+        [primary_node.clone(), writer_node],
+        _runtime.data_dir(&observer_node),
+        crate::test_runtime::executor().handle(),
+    );
+    let shard = DfsMetadataShardId::new(config.shard_id.clone());
+    let before = observer
+        .metadata_backend()
+        .unwrap()
+        .metadata_prefix_proof(&shard)
+        .unwrap();
+    let progress = observer
+        .metadata_backend()
+        .unwrap()
+        .subscribe_metadata_replica_progress(&shard)
+        .unwrap()
+        .unwrap();
+    let before_generation = progress.latest().map_or(0, |row| row.generation);
     observer.disable_implicit_read_replica_ingest();
     let listed =
         observer.capture_mounted_mutation(|service| service.posix_list_dir_distributed(dir));
@@ -3020,6 +3217,23 @@ fn sifs_non_replica_directory_pull_captures_durable_replica_progress() {
         listed.committed_work.metadata_replica_progress,
         "a non-replica SyncPath pull must retain its durable replica-progress edge"
     );
+    let after = observer
+        .metadata_backend()
+        .unwrap()
+        .metadata_prefix_proof(&shard)
+        .unwrap()
+        .expect("actual durable pulled prefix");
+    assert!(after.journal_sequence > before.map_or(0, |prefix| prefix.journal_sequence));
+    let observed = progress
+        .latest()
+        .expect("actual authorized ingest observation");
+    assert!(observed.generation > before_generation);
+    assert_eq!(observed.file_system_id, config.file_system_id);
+    assert_eq!(observed.shard_id, shard);
+    assert_eq!(observed.source_node_id, primary_node);
+    assert_eq!(observed.source_epoch, config.epoch);
+    assert_eq!(observed.prefix, after);
+
     let settled =
         observer.capture_mounted_mutation(|service| service.posix_list_dir_distributed(dir));
     let settled_entries = settled.outcome.expect("settled outsider directory pull");
@@ -3028,8 +3242,16 @@ fn sifs_non_replica_directory_pull_captures_durable_replica_progress() {
         !settled.committed_work.metadata_replica_progress,
         "an explicit directory pull with no newly applied entries must not report replica progress"
     );
-
-    stop_primary.store(true, Ordering::SeqCst);
-    primary_thread.join().expect("primary thread");
-    drop(_runtime);
+    assert_eq!(
+        observer
+            .metadata_backend()
+            .unwrap()
+            .metadata_prefix_proof(&shard)
+            .unwrap(),
+        Some(after)
+    );
+    assert_eq!(progress.latest(), Some(observed));
+    drop(observer);
+    drop(primary);
+    _runtime.close().expect("normal native owner drain");
 }

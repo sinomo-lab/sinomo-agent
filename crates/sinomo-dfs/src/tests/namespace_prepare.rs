@@ -28,7 +28,11 @@ fn clustered_w2_foreground_create_commits_the_exact_authorized_namespace_prepare
         .expect("actual services assignment");
     let local = services.primary_node_id.clone();
     let remote = nodes.iter().find(|node| **node != local).unwrap().clone();
-    let mut dfs = runtime.client(&local).expect("normal primary client");
+    // The prepare hook is thread-local: execute through the real Core owner
+    // on this thread rather than a browser dispatch to a Main worker.
+    let mut dfs = runtime
+        .metadata_primary_service("/services")
+        .expect("actual Core metadata owner");
     let metadata_root = default_dfs_metadata_shards_root(runtime.data_dir(&local));
     let hook_configs = configs.clone();
     let observed_prepare = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -53,16 +57,29 @@ fn clustered_w2_foreground_create_commits_the_exact_authorized_namespace_prepare
                 .unwrap();
             assert_eq!(pending.status, DfsWriteIntentStatus::ReceiptsPending);
             *creation_from_hook.lock().unwrap() = Some(pending.created_at);
-            assert!(
-                pending.base_version.is_some(),
-                "public create retains its transient version token"
+            assert_eq!(
+                pending.base_version, None,
+                "a new native create has no durable predecessor"
             );
             assert_eq!(
-                pending.base_version.as_ref(),
-                pending
-                    .object_metadata
-                    .as_ref()
-                    .map(|object| &object.version)
+                pending.target_version, child.version,
+                "the pending write and sealed create name the same new version"
+            );
+            assert!(
+                prepare
+                    .expected_object_versions
+                    .iter()
+                    .any(|expected| expected.object_id == child.object_id
+                        && expected.expected_version.is_none())
+            );
+            assert!(
+                prepare
+                    .expected_path_occupants
+                    .iter()
+                    .any(
+                        |expected| expected.path == crate::namespace::metadata_path(&child.path)
+                            && expected.expected_object_id.is_none()
+                    )
             );
             assert!(backend.get_object(&child.object_id).unwrap().is_none());
             assert_eq!(pending.content_hash, child.content_hash);
@@ -220,7 +237,7 @@ fn clustered_w2_foreground_create_commits_the_exact_authorized_namespace_prepare
                 target_version: child_only_target,
                 requesting_node_id: local.clone(),
             },
-            Some(child_only_base),
+            None,
             b"child-only first publication".to_vec(),
             vec![local, remote],
             DfsReplicationPolicy::new(2, 2).expect("child-only W2 policy"),
@@ -297,8 +314,43 @@ fn concurrent_create_rejects_every_different_immutable_body_without_publication(
             .find(|shard| shard.shard_id == "services")
             .unwrap();
         let local = services.primary_node_id.clone();
-        let mut dfs = runtime.client(&local).unwrap();
+        let mut dfs = runtime.metadata_primary_service("/services").unwrap();
         let metadata_root = default_dfs_metadata_shards_root(runtime.data_dir(&local));
+        let mut author =
+            open_local_sharded_metadata_backend(metadata_root, configs.clone()).unwrap();
+        let control = runtime.shared_control_plane().unwrap();
+        let (pending, proof) = control.with_client(|kv| {
+            let store = DfsControlPlaneStore::new(kv.as_mut());
+            assert_eq!(
+                store
+                    .get_metadata_shard(&services.file_system_id, &services.shard_id)
+                    .unwrap()
+                    .as_ref(),
+                Some(services)
+            );
+            (
+                store
+                    .get_metadata_shard_membership_handoff(
+                        &services.file_system_id,
+                        &services.shard_id,
+                    )
+                    .unwrap(),
+                store
+                    .get_metadata_shard_membership_handoff_proof(
+                        &services.file_system_id,
+                        &services.shard_id,
+                    )
+                    .unwrap(),
+            )
+        });
+        crate::service_sync::rebind_completed_metadata_shard_membership_handoff(
+            &mut author,
+            &local,
+            services,
+            pending.as_ref(),
+            proof.as_ref(),
+        )
+        .unwrap();
         let captured = Arc::new(Mutex::new(None));
         let captured_from_hook = captured.clone();
         let recovery_fence = Arc::new(Mutex::new(None));
@@ -317,8 +369,9 @@ fn concurrent_create_rejects_every_different_immutable_body_without_publication(
                     child.mode ^= 0o100;
                     raced.terminal_intent.as_mut().unwrap().object_metadata = Some(child.clone());
                 }
-                let mut backend =
-                    open_local_sharded_metadata_backend(metadata_root, configs).unwrap();
+                // This competing writer was opened and bound through the real
+                // completed handoff before the foreground admission began.
+                let backend = &mut author;
                 let scope = backend
                     .publication_owner_scope(&raced.file_system_id, &raced.shard_id)
                     .unwrap();

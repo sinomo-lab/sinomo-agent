@@ -77,6 +77,25 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
     ) -> Result<Option<DfsPreparedOperationRecord>> {
         self.current_prepared_operation_record(operation_id)
     }
+    fn prepared_operation_read_context(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        file_system_id: &DfsFileSystemId,
+        operation_id: &str,
+    ) -> Result<(Option<DfsFileSystem>, Option<DfsPreparedOperationRecord>)> {
+        self.require_replication_source_shard(shard_id)?;
+        let tables = self.current_tables_snapshot()?;
+        let record = tables.prepared_operations_v7.get(operation_id).cloned();
+        if let Some(record) = &record {
+            record.validate()?;
+            if record.file_system_id != *file_system_id || record.shard_id != *shard_id {
+                return Err(MetadataBackendError::Serde(
+                    "prepare read context names a foreign operation scope".into(),
+                ));
+            }
+        }
+        Ok((tables.file_systems.get(file_system_id).cloned(), record))
+    }
     fn list_prepared_operations(&self) -> Result<Vec<DfsPreparedOperationRecord>> {
         let tables = self.current_tables_snapshot()?;
         Ok(tables
@@ -85,6 +104,19 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             .filter(|record| record.status == DfsPreparedOperationStatus::Prepared)
             .cloned()
             .collect())
+    }
+    fn prepared_operation_reservations(
+        &self,
+        payload: &crate::DfsPreparedOperationPayload,
+    ) -> Result<Vec<DfsPreparedOperationRecord>> {
+        if payload.shard_id != self.shard_id {
+            return Err(MetadataBackendError::Serde(
+                "prepared reservation query names a foreign physical shard".into(),
+            ));
+        }
+        Ok(self
+            .current_tables_snapshot()?
+            .prepared_operation_reservations(payload))
     }
     fn prepared_operation_for_request(
         &self,
@@ -182,8 +214,19 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         shard_id: &DfsMetadataShardId,
         digest: &crate::metadata_records::DfsPreparedOperationDigest,
         source: Option<&crate::DfsSourceAdoptionWitness>,
+        provider: Option<&crate::publication_guard::DfsPublicationExecutionProvider>,
+        execution: Option<&crate::publication_guard::DfsPublicationExecutionOwners>,
+        clustered: Option<&crate::DfsMetadataShardConfig>,
     ) -> Result<crate::publication_guard::DfsPublicationWriterSession> {
-        self.publication_writer_session_for_backend(file_system_id, shard_id, digest, source)
+        self.publication_writer_session_for_backend(
+            file_system_id,
+            shard_id,
+            digest,
+            source,
+            provider,
+            execution,
+            clustered,
+        )
     }
 
     fn publication_writer_file_system(
@@ -1830,6 +1873,7 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         batch: &DfsMetadataJournalBatch,
         frames: &[DfsMetadataJournalFrameRecord],
         expected_target_prefix: &DfsMetadataPrefixProof,
+        expected_operation: &crate::DfsMetadataAuthorityOperation,
     ) -> Result<DfsMetadataReplicaApplyReport> {
         LocalSobjMetadataBackend::persist_authority_journal_frames_with_replica_permit_report(
             self,
@@ -1837,6 +1881,7 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             batch,
             frames,
             expected_target_prefix,
+            expected_operation,
         )
     }
 

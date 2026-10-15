@@ -35,12 +35,18 @@ fn native_checkpoint_fixture(
             },
         )
         .unwrap();
-    let head = writer
+    drop(writer);
+    // The browser retains its pre-write inspection image. Select the actual
+    // owning Root journal that produced the acknowledged native write instead.
+    let source = runtime
+        .metadata_primary_service("/native-checkpoint.bin")
+        .unwrap();
+    let head = source
         .metadata_backend()
         .unwrap()
         .journal_last_sequence()
         .unwrap();
-    drop(writer);
+    drop(source);
     let mut reactor = DefaultDfsReconciliationRuntime::new(
         &ClusterPaths::new(&data_dir),
         &shard.primary_node_id,

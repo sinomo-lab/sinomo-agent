@@ -1,4 +1,4 @@
-//! Read-only inspection of the original native generation-8 image.
+//! Read-only inspection of original native generation-8 and generation-9 images.
 //! Its hashes describe retained DATA; native recovery separately replays the
 //! exact saved plan and committed activation request. DFS never opens this image.
 use super::{Result, error, source_proof};
@@ -43,8 +43,11 @@ enum Record {
         record: DfsPreparedOperationEviction,
     },
 }
-fn native8_document(bytes: &[u8]) -> Result<()> {
-    if bytes.len() < 6 || &bytes[..4] != MAGIC || u16::from_le_bytes([bytes[4], bytes[5]]) != 8 {
+fn native_document(bytes: &[u8], generation: u16) -> Result<()> {
+    if bytes.len() < 6
+        || &bytes[..4] != MAGIC
+        || u16::from_le_bytes([bytes[4], bytes[5]]) != generation
+    {
         return Err(error("prior native image has a foreign record generation"));
     }
     Ok(())
@@ -231,11 +234,14 @@ pub(super) fn inspect(root: &Path) -> Result<DfsMetadataCandidateIdentity> {
     let mut file = File::open(&path).map_err(error)?;
     let mut reader =
         MigrationStreamReader::from_file(file.try_clone().map_err(error)?).map_err(error)?;
-    native8_document(&reader.header)?;
     let header: Header = serde_ext::from_bytes(&reader.header).map_err(error)?;
+    let generation = header.format_version;
+    if !matches!(generation, 8 | 9) {
+        return Err(error("unknown original native image generation"));
+    }
+    native_document(&reader.header, generation)?;
     source_proof::validate(&header.prefix_proof)?;
-    if header.format_version != 8
-        || header.prefix_proof.version != 2
+    if header.prefix_proof.version != 2
         || header.materialized_through_sequence != header.prefix_proof.journal_sequence
     {
         return Err(error("invalid prior native image header/cut"));
@@ -247,7 +253,7 @@ pub(super) fn inspect(root: &Path) -> Result<DfsMetadataCandidateIdentity> {
         .next_record(MAX_RECORD_BYTES as usize)
         .map_err(error)?
     {
-        native8_document(&bytes)?;
+        native_document(&bytes, generation)?;
         let record: Record = serde_ext::from_bytes(&bytes).map_err(error)?;
         match record {
             Record::Table { op } => {
@@ -317,6 +323,15 @@ pub(super) fn inspect(root: &Path) -> Result<DfsMetadataCandidateIdentity> {
             }
             Record::Prepared { record } => {
                 let id = validate_prepare(&record)?;
+                if generation == 9 {
+                    let original: DfsPreparedOperationRecord =
+                        serde_json::from_value(record.clone()).map_err(error)?;
+                    original.validate()?;
+                    if serde_json::to_value(&original).map_err(error)? != record {
+                        return Err(error("original native9 preparation changes its typed body"));
+                    }
+                    tables.prepared_operations_v7.push(original);
+                }
                 if prepares.insert(id, record).is_some() {
                     return Err(error("prior native image repeats a preparation identity"));
                 }
@@ -342,25 +357,39 @@ pub(super) fn inspect(root: &Path) -> Result<DfsMetadataCandidateIdentity> {
     let jobs = jobs.into_values().collect::<Vec<_>>();
     let prepares = prepares.into_values().collect::<Vec<_>>();
     #[derive(Serialize)]
-    struct Semantic<'a> {
+    struct Semantic<T: Serialize> {
         format_version: u16,
         materialized_through_sequence: u64,
-        tables: Tables<'a>,
+        tables: T,
     }
     let mut semantic = blake3::Hasher::new();
-    serde_json::to_writer(
-        &mut semantic,
-        &Semantic {
-            format_version: 8,
-            materialized_through_sequence: header.materialized_through_sequence,
-            tables: Tables {
-                current_data: &tables,
-                jobs: &jobs,
-                prepares: &prepares,
+    if generation == 8 {
+        serde_json::to_writer(
+            &mut semantic,
+            &Semantic {
+                format_version: generation,
+                materialized_through_sequence: header.materialized_through_sequence,
+                tables: Tables {
+                    current_data: &tables,
+                    jobs: &jobs,
+                    prepares: &prepares,
+                },
             },
-        },
-    )
-    .map_err(error)?;
+        )
+        .map_err(error)?;
+    } else {
+        // Generation9 has the exact current non-alias DTO shape/order. Its
+        // source generation participates in the original semantic checksum.
+        serde_json::to_writer(
+            &mut semantic,
+            &Semantic {
+                format_version: generation,
+                materialized_through_sequence: header.materialized_through_sequence,
+                tables: &tables,
+            },
+        )
+        .map_err(error)?;
+    }
     let fingerprint = format!("blake3:{}", semantic.finalize().to_hex());
     if fingerprint != header.semantic_state_fingerprint {
         return Err(error("prior native image semantic checksum mismatch"));
@@ -423,6 +452,221 @@ mod tests {
     const SNAPSHOT: &[u8] = include_bytes!("fixtures/current8-history-cleanup.snapshot.sobj");
     const TABLE_LOG: &[u8] = include_bytes!("fixtures/current8-history-cleanup.materialized.slog");
     const JOURNAL: &[u8] = include_bytes!("fixtures/current8-history-cleanup.journal.slog");
+
+    // Exact native9 physical records produced by R1420's genuine normal
+    // three-node runtime. No header/epoch/body/digest/receipt is remodeled.
+    const NATIVE9_USERS: [(&str, &[u8]); 4] = [
+        (
+            "records/tables/snapshot.sobj",
+            include_bytes!("fixtures/native9-r1420-users/records/tables/snapshot.sobj"),
+        ),
+        (
+            "records/tables/materialized.slog",
+            include_bytes!("fixtures/native9-r1420-users/records/tables/materialized.slog"),
+        ),
+        (
+            "journal/head.sobj",
+            include_bytes!("fixtures/native9-r1420-users/journal/head.sobj"),
+        ),
+        (
+            "journal/segments/00000000000000000001.slog",
+            include_bytes!(
+                "fixtures/native9-r1420-users/journal/segments/00000000000000000001.slog"
+            ),
+        ),
+    ];
+    const NATIVE9_SERVICES: [(&str, &[u8]); 4] = [
+        (
+            "records/tables/snapshot.sobj",
+            include_bytes!("fixtures/native9-r1420-services/records/tables/snapshot.sobj"),
+        ),
+        (
+            "records/tables/materialized.slog",
+            include_bytes!("fixtures/native9-r1420-services/records/tables/materialized.slog"),
+        ),
+        (
+            "journal/head.sobj",
+            include_bytes!("fixtures/native9-r1420-services/journal/head.sobj"),
+        ),
+        (
+            "journal/segments/00000000000000000001.slog",
+            include_bytes!(
+                "fixtures/native9-r1420-services/journal/segments/00000000000000000001.slog"
+            ),
+        ),
+    ];
+    fn write_native9_fixture(root: &Path, files: &[(&str, &[u8])]) {
+        for (relative, bytes) in files {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
+    }
+    fn original_native9_prepares(root: &Path) -> Vec<Value> {
+        use super::super::source::{SourceCursor, SourceRecord};
+        let inventory = super::super::source::discover(root).unwrap();
+        let mut cursor = SourceCursor::new(inventory.clone());
+        let mut rows = Vec::new();
+        while let Some(record) = super::super::source::next(root, &mut cursor).unwrap() {
+            match record {
+                SourceRecord::JournalFrame { entry, .. }
+                    if entry["mutation"]["type"].as_str() == Some("prepare-operation-v7") =>
+                {
+                    rows.push(entry["mutation"]["record"].clone());
+                }
+                SourceRecord::TableBatch { batch, .. } => {
+                    for op in batch["ops"].as_array().unwrap() {
+                        if op["type"].as_str() == Some("put-prepared-operation-v7") {
+                            rows.push(op["record"].clone());
+                        }
+                    }
+                }
+                SourceRecord::SnapshotRow { table, row, .. }
+                    if table == "prepared_operations_v7" =>
+                {
+                    rows.push(row)
+                }
+                _ => {}
+            }
+        }
+        inventory.verify(root).unwrap();
+        rows
+    }
+    fn contains_old_alias_frame(row: &Value) -> bool {
+        row["payload"]["metadata_effects"]
+            .as_array()
+            .is_some_and(|effects| {
+                effects.iter().any(|effect| {
+                    effect["type"].as_str() == Some("put-namespace-job")
+                        && effect["job"]["pending_frames"]
+                            .as_array()
+                            .is_some_and(|frames| {
+                                frames.iter().any(|frame| {
+                                    frame["type"].as_str()
+                                        == Some("cross-shard-hardlink-alias-commit")
+                                })
+                            })
+                })
+            })
+    }
+    #[test]
+    fn actual_original_native9_non_alias_source_retains_full_prepare_identity_and_hash() {
+        let dir = sinomo_testdir::TestDir::new("original-native9-non-alias-source");
+        write_native9_fixture(dir.path(), &NATIVE9_USERS);
+        let identity = inspect(dir.path()).unwrap();
+        assert_eq!(
+            identity,
+            super::super::inspect_import_candidate(dir.path()).unwrap()
+        );
+        assert_eq!(
+            super::super::original_native_root_format(dir.path()).unwrap(),
+            Some(9)
+        );
+        assert!(!super::super::current_root(dir.path()).unwrap());
+        assert!(
+            LocalSobjMetadataBackend::open_for_inspection(
+                DfsMetadataShardId::new("users"),
+                dir.path()
+            )
+            .is_err(),
+            "normal current reader never admits native9"
+        );
+        let rows = original_native9_prepares(dir.path());
+        assert!(
+            !rows.is_empty(),
+            "a real producer body, not only its header, is required"
+        );
+        for row in rows {
+            assert!(!contains_old_alias_frame(&row));
+            let original = row.clone();
+            legacy_wire::validate_original_v7_record(&row).unwrap();
+            validate_prepare(&row).unwrap();
+            let exact: DfsPreparedOperationRecord = serde_json::from_value(row.clone()).unwrap();
+            exact.validate().unwrap();
+            assert_eq!(serde_json::to_value(&exact).unwrap(), original);
+            assert_eq!(
+                serde_json::to_value(payload_data(row["payload"].clone()).unwrap()).unwrap(),
+                original["payload"]
+            );
+            let mut changed = row;
+            changed["payload"]["owner_epoch"] = serde_json::json!(exact.payload.owner_epoch + 1);
+            assert!(legacy_wire::validate_original_v7_record(&changed).is_err());
+        }
+        for (relative, original) in NATIVE9_USERS {
+            assert_eq!(std::fs::read(dir.join(relative)).unwrap(), original);
+        }
+    }
+    #[test]
+    fn actual_original_native9_alias_digest_is_valid_but_missing_original_comparisons_blocks_conversion()
+     {
+        let dir = sinomo_testdir::TestDir::new("original-native9-missing-alias-custody");
+        write_native9_fixture(dir.path(), &NATIVE9_SERVICES);
+        assert!(!super::super::current_root(dir.path()).unwrap());
+        let rows = original_native9_prepares(dir.path());
+        let original_aliases = rows
+            .into_iter()
+            .filter(contains_old_alias_frame)
+            .collect::<Vec<_>>();
+        assert!(
+            !original_aliases.is_empty(),
+            "the genuine R1420 durable producer body must be present"
+        );
+        for row in original_aliases {
+            let original = row.clone();
+            let calculated =
+                legacy_wire::original_native9_alias_payload_digest(&row["payload"]).unwrap();
+            eprintln!(
+                "actual native9 alias original operation={} slot={} stored={} calculated={}",
+                row["digest"]["operation_id"],
+                row["digest"]["prepare_sequence"],
+                row["digest"]["payload_digest"],
+                calculated
+            );
+            assert_eq!(
+                Some(calculated.as_str()),
+                row["digest"]["payload_digest"].as_str()
+            );
+            legacy_wire::validate_original_v7_record(&row).unwrap();
+            assert!(serde_json::from_value::<DfsPreparedOperationRecord>(row.clone()).is_err());
+            assert!(matches!(
+                payload_data(row["payload"].clone()),
+                Err(MetadataBackendError::MissingOriginalSourceCustody { .. })
+            ));
+            assert_eq!(
+                row, original,
+                "no predicates, epochs, slots, digests or source bytes are fabricated"
+            );
+            let mut changed = row.clone();
+            changed["payload"]["operation_id"] = Value::String("changed-original-id".into());
+            assert!(legacy_wire::validate_original_v7_record(&changed).is_err());
+            let mut wrong_digest = row.clone();
+            wrong_digest["digest"]["payload_digest"] = Value::String(format!(
+                "dfs-prepared-operation-v7:blake3:{}",
+                "0".repeat(64)
+            ));
+            assert!(legacy_wire::validate_original_v7_record(&wrong_digest).is_err());
+            let mut unknown = row.clone();
+            unknown["payload"]["metadata_effects"][0]["job"]["unrecognized_custody"] =
+                Value::Bool(true);
+            assert!(legacy_wire::validate_original_v7_record(&unknown).is_err());
+            let mut changed_frame = row;
+            let effects = changed_frame["payload"]["metadata_effects"]
+                .as_array_mut()
+                .unwrap();
+            let alias = effects
+                .iter_mut()
+                .filter_map(|effect| effect["job"]["pending_frames"].as_array_mut())
+                .flat_map(|frames| frames.iter_mut())
+                .find(|frame| frame["type"].as_str() == Some("cross-shard-hardlink-alias-commit"))
+                .unwrap();
+            alias["transaction"]["transaction_id"] =
+                Value::String("changed-original-alias-body".into());
+            assert!(legacy_wire::validate_original_v7_record(&changed_frame).is_err());
+        }
+        for (relative, original) in NATIVE9_SERVICES {
+            assert_eq!(std::fs::read(dir.join(relative)).unwrap(), original);
+        }
+    }
 
     #[test]
     fn actual_prior_native_image_is_checked_without_current_admission() {

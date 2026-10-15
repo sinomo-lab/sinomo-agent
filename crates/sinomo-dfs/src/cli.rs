@@ -36,6 +36,7 @@ pub enum DfsCliCommand<C = ()> {
         json: bool,
     },
     MetadataShardTransferPrimary(DfsMetadataShardTransferPrimaryOptions),
+    MetadataShardSetReplicas(DfsMetadataShardSetReplicasOptions),
     PlacementAuthority(DfsPlacementAuthorityCliCommand),
     Mount(DfsMountOptions),
     Nfs(DfsNfsCliCommand),
@@ -115,6 +116,16 @@ pub struct DfsMetadataShardTransferPrimaryOptions {
     pub shard_id: String,
     pub new_primary_node_id: NodeId,
     pub expected_epoch: Option<u64>,
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct DfsMetadataShardSetReplicasOptions {
+    pub file_system_id: DfsFileSystemId,
+    pub shard_id: String,
+    /// Complete replica set; the current primary is retained separately.
+    pub replica_node_ids: Vec<NodeId>,
+    pub expected_epoch: u64,
     pub json: bool,
 }
 
@@ -270,6 +281,21 @@ pub fn dfs_cli_spec() -> CliCommandSpec {
                 CliCommandSpec::new("publish", "publish the primary metadata shard journal")
                     .with_options([json()]),
                 CliCommandSpec::new("shard", "manage metadata shards").with_children([
+                    CliCommandSpec::new("set-replicas", "request an exact metadata replica assignment")
+                        .with_options([
+                            filesystem(),
+                            option("--shard", "metadata shard id", "shard-id"),
+                            option("--replica", "assigned replica node (repeat for the complete set)", "node-id")
+                                .repeatable()
+                                .required(),
+                            option("--expected-epoch", "exact current shard epoch", "epoch")
+                                .required(),
+                            json(),
+                        ])
+                        .with_positionals([CliPositionalSpec::optional(CliValueSpec::new(
+                            "shard-id",
+                            "metadata shard id",
+                        ))]),
                     CliCommandSpec::new("transfer-primary", "transfer a metadata shard primary")
                         .with_options([
                             filesystem(),
@@ -520,6 +546,48 @@ pub fn parse_dfs_matches<C>(
         ["dfs", "metadata", "publish"] => Ok(DfsCliCommand::MetadataPublish {
             json: matches.contains("--json"),
         }),
+        ["dfs", "metadata", "shard", "set-replicas"] => {
+            let shard_id = matches
+                .value("--shard")
+                .or_else(|| matches.positionals().first().map(String::as_str))
+                .ok_or_else(|| CliParseError::Parse {
+                    detail: "metadata replica assignment requires a shard id".to_string(),
+                })?;
+            let replica_node_ids = matches
+                .values("--replica")
+                .map(parse_node_id)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(semantic_parse_error)?;
+            if replica_node_ids
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                != replica_node_ids.len()
+            {
+                return Err(CliParseError::Parse {
+                    detail: "metadata replica assignment contains a duplicate node".into(),
+                });
+            }
+            Ok(DfsCliCommand::MetadataShardSetReplicas(
+                DfsMetadataShardSetReplicasOptions {
+                    file_system_id: matches
+                        .value("--filesystem")
+                        .map(parse_dfs_file_system_id)
+                        .transpose()
+                        .map_err(semantic_parse_error)?
+                        .unwrap_or_else(default_dfs_file_system_id),
+                    shard_id: non_empty_string(shard_id, "metadata shard id")
+                        .map_err(semantic_parse_error)?,
+                    replica_node_ids,
+                    expected_epoch: required_option(matches, "--expected-epoch")?
+                        .parse::<u64>()
+                        .map_err(|source| CliParseError::Parse {
+                            detail: format!("invalid DFS metadata shard epoch: {source}"),
+                        })?,
+                    json: matches.contains("--json"),
+                },
+            ))
+        }
         ["dfs", "metadata", "shard", "transfer-primary"] => {
             let shard_id = matches
                 .value("--shard")
@@ -903,7 +971,8 @@ pub fn dfs_command_requires_cluster_state<C>(command: &DfsCliCommand<C>) -> bool
         DfsCliCommand::Services { .. }
         | DfsCliCommand::MetadataPublish { .. }
         | DfsCliCommand::RetryRepairs { .. }
-        | DfsCliCommand::MetadataShardTransferPrimary(_) => true,
+        | DfsCliCommand::MetadataShardTransferPrimary(_)
+        | DfsCliCommand::MetadataShardSetReplicas(_) => true,
         _ => false,
     }
 }
@@ -958,5 +1027,80 @@ mod repair_retry_tests {
         assert!(matches!(parse_dfs_command(&args).unwrap(),
             DfsCliCommand::RetryRepairs { compact_namespace_jobs, .. }
                 if compact_namespace_jobs == ["job-a", "job-b"]));
+    }
+}
+
+#[cfg(test)]
+mod metadata_replica_cli_tests {
+    use super::*;
+
+    #[test]
+    fn metadata_replica_assignment_requires_exact_epoch_and_unique_nodes() {
+        let a = NodeId::from_legacy_named("cli-metadata-replica-a").unwrap();
+        let b = NodeId::from_legacy_named("cli-metadata-replica-b").unwrap();
+        let args = [
+            "metadata",
+            "shard",
+            "set-replicas",
+            "root",
+            "--replica",
+            a.as_str(),
+            "--replica",
+            b.as_str(),
+            "--expected-epoch",
+            "2",
+            "--json",
+        ]
+        .map(String::from);
+        let parsed = parse_dfs_command(&args).unwrap();
+        assert!(dfs_command_requires_cluster_state(&parsed));
+        assert!(
+            matches!(parsed, DfsCliCommand::MetadataShardSetReplicas(options)
+            if options.replica_node_ids == [a.clone(), b] && options.expected_epoch == 2 && options.json)
+        );
+        for args in [
+            vec![
+                "metadata",
+                "shard",
+                "set-replicas",
+                "root",
+                "--replica",
+                a.as_str(),
+            ],
+            vec![
+                "metadata",
+                "shard",
+                "set-replicas",
+                "root",
+                "--expected-epoch",
+                "2",
+            ],
+            vec![
+                "metadata",
+                "shard",
+                "set-replicas",
+                "root",
+                "--replica",
+                a.as_str(),
+                "--replica",
+                a.as_str(),
+                "--expected-epoch",
+                "2",
+            ],
+            vec![
+                "metadata",
+                "shard",
+                "set-replicas",
+                "root",
+                "--replica",
+                a.as_str(),
+                "--expected-epoch",
+                "invalid",
+            ],
+        ] {
+            assert!(
+                parse_dfs_command(&args.into_iter().map(String::from).collect::<Vec<_>>()).is_err()
+            );
+        }
     }
 }

@@ -62,7 +62,7 @@ pub fn queue_namespace_reconciliation_work(
         detail: "namespace reconciliation has no registered runtime".into(),
     })?;
     if !Arc::ptr_eq(&current, &owner)
-        || host.shutting_down.load(Ordering::Acquire)
+        || host.shutting_down.is_cancelled()
         || binding.is_empty()
         || binding.len() > 512
     {
@@ -496,11 +496,7 @@ pub(super) fn daemon_dfs_offline_node_ids(
                 .ok()
                 .flatten()
         })
-        .filter(|host| {
-            !host
-                .shutting_down
-                .load(std::sync::atomic::Ordering::Acquire)
-        });
+        .filter(|host| !host.shutting_down.is_cancelled());
     sinomo_dfs::maintenance::dfs_offline_node_ids_with_transport_availability(
         cluster_paths,
         state,
@@ -815,6 +811,38 @@ pub(crate) fn daemon_dfs_pending_reactive_maintenance_work(
 pub(crate) fn daemon_dfs_pending_maintenance_work(
     paths: &DaemonPaths,
 ) -> Result<DaemonDfsPendingMaintenanceWork, DaemonError> {
+    daemon_dfs_pending_maintenance_work_with_topology(paths, None)
+}
+
+/// The same full diagnostic classifier, using the live owner's retained
+/// complete configuration instead of reopening its owned Raft files.
+#[cfg(test)]
+pub(crate) fn daemon_dfs_pending_maintenance_work_on_runtime(
+    paths: &DaemonPaths,
+    runtime: &tokio::runtime::Handle,
+) -> Result<DaemonDfsPendingMaintenanceWork, DaemonError> {
+    let data_dir = SinomoDataDir::new(daemon_data_dir(paths)?);
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)?;
+    let authority = daemon_dfs_metadata_authority_generation_for_identity(
+        &cluster_paths,
+        &state.cluster_id,
+        &state.local_node_id,
+        Some(runtime),
+    )?;
+    let topology = authority
+        .current_complete_prefix()
+        .ok_or_else(|| DaemonError::Parse {
+            detail: "full native diagnostic awaits a complete retained authority projection".into(),
+        })?;
+    daemon_dfs_pending_maintenance_work_with_topology(paths, Some(topology))
+}
+
+#[cfg(test)]
+fn daemon_dfs_pending_maintenance_work_with_topology(
+    paths: &DaemonPaths,
+    topology: Option<crate::DfsAuthoritativePrefixProjection>,
+) -> Result<DaemonDfsPendingMaintenanceWork, DaemonError> {
     let data_dir = daemon_data_dir(paths)?;
     let data_dir = SinomoDataDir::new(data_dir);
     let cluster_paths = ClusterPaths::new(&data_dir);
@@ -835,22 +863,26 @@ pub(crate) fn daemon_dfs_pending_maintenance_work(
 
         receipt_records,
         lookups,
-    } = daemon_dfs_maintenance_metadata_observation(&data_dir, &cluster_paths)?;
+    } = daemon_dfs_maintenance_metadata_observation(&data_dir, &cluster_paths, topology.clone())?;
     let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
         .map_err(DaemonError::from)?;
+    let authority_entries = match topology {
+        Some(topology) => topology.entries().to_vec(),
+        None => sinomo_core::cluster::read_cluster_kv_latest_observed_prefix_entries(
+            &cluster_paths,
+            DAEMON_DFS_METADATA_AUTHORITY_PREFIX,
+        )?,
+    };
     let pending_local_membership_handoff_count =
         daemon_dfs_local_membership_handoff_keys(&metadata_shard_statuses, &state.local_node_id)
             .into_iter()
-            .try_fold(0usize, |count, key| {
-                sinomo_core::cluster::read_cluster_kv_latest_observed_entry(&cluster_paths, &key)
-                    .map(|entry| count.saturating_add(usize::from(entry.is_some())))
-                    .map_err(DaemonError::from)
-            })?;
-    let membership_handoffs = cluster_dfs_all_metadata_shard_membership_handoffs(&cluster_paths)?;
-    let authority_entries = sinomo_core::cluster::read_cluster_kv_latest_observed_prefix_entries(
-        &cluster_paths,
-        DAEMON_DFS_METADATA_AUTHORITY_PREFIX,
-    )?;
+            .filter(|key| authority_entries.iter().any(|entry| &entry.key == key))
+            .count();
+    let membership_handoffs = authority_entries
+        .iter()
+        .filter(|entry| crate::dfs_metadata_shard_membership_handoff_key_is_exact(&entry.key))
+        .map(|entry| entry.decode::<crate::DfsMetadataShardMembershipHandoff>())
+        .collect::<Result<Vec<_>, _>>()?;
     let active_shards = authority_entries
         .iter()
         .filter(|entry| daemon_dfs_metadata_shard_config_key_is_exact(&entry.key))
@@ -868,12 +900,11 @@ pub(crate) fn daemon_dfs_pending_maintenance_work(
         read_dfs_repair_attempt_snapshot(&default_dfs_repair_attempt_snapshot_path(&data_dir))?
             .map(|snapshot| snapshot.records)
             .unwrap_or_default();
-    let placement_reconciliation_jobs =
-        sinomo_core::cluster::read_cluster_kv_latest_observed_prefix_entries(
-            &cluster_paths,
-            &sinomo_dfs::placement_reconciliations_prefix(&sinomo_dfs::sifs_file_system_id()),
-        )?
-        .into_iter()
+    let placement_prefix =
+        sinomo_dfs::placement_reconciliations_prefix(&sinomo_dfs::sifs_file_system_id());
+    let placement_reconciliation_jobs = authority_entries
+        .iter()
+        .filter(|entry| entry.key.starts_with(&placement_prefix))
         .map(|entry| entry.decode::<DfsPlacementReconciliationJob>())
         .collect::<Result<Vec<_>, _>>()?;
     let actionable_placement_reconciliation_count =

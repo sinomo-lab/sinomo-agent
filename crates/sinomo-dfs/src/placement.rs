@@ -1650,9 +1650,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let Some(control_plane) = self.control_plane.as_mut() else {
             return Ok(vec![DfsNodeAdvertisement::content(self.node_id.clone())]);
         };
-        let mut candidates = DfsControlPlaneStore::new(control_plane.as_mut())
-            .cluster_view()?
-            .content_nodes;
+        let mut candidates = match control_plane.write_configuration_projection()? {
+            Some(configuration) => configuration.content_advertisements()?,
+            // Compatibility callers retain the same content advertisements;
+            // metadata offers do not participate in content placement.
+            None => DfsControlPlaneStore::new(control_plane.as_mut()).content_services()?,
+        };
         if !candidates
             .iter()
             .any(|candidate| candidate.node_id == self.node_id)
@@ -2673,7 +2676,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(());
         }
         let owner_epoch = self.local_metadata_owner_epoch_for_object(&object)?;
-        let intent = DistributedWriteIntent {
+        let mut intent = DistributedWriteIntent {
             publication: Default::default(),
             intent_id: intent_id.clone(),
             file_system_id: object.file_system_id.clone(),
@@ -2690,6 +2693,33 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             create_predecessor_object_id: None,
             state: DfsWriteIntentState::Committed,
         };
+        if let Some(recorded) = self
+            .metadata_backend
+            .as_ref()
+            .map(|backend| backend.get_intent(object_id, &intent_id))
+            .transpose()?
+            .flatten()
+        {
+            let original = crate::intent::distributed_intent_from_record(&recorded);
+            let mut current_owner = original.clone();
+            current_owner.owner_epoch = intent.owner_epoch;
+            current_owner.requesting_node_id = intent.requesting_node_id.clone();
+            if original.owner_epoch > intent.owner_epoch
+                || (original.owner_epoch == intent.owner_epoch
+                    && original.requesting_node_id != intent.requesting_node_id)
+                || current_owner != intent
+                || recorded.content_hash.as_deref() != Some(content_hash.as_str())
+            {
+                return Err(DfsError::Metadata {
+                    message: "placement replay differs from its original committed obligation"
+                        .into(),
+                });
+            }
+            // The current job/plan and actual local primary were validated
+            // above. A handoff moves execution authority, not the immutable
+            // identity of the already committed placement obligation.
+            intent = original;
+        }
         let durable_receipts = desired_replica_node_ids
             .iter()
             .filter(|node_id| current.contains(*node_id))
@@ -3837,6 +3867,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         )>,
         DfsError,
     > {
+        #[cfg(test)]
+        let mut observation =
+            self.native_publication_owner_for_observation()
+                .and_then(|(root, owner)| {
+                    crate::test_runtime::observe_placement_authority_call(
+                        &root, &owner, job_id, path,
+                    )
+                });
         for attempt in 0..PLACEMENT_AUTHORITY_ACQUIRE_RETRIES {
             let Some((job, accepted_config, current_config)) =
                 self.authoritative_placement_reconciliation_for_path(file_system_id, job_id, path)?
@@ -3867,6 +3905,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     )?
             };
             if let Some(permit) = permit {
+                #[cfg(test)]
+                let permit = permit.with_native_observation(observation.take(), job.state.clone());
                 return Ok(Some((job, accepted_config, permit)));
             }
             if attempt + 1 < PLACEMENT_AUTHORITY_ACQUIRE_RETRIES {
@@ -3901,6 +3941,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     message: "control plane unavailable".to_string(),
                 }),
             };
+            #[cfg(test)]
+            permit.observe_native_release(result.is_ok());
             match result {
                 Ok(()) => return Ok(()),
                 Err(error) => {
@@ -7123,7 +7165,7 @@ mod tests {
 
     #[test]
     fn aggregate_impact_pages_past_the_first_metadata_chunk() {
-        let (_runtime, mut service, nodes) =
+        let (runtime, service, nodes) =
             native_placement_fixture("aggregate_impact_pages_past_the_first_metadata_chunk", 1);
         let node = |label: &str| nodes[label].clone();
         let advertisement = |label: &str, zone: &str| {
@@ -7132,6 +7174,9 @@ mod tests {
             candidate
         };
         let owner = node("node-a");
+        drop(service);
+        let mut service = runtime.metadata_primary_service("/services/paged").unwrap();
+
         let objects = (0..(PLACEMENT_IMPACT_PAGE_SIZE + 17))
             .map(|index| {
                 placement_object(
@@ -7144,7 +7189,11 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        native_placement_objects(&mut service, objects);
+        let objects = native_placement_objects(&mut service, objects);
+        assert_eq!(objects.len(), PLACEMENT_IMPACT_PAGE_SIZE + 17);
+        let parent = service.posix_stat("/services/paged").unwrap();
+        assert_eq!(parent.kind, DfsObjectKind::Directory);
+        assert!(objects.iter().all(|object| object.path != parent.path));
         let mut config = placement_config(owner);
         upsert_placement_rule(
             &mut config.subtree_policies,
@@ -7167,7 +7216,8 @@ mod tests {
             .expect("paged impact");
         assert_eq!(
             impact.affected_object_count,
-            (PLACEMENT_IMPACT_PAGE_SIZE + 17) as u64
+            objects.len() as u64 + 1,
+            "the subtree includes all 273 children and their actual native parent"
         );
         assert_eq!(impact.affected_bytes, 0);
         assert_eq!(impact.copies_added, 0);
@@ -7182,9 +7232,55 @@ mod tests {
                 31,
             )
             .expect("bounded page");
-        assert_eq!(first_page.impact.affected_object_count, 31);
+        let raw_first = service
+            .placement_object_page_for_file_system(&config.file_system_id, None, 31)
+            .unwrap();
+        assert_eq!(
+            raw_first.objects.len(),
+            31,
+            "unchanged metadata page budget"
+        );
+        let outside = raw_first
+            .objects
+            .iter()
+            .filter(|object| {
+                object.path != "/services/paged" && !object.path.starts_with("/services/paged/")
+            })
+            .map(|object| object.path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outside,
+            vec!["/services"],
+            "actual bootstrap parent is outside the proposed subtree"
+        );
+        assert_eq!(first_page.impact.affected_object_count, 30);
         assert!(first_page.next_cursor.is_some());
         assert!(first_page.blocking_diagnostics.is_empty());
+        let mut paged_count = first_page.impact.affected_object_count;
+        let mut cursor = first_page.next_cursor;
+        while let Some(after) = cursor {
+            let page = service
+                .placement_impact_page_for_config(
+                    &config,
+                    "/services/paged",
+                    DfsPlacementScope::Subtree,
+                    &[advertisement("node-a", "east")],
+                    Some(&after),
+                    31,
+                )
+                .unwrap();
+            assert!(page.impact.affected_object_count <= 31);
+            assert!(page.blocking_diagnostics.is_empty());
+            paged_count += page.impact.affected_object_count;
+            cursor = page.next_cursor;
+        }
+        assert_eq!(
+            paged_count, impact.affected_object_count,
+            "every original child and its real parent is covered exactly once"
+        );
+        drop(service);
+        assert_eq!(runtime.observation_dropped_count(), 0);
+        runtime.close().unwrap();
     }
 
     #[test]

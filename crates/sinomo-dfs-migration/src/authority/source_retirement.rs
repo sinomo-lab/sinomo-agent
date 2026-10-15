@@ -130,8 +130,14 @@ impl NativeImportAuthority {
                 &proof,
             )?;
             self.original_scope_still_retired(&proof)?;
-            let stage = self.commit(blueprint.plan.stage_request.clone())?;
-            let activation = self.commit(blueprint.activation_request.clone())?;
+            let stage = self.observe_original_import_commit(
+                &blueprint.plan,
+                blueprint.plan.stage_request.clone(),
+            )?;
+            let activation = self.observe_original_import_commit(
+                &blueprint.plan,
+                blueprint.activation_request.clone(),
+            )?;
             Self::require_committed(&stage)?;
             Self::require_committed(&activation)?;
             if !stage.result.replayed_committed_request
@@ -141,6 +147,7 @@ impl NativeImportAuthority {
                     "namespace work requires already committed original receipts",
                 ));
             }
+            self.original_scope_still_retired(&proof)?;
             let scope = (
                 proof.retiring_shard.file_system_id.clone(),
                 sinomo_dfs::DfsMetadataShardId::new(&proof.retiring_shard.shard_id),
@@ -464,6 +471,23 @@ impl NativeImportAuthority {
             sinomo_dfs::DfsMetadataShardMembershipHandoffProof,
         )>,
     > {
+        self.evaluate_scope_retirement(file_system_id, shard_id)
+            .map_err(NativeEvaluationError::into_metadata)
+    }
+
+    pub(super) fn evaluate_scope_retirement(
+        &self,
+        file_system_id: &sinomo_dfs::DfsFileSystemId,
+        shard_id: &sinomo_dfs::DfsMetadataShardId,
+    ) -> std::result::Result<
+        Option<(
+            MetadataImportPlan,
+            DfsNativeTxnCommit,
+            DfsNativeTxnCommit,
+            sinomo_dfs::DfsMetadataShardMembershipHandoffProof,
+        )>,
+        NativeEvaluationError,
+    > {
         let key =
             sinomo_dfs::metadata_shard_membership_handoff_proof_key(file_system_id, &shard_id.0);
         let (entries, _) = self.read_exact(&[key])?;
@@ -498,8 +522,9 @@ impl NativeImportAuthority {
             let actual = Self::activation_proof(&activation)?
                 .ok_or_else(|| error("original activation request has no exact joint proof"))?;
             self.validate_activation_request(&activation, &plan, &actual)?;
-            let stage_commit = self.commit(plan.stage_request.clone())?;
-            let activation_commit = self.commit(activation)?;
+            let stage_commit =
+                self.evaluate_original_import_commit(&plan, plan.stage_request.clone())?;
+            let activation_commit = self.evaluate_original_import_commit(&plan, activation)?;
             Self::require_committed(&stage_commit)?;
             Self::require_committed(&activation_commit)?;
             self.original_scope_still_retired(&actual)?;

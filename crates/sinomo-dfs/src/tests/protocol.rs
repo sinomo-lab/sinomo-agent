@@ -918,114 +918,104 @@ fn node_transport_relays_remote_returned_messages_preserving_source() {
 
 #[test]
 fn served_message_drains_nested_stage_response_before_returning() {
-    let root = temp_root("served-object-message-drains-nested-stage-response");
-    let requester = NodeId::from_legacy_named("node_served_frame_requester").expect("requester");
-    let primary = NodeId::from_legacy_named("node_served_frame_primary").expect("primary");
-    let replica = NodeId::from_legacy_named("node_served_frame_replica").expect("replica");
-    let object_id = DfsObjectId::from_legacy_named("obj_served_frame_routed").expect("object");
-    let version_1 = DfsVersion::from_legacy_named("version_served_frame_1").expect("version");
-    let version_2 = DfsVersion::from_legacy_named("version_served_frame_2").expect("version");
-    let stage_calls = Arc::new(Mutex::new(Vec::new()));
-    let promotion_calls = Arc::new(Mutex::new(Vec::new()));
-    let promotion_gate = Arc::new((Mutex::new((false, false)), Condvar::new()));
-    let stage_calls_for_sender = Arc::clone(&stage_calls);
-    let promotion_calls_for_sender = Arc::clone(&promotion_calls);
-    let promotion_gate_for_sender = Arc::clone(&promotion_gate);
-    let replica_for_sender = replica.clone();
-    let sender: DfsMessageSender = Arc::new(move |target_node_id, command, _timeout| {
-        assert_eq!(target_node_id, &replica_for_sender);
-        let message = command.routed_message.message.clone();
-        let stage = match message {
-            DfsNetworkMessage::StageBlob(stage) => stage,
-            DfsNetworkMessage::CommitVersion(commit) => {
-                promotion_calls_for_sender
-                    .lock()
-                    .expect("promotion calls lock")
-                    .push(commit.intent_id.clone());
-                let (state, changed) = promotion_gate_for_sender.as_ref();
-                let mut state = state.lock().expect("promotion gate");
-                state.0 = true;
-                changed.notify_all();
-                while !state.1 {
-                    state = changed.wait(state).expect("promotion release");
-                }
-                drop(state);
-                return Ok(DfsMessageResponse {
-                    request_id: command.request_id.clone(),
-                    outbound_messages: vec![DfsRoutedMessage {
-                        source_node_id: command.routed_message.target_node_id.clone(),
-                        target_node_id: command.routed_message.source_node_id.clone(),
-                        frame_id: command.routed_message.frame_id,
-                        message_id: command.routed_message.message_id,
-                        message: DfsNetworkMessage::CommitVersionResponse(
-                            DfsCommitVersionResponse {
-                                request_id: commit.request_id,
-                                intent_id: commit.intent_id,
-                                file_system_id: commit.file_system_id,
-                                object_id: commit.object_id,
-                                version: commit.version,
-                                replica_node_id: command.routed_message.target_node_id.clone(),
-                                result: DfsBlobTransferResult::Committed {
-                                    content_hash: commit.content_hash,
-                                },
-                            },
-                        ),
-                    }],
-                });
-            }
-            _ => {
-                return Ok(DfsMessageResponse {
-                    request_id: command.request_id.clone(),
-                    outbound_messages: Vec::new(),
-                });
-            }
-        };
-        stage_calls_for_sender
-            .lock()
-            .expect("stage calls lock")
-            .push(stage.request_id.clone());
-        let response = DfsNetworkMessage::StageBlobResponse(DfsStageBlobResponse {
-            request_id: stage.request_id,
-            intent_id: stage.intent_id,
-            file_system_id: stage.file_system_id,
-            object_id: stage.object_id,
-            version: stage.version,
-            replica_node_id: command.routed_message.target_node_id.clone(),
-            result: DfsBlobTransferResult::Durable {
-                content_hash: stage.content_hash,
+    let name = "native-served-nested-stage-response";
+    let (runtime, browser, shard) =
+        crate::test_support::current_native_metadata_service(name, 3, "/services").unwrap();
+    drop(browser);
+    let primary = shard.primary_node_id.clone();
+    let peers = crate::test_runtime::DfsTestRuntime::ordered_node_ids(name, 3)
+        .into_iter()
+        .filter(|node| *node != primary)
+        .collect::<Vec<_>>();
+    let replica = peers[0].clone();
+    let requester = peers[1].clone();
+    let path = "/services/served-frame-routed.txt";
+    let mut placement = DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 2, 2).unwrap();
+    placement.required_node_ids = vec![primary.clone(), replica.clone()];
+    let accepted = runtime
+        .apply_placement_policy(&primary, path, DfsPlacementScope::SelfOnly, placement)
+        .unwrap();
+    let control = runtime.shared_control_plane().unwrap();
+    let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    loop {
+        let job = control
+            .with_client(|kv| {
+                DfsControlPlaneStore::new(kv.as_mut())
+                    .placement_reconciliation(&accepted.file_system_id, &accepted.job_id)
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.scanned_object_count, 0);
+        assert_eq!(job.accepted_config, accepted.accepted_config);
+        assert!(job.last_error.is_none());
+        if job.state == DfsPlacementReconciliationState::Completed {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(!remaining.is_zero(), "normal empty Apply setup deadline");
+        runtime
+            .maintenance_tick(&primary, remaining)
+            .unwrap()
+            .outcome
+            .unwrap();
+    }
+    drop(control);
+    let mut dfs = runtime.metadata_primary_service(path).unwrap();
+    let (_, _, policy) = dfs
+        .managed_replication_policy_for_path(path, DfsObjectPolicy::ReplicatedEventual, 2)
+        .unwrap();
+    let base = dfs
+        .posix_write_file(
+            path,
+            b"actual sealed predecessor",
+            DfsWriteOptions {
+                policy: policy.clone(),
+                replica_candidates: vec![primary.clone(), replica.clone()],
+                wait_for_commit: true,
+                foreground_replica_repair: true,
             },
-        });
-        Ok(DfsMessageResponse {
-            request_id: command.request_id.clone(),
-            outbound_messages: vec![DfsRoutedMessage {
-                source_node_id: command.routed_message.target_node_id.clone(),
-                target_node_id: command.routed_message.source_node_id.clone(),
-                frame_id: 100,
-                message_id: 100,
-                message: response,
-            }],
-        })
-    });
-    let transport = served_transport_with_canonical_message_peer(
+        )
+        .unwrap();
+    dfs.flush_detached_transport_sends().unwrap();
+    dfs.process_incoming().unwrap();
+    let original = dfs
+        .metadata_backend()
+        .unwrap()
+        .get_object(&base.object_id)
+        .unwrap()
+        .unwrap();
+    let object_id = base.object_id;
+    let version_1 = base.version;
+    let version_2 = crate::namespace::next_version(&version_1);
+    let requester_service = runtime.client(&requester).unwrap();
+    requester_service
+        .content()
+        .put_object_version(
+            object_id.as_str(),
+            version_2.as_str(),
+            b"served routed bytes",
+        )
+        .unwrap();
+    drop(requester_service);
+    let (peer, async_peer) = runtime.peer_transports(&primary).unwrap();
+    dfs.transport = DfsNodeTransport::new_with_peer_transports_for_nodes(
         primary.clone(),
-        vec![replica.clone()],
-        sender,
+        peers,
+        peer,
+        async_peer,
         Duration::from_millis(1),
     );
-    let content = LocalContentStore::new(root.join("content")).expect("content store");
-    let metadata = open_root_local_metadata_backend(root.join("metadata")).expect("metadata");
-    let mut dfs = NetworkedDfsService::new(transport, content)
-        .with_metadata_backend(metadata)
-        .expect("metadata backend");
-    dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
-    let mut object = file_metadata(primary.clone());
-    object.object_id = object_id.clone();
-    object.path = "/services/served-frame/routed.txt".to_string();
-    object.version = version_1.clone();
-    object.policy = DfsObjectPolicy::ReplicatedEventual;
-    object.current_locations = vec![primary.clone()];
-    dfs.add_object_metadata(object).expect("object metadata");
-
+    let promotion_gate = Arc::new(tokio::sync::Semaphore::new(0));
+    runtime.install_fault(crate::test_runtime::FaultRule {
+        source: Some(primary.clone()),
+        target: Some(replica.clone()),
+        route: Some(crate::DFS_DATA_COMMIT_VERSION_ROUTE.into()),
+        call_id: None,
+        origin: Some(crate::test_runtime::RpcOrigin::RegisteredHost),
+        remaining_hits: 1,
+        action: crate::test_runtime::FaultAction::PauseBeforeDispatch(Arc::clone(&promotion_gate)),
+    });
+    let observed_before = runtime.rpc_observations().len();
     let request_id = "dfs_net_req_served_frame".to_string();
     let command = DfsDistributedWriteCommand {
         publication: Default::default(),
@@ -1044,9 +1034,9 @@ fn served_message_drains_nested_stage_response_before_returning() {
         content_size_bytes: None,
         requester_blob_pre_staged: true,
         desired_replica_nodes: vec![primary.clone(), replica.clone()],
-        policy: DfsReplicationPolicy::new(2, 2).expect("policy"),
-        object_metadata: None,
-        authority_shard: None,
+        policy,
+        object_metadata: Some(original),
+        authority_shard: Some(shard),
         touch_parent_on_create: false,
         foreground_replica_repair: true,
         exclusive_create: false,
@@ -1066,13 +1056,25 @@ fn served_message_drains_nested_stage_response_before_returning() {
         ))
         .expect("process DFS message");
 
-    assert_eq!(stage_calls.lock().expect("stage calls lock").len(), 1);
+    let calls = runtime.rpc_observations()[observed_before..].to_vec();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call.source == primary
+                && call.target == replica
+                && call.route == crate::DFS_DATA_STAGE_BLOB_ROUTE
+                && call.phase == crate::test_runtime::RpcPhase::Completed)
+            .count(),
+        1,
+        "one actual nested Stage completes: {:?}",
+        result.events
+    );
     assert!(
-        promotion_calls
-            .lock()
-            .expect("promotion calls lock")
-            .is_empty(),
-        "served write response must be complete before replica promotion dispatch"
+        !calls.iter().any(|call| call.source == primary
+            && call.target == replica
+            && call.route == crate::DFS_DATA_COMMIT_VERSION_ROUTE
+            && call.phase == crate::test_runtime::RpcPhase::BeforeDispatch),
+        "served response completes before promotion dispatch"
     );
     assert!(
         dfs.writes.pending_writes.is_empty(),
@@ -1142,12 +1144,24 @@ fn served_message_drains_nested_stage_response_before_returning() {
 
     let mut promotion_worker = dfs.prepare_message_deferred_work();
     let promotion_thread = std::thread::spawn(move || promotion_worker.drain());
-    let (gate, changed) = promotion_gate.as_ref();
-    let entered = gate.lock().expect("promotion gate");
-    let (mut entered, wait) = changed
-        .wait_timeout_while(entered, Duration::from_secs(1), |state| !state.0)
-        .expect("promotion dispatch wait");
-    let timed_out = wait.timed_out();
+    let promotion_deadline = Instant::now() + Duration::from_secs(1);
+    let entered = loop {
+        if runtime.rpc_observations()[observed_before..]
+            .iter()
+            .any(|call| {
+                call.source == primary
+                    && call.target == replica
+                    && call.route == crate::DFS_DATA_COMMIT_VERSION_ROUTE
+                    && call.phase == crate::test_runtime::RpcPhase::BeforeDispatch
+            })
+        {
+            break true;
+        }
+        if Instant::now() >= promotion_deadline {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    };
     let deferred_work_pending = dfs
         .message_deferred_work_pending()
         .expect("inflight promotion outbox");
@@ -1155,14 +1169,13 @@ fn served_message_drains_nested_stage_response_before_returning() {
         .current_read_object_metadata(&object_id)
         .expect("primary remains usable while promotion waits")
         .version;
-    entered.1 = true;
-    changed.notify_all();
-    drop(entered);
+    runtime.clear_faults();
+    promotion_gate.add_permits(1);
     promotion_thread
         .join()
         .expect("promotion worker thread")
         .expect("drain post-response replica promotion");
-    assert!(!timed_out, "promotion RPC should enter its sender");
+    assert!(entered, "promotion RPC should enter its actual sender");
     assert!(
         !deferred_work_pending,
         "the detached worker must claim the promotion without retaining the service lane"
@@ -1172,12 +1185,19 @@ fn served_message_drains_nested_stage_response_before_returning() {
         "a blocked promotion RPC must not prevent the primary service from serving later work"
     );
     assert_eq!(
-        promotion_calls.lock().expect("promotion calls lock").len(),
+        runtime.rpc_observations()[observed_before..]
+            .iter()
+            .filter(|call| call.source == primary
+                && call.target == replica
+                && call.route == crate::DFS_DATA_COMMIT_VERSION_ROUTE
+                && call.phase == crate::test_runtime::RpcPhase::Completed)
+            .count(),
         1,
         "the durable staged replica should be promoted exactly once after response"
     );
 
-    std::fs::remove_dir_all(root).ok();
+    drop(dfs);
+    runtime.close().unwrap();
 }
 
 #[test]
@@ -1315,7 +1335,7 @@ fn networked_dfs_async_send_uses_typed_object_message_path() {
             .iter()
             .any(|event| event.source == requester
                 && event.target == owner
-                && event.route == crate::DFS_DATA_READ_ROUTE
+                && event.route == crate::DFS_DIRECT_READ_ROUTE
                 && event.phase == crate::test_support::DfsTestRpcPhase::Completed)
     );
     drop(client);
@@ -1877,11 +1897,59 @@ fn background_quorum_stage_refills_failed_target_without_retry_tick() {
     let primary = config.primary_node_id;
     let nodes = crate::test_support::DfsTestRuntime::ordered_node_ids(name, 3);
     let path = "/services/native-quorum-refill.bin";
-    let mut file_system = runtime.file_system();
-    let mut policy = DfsSubtreePolicy::new(path, DfsObjectPolicy::ReplicatedEventual, 2, 3);
-    policy.required_node_ids = nodes.clone();
-    file_system.subtree_policies.push(policy);
-    dfs.add_file_system(file_system).unwrap();
+    drop(dfs);
+    let mut placement = DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 2, 3).unwrap();
+    placement.required_node_ids = nodes.clone();
+    let accepted = runtime
+        .apply_placement_policy(&primary, path, DfsPlacementScope::SelfOnly, placement)
+        .unwrap();
+    let control = runtime.shared_control_plane().unwrap();
+    let setup_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    loop {
+        let job = control
+            .with_client(|kv| {
+                DfsControlPlaneStore::new(kv.as_mut())
+                    .placement_reconciliation(&accepted.file_system_id, &accepted.job_id)
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.accepted_config, accepted.accepted_config);
+        assert_eq!(job.scanned_object_count, 0);
+        assert!(job.last_error.is_none());
+        if job.state == DfsPlacementReconciliationState::Completed {
+            break;
+        }
+        let remaining = setup_deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "actual empty Apply remains within its network budget"
+        );
+        runtime
+            .maintenance_tick(&primary, remaining)
+            .unwrap()
+            .outcome
+            .unwrap();
+    }
+    drop(control);
+    let background = runtime
+        .deny_background_replica_before_claim(&primary)
+        .unwrap();
+    let mut dfs = runtime.metadata_primary_service(path).unwrap();
+    let (_, _, policy) = dfs
+        .managed_replication_policy_for_path(path, DfsObjectPolicy::ReplicatedEventual, 3)
+        .unwrap();
+    assert_eq!(
+        (policy.min_commit_replicas, policy.desired_replicas),
+        (2, 3)
+    );
+    assert_eq!(
+        policy
+            .required_node_ids
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        nodes.iter().cloned().collect()
+    );
     runtime.install_fault(crate::test_support::DfsTestFaultRule {
         source: Some(primary.clone()),
         target: None,
@@ -1889,7 +1957,7 @@ fn background_quorum_stage_refills_failed_target_without_retry_tick() {
         call_id: None,
         origin: Some(crate::test_support::DfsTestRpcOrigin::RegisteredHost),
         remaining_hits: 1,
-        action: crate::test_support::DfsTestFaultAction::BudgetExhausted,
+        action: crate::test_support::DfsTestFaultAction::BudgetExhaustedForFirstCall,
     });
     let before = runtime.rpc_observations().len();
     let retry_tick = dfs.repair_retry_tick;
@@ -1902,7 +1970,7 @@ fn background_quorum_stage_refills_failed_target_without_retry_tick() {
             &bytes,
             DfsWriteOptions {
                 replica_candidates: nodes,
-                policy: DfsReplicationPolicy::new(2, 3).unwrap(),
+                policy,
                 wait_for_commit: true,
                 foreground_replica_repair: false,
             },
@@ -1926,6 +1994,16 @@ fn background_quorum_stage_refills_failed_target_without_retry_tick() {
         .find(|event| event.phase == crate::test_support::DfsTestRpcPhase::Completed)
         .unwrap();
     assert_ne!(failed.target, accepted.target);
+    assert_ne!(failed.call_id, accepted.call_id);
+    assert_eq!(
+        calls
+            .iter()
+            .filter(
+                |event| event.phase == crate::test_support::DfsTestRpcPhase::EndedWithoutResponse
+            )
+            .count(),
+        1
+    );
     let receipts = dfs
         .metadata_backend()
         .unwrap()
@@ -1954,6 +2032,7 @@ fn background_quorum_stage_refills_failed_target_without_retry_tick() {
     drop(peer);
     drop(dfs);
     runtime.clear_faults();
+    drop(background);
     runtime.close().unwrap();
 }
 
@@ -2019,15 +2098,31 @@ fn malformed_dfs_object_rpc_message_does_not_block_following_valid_message() {
             range_max_bytes: None,
         }),
     );
+    let deadline = Instant::now() + Duration::from_secs(5);
     let reply = runtime
-        .rpc_request(
+        .rpc_result(
             &requester,
             &server,
-            dfs_message_rpc_request(&command).unwrap(),
+            sinomo_core::network::ObjectRpcCall::value(dfs_message_rpc_request(&command).unwrap()),
             Duration::from_secs(5),
         )
         .unwrap();
-    let response = decode_dfs_message_rpc_response(&reply).unwrap();
+    assert!(
+        !reply.body.is_empty(),
+        "actual data-read reply owns its attachment"
+    );
+    let head =
+        crate::body_rpc::decode_dfs_attachment_message_rpc_response(&reply.response).unwrap();
+    assert_eq!(head.attachment.total_size_bytes, bytes.len() as u64);
+    let response = runtime.runtime_handle().block_on(async {
+        tokio::time::timeout(
+            deadline.saturating_duration_since(Instant::now()),
+            crate::node_transport::dfs_message_response_from_rpc_result(reply),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+    });
     assert!(matches!(response.outbound_messages.as_slice(),
         [DfsRoutedMessage { message: DfsNetworkMessage::ReadResponse(DfsReadResponse {
             request_id, object_id, result: DfsReadResult::Found(data),
@@ -2168,12 +2263,31 @@ fn stage_command_accepts_metadata_shard_primary_for_transient_object() {
             .is_none()
     );
     drop(before_replica);
-    let mut writer = runtime.client(&owner).unwrap();
-    let mut file_system = runtime.file_system();
     let mut policy = DfsSubtreePolicy::new(path, DfsObjectPolicy::ReplicatedConfirmed, 2, 2);
     policy.required_node_ids = vec![owner.clone(), replica.clone()];
-    file_system.subtree_policies.push(policy);
-    writer.add_file_system(file_system).unwrap();
+    let mut requested =
+        DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedConfirmed, 2, 2).unwrap();
+    requested.required_node_ids = policy.required_node_ids.clone();
+    runtime
+        .apply_placement_policy(&primary, path, DfsPlacementScope::Subtree, requested)
+        .unwrap();
+    let actual_config = runtime.shared_control_plane().unwrap().with_client(|kv| {
+        DfsControlPlaneStore::new(kv.as_mut())
+            .get_file_system_config(&sifs_file_system_id())
+            .unwrap()
+            .unwrap()
+    });
+    assert!(
+        actual_config.subtree_policies.contains(&policy),
+        "stage coverage requires its actual committed required-node rule: {actual_config:?}"
+    );
+    let mut writer = runtime.client(&owner).unwrap();
+    let (_, _, write_policy) = writer
+        .managed_replication_policy_for_path(path, DfsObjectPolicy::ReplicatedConfirmed, 2)
+        .unwrap();
+    assert_eq!(write_policy.min_commit_replicas, 2);
+    assert_eq!(write_policy.desired_replicas, 2);
+    assert_eq!(write_policy.required_node_ids, policy.required_node_ids);
     let before = runtime.rpc_observations().len();
     let bytes = b"actual metadata primary stages a requester's new object";
     let stat = writer
@@ -2182,19 +2296,24 @@ fn stage_command_accepts_metadata_shard_primary_for_transient_object() {
             bytes,
             DfsWriteOptions {
                 replica_candidates: vec![owner.clone(), replica.clone()],
-                policy: DfsReplicationPolicy::new(2, 2).unwrap(),
+                policy: write_policy,
                 wait_for_commit: true,
                 foreground_replica_repair: false,
             },
         )
         .unwrap();
+    assert_eq!(stat.policy, DfsObjectPolicy::ReplicatedConfirmed);
+    let stage_observations = runtime.rpc_observations();
     assert!(
-        runtime.rpc_observations()[before..]
+        stage_observations[before..]
             .iter()
             .any(|event| event.source == primary
                 && event.target == replica
                 && event.route == DFS_DATA_STAGE_BLOB_ROUTE
-                && event.phase == crate::test_support::DfsTestRpcPhase::Completed)
+                && event.phase == crate::test_support::DfsTestRpcPhase::Completed),
+        "actual completed write={stat:?}; first actual RPC cut={:?}; subsequent actual RPC cut={:?}",
+        &stage_observations[before..],
+        &runtime.rpc_observations()[before..]
     );
     let publisher = runtime.client(&primary).unwrap();
     let metadata = publisher
@@ -2238,11 +2357,10 @@ fn stage_command_accepts_metadata_shard_primary_for_transient_object() {
 
 #[test]
 fn visible_metadata_publication_is_idempotent() {
-    let root = temp_root("visible-metadata-publication-idempotent");
     let node_id = NodeId::from_legacy_named("node_visible_metadata_idempotent").expect("node");
     let file_path = "/services/sandbox/instances/sandbox_meta/work/site.py";
 
-    let (_runtime, mut dfs) = native_sifs_service(
+    let (runtime, mut dfs) = native_sifs_service(
         "visible_metadata_publication_is_idempotent",
         node_id.clone(),
     );
@@ -2258,9 +2376,11 @@ fn visible_metadata_publication_is_idempotent() {
     let object = dfs
         .current_read_object_metadata(&stat.object_id)
         .expect("current object");
-    let journal_count_before = std::fs::read_dir(root.join("metadata/journal"))
-        .expect("journal dir")
-        .count();
+    let journal_before = dfs
+        .metadata_backend()
+        .unwrap()
+        .metadata_shard_statuses()
+        .unwrap();
 
     dfs.put_visible_object_in_metadata_backend(&object)
         .expect("repeat visible object");
@@ -2269,15 +2389,26 @@ fn visible_metadata_publication_is_idempotent() {
     dfs.put_object_version_size_in_metadata_backend(&object, stat.size_bytes)
         .expect("repeat visible version size");
 
-    let journal_count_after = std::fs::read_dir(root.join("metadata/journal"))
-        .expect("journal dir")
-        .count();
+    let journal_after = dfs
+        .metadata_backend()
+        .unwrap()
+        .metadata_shard_statuses()
+        .unwrap();
     assert_eq!(
-        journal_count_after, journal_count_before,
+        journal_after, journal_before,
         "re-publishing unchanged object/version metadata should not emit journal entries"
     );
 
-    std::fs::remove_dir_all(root).ok();
+    assert_eq!(
+        dfs.current_read_object_metadata(&stat.object_id).unwrap(),
+        object
+    );
+    assert_eq!(
+        dfs.posix_read_file(file_path).unwrap(),
+        b"print('metadata')\n"
+    );
+    drop(dfs);
+    runtime.close().unwrap();
 }
 
 #[test]
@@ -2341,15 +2472,24 @@ fn local_eventual_batch_shard_selection_uses_one_current_snapshot_for_bulk_paths
     let name = "native-local-eventual-bulk-capture";
     let (runtime, service, config) =
         crate::test_support::current_native_metadata_service(name, 1, "/services").unwrap();
-    let owner = config.primary_node_id;
+    let owner = config.primary_node_id.clone();
     drop(service);
-    let (mut dfs, probe) = runtime.client_with_control_plane_probe(&owner).unwrap();
+    // These counters and the explicit publication replay belong to the actual
+    // owning Core lane, rather than a browser facade's sharded read projection.
+    let (mut dfs, probe) = runtime
+        .metadata_primary_service_with_control_plane_probe("/services")
+        .unwrap();
     dfs.posix_mkdir_all("/services/native-bulk").unwrap();
+    let parent_before = dfs.posix_stat("/services/native-bulk").unwrap();
+    let shard_id = DfsMetadataShardId::new(&config.shard_id);
     let before = dfs
         .metadata_backend()
         .unwrap()
-        .list_prepared_operations()
+        .export_shard_table_snapshot(&shard_id)
         .unwrap()
+        .unwrap()
+        .tables
+        .prepared_operations_v7
         .into_iter()
         .map(|record| record.digest.operation_id)
         .collect::<BTreeSet<_>>();
@@ -2367,6 +2507,10 @@ fn local_eventual_batch_shard_selection_uses_one_current_snapshot_for_bulk_paths
         .posix_create_files_local_eventual_with_known_parents(files.iter().copied())
         .unwrap();
     let snapshot_calls = crate::metadata_backend::metadata_current_tables_snapshot_calls();
+    eprintln!(
+        "64-file bulk: snapshots={snapshot_calls}, prepare_read_sets={}",
+        crate::service_metadata::namespace_prepare_expectation_capture_calls()
+    );
     assert_eq!(stats.len(), 64);
     assert!(
         snapshot_calls <= 10,
@@ -2385,8 +2529,11 @@ fn local_eventual_batch_shard_selection_uses_one_current_snapshot_for_bulk_paths
     let authored = dfs
         .metadata_backend()
         .unwrap()
-        .list_prepared_operations()
+        .export_shard_table_snapshot(&shard_id)
         .unwrap()
+        .unwrap()
+        .tables
+        .prepared_operations_v7
         .into_iter()
         .filter(|record| !before.contains(&record.digest.operation_id))
         .collect::<Vec<_>>();
@@ -2431,6 +2578,103 @@ fn local_eventual_batch_shard_selection_uses_one_current_snapshot_for_bulk_paths
             .collect::<BTreeMap<_, _>>(),
         before_replay
     );
+    // Exercise the batch entry too, with genuine original receipts and parent
+    // observations. An old exact batch must not roll back a later file head.
+    let proofs = replay_body
+        .content_receipts
+        .iter()
+        .map(|receipt| DfsLocalEventualBatchWriteProof {
+            expected_base_version: None,
+            expected_parent_object_id: Some(parent_before.object_id.clone()),
+            expected_parent_version: Some(parent_before.version.clone()),
+            receipt: receipt.clone(),
+        })
+        .collect::<Vec<_>>();
+    let newer = dfs
+        .posix_write_file(
+            &paths[0],
+            b"newer bytes",
+            DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
+        )
+        .unwrap();
+    let head_before_replay = dfs
+        .metadata_backend()
+        .unwrap()
+        .metadata_shard_statuses()
+        .unwrap();
+    assert!(
+        !dfs.apply_local_eventual_batch_commit(
+            &owner,
+            replay_body.transaction.clone(),
+            proofs.clone(),
+            Some(config.clone())
+        )
+        .unwrap()
+    );
+    assert_eq!(
+        dfs.metadata.object(&newer.object_id).unwrap().version,
+        newer.version
+    );
+    assert_eq!(dfs.posix_read_file(&paths[0]).unwrap(), b"newer bytes");
+    let mut changed_parent = proofs.clone();
+    changed_parent[0].expected_parent_version = Some(newer.version.clone());
+    assert!(
+        dfs.apply_local_eventual_batch_commit(
+            &owner,
+            replay_body.transaction.clone(),
+            changed_parent,
+            Some(config.clone())
+        )
+        .is_err()
+    );
+    let mut changed_body = replay_body.transaction.clone();
+    changed_body.created_at += time::Duration::seconds(1);
+    assert!(
+        dfs.apply_local_eventual_batch_commit(
+            &owner,
+            changed_body,
+            proofs.clone(),
+            Some(config.clone())
+        )
+        .is_err()
+    );
+    let mut changed_receipt = proofs.clone();
+    changed_receipt[0].receipt.content_hash = Some("blake3:changed-replay-proof".into());
+    assert!(
+        dfs.apply_local_eventual_batch_commit(
+            &owner,
+            replay_body.transaction.clone(),
+            changed_receipt,
+            Some(config.clone())
+        )
+        .is_err()
+    );
+    let mut duplicate_proof = proofs.clone();
+    duplicate_proof[1] = duplicate_proof[0].clone();
+    assert!(
+        dfs.apply_local_eventual_batch_commit(
+            &owner,
+            replay_body.transaction.clone(),
+            duplicate_proof,
+            Some(config)
+        )
+        .is_err()
+    );
+    assert_eq!(
+        dfs.metadata_backend()
+            .unwrap()
+            .metadata_shard_statuses()
+            .unwrap(),
+        head_before_replay
+    );
+    assert_eq!(
+        dfs.metadata_backend()
+            .unwrap()
+            .prepared_operation_record(&authored[0].digest.operation_id)
+            .unwrap()
+            .unwrap(),
+        authored[0]
+    );
     drop(dfs);
     runtime.close().unwrap();
 }
@@ -2445,11 +2689,28 @@ fn bulk_local_eventual_splits_distinct_shards_owned_by_the_same_primary() {
     .unwrap();
     dfs.posix_mkdir_all("/users/native-bulk").unwrap();
     dfs.posix_mkdir_all("/services/native-bulk").unwrap();
-    let before = dfs
-        .metadata_backend()
-        .unwrap()
-        .list_prepared_operations()
-        .unwrap()
+    let committed = || {
+        ["users", "services"]
+            .into_iter()
+            .flat_map(|shard| {
+                // Snapshot the actual Core lane after the served operation has
+                // drained; a browser facade may retain its earlier projection.
+                let current = runtime
+                    .metadata_primary_service(&format!("/{shard}"))
+                    .unwrap();
+                current
+                    .metadata_backend()
+                    .unwrap()
+                    .export_shard_table_snapshot(&DfsMetadataShardId::new(shard))
+                    .unwrap()
+                    .unwrap()
+                    .tables
+                    .prepared_operations_v7
+            })
+            .filter(|record| record.status == crate::DfsPreparedOperationStatus::Committed)
+            .collect::<Vec<_>>()
+    };
+    let before = committed()
         .into_iter()
         .map(|record| record.digest.operation_id)
         .collect::<BTreeSet<_>>();
@@ -2467,13 +2728,13 @@ fn bulk_local_eventual_splits_distinct_shards_owned_by_the_same_primary() {
         .posix_create_files_local_eventual_with_known_parents(files)
         .unwrap();
     assert_eq!(stats.len(), 2);
-    let scopes = dfs
-        .metadata_backend()
-        .unwrap()
-        .list_prepared_operations()
-        .unwrap()
+    let authored = committed()
         .into_iter()
         .filter(|record| !before.contains(&record.digest.operation_id))
+        .collect::<Vec<_>>();
+    assert_eq!(authored.len(), 2, "one genuine committed batch per shard");
+    let scopes = authored
+        .into_iter()
         .map(|record| record.digest.shard_id)
         .collect::<BTreeSet<_>>();
     assert_eq!(
@@ -2522,12 +2783,29 @@ fn local_eventual_batch_rejects_multiple_shards_with_the_same_local_primary() {
             .unwrap()
             .unwrap()
     });
-    let before = backend
-        .metadata_shard_statuses()
-        .unwrap()
+    let actual_snapshots = || {
+        [
+            ("root", "/"),
+            ("services", "/services"),
+            ("users", "/users"),
+        ]
         .into_iter()
-        .map(|status| (status.shard_id, status.journal_last_sequence))
-        .collect::<BTreeMap<_, _>>();
+        .map(|(shard, path)| {
+            let current = runtime.metadata_primary_service(path).unwrap();
+            let id = DfsMetadataShardId::new(shard);
+            (
+                id.clone(),
+                current
+                    .metadata_backend()
+                    .unwrap()
+                    .export_shard_table_snapshot(&id)
+                    .unwrap()
+                    .unwrap(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>()
+    };
+    let before = actual_snapshots();
     let transaction = DfsNamespaceTransaction {
         content_reference_identity: None,
         extension_expectations: Vec::new(),
@@ -2540,6 +2818,31 @@ fn local_eventual_batch_rejects_multiple_shards_with_the_same_local_primary() {
         advisory_lock_states: Vec::new(),
         created_at: OffsetDateTime::now_utc(),
     };
+    let writes = [&a, &b]
+        .into_iter()
+        .map(|stat| DfsLocalEventualBatchWriteProof {
+            expected_base_version: Some(stat.version.clone()),
+            expected_parent_object_id: None,
+            expected_parent_version: None,
+            receipt: dfs
+                .backend_receipt_for_replica(&stat.object_id, &stat.version, &owner)
+                .unwrap()
+                .unwrap(),
+        })
+        .collect();
+    let operation = DfsNamespaceOperation::CommitLocalEventualBatch {
+        transaction,
+        writes,
+    };
+    let authority_shards = dfs
+        .affected_namespace_shards(&a.file_system_id, &operation)
+        .unwrap();
+    assert_eq!(authority_shards.len(), 2);
+    assert!(
+        authority_shards
+            .iter()
+            .all(|shard| shard.primary_node_id == owner)
+    );
     let event = dfs
         .handle_namespace_request(
             owner.clone(),
@@ -2549,29 +2852,18 @@ fn local_eventual_batch_rejects_multiple_shards_with_the_same_local_primary() {
                 requesting_node_id: owner,
                 include_metadata_journal_batches: false,
                 metadata_journal_after_sequences: Vec::new(),
-                authority_shards: Vec::new(),
-                operation: DfsNamespaceOperation::CommitLocalEventualBatch {
-                    transaction,
-                    writes: Vec::new(),
-                },
+                authority_shards,
+                operation,
             },
         )
         .unwrap();
     assert!(
         matches!(event, NetworkedDfsServiceEvent::RemoteNamespaceServed {
         result: DfsNamespaceResult::Rejected { ref reason, .. }, ..
-    } if reason.contains("must resolve to exactly one metadata shard"))
+    } if reason.contains("must resolve to exactly one metadata shard")),
+        "{event:?}"
     );
-    assert_eq!(
-        dfs.metadata_backend()
-            .unwrap()
-            .metadata_shard_statuses()
-            .unwrap()
-            .into_iter()
-            .map(|status| (status.shard_id, status.journal_last_sequence))
-            .collect::<BTreeMap<_, _>>(),
-        before
-    );
+    assert_eq!(actual_snapshots(), before);
     assert_eq!(
         dfs.metadata_backend()
             .unwrap()

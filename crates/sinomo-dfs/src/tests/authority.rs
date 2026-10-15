@@ -3,6 +3,531 @@
 use super::*;
 
 #[test]
+fn native_explicit_primary_handoff_preserves_an_unfinished_metadata_prepare() {
+    let (mut runtime, requester, retiring) = crate::test_support::current_native_metadata_service(
+        "native-handoff-unfinished-prepare",
+        3,
+        "/services",
+    )
+    .unwrap();
+    drop(requester);
+    let control = runtime.shared_control_plane().unwrap();
+    let configs = runtime.metadata_shards().unwrap();
+    let promoted = retiring.replica_node_ids[0].clone();
+    let shard_id = DfsMetadataShardId::new(retiring.shard_id.clone());
+    let mut source = runtime.metadata_primary_service("/services").unwrap();
+    let filesystem = source
+        .metadata_backend()
+        .unwrap()
+        .get_file_system_on_shard(&shard_id, &retiring.file_system_id)
+        .unwrap()
+        .unwrap();
+    let scope = DfsPreparedOperationScope {
+        file_system_id: retiring.file_system_id.clone(),
+        shard_id: shard_id.clone(),
+        owner_epoch: retiring.epoch,
+        operation_id: format!("native-handoff-prepare:{}", sinomo_core::Id::generate()),
+    };
+    let payload = DfsPreparedOperationPayload::for_metadata_effects(
+        scope.clone(),
+        Vec::new(),
+        Vec::new(),
+        vec![DfsPreparedMetadataEffect::PutFileSystem {
+            file_system: filesystem.clone(),
+        }],
+        OffsetDateTime::now_utc(),
+    )
+    .unwrap();
+    // Stop at the ordinary producer's durable Prepare boundary. The SAME
+    // native provider owns admission and the physical writer; no receipt,
+    // authority probe, handoff proof or persisted packet is supplied by the test.
+    let execution = source.acquire_prepared_execution(&scope).unwrap();
+    let digest = source
+        .prepare_payload_for_publication(payload.clone())
+        .unwrap();
+    drop(execution);
+    let original = source
+        .metadata_backend()
+        .unwrap()
+        .prepared_operation_record(&digest.operation_id)
+        .unwrap()
+        .unwrap();
+    original.validate().unwrap();
+    assert_eq!(original.status, DfsPreparedOperationStatus::Prepared);
+    assert_eq!(original.payload.as_ref(), &payload);
+    let handoff = control
+        .with_client(|kv| {
+            DfsControlPlaneStore::new(kv.as_mut())
+                .request_metadata_shard_primary_handoff(&retiring, &promoted)
+        })
+        .unwrap()
+        .unwrap();
+    let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    let explicit = source.reconcile_pending_metadata_shard_membership_handoffs(
+        &configs,
+        sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+    );
+    loop {
+        if let Some(active) = runtime
+            .observe_completed_native_handoff(&control, &handoff, deadline)
+            .unwrap()
+        {
+            assert_eq!(active, handoff.desired_shard);
+            break;
+        }
+        let (active, pending) = control
+            .with_client(|kv| {
+                DfsControlPlaneStore::new(kv.as_mut()).retiring_metadata_shard_handoff_view_before(
+                    &retiring.file_system_id,
+                    &retiring.shard_id,
+                    deadline,
+                )
+            })
+            .unwrap();
+        assert!(
+            pending
+                .as_ref()
+                .is_some_and(|value| value.handoff_id == handoff.handoff_id)
+                || active.as_ref() == Some(&handoff.desired_shard),
+            "the exact requested transfer cannot disappear while draining a prepare: active={active:?}, pending={pending:?}, explicit={explicit:?}"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "the original native handoff must finish within its existing deadline: {explicit:?}"
+        );
+        std::thread::yield_now();
+    }
+    assert!(
+        source.commit_stored_prepared_operation(&digest).is_err(),
+        "the retiring writer cannot commit its original prepare after activation"
+    );
+    drop(source);
+    // Restart the actual promoted owner before its existing recovery executor
+    // reads the transferred durable prepares. This staged Core producer has no
+    // foreground request latch; opening a lazy service alone is not execution.
+    runtime.stop_node(&promoted).unwrap();
+    runtime.reopen_node(promoted.clone()).unwrap();
+    let mut successor = runtime.metadata_primary_service("/services").unwrap();
+    assert_eq!(successor.node_id(), &promoted);
+    successor.recover_durable_namespace_prepares().unwrap();
+    let backend = successor.metadata_backend().unwrap();
+    let old = backend
+        .prepared_operation_record(&digest.operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(old.digest, digest);
+    assert_eq!(old.payload, original.payload);
+    assert_eq!(old.status, DfsPreparedOperationStatus::Superseded);
+    let adopted_id = format!(
+        "recover:{}:{}",
+        digest.operation_id, handoff.desired_shard.epoch
+    );
+    let adopted = backend
+        .prepared_operation_record(&adopted_id)
+        .unwrap()
+        .unwrap();
+    let mut expected = payload;
+    expected.operation_id = adopted_id;
+    expected.owner_epoch = handoff.desired_shard.epoch;
+    expected
+        .metadata_effects
+        .push(DfsPreparedMetadataEffect::ResolvePreparedOperation {
+            digest,
+            status: DfsPreparedOperationStatus::Superseded,
+        });
+    assert_eq!(adopted.payload.as_ref(), &expected);
+    assert_eq!(adopted.status, DfsPreparedOperationStatus::Committed);
+    assert_eq!(
+        backend
+            .get_file_system_on_shard(&shard_id, &retiring.file_system_id)
+            .unwrap(),
+        Some(filesystem)
+    );
+    drop(successor);
+    runtime.close().unwrap();
+}
+
+#[test]
+fn ingested_manifest_counts_verified_local_copy_after_native_replanning() {
+    let (runtime, mut requester, shard) = crate::test_support::current_native_metadata_service(
+        "native-ingested-replan-local-receipt",
+        3,
+        "/services",
+    )
+    .unwrap();
+    let path = "/services/ingested-replan.bin";
+    let initial = requester
+        .posix_write_file(
+            path,
+            b"initial",
+            DfsWriteOptions {
+                policy: DfsReplicationPolicy::new(1, 1).unwrap(),
+                replica_candidates: vec![shard.primary_node_id.clone()],
+                wait_for_commit: true,
+                foreground_replica_repair: false,
+            },
+        )
+        .unwrap();
+    drop(requester);
+    let tick = runtime
+        .maintenance_tick(
+            &shard.primary_node_id,
+            sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+        )
+        .unwrap();
+    assert!(
+        tick.outcome.is_ok(),
+        "native placement observation: {:?}",
+        tick.outcome
+    );
+    let mut owner = runtime.metadata_primary_service(path).unwrap();
+    assert!(
+        owner.placement_snapshot_cache().snapshot().is_some(),
+        "actual native placement view"
+    );
+    let previous_selection = vec![shard.replica_node_ids[0].clone()];
+    let policy = DfsReplicationPolicy::new(1, 1).unwrap();
+    // Select input DATA using the real observed planner, before any write.
+    // No receipt, assignment, authority or durable outcome is constructed.
+    let request = (0..128)
+        .find_map(|_| {
+            let request = DfsWriteRequest {
+                file_system_id: initial.file_system_id.clone(),
+                object_id: initial.object_id.clone(),
+                target_version: DfsVersion::generate(),
+                requesting_node_id: shard.replica_node_ids[0].clone(),
+            };
+            let plan = owner
+                .plan_distributed_eventual_replicas(
+                    &request,
+                    previous_selection.clone(),
+                    policy.clone(),
+                )
+                .unwrap();
+            (plan.desired_replica_nodes == vec![shard.primary_node_id.clone()]).then_some(request)
+        })
+        .expect("the real native planner selects this metadata primary for an input version");
+    let bytes = b"actually ingested before the primary replans";
+    let manifest = owner
+        .content()
+        .put_object_version(
+            initial.object_id.as_str(),
+            request.target_version.as_str(),
+            bytes,
+        )
+        .unwrap();
+    let result = owner
+        .write_stable_ingested_distributed_manifest(
+            request.clone(),
+            Some(initial.version),
+            manifest.content_hash.clone(),
+            manifest.size_bytes,
+            previous_selection,
+            policy,
+            "native-ingested-replan-original".into(),
+            DfsDistributedWriteOptions {
+                repair: DfsWriteRepair::Background,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(
+        matches!(result, NetworkedDfsWriteOutcome::Committed { .. }),
+        "a verified local copy selected by the final native plan must satisfy W: {result:?}"
+    );
+    let current = owner
+        .metadata_backend()
+        .unwrap()
+        .get_object(&initial.object_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.version, request.target_version);
+    assert_eq!(current.current_locations, vec![shard.primary_node_id]);
+    assert_eq!(
+        owner
+            .content()
+            .read_object_version(current.object_id.as_str(), current.version.as_str())
+            .unwrap()
+            .1,
+        bytes
+    );
+    drop(owner);
+    runtime.close().unwrap();
+}
+
+#[test]
+fn native_create_fetches_and_stages_when_requester_and_primary_are_outside_the_plan() {
+    let (runtime, initial, shard) = crate::test_support::current_native_metadata_service(
+        "native-unselected-upload-source",
+        3,
+        "/services",
+    )
+    .unwrap();
+    drop(initial);
+    let primary = shard.primary_node_id.clone();
+    let requester_node = shard.replica_node_ids[0].clone();
+    let destination = shard.replica_node_ids[1].clone();
+    let path = "/services/unselected-upload-source.bin";
+    let mut placement = DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 1).unwrap();
+    placement.required_node_ids = vec![destination.clone()];
+    placement.forbidden_node_ids = vec![primary.clone(), requester_node.clone()];
+    runtime
+        .apply_placement_policy(&primary, path, DfsPlacementScope::SelfOnly, placement)
+        .unwrap();
+    let mut requester = runtime.client(&requester_node).unwrap();
+    let (_, _, policy) = requester
+        .managed_replication_policy_for_path(path, DfsObjectPolicy::ReplicatedEventual, 1)
+        .unwrap();
+    let before = runtime.rpc_observations().len();
+    let bytes = b"only the selected replica can satisfy W";
+    let original = requester.posix_write_file_with_operation_id(
+        path,
+        bytes,
+        DfsWriteOptions {
+            policy,
+            replica_candidates: vec![destination.clone()],
+            wait_for_commit: false,
+            foreground_replica_repair: false,
+        },
+        "native-unselected-source-original",
+    );
+    let maintenance = runtime
+        .maintenance_tick(&primary, sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
+        .unwrap();
+    assert!(
+        maintenance.outcome.is_ok(),
+        "normal Main maintenance: {:?}",
+        maintenance.outcome
+    );
+    let mut inspect = runtime.metadata_primary_service(path).unwrap();
+    let intents = inspect
+        .metadata_backend()
+        .unwrap()
+        .write_intents_page(None, 128)
+        .unwrap()
+        .intents;
+    let stat = inspect.posix_stat(path).unwrap_or_else(|error| panic!(
+        "original={original:?}; actual canonical stat={error}; durable intents={intents:?}; calls={:?}",
+        &runtime.rpc_observations()[before..],
+    ));
+    assert_eq!(
+        stat.content_hash,
+        Some(format!("blake3:{}", blake3::hash(bytes).to_hex()))
+    );
+    assert_eq!(stat.current_locations, vec![destination.clone()]);
+    assert!(
+        runtime.rpc_observations()[before..]
+            .iter()
+            .any(|call| call.source == primary
+                && call.target == destination
+                && call.route == crate::DFS_DATA_STAGE_BLOB_ROUTE
+                && call.phase == crate::test_runtime::RpcPhase::BeforeDispatch)
+    );
+    let receiver = runtime.client(&destination).unwrap();
+    assert_eq!(
+        receiver
+            .content()
+            .read_object_version(stat.object_id.as_str(), stat.version.as_str())
+            .unwrap()
+            .1,
+        bytes
+    );
+    drop(receiver);
+    drop(inspect);
+    drop(requester);
+    runtime.close().unwrap();
+}
+
+#[test]
+fn committed_intent_replay_preserves_original_capture_after_replica_withdrawal() {
+    let (runtime, mut requester, shard) = crate::test_support::current_native_metadata_service(
+        "native-terminal-replay-after-withdrawal",
+        3,
+        "/services",
+    )
+    .unwrap();
+    let path = "/services/terminal-replay";
+    let participants = vec![
+        shard.primary_node_id.clone(),
+        shard.replica_node_ids[0].clone(),
+    ];
+    let stat = requester
+        .posix_write_file(
+            path,
+            b"original immutable bytes",
+            DfsWriteOptions {
+                policy: DfsReplicationPolicy::new(2, 2).unwrap(),
+                replica_candidates: participants.clone(),
+                wait_for_commit: true,
+                foreground_replica_repair: false,
+            },
+        )
+        .unwrap();
+    drop(requester);
+    let mut owner = runtime.metadata_primary_service(path).unwrap();
+    let recorded = owner
+        .metadata_backend()
+        .unwrap()
+        .write_intents_page(None, 128)
+        .unwrap()
+        .intents
+        .into_iter()
+        .find(|intent| {
+            intent.object_id == stat.object_id && intent.status == DfsWriteIntentStatus::Committed
+        })
+        .unwrap();
+    owner
+        .mark_remote_read_location_missing(
+            &stat.object_id,
+            &stat.version,
+            &stat.content_hash,
+            &participants[1],
+        )
+        .unwrap();
+    let current = owner.current_read_object_metadata(&stat.object_id).unwrap();
+    assert_ne!(recorded.object_metadata.as_ref(), Some(&current));
+    let intent = crate::intent::distributed_intent_from_record(&recorded);
+    let hash = stat.content_hash.as_deref().unwrap();
+    owner
+        .put_metadata_intent_and_receipts(&intent, hash, &participants[..1])
+        .unwrap();
+    assert_eq!(
+        owner
+            .metadata_backend()
+            .unwrap()
+            .get_intent(&stat.object_id, &intent.intent_id)
+            .unwrap()
+            .unwrap(),
+        recorded
+    );
+    let prefix = owner
+        .metadata_backend()
+        .unwrap()
+        .metadata_prefix_proof(&DfsMetadataShardId::new("services"))
+        .unwrap();
+    let mut changed = intent;
+    changed.policy = DfsReplicationPolicy::new(1, 2).unwrap();
+    assert!(
+        owner
+            .put_metadata_intent_and_receipts(&changed, hash, &participants[..1])
+            .is_err()
+    );
+    assert_eq!(
+        owner
+            .metadata_backend()
+            .unwrap()
+            .metadata_prefix_proof(&DfsMetadataShardId::new("services"))
+            .unwrap(),
+        prefix
+    );
+    drop(owner);
+    runtime.close().unwrap();
+}
+
+#[test]
+fn recovered_prepare_restores_the_original_resident_write_outcome() {
+    check_recovered_original_write(false);
+}
+
+#[test]
+fn explicit_original_write_retry_recovers_its_complete_prepare() {
+    check_recovered_original_write(true);
+}
+
+fn check_recovered_original_write(explicit_retry: bool) {
+    let name = if explicit_retry {
+        "native-explicit-original-retry"
+    } else {
+        "native-recovered-write-outcome"
+    };
+    let (mut runtime, mut requester, shard) =
+        crate::test_support::current_native_metadata_service(name, 3, "/").unwrap();
+    let path = "/recovered-write-outcome";
+    let options = DfsWriteOptions {
+        policy: DfsReplicationPolicy::new(1, 1).unwrap(),
+        replica_candidates: vec![shard.primary_node_id.clone()],
+        wait_for_commit: true,
+        foreground_replica_repair: false,
+    };
+    let initial = requester
+        .posix_write_file(path, b"original", options.clone())
+        .unwrap();
+    drop(requester);
+    let mut owner = runtime.metadata_primary_service(path).unwrap();
+    let interrupted = shard.replica_node_ids[0].clone();
+    runtime.stop_node(&interrupted).unwrap();
+    let operation = "native-original-partition-write";
+    assert!(
+        owner
+            .posix_write_file_with_operation_id(path, b"recovered", options.clone(), operation)
+            .is_err()
+    );
+    let prepared = owner
+        .metadata_backend()
+        .unwrap()
+        .list_prepared_operations()
+        .unwrap()
+        .into_iter()
+        .find(|record| {
+            record
+                .payload
+                .prepared_intent
+                .as_ref()
+                .is_some_and(|intent| intent.operation_id.as_deref() == Some(operation))
+        })
+        .unwrap();
+    assert_eq!(prepared.status, DfsPreparedOperationStatus::Prepared);
+    assert_eq!(
+        owner
+            .metadata_backend()
+            .unwrap()
+            .get_object(&initial.object_id)
+            .unwrap()
+            .unwrap()
+            .version,
+        initial.version
+    );
+    let intent = prepared.payload.prepared_intent.as_ref().unwrap().clone();
+    runtime.reopen_node(interrupted).unwrap();
+    if explicit_retry {
+        let outcome = owner
+            .posix_write_file_with_operation_id(path, b"recovered", options, operation)
+            .expect("the original explicit retry must return its recovered committed outcome");
+        assert_eq!(outcome.version, intent.target_version);
+    } else {
+        owner
+            .recover_one_prepared_operation(prepared.clone())
+            .unwrap();
+    }
+    let committed = owner
+        .metadata_backend()
+        .unwrap()
+        .prepared_operation_record(&prepared.digest.operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(committed.digest, prepared.digest);
+    assert_eq!(committed.status, DfsPreparedOperationStatus::Committed);
+    assert_eq!(
+        owner
+            .metadata_backend()
+            .unwrap()
+            .get_object(&initial.object_id)
+            .unwrap()
+            .unwrap()
+            .version,
+        intent.target_version
+    );
+    assert!(
+        matches!(owner.write_outcome(&intent.intent_id).unwrap(),
+        NetworkedDfsWriteOutcome::Committed { version, content_hash, .. }
+        if version == intent.target_version && Some(content_hash.as_str()) == intent.content_hash.as_deref()),
+        "durable recovery must also finish the original resident outcome"
+    );
+    drop(owner);
+    runtime.close().unwrap();
+}
+
+#[test]
 fn posix_create_cleans_transient_metadata_when_publication_authorization_is_unavailable() {
     use crate::test_runtime::{DfsTestRuntime, FaultAction, FaultRule, RpcPhase};
     let nodes = DfsTestRuntime::ordered_node_ids("native-create-publication-unavailable", 3);
@@ -51,7 +576,7 @@ fn posix_create_cleans_transient_metadata_when_publication_authorization_is_unav
         }
     }
     // The real prepared-publication guard needs operation-bound metadata acknowledgements,
-    // including its recovery quorum. A browser planning getter is unrelated to
+    // including every assigned participant. A browser planning getter is unrelated to
     // an explicit-options writer and supplies no publication authorization.
     let options = DfsWriteOptions::replicated_eventual(vec![node_id.clone()]);
     let operation_id = sinomo_core::Id::generate().to_string();
@@ -60,8 +585,9 @@ fn posix_create_cleans_transient_metadata_when_publication_authorization_is_unav
         .expect_err("unavailable operation-bound metadata quorum must reject the create");
     assert!(
         matches!(&error, DfsPosixError::Dfs(DfsError::MetadataRecoveryQuorumUnavailable {
-        file_system_id, shard_id, required: 2, verified: 1,
-    }) if file_system_id == &shard.file_system_id && shard_id == &shard.shard_id),
+        file_system_id, shard_id, required, verified: 1,
+    }) if file_system_id == &shard.file_system_id && shard_id == &shard.shard_id
+        && *required == shard.replica_node_ids.len() + 1),
         "unexpected authorization error: {error}"
     );
     for replica in &shard.replica_node_ids {
@@ -424,7 +950,7 @@ fn metadata_authority_probe_rejects_a_gap_before_the_hidden_prepare() {
     let shard = runtime.root_shard().unwrap();
     let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
     let file_system = runtime.file_system();
-    let mut source = runtime.client(&primary).unwrap();
+    let mut source = runtime.metadata_primary_service("/").unwrap();
     let dispatch = Arc::new(tokio::sync::Semaphore::new(0));
     runtime.install_fault(FaultRule {
         source: Some(primary.clone()),
@@ -529,8 +1055,10 @@ fn metadata_authority_probe_rejects_a_gap_before_the_hidden_prepare() {
     };
     let first = prepare(&mut source, "authority-gap-missing-prefix");
     let second = prepare(&mut source, "authority-gap-hidden-prepare");
+    let later = prepare(&mut source, "authority-gap-later-independent-prepare");
     assert_eq!(first.prepare_sequence, base_head + 1);
     assert_eq!(second.prepare_sequence, first.prepare_sequence + 1);
+    assert_eq!(later.prepare_sequence, second.prepare_sequence + 1);
     let backend = source.metadata_backend.as_ref().unwrap();
     let suffix = backend
         .journal_batch_for_shard_since_limited(
@@ -541,13 +1069,16 @@ fn metadata_authority_probe_rejects_a_gap_before_the_hidden_prepare() {
         )
         .unwrap()
         .unwrap();
-    assert_eq!(suffix.entries.len(), 1);
+    assert_eq!(suffix.entries.len(), 2);
+    assert_eq!(suffix.next_after_sequence, later.prepare_sequence);
     let frames = crate::metadata_replication::prepare_dfs_metadata_journal_frame_batch(
         backend.as_ref(),
         &suffix,
     )
     .unwrap();
     let prepared_prefix = backend.metadata_prefix_proof(&shard_id).unwrap().unwrap();
+    assert_eq!(prepared_prefix.journal_sequence, later.prepare_sequence);
+    assert!(second.prepare_sequence < prepared_prefix.journal_sequence);
     let probe = DfsMetadataAuthorityProbe {
         probe_id: "native-authority-gap-probe".into(),
         expected_shard: shard.clone(),
@@ -644,8 +1175,106 @@ fn metadata_authority_probe_rejects_a_gap_before_the_hidden_prepare() {
             .journal_sequence,
         first.prepare_sequence
     );
-    // The real authority receiver accepts the contiguous durable suffix even
-    // while the rebuildable projection remains paused at the older prefix.
+    // Each negative contains the earlier named operation and ALL later slots.
+    // A wrong original tuple or a poisoned/forked later frame must reject before
+    // persisting either preparation or advancing any local acknowledgement.
+    let before_prefix = receiver.metadata_prefix_proof().unwrap();
+    let before_authority_floor = receiver.metadata_authority_ack_floor(&shard_id).unwrap();
+    let before_prefix_floor = receiver.metadata_prefix_ack_floor(&shard_id).unwrap();
+    for variant in 0..8 {
+        let mut invalid = command.clone();
+        invalid.request_id = format!("native-current-cut-original-negative-{variant}");
+        let candidate = invalid.authority_probe.as_mut().unwrap();
+        let DfsMetadataAuthorityOperation::PreparedOperation {
+            operation_id,
+            payload_digest,
+            prepare_sequence,
+            ..
+        } = &mut candidate.operation;
+        match variant {
+            0 => operation_id.push_str("-missing"),
+            1 => {
+                let last = payload_digest.pop().unwrap();
+                payload_digest.push(if last == '0' { '1' } else { '0' });
+            }
+            2 => *prepare_sequence = later.prepare_sequence,
+            3 => *prepare_sequence = later.prepare_sequence + 1,
+            4 | 5 => {
+                let frame = invalid.batch.journal_frames.last_mut().unwrap();
+                assert_eq!(frame.sequence, later.prepare_sequence);
+                let mut entry =
+                    crate::metadata_journal::decode_metadata_journal_frame_record(frame).unwrap();
+                let DfsMetadataMutation::PrepareOperationV7 { record, .. } = &mut entry.mutation
+                else {
+                    panic!("actual later hidden preparation")
+                };
+                let payload = Arc::make_mut(&mut record.payload);
+                let DfsPreparedMetadataEffect::PutFileSystem { file_system } =
+                    &mut payload.metadata_effects[0]
+                else {
+                    panic!("actual later filesystem effect")
+                };
+                file_system.display_name.push_str("-foreign-later-body");
+                if variant == 4 {
+                    // Fully valid current frame encoding and record, but a fork
+                    // of the sealed later frame. The complete prefix must fail.
+                    record.digest = DfsPreparedOperationDigest::at_sequence(
+                        &record.payload,
+                        later.prepare_sequence,
+                    )
+                    .unwrap();
+                    record.validate().unwrap();
+                }
+                *frame =
+                    crate::metadata_journal::encode_metadata_journal_frame_record(&entry).unwrap();
+            }
+            6 => {
+                invalid.batch.journal_frames.pop();
+            }
+            7 => {
+                let last = candidate.prepared_prefix.digest.pop().unwrap();
+                candidate
+                    .prepared_prefix
+                    .digest
+                    .push(if last == '0' { '1' } else { '0' });
+            }
+            _ => unreachable!(),
+        }
+        let rejected = call(&invalid);
+        assert!(
+            matches!(
+                rejected.result,
+                DfsMetadataJournalBatchResult::Rejected { .. }
+            ),
+            "current cut/original obligation negative {variant}: {rejected:?}"
+        );
+        assert_eq!(rejected.verified_authority_probe_id, None);
+        assert_eq!(rejected.applied_entries, 0);
+        assert_eq!(receiver.metadata_prefix_proof().unwrap(), before_prefix);
+        assert_eq!(
+            receiver.metadata_authority_ack_floor(&shard_id).unwrap(),
+            before_authority_floor
+        );
+        assert_eq!(
+            receiver.metadata_prefix_ack_floor(&shard_id).unwrap(),
+            before_prefix_floor
+        );
+        assert!(
+            receiver
+                .journal_batch_for_shard_since_limited(
+                    &shard_id,
+                    first.prepare_sequence,
+                    usize::MAX,
+                    usize::MAX
+                )
+                .unwrap()
+                .is_none(),
+            "rejected invocation must not append the named or later frame: {variant}"
+        );
+    }
+    // The real authority receiver accepts the complete current suffix while
+    // its rebuildable projection remains paused. Its report must validate the
+    // named SECOND original body, rather than the last THIRD preparation.
     let accepted = call(&command);
     assert_eq!(accepted.result, DfsMetadataJournalBatchResult::Applied);
     assert_eq!(
@@ -658,7 +1287,7 @@ fn metadata_authority_probe_rejects_a_gap_before_the_hidden_prepare() {
             .unwrap()
             .unwrap()
             .journal_sequence,
-        second.prepare_sequence
+        later.prepare_sequence
     );
     assert_eq!(
         receiver.metadata_replay_cursor(&shard_id).unwrap(),
@@ -674,6 +1303,292 @@ fn metadata_authority_probe_rejects_a_gap_before_the_hidden_prepare() {
     runtime
         .close()
         .expect("join actual native ownership and cleanup");
+}
+
+#[test]
+fn metadata_authority_empty_probe_confirms_only_exact_snapshot_covered_prepare() {
+    use crate::test_runtime::{DfsTestRuntime, FaultAction, FaultRule, RpcOrigin};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let name = "native-empty-authority-snapshot-prepare";
+    let nodes = DfsTestRuntime::ordered_node_ids(name, 3);
+    let primary = nodes[0].clone();
+    let mut runtime = DfsTestRuntime::new(name, primary.clone()).unwrap();
+    for node in &nodes[1..] {
+        runtime.define_node(node.clone()).unwrap();
+    }
+    runtime.start_nodes().unwrap();
+    let shard = runtime.root_shard().unwrap();
+    assert_eq!(shard.primary_node_id, primary);
+    let replica = shard.replica_node_ids[0].clone();
+    let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
+    let file_system = runtime.file_system();
+    let mut source = runtime
+        .metadata_primary_service("/native-empty-authority")
+        .unwrap();
+    // Retain the real normal admission across this physical hidden prepare and
+    // its queries. No background author can commit or advance this source cut.
+    let scope = DfsPreparedOperationScope {
+        file_system_id: shard.file_system_id.clone(),
+        shard_id: shard_id.clone(),
+        owner_epoch: shard.epoch,
+        operation_id: "native-snapshot-covered-hidden-prepare".into(),
+    };
+    let execution = source.acquire_prepared_execution(&scope).unwrap();
+    let dispatch = Arc::new(tokio::sync::Semaphore::new(0));
+    for route in [
+        DFS_METADATA_JOURNAL_BATCH_ROUTE,
+        DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE,
+    ] {
+        runtime.install_fault(FaultRule {
+            source: Some(primary.clone()),
+            target: Some(replica.clone()),
+            route: Some(route.into()),
+            call_id: None,
+            origin: Some(RpcOrigin::RegisteredHost),
+            remaining_hits: 32,
+            action: FaultAction::PauseBeforeDispatch(Arc::clone(&dispatch)),
+        });
+    }
+    let digest = source
+        .metadata_backend_mut()
+        .unwrap()
+        .prepare_operation(
+            DfsPreparedOperationPayload::for_metadata_effects(
+                scope,
+                Vec::new(),
+                Vec::new(),
+                vec![DfsPreparedMetadataEffect::PutFileSystem {
+                    file_system: file_system.clone(),
+                }],
+                OffsetDateTime::now_utc(),
+            )
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+    let later = source
+        .metadata_backend_mut()
+        .unwrap()
+        .prepare_operation(
+            DfsPreparedOperationPayload::for_metadata_effects(
+                DfsPreparedOperationScope {
+                    file_system_id: shard.file_system_id.clone(),
+                    shard_id: shard_id.clone(),
+                    owner_epoch: shard.epoch,
+                    operation_id: "native-snapshot-covered-later-prepare".into(),
+                },
+                Vec::new(),
+                Vec::new(),
+                vec![DfsPreparedMetadataEffect::PutFileSystem { file_system }],
+                OffsetDateTime::now_utc(),
+            )
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+    assert_eq!(later.prepare_sequence, digest.prepare_sequence + 1);
+    let backend = source.metadata_backend().unwrap();
+    let original = backend
+        .prepared_operation_record(&digest.operation_id)
+        .unwrap()
+        .unwrap();
+    original.validate().unwrap();
+    assert_eq!(original.status, DfsPreparedOperationStatus::Prepared);
+    let image = backend
+        .export_shard_snapshot_image(&shard_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(image.materialized_through_sequence, later.prepare_sequence);
+    let prepared_prefix = image.prefix_proof.clone();
+    assert!(prepared_prefix.is_well_formed());
+    assert_eq!(prepared_prefix.journal_sequence, later.prepare_sequence);
+    let expected = backend
+        .export_shard_table_snapshot(&shard_id)
+        .unwrap()
+        .unwrap();
+    let snapshot = DfsMetadataSnapshotInstallCommand {
+        request_id: "native-empty-authority-install".into(),
+        source_node_id: primary.clone(),
+        file_system_id: Some(shard.file_system_id.clone()),
+        authority_epoch: Some(shard.epoch),
+        primary_handoff_id: None,
+        shard_id: shard_id.clone(),
+        next_after_sequence: image.materialized_through_sequence,
+        snapshot: image.descriptor().clone(),
+        image: Some(image),
+        reason: "actual native snapshot covers the original hidden preparation".into(),
+    };
+    let installed = decode_dfs_metadata_snapshot_install_rpc_response(
+        &runtime
+            .rpc_call(
+                &primary,
+                &replica,
+                dfs_metadata_snapshot_install_rpc_call(&snapshot).unwrap(),
+                Duration::from_secs(5),
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        matches!(
+            installed.result,
+            DfsMetadataSnapshotInstallResult::Installed { .. }
+        ),
+        "normal authenticated snapshot receiver: {installed:?}"
+    );
+    let receiver_root =
+        default_dfs_metadata_shards_root(runtime.data_dir(&replica)).join(&shard_id.0);
+    let inspect = || {
+        // A fresh inspection handle follows the real installed incarnation;
+        // never use a stale pre-exchange backend to assert frame absence.
+        let mut receiver =
+            LocalSobjMetadataBackend::open_for_inspection(shard_id.clone(), &receiver_root)
+                .unwrap();
+        receiver.begin_inspection_snapshot().unwrap();
+        let tables = receiver.export_table_snapshot();
+        let authority_floor = receiver.metadata_authority_ack_floor(&shard_id).unwrap();
+        let prefix_floor = receiver.metadata_prefix_ack_floor(&shard_id).unwrap();
+        let frames = receiver
+            .journal_since_limited(0, DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT)
+            .unwrap();
+        receiver.end_inspection_snapshot();
+        (tables, authority_floor, prefix_floor, frames)
+    };
+    let before = inspect();
+    assert_eq!(before.0, expected);
+    assert!(
+        before.3.is_empty(),
+        "snapshot-covered original frames must be absent from live journal"
+    );
+    assert_eq!(
+        before
+            .0
+            .tables
+            .prepared_operations_v7
+            .iter()
+            .find(|row| row.digest.operation_id == digest.operation_id),
+        Some(&original)
+    );
+    let probe = DfsMetadataAuthorityProbe {
+        probe_id: "native-empty-authority-known".into(),
+        expected_shard: shard.clone(),
+        operation: DfsMetadataAuthorityOperation::PreparedOperation {
+            operation_id: digest.operation_id.clone(),
+            file_system_id: digest.file_system_id.clone(),
+            shard_id: digest.shard_id.clone(),
+            owner_epoch: digest.owner_epoch,
+            prepare_sequence: digest.prepare_sequence,
+            payload_digest: digest.payload_digest.clone(),
+        },
+        prepared_prefix: prepared_prefix.clone(),
+    };
+    let command = DfsMetadataJournalBatchCommand {
+        request_id: "native-empty-authority-query".into(),
+        source_node_id: Some(primary.clone()),
+        file_system_id: Some(shard.file_system_id.clone()),
+        authority_epoch: Some(shard.epoch),
+        verify_prefix_only: false,
+        prefix_probe: None,
+        authority_probe: Some(probe.clone()),
+        durable_replication: None,
+        batch: DfsMetadataJournalFrameBatch {
+            shard_id: shard_id.clone(),
+            next_after_sequence: later.prepare_sequence,
+            journal_frames: Vec::new(),
+        },
+    };
+    let call = |command: &DfsMetadataJournalBatchCommand| {
+        decode_dfs_metadata_journal_batch_rpc_response(
+            &runtime
+                .rpc_request(
+                    &primary,
+                    &replica,
+                    dfs_metadata_journal_batch_rpc_request(command).unwrap(),
+                    Duration::from_secs(5),
+                )
+                .unwrap(),
+        )
+        .unwrap()
+    };
+    for variant in 0..7 {
+        let mut rejected = command.clone();
+        rejected.request_id = format!("native-empty-authority-negative-{variant}");
+        let candidate = rejected.authority_probe.as_mut().unwrap();
+        let DfsMetadataAuthorityOperation::PreparedOperation {
+            operation_id,
+            payload_digest,
+            owner_epoch,
+            prepare_sequence,
+            ..
+        } = &mut candidate.operation;
+        match variant {
+            0 => operation_id.push_str("-unknown"),
+            1 => {
+                let last = payload_digest.pop().unwrap();
+                payload_digest.push(if last == '0' { '1' } else { '0' });
+            }
+            2 => *owner_epoch += 1,
+            3 => {
+                let last = candidate.prepared_prefix.digest.pop().unwrap();
+                candidate
+                    .prepared_prefix
+                    .digest
+                    .push(if last == '0' { '1' } else { '0' });
+            }
+            4 => rejected.authority_probe = None,
+            5 => *prepare_sequence = later.prepare_sequence,
+            6 => *prepare_sequence = later.prepare_sequence + 1,
+            _ => unreachable!(),
+        }
+        let response = call(&rejected);
+        assert!(
+            matches!(
+                response.result,
+                DfsMetadataJournalBatchResult::Rejected { .. }
+            ),
+            "unknown/changed/foreign or purposeless empty confirmation must reject: {variant}: {response:?}"
+        );
+        assert_eq!(response.verified_authority_probe_id, None);
+        assert_eq!(response.applied_entries, 0);
+        let after = inspect();
+        assert_eq!(
+            after, before,
+            "rejected empty authority query must not change tables/prefix/journal/ACK floors: {variant}"
+        );
+    }
+    let confirmed = call(&command);
+    assert_eq!(confirmed.result, DfsMetadataJournalBatchResult::Applied);
+    assert_eq!(confirmed.applied_entries, 0);
+    assert!(!confirmed.verified_prefix_only);
+    assert_eq!(confirmed.next_after_sequence, later.prepare_sequence);
+    assert_eq!(
+        confirmed.verified_authority_probe_id,
+        crate::service_replica::metadata_authority_probe_confirmation_id(&probe)
+    );
+    assert!(confirmed.verified_authority_probe_id.is_some());
+    let after = inspect();
+    assert_eq!(after.0, before.0);
+    assert_eq!(after.2, before.2);
+    assert!(after.3.is_empty());
+    assert_eq!(
+        after.1,
+        Some(DfsMetadataAuthorityAckFloor {
+            shard_id: shard_id.clone(),
+            journal_sequence: later.prepare_sequence,
+            durable_prefix_proof: prepared_prefix,
+        })
+    );
+    drop(call);
+    drop(inspect);
+    dispatch.close();
+    runtime.clear_faults();
+    drop(execution);
+    drop(source);
+    runtime
+        .close()
+        .expect("join real native owners after empty confirmation");
 }
 
 #[test]
@@ -858,7 +1773,9 @@ fn retry_pending_repairs_skips_sender_that_lost_metadata_primary_authority() {
             action: crate::test_support::DfsTestFaultAction::BudgetExhausted,
         });
     }
-    let mut old = runtime.client(&owner).unwrap();
+    // This fixture owns the actual Core producer, rather than the browser
+    // client whose same-node write is delegated to Main.
+    let mut old = runtime.metadata_primary_service(path).unwrap();
     let stat = old
         .posix_write_file(
             path,
@@ -926,29 +1843,131 @@ fn native_negative_lost_authority_reply(
     NetworkedDfsService<DfsNodeTransport>,
     DfsStat,
     String,
+    Option<impl Send + use<>>,
+    DfsRepairReplicaResponse,
 ) {
-    let (runtime, owner, replica, mut service, stat, intent_id, _background_interception) =
-        super::repair::native_committed_repair_backlog(name, false);
+    // Preserve the actual missing target until this Core producer consumes
+    // its genuine Repair response. The existing hook denies only background
+    // claims; it neither alters queue custody nor blocks this foreground call.
+    let (runtime, owner, replica, service, stat, intent_id, seed_interception) =
+        super::repair::native_committed_repair_backlog(name, true);
+    drop(service);
     runtime.clear_faults();
-    assert_eq!(service.retry_pending_repairs_bounded(1).unwrap().len(), 1);
-    let mut original = service
-        .transport
-        .drain_incoming_messages()
-        .unwrap()
-        .into_iter()
-        .find(|routed| {
-            matches!(&routed.message,
-            DfsNetworkMessage::RepairReplicaResponse(response) if response.intent_id == intent_id)
-        })
+    let captured = Arc::new(Mutex::new(Vec::<DfsRoutedMessage>::new()));
+    runtime.install_fault(crate::test_runtime::FaultRule {
+        source: Some(owner.clone()),
+        target: Some(replica.clone()),
+        route: Some(DFS_DATA_REPAIR_REPLICA_ROUTE.into()),
+        call_id: None,
+        origin: Some(crate::test_runtime::RpcOrigin::RegisteredHost),
+        remaining_hits: 1,
+        action: crate::test_runtime::FaultAction::CaptureTransferReplyAndLoseAfterDispatch {
+            intent_id: Some(intent_id.clone()),
+            captured: Arc::clone(&captured),
+        },
+    });
+    // The real Main producer checkpoints its named transfer before dispatch.
+    // Losing its genuine returned reply preserves that SAME physical claim;
+    // a direct Core helper must not insert a request after the carrier ran.
+    drop(seed_interception);
+    let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    let tick = runtime
+        .maintenance_tick(&owner, deadline.saturating_duration_since(Instant::now()))
         .unwrap();
+    assert!(
+        tick.outcome.is_ok(),
+        "actual Main repair producer: {:?}",
+        tick.outcome
+    );
+    let mut original = crate::test_runtime::executor()
+        .block_on(async {
+            tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), async {
+                loop {
+                    if let Some(reply) = captured
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .find(|routed| {
+                            matches!(&routed.message,
+                        DfsNetworkMessage::RepairReplicaResponse(response)
+                            if response.intent_id == intent_id
+                                && response.object_id == stat.object_id
+                                && response.version == stat.version)
+                        })
+                        .cloned()
+                    {
+                        break reply;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+        })
+        .expect("the selected real Main Repair returns within its unchanged native window");
+    let background_interception = Some(
+        runtime
+            .deny_background_replica_before_claim(&owner)
+            .unwrap(),
+    );
+    runtime.clear_faults();
+    let queue = LocalDfsRepairQueueStore::new(default_dfs_repair_attempt_snapshot_path(
+        runtime.data_dir(&owner),
+    ));
+    let captured_records = queue
+        .records_for_targets(&intent_id, std::slice::from_ref(&replica))
+        .unwrap();
+    assert_eq!(captured_records.len(), 1);
+    let mut service = runtime.metadata_primary_service(&stat.path).unwrap();
+    assert_eq!(service.node_id(), &owner);
+    assert!(
+        service
+            .retry_pending_repairs_bounded_with_attempts(0, &captured_records)
+            .unwrap()
+            .is_empty()
+    );
+    let current = service
+        .current_read_object_metadata(&stat.object_id)
+        .unwrap();
+    let shard = service
+        .local_metadata_owner_shard_hint_for_object(&current)
+        .unwrap()
+        .unwrap();
+    let execution = service
+        .acquire_prepared_execution(&DfsPreparedOperationScope {
+            file_system_id: stat.file_system_id.clone(),
+            shard_id: DfsMetadataShardId::new(shard.shard_id),
+            owner_epoch: shard.epoch,
+            operation_id: intent_id.clone(),
+        })
+        .unwrap()
+        .expect("the mounted current Core owner supplies actual admission for reply consumption");
     assert_eq!(original.source_node_id, replica);
     assert_eq!(original.target_node_id, owner);
     let DfsNetworkMessage::RepairReplicaResponse(response) = &mut original.message else {
         unreachable!()
     };
+    assert_eq!(response.file_system_id, stat.file_system_id);
     assert_eq!(response.object_id, stat.object_id);
     assert_eq!(response.version, stat.version);
     assert_eq!(response.replica_node_id, replica);
+    let claimed = &captured_records[0];
+    assert_eq!(claimed.intent_id, intent_id);
+    assert_eq!(claimed.object_id, stat.object_id);
+    assert_eq!(claimed.version, stat.version);
+    assert_eq!(
+        Some(claimed.content_hash.as_str()),
+        stat.content_hash.as_deref()
+    );
+    assert_eq!(claimed.missing_replica_node_id, replica);
+    assert_eq!(
+        claimed.transfer_kind,
+        Some(sinomo_api::dfs::maintenance::DfsRepairTransferKind::Repair)
+    );
+    assert_eq!(
+        claimed.transfer_request_id.as_deref(),
+        Some(response.request_id.as_str())
+    );
+    assert_eq!(claimed.completed_transfer_request_id, None);
     assert_eq!(
         service
             .writes
@@ -969,6 +1988,7 @@ fn native_negative_lost_authority_reply(
     response.result = DfsBlobTransferResult::Rejected {
         reason: "source is not current metadata shard primary".into(),
     };
+    let rejected = response.clone();
     let events = service
         .process_routed_messages_with_options(vec![original], true)
         .unwrap();
@@ -976,6 +1996,18 @@ fn native_negative_lost_authority_reply(
         NetworkedDfsServiceEvent::RepairRejected { replica_node_id, reason, .. }
             if replica_node_id == &replica && reason.contains("source is not current metadata shard primary"))));
     service.observe_repair_maintenance_events(&events);
+    let terminal = queue
+        .records_for_targets(&intent_id, std::slice::from_ref(&replica))
+        .unwrap();
+    assert_eq!(terminal.len(), 1);
+    assert_eq!(terminal[0].transfer_request_id, None);
+    assert_eq!(
+        terminal[0].completed_transfer_request_id.as_deref(),
+        Some(rejected.request_id.as_str())
+    );
+    assert!(!terminal[0].in_flight);
+    drop(execution);
+    drop(queue);
     for route in [DFS_DATA_STAGE_BLOB_ROUTE, DFS_DATA_REPAIR_REPLICA_ROUTE] {
         runtime.install_fault(crate::test_runtime::FaultRule {
             source: Some(owner.clone()),
@@ -987,13 +2019,30 @@ fn native_negative_lost_authority_reply(
             action: crate::test_runtime::FaultAction::BudgetExhausted,
         });
     }
-    (runtime, owner, replica, service, stat, intent_id)
+    (
+        runtime,
+        owner,
+        replica,
+        service,
+        stat,
+        intent_id,
+        background_interception,
+        rejected,
+    )
 }
 
 #[test]
 fn repair_authority_rejection_suppresses_stale_retry_loop() {
-    let (runtime, owner, replica, mut service, _stat, intent_id) =
-        native_negative_lost_authority_reply("native-negative-authority-suppression");
+    let (
+        runtime,
+        owner,
+        replica,
+        mut service,
+        _stat,
+        intent_id,
+        background_interception,
+        _rejected,
+    ) = native_negative_lost_authority_reply("native-negative-authority-suppression");
     let before = runtime.rpc_observations().len();
     for _ in 0..100 {
         assert!(service.retry_pending_repairs_bounded(1).unwrap().is_empty());
@@ -1019,13 +2068,14 @@ fn repair_authority_rejection_suppresses_stale_retry_loop() {
             && event.phase == crate::test_runtime::RpcPhase::BeforeDispatch)
     }));
     drop(service);
+    drop(background_interception);
     runtime.clear_faults();
     runtime.close().unwrap();
 }
 
 #[test]
 fn repair_attempt_restore_preserves_lost_authority_suppression() {
-    let (mut runtime, owner, replica, service, stat, intent_id) =
+    let (mut runtime, owner, replica, service, stat, intent_id, background_interception, rejected) =
         native_negative_lost_authority_reply("native-negative-authority-restore");
     let records = service.active_repair_attempt_records();
     assert_eq!(records.len(), 1);
@@ -1043,11 +2093,75 @@ fn repair_attempt_restore_preserves_lost_authority_suppression() {
             .as_deref()
             .is_some_and(|error| error.contains("source is not current metadata shard primary"))
     );
+    // This direct Core consumer does not run Main's report checkpoint. Save
+    // its actual terminal suppression through the existing observed queue CAS
+    // before the normal restarted Main can borrow that scheduling state.
+    let queue = LocalDfsRepairQueueStore::new(default_dfs_repair_attempt_snapshot_path(
+        runtime.data_dir(&owner),
+    ));
+    let (mut saved, observed) = queue.view_for_maintenance().unwrap();
+    let before = saved
+        .records
+        .iter_mut()
+        .find(|row| row.intent_id == intent_id && row.missing_replica_node_id == replica)
+        .expect("actual native Repair terminal remains in the owned queue");
+    assert_eq!(before.object_id, records[0].object_id);
+    assert_eq!(before.version, records[0].version);
+    assert_eq!(before.content_hash, records[0].content_hash);
+    assert_eq!(before.transfer_kind, records[0].transfer_kind);
+    assert_eq!(rejected.intent_id, intent_id);
+    assert_eq!(rejected.file_system_id, stat.file_system_id);
+    assert_eq!(rejected.object_id, stat.object_id);
+    assert_eq!(rejected.version, stat.version);
+    assert_eq!(rejected.replica_node_id, replica);
+    assert!(matches!(
+        &rejected.result,
+        DfsBlobTransferResult::Rejected { reason }
+            if records[0].last_error.as_deref() == Some(reason.as_str())
+    ));
+    assert_eq!(before.transfer_request_id, None);
+    assert_eq!(
+        before.completed_transfer_request_id.as_deref(),
+        Some(rejected.request_id.as_str())
+    );
+    assert!(!before.in_flight);
+    assert_eq!(records[0].transfer_request_id, None);
+    assert_eq!(
+        records[0].completed_transfer_request_id.as_deref(),
+        Some(rejected.request_id.as_str())
+    );
+    assert_eq!(
+        crate::service_repair::join_transfer_delivery(
+            before.transfer_delivery_state,
+            records[0].transfer_delivery_state,
+        ),
+        records[0].transfer_delivery_state,
+        "actual SAME-request reply can advance delivery; old PossiblyApplied cannot be erased"
+    );
+    assert!(!records[0].in_flight);
+    // The real admitted consumer already checkpointed this SAME terminal.
+    // Save only its actual later report's suppression schedule/error through
+    // the normal observed queue CAS, retaining every other physical row.
+    *before = records[0].clone();
+    assert!(matches!(
+        queue.reconcile_observed(&observed, &saved.records).unwrap(),
+        crate::repair_queue_store::DfsRepairQueueObservedReconcileOutcome::Applied(_)
+    ));
+    assert_eq!(queue.view().unwrap().records, saved.records);
+    drop(queue);
     drop(service);
     runtime.stop_node(&owner).unwrap();
     runtime.reopen_node(owner.clone()).unwrap();
-    let mut restored = runtime.client(&owner).unwrap();
+    let mut restored = runtime.metadata_primary_service(&stat.path).unwrap();
+    assert_eq!(restored.node_id(), &owner);
     let before = runtime.rpc_observations().len();
+    assert!(
+        restored
+            .retry_pending_repairs_bounded_with_attempts(0, &records)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(restored.active_repair_attempt_records(), records);
     let scheduled = restored
         .retry_pending_repairs_bounded_with_attempts(1, &records)
         .unwrap();
@@ -1068,6 +2182,7 @@ fn repair_attempt_restore_preserves_lost_authority_suppression() {
             && event.phase == crate::test_runtime::RpcPhase::BeforeDispatch)
     }));
     drop(restored);
+    drop(background_interception);
     runtime.clear_faults();
     runtime.close().unwrap();
 }
@@ -1090,24 +2205,80 @@ fn repair_command_accepts_newer_authority_shard_when_receiver_view_is_stale() {
     let path = "/services/native-stale-configuration-repair.bin";
     let mut policy = DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 2).unwrap();
     policy.required_node_ids = vec![old_primary.clone(), target.clone()];
+    policy.forbidden_node_ids = vec![current_primary.clone()];
     runtime
         .apply_placement_policy(&old_primary, path, DfsPlacementScope::Subtree, policy)
         .unwrap();
     deny_native_read_repair(&runtime, &old_primary, &target);
-    let mut source = runtime.client(&old_primary).unwrap();
+    let mut writer = runtime.client(&old_primary).unwrap();
+    let (resolved, _, replication) = writer
+        .managed_replication_policy_for_path(path, DfsObjectPolicy::ReplicatedEventual, 2)
+        .unwrap();
+    assert_eq!(
+        resolved.policy.consistency,
+        DfsObjectPolicy::ReplicatedEventual
+    );
+    assert_eq!(replication.min_commit_replicas, 1);
+    assert_eq!(replication.desired_replicas, 2);
+    assert_eq!(
+        replication
+            .required_node_ids
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        [old_primary.clone(), target.clone()].into_iter().collect()
+    );
+    assert_eq!(
+        replication.forbidden_node_ids,
+        vec![current_primary.clone()]
+    );
     let bytes = vec![0x79; 2 * 1024 * 1024 + 4096];
-    let stat = source
+    let stat = writer
         .posix_write_file(
             path,
             &bytes,
             DfsWriteOptions {
                 replica_candidates: vec![old_primary.clone(), target.clone()],
-                policy: DfsReplicationPolicy::new(1, 2).unwrap(),
+                policy: replication,
                 wait_for_commit: true,
                 foreground_replica_repair: false,
             },
         )
         .unwrap();
+    drop(writer);
+    // Main's ordinary committed-work publication makes real replica metadata
+    // available. A distributed stat overlay alone is not physical replay.
+    let published = runtime
+        .maintenance_tick(&old_primary, sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
+        .unwrap();
+    assert!(
+        published.outcome.is_ok(),
+        "ordinary Main publication: {:?}",
+        published.outcome
+    );
+    let queue = LocalDfsRepairQueueStore::new(default_dfs_repair_attempt_snapshot_path(
+        runtime.data_dir(&old_primary),
+    ));
+    let captured = queue
+        .view()
+        .unwrap()
+        .records
+        .into_iter()
+        .filter(|row| {
+            row.object_id == stat.object_id
+                && row.version == stat.version
+                && Some(row.content_hash.as_str()) == stat.content_hash.as_deref()
+                && row.missing_replica_node_id == target
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(captured.len(), 1);
+    let mut source = runtime.metadata_primary_service(path).unwrap();
+    assert!(
+        source
+            .retry_pending_repairs_bounded_with_attempts(0, &captured)
+            .unwrap()
+            .is_empty()
+    );
     let job = source
         .coordinator()
         .repair_jobs()
@@ -1126,6 +2297,12 @@ fn repair_command_accepts_newer_authority_shard_when_receiver_view_is_stale() {
         .unwrap()
         .unwrap();
     let mut next = runtime.client(&current_primary).unwrap();
+    // A content hint cannot substitute for the normal authoritative lookup.
+    // Synchronize the real published object before requesting its cache bytes.
+    let observed = next.posix_stat_distributed(path).unwrap();
+    assert_eq!(observed.object_id, stat.object_id);
+    assert_eq!(observed.version, stat.version);
+    assert_eq!(observed.content_hash, stat.content_hash);
     assert_eq!(
         next.request_remote_object_read(&stat.object_id).unwrap(),
         vec![old_primary.clone()]
@@ -1139,7 +2316,11 @@ fn repair_command_accepts_newer_authority_shard_when_receiver_view_is_stale() {
         bytes,
         "the future primary obtains only ordinary verified cache bytes before authority changes"
     );
-    let target_before = runtime.client(&target).unwrap();
+    let mut target_before = runtime.client(&target).unwrap();
+    let target_observed = target_before.posix_stat_distributed(path).unwrap();
+    assert_eq!(target_observed.object_id, stat.object_id);
+    assert_eq!(target_observed.version, stat.version);
+    assert_eq!(target_observed.content_hash, stat.content_hash);
     let target_content = target_before.content().clone();
     let target_head = target_before
         .metadata_backend()
@@ -1172,12 +2353,32 @@ fn repair_command_accepts_newer_authority_shard_when_receiver_view_is_stale() {
     // The third receiver owns no fabricated replacement view. Normal joint
     // handoff can activate through the two actual assignment majorities and
     // both real primaries while its configuration rebuild remains withheld.
-    source
-        .reconcile_pending_metadata_shard_membership_handoffs(
-            &configs,
-            sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
-        )
+    let handoff_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    let reconciled = source.reconcile_pending_metadata_shard_membership_handoffs(
+        &configs,
+        sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+    );
+    let completed = runtime
+        .observe_completed_native_handoff(&control, &handoff, handoff_deadline)
         .unwrap();
+    assert_eq!(
+        completed.as_ref(),
+        Some(&handoff.desired_shard),
+        "the exact original handoff must have native proof and activated retiring-owner freeze; explicit caller={reconciled:?}"
+    );
+    let mut divergent_request_head = handoff.clone();
+    divergent_request_head
+        .required_head_watermark
+        .as_mut()
+        .unwrap()
+        .state_fingerprint = format!("dfs-metadata-prefix-v2:blake3:{}", "0".repeat(64));
+    assert!(
+        runtime
+            .observe_completed_native_handoff(&control, &divergent_request_head, handoff_deadline,)
+            .unwrap()
+            .is_none(),
+        "a later sequence cannot conceal a forked original prefix"
+    );
     gap.wait_rebuild(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
         .unwrap();
     assert!(
@@ -1299,7 +2500,7 @@ fn repair_command_accepts_newer_authority_shard_when_receiver_view_is_stale() {
 }
 
 #[test]
-fn sifs_cluster_bulk_create_rebases_stale_parent_on_authority() {
+fn sifs_cluster_bulk_create_refreshes_stale_parent_before_publication() {
     let mut cluster = sifs_two_primary_cluster("sifs-bulk-stale-parent-rebase");
     let parent_path = "/services/bulk-stale-parent";
     let child_path = "/services/bulk-stale-parent/created.txt";
@@ -1369,6 +2570,10 @@ fn sifs_cluster_bulk_create_rebases_stale_parent_on_authority() {
     let services_thread =
         std::thread::spawn(move || pump_sifs_service_until_stop(services_primary, services_stop));
 
+    let bulk_capture = _runtime
+        .capture_namespace_requests(&services_primary_node, 32)
+        .expect("actual Main bulk request capture");
+
     let stats = replica
         .posix_create_files_local_eventual_with_known_parents([(
             child_path,
@@ -1394,34 +2599,65 @@ fn sifs_cluster_bulk_create_rebases_stale_parent_on_authority() {
             .as_deref(),
         Some(content_hash(b"stale parent bulk payload").as_str())
     );
-    let bulk_requests = services_primary
-        .metadata_backend
-        .as_ref()
-        .expect("services metadata backend")
-        .list_namespace_requests()
-        .expect("bulk namespace request ledger")
-        .into_iter()
-        .filter(|request| {
-            matches!(
-                request.operation,
-                DfsNamespaceOperation::CommitLocalEventualBatch { .. }
-            )
-        })
-        .collect::<Vec<_>>();
-    assert!(
-        bulk_requests.iter().any(|request| {
-            matches!(
-                request.result,
-                Some(DfsNamespaceResult::Rejected {
-                    posix_error: Some(DfsNamespacePosixError::Conflict { .. }),
-                    ..
-                })
-            )
-        }),
-        "the authority must reject the requester's stale parent generation before retry"
+    // The public client does not own Main's current request rows, and completed
+    // rows may already be compact receipts. Inspect the actual owning shard,
+    // bound to the exact native requests captured in this invocation.
+    let current_owner = _runtime.metadata_primary_service(parent_path).unwrap();
+    let backend = current_owner.metadata_backend().unwrap();
+    let mut bulk_results = Vec::new();
+    for routed in bulk_capture.records() {
+        let DfsNetworkMessage::NamespaceRequest(command) = routed.message else {
+            continue;
+        };
+        if !matches!(
+            command.operation,
+            DfsNamespaceOperation::CommitLocalEventualBatch { .. }
+        ) {
+            continue;
+        }
+        let DfsNamespaceOperation::CommitLocalEventualBatch { writes, .. } = &command.operation
+        else {
+            unreachable!()
+        };
+        assert_eq!(writes.len(), 1);
+        assert_eq!(
+            writes[0].expected_parent_object_id.as_ref(),
+            Some(&authority_parent_before.object_id)
+        );
+        assert_eq!(
+            writes[0].expected_parent_version.as_ref(),
+            Some(&authority_parent_before.version)
+        );
+        assert_ne!(
+            writes[0].expected_parent_version.as_ref(),
+            Some(&stale_parent_version)
+        );
+        let expected_digest =
+            crate::service_routed_namespace::namespace_command_digest(&command).unwrap();
+        if let Some(receipt) = backend
+            .get_namespace_request_receipt(&routed.source_node_id, &command.request_id)
+            .unwrap()
+        {
+            assert_eq!(receipt.command_digest, expected_digest);
+            bulk_results.push(receipt.result);
+        } else {
+            let request = backend
+                .get_namespace_request(&routed.source_node_id, &command.request_id)
+                .unwrap()
+                .expect("same native bulk request's durable outcome");
+            assert_eq!(request.command_digest, expected_digest);
+            bulk_results.push(request.result.expect("actual bulk request completed"));
+        }
+    }
+    assert_eq!(
+        bulk_results,
+        vec![DfsNamespaceResult::Applied],
+        "the normal browser resolves the current owner before preparing its one bulk command"
     );
     _runtime.clear_faults();
     replica_delivery.add_permits(64);
+    drop(current_owner);
+    drop(bulk_capture);
     drop(services_primary);
     drop(replica);
     drop(shared_kv);
@@ -1578,8 +2814,17 @@ fn sifs_cluster_authority_local_follower_bootstrap_stays_on_incremental_stream()
 fn served_routed_write_committed_work_tracks_only_authority_owned_repairs() {
     for desired in [1, 2] {
         let name = format!("native-authority-served-work-n{desired}");
-        let (runtime, primary, replica, requester, base, _) =
-            native_read_fixture(&name, 1, false, b"actual routed predecessor".to_vec());
+        let (runtime, initial, shard) =
+            crate::test_support::current_native_metadata_service(&name, 3, "/services").unwrap();
+        let primary = shard.primary_node_id;
+        drop(initial);
+        let peers = crate::test_runtime::DfsTestRuntime::ordered_node_ids(&name, 3)
+            .into_iter()
+            .filter(|node| *node != primary)
+            .collect::<Vec<_>>();
+        let replica = peers[0].clone();
+        let requester = peers[1].clone();
+        let path = format!("/services/{name}.bin");
         let nodes = if desired == 1 {
             vec![requester.clone()]
         } else {
@@ -1589,8 +2834,33 @@ fn served_routed_write_committed_work_tracks_only_authority_owned_repairs() {
             DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, desired).unwrap();
         placement.required_node_ids = nodes.clone();
         runtime
-            .apply_placement_policy(&primary, &base.path, DfsPlacementScope::Subtree, placement)
+            .apply_placement_policy(&primary, &path, DfsPlacementScope::Subtree, placement)
             .unwrap();
+        // Create the predecessor under the intended current Eventual policy.
+        // Updating managed configuration cannot rewrite an existing Confirmed
+        // object inherited from the read fixture.
+        let mut seed = runtime.client(&requester).unwrap();
+        let mut seed_policy = DfsReplicationPolicy::new(1, desired).unwrap();
+        seed_policy.required_node_ids = nodes.clone();
+        let base = seed
+            .posix_write_file(
+                &path,
+                b"actual routed predecessor",
+                DfsWriteOptions {
+                    replica_candidates: nodes.clone(),
+                    policy: seed_policy,
+                    wait_for_commit: true,
+                    foreground_replica_repair: true,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            seed.current_read_object_metadata(&base.object_id)
+                .unwrap()
+                .policy,
+            DfsObjectPolicy::ReplicatedEventual
+        );
+        drop(seed);
         deny_native_read_repair(&runtime, &primary, &replica);
         let capture = runtime.capture_served_work(&primary, 32).unwrap();
         let mut client = runtime.client(&requester).unwrap();
@@ -1720,7 +2990,9 @@ fn served_replica_stage_does_not_claim_authority_repair_work() {
         .apply_placement_policy(&primary, path, DfsPlacementScope::Subtree, target_policy)
         .unwrap();
     let capture = runtime.capture_served_work(&replica, 32).unwrap();
-    let mut owner = runtime.client(&primary).unwrap();
+    // The actual Core producer retains the intermediate Stage reply; the
+    // browser client receives the final routed completion from Main instead.
+    let mut owner = runtime.metadata_primary_service(path).unwrap();
     let request = DfsWriteRequest {
         file_system_id: base.file_system_id,
         object_id: base.object_id,

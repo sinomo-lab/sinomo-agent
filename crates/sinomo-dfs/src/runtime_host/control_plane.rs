@@ -1,6 +1,10 @@
 use super::*;
 
 const DAEMON_DFS_AUTHORITY_PROJECTION_REPLAN_MAX_ATTEMPTS: usize = 8;
+#[cfg(test)]
+std::thread_local! {
+    pub(super) static AFTER_CACHED_METADATA_SYNC: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
 
 #[cfg(test)]
 #[derive(Debug)]
@@ -177,7 +181,7 @@ impl DaemonDfsControlPlaneKvClient {
     pub(super) fn synchronize_retained_metadata_authority(
         &self,
     ) -> Result<DaemonDfsRetainedMetadataSync, KvError> {
-        if let Some(synchronized) = self.try_synchronize_retained_metadata_authority()? {
+        if let Some(synchronized) = self.try_synchronize_retained_configuration()? {
             return Ok(synchronized);
         }
         // Browser/restore workers are synchronous, but a missing certificate
@@ -191,7 +195,7 @@ impl DaemonDfsControlPlaneKvClient {
     async fn synchronize_retained_metadata_authority_async(
         &self,
     ) -> Result<DaemonDfsRetainedMetadataSync, KvError> {
-        if let Some(synchronized) = self.try_synchronize_retained_metadata_authority()? {
+        if let Some(synchronized) = self.try_synchronize_retained_configuration()? {
             return Ok(synchronized);
         }
         let authority = self.retained_metadata_authority.as_ref().ok_or_else(|| {
@@ -203,14 +207,25 @@ impl DaemonDfsControlPlaneKvClient {
                 // One in-flight shared refresh owns the proof. Its completion
                 // can change topology or be superseded by a newer revision;
                 // replan against the resulting generation, never the old one.
-                authority
+                let proof = authority
                     .ensure_complete_prefix_for_generation_async(
                         generation,
                         #[cfg(test)]
                         None,
                     )
                     .await;
-                if let Some(synchronized) = self.try_synchronize_retained_metadata_authority()? {
+                if proof.is_some() && self.write_configuration_projection_required {
+                    // The filesystem prefix publishes before the shared
+                    // content/provider bundle. Join that same owner within
+                    // this synchronization's original timeout and replan cap.
+                    authority
+                        .ensure_write_configuration_ready_async()
+                        .await
+                        .map_err(|error| KvError::AuthorityUnavailable {
+                            detail: error.to_string(),
+                        })?;
+                }
+                if let Some(synchronized) = self.try_synchronize_retained_configuration()? {
                     return Ok(synchronized);
                 }
             }
@@ -229,6 +244,29 @@ impl DaemonDfsControlPlaneKvClient {
                     authority.generation(),
                 ),
             })?
+    }
+
+    /// sinomo:kv-configuration: A daemon client requiring the shared configuration may lend its compact prefix only after the same retained bundle is ready at the native floor.
+    fn try_synchronize_retained_configuration(
+        &self,
+    ) -> Result<Option<DaemonDfsRetainedMetadataSync>, KvError> {
+        let synchronized = self.try_synchronize_retained_metadata_authority()?;
+        if synchronized.is_some() && self.write_configuration_projection_required {
+            let authority = self.retained_metadata_authority.as_ref().ok_or_else(|| {
+                self.superseded_authority_error("missing required write configuration owner")
+            })?;
+            if matches!(
+                authority.write_configuration_readiness().map_err(|error| {
+                    KvError::AuthorityUnavailable {
+                        detail: error.to_string(),
+                    }
+                })?,
+                crate::DfsWriteConfigurationReadiness::Pending
+            ) {
+                return Ok(None);
+            }
+        }
+        Ok(synchronized)
     }
 
     fn try_synchronize_retained_metadata_authority(
@@ -963,34 +1001,46 @@ impl sinomo_dfs::DfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient {
                 detail: "daemon write configuration owner is unavailable".into(),
             });
         };
-        let generation = authority.generation();
-        let readiness = authority.write_configuration_readiness().map_err(|error| {
-            KvError::AuthorityUnavailable {
-                detail: error.to_string(),
+        for _ in 0..DAEMON_DFS_AUTHORITY_PROJECTION_REPLAN_MAX_ATTEMPTS {
+            let generation = authority.generation();
+            let readiness = authority.write_configuration_readiness().map_err(|error| {
+                KvError::AuthorityUnavailable {
+                    detail: error.to_string(),
+                }
+            })?;
+            if matches!(
+                &readiness,
+                crate::DfsWriteConfigurationReadiness::Ready(Some(_))
+            ) {
+                if !matches!(
+                    self.try_synchronize_retained_metadata_authority()?,
+                    Some(DaemonDfsRetainedMetadataSync::Current)
+                ) {
+                    return Ok(crate::DfsWriteConfigurationReadiness::Pending);
+                }
+                if authority.generation() != generation {
+                    // A complete committed delta can change the generation
+                    // during the floor read without withdrawing configuration.
+                    // Re-read that same owner's cut and validate its native
+                    // floor again; never lend the superseded view or turn this
+                    // local observation race into an unavailable projection.
+                    continue;
+                }
             }
-        })?;
-        if matches!(
-            &readiness,
-            crate::DfsWriteConfigurationReadiness::Ready(Some(_))
-        ) && (!matches!(
-            self.try_synchronize_retained_metadata_authority()?,
-            Some(DaemonDfsRetainedMetadataSync::Current)
-        ) || authority.generation() != generation)
-        {
-            return Ok(crate::DfsWriteConfigurationReadiness::Pending);
-        }
-        #[cfg(any(test, feature = "test-support"))]
-        if let crate::DfsWriteConfigurationReadiness::Ready(Some(view)) = &readiness {
-            if let Some(root) = self.cluster_paths.root.parent() {
-                crate::native_shard_trace::record_configuration_cut(
-                    root,
-                    self.data_owner_lock().as_ref(),
-                    view,
-                    generation,
-                );
+            #[cfg(any(test, feature = "test-support"))]
+            if let crate::DfsWriteConfigurationReadiness::Ready(Some(view)) = &readiness {
+                if let Some(root) = self.cluster_paths.root.parent() {
+                    crate::native_shard_trace::record_configuration_cut(
+                        root,
+                        self.data_owner_lock().as_ref(),
+                        view,
+                        generation,
+                    );
+                }
             }
+            return Ok(readiness);
         }
-        Ok(readiness)
+        Ok(crate::DfsWriteConfigurationReadiness::Pending)
     }
 
     fn cached_metadata_shards(
@@ -1004,11 +1054,31 @@ impl sinomo_dfs::DfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient {
         {
             return Ok(None);
         }
-        authority.cached_metadata_shards(
-            file_system_id,
-            self.retained_metadata_projection_generation
-                .load(Ordering::Acquire),
-        )
+        for _ in 0..DAEMON_DFS_AUTHORITY_PROJECTION_REPLAN_MAX_ATTEMPTS {
+            let generation = self
+                .retained_metadata_projection_generation
+                .load(Ordering::Acquire);
+            #[cfg(test)]
+            {
+                let hook = AFTER_CACHED_METADATA_SYNC.with(|slot| slot.borrow_mut().take());
+                if let Some(hook) = hook {
+                    hook();
+                }
+            }
+            let shards = authority.cached_metadata_shards(file_system_id, generation)?;
+            if authority.projection_generation() == generation {
+                return Ok(shards);
+            }
+            // A complete committed delta can advance between synchronization
+            // and the indexed read. Rebind only an already-complete local cut;
+            // do not restart the original synchronization's I/O or timeout.
+            if self.try_synchronize_retained_configuration()?
+                != Some(DaemonDfsRetainedMetadataSync::Current)
+            {
+                return Ok(None);
+            }
+        }
+        Err(self.superseded_authority_error("cached metadata shard index"))
     }
 
     fn refresh_latest(&mut self) -> Result<(), KvError> {
@@ -1841,4 +1911,31 @@ impl sinomo_dfs::AsyncDfsControlPlaneKvClient for GatedNativePlacementControlPla
             native.await
         })
     }
+}
+
+#[cfg(test)]
+pub(crate) async fn test_retained_client_configuration_sync(
+    authority: Arc<DaemonDfsMetadataAuthorityGeneration>,
+    paths: &ClusterPaths,
+) -> Result<(), KvError> {
+    let mut client =
+        DaemonDfsControlPlaneKvClient::new_on_runtime(paths, &tokio::runtime::Handle::current());
+    client.retained_metadata_authority = Some(authority);
+    client.write_configuration_projection_required = true;
+    client
+        .synchronize_retained_metadata_authority_async()
+        .await?;
+    sinomo_dfs::DfsControlPlaneKvClient::write_configuration_projection(&client).map(|_| ())
+}
+
+#[cfg(test)]
+pub(crate) fn test_retained_client_configuration_projection(
+    authority: Arc<DaemonDfsMetadataAuthorityGeneration>,
+    paths: &ClusterPaths,
+) -> Result<Option<Arc<crate::DfsWriteConfigurationProjection>>, KvError> {
+    let mut client =
+        DaemonDfsControlPlaneKvClient::new_on_runtime(paths, &tokio::runtime::Handle::current());
+    client.retained_metadata_authority = Some(authority);
+    client.write_configuration_projection_required = true;
+    sinomo_dfs::DfsControlPlaneKvClient::write_configuration_projection(&client)
 }

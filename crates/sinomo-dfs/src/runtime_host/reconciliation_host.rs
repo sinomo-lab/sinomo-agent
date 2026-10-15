@@ -690,6 +690,53 @@ fn default_dfs_lifecycle_admission_scope(
     }
 }
 
+// Foreground metadata replies may complete work already holding an exact
+// generation fence. A queued broad writer must yield to that work even when
+// the lifecycle generation itself is mandatory. No lifecycle effect has begun
+// here; the caller leaves that generation unfinished and reselects normally.
+async fn acquire_default_dfs_lifecycle_admission(
+    lifecycle_gate: Arc<tokio::sync::Mutex<()>>,
+    mutation_scheduler: &Arc<DaemonDfsMutationScheduler>,
+    lifecycle_scope: &DfsMessageExecutionScope,
+) -> Result<
+    Option<(
+        tokio::sync::OwnedMutexGuard<()>,
+        DaemonDfsMutationAdmission,
+        DaemonDfsMaintenanceForegroundPreemption,
+    )>,
+    DaemonError,
+> {
+    let foreground_preemption = mutation_scheduler.begin_maintenance_interest();
+    let mut lifecycle_admission = Box::pin(lifecycle_gate.lock_owned());
+    let lifecycle_guard = tokio::select! {
+        biased;
+        _ = foreground_preemption.requested() => None,
+        guard = &mut lifecycle_admission => Some(guard),
+    };
+    drop(lifecycle_admission);
+    let Some(lifecycle_guard) = lifecycle_guard else {
+        return Ok(None);
+    };
+    let mut mutation_admission_future = Box::pin(mutation_scheduler.admit(lifecycle_scope));
+    let mutation_admission = tokio::select! {
+        biased;
+        _ = foreground_preemption.requested() => None,
+        admission = &mut mutation_admission_future => Some(admission?),
+    };
+    // Destroy a queued fair-RwLock writer before releasing the lifecycle gate.
+    // Later exact-shard replies can then complete the existing owner normally.
+    drop(mutation_admission_future);
+    let Some(mutation_admission) = mutation_admission else {
+        drop(lifecycle_guard);
+        return Ok(None);
+    };
+    Ok(Some((
+        lifecycle_guard,
+        mutation_admission,
+        foreground_preemption,
+    )))
+}
+
 async fn ensure_default_distributed_dfs_outcome_async_on_runtime(
     paths: &DaemonPaths,
     options: &DaemonRunOptions,
@@ -780,55 +827,32 @@ async fn ensure_default_distributed_dfs_outcome_async_on_runtime(
     let lifecycle_gate = daemon_default_dfs_lifecycle_gate(data_dir)?;
     let mutation_scheduler = daemon_dfs_mutation_scheduler(&lifecycle_data_dir)?;
     tracing::trace!(target: "sinomo.dfs.reconciliation", phase = "lifecycle-admission", scope = ?lifecycle_scope);
-    // The dedicated reactor is the sole owner of default reconciliation. A
-    // startup pass waits normally. Background passes publish maintenance
-    // interest before either broad gate and destroy any queued global writer
-    // as soon as foreground traffic asks to run; this avoids Tokio's
-    // write-preferring RwLock stranding later exact-shard requests behind a
-    // reconciliation generation which has not started yet.
-    let (lifecycle_guard, mutation_admission, foreground_preemption) = if foreground_preemptible {
-        loop {
-            let foreground_preemption = mutation_scheduler.begin_maintenance_interest();
-            let mut lifecycle_admission = Box::pin(Arc::clone(&lifecycle_gate).lock_owned());
-            let lifecycle_guard = tokio::select! {
-                biased;
-                _ = foreground_preemption.requested() => None,
-                guard = &mut lifecycle_admission => Some(guard),
-            };
-            drop(lifecycle_admission);
-            let Some(lifecycle_guard) = lifecycle_guard else {
-                drop(foreground_preemption);
-                return Ok((
-                    DaemonDefaultDfsLifecycleOutcome::DeferredBeforeAdmission,
-                    true,
-                ));
-            };
-            let mut mutation_admission_future =
-                Box::pin(mutation_scheduler.admit(&lifecycle_scope));
-            let mutation_admission = tokio::select! {
-                biased;
-                _ = foreground_preemption.requested() => None,
-                admission = &mut mutation_admission_future => Some(admission?),
-            };
-            drop(mutation_admission_future);
-            let Some(mutation_admission) = mutation_admission else {
-                drop(lifecycle_guard);
-                drop(foreground_preemption);
-                return Ok((
-                    DaemonDefaultDfsLifecycleOutcome::DeferredBeforeAdmission,
-                    true,
-                ));
-            };
-            break (
-                lifecycle_guard,
-                mutation_admission,
-                Some(foreground_preemption),
-            );
-        }
+    // The sole reactor retains mandatory startup/configuration work until it
+    // completes. Before either broad gate is acquired, yield queued admission
+    // to the existing foreground edge so reciprocal metadata replies are not
+    // stranded behind a generation which has not started yet.
+    let Some((lifecycle_guard, mutation_admission, queued_foreground_preemption)) =
+        acquire_default_dfs_lifecycle_admission(
+            lifecycle_gate,
+            &mutation_scheduler,
+            &lifecycle_scope,
+        )
+        .await?
+    else {
+        tracing::trace!(target: "sinomo.dfs.reconciliation",
+            phase = "lifecycle-deferred-before-admission", foreground_preemptible);
+        return Ok((
+            DaemonDefaultDfsLifecycleOutcome::DeferredBeforeAdmission,
+            true,
+        ));
+    };
+    // A mandatory pass stays nonpreemptible once it owns actual admission.
+    // Only the existing background path keeps its post-admission quiet signal.
+    let foreground_preemption = if foreground_preemptible {
+        Some(queued_foreground_preemption)
     } else {
-        let lifecycle_guard = lifecycle_gate.lock_owned().await;
-        let mutation_admission = mutation_scheduler.admit(&lifecycle_scope).await?;
-        (lifecycle_guard, mutation_admission, None)
+        drop(queued_foreground_preemption);
+        None
     };
     // Own admission inside the blocking task that polls the complete lifecycle
     // future. Dropping the JoinHandle cannot cancel a running blocking task, so
@@ -1145,4 +1169,116 @@ async fn nonmaterializing_lifecycle_keeps_global_writers_exclusive_without_joini
     drop(reader);
     assert!(scheduler.global_is_exclusively_held());
     drop(writer);
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn mandatory_lifecycle_queued_writer_yields_to_reciprocal_metadata_admission() {
+    use std::future::Future;
+    use std::task::Poll;
+
+    let scheduler = Arc::new(DaemonDfsMutationScheduler::new());
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    let source_scope = DfsMessageExecutionScope::ExactShard {
+        file_system_id: crate::sifs_file_system_id(),
+        shard_id: DfsMetadataShardId::new("users"),
+    };
+    let reply_scope = DfsMessageExecutionScope::ExactShard {
+        file_system_id: crate::sifs_file_system_id(),
+        shard_id: DfsMetadataShardId::new("services"),
+    };
+    let lifecycle_scope = DfsMessageExecutionScope::GlobalExclusive;
+    let source = scheduler.admit(&source_scope).await.unwrap();
+    let mut lifecycle = Box::pin(acquire_default_dfs_lifecycle_admission(
+        Arc::clone(&gate),
+        &scheduler,
+        &lifecycle_scope,
+    ));
+    std::future::poll_fn(|context| {
+        assert!(matches!(lifecycle.as_mut().poll(context), Poll::Pending));
+        Poll::Ready(())
+    })
+    .await;
+    assert_eq!(scheduler.maintenance_interest_count(), 1);
+
+    // The existing normal admission API raises the foreground edge. Its
+    // exact-shard reply is initially behind the actual queued global writer.
+    let mut reply = Box::pin(admit_daemon_dfs_message(&scheduler, &reply_scope, true));
+    std::future::poll_fn(|context| {
+        assert!(matches!(reply.as_mut().poll(context), Poll::Pending));
+        Poll::Ready(())
+    })
+    .await;
+    assert!(lifecycle.await.unwrap().is_none());
+    assert_eq!(scheduler.maintenance_interest_count(), 0);
+    let reply = tokio::time::timeout(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT, reply)
+        .await
+        .expect("reciprocal reply must proceed while the source read is still held")
+        .unwrap();
+    assert!(reply.is_exact());
+    assert!(source.is_exact());
+    drop(reply);
+    drop(source);
+
+    // The unfinished generation can reacquire actual exclusive admission.
+    // Dropping its queue-only signal cannot cancel this already-held owner.
+    let (lifecycle_gate, lifecycle_admission, foreground_preemption) =
+        acquire_default_dfs_lifecycle_admission(Arc::clone(&gate), &scheduler, &lifecycle_scope)
+            .await
+            .unwrap()
+            .unwrap();
+    assert!(lifecycle_admission.is_global());
+    drop(foreground_preemption);
+    assert_eq!(scheduler.maintenance_interest_count(), 0);
+    let mut later_reply = Box::pin(admit_daemon_dfs_message(&scheduler, &reply_scope, true));
+    std::future::poll_fn(|context| {
+        assert!(matches!(later_reply.as_mut().poll(context), Poll::Pending));
+        Poll::Ready(())
+    })
+    .await;
+    assert!(gate.try_lock().is_err());
+    drop(lifecycle_admission);
+    drop(lifecycle_gate);
+    let later_reply =
+        tokio::time::timeout(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT, later_reply)
+            .await
+            .unwrap()
+            .unwrap();
+    assert!(later_reply.is_exact());
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn mandatory_lifecycle_yields_before_its_lifecycle_gate_without_releasing_the_owner() {
+    use std::future::Future;
+    use std::task::Poll;
+
+    let scheduler = Arc::new(DaemonDfsMutationScheduler::new());
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    let held = Arc::clone(&gate).lock_owned().await;
+    let scope = DfsMessageExecutionScope::GlobalExclusive;
+    let mut lifecycle = Box::pin(acquire_default_dfs_lifecycle_admission(
+        Arc::clone(&gate),
+        &scheduler,
+        &scope,
+    ));
+    std::future::poll_fn(|context| {
+        assert!(matches!(lifecycle.as_mut().poll(context), Poll::Pending));
+        Poll::Ready(())
+    })
+    .await;
+    scheduler.request_foreground_admission();
+    assert!(lifecycle.await.unwrap().is_none());
+    assert!(
+        gate.try_lock().is_err(),
+        "the original held owner stays exact"
+    );
+    assert_eq!(scheduler.maintenance_interest_count(), 0);
+    drop(held);
+    let (_gate, admission, _interest) =
+        acquire_default_dfs_lifecycle_admission(gate, &scheduler, &scope)
+            .await
+            .unwrap()
+            .unwrap();
+    assert!(admission.is_global());
 }

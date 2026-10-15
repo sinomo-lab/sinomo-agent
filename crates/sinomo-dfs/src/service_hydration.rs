@@ -434,14 +434,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     return Ok(false);
                 }
 
-                self.reset_reconstructable_metadata_projection();
-                self.restore_durable_intent_counter_floor()?;
-                if !self.rebuild_cross_shard_namespace_locks_until_cancelled(should_cancel)? {
-                    return Ok(false);
-                }
                 if !self
                     .project_hydration_file_systems_until_cancelled(&file_systems, should_cancel)
                 {
+                    return Ok(false);
+                }
+                // A cancelled or failed rebuild returns this same request
+                // shell to its owner. Keep its complete coherent catalog at
+                // every handback boundary, even before job/object replay.
+                let catalog = std::mem::take(&mut self.metadata.filesystems);
+                self.reset_reconstructable_metadata_projection();
+                self.metadata.filesystems = catalog;
+                self.restore_durable_intent_counter_floor()?;
+                if !self.rebuild_cross_shard_namespace_locks_until_cancelled(should_cancel)? {
                     return Ok(false);
                 }
 
@@ -482,20 +487,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         file_systems: &[DfsFileSystem],
         should_cancel: &(dyn Fn() -> bool + Sync),
     ) -> bool {
+        let mut catalog = BTreeMap::new();
         for file_system in file_systems {
             if should_cancel() {
                 return false;
             }
-            self.metadata.add_file_system(file_system.clone());
+            catalog.insert(file_system.file_system_id.clone(), file_system.clone());
         }
-        if !self
-            .metadata
-            .filesystems
-            .contains_key(&sifs_file_system_id())
-        {
-            self.metadata
-                .add_file_system(DfsFileSystem::sifs(self.node_id.clone()));
-        }
+        catalog
+            .entry(sifs_file_system_id())
+            .or_insert_with(|| DfsFileSystem::sifs(self.node_id.clone()));
+        self.metadata.filesystems = catalog;
         true
     }
 
@@ -1535,5 +1537,58 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             Err(error) => Err(error.into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod cancelled_catalog_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn cancelled_native_hydration_retains_the_complete_filesystem_catalog() {
+        let (runtime, initial, _) = crate::test_support::current_native_metadata_service(
+            "native-cancelled-hydration-catalog",
+            1,
+            "/services",
+        )
+        .unwrap();
+        drop(initial);
+        for cancel_at in 3..=8 {
+            let mut service = runtime.metadata_primary_service("/services").unwrap();
+            let before = service.metadata.filesystems.clone();
+            let actual = service
+                .metadata_backend()
+                .unwrap()
+                .get_file_system(&sifs_file_system_id())
+                .unwrap()
+                .unwrap();
+            assert_eq!(before.get(&actual.file_system_id), Some(&actual));
+            let checked = AtomicUsize::new(0);
+            let completed = service
+                .hydrate_from_metadata_backend_for_commit_promotion_recovery_until_cancelled(
+                    &|| checked.fetch_add(1, Ordering::SeqCst) + 1 >= cancel_at,
+                )
+                .unwrap();
+            assert!(
+                !completed,
+                "the requested native cancellation point must be exercised"
+            );
+            assert_eq!(checked.load(Ordering::SeqCst), cancel_at);
+            assert_eq!(
+                service.metadata.filesystems, before,
+                "cancellation at native checkpoint {cancel_at} must hand back a complete catalog"
+            );
+            assert_eq!(
+                service
+                    .metadata_backend()
+                    .unwrap()
+                    .get_file_system(&actual.file_system_id)
+                    .unwrap(),
+                Some(actual)
+            );
+            drop(service);
+        }
+        runtime.close().unwrap();
     }
 }

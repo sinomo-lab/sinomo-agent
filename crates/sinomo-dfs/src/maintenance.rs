@@ -3384,16 +3384,103 @@ mod causal_time_tests {
 
     #[test]
     fn sync_repair_budget_excludes_durably_parked_records() {
-        let runnable_target =
-            NodeId::from_legacy_named("node-sync-budget-runnable").expect("runnable target");
-        let parked_target =
-            NodeId::from_legacy_named("node-sync-budget-parked").expect("parked target");
-        let now = dfs_now_unix_nanos();
-        let mut runnable = repair_attempt_for_connectivity_test(runnable_target, 1);
-        runnable.next_retry_unix_nanos = now;
-        let mut parked = repair_attempt_for_connectivity_test(parked_target, 1);
-        parked.next_retry_unix_nanos = u64::MAX;
-        parked.last_error = Some(DFS_REPAIR_EXECUTION_BLOCKED_BY_CONNECTIVITY.to_string());
+        let (runtime, mut writer, shard) = crate::test_support::current_native_metadata_service(
+            "native-sync-repair-budget",
+            3,
+            "/",
+        )
+        .unwrap();
+        let owner = shard.primary_node_id.clone();
+        let nodes = std::iter::once(owner.clone())
+            .chain(shard.replica_node_ids.iter().cloned())
+            .collect::<Vec<_>>();
+        for target in &shard.replica_node_ids {
+            for route in [
+                crate::DFS_DATA_STAGE_BLOB_ROUTE,
+                crate::DFS_DATA_REPAIR_REPLICA_ROUTE,
+            ] {
+                runtime.install_fault(crate::test_runtime::FaultRule {
+                    source: None,
+                    target: Some(target.clone()),
+                    route: Some(route.into()),
+                    call_id: None,
+                    origin: None,
+                    remaining_hits: 32,
+                    action: crate::test_runtime::FaultAction::BudgetExhausted,
+                });
+            }
+        }
+        let stat = writer
+            .posix_write_file(
+                "/native-sync-budget",
+                b"actual budget accounting inputs",
+                crate::DfsWriteOptions {
+                    policy: crate::DfsReplicationPolicy::new(1, 3).unwrap(),
+                    replica_candidates: nodes,
+                    wait_for_commit: true,
+                    foreground_replica_repair: true,
+                },
+            )
+            .unwrap();
+        drop(writer);
+        let queue = crate::LocalDfsRepairQueueStore::new(
+            crate::default_dfs_repair_attempt_snapshot_path(runtime.data_dir(&owner)),
+        );
+        let deadline = std::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+        let originals = loop {
+            let records = queue
+                .view()
+                .unwrap()
+                .records
+                .into_iter()
+                .filter(|record| {
+                    record.object_id == stat.object_id && record.version == stat.version
+                })
+                .collect::<Vec<_>>();
+            if records.len() == 2
+                && records.iter().all(|record| {
+                    record.attempts > 0
+                        && !record.in_flight
+                        && !crate::service_repair::repair_record_has_unidentified_producer(record)
+                        && record.transfer_delivery_state
+                            == Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent)
+                        && record.next_retry_unix_nanos != u64::MAX
+                })
+            {
+                break records;
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "actual failed transfers must checkpoint their producer facts: {records:?}"
+            );
+            runtime
+                .maintenance_tick(&owner, remaining)
+                .unwrap()
+                .outcome
+                .unwrap();
+        };
+        // These are read-only classifier inputs from actual failed native sends.
+        // Evaluate at their recorded due time without advancing a runtime clock
+        // or modifying the live durable queue. Only the second copied row parks.
+        let now = originals
+            .iter()
+            .map(|record| record.next_retry_unix_nanos)
+            .max()
+            .unwrap();
+        let runnable = originals[0].clone();
+        let mut parked = originals[1].clone();
+        let exclusions =
+            DfsMaintenanceExecutionExclusions::new([parked.missing_replica_node_id.clone()]);
+        mark_connectivity_blocked_dfs_repair_attempt_records(
+            std::slice::from_mut(&mut parked),
+            &exclusions,
+        );
+        assert_eq!(parked.next_retry_unix_nanos, u64::MAX);
+        assert_eq!(
+            parked.last_error.as_deref(),
+            Some(DFS_REPAIR_EXECUTION_BLOCKED_BY_CONNECTIVITY)
+        );
         let queue_before = [runnable.clone(), parked];
         let eligible_count = queue_before
             .iter()
@@ -3421,6 +3508,21 @@ mod causal_time_tests {
             ),
             "the same queue must report exhaustion when its executable work fills the budget"
         );
+        let mut unidentified = runnable.clone();
+        unidentified.transfer_kind = None;
+        unidentified.transfer_delivery_state = None;
+        unidentified.transfer_request_id = None;
+        unidentified.completed_transfer_request_id = None;
+        assert!(
+            !dfs_repair_maintenance_budget_exhausted(1, 1, 1, &[unidentified], now),
+            "unknown producer DATA cannot consume an executable retry budget"
+        );
+        println!(
+            "actual repair budget records: {}",
+            serde_json::to_string(&originals).unwrap()
+        );
+        runtime.clear_faults();
+        runtime.close().unwrap();
     }
 
     #[test]

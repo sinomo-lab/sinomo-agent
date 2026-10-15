@@ -102,7 +102,11 @@ class HarnessTests(unittest.TestCase):
             self.assertEqual(gates[0]['summary']['status'], 'fail')
             self.assertEqual(gates[0]['nodes'][0], {
                 'node': 'node1', 'samples': 2, 'mean_cpu_percent': 11,
-                'p95_cpu_percent': 20, 'max_cpu_percent': 20, 'over_limit_samples': 1})
+                'p95_cpu_percent': 20, 'max_cpu_percent': 20, 'over_limit_samples': 1,
+                'network_gate_recorded': False, 'network_intervals': 0,
+                'network_max_combined_bytes_per_second': None,
+                'network_over_limit_intervals': None, 'network_rx_bytes': None,
+                'network_tx_bytes': None, 'network_unavailable_intervals': 0})
             with (root / 'network-quiet-idle.summary.txt').open('a') as output:
                 output.write('container_count=3\n')
             missing = driver.verification_report.quietness_results(root)[0]['nodes'][2]
@@ -168,6 +172,7 @@ compose_exec_timeout() {
   fi
 }
 DFS_CONVERGENCE_WAIT=360
+DFS_FRESH_TOPOLOGY_REQUESTED=1
 READINESS_COMMAND_TIMEOUT=10
 POLL_INTERVAL=1
 NODES=node1
@@ -291,19 +296,20 @@ NODES=node1
 
     def test_restart_readiness_does_not_reenter_dfs_suite(self):
         runner = self.runner()
-        runner.env = {"SINOMO_TEST_DFS_ONLY": "1"}
+        runner.env = {"SINOMO_TEST_DFS_ONLY": "1", "SINOMO_TEST_DFS_BASELINE_ONLY": "1"}
         runner.args = SimpleNamespace(project="fixture")
         runner.binary = Path("/binary")
         runner.artifacts = Path("/artifacts")
         def readiness(*args, **kwargs):
             self.assertEqual(runner.env["SINOMO_TEST_DFS_ONLY"], "0")
+            self.assertEqual(runner.env["SINOMO_TEST_DFS_BASELINE_ONLY"], "0")
             self.assertEqual(runner.env["SINOMO_TEST_DFS_READY_ONLY"], "1")
             self.assertEqual(runner.env["SINOMO_TEST_REUSE"], "1")
             raise RuntimeError("gate failed")
         runner.run = readiness
         with self.assertRaisesRegex(RuntimeError, "gate failed"):
             runner.wait_ready("restart")
-        self.assertEqual(runner.env, {"SINOMO_TEST_DFS_ONLY": "1"})
+        self.assertEqual(runner.env, {"SINOMO_TEST_DFS_ONLY": "1", "SINOMO_TEST_DFS_BASELINE_ONLY": "1"})
 
     def test_percentiles_keep_profiles_and_directions_separate(self):
         samples = [{"profile": "ordinary", "origin": "node1", "operation": "write", "elapsed_ms": value}
@@ -719,7 +725,7 @@ if mode == 'stale':
 if mode == 'stall':
     sys.stdin.readline(); time.sleep(10); sys.exit(0)
 args=sys.argv[4:]
-args[-1]=str(root/container)
+args[-2]=str(root/container)
 os.execvp(args[0],args)
 '''
 
@@ -734,6 +740,7 @@ class PersistentGenerationTests(unittest.TestCase):
         marker = 'if [ "${SINOMO_TEST_TIMING_HELPERS_SELF_TEST:-0}" = 1 ]; then'
         self.assertEqual(source.count(marker), 1)
         (self.root / 'definitions.sh').write_text(source.split(marker)[0])
+        (self.root / 'quiet-network-counters.py').write_text(Path(__file__).with_name('quiet-network-counters.py').read_text())
         for node in ('node1', 'node2', 'node3', 'node4', 'node5', 'node6'):
             self.proc(node, '1', 'sinomo-shadow', ['sinomo', 'daemon', 'shadow', 'run'], '101')
             self.proc(node, '28', 'sinomo', ['sinomo', 'daemon', 'run'], '202')
@@ -776,6 +783,27 @@ class PersistentGenerationTests(unittest.TestCase):
         ! container_daemon_generation_snapshot node1 1 >/dev/null
         ''')
         self.assertEqual(len((self.root/'launches').read_text().splitlines()),1)
+
+    def test_network_reads_reuse_generation_worker_and_inherited_descriptors(self):
+        self.shell(r'''
+        NETWORK_QUIET_NET_DIRECTORY="$PROC_FIXTURES/counters"
+        mkdir "$NETWORK_QUIET_NET_DIRECTORY"
+        printf '%s\n' 'printf "net:[123]\\n28 202 1 101\\nInter-| Receive | Transmit\\nface | bytes | bytes\\nlo: 1 0 0 0 0 0 0 0 2 0 0 0 0 0 0 0\\n"' > "$NETWORK_QUIET_NET_DIRECTORY/counter-program.sh"
+        deadline=$(( $(monotonic_millis) + 5000 ))
+        network_quiet_generation_sessions_start "$deadline" node1
+        trap network_quiet_generation_sessions_stop EXIT
+        python3 - "$BASHPID" "${NETWORK_QUIET_GENERATION_READ_FD[node1]}" "${NETWORK_QUIET_GENERATION_WRITE_FD[node1]}" "$deadline" "$PROC_FIXTURES/quiet-network-counters.py" <<'PYCOUNTER'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location('counter', sys.argv[5])
+module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+for _ in range(2):
+    raw = module.read_owned_worker_counter(*map(int, sys.argv[1:5]))
+    namespace, generations, interfaces = module.parse_counters(raw)
+    assert namespace == 'net:[123]' and interfaces['lo']['tx_bytes'] == '2'
+PYCOUNTER
+        [ "$(container_daemon_generation_snapshot node1 1)" = $'28\t202\t1\t101' ]
+        [ "$(wc -l < "$PROC_FIXTURES/launches")" = 1 ]
+        ''')
 
     def test_multiple_sessions_close_all_inherited_writers_on_eof(self):
         self.shell(r'''
@@ -874,11 +902,16 @@ class PersistentGenerationTests(unittest.TestCase):
         mock_stream_running=0
         mock_cleanup_count=0
         mock_cleanup_stream=unavailable
-        times=(1000 2000 32000 34000 34500 35500)
+        times=(1000 2000 32000 34000 34500 35500 36500)
         monotonic_millis() { printf '%s\n' "$mock_now"; }
         network_quiet_container_for_node_before_deadline() { printf 'id-node1\n'; }
         network_quiet_container_name_before_deadline() { printf 'mock-node1\n'; }
-        network_quiet_stats_stream_start() { mock_stream_running=1; }
+        network_quiet_stats_stream_start() { mock_stream_running=1; NETWORK_QUIET_NET_SEALED=0; }
+        network_quiet_sample_network_group() {
+          NETWORK_QUIET_GROUP_NET_MIN_MS="$mock_now"
+          NETWORK_QUIET_GROUP_NET_CLOSED_MS="$mock_now"
+          NETWORK_QUIET_GROUP_NET_STATUS[node1]=within
+        }
         network_quiet_stats_stream_stop() { mock_stream_running=0; }
         network_quiet_stream_restart_delay() { return 1; }
         network_quiet_establish_generation_baseline() { generation_baseline[node1]='id-node1|28 202 1 101'; }
@@ -966,6 +999,118 @@ class PersistentGenerationTests(unittest.TestCase):
         self.assertEqual(fields[4:6], ['node1', 'replacement-container'])
         self.assertEqual(fields[6:10], ['', '', '', ''])
         self.assertEqual(fields[10:], ['false', 'changed'])
+
+
+
+class DfsBaselineLaneTests(unittest.TestCase):
+    @staticmethod
+    def shell_function(name):
+        script = Path(__file__).with_name('test-cluster.sh').read_text()
+        return name + '() {' + script.split('\n' + name + '() {', 1)[1].split('\n}\n', 1)[0] + '\n}\n'
+
+    def test_baseline_selector_rejects_combined_lanes_and_invalid_values(self):
+        validator = self.shell_function('validate_dfs_suite_config')
+        check = r'''require_bounded_uint() {
+  [[ "$2" =~ ^[0-9]+$ ]] && [ "$2" -ge "$3" ] && [ "$2" -le "$4" ]
+}
+log() { :; }
+''' + validator + '\nvalidate_dfs_suite_config'
+        base = dict(os.environ, DFS_BASELINE_ONLY='1', DFS_ONLY='0', DFS_READY_ONLY='0',
+                    FORMATION_ONLY='0', CLUSTER_KV_ONLY='0', PJDFSTEST_ONLY='0', QUIET_ONLY='0',
+                    NETWORK_CASES='', SINOMO_TEST_NETWORK_ONLY='0', DFS_READY_REQUIRE_QUIET='0')
+        self.assertEqual(subprocess.run(['bash','-c',check], env=base, capture_output=True).returncode, 0)
+        for key in ('DFS_ONLY','DFS_READY_ONLY','FORMATION_ONLY','CLUSTER_KV_ONLY','PJDFSTEST_ONLY',
+                    'QUIET_ONLY','SINOMO_TEST_NETWORK_ONLY','NETWORK_CASES'):
+            with self.subTest(selector=key):
+                env = dict(base, **{key:'1'})
+                self.assertNotEqual(subprocess.run(['bash','-c',check], env=env, capture_output=True).returncode, 0)
+        for value in ('2', 'unknown'):
+            self.assertNotEqual(subprocess.run(['bash','-c',check], env=dict(base, DFS_BASELINE_ONLY=value),
+                                               capture_output=True).returncode, 0)
+
+    def test_baseline_keeps_every_final_check_after_a_real_scenario_failure_result(self):
+        with tempfile.TemporaryDirectory() as directory:
+            command = r'''FAILED_SCENARIOS=""
+scenario() {
+  local name="$1"
+  printf '%s\t%s\n' "$name" "$*" >> "$ARTIFACTS/calls.tsv"
+  if [ "$name" = dfs-normal-correctness ]; then FAILED_SCENARIOS="$FAILED_SCENARIOS $name"; fi
+}
+''' + self.shell_function('dfs_baseline_case') + self.shell_function('dfs_baseline_correctness') + '\ndfs_baseline_correctness'
+            result = subprocess.run(['bash','-c',command], env=dict(os.environ, ARTIFACTS=directory), capture_output=True)
+            self.assertNotEqual(result.returncode, 0, result.stderr.decode())
+            scope = json.loads((Path(directory)/'dfs-baseline-scope.json').read_text())
+            self.assertEqual(scope['status'], 'failed')
+            self.assertEqual(len(scope['required_cases']), 15)
+            self.assertEqual([case['name'] for case in scope['required_cases'] if case['status'] != 'passed'],
+                             ['dfs-normal-correctness'])
+            calls = (Path(directory)/'calls.tsv').read_text()
+            self.assertIn('dfs-history-restart dfs_acceptance_case history --restart-cluster', calls)
+            self.assertIn('dfs-native-handoff dfs_acceptance_case handoff', calls)
+            for name in ('invariants-final','routed-status-final','baseline-final-convergence','baseline-final-joint-quiet'):
+                self.assertIn(name, calls)
+            self.assertNotIn('bulk-performance\t', calls)
+            self.assertNotIn('dfs-cli-benchmarks\t', calls)
+            self.assertTrue(all(case['status']=='not_run' for case in scope['performance_cases']))
+            self.assertFalse(scope['performance_acceptance'])
+
+    def test_report_preserves_not_run_performance_and_rejects_incomplete_claimed_baseline(self):
+        names = ['invariants-baseline','read-your-write','cross-node','rename-across-prefixes',
+                 'disk-damage-recovery','temporary-network-recovery','restart-durability',
+                 'dfs-core-only-components','dfs-normal-correctness','dfs-history-restart',
+                 'dfs-native-handoff','invariants-final','routed-status-final',
+                 'baseline-final-convergence','baseline-final-joint-quiet']
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root/'verification.json').write_text(json.dumps({'passed':True,'lane':'dfs-baseline=1'}))
+            scope = {'schema':'sinomo.dfs-correctness-baseline.v1','status':'passed',
+                     'required_cases':[{'name':name,'status':'passed'} for name in names],
+                     'performance_cases':[{'name':'bulk-performance','status':'not_run','reason':'deferred'}],
+                     'voter_coverage':'six containers do not prove multi-voter coverage'}
+            (root/'dfs-baseline-scope.json').write_text(json.dumps(scope))
+            report = driver.verification_report.write_report(root)
+            self.assertTrue(report['passed'])
+            self.assertFalse(report['performance_acceptance'])
+            self.assertEqual(report['dfs_baseline']['performance_cases'][0]['status'], 'not_run')
+            self.assertIn('NOT_RUN', (root/'REPORT.md').read_text())
+            scope['required_cases'].pop()
+            (root/'dfs-baseline-scope.json').write_text(json.dumps(scope))
+            self.assertFalse(driver.verification_report.write_report(root)['passed'])
+            (root/'dfs-baseline-scope.json').unlink()
+            self.assertFalse(driver.verification_report.write_report(root)['passed'])
+
+
+class AssignedParticipantInterruptionTests(unittest.TestCase):
+    def test_cut_requires_exact_durable_witness_and_heal_reuses_original_inputs(self):
+        body = DfsBaselineLaneTests.shell_function('temporary_network_recovery')
+        self.assertLess(body.index('--param phase=baseline'), body.index('docker network disconnect'))
+        self.assertLess(body.index('--param phase=blocked'), body.index('docker network connect'))
+        self.assertLess(body.index('docker network connect'), body.index('--param phase=recover'))
+        self.assertEqual(body.count('--param "operation-id=$operation_id"'), 3)
+        self.assertEqual(body.count('--param required-participants=6'), 3)
+        self.assertEqual(body.count('--param "original-options-json=$options_json"'), 2)
+        self.assertIn('compose restart node6', body)
+        self.assertIn('new write after network heal', body)
+        self.assertNotIn('expect-error', body)
+        self.assertNotIn('grep', body)
+
+    def test_failed_cut_is_retained_while_actual_heal_and_original_recovery_are_attempted(self):
+        body = DfsBaselineLaneTests.shell_function('temporary_network_recovery')
+        # The blocked probe must not return before the real link is healed.
+        blocked = body.split('--param phase=blocked', 1)[1].split('--param phase=recover', 1)[0]
+        self.assertIn('|| rc=1', blocked)
+        self.assertNotIn('return 0', blocked)
+        self.assertIn('docker network connect', blocked)
+        self.assertNotIn('if [ "$rc" = 0 ]', body)
+
+    def test_runtime_probe_does_not_accept_bare_errors_or_parse_rejection_strings(self):
+        source = (Path(__file__).parents[1] / 'crates/sinomo-cli/src/commands/test_cases_dfs/partition_write.rs').read_text()
+        for required in ('record.validate()', 'DfsPreparedOperationStatus::Prepared',
+                         'original_intent_matches', 'actual.version != original.version',
+                         'DfsStableWriteOperationReconciliation::Applied', 'receipt.target_version != target'):
+            self.assertIn(required, source)
+        self.assertNotIn('error.to_string().contains', source)
+        self.assertNotIn('write_return.contains', source)
 
 
 if __name__ == "__main__":

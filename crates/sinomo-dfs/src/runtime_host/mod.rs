@@ -355,7 +355,7 @@ pub struct DfsRuntimeHost {
     maintenance_notify: Arc<tokio::sync::Notify>,
     event_client: Option<ComponentEventClient>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
-    shutting_down: AtomicBool,
+    shutting_down: crate::DfsCancellationFlag,
 }
 
 impl DfsRuntimeHost {
@@ -372,7 +372,7 @@ impl DfsRuntimeHost {
             maintenance_notify: Arc::new(tokio::sync::Notify::new()),
             event_client: None,
             tasks: Mutex::new(Vec::new()),
-            shutting_down: AtomicBool::new(false),
+            shutting_down: crate::DfsCancellationFlag::new(),
         }
     }
 
@@ -383,7 +383,7 @@ impl DfsRuntimeHost {
 
     pub(crate) fn own_task(&self, task: tokio::task::JoinHandle<()>) {
         let mut tasks = self.tasks.lock().unwrap_or_else(|error| error.into_inner());
-        if self.shutting_down.load(Ordering::Acquire) {
+        if self.shutting_down.is_cancelled() {
             // Abort does not stop an already-running blocking task. Retain its
             // handle so the same lifecycle drain can join its actual owner.
             task.abort();
@@ -393,7 +393,7 @@ impl DfsRuntimeHost {
     }
 
     pub(crate) fn shutdown(&self) {
-        self.shutting_down.store(true, Ordering::Release);
+        self.shutting_down.cancel();
         self.response_delivery.shutdown();
         if let Ok(tasks) = self.tasks.lock() {
             for task in tasks.iter() {
@@ -480,6 +480,7 @@ struct TestDfsClusterAccess {
     local_data_dir: SinomoDataDir,
     authority_data_dir: SinomoDataDir,
     peers: Option<Arc<DfsTestClusterPeerBridge>>,
+    object_rpc: Option<Arc<dyn ComponentObjectRpcTransport>>,
     full_commit_calls: AtomicUsize,
     compact_commit_calls: AtomicUsize,
 }
@@ -504,6 +505,7 @@ impl TestDfsClusterAccess {
 #[cfg(any(test, feature = "test-support"))]
 struct TestDfsClusterQuorumHost {
     peers: Option<Arc<DfsTestClusterPeerBridge>>,
+    object_rpc: Option<Arc<dyn ComponentObjectRpcTransport>>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -636,7 +638,262 @@ fn test_dfs_cluster_transport_unavailable<'a, T: 'a>(
 }
 
 #[cfg(any(test, feature = "test-support"))]
-impl sinomo_core::network::ClusterObjectRpcAsyncHost for TestDfsClusterQuorumHost {}
+impl sinomo_core::network::ClusterObjectRpcAsyncHost for TestDfsClusterQuorumHost {
+    fn call_node_object_rpc_async<'a>(
+        &'a mut self,
+        paths: &'a ClusterPaths,
+        state: &'a sinomo_core::ClusterBootstrapState,
+        target_node_id: &'a NodeId,
+        call: sinomo_core::network::ObjectRpcCall,
+        options: sinomo_core::network::ClusterObjectRpcOptions,
+    ) -> sinomo_core::network::ClusterObjectRpcFuture<'a, sinomo_core::network::ObjectRpcResult>
+    {
+        Box::pin(async move {
+            if let Some(transport) = &self.object_rpc {
+                return transport
+                    .call_async(target_node_id, call, options, true)
+                    .await;
+            }
+            let mut client =
+                sinomo_core::network::ClusterObjectRpcClient::routed_from_fenced_bootstrap_state(
+                    self, paths, state,
+                )?;
+            client
+                .call_target(state, target_node_id, call, options)
+                .await
+        })
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+struct DfsTestHostedClusterKvServiceHost {
+    paths: ClusterPaths,
+    peers: Arc<DfsTestClusterPeerBridge>,
+    object_rpc: Arc<dyn ComponentObjectRpcTransport>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl DfsTestHostedClusterKvServiceHost {
+    fn native_host(&self) -> TestDfsClusterQuorumHost {
+        TestDfsClusterQuorumHost {
+            peers: Some(Arc::clone(&self.peers)),
+            object_rpc: Some(Arc::clone(&self.object_rpc)),
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl sinomo_core::cluster::ClusterKvServiceHost for DfsTestHostedClusterKvServiceHost {
+    fn authoritative_snapshot<'a>(
+        &'a self,
+        allow_forwarding: bool,
+    ) -> sinomo_core::cluster::ClusterKvServiceFuture<
+        'a,
+        sinomo_core::kv::KvAuthoritativeRead<sinomo_core::kv::KvSnapshot>,
+    > {
+        Box::pin(async move {
+            let runtime = tokio::runtime::Handle::current();
+            let mut state =
+                sinomo_core::cluster::read_cluster_state_without_kv_async(&runtime, &self.paths)
+                    .await?;
+            let mut host = self.native_host();
+            sinomo_core::cluster::read_cluster_kv_authoritative_snapshot_async_with_host(
+                &runtime,
+                &self.paths,
+                &mut state,
+                sinomo_core::cluster::ClusterControlPlaneTimeouts::default_daemon_transport()
+                    .kv_txn_quorum_options(allow_forwarding),
+                &mut host,
+            )
+            .await
+            .map_err(sinomo_core::service::ServiceError::from)
+        })
+    }
+    fn authoritative_entry<'a>(
+        &'a self,
+        key: String,
+        allow_forwarding: bool,
+    ) -> sinomo_core::cluster::ClusterKvServiceFuture<
+        'a,
+        sinomo_core::kv::KvAuthoritativeRead<Option<sinomo_core::kv::KvEntry>>,
+    > {
+        Box::pin(async move {
+            let runtime = tokio::runtime::Handle::current();
+            let mut state =
+                sinomo_core::cluster::read_cluster_state_without_kv_async(&runtime, &self.paths)
+                    .await?;
+            let mut host = self.native_host();
+            sinomo_core::cluster::read_cluster_kv_authoritative_entry_async_with_host(
+                &runtime,
+                &self.paths,
+                &mut state,
+                key,
+                sinomo_core::cluster::ClusterControlPlaneTimeouts::default_daemon_transport()
+                    .kv_txn_quorum_options(allow_forwarding),
+                &mut host,
+            )
+            .await
+            .map_err(sinomo_core::service::ServiceError::from)
+        })
+    }
+    fn authoritative_entries<'a>(
+        &'a self,
+        keys: Vec<String>,
+        allow_forwarding: bool,
+    ) -> sinomo_core::cluster::ClusterKvServiceFuture<
+        'a,
+        sinomo_core::kv::KvAuthoritativeRead<Vec<Option<sinomo_core::kv::KvEntry>>>,
+    > {
+        Box::pin(async move {
+            let runtime = tokio::runtime::Handle::current();
+            let mut state =
+                sinomo_core::cluster::read_cluster_state_without_kv_async(&runtime, &self.paths)
+                    .await?;
+            let mut host = self.native_host();
+            sinomo_core::cluster::read_cluster_kv_authoritative_entries_async_with_host(
+                &runtime,
+                &self.paths,
+                &mut state,
+                keys,
+                sinomo_core::cluster::ClusterControlPlaneTimeouts::default_daemon_transport()
+                    .kv_txn_quorum_options(allow_forwarding),
+                &mut host,
+            )
+            .await
+            .map_err(sinomo_core::service::ServiceError::from)
+        })
+    }
+    fn authoritative_range_prefix<'a>(
+        &'a self,
+        prefix: String,
+        allow_forwarding: bool,
+    ) -> sinomo_core::cluster::ClusterKvServiceFuture<
+        'a,
+        sinomo_core::kv::KvAuthoritativeRead<Vec<sinomo_core::kv::KvEntry>>,
+    > {
+        Box::pin(async move {
+            let runtime = tokio::runtime::Handle::current();
+            let mut state =
+                sinomo_core::cluster::read_cluster_state_without_kv_async(&runtime, &self.paths)
+                    .await?;
+            let mut host = self.native_host();
+            sinomo_core::cluster::read_cluster_kv_authoritative_range_prefix_async_with_host(
+                &runtime,
+                &self.paths,
+                &mut state,
+                prefix,
+                sinomo_core::cluster::ClusterControlPlaneTimeouts::default_daemon_transport()
+                    .kv_txn_quorum_options(allow_forwarding),
+                &mut host,
+            )
+            .await
+            .map_err(sinomo_core::service::ServiceError::from)
+        })
+    }
+    fn authoritative_complete_range_prefix<'a>(
+        &'a self,
+        prefix: String,
+        allow_forwarding: bool,
+    ) -> sinomo_core::cluster::ClusterKvServiceFuture<
+        'a,
+        sinomo_core::kv::KvAuthoritativeRead<Vec<sinomo_core::kv::KvEntry>>,
+    > {
+        Box::pin(async move {
+            let runtime = tokio::runtime::Handle::current();
+            let mut state =
+                sinomo_core::cluster::read_cluster_state_without_kv_async(&runtime, &self.paths)
+                    .await?;
+            let mut host = self.native_host();
+            sinomo_core::cluster::read_cluster_kv_authoritative_complete_range_prefix_async_with_host(
+                &runtime, &self.paths, &mut state, prefix, sinomo_core::cluster::ClusterControlPlaneTimeouts::default_daemon_transport().kv_txn_quorum_options(allow_forwarding), &mut host,
+            ).await.map_err(sinomo_core::service::ServiceError::from)
+        })
+    }
+    fn request_outcome<'a>(
+        &'a self,
+        request: sinomo_core::kv::ClusterKvRequestOutcomeRequest,
+        allow_forwarding: bool,
+    ) -> sinomo_core::cluster::ClusterKvServiceFuture<
+        'a,
+        sinomo_core::kv::ClusterKvRequestOutcomeRead,
+    > {
+        Box::pin(async move {
+            let runtime = tokio::runtime::Handle::current();
+            let mut state =
+                sinomo_core::cluster::read_cluster_state_without_kv_async(&runtime, &self.paths)
+                    .await?;
+            let mut host = self.native_host();
+            sinomo_core::cluster::read_cluster_kv_request_outcome_async_with_host(
+                &runtime,
+                &self.paths,
+                &mut state,
+                request.request_id,
+                false,
+                sinomo_core::cluster::ClusterControlPlaneTimeouts::default_daemon_transport()
+                    .kv_txn_quorum_options(allow_forwarding),
+                &mut host,
+            )
+            .await
+            .map_err(sinomo_core::service::ServiceError::from)
+        })
+    }
+    fn commit_transaction<'a>(
+        &'a self,
+        request: sinomo_core::kv::KvTxnRequest,
+        allow_forwarding: bool,
+    ) -> sinomo_core::cluster::ClusterKvServiceFuture<'a, sinomo_core::kv::ClusterKvTxnRpcResponse>
+    {
+        Box::pin(async move {
+            let mut host = self.native_host();
+            sinomo_core::cluster::handle_forwarded_cluster_kv_txn_rpc_request_compact_async_with_host(
+                &tokio::runtime::Handle::current(), &self.paths, request,
+                sinomo_core::cluster::ClusterControlPlaneTimeouts::default_daemon_transport().kv_txn_quorum_options(allow_forwarding), &mut host,
+            ).await.map_err(sinomo_core::service::ServiceError::from)
+        })
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn hosted_cluster_kv_test_factory(
+    peers: Arc<DfsTestClusterPeerBridge>,
+) -> Result<sinomo_module::StaticComponentFactory, sinomo_module::ComponentError> {
+    let mut offer = sinomo_module::ServiceOffer::new(
+        "cluster-kv",
+        "sinomo.cluster.kv",
+        env!("CARGO_PKG_VERSION"),
+    );
+    for route in sinomo_core::kv::CLUSTER_KV_RPC_ROUTES {
+        offer = offer.with_route(*route);
+    }
+    sinomo_module::StaticComponentFactory::new(
+        sinomo_module::ComponentDescriptor::new(
+            "native-test-hosted-cluster-kv",
+            env!("CARGO_PKG_VERSION"),
+        )
+        .with_offer(offer),
+        move |context, scope| {
+            let object_rpc = context.object_rpc_transport().ok_or_else(|| {
+                sinomo_module::ComponentError::component(
+                    "native-test-hosted-cluster-kv",
+                    "actual component carrier is missing",
+                )
+            })?;
+            let host = Arc::new(DfsTestHostedClusterKvServiceHost {
+                paths: ClusterPaths::new(context.data_dir()),
+                peers: Arc::clone(&peers),
+                object_rpc,
+            });
+            scope.set_services(
+                sinomo_core::cluster::register_cluster_kv_service(
+                    sinomo_core::service::ServiceRegistryBuilder::default(),
+                    host,
+                )
+                .build(),
+            );
+            Ok(())
+        },
+    )
+}
 
 #[cfg(any(test, feature = "test-support"))]
 impl sinomo_core::cluster::ClusterKvQuorumAsyncHost for TestDfsClusterQuorumHost {
@@ -758,6 +1015,7 @@ impl sinomo_core::cluster::ClusterKvQuorumAsyncHost for TestDfsClusterQuorumHost
                 let _wave = worker.fanout.lock().await;
                 let mut host = TestDfsClusterQuorumHost {
                     peers: Some(Arc::clone(&worker)),
+                    object_rpc: None,
                 };
                 sinomo_core::cluster::fan_out_committed_cluster_raft_command_async_with_host(
                     &tokio::runtime::Handle::current(),
@@ -934,6 +1192,7 @@ impl sinomo_core::service::ClusterAccess for TestDfsClusterAccess {
             let runtime = tokio::runtime::Handle::current();
             let mut host = TestDfsClusterQuorumHost {
                 peers: self.peers.clone(),
+                object_rpc: None,
             };
             sinomo_core::cluster::read_cluster_kv_authoritative_entry_async_with_host(
                 &runtime,
@@ -971,6 +1230,7 @@ impl sinomo_core::service::ClusterAccess for TestDfsClusterAccess {
             let runtime = tokio::runtime::Handle::current();
             let mut host = TestDfsClusterQuorumHost {
                 peers: self.peers.clone(),
+                object_rpc: None,
             };
             sinomo_core::cluster::read_cluster_kv_authoritative_entries_async_with_host(
                 &runtime, &paths, &mut state, keys, options, &mut host,
@@ -1003,6 +1263,7 @@ impl sinomo_core::service::ClusterAccess for TestDfsClusterAccess {
             let runtime = tokio::runtime::Handle::current();
             let mut host = TestDfsClusterQuorumHost {
                 peers: self.peers.clone(),
+                object_rpc: None,
             };
             sinomo_core::cluster::read_cluster_kv_authoritative_range_prefix_async_with_host(
                 &runtime, &paths, &mut state, prefix, options, &mut host,
@@ -1028,6 +1289,7 @@ impl sinomo_core::service::ClusterAccess for TestDfsClusterAccess {
             let runtime = tokio::runtime::Handle::current();
             let mut host = TestDfsClusterQuorumHost {
                 peers: self.peers.clone(),
+                object_rpc: None,
             };
             sinomo_core::cluster::read_cluster_kv_authoritative_complete_range_prefix_async_with_host(
                 &runtime, &paths, &mut state, prefix, options, &mut host,
@@ -1060,6 +1322,7 @@ impl sinomo_core::service::ClusterAccess for TestDfsClusterAccess {
             let runtime = tokio::runtime::Handle::current();
             let mut host = TestDfsClusterQuorumHost {
                 peers: self.peers.clone(),
+                object_rpc: None,
             };
             sinomo_core::cluster::read_cluster_kv_request_outcome_async_with_host(
                 &runtime, &paths, &mut state, request_id, true, options, &mut host,
@@ -1089,10 +1352,11 @@ impl sinomo_core::service::ClusterAccess for TestDfsClusterAccess {
             let options =
                 sinomo_core::cluster::ClusterControlPlaneTimeouts::default_daemon_transport()
                     .kv_txn_quorum_options(true);
-            let paths = self.cluster_paths();
+            let paths = self.local_cluster_paths();
             let runtime = tokio::runtime::Handle::current();
             let mut host = TestDfsClusterQuorumHost {
                 peers: self.peers.clone(),
+                object_rpc: self.object_rpc.clone(),
             };
             sinomo_core::cluster::handle_cluster_kv_txn_request_async_with_host(
                 &runtime, &paths, request, options, &mut host,
@@ -1101,6 +1365,7 @@ impl sinomo_core::service::ClusterAccess for TestDfsClusterAccess {
             .map_err(sinomo_core::service::ServiceError::Network)
         })
     }
+
     fn kv_commit_compact_async<'a>(
         &'a self,
         request: sinomo_core::kv::KvTxnRequest,
@@ -1121,10 +1386,11 @@ impl sinomo_core::service::ClusterAccess for TestDfsClusterAccess {
             let options =
                 sinomo_core::cluster::ClusterControlPlaneTimeouts::default_daemon_transport()
                     .kv_txn_quorum_options(true);
-            let paths = self.cluster_paths();
+            let paths = self.local_cluster_paths();
             let runtime = tokio::runtime::Handle::current();
             let mut host = TestDfsClusterQuorumHost {
                 peers: self.peers.clone(),
+                object_rpc: self.object_rpc.clone(),
             };
             sinomo_core::cluster::handle_cluster_kv_txn_request_compact_async_with_host(
                 &runtime, &paths, request, options, &mut host,
@@ -1186,10 +1452,21 @@ pub(crate) fn test_cluster_access_for_node_on_voter(
     authority_data_dir: &SinomoDataDir,
     peers: Option<Arc<DfsTestClusterPeerBridge>>,
 ) -> Arc<dyn sinomo_core::service::ClusterAccess> {
+    test_cluster_access_for_node_on_voter_with_rpc(local_data_dir, authority_data_dir, peers, None)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn test_cluster_access_for_node_on_voter_with_rpc(
+    local_data_dir: &SinomoDataDir,
+    authority_data_dir: &SinomoDataDir,
+    peers: Option<Arc<DfsTestClusterPeerBridge>>,
+    object_rpc: Option<Arc<dyn ComponentObjectRpcTransport>>,
+) -> Arc<dyn sinomo_core::service::ClusterAccess> {
     Arc::new(TestDfsClusterAccess {
         local_data_dir: local_data_dir.clone(),
         authority_data_dir: authority_data_dir.clone(),
         peers,
+        object_rpc,
         full_commit_calls: AtomicUsize::new(0),
         compact_commit_calls: AtomicUsize::new(0),
     })
@@ -1292,6 +1569,7 @@ fn test_dfs_runtime_host(data_dir: &SinomoDataDir) -> Arc<DfsRuntimeHost> {
                 local_data_dir: data_dir.clone(),
                 authority_data_dir: data_dir.clone(),
                 peers: None,
+                object_rpc: None,
                 full_commit_calls: AtomicUsize::new(0),
                 compact_commit_calls: AtomicUsize::new(0),
             }),
@@ -1536,6 +1814,56 @@ pub(crate) fn registered_dfs_runtime_peer_node_ids(
     Ok(peers)
 }
 
+/// Qualify bootstrap with the same registered host and already-held execution
+/// owners. Configuration readiness precedes the native publication writer.
+pub(crate) async fn bootstrap_publication_execution_provider(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    execution: &Arc<crate::DfsPublicationExecutionOwners>,
+    runtime: &tokio::runtime::Handle,
+) -> Result<Arc<crate::DfsPublicationExecutionProvider>, crate::DfsError> {
+    let error = |message: String| crate::DfsError::Metadata { message };
+    if execution.data_root() != data_dir.root()
+        || cluster_paths.root != ClusterPaths::new(data_dir).root
+    {
+        return Err(error(
+            "bootstrap publication belongs to another data root".into(),
+        ));
+    }
+    let host = registered_dfs_runtime_host(data_dir)
+        .map_err(|source| error(source.to_string()))?
+        .ok_or_else(|| {
+            error("bootstrap publication has no actual registered runtime host".into())
+        })?;
+    if host.shutting_down.is_cancelled() {
+        return Err(error(
+            "bootstrap publication runtime host is stopping".into(),
+        ));
+    }
+    let state = sinomo_core::cluster::read_cluster_state_without_kv(cluster_paths)
+        .map_err(|source| error(source.to_string()))?;
+    let authority = message_host::daemon_dfs_metadata_authority_generation_for_identity(
+        cluster_paths,
+        &state.cluster_id,
+        &state.local_node_id,
+        Some(runtime),
+    )?;
+    // Bootstrap has written its assignment before this shared configuration
+    // join. It retains the existing global admission; no nested permit is taken.
+    authority.ensure_write_configuration_ready_async().await?;
+    if host.shutting_down.is_cancelled() {
+        return Err(error(
+            "bootstrap publication runtime host is stopping".into(),
+        ));
+    }
+    crate::DfsPublicationExecutionProvider::from_execution_owners(
+        execution,
+        authority,
+        runtime.clone(),
+    )
+    .map_err(crate::DfsError::from)
+}
+
 pub fn open_dfs_runtime_service_with_content(
     data_dir: &SinomoDataDir,
     runtime: Option<&tokio::runtime::Handle>,
@@ -1602,17 +1930,30 @@ fn open_dfs_runtime_service_for_effect(
     // another KV-path reader here competes with the live Raft owner and cannot
     // substitute for that component's retained configuration.
     let peer_node_ids = registered_dfs_runtime_peer_node_ids(control_plane.as_ref(), &state)?;
-    let shards = authority
-        .cached_metadata_shards(
-            &effect
-                .map(|scope| scope.file_system_id.clone())
-                .unwrap_or_else(crate::sifs_file_system_id),
-            authority.projection_generation(),
-        )?
-        .filter(|shards| !shards.is_empty())
+    // Borrow one immutable native configuration view. Separately loading its
+    // generation and the decoded authority index can lose a coherent view to
+    // an unrelated committed delta between the two reads.
+    let configuration =
+        authority
+            .write_configuration_projection()?
+            .ok_or_else(|| DfsRuntimeError::Parse {
+                detail: "native DFS service has no current certified metadata topology".into(),
+            })?;
+    let file_system_id = effect
+        .map(|scope| scope.file_system_id.clone())
+        .unwrap_or_else(crate::sifs_file_system_id);
+    let prefix = format!("{}/", crate::metadata_shards_prefix(&file_system_id));
+    let entries = configuration
+        .entries(&prefix)
+        .filter(|entries| !entries.is_empty())
         .ok_or_else(|| DfsRuntimeError::Parse {
             detail: "native DFS service has no current certified metadata topology".into(),
         })?;
+    let mut shards = entries
+        .iter()
+        .map(|entry| entry.decode::<crate::DfsMetadataShardConfig>())
+        .collect::<Result<Vec<_>, _>>()?;
+    shards.sort_by(|left, right| left.shard_id.cmp(&right.shard_id));
     // Only a fresh ordinary shell needs local bindings here. This precedes
     // request-local writes/reads; rebuilding an active producer would lose custody.
     let cold_local_shards = if effect.is_none() {
@@ -1663,6 +2004,7 @@ fn open_dfs_runtime_service_for_effect(
         authority,
         provider_runtime.clone(),
     );
+    let cancellation = host.shutting_down.clone();
     let transport = if effect.is_none() {
         data_plane::daemon_dfs_client_node_transport(
             state.local_node_id.clone(),
@@ -1679,7 +2021,16 @@ fn open_dfs_runtime_service_for_effect(
             &provider_runtime,
         )
     };
-    let service = NetworkedDfsService::new(transport, content);
+    // The same normal host owns eligibility for this Core/client shell. Borrow
+    // its shared reactive cache; opening a service neither samples storage nor
+    // rebuilds an advisory placement snapshot. Publication permission remains
+    // exclusively with the native provider/intent/receipt/kernel guards.
+    let service = NetworkedDfsService::new(transport, content)
+        .with_cancellation(cancellation)
+        .with_placement_snapshot_cache(cached_daemon_dfs_placement_snapshot_cache(
+            data_dir,
+            &state.local_node_id,
+        ));
     service
         .publication_provider
         .retain_runtime_provider(publication_provider);
@@ -1692,7 +2043,10 @@ fn open_dfs_runtime_service_for_effect(
         // completed membership-handoff binding. Reuse normal mutation admission's
         // exact active-assignment, completion-proof and durable-prefix checks
         // before this bounded effect can acquire its authoritative writer.
-        service.rebind_completed_local_metadata_shard_membership_handoff_if_frozen(expected)?;
+        // This newly created lazy shell has no operational projection to
+        // rehydrate. Clear/bind only its exact certified physical instance;
+        // ordinary mutation/hydration retains all participant recovery checks.
+        service.rebind_completed_local_metadata_shard_instance_if_frozen(expected)?;
     } else {
         let mut rebound = false;
         for expected in cold_local_shards {
@@ -2213,6 +2567,12 @@ impl DaemonDfsReplicaMaterializationLane {
         // high-water mark. The lane's final drop transfers one cleanup edge to
         // the scoped allocator lane after every attempted pass.
         self.allocator_cleanup_needed.store(true, Ordering::Release);
+        #[cfg(any(test, feature = "test-support"))]
+        let _blocking_owner_observation = materialization_test::observe_blocking_owner(
+            &self.data_dir,
+            &self.lane.shard_id,
+            &self._data_owner_lock,
+        );
         #[cfg(test)]
         wait_at_daemon_dfs_message_committed_edge_test_hook(&format!(
             "replica-materialization:{}",
@@ -2603,6 +2963,10 @@ pub(crate) use control_plane::{
 pub(crate) use control_plane::{
     NativePlacementProgressRpcGate, gated_native_placement_control_plane_for_test,
 };
+#[cfg(test)]
+pub(crate) use control_plane::{
+    test_retained_client_configuration_projection, test_retained_client_configuration_sync,
+};
 
 mod data_plane;
 #[cfg(any(test, feature = "test-support"))]
@@ -2736,7 +3100,7 @@ pub fn owned_storage_import_control_plane_client(
         registered_dfs_runtime_host(context.data_dir())?.ok_or_else(|| DfsRuntimeError::Parse {
             detail: "storage import normal host is not registered yet".into(),
         })?;
-    if host.shutting_down.load(Ordering::Acquire) {
+    if host.shutting_down.is_cancelled() {
         return Err(DfsRuntimeError::Parse {
             detail: "storage import native host is stopping".into(),
         });

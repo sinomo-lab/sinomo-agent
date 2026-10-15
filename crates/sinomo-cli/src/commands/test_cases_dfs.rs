@@ -129,6 +129,7 @@ struct ScopedSifsTestNamespace {
 }
 
 mod attachments;
+mod partition_write;
 mod semantic_lost_reply;
 
 struct ScopedDfsRuntimeProbeRoot {
@@ -330,6 +331,7 @@ pub fn register_dfs_cluster_test_cases(
         .register(dfs_protocol_codec_baseline())
         .register(dfs_content_version_gc())
         .register(dfs_write())
+        .register(partition_write::dfs_partition_write())
         .register(dfs_write_latency())
         .register(dfs_expect_file())
         .register(dfs_expect_absent())

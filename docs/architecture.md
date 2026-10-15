@@ -287,12 +287,22 @@ The cluster KV stores compact filesystem configuration and shard placement.
 DFS metadata shards own paths, versions, intents, receipts, namespace
 transactions, journals, and repair state. Content stores own immutable bytes
 and manifests. DFS writes serialize through the relevant owner or metadata
-primary and produce one authoritative visible history. A healthy publication
-is acknowledged by the complete configured metadata shard without touching
-Raft. If only a DFS recovery quorum is reachable, cluster KV may commit one
-bounded, operation-specific permit and head watermark for the exact assignment
-and epoch. This deliberately reuses the cluster's existing Raft consensus to
-fence failover; it does not put DFS metadata or content in KV.
+primary and produce one authoritative visible history. Ordinary metadata
+publication and sync use the existing configuration projections, durable
+shard-local writer fences, and acknowledgements from the complete configured
+metadata shard. Incomplete participant evidence leaves the operation pending
+or unavailable; cluster KV cannot supply a substitute metadata permit, floor,
+watermark, journal, or receipt ledger. Content W/N remains governed separately
+by filesystem policy.
+
+Cluster KV retains its atomic transactional API. It orders genuine cluster
+configuration and authority transitions, including proof-carrying shard
+handoffs, without caller bindings, caller sessions, or DFS-specific Raft APIs.
+DFS reconciles an ambiguous configuration transaction through existing
+authoritative outcomes and guarded configuration reads, then continues through
+its own durable shard state and participant protocol. Legacy formats and
+historical normalization belong exclusively to `sinomo-dfs-migration`;
+incompatible nodes must be upgraded.
 
 See [DFS architecture](dfs-architecture.md), the [SIFS layout](sifs.md), the
 [direct NFSv3 adapter](nfs-architecture.md), and the

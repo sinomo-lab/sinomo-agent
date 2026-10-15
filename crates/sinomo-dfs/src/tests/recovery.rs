@@ -160,6 +160,13 @@ fn persisted_repair_attempts_prevent_duplicate_retry_after_reopen() {
     let (runtime, mut dfs, config) =
         crate::test_support::current_native_metadata_service(name, 2, "/services").unwrap();
     let owner = config.primary_node_id;
+    drop(dfs);
+    let background = runtime
+        .deny_background_replica_before_claim(&owner)
+        .unwrap();
+    let mut dfs = runtime
+        .metadata_primary_service("/services/native-recorded-backoff")
+        .unwrap();
     let replica = crate::test_support::DfsTestRuntime::ordered_node_ids(name, 2)
         .into_iter()
         .find(|node| *node != owner)
@@ -202,7 +209,10 @@ fn persisted_repair_attempts_prevent_duplicate_retry_after_reopen() {
     // returned in-flight record is restart bookkeeping, never a receipt or
     // permission to run repair without current native authority.
     drop(dfs);
-    let mut reopened = runtime.client(&owner).unwrap();
+    let mut reopened = runtime
+        .metadata_primary_service("/services/native-recorded-backoff")
+        .unwrap();
+    reopened.hydrate_from_metadata_backend().unwrap();
     let before = runtime.rpc_observations().len();
     assert!(records[0].next_retry_unix_nanos > dfs_now_unix_nanos());
     assert!(
@@ -233,6 +243,7 @@ fn persisted_repair_attempts_prevent_duplicate_retry_after_reopen() {
     );
     drop(peer);
     drop(reopened);
+    drop(background);
     runtime.close().unwrap();
 }
 
@@ -242,6 +253,13 @@ fn persisted_repair_attempts_prevent_duplicate_fetch_after_reopen() {
     let (runtime, mut dfs, config) =
         crate::test_support::current_native_metadata_service(name, 3, "/services").unwrap();
     let primary = config.primary_node_id;
+    drop(dfs);
+    let background = runtime
+        .deny_background_replica_before_claim(&primary)
+        .unwrap();
+    let mut dfs = runtime
+        .metadata_primary_service("/services/native-fetch-backoff.bin")
+        .unwrap();
     let other = crate::test_support::DfsTestRuntime::ordered_node_ids(name, 3)
         .into_iter()
         .filter(|node| *node != primary)
@@ -314,10 +332,30 @@ fn persisted_repair_attempts_prevent_duplicate_fetch_after_reopen() {
     assert_eq!(records[0].content_hash, hash);
     assert_eq!(records[0].missing_replica_node_id, target);
     assert!(records[0].in_flight);
-    assert!(records[0].transfer_request_id.is_some());
+    let pending = dfs
+        .writes
+        .pending_writes
+        .get(&records[0].intent_id)
+        .expect("actual producer owns the pending Fetch");
+    assert!(pending.fetch_inflight_from.contains(&source));
+    assert!(
+        pending
+            .fetch_inflight_request_ids
+            .get(&source)
+            .is_some_and(|id| !id.is_empty()),
+        "the actual source Fetch has its own correlated request identity"
+    );
+    assert!(
+        records[0].transfer_request_id.is_none(),
+        "a source Fetch cannot invent custody of a separate target Repair"
+    );
+    assert!(!pending.repair_inflight_request_ids.contains_key(&target));
     assert!(records[0].next_retry_unix_nanos > dfs_now_unix_nanos());
     drop(dfs);
-    let mut reopened = runtime.client(&primary).unwrap();
+    let mut reopened = runtime
+        .metadata_primary_service("/services/native-fetch-backoff.bin")
+        .unwrap();
+    reopened.hydrate_from_metadata_backend().unwrap();
     let before_retry = runtime.rpc_observations().len();
     assert!(records[0].next_retry_unix_nanos > dfs_now_unix_nanos());
     assert!(
@@ -346,6 +384,7 @@ fn persisted_repair_attempts_prevent_duplicate_fetch_after_reopen() {
     drop(actual_source);
     drop(reopened);
     runtime.clear_faults();
+    drop(background);
     runtime.close().unwrap();
 }
 
@@ -508,13 +547,15 @@ fn recovery_hydration_skips_fully_repaired_committed_pending_write() {
 }
 
 #[test]
-fn hydrate_recovers_zero_byte_create_after_authoritative_view_refresh_failure_once() {
+fn hydrate_recovers_zero_byte_create_after_missing_native_prepare_ack_once() {
     let name = "native-zero-create-floor-return-failure";
     let (mut runtime, mut original, config) =
         crate::test_support::current_native_metadata_service(name, 3, "/services").unwrap();
     let owner = config.primary_node_id.clone();
     let parent_path = "/services/native-floor-recovery";
     let child_path = "/services/native-floor-recovery/empty.bin";
+    drop(original);
+    let mut original = runtime.metadata_primary_service(child_path).unwrap();
     original.posix_mkdir_all(parent_path).unwrap();
     let parent_before = original.posix_stat(parent_path).unwrap();
     let parent_versions_before = original
@@ -524,15 +565,15 @@ fn hydrate_recovers_zero_byte_create_after_authoritative_view_refresh_failure_on
         .unwrap()
         .len();
     let missing_ack = config.replica_node_ids[0].clone();
-    runtime.install_fault(crate::test_support::DfsTestFaultRule {
+    let missing_ack_fault = crate::test_support::DfsTestFaultRule {
         source: Some(owner.clone()),
         target: Some(missing_ack),
-        route: Some(DFS_METADATA_JOURNAL_BATCH_ROUTE.into()),
+        route: None,
         call_id: None,
         origin: Some(crate::test_support::DfsTestRpcOrigin::RegisteredHost),
         remaining_hits: 32,
         action: crate::test_support::DfsTestFaultAction::BudgetExhausted,
-    });
+    };
     let fault = runtime.metadata_operation_floor_fault(&owner).unwrap();
     let trigger = fault.operation_floor_denial_trigger(
         crate::control_plane::metadata_shard_operation_floor_key(
@@ -540,26 +581,51 @@ fn hydrate_recovers_zero_byte_create_after_authoritative_view_refresh_failure_on
             &config.shard_id,
         ),
     );
+    let runtime = std::rc::Rc::new(std::cell::RefCell::new(runtime));
+    let runtime_in_hook = std::rc::Rc::clone(&runtime);
+    let reached_prepare = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observed_prepare = Arc::clone(&reached_prepare);
     crate::service_commit::BEFORE_CREATE_PREPARE.with(|hook| {
-        *hook.borrow_mut() = Some(Box::new(move |_| trigger()));
+        *hook.borrow_mut() = Some(Box::new(move |_| {
+            observed_prepare.store(true, Ordering::SeqCst);
+            trigger();
+            runtime_in_hook.borrow().install_fault(missing_ack_fault);
+        }));
     });
     let operation_id = format!("cf_{}", sinomo_core::Id::generate());
-    let error = original
-        .posix_create_file_with_contents_and_attrs_and_operation_id(
-            child_path,
-            &[],
-            DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
-            DfsPosixCreateAttrs::new(0o640, 6101, 6102),
-            &operation_id,
-        )
-        .unwrap_err();
-    assert!(
-        error.to_string().contains("retry the read"),
-        "unexpected real failure: {error}"
+    let result = original.posix_create_file_with_contents_and_attrs_and_operation_id(
+        child_path,
+        &[],
+        DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
+        DfsPosixCreateAttrs::new(0o640, 6101, 6102),
+        &operation_id,
     );
+    // Clear an unconsumed negative hook on every outcome before reclaiming the
+    // fixture; an earlier failure must not retain its native owner accidentally.
+    crate::service_commit::BEFORE_CREATE_PREPARE.with(|hook| {
+        hook.borrow_mut().take();
+    });
+    let mut runtime = std::rc::Rc::try_unwrap(runtime)
+        .ok()
+        .expect("prepare hook released fixture")
+        .into_inner();
+    assert!(reached_prepare.load(Ordering::SeqCst));
+    let error = result.unwrap_err();
     assert!(
-        fault.denied_operation_floor_reads() > 1,
-        "the normal bounded authority retry must reach the actual floor boundary"
+        matches!(
+            &error,
+            DfsPosixError::Dfs(DfsError::MetadataRecoveryQuorumUnavailable {
+                required: 3,
+                verified: 2,
+                ..
+            })
+        ),
+        "the actual missing native participant must prevent publication: {error:?}"
+    );
+    assert_eq!(
+        fault.denied_operation_floor_reads(),
+        0,
+        "ordinary full-participant preparation must not fall back to a KV operation floor"
     );
     let backend = original.metadata_backend().unwrap();
     let prepared = backend
@@ -611,7 +677,7 @@ fn hydrate_recovers_zero_byte_create_after_authoritative_view_refresh_failure_on
         .unwrap()
         .outcome
         .unwrap();
-    let mut recovered = runtime.client(&owner).unwrap();
+    let mut recovered = runtime.metadata_primary_service(child_path).unwrap();
     recovered
         .hydrate_from_metadata_backend_for_commit_promotion_recovery()
         .unwrap();
@@ -645,7 +711,7 @@ fn hydrate_recovers_zero_byte_create_after_authoritative_view_refresh_failure_on
     drop(recovered);
     runtime.stop_node(&owner).unwrap();
     runtime.reopen_node(owner.clone()).unwrap();
-    let reopened = runtime.client(&owner).unwrap();
+    let reopened = runtime.metadata_primary_service(child_path).unwrap();
     assert_eq!(reopened.posix_stat(child_path).unwrap(), child);
     assert_eq!(reopened.posix_stat(parent_path).unwrap(), parent_after);
     assert_eq!(
@@ -855,7 +921,7 @@ fn sifs_posix_rename_directory_bounded_job_resumes_after_reopen() {
         }
 
         let job = dfs
-            .posix_rename_directory_bounded(old_dir, new_dir, 1)
+            .posix_rename_directory_bounded_routed(old_dir, new_dir, 1)
             .expect("first bounded rename batch");
         assert_eq!(job.status, DfsNamespaceJobStatus::Running);
         assert!(
@@ -863,11 +929,11 @@ fn sifs_posix_rename_directory_bounded_job_resumes_after_reopen() {
             "a one-step directory rename should persist remaining subtree work"
         );
         assert!(matches!(
-            dfs.posix_stat(old_dir),
+            dfs.posix_stat_distributed(old_dir),
             Err(DfsPosixError::NotFound { .. })
         ));
         assert_eq!(
-            dfs.posix_stat(new_dir)
+            dfs.posix_stat_distributed(new_dir)
                 .expect("new root after first batch")
                 .kind,
             DfsObjectKind::Directory
@@ -880,23 +946,24 @@ fn sifs_posix_rename_directory_bounded_job_resumes_after_reopen() {
     {
         let mut dfs = runtime.client(&node_id).unwrap();
         let mut job = dfs
-            .posix_resume_namespace_job_bounded(&job_id, 2)
+            .posix_resume_namespace_job_bounded_routed(&job_id, old_dir, 2)
             .expect("resume bounded rename after reopen");
         while job.status != DfsNamespaceJobStatus::Completed {
             job = dfs
-                .posix_resume_namespace_job_bounded(&job_id, 2)
+                .posix_resume_namespace_job_bounded_routed(&job_id, old_dir, 2)
                 .expect("resume next rename batch");
         }
         assert!(job.processed_object_count >= old_files.len() as u64);
         for path in &old_files {
             assert!(matches!(
-                dfs.posix_read_file(path),
+                dfs.posix_read_file_distributed(path),
                 Err(DfsPosixError::NotFound { .. })
             ));
         }
         for (old_path, new_path) in old_files.iter().zip(new_files.iter()) {
             assert_eq!(
-                dfs.posix_read_file(new_path).expect("new file content"),
+                dfs.posix_read_file_distributed(new_path)
+                    .expect("new file content"),
                 old_path.as_bytes()
             );
         }
@@ -905,7 +972,7 @@ fn sifs_posix_rename_directory_bounded_job_resumes_after_reopen() {
     runtime.stop_node(&node_id).unwrap();
     runtime.reopen_node(node_id.clone()).unwrap();
     {
-        let dfs = runtime.client(&node_id).unwrap();
+        let mut dfs = runtime.metadata_primary_service(new_dir).unwrap();
         let job = dfs
             .metadata_backend
             .as_ref()
@@ -917,7 +984,9 @@ fn sifs_posix_rename_directory_bounded_job_resumes_after_reopen() {
         assert!(job.completed_at.is_some());
         for new_path in &new_files {
             assert_eq!(
-                dfs.posix_stat(new_path).expect("reloaded moved file").kind,
+                dfs.posix_stat_distributed(new_path)
+                    .expect("reloaded moved file")
+                    .kind,
                 DfsObjectKind::File
             );
         }
@@ -984,11 +1053,52 @@ fn sifs_cluster_writer_recovers_from_local_blob_loss_after_async_repair() {
         .map(|index| (index % 251) as u8)
         .collect::<Vec<_>>();
     let expected_hash = content_hash(&bytes);
+    let required = vec![cluster.writer_node.clone(), cluster.primary_node.clone()];
+    let mut placement = DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 2).unwrap();
+    placement.required_node_ids = required.clone();
+    let accepted = cluster
+        ._runtime
+        .apply_placement_policy(
+            &cluster.primary_node,
+            path,
+            DfsPlacementScope::SelfOnly,
+            placement,
+        )
+        .unwrap();
+    let control = cluster._runtime.shared_control_plane().unwrap();
+    let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    loop {
+        let job = control
+            .with_client(|kv| {
+                DfsControlPlaneStore::new(kv.as_mut())
+                    .placement_reconciliation(&accepted.file_system_id, &accepted.job_id)
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.accepted_config, accepted.accepted_config);
+        assert_eq!(job.scanned_object_count, 0);
+        assert!(job.last_error.is_none());
+        if job.state == DfsPlacementReconciliationState::Completed {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(!remaining.is_zero(), "normal empty Apply setup budget");
+        cluster
+            ._runtime
+            .maintenance_tick(&cluster.primary_node, remaining)
+            .unwrap()
+            .outcome
+            .unwrap();
+    }
+    drop(control);
+    let mut policy = DfsReplicationPolicy::new(1, 2).unwrap();
+    policy.required_node_ids = required;
+
     match cluster.writer.posix_write_file(
         path,
         &bytes,
         DfsWriteOptions {
-            policy: DfsReplicationPolicy::new(1, 2).expect("policy"),
+            policy,
             replica_candidates: vec![cluster.writer_node.clone(), cluster.primary_node.clone()],
             wait_for_commit: false,
             foreground_replica_repair: false,
@@ -1100,118 +1210,170 @@ fn recovered_stage_response_committed_work_tracks_remaining_repairs_only() {
     for (case, include_missing_replica, expect_repair_maintenance) in
         [("remaining", true, true), ("complete", false, false)]
     {
-        let root = temp_root(&format!("recovered-stage-committed-work-{case}"));
-        let primary = NodeId::from_legacy_named(format!("node_recovered_work_primary_{case}"))
-            .expect("primary");
-        let replica = NodeId::from_legacy_named(format!("node_recovered_work_replica_{case}"))
-            .expect("replica");
-        let missing = NodeId::from_legacy_named(format!("node_recovered_work_missing_{case}"))
-            .expect("missing replica");
-        let object_id =
-            DfsObjectId::from_legacy_named(format!("obj_recovered_work_{case}")).expect("object");
-        let version_1 = DfsVersion::from_legacy_named(format!("version_recovered_work_{case}_1"))
-            .expect("base version");
-        let version_2 = DfsVersion::from_legacy_named(format!("version_recovered_work_{case}_2"))
-            .expect("target version");
-        let bytes = format!("recovered stage committed work {case}").into_bytes();
-        let content_root = root.join("content");
-        let metadata_root = root.join("metadata");
-        let content = LocalContentStore::new(&content_root).expect("content store");
-        let metadata = open_root_local_metadata_backend(&metadata_root).expect("metadata backend");
-        let mut original = NetworkedDfsService::new(
-            crate::test_runtime::DfsTestRuntime::local_transport(primary.clone()),
-            content,
-        )
-        .with_metadata_backend(metadata)
-        .expect("attach metadata backend");
-        original
-            .bootstrap_distributed_sifs()
-            .expect("bootstrap sifs");
-        let mut object = file_metadata(primary.clone());
-        object.object_id = object_id.clone();
-        object.path = format!("/services/recovered-work-{case}.bin");
-        object.version = version_1.clone();
-        object.policy = DfsObjectPolicy::ReplicatedEventual;
-        object.current_locations = vec![primary.clone()];
-        original
-            .add_object_metadata(object)
-            .expect("object metadata");
-        let mut desired_replica_nodes = vec![primary.clone(), replica.clone()];
-        if include_missing_replica {
-            desired_replica_nodes.push(missing.clone());
-        }
-        let desired_replicas = desired_replica_nodes.len();
-        let outcome = original
-            .write_distributed_eventual(
-                DfsWriteRequest {
-                    file_system_id: sifs_file_system_id(),
-                    object_id: object_id.clone(),
-                    target_version: version_2.clone(),
-                    requesting_node_id: primary.clone(),
+        let name = format!("native-recovered-stage-work-{case}");
+        let path = format!("/services/recovered-work-{case}.bin");
+        let desired = if include_missing_replica { 3 } else { 2 };
+        let (runtime, primary, nodes, mut original, policy) =
+            super::repair::native_owned_repair_fixture(&name, &path, 2, desired, false);
+        let peers = nodes
+            .iter()
+            .filter(|node| **node != primary)
+            .cloned()
+            .collect::<Vec<_>>();
+        let replica = peers[0].clone();
+        let background = runtime
+            .deny_background_replica_before_claim(&primary)
+            .unwrap();
+        let base = original
+            .posix_write_file(
+                &path,
+                b"actual sealed recovery predecessor",
+                DfsWriteOptions {
+                    policy: policy.clone(),
+                    replica_candidates: nodes.clone(),
+                    wait_for_commit: true,
+                    foreground_replica_repair: true,
                 },
-                bytes,
-                desired_replica_nodes,
-                DfsReplicationPolicy::new(2, desired_replicas).expect("policy"),
             )
-            .expect("create pending write");
-        let NetworkedDfsWriteOutcome::Pending { intent_id, .. } = outcome else {
-            panic!("expected pre-recovery pending write, got {outcome:?}");
-        };
-        let content_hash = original
+            .unwrap();
+        let setup_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+        while original
             .metadata_backend()
-            .expect("metadata backend")
-            .get_intent(&object_id, &intent_id)
-            .expect("read intent")
-            .expect("intent")
-            .content_hash
-            .expect("intent content hash");
+            .unwrap()
+            .receipts_for_version(&base.object_id, &base.version)
+            .unwrap()
+            .len()
+            != desired
+        {
+            assert!(
+                Instant::now() < setup_deadline,
+                "native predecessor desired copies must settle"
+            );
+            original.retry_pending_repairs().unwrap();
+            original.process_incoming().unwrap();
+        }
+        original.flush_detached_transport_sends().unwrap();
+        if let Some(missing) = peers.get(1) {
+            for route in [DFS_DATA_STAGE_BLOB_ROUTE, DFS_DATA_REPAIR_REPLICA_ROUTE] {
+                runtime.install_fault(crate::test_runtime::FaultRule {
+                    source: Some(primary.clone()),
+                    target: Some(missing.clone()),
+                    route: Some(route.into()),
+                    call_id: None,
+                    origin: Some(crate::test_runtime::RpcOrigin::RegisteredHost),
+                    remaining_hits: 32,
+                    action: crate::test_runtime::FaultAction::BudgetExhausted,
+                });
+            }
+        }
+        let bytes = format!("recovered stage committed work {case}").into_bytes();
+        let hash = content_hash(&bytes);
+        let request = DfsWriteRequest {
+            file_system_id: base.file_system_id,
+            object_id: base.object_id,
+            target_version: crate::namespace::next_version(&base.version),
+            requesting_node_id: primary.clone(),
+        };
+        let outcome = original
+            .write_distributed_reader_with_candidates(
+                request.clone(),
+                std::io::Cursor::new(&bytes),
+                nodes.clone(),
+                policy,
+                DfsDistributedWriteOptions::default(),
+            )
+            .unwrap();
+        let NetworkedDfsWriteOutcome::Pending {
+            intent_id,
+            durable_receipts: 1,
+            required_receipts: 2,
+        } = outcome
+        else {
+            panic!("actual pre-recovery W2 pending write required: {outcome:?}");
+        };
+        let old = original
+            .transport
+            .drain_incoming_messages()
+            .unwrap()
+            .into_iter()
+            .find(|routed| {
+                matches!(&routed.message, DfsNetworkMessage::StageBlobResponse(reply)
+                if reply.intent_id == intent_id && reply.replica_node_id == replica)
+            })
+            .unwrap();
+        let DfsNetworkMessage::StageBlobResponse(old_ack) = &old.message else {
+            unreachable!()
+        };
+        let old_request_id = old_ack.request_id.clone();
+        original
+            .ensure_stage_response_matches_pending(old_ack, &hash)
+            .unwrap();
         drop(original);
-
-        let sender: DfsMessageSender = Arc::new(|target_node_id, command, _timeout| {
-            Err(DfsPeerTransportError::new(format!(
-                "unexpected recovered-stage test send to {target_node_id} for {}",
-                command.request_id
-            )))
-        });
-        let transport = DfsNodeTransport::new_with_message_sender(
-            primary.clone(),
-            vec![replica.clone(), missing.clone()],
-            sender,
-            Duration::from_millis(50),
-        );
-        let content = LocalContentStore::new(&content_root).expect("reopen content store");
-        let metadata =
-            open_root_local_metadata_backend(&metadata_root).expect("reopen metadata backend");
-        let mut recovered = NetworkedDfsService::new(transport, content)
-            .with_metadata_backend(metadata)
-            .expect("restore metadata backend");
+        let mut recovered = runtime.metadata_primary_service(&path).unwrap();
+        recovered.hydrate_from_metadata_backend().unwrap();
         assert!(
             recovered
                 .writes
                 .pending_writes
                 .get(&intent_id)
                 .is_some_and(|pending| pending.stage_inflight_request_ids.is_empty()),
-            "recovery must not depend on ephemeral stage request tracking"
+            "recovery cannot inherit ephemeral Stage tracking"
+        );
+        assert!(
+            recovered
+                .ensure_stage_response_matches_pending(old_ack, &hash)
+                .is_err()
+        );
+        let unchanged = recovered
+            .metadata_backend()
+            .unwrap()
+            .export_table_snapshot()
+            .unwrap();
+        let rejected = recovered
+            .process_routed_messages_with_options(vec![old], false)
+            .unwrap();
+        assert!(
+            rejected
+                .iter()
+                .any(|event| matches!(event, NetworkedDfsServiceEvent::BlobStageRejected { .. }))
+        );
+        assert_eq!(
+            recovered
+                .metadata_backend()
+                .unwrap()
+                .export_table_snapshot()
+                .unwrap(),
+            unchanged
+        );
+        recovered.retry_pending_repairs().unwrap();
+        let fresh_request_id = recovered
+            .writes
+            .pending_writes
+            .get(&intent_id)
+            .unwrap()
+            .stage_inflight_request_ids
+            .get(&replica)
+            .unwrap()
+            .clone();
+        assert_ne!(fresh_request_id, old_request_id);
+        let fresh = recovered.transport.drain_incoming_messages().unwrap().into_iter().find(|routed|
+            matches!(&routed.message, DfsNetworkMessage::StageBlobResponse(reply)
+                if reply.request_id == fresh_request_id && reply.intent_id == intent_id
+                && reply.file_system_id == request.file_system_id && reply.object_id == request.object_id
+                && reply.version == request.target_version && reply.replica_node_id == replica
+                && matches!(&reply.result, DfsBlobTransferResult::Durable { content_hash } if content_hash == &hash))).unwrap();
+        let (peer, async_peer) = runtime.peer_transports(&primary).unwrap();
+        recovered.transport = DfsNodeTransport::new_with_peer_transports_for_nodes(
+            primary.clone(),
+            peers,
+            peer,
+            async_peer,
+            Duration::from_millis(50),
         );
         let report = recovered.process_message_command_report(test_dfs_message_command(
             format!("dfs_message_recovered_work_{case}"),
-            build_dfs_routed_message(
-                &replica,
-                &primary,
-                46,
-                47,
-                DfsNetworkMessage::StageBlobResponse(DfsStageBlobResponse {
-                    request_id: format!("lost_recovered_work_request_{case}"),
-                    intent_id: intent_id.clone(),
-                    file_system_id: sifs_file_system_id(),
-                    object_id: object_id.clone(),
-                    version: version_2,
-                    replica_node_id: replica.clone(),
-                    result: DfsBlobTransferResult::Durable { content_hash },
-                }),
-            ),
+            fresh,
         ));
-
         let result = report.outcome.expect("serve recovered stage response");
         assert!(result.events.iter().any(|event| matches!(
             event,
@@ -1234,6 +1396,10 @@ fn recovered_stage_response_committed_work_tracks_remaining_repairs_only() {
                 if repair_jobs.is_empty() != expect_repair_maintenance
         ));
 
-        std::fs::remove_dir_all(root).ok();
+        recovered.flush_detached_transport_sends().unwrap();
+        drop(recovered);
+        drop(background);
+        runtime.clear_faults();
+        runtime.close().unwrap();
     }
 }

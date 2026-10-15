@@ -1614,6 +1614,27 @@ fn job_frame_wire(mut value: Value) -> Result<Value> {
     encoded(decode::<DfsNamespaceJobFrame>(value)?)
 }
 pub(crate) fn normalize_namespace_job(mut value: Value) -> Result<DfsNamespaceJobRecord> {
+    if value
+        .get("pending_frames")
+        .and_then(Value::as_array)
+        .is_some_and(|frames| {
+            frames.iter().any(|frame| {
+                frame.get("type").and_then(Value::as_str)
+                    == Some("cross-shard-hardlink-alias-commit")
+            })
+        })
+    {
+        validate_original_source_job(&value)?;
+        return Err(MetadataBackendError::MissingOriginalSourceCustody {
+            family: "namespace job".into(),
+            identity: value
+                .get("job_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| invalid("original alias job has no identity"))?
+                .into(),
+            requirement: "original alias object-version and path-occupant comparisons".into(),
+        });
+    }
     if value.get("kind").and_then(Value::as_str) == Some("file-history-restore") {
         value["kind"] = Value::String("content-copy".into());
     }
@@ -2069,7 +2090,179 @@ pub(crate) fn verify_original_namespace_request(raw: &Value) -> Result<()> {
         "original routed request changes its semantic command digest",
     ))
 }
+
+/// Native9 kept the original alias tag and only its transaction. The other
+/// frames already use the finite typed target fence. These decode-only types
+/// reproduce that exact producer preimage; they are never normalized into a
+/// current job or used to supply publication authority/comparison predicates.
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
+enum OriginalNative9AliasFrame {
+    CrossShardHardlinkAliasCommit {
+        transaction: DfsNamespaceTransaction,
+    },
+}
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum OriginalNative9FrameInput {
+    Alias(OriginalNative9AliasFrame),
+    Unchanged(DfsNamespaceJobFrame),
+}
+struct OriginalNative9Frame(OriginalNative9FrameInput);
+impl<'de> Deserialize<'de> for OriginalNative9Frame {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        use serde::de::Error;
+        let value = OriginalNative9FrameInput::deserialize(deserializer)?;
+        if matches!(
+            &value,
+            OriginalNative9FrameInput::Unchanged(
+                DfsNamespaceJobFrame::CrossShardHardlinkAliasCommit { .. }
+            )
+        ) {
+            return Err(D::Error::custom(
+                "native9 cannot contain the later read-set frame tag",
+            ));
+        }
+        Ok(Self(value))
+    }
+}
+impl Serialize for OriginalNative9Frame {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        match &self.0 {
+            OriginalNative9FrameInput::Alias(value) => value.serialize(serializer),
+            OriginalNative9FrameInput::Unchanged(value) => value.serialize(serializer),
+        }
+    }
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OriginalNative9Job {
+    job_id: String,
+    file_system_id: DfsFileSystemId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    origin: Option<DfsNamespaceJobOrigin>,
+    kind: DfsNamespaceJobKind,
+    status: DfsNamespaceJobStatus,
+    root_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pending_frames: Vec<OriginalNative9Frame>,
+    processed_object_count: u64,
+    #[serde(with = "time::serde::rfc3339")]
+    created_at: time::OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    updated_at: time::OffsetDateTime,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "time::serde::rfc3339::option"
+    )]
+    completed_at: Option<time::OffsetDateTime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    failure_reason: Option<String>,
+}
+impl OriginalNative9Job {
+    fn has_original_alias(&self) -> bool {
+        self.pending_frames
+            .iter()
+            .any(|frame| matches!(&frame.0, OriginalNative9FrameInput::Alias(_)))
+    }
+}
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
+enum OriginalNative9JobEffect {
+    PutNamespaceJob { job: OriginalNative9Job },
+}
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum OriginalNative9Effect {
+    Job(OriginalNative9JobEffect),
+    Unchanged(DfsPreparedMetadataEffect),
+}
+/// Field order/null behavior is the native9 prepared producer's exact tuple.
+/// Roundtrip equality below prevents unknown/omitted fields from being erased.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OriginalNative9Payload {
+    protocol_version: u8,
+    file_system_id: DfsFileSystemId,
+    shard_id: DfsMetadataShardId,
+    owner_epoch: u64,
+    operation_id: String,
+    journal_operation_id: Option<String>,
+    expected_journal_sequence: Option<u64>,
+    expected_object_versions: Vec<DfsNamespaceObjectVersionExpectation>,
+    expected_path_occupants: Vec<DfsNamespacePathOccupantExpectation>,
+    transaction: DfsNamespaceTransaction,
+    metadata_effects: Vec<OriginalNative9Effect>,
+    content_receipts: Vec<DfsReplicaReceiptRecord>,
+    required_replica_node_ids: Vec<sinomo_core::node::NodeId>,
+    prepared_intent: Option<DfsWriteIntentRecord>,
+    terminal_intent: Option<DfsWriteIntentRecord>,
+    completed_request: Option<DfsNamespaceRequestRecord>,
+    completed_request_completion: Option<DfsNamespaceRequestCompletion>,
+}
+impl OriginalNative9Payload {
+    fn has_original_alias(&self) -> bool {
+        self.metadata_effects.iter().any(|effect| {
+            matches!(effect,
+            OriginalNative9Effect::Job(OriginalNative9JobEffect::PutNamespaceJob { job })
+                if job.has_original_alias())
+        })
+    }
+    fn hash(&self) -> Result<String> {
+        let mut hash = blake3::Hasher::new();
+        hash.update(b"sinomo.dfs.prepared-operation\0v7\0");
+        serde_json::to_writer(&mut hash, self).map_err(invalid)?;
+        Ok(format!(
+            "dfs-prepared-operation-v7:blake3:{}",
+            hash.finalize().to_hex()
+        ))
+    }
+}
+fn original_native9_alias_payload(raw: &Value) -> Result<Option<OriginalNative9Payload>> {
+    let Ok(payload) = serde_json::from_value::<OriginalNative9Payload>(raw.clone()) else {
+        return Ok(None);
+    };
+    if !payload.has_original_alias()
+        || payload.metadata_effects.iter().any(|effect| {
+            matches!(
+                effect,
+                OriginalNative9Effect::Unchanged(DfsPreparedMetadataEffect::PutNamespaceJob { .. })
+            )
+        })
+        || serde_json::to_value(&payload).map_err(invalid)? != *raw
+    {
+        return Ok(None);
+    }
+    Ok(Some(payload))
+}
+#[cfg(test)]
+pub(crate) fn original_native9_alias_payload_digest(raw: &Value) -> Result<String> {
+    original_native9_alias_payload(raw)?
+        .ok_or_else(|| invalid("not an exact native9 alias preimage"))?
+        .hash()
+}
+
 pub(crate) fn validate_original_source_job(raw: &Value) -> Result<()> {
+    if let Ok(current) = serde_json::from_value::<DfsNamespaceJobRecord>(raw.clone()) {
+        if serde_json::to_value(&current).map_err(invalid)? == *raw {
+            return Ok(());
+        }
+    }
+    if let Ok(original) = serde_json::from_value::<OriginalNative9Job>(raw.clone()) {
+        if original.has_original_alias()
+            && serde_json::to_value(&original).map_err(invalid)? == *raw
+        {
+            return Ok(());
+        }
+    }
     serde_json::to_writer(
         std::io::sink(),
         &OriginalRouted {
@@ -2114,10 +2307,38 @@ pub(crate) fn validate_original_v7_record(row: &Value) -> Result<()> {
             .ok_or_else(|| invalid("retained v7 record omits original digest"))?,
     )
     .map_err(invalid)?;
-    // Source generations are independently ordered decode-only serializers.
-    // A current DTO's evolving field requirements cannot decide this proof.
+    // The exact native9 model keeps its old alias tag and finite fence body.
+    // It cannot become current DATA without the separately required original
+    // comparison custody. This is hash validation only, never that custody.
     let mut source_hash = None;
-    for generation in if had_provenance {
+    if let Some(original) = original_native9_alias_payload(raw)? {
+        let candidate = original.hash()?;
+        if candidate == digest.payload_digest {
+            let status: DfsPreparedOperationStatus =
+                serde_json::from_value(row["status"].clone()).map_err(invalid)?;
+            let committed: Option<DfsPreparedOperationCommitReference> =
+                serde_json::from_value(row.get("committed_entry").cloned().unwrap_or(Value::Null))
+                    .map_err(invalid)?;
+            if (status == DfsPreparedOperationStatus::Committed) != committed.is_some()
+                || original.expected_journal_sequence.is_some_and(|sequence| {
+                    sequence.checked_add(1) != Some(digest.prepare_sequence)
+                })
+            {
+                return Err(invalid(
+                    "native9 alias record changes its original slot/terminal identity",
+                ));
+            }
+            if let Some(committed) = committed {
+                committed.validate(&digest)?;
+            }
+            source_hash = Some(candidate);
+        }
+    }
+    // Earlier source generations keep their independently ordered serializers.
+    // A current DTO's evolving field requirements cannot decide this proof.
+    for generation in if source_hash.is_some() {
+        &[][..]
+    } else if had_provenance {
         &[SourceGeneration::Released, SourceGeneration::CanonicalTags][..]
     } else {
         &[SourceGeneration::Released][..]

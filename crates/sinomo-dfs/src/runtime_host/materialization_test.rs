@@ -18,6 +18,7 @@ struct Gate {
     released: tokio::sync::Semaphore,
     worker: Mutex<Option<tokio::task::AbortHandle>>,
     worker_registered: tokio::sync::Semaphore,
+    blocking_owner: Mutex<Option<std::sync::Weak<DaemonDataOwnerLock>>>,
 }
 static GATES: OnceLock<Mutex<BTreeMap<PathBuf, Arc<Gate>>>> = OnceLock::new();
 
@@ -26,6 +27,14 @@ pub struct DfsTestMaterializationPause {
     gate: Arc<Gate>,
 }
 impl DfsTestMaterializationPause {
+    pub(super) fn blocking_replay_holds_owner(&self, owner: &Arc<DaemonDataOwnerLock>) -> bool {
+        self.gate
+            .blocking_owner
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|held| held.ptr_eq(&Arc::downgrade(owner)))
+    }
     /// Cancel only the actual worker recorded at the normal scheduling return.
     /// The native host retains its original JoinHandle and blocking custody.
     pub async fn abort_worker(&self, budget: std::time::Duration) -> Result<(), String> {
@@ -94,9 +103,46 @@ pub(crate) fn install(root: &Path) -> Result<DfsTestMaterializationPause, String
         released: tokio::sync::Semaphore::new(0),
         worker: Mutex::new(None),
         worker_registered: tokio::sync::Semaphore::new(0),
+        blocking_owner: Mutex::new(None),
     });
     gates.insert(root.clone(), Arc::clone(&gate));
     Ok(DfsTestMaterializationPause { root, gate })
+}
+
+/// Observe the actual blocking call's borrowed owner without adding a strong
+/// reference that could itself keep the capability alive across cancellation.
+pub(super) struct BlockingOwnerObservation<'a> {
+    gate: Arc<Gate>,
+    _owner: &'a Arc<DaemonDataOwnerLock>,
+}
+impl Drop for BlockingOwnerObservation<'_> {
+    fn drop(&mut self) {
+        *self.gate.blocking_owner.lock().unwrap() = None;
+    }
+}
+pub(super) fn observe_blocking_owner<'a>(
+    data_dir: &SinomoDataDir,
+    shard_id: &crate::DfsMetadataShardId,
+    owner: &'a Arc<DaemonDataOwnerLock>,
+) -> Option<BlockingOwnerObservation<'a>> {
+    let root = crate::default_dfs_metadata_shards_root(data_dir)
+        .join(&shard_id.0)
+        .canonicalize()
+        .ok()?;
+    let gate = GATES.get()?.lock().ok()?.get(&root).cloned()?;
+    let previous = gate
+        .blocking_owner
+        .lock()
+        .unwrap()
+        .replace(Arc::downgrade(owner));
+    assert!(
+        previous.is_none(),
+        "one exact shard has one active blocking replay"
+    );
+    Some(BlockingOwnerObservation {
+        gate,
+        _owner: owner,
+    })
 }
 
 pub(super) struct PendingCapture {

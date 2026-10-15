@@ -140,10 +140,10 @@ pub(crate) fn namespace_prepare_expectation_capture_calls() -> usize {
     NAMESPACE_PREPARE_EXPECTATION_CAPTURE_CALLS.get()
 }
 
-struct NamespacePrepareExpectationBundle {
-    shard_id: DfsMetadataShardId,
-    expected_object_versions: BTreeMap<DfsObjectId, Option<DfsVersion>>,
-    expected_path_occupants: BTreeMap<String, Option<DfsObjectId>>,
+pub(crate) struct NamespacePrepareExpectationBundle {
+    pub(crate) shard_id: DfsMetadataShardId,
+    pub(crate) expected_object_versions: BTreeMap<DfsObjectId, Option<DfsVersion>>,
+    pub(crate) expected_path_occupants: BTreeMap<String, Option<DfsObjectId>>,
 }
 
 fn carries_namespace_content(object: &DfsObjectMetadata) -> bool {
@@ -980,6 +980,29 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // Configuration alone does not authorize a metadata effect. Every local
         // filesystem row is published through the same exact-shard capability.
         for scope in scopes {
+            // A prior attempt can have the requested filesystem body durably
+            // prepared even though its ALL-assigned probe failed. Reconcile
+            // that exact original body before equality can skip publication or
+            // a new operation could leave the old preparation unresolved.
+            let recorded = self
+                .metadata_backend
+                .as_ref()
+                .ok_or_else(|| DfsError::Metadata {
+                    message: "filesystem publication requires a current backend".into(),
+                })?
+                .list_prepared_operations()?;
+            if let Some(record) =
+                original_filesystem_preparation_for_request(recorded, &scope, &file_system)?
+            {
+                let recovered = self.commit_stored_prepared_operation(&record.digest)?;
+                self.refresh_recorded_prepared_rows(&recovered.payload)?;
+                if recovered.published {
+                    self.record_message_committed_work(crate::DfsMessageCommittedWork {
+                        publish_metadata: true,
+                        ..Default::default()
+                    });
+                }
+            }
             let existing = self
                 .metadata_backend
                 .as_ref()
@@ -1443,6 +1466,154 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         .map_err(NamespaceTransactionApplyError::into_dfs_error)
     }
 
+    /// Capture comparisons from the original producer before its durable
+    /// job yields. This is conditional DATA; publication still needs every
+    /// normal current-owner, writer, content and assigned participant guard.
+    pub(crate) fn capture_namespace_transaction_read_set(
+        &mut self,
+        transaction: &DfsNamespaceTransaction,
+    ) -> Result<NamespacePrepareExpectationBundle, DfsError> {
+        let original =
+            self.namespace_execution
+                .captured_reads()
+                .ok_or_else(|| DfsError::Metadata {
+                    message: "durable namespace frame has no original planning scope".into(),
+                })?;
+        let shard_id = if self.control_plane.is_some() {
+            let paths = namespace_transaction_shard_paths(
+                self.metadata_backend
+                    .as_ref()
+                    .ok_or_else(|| DfsError::Metadata {
+                        message: "durable namespace capture has no metadata backend".into(),
+                    })?
+                    .as_ref(),
+                transaction,
+            )?;
+            let shards = self.namespace_shards_for_exact_paths(
+                &transaction.file_system_id,
+                paths.iter().map(String::as_str),
+            )?;
+            let [shard] = shards.as_slice() else {
+                return Err(DfsError::Metadata {
+                    message: "durable alias transaction has no single original physical shard"
+                        .into(),
+                });
+            };
+            if shard.primary_node_id != self.node_id {
+                return Err(DfsError::StaleOwnerEpoch {
+                    file_system_id: transaction.file_system_id.clone(),
+                    local_node_id: self.node_id.clone(),
+                    primary_node_id: shard.primary_node_id.clone(),
+                    epoch: shard.epoch,
+                });
+            }
+            DfsMetadataShardId::new(&shard.shard_id)
+        } else {
+            self.local_prepared_operation_shard()?
+        };
+        let backend = self
+            .metadata_backend
+            .as_ref()
+            .ok_or_else(|| DfsError::Metadata {
+                message: "durable namespace capture has no metadata backend".into(),
+            })?;
+        let (mut objects, mut paths, _) =
+            namespace_prepare_expectations(backend.as_ref(), &shard_id, transaction)?;
+        original.bind_recorded_expectations(
+            &transaction.file_system_id,
+            &mut objects,
+            &mut paths,
+        )?;
+        Ok(NamespacePrepareExpectationBundle {
+            shard_id,
+            expected_object_versions: objects
+                .into_iter()
+                .map(|e| (e.object_id, e.expected_version))
+                .collect(),
+            expected_path_occupants: paths
+                .into_iter()
+                .map(|e| {
+                    (
+                        crate::namespace::metadata_path(&e.path),
+                        e.expected_object_id,
+                    )
+                })
+                .collect(),
+        })
+    }
+
+    pub(crate) fn apply_namespace_transaction_with_recorded_read_set(
+        &mut self,
+        transaction: DfsNamespaceTransaction,
+        operation_id: &str,
+        shard_id: DfsMetadataShardId,
+        objects: Vec<DfsNamespaceObjectVersionExpectation>,
+        paths: Vec<DfsNamespacePathOccupantExpectation>,
+    ) -> Result<(), posix_model::DfsPosixError> {
+        let object_count = objects.len();
+        let path_count = paths.len();
+        let expected = NamespacePrepareExpectationBundle {
+            shard_id,
+            expected_object_versions: objects
+                .into_iter()
+                .map(|e| (e.object_id, e.expected_version))
+                .collect(),
+            expected_path_occupants: paths
+                .into_iter()
+                .map(|e| {
+                    (
+                        crate::namespace::metadata_path(&e.path),
+                        e.expected_object_id,
+                    )
+                })
+                .collect(),
+        };
+        let mut required_objects = transaction
+            .objects
+            .iter()
+            .map(|o| o.object_id.clone())
+            .chain(transaction.versions.iter().map(|v| v.object_id.clone()))
+            .chain(
+                transaction
+                    .content_reference_identity
+                    .iter()
+                    .map(|i| i.object_id.clone()),
+            )
+            .chain(
+                transaction
+                    .advisory_lock_states
+                    .iter()
+                    .map(|a| a.object_id.clone()),
+            )
+            .collect::<BTreeSet<_>>();
+        required_objects.extend(expected.expected_path_occupants.values().flatten().cloned());
+        if object_count != expected.expected_object_versions.len()
+            || path_count != expected.expected_path_occupants.len()
+            || required_objects
+                .iter()
+                .any(|id| !expected.expected_object_versions.contains_key(id))
+            || transaction.objects.iter().any(|object| {
+                !expected
+                    .expected_path_occupants
+                    .contains_key(&crate::namespace::metadata_path(&object.path))
+            })
+        {
+            return Err(posix_model::DfsPosixError::Dfs(DfsError::Metadata {
+                message: "durable alias frame has an incomplete or ambiguous original read set"
+                    .into(),
+            }));
+        }
+        self.apply_namespace_transaction_with_selected_shard(
+            transaction,
+            None,
+            Vec::new(),
+            Some(expected),
+            Some(operation_id.to_string()),
+            Vec::new(),
+        )
+        .map_err(NamespaceTransactionApplyError::into_posix_error)
+    }
+
     pub(crate) fn apply_namespace_transaction_with_journal_operation_id(
         &mut self,
         transaction: DfsNamespaceTransaction,
@@ -1480,68 +1651,124 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         )
     }
 
-    fn local_eventual_batch_commit_is_durable_replay(
+    fn local_eventual_batch_committed_replay(
         &self,
+        requester_node_id: &NodeId,
         transaction: &DfsNamespaceTransaction,
         writes: &[DfsLocalEventualBatchWriteProof],
         selected_shard: Option<&DfsMetadataShardConfig>,
-    ) -> Result<bool, DfsError> {
+    ) -> Result<Option<std::sync::Arc<DfsPreparedOperationPayload>>, DfsError> {
         let Some(backend) = self.metadata_backend.as_ref() else {
-            return Ok(false);
+            return Ok(None);
         };
-        let mut retained = backend
-            .list_prepared_operations()?
-            .into_iter()
-            .filter(|record| {
-                record.status == crate::DfsPreparedOperationStatus::Committed
-                    && record.payload.file_system_id == transaction.file_system_id
-                    && record.payload.transaction.transaction_id == transaction.transaction_id
-            });
-        let Some(prepare) = retained.next() else {
-            if backend
-                .get_namespace_transaction_receipt(&transaction.transaction_id)?
-                .is_some()
-            {
-                return Err(DfsError::Metadata { message: "local-eventual batch retained its receipt but lost its complete recorded body; reconcile instead of replaying".into() });
-            }
-            return Ok(false);
-        };
-        if retained.next().is_some() {
-            return Err(DfsError::Metadata {
-                message: "local-eventual batch has competing recorded operation identities".into(),
-            });
+        if backend
+            .get_namespace_transaction_receipt(&transaction.transaction_id)?
+            .is_none()
+        {
+            return Ok(None);
         }
-        let expected_receipts = writes
-            .iter()
-            .map(|write| &write.receipt)
-            .collect::<Vec<_>>();
-        if prepare.payload.transaction != *transaction
-            || backend
-                .committed_prepared_operation(&prepare.digest)?
-                .is_none()
+        // Match the same identities used by namespace publication. Routed
+        // completion uses its original request identity; direct batches use
+        // the transaction identity. Pending-only listings are not commit proof.
+        let mut operation_ids = Vec::new();
+        if let Some(request) = self.namespace_execution.request() {
+            operation_ids.push(format!(
+                "namespace-request:{}:{}",
+                request.operation_id, transaction.transaction_id,
+            ));
+        }
+        operation_ids.push(format!("namespace:{}", transaction.transaction_id));
+        let mut retained = None;
+        for operation_id in operation_ids {
+            if let Some(record) = backend.prepared_operation_record(&operation_id)? {
+                record.validate()?;
+                if record.status == crate::DfsPreparedOperationStatus::Committed {
+                    if retained.replace(record).is_some() {
+                        return Err(DfsError::Metadata {
+                            message:
+                                "local-eventual batch has competing recorded operation identities"
+                                    .into(),
+                        });
+                    }
+                }
+            }
+        }
+        let prepare = retained.ok_or_else(|| DfsError::Metadata {
+            message: "local-eventual batch retained its receipt but lost its complete recorded body; reconcile instead of replaying".into(),
+        })?;
+        let payload = &prepare.payload;
+        let mut replay_transaction = transaction.clone();
+        crate::metadata_records::normalize_namespace_transaction_in_place(&mut replay_transaction);
+        complete_recorded_namespace_carried_versions(&mut replay_transaction, &payload.transaction);
+        let mut proven_objects = BTreeSet::new();
+        let proofs_match = writes.iter().all(|write| {
+            let object_id = &write.receipt.receipt.object_id;
+            if !proven_objects.insert(object_id)
+                || write.receipt.replica_node_id != *requester_node_id
+                || !payload.content_receipts.iter().any(|existing| {
+                    crate::metadata_receipt::replay_receipt_matches_existing(
+                        existing,
+                        &write.receipt,
+                    )
+                })
+            {
+                return false;
+            }
+            let Some(object) = payload
+                .transaction
+                .objects
+                .iter()
+                .find(|object| &object.object_id == object_id)
+            else {
+                return false;
+            };
+            if object.owner_node_id != *requester_node_id {
+                return false;
+            }
+            match write.expected_base_version.as_ref() {
+                Some(version) => {
+                    payload.expected_object_versions.iter().any(|row| {
+                        row.object_id == *object_id
+                            && row.expected_version.as_ref() == Some(version)
+                    }) && write.expected_parent_object_id.is_none()
+                        && write.expected_parent_version.is_none()
+                }
+                None => {
+                    // Creates seal the exact parent generation, including
+                    // recreation over a tombstone. Never compare to today's head.
+                    let parent_path = crate::posix_path::parent_posix_path(&object.path);
+                    let parent = payload.transaction.objects.iter().find(|parent| {
+                        parent.kind == DfsObjectKind::Directory
+                            && parent_path.as_deref() == Some(parent.path.as_str())
+                    });
+                    parent.is_some_and(|parent| {
+                        write.expected_parent_object_id.as_ref() == Some(&parent.object_id)
+                            && write.expected_parent_version.is_some()
+                            && payload.expected_object_versions.iter().any(|row| {
+                                row.object_id == parent.object_id
+                                    && row.expected_version == write.expected_parent_version
+                            })
+                    })
+                }
+            }
+        });
+        if payload.file_system_id != transaction.file_system_id
+            || payload.transaction != replay_transaction
             || selected_shard.is_some_and(|shard| {
                 prepare.digest.shard_id.0 != shard.shard_id
                     || prepare.digest.file_system_id != shard.file_system_id
             })
-            || prepare.payload.content_receipts.len() != expected_receipts.len()
-            || !expected_receipts.iter().all(|expected| {
-                prepare.payload.content_receipts.iter().any(|existing| {
-                    crate::metadata_receipt::replay_receipt_matches_existing(existing, expected)
-                })
-            })
+            || payload.content_receipts.len() != writes.len()
+            || !proofs_match
         {
             return Err(DfsError::Distributed {
                 message: format!(
-                    "local-eventual batch {} does not match its exact recorded body and receipts",
-                    transaction.transaction_id
+                    "local-eventual batch {} does not match its exact recorded body, read set and receipts",
+                    transaction.transaction_id,
                 ),
             });
         }
-
-        // The original committed body retains its actual receipt evidence.
-        // A read-only replay does not depend on fresh replica ACKs or the
-        // later lifetime of auxiliary receipt rows.
-        Ok(true)
+        Ok(Some(prepare.payload))
     }
 
     fn materialize_namespace_transaction_in_memory(
@@ -1582,15 +1809,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         writes: Vec<DfsLocalEventualBatchWriteProof>,
         selected_shard: Option<DfsMetadataShardConfig>,
     ) -> Result<bool, posix_model::DfsPosixError> {
-        if self
-            .local_eventual_batch_commit_is_durable_replay(
+        if let Some(payload) = self
+            .local_eventual_batch_committed_replay(
+                requester_node_id,
                 &transaction,
                 &writes,
                 selected_shard.as_ref(),
             )
             .map_err(posix_model::DfsPosixError::from)?
         {
-            self.materialize_namespace_transaction_in_memory(&transaction)
+            self.refresh_recorded_prepared_rows(&payload)
                 .map_err(posix_model::DfsPosixError::from)?;
             return Ok(false);
         }
@@ -1706,7 +1934,29 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     &mut replay_transaction,
                     &payload.transaction,
                 );
-                if payload.transaction != replay_transaction
+                let recorded_read_set_matches =
+                    prepare_expectations.as_ref().is_none_or(|expected| {
+                        expected.shard_id == payload.shard_id
+                            && payload
+                                .expected_object_versions
+                                .iter()
+                                .map(|row| (row.object_id.clone(), row.expected_version.clone()))
+                                .collect::<BTreeMap<_, _>>()
+                                == expected.expected_object_versions
+                            && payload
+                                .expected_path_occupants
+                                .iter()
+                                .map(|row| {
+                                    (
+                                        crate::namespace::metadata_path(&row.path),
+                                        row.expected_object_id.clone(),
+                                    )
+                                })
+                                .collect::<BTreeMap<_, _>>()
+                                == expected.expected_path_occupants
+                    });
+                if !recorded_read_set_matches
+                    || payload.transaction != replay_transaction
                     || payload.journal_operation_id != replay_journal_operation_id
                     || !payload.metadata_effects.iter().filter(|effect| !matches!(effect,
                         DfsPreparedMetadataEffect::PutFileSystem { file_system } if file_system.file_system_id == payload.file_system_id))
@@ -2098,7 +2348,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             transaction = published.payload.transaction.clone();
         } else if self.metadata_backend.is_some() {
             let shard_id = self.local_prepared_operation_shard()?;
+            let recorded_expectations = prepare_expectations.is_some();
             let (mut objects, mut paths, _) = if let Some(expectations) = prepare_expectations {
+                if expectations.shard_id != shard_id {
+                    return Err(DfsError::Metadata {
+                        message: "recorded namespace comparisons name a different physical shard"
+                            .into(),
+                    }
+                    .into());
+                }
                 (
                     expectations
                         .expected_object_versions
@@ -2139,7 +2397,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     },
                 )?
             };
-            if let Some(reads) = planned_reads.as_ref() {
+            if !recorded_expectations && let Some(reads) = planned_reads.as_ref() {
                 reads.bind_expectations(&transaction.file_system_id, &mut objects, &mut paths);
             }
             #[cfg(test)]
@@ -2244,5 +2502,233 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             trace_started.elapsed().as_millis()
         ));
         Ok(())
+    }
+}
+
+/// A filesystem retry may recover only one exact original current-era body.
+/// Actual native commit/current provider/ALL-assigned guards remain separate.
+fn original_filesystem_preparation_for_request(
+    records: Vec<crate::DfsPreparedOperationRecord>,
+    scope: &DfsPreparedOperationScope,
+    requested: &DfsFileSystem,
+) -> Result<Option<crate::DfsPreparedOperationRecord>, DfsError> {
+    let mut active = records
+        .into_iter()
+        .filter(|record| {
+            record.status == crate::DfsPreparedOperationStatus::Prepared
+                && record.digest.file_system_id == scope.file_system_id
+                && record.digest.shard_id == scope.shard_id
+                && (record.digest.operation_id.starts_with("filesystem:")
+                    || record.payload.metadata_effects.iter().any(|effect| {
+                        matches!(
+                            effect,
+                            crate::DfsPreparedMetadataEffect::PutFileSystem { .. }
+                        )
+                    }))
+        })
+        .collect::<Vec<_>>();
+    if active.len() > 1 {
+        return Err(DfsError::Metadata {
+            message: "filesystem publication has ambiguous active preparations; original native recovery is required".into(),
+        });
+    }
+    let Some(record) = active.pop() else {
+        return Ok(None);
+    };
+    record.validate()?;
+    if record.digest.owner_epoch != scope.owner_epoch {
+        return Err(DfsError::Metadata {
+            message: "filesystem publication has a preparation from another epoch; original native recovery is required".into(),
+        });
+    }
+    let payload = &record.payload;
+    if !record
+        .digest
+        .operation_id
+        .strip_prefix("filesystem:")
+        .is_some_and(|id| !id.is_empty())
+        || payload.transaction.transaction_id != format!("metadata:{}", record.digest.operation_id)
+        || !payload.transaction.objects.is_empty()
+        || !payload.transaction.versions.is_empty()
+        || !payload.transaction.advisory_lock_states.is_empty()
+        || payload.transaction.content_reference_identity.is_some()
+        || !payload.transaction.extension_expectations.is_empty()
+        || payload.transaction.contribution_digest.is_some()
+        || payload.transaction.file_version_pins.is_some()
+        || !payload.expected_object_versions.is_empty()
+        || !payload.expected_path_occupants.is_empty()
+        || !payload.content_receipts.is_empty()
+        || !payload.required_replica_node_ids.is_empty()
+        || payload.prepared_intent.is_some()
+        || payload.terminal_intent.is_some()
+        || payload.completed_request.is_some()
+        || payload.completed_request_completion.is_some()
+        || !matches!(payload.metadata_effects.as_slice(),
+            [crate::DfsPreparedMetadataEffect::PutFileSystem { file_system }] if file_system == requested)
+    {
+        return Err(DfsError::Metadata {
+            message: "filesystem publication conflicts with an active original body; original native recovery is required".into(),
+        });
+    }
+    Ok(Some(record))
+}
+
+#[cfg(test)]
+mod filesystem_preparation_recovery_tests {
+    use super::*;
+    use crate::DfsMetadataBackend;
+
+    #[test]
+    fn native_filesystem_retry_rejects_ambiguous_bodies_and_recovers_each_original() {
+        let (mut native, mut requester, shard) =
+            crate::test_support::current_native_metadata_service(
+                "native-filesystem-original-preparation-ambiguity",
+                3,
+                "/",
+            )
+            .unwrap();
+        assert_eq!(shard.replica_node_ids.len(), 2);
+        let receiver = shard.replica_node_ids[0].clone();
+        let initial = native.metadata_primary_service("/").unwrap();
+        let original = initial
+            .metadata_backend()
+            .unwrap()
+            .get_file_system_on_shard(
+                &crate::DfsMetadataShardId::new(&shard.shard_id),
+                &shard.file_system_id,
+            )
+            .unwrap()
+            .unwrap();
+        drop(initial);
+        let mut requested = original.clone();
+        requested.display_name = "actual independent filesystem requests".into();
+        native.stop_node(&receiver).unwrap();
+        let first = requester.add_file_system(requested.clone());
+        assert!(matches!(
+            first,
+            Err(DfsError::MetadataRecoveryQuorumUnavailable {
+                required: 3,
+                verified: 2,
+                ..
+            })
+        ));
+        drop(requester);
+        let mut source = native.metadata_primary_service("/").unwrap();
+        let scope = DfsPreparedOperationScope {
+            file_system_id: shard.file_system_id.clone(),
+            shard_id: crate::DfsMetadataShardId::new(&shard.shard_id),
+            owner_epoch: shard.epoch,
+            operation_id: format!("filesystem:{}", sinomo_core::Id::generate()),
+        };
+        let before = source
+            .metadata_backend()
+            .unwrap()
+            .list_prepared_operations()
+            .unwrap();
+        let selected = original_filesystem_preparation_for_request(before, &scope, &requested)
+            .unwrap()
+            .unwrap();
+        let mut stale_scope = scope.clone();
+        stale_scope.owner_epoch += 1;
+        assert!(
+            matches!(original_filesystem_preparation_for_request(vec![selected.clone()], &stale_scope, &requested),
+            Err(DfsError::Metadata { message }) if message == "filesystem publication has a preparation from another epoch; original native recovery is required")
+        );
+        let mut other = requested.clone();
+        other.file_system_id = sinomo_core::Id::generate();
+        assert!(
+            matches!(original_filesystem_preparation_for_request(vec![selected.clone()], &scope, &other),
+            Err(DfsError::Metadata { message }) if message == "filesystem publication conflicts with an active original body; original native recovery is required")
+        );
+        let mut non_singleton = selected.clone();
+        std::sync::Arc::make_mut(&mut non_singleton.payload)
+            .metadata_effects
+            .push(crate::DfsPreparedMetadataEffect::PutFileSystem {
+                file_system: requested.clone(),
+            });
+        assert!(
+            original_filesystem_preparation_for_request(vec![non_singleton], &scope, &requested)
+                .is_err()
+        );
+        let second = source.publish_metadata_effects_on_shard(
+            scope.clone(),
+            Vec::new(),
+            Vec::new(),
+            vec![crate::DfsPreparedMetadataEffect::PutFileSystem {
+                file_system: requested.clone(),
+            }],
+        );
+        assert!(matches!(
+            second,
+            Err(DfsError::MetadataRecoveryQuorumUnavailable {
+                required: 3,
+                verified: 2,
+                ..
+            })
+        ));
+        let originals = source
+            .metadata_backend()
+            .unwrap()
+            .list_prepared_operations()
+            .unwrap()
+            .into_iter()
+            .filter(|record| {
+                record.status == crate::DfsPreparedOperationStatus::Prepared
+                    && record.digest.file_system_id == scope.file_system_id
+                    && record.digest.shard_id == scope.shard_id
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(originals.len(), 2);
+        assert_ne!(originals[0].digest, originals[1].digest);
+        let prefix = source
+            .metadata_backend()
+            .unwrap()
+            .metadata_prefix_proof(&scope.shard_id)
+            .unwrap();
+        let ambiguous = source.add_file_system(requested.clone());
+        assert!(matches!(ambiguous, Err(DfsError::Metadata { message })
+            if message == "filesystem publication has ambiguous active preparations; original native recovery is required"));
+        assert_eq!(
+            source
+                .metadata_backend()
+                .unwrap()
+                .metadata_prefix_proof(&scope.shard_id)
+                .unwrap(),
+            prefix
+        );
+        assert_eq!(
+            source
+                .metadata_backend()
+                .unwrap()
+                .get_file_system(&scope.file_system_id)
+                .unwrap(),
+            Some(original)
+        );
+        drop(source);
+        native.reopen_node(receiver).unwrap();
+        let mut source = native.metadata_primary_service("/").unwrap();
+        source.recover_durable_namespace_prepares().unwrap();
+        for original in originals {
+            let actual = source
+                .metadata_backend()
+                .unwrap()
+                .prepared_operation_record(&original.digest.operation_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(actual.digest, original.digest);
+            assert_eq!(actual.payload, original.payload);
+            assert_eq!(actual.status, crate::DfsPreparedOperationStatus::Committed);
+            assert!(actual.committed_entry.is_some());
+        }
+        assert_eq!(
+            source
+                .metadata_backend()
+                .unwrap()
+                .get_file_system(&scope.file_system_id)
+                .unwrap(),
+            Some(requested)
+        );
+        drop(source);
+        native.close().unwrap();
     }
 }

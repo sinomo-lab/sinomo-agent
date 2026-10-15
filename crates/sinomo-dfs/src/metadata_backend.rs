@@ -807,12 +807,14 @@ impl LocalSobjMetadataBackend {
         batch: &DfsMetadataJournalBatch,
         frames: &[DfsMetadataJournalFrameRecord],
         expected_target_prefix: &DfsMetadataPrefixProof,
+        expected_operation: &crate::DfsMetadataAuthorityOperation,
     ) -> Result<DfsMetadataReplicaApplyReport> {
         self.persist_exact_journal_frames_with_replica_permit_report(
             permit,
             batch,
             frames,
             Some(expected_target_prefix),
+            Some(expected_operation),
         )
     }
 

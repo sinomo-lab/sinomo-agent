@@ -210,8 +210,7 @@ pub struct MetadataImportedRetainedContent {
     pub(crate) receipts: Vec<sinomo_dfs::DfsReplicaReceiptRecord>,
 }
 
-pub(super) fn verify_local_retained_content(
-    content: &sinomo_dfs::LocalContentStore,
+fn validate_retained_content_locator(
     version: &sinomo_dfs::DfsObjectVersionRecord,
     locator: &MetadataSourceContentLocator,
 ) -> Result<()> {
@@ -226,17 +225,6 @@ pub(super) fn verify_local_retained_content(
             "actual source content locator maps to another canonical version",
         ));
     }
-    let hash = version
-        .content_hash
-        .as_deref()
-        .ok_or_else(|| error("retained content work lacks its exact source hash"))?;
-    let size = version
-        .size_bytes
-        .ok_or_else(|| error("retained content work lacks its exact source length"))?;
-    let content_version = locator
-        .content_version
-        .as_deref()
-        .unwrap_or(&locator.version);
     if let (Some(raw_source), Some(durability)) =
         (&locator.content_version, &version.content_durability)
     {
@@ -248,6 +236,37 @@ pub(super) fn verify_local_retained_content(
                 "content locator differs from the actual recorded source generation",
             ));
         }
+    }
+    Ok(())
+}
+
+pub(super) fn verify_local_retained_content(
+    content: &sinomo_dfs::LocalContentStore,
+    version: &sinomo_dfs::DfsObjectVersionRecord,
+    locator: &MetadataSourceContentLocator,
+) -> Result<()> {
+    validate_retained_content_locator(version, locator)?;
+    let hash = version
+        .content_hash
+        .as_deref()
+        .ok_or_else(|| error("retained content work lacks its exact source hash"))?;
+    let size = version
+        .size_bytes
+        .ok_or_else(|| error("retained content work lacks its exact source length"))?;
+    let content_version = locator
+        .content_version
+        .as_deref()
+        .unwrap_or(&locator.version);
+    if content
+        .object_version_is_deleted(&locator.object_id, content_version)
+        .map_err(error)?
+        || content
+            .object_version_is_deleted(version.object_id.as_str(), version.version.as_str())
+            .map_err(error)?
+    {
+        return Err(error(
+            "retained source or canonical identity was explicitly collected",
+        ));
     }
     // Adapters obtain this locator from the independently re-read original row;
     // the metadata successor and its byte generation remain separate identities.
@@ -267,12 +286,67 @@ pub(super) fn verify_local_retained_content(
         // current binding. It still has to pass the complete byte verification.
         (version.object_id.as_str(), version.version.as_str())
     };
-    let (manifest, mut reader) = content
-        .open_object_version_stream(object_key, version_key)
-        .map_err(error)?;
-    if manifest.content_hash != hash || manifest.size_bytes != size {
-        return Err(error("retained manifest differs from the captured version"));
-    }
+    let mut reader: Box<dyn Read> = match content.read_manifest(object_key, version_key) {
+        Ok(_) => {
+            let (manifest, reader) = content
+                .open_object_version_stream(object_key, version_key)
+                .map_err(error)?;
+            if manifest.content_hash != hash || manifest.size_bytes != size {
+                return Err(error("retained manifest differs from the captured version"));
+            }
+            Box::new(reader)
+        }
+        Err(sinomo_dfs::ContentStoreError::Io { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            if content.blob_storage_candidate_exists(hash).map_err(error)? {
+                let candidate = content.open_blob_stream(hash).map_err(error)?;
+                if candidate.size_bytes() != size {
+                    return Err(error(
+                        "retained blob length differs from the captured version",
+                    ));
+                }
+                Box::new(candidate)
+            } else {
+                let mut candidate: Option<Box<dyn Read>> = None;
+                for (index, object) in [locator.object_id.as_str(), version.object_id.as_str()]
+                    .into_iter()
+                    .enumerate()
+                {
+                    if index == 1 && object == locator.object_id {
+                        continue;
+                    }
+                    for manifest in content.manifests_for_object(object).map_err(error)? {
+                        if manifest.content_hash != hash || manifest.size_bytes != size {
+                            continue;
+                        }
+                        // This is a byte representation, not predecessor or grant
+                        // evidence. The captured locator and durability stay intact.
+                        let (actual, reader) = content
+                            .open_object_version_stream(object, &manifest.version)
+                            .map_err(error)?;
+                        if actual != manifest
+                            || actual.object_id != object
+                            || actual.content_hash != hash
+                            || actual.size_bytes != size
+                        {
+                            return Err(error(
+                                "retained byte candidate changed its exact identity/hash/size",
+                            ));
+                        }
+                        candidate = Some(Box::new(reader));
+                        break;
+                    }
+                    if candidate.is_some() {
+                        break;
+                    }
+                }
+                candidate
+                    .ok_or_else(|| error("retained content has no live storage byte candidate"))?
+            }
+        }
+        Err(error_value) => return Err(error(error_value)),
+    };
     let mut ingest = content
         .begin_quarantined_blob_ingest(size, Some(hash))
         .map_err(error)?;
@@ -286,7 +360,9 @@ pub(super) fn verify_local_retained_content(
     }
     let verified = ingest.finish_quarantined().map_err(error)?;
     content
-        .bind_quarantined_blob(
+        .bind_quarantined_blob_from_unretired_source(
+            &locator.object_id,
+            content_version,
             version.object_id.as_str(),
             version.version.as_str(),
             verified,
@@ -458,6 +534,7 @@ impl NativeImportAuthority {
         caller: &sinomo_core::node::NodeId,
         request: &ContentVerificationRequest,
     ) -> Result<()> {
+        validate_retained_content_locator(&request.version, &request.locator)?;
         if request.request_id != request.binding()?
             || request.object.file_system_id != request.version.file_system_id
             || request.object.object_id != request.version.object_id
@@ -809,6 +886,129 @@ impl NativeImportAuthority {
         block_native(&self.runtime, result.materialize_value_body(64 * 1024))?;
         Ok(result)
     }
+    fn stage_retained_content(
+        &self,
+        target: &sinomo_core::node::NodeId,
+        confirmation: &ContentVerificationRequest,
+        policy: &sinomo_dfs::DfsReplicationPolicy,
+        targets: &[sinomo_core::node::NodeId],
+        content: &sinomo_dfs::LocalContentStore,
+    ) -> Result<()> {
+        let source = &confirmation.source;
+        let object = &confirmation.object;
+        let version = &confirmation.version;
+        let cfg = &confirmation.authority;
+        if object.policy == sinomo_core::DfsObjectPolicy::LocalOwned || confirmation.export_bytes {
+            return Err(error(
+                "retained staging cannot export local-owned or verification response bytes",
+            ));
+        }
+        let local = self.local_node()?;
+        let hash = version
+            .content_hash
+            .as_deref()
+            .ok_or_else(|| error("retained stage lacks its original content hash"))?;
+        let size = version
+            .size_bytes
+            .ok_or_else(|| error("retained stage lacks its original content length"))?;
+        let request_id = digest(&(
+            "retained-content-import-v1",
+            &source.source_identity,
+            &version.file_system_id,
+            &version.object_id,
+            &version.version,
+            hash,
+            &policy,
+            &targets,
+            target,
+        ))?;
+        let intent_id = format!("storage-import-content:{request_id}");
+        let clock = blake3::hash(request_id.as_bytes());
+        let frame_id = u64::from_le_bytes(
+            clock.as_bytes()[..8]
+                .try_into()
+                .expect("BLAKE3 identity prefix"),
+        );
+        let command = sinomo_dfs::DfsMessageCommand {
+            request_id: request_id.clone(),
+            routed_message: sinomo_dfs::DfsRoutedMessage {
+                source_node_id: local.clone(),
+                target_node_id: target.clone(),
+                frame_id,
+                message_id: frame_id,
+                message: sinomo_dfs::DfsNetworkMessage::StageRetainedBlob(
+                    sinomo_dfs::DfsStageBlobCommand {
+                        request_id: request_id.clone(),
+                        intent_id: intent_id.clone(),
+                        file_system_id: version.file_system_id.clone(),
+                        object_id: version.object_id.clone(),
+                        expected_base_version: None,
+                        version: version.version.clone(),
+                        content_hash: hash.to_owned(),
+                        bytes: Vec::new(),
+                        object_metadata: Some(object.clone()),
+                        authority_shard: Some((*cfg).clone()),
+                    },
+                ),
+            },
+        };
+        let request = sinomo_core::network::ObjectRpcRequest::encode_body(
+            staged_service::CONTENT_STAGE_ROUTE,
+            "dfs-migration",
+            &staged_service::ContentStageRequest {
+                command,
+                size_bytes: size,
+                verification: confirmation.clone(),
+            },
+        )
+        .map_err(error)?;
+        let (_, reader) = content
+            .open_object_version_stream(version.object_id.as_str(), version.version.as_str())
+            .map_err(error)?;
+        let body = sinomo_core::network::ObjectRpcBodySource::from_reader(reader, Some(size));
+        let call = sinomo_core::network::ObjectRpcCall::new(request, body);
+        let transport = self
+            .transport
+            .as_ref()
+            .ok_or_else(|| error("retained import has no actual native transport"))?;
+        let result = block_native(
+            &self.runtime,
+            transport.call_async(target, call, source_effect_rpc_options(), true),
+        )?;
+        let response = block_native(
+            &self.runtime,
+            result.into_materialized_value_response(64 * 1024),
+        )?;
+        let response: sinomo_dfs::DfsMessageResponse = response.decode_body().map_err(error)?;
+        if response.request_id != request_id {
+            return Err(error("retained-content reply changes request identity"));
+        }
+        let mut confirmed = false;
+        for message in response.outbound_messages {
+            if let sinomo_dfs::DfsNetworkMessage::StageBlobResponse(reply) = message.message
+                && message.source_node_id == *target
+                && message.target_node_id == local
+                && reply.request_id == request_id
+                && reply.intent_id == intent_id
+                && reply.file_system_id == version.file_system_id
+                && reply.object_id == version.object_id
+                && reply.version == version.version
+                && reply.replica_node_id == *target
+                && matches!(reply.result, sinomo_dfs::DfsBlobTransferResult::Durable { content_hash } if content_hash == hash)
+            {
+                if confirmed {
+                    return Err(error("retained-content reply repeats a durable receipt"));
+                }
+                confirmed = true;
+            }
+        }
+        if !confirmed {
+            return Err(error(
+                "retained-content import lacks the actual correlated durable receiver result",
+            ));
+        }
+        Ok(())
+    }
     pub(super) fn establish_retained_content(
         &self,
         source: &MetadataSourceContentWorkScope,
@@ -898,7 +1098,7 @@ impl NativeImportAuthority {
             .content_hash
             .as_deref()
             .ok_or_else(|| error("retained work has no actual source hash"))?;
-        let size = version
+        version
             .size_bytes
             .ok_or_else(|| error("retained work has no actual source length"))?;
         let mut receipts = Vec::new();
@@ -926,111 +1126,10 @@ impl NativeImportAuthority {
                     });
                     continue;
                 }
-                if object.policy == sinomo_core::DfsObjectPolicy::LocalOwned
-                    || confirmation.import_plan.is_some()
-                {
+                if object.policy == sinomo_core::DfsObjectPolicy::LocalOwned {
                     return Err(confirmed.expect_err("confirmation failed"));
                 }
-                let request_id = digest(&(
-                    "retained-content-import-v1",
-                    &source.source_identity,
-                    &version.file_system_id,
-                    &version.object_id,
-                    &version.version,
-                    hash,
-                    &policy,
-                    &targets,
-                    target,
-                ))?;
-                let intent_id = format!("storage-import-content:{request_id}");
-                let clock = blake3::hash(request_id.as_bytes());
-                let frame_id = u64::from_le_bytes(
-                    clock.as_bytes()[..8]
-                        .try_into()
-                        .expect("BLAKE3 identity prefix"),
-                );
-                let command = sinomo_dfs::DfsMessageCommand {
-                    request_id: request_id.clone(),
-                    routed_message: sinomo_dfs::DfsRoutedMessage {
-                        source_node_id: local.clone(),
-                        target_node_id: target.clone(),
-                        frame_id,
-                        message_id: frame_id,
-                        message: sinomo_dfs::DfsNetworkMessage::StageRetainedBlob(
-                            sinomo_dfs::DfsStageBlobCommand {
-                                request_id: request_id.clone(),
-                                intent_id: intent_id.clone(),
-                                file_system_id: version.file_system_id.clone(),
-                                object_id: version.object_id.clone(),
-                                expected_base_version: None,
-                                version: version.version.clone(),
-                                content_hash: hash.to_owned(),
-                                bytes: Vec::new(),
-                                object_metadata: Some(object.clone()),
-                                authority_shard: Some(cfg.clone()),
-                            },
-                        ),
-                    },
-                };
-                let request = sinomo_core::network::ObjectRpcRequest::encode_body(
-                    staged_service::CONTENT_STAGE_ROUTE,
-                    "dfs-migration",
-                    &staged_service::ContentStageRequest {
-                        command,
-                        size_bytes: size,
-                    },
-                )
-                .map_err(error)?;
-                let (_, reader) = content
-                    .open_object_version_stream(
-                        version.object_id.as_str(),
-                        version.version.as_str(),
-                    )
-                    .map_err(error)?;
-                let body =
-                    sinomo_core::network::ObjectRpcBodySource::from_reader(reader, Some(size));
-                let call = sinomo_core::network::ObjectRpcCall::new(request, body);
-                let transport = self
-                    .transport
-                    .as_ref()
-                    .ok_or_else(|| error("retained import has no actual native transport"))?;
-                let result = block_native(
-                    &self.runtime,
-                    transport.call_async(target, call, source_effect_rpc_options(), true),
-                )?;
-                let response = block_native(
-                    &self.runtime,
-                    result.into_materialized_value_response(64 * 1024),
-                )?;
-                let response: sinomo_dfs::DfsMessageResponse =
-                    response.decode_body().map_err(error)?;
-                if response.request_id != request_id {
-                    return Err(error("retained-content reply changes request identity"));
-                }
-                let mut confirmed = false;
-                for message in response.outbound_messages {
-                    if let sinomo_dfs::DfsNetworkMessage::StageBlobResponse(reply) = message.message
-                        && message.source_node_id == *target
-                        && message.target_node_id == local
-                        && reply.request_id == request_id
-                        && reply.intent_id == intent_id
-                        && reply.file_system_id == version.file_system_id
-                        && reply.object_id == version.object_id
-                        && reply.version == version.version
-                        && reply.replica_node_id == *target
-                        && matches!(reply.result, sinomo_dfs::DfsBlobTransferResult::Durable { content_hash } if content_hash == hash)
-                    {
-                        if confirmed {
-                            return Err(error("retained-content reply repeats a durable receipt"));
-                        }
-                        confirmed = true;
-                    }
-                }
-                if !confirmed {
-                    return Err(error(
-                        "retained-content import lacks the actual correlated durable receiver result",
-                    ));
-                }
+                self.stage_retained_content(target, &confirmation, &policy, &targets, &content)?;
             }
             receipts.push(sinomo_dfs::DfsReplicaReceiptRecord {
                 receipt: sinomo_core::DfsWriteReceipt {
@@ -1455,11 +1554,50 @@ mod tests {
 
     #[test]
     fn native_verification_plan_context_uses_normal_route_and_expires_on_receiver_restart() {
+        native_verification_plan_context(NativeContentSetup::Published);
+    }
+
+    #[test]
+    fn native_verification_plan_context_recovers_blob_only_peer_without_a_manifest() {
+        native_verification_plan_context(NativeContentSetup::BlobOnly);
+    }
+
+    #[test]
+    fn native_pending_plan_stages_verified_bytes_to_a_missing_peer() {
+        native_verification_plan_context(NativeContentSetup::Missing);
+    }
+
+    #[test]
+    fn native_verification_plan_context_recovers_same_object_extent_bytes() {
+        native_verification_plan_context(NativeContentSetup::Extents);
+    }
+
+    enum NativeContentSetup {
+        Published,
+        BlobOnly,
+        Missing,
+        Extents,
+    }
+
+    fn native_verification_plan_context(setup: NativeContentSetup) {
+        let blob_only_peer = matches!(setup, NativeContentSetup::BlobOnly);
+        let missing_peer = matches!(setup, NativeContentSetup::Missing);
+        let extent_peer = matches!(setup, NativeContentSetup::Extents);
+        let unpublished_peer = !matches!(setup, NativeContentSetup::Published);
         use crate::authority::placement_work::native_tests::{
-            canonical_migration_runtime, native_migration_cluster,
+            canonical_migration_runtime, continue_native_source_step, native_migration_cluster,
         };
         use crate::metadata::{MetadataImportAuthority, MetadataSourceCut};
-        let (mut native, nodes) = native_migration_cluster("migration-wire2-owner-context", 2);
+        let name = if extent_peer {
+            "migration-wire2-extent-byte-context"
+        } else if missing_peer {
+            "migration-wire2-missing-peer-context"
+        } else if blob_only_peer {
+            "migration-wire2-blob-only-context"
+        } else {
+            "migration-wire2-owner-context"
+        };
+        let (mut native, nodes) = native_migration_cluster(name, 2);
         let primary = nodes[0].clone();
         let peer = nodes[1].clone();
         let context = native.component_context(&primary).unwrap();
@@ -1467,8 +1605,16 @@ mod tests {
         let fs = sinomo_dfs::sifs_file_system_id();
         let payload = b"actual Main immutable bytes for plan context";
         let options = sinomo_dfs::DfsWriteOptions {
-            policy: sinomo_dfs::DfsReplicationPolicy::new(2, 2).unwrap(),
-            replica_candidates: nodes.clone(),
+            policy: sinomo_dfs::DfsReplicationPolicy::new(
+                if unpublished_peer { 1 } else { 2 },
+                if unpublished_peer { 1 } else { 2 },
+            )
+            .unwrap(),
+            replica_candidates: if unpublished_peer {
+                vec![primary.clone()]
+            } else {
+                nodes.clone()
+            },
             wait_for_commit: true,
             foreground_replica_repair: true,
         };
@@ -1644,26 +1790,47 @@ mod tests {
             &plan.expected_handoff,
             &source_fence,
         ));
+        let stage_deadline =
+            std::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
         for node in &nodes {
-            runtime
-                .authority
-                .confirm_stage_node(
-                    node,
-                    sinomo_dfs::DfsMetadataSnapshotInstallCommand {
-                        request_id: sinomo_core::Id::generate().to_string(),
-                        source_node_id: primary.clone(),
-                        file_system_id: Some(fs.clone()),
-                        authority_epoch: Some(active.epoch),
-                        primary_handoff_id: Some(pending.handoff_id.clone()),
-                        shard_id: shard.clone(),
-                        next_after_sequence: target.prefix_proof.journal_sequence,
-                        snapshot: image.descriptor().clone(),
-                        image: Some(image.clone()),
-                        reason: "current storage import".into(),
-                    },
-                    &plan,
-                )
-                .unwrap();
+            let command = sinomo_dfs::DfsMetadataSnapshotInstallCommand {
+                request_id: sinomo_core::Id::generate().to_string(),
+                source_node_id: primary.clone(),
+                file_system_id: Some(fs.clone()),
+                authority_epoch: Some(active.epoch),
+                primary_handoff_id: Some(pending.handoff_id.clone()),
+                shard_id: shard.clone(),
+                next_after_sequence: target.prefix_proof.journal_sequence,
+                snapshot: image.descriptor().clone(),
+                image: Some(image.clone()),
+                reason: "current storage import".into(),
+            };
+            let actual_source = native
+                .data_dir(node)
+                .dfs_dir()
+                .join("metadata")
+                .join(&shard.0);
+            // Acquire the same actual receiver fence while Pending remains
+            // typed. A remote service error crosses the normal RPC as an error,
+            // so the continuation must not classify its formatted Serde text.
+            // The existing weak registry lets that receiver reborrow this File;
+            // it grants no ACK, prefix, request outcome, or native authority.
+            let receiver_source_fence =
+                continue_native_source_step(&actual_source, stage_deadline, || {
+                    crate::metadata::retain_source_fence(&actual_source)
+                })
+                .expect("actual receiver source writer within the original stage deadline");
+            assert!(Arc::ptr_eq(
+                &receiver_source_fence,
+                &crate::metadata::retain_source_fence(&actual_source).unwrap(),
+            ));
+            continue_native_source_step(&actual_source, stage_deadline, || {
+                runtime
+                    .authority
+                    .confirm_stage_node(node, command.clone(), &plan)
+            })
+            .unwrap();
+            drop(receiver_source_fence);
         }
         let mut request = ContentVerificationRequest {
             request_id: String::new(),
@@ -1693,6 +1860,184 @@ mod tests {
         let content =
             sinomo_dfs::LocalContentStore::new(context.data_dir().dfs_dir().join("content"))
                 .unwrap();
+        if blob_only_peer {
+            let peer_content = sinomo_dfs::LocalContentStore::new(
+                native.data_dir(&peer).dfs_dir().join("content"),
+            )
+            .unwrap();
+            assert!(
+                peer_content
+                    .read_manifest(version.object_id.as_str(), version.version.as_str())
+                    .is_err()
+            );
+            let staged = peer_content
+                .put_object_version_blob_only(
+                    version.object_id.as_str(),
+                    version.version.as_str(),
+                    payload,
+                )
+                .unwrap();
+            assert_eq!(Some(staged.content_hash), version.content_hash);
+            assert_eq!(Some(staged.size_bytes), version.size_bytes);
+            assert!(
+                peer_content
+                    .read_manifest(version.object_id.as_str(), version.version.as_str())
+                    .is_err(),
+                "the ordinary blob-only producer must not publish a manifest"
+            );
+        }
+        if extent_peer {
+            let peer_content = sinomo_dfs::LocalContentStore::new(
+                native.data_dir(&peer).dfs_dir().join("content"),
+            )
+            .unwrap();
+            assert!(
+                peer_content
+                    .read_manifest(version.object_id.as_str(), version.version.as_str())
+                    .is_err()
+            );
+            let base = sinomo_core::Id::generate().to_string();
+            let alias = sinomo_core::Id::generate().to_string();
+            peer_content
+                .put_object_version(version.object_id.as_str(), &base, &payload[..11])
+                .unwrap();
+            let manifest = peer_content
+                .put_object_version_patch(
+                    version.object_id.as_str(),
+                    &base,
+                    &alias,
+                    11,
+                    &payload[11..],
+                )
+                .unwrap();
+            assert!(!manifest.extents.is_empty());
+            assert_eq!(Some(manifest.content_hash.clone()), version.content_hash);
+            assert_eq!(Some(manifest.size_bytes), version.size_bytes);
+            assert!(
+                !peer_content
+                    .blob_storage_candidate_exists(&manifest.content_hash)
+                    .unwrap()
+            );
+            assert!(
+                peer_content
+                    .read_manifest(version.object_id.as_str(), version.version.as_str())
+                    .is_err()
+            );
+        }
+        if missing_peer {
+            let peer_content = sinomo_dfs::LocalContentStore::new(
+                native.data_dir(&peer).dfs_dir().join("content"),
+            )
+            .unwrap();
+            assert!(
+                peer_content
+                    .read_manifest(version.object_id.as_str(), version.version.as_str())
+                    .is_err()
+            );
+            assert!(
+                !peer_content
+                    .blob_storage_candidate_exists(version.content_hash.as_deref().unwrap())
+                    .unwrap()
+            );
+            assert!(
+                runtime
+                    .authority
+                    .confirm_or_read_content(&peer, &request, &content)
+                    .is_err()
+            );
+            let stage_id = sinomo_core::Id::generate().to_string();
+            let frame_digest = blake3::hash(stage_id.as_bytes());
+            let frame_id = u64::from_le_bytes(frame_digest.as_bytes()[..8].try_into().unwrap());
+            let stage = staged_service::ContentStageRequest {
+                command: sinomo_dfs::DfsMessageCommand {
+                    request_id: stage_id.clone(),
+                    routed_message: sinomo_dfs::DfsRoutedMessage {
+                        source_node_id: primary.clone(),
+                        target_node_id: peer.clone(),
+                        frame_id,
+                        message_id: frame_id,
+                        message: sinomo_dfs::DfsNetworkMessage::StageRetainedBlob(
+                            sinomo_dfs::DfsStageBlobCommand {
+                                request_id: stage_id.clone(),
+                                intent_id: format!("storage-import-content:{stage_id}"),
+                                file_system_id: fs.clone(),
+                                object_id: version.object_id.clone(),
+                                expected_base_version: None,
+                                version: version.version.clone(),
+                                content_hash: version.content_hash.clone().unwrap(),
+                                bytes: Vec::new(),
+                                object_metadata: Some(object.clone()),
+                                authority_shard: Some(request.authority.clone()),
+                            },
+                        ),
+                    },
+                },
+                size_bytes: payload.len() as u64,
+                verification: request.clone(),
+            };
+            for negative in 0..4 {
+                let mut changed = stage.clone();
+                let caller = if negative == 0 { &peer } else { &primary };
+                let body = if negative == 1 {
+                    vec![0x41; payload.len()]
+                } else {
+                    payload.to_vec()
+                };
+                if negative == 2 {
+                    changed.verification.locator.object_id = "foreign-original-object".into();
+                    changed.verification.request_id = changed.verification.binding().unwrap();
+                }
+                if negative == 3 {
+                    changed.verification.source.scope_shard =
+                        sinomo_dfs::DfsMetadataShardId::new("services");
+                    changed.verification.request_id = changed.verification.binding().unwrap();
+                }
+                let rpc = sinomo_core::network::ObjectRpcRequest::encode_body(
+                    staged_service::CONTENT_STAGE_ROUTE,
+                    "dfs-migration",
+                    &changed,
+                )
+                .unwrap();
+                let body = sinomo_core::network::ObjectRpcBodySource::from_reader(
+                    std::io::Cursor::new(body),
+                    Some(payload.len() as u64),
+                );
+                assert!(
+                    native
+                        .rpc_call(
+                            caller,
+                            &peer,
+                            sinomo_core::network::ObjectRpcCall::new(rpc, body),
+                            sinomo_core::network::DEFAULT_NETWORK_TIMEOUT
+                        )
+                        .is_err()
+                );
+                assert!(
+                    peer_content
+                        .read_manifest(version.object_id.as_str(), version.version.as_str())
+                        .is_err()
+                );
+            }
+            // SAME ordinary producer helper and authenticated stage receiver;
+            // the pending import plan grants only this exact copied byte tuple.
+            runtime
+                .authority
+                .stage_retained_content(
+                    &peer,
+                    &request,
+                    &sinomo_dfs::DfsReplicationPolicy::new(1, 2).unwrap(),
+                    &nodes,
+                    &content,
+                )
+                .unwrap();
+            assert_eq!(
+                peer_content
+                    .read_object_version(version.object_id.as_str(), version.version.as_str())
+                    .unwrap()
+                    .1,
+                payload
+            );
+        }
         // Full normal verification, then the SAME product helper emits a scoped
         // reference. Both use the ordinary authenticated Main verifier route.
         runtime
@@ -1812,9 +2157,159 @@ mod tests {
                 .is_err(),
             "a plan context must not substitute for actual current byte verification"
         );
+        let old_floor_ledger = if !unpublished_peer {
+            let peer_context = native.component_context(&peer).unwrap();
+            let peer_runtime = canonical_migration_runtime(&peer_context);
+            let data = request.import_plan.as_ref().unwrap();
+            let receiver = peer_runtime
+                .authority
+                .receiver_root_for(
+                    &fs,
+                    &request.source.scope_shard.0,
+                    &data.plan.expected_handoff.handoff_id,
+                )
+                .unwrap();
+            let ancestry_request: String = serde_json::from_slice(
+                &std::fs::read(receiver.join("source-ancestry-request.json")).unwrap(),
+            )
+            .unwrap();
+            let ancestry = peer_runtime
+                .authority
+                .receiver_root
+                .join("source-ancestry")
+                .join(
+                    digest(&(
+                        data.plan.expected_handoff.handoff_id.as_str(),
+                        ancestry_request.as_str(),
+                    ))
+                    .unwrap(),
+                );
+            let mut original = BTreeMap::new();
+            for entry in std::fs::read_dir(&ancestry).unwrap() {
+                let entry = entry.unwrap();
+                assert!(entry.file_type().unwrap().is_file());
+                original.insert(entry.file_name(), std::fs::read(entry.path()).unwrap());
+            }
+            let floor_path = ancestry.join("floors.json");
+            let original_floor = std::fs::read(&floor_path).unwrap();
+            std::fs::write(
+                stage.join("original-current-source-floors.json"),
+                &original_floor,
+            )
+            .unwrap();
+            let mut old: serde_json::Value = serde_json::from_slice(&original_floor).unwrap();
+            assert_eq!(old.as_object().unwrap().len(), 4);
+            assert_eq!(
+                old.as_object_mut().unwrap().remove("checkpoints").unwrap(),
+                serde_json::json!([])
+            );
+            let checkpoint_path = ancestry.join("source-checkpoints.json");
+            let original_checkpoints = std::fs::read(&checkpoint_path).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&original_checkpoints).unwrap(),
+                serde_json::json!([])
+            );
+            std::fs::write(
+                stage.join("original-current-source-checkpoints.json"),
+                &original_checkpoints,
+            )
+            .unwrap();
+            let old_bytes = serde_json::to_vec(&old).unwrap();
+            std::fs::remove_file(checkpoint_path).unwrap();
+            let confirm_peer = || {
+                runtime.authority.confirm_stage_node(
+                    &peer,
+                    sinomo_dfs::DfsMetadataSnapshotInstallCommand {
+                        request_id: sinomo_core::Id::generate().to_string(),
+                        source_node_id: primary.clone(),
+                        file_system_id: Some(fs.clone()),
+                        authority_epoch: Some(request.authority.epoch),
+                        primary_handoff_id: Some(pending.handoff_id.clone()),
+                        shard_id: request.source.scope_shard.clone(),
+                        next_after_sequence: target.prefix_proof.journal_sequence,
+                        snapshot: image.descriptor().clone(),
+                        image: Some(image.clone()),
+                        reason: "current storage import".into(),
+                    },
+                    &data.plan,
+                )
+            };
+            for negative in 0..3 {
+                let mut changed = old.clone();
+                match negative {
+                    0 => {
+                        changed["foreign-provenance"] = serde_json::json!(true);
+                    }
+                    1 => {
+                        let floor = changed["floors"]
+                            .as_array_mut()
+                            .unwrap()
+                            .first_mut()
+                            .expect("genuine native ACK floor");
+                        let height = floor["journal_sequence"].as_u64().unwrap();
+                        floor["journal_sequence"] =
+                            serde_json::json!(height.checked_add(1).unwrap());
+                    }
+                    _ => {
+                        changed["request_id"] =
+                            serde_json::json!(sinomo_core::Id::generate().to_string());
+                    }
+                }
+                std::fs::write(&floor_path, serde_json::to_vec(&changed).unwrap()).unwrap();
+                assert!(confirm_peer().is_err());
+            }
+            std::fs::write(&floor_path, &old_bytes).unwrap();
+            confirm_peer().unwrap();
+            assert_eq!(std::fs::read(&floor_path).unwrap(), old_bytes);
+            assert!(!ancestry.join("source-checkpoints.json").exists());
+            for (name, bytes) in &original {
+                if name.as_os_str() != std::ffi::OsStr::new("floors.json")
+                    && name.as_os_str() != std::ffi::OsStr::new("source-checkpoints.json")
+                {
+                    assert_eq!(std::fs::read(ancestry.join(name)).unwrap(), *bytes);
+                }
+            }
+            drop(peer_runtime);
+            drop(peer_context);
+            Some((floor_path, old_bytes))
+        } else {
+            None
+        };
         // No peer context/runtime/data-owner borrow is retained by this fixture.
         native.stop_node(&peer).unwrap();
         native.reopen_node(peer.clone()).unwrap();
+        if let Some((floor_path, old_bytes)) = &old_floor_ledger {
+            let data = request.import_plan.as_ref().unwrap();
+            // The normal repeat challenge and staged snapshot/prefix receiver
+            // MUST re-read the old ledger; content-context Ready is insufficient.
+            runtime
+                .authority
+                .confirm_stage_node(
+                    &peer,
+                    sinomo_dfs::DfsMetadataSnapshotInstallCommand {
+                        request_id: sinomo_core::Id::generate().to_string(),
+                        source_node_id: primary.clone(),
+                        file_system_id: Some(fs.clone()),
+                        authority_epoch: Some(request.authority.epoch),
+                        primary_handoff_id: Some(pending.handoff_id.clone()),
+                        shard_id: request.source.scope_shard.clone(),
+                        next_after_sequence: target.prefix_proof.journal_sequence,
+                        snapshot: image.descriptor().clone(),
+                        image: Some(image.clone()),
+                        reason: "current storage import".into(),
+                    },
+                    &data.plan,
+                )
+                .unwrap();
+            assert_eq!(std::fs::read(floor_path).unwrap(), *old_bytes);
+            assert!(
+                !floor_path
+                    .parent()
+                    .unwrap()
+                    .join("source-checkpoints.json")
+                    .exists()
+            );
+        }
         let rpc = sinomo_core::network::ObjectRpcRequest::encode_body(
             staged_service::CONTENT_VERIFY_ROUTE,
             "dfs-migration",
@@ -1867,6 +2362,341 @@ mod tests {
         drop(_source_writer);
         drop(runtime);
         drop(context);
+        native.close().unwrap();
+    }
+
+    #[test]
+    fn same_object_extent_bytes_recover_without_inferred_source_generation() {
+        let root = sinomo_testdir::TestDir::new("import-content-extent-byte-candidate");
+        let content = sinomo_dfs::LocalContentStore::new(root.path()).unwrap();
+        let locator = MetadataSourceContentLocator {
+            object_id: "original-object".into(),
+            version: "logical-version".into(),
+            content_version: None,
+        };
+        let bytes = b"elevenbytes+seven!";
+        content
+            .put_object_version(&locator.object_id, "byte-base", &bytes[..11])
+            .unwrap();
+        let alias = content
+            .put_object_version_patch(
+                &locator.object_id,
+                "byte-base",
+                "byte-version",
+                11,
+                &bytes[11..],
+            )
+            .unwrap();
+        assert!(!alias.extents.is_empty());
+        assert!(
+            !content
+                .blob_storage_candidate_exists(&alias.content_hash)
+                .unwrap()
+        );
+        let version = captured_version(&alias, &locator);
+        assert!(version.content_durability.is_none());
+        verify_local_retained_content(&content, &version, &locator).unwrap();
+        assert_eq!(
+            content
+                .read_object_version(version.object_id.as_str(), version.version.as_str())
+                .unwrap()
+                .1,
+            bytes
+        );
+        assert_eq!(
+            content
+                .read_manifest(&locator.object_id, "byte-version")
+                .unwrap(),
+            alias
+        );
+        assert!(version.content_durability.is_none());
+        assert!(locator.content_version.is_none());
+    }
+
+    #[test]
+    fn foreign_object_extents_and_wrong_hash_never_supply_source_bytes() {
+        let root = sinomo_testdir::TestDir::new("import-content-extent-byte-reject");
+        let content = sinomo_dfs::LocalContentStore::new(root.path()).unwrap();
+        let locator = MetadataSourceContentLocator {
+            object_id: "original-object".into(),
+            version: "logical-version".into(),
+            content_version: None,
+        };
+        let bytes = b"elevenbytes+seven!";
+        content
+            .put_object_version("foreign-object", "byte-base", &bytes[..11])
+            .unwrap();
+        let foreign = content
+            .put_object_version_patch(
+                "foreign-object",
+                "byte-base",
+                "byte-version",
+                11,
+                &bytes[11..],
+            )
+            .unwrap();
+        assert!(!foreign.extents.is_empty());
+        assert!(
+            !content
+                .blob_storage_candidate_exists(&foreign.content_hash)
+                .unwrap()
+        );
+        let version = captured_version(&foreign, &locator);
+        assert!(verify_local_retained_content(&content, &version, &locator).is_err());
+        content
+            .put_object_version(&locator.object_id, "other-content", b"different body")
+            .unwrap();
+        assert!(verify_local_retained_content(&content, &version, &locator).is_err());
+        assert!(
+            content
+                .read_manifest(version.object_id.as_str(), version.version.as_str())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn blob_only_source_bytes_are_verified_before_canonical_binding() {
+        let root = sinomo_testdir::TestDir::new("import-content-blob-only-binding");
+        let locator = MetadataSourceContentLocator {
+            object_id: "original-object".into(),
+            version: "original-version".into(),
+            content_version: None,
+        };
+        let bytes = vec![0x36; 128 * 1024];
+        let content = sinomo_dfs::LocalContentStore::new(root.path()).unwrap();
+        let manifest = content
+            .put_object_version_blob_only(&locator.object_id, &locator.version, &bytes)
+            .unwrap();
+        let version = captured_version(&manifest, &locator);
+        drop(content);
+        let content = sinomo_dfs::LocalContentStore::new(root.path()).unwrap();
+        assert!(
+            content
+                .read_manifest(&locator.object_id, &locator.version)
+                .is_err()
+        );
+        assert!(
+            content
+                .read_manifest(version.object_id.as_str(), version.version.as_str())
+                .is_err()
+        );
+        verify_local_retained_content(&content, &version, &locator).unwrap();
+        assert_eq!(
+            content
+                .read_object_version(version.object_id.as_str(), version.version.as_str())
+                .unwrap()
+                .1,
+            bytes,
+        );
+    }
+
+    #[test]
+    fn blob_only_corruption_wrong_length_and_foreign_locator_never_bind() {
+        let root = sinomo_testdir::TestDir::new("import-content-blob-only-reject");
+        let content = sinomo_dfs::LocalContentStore::new(root.path()).unwrap();
+        let locator = MetadataSourceContentLocator {
+            object_id: "original-object".into(),
+            version: "original-version".into(),
+            content_version: None,
+        };
+        let bytes = vec![0x36; 128 * 1024];
+        let manifest = content
+            .put_object_version_blob_only(&locator.object_id, &locator.version, &bytes)
+            .unwrap();
+        let version = captured_version(&manifest, &locator);
+        let foreign = MetadataSourceContentLocator {
+            object_id: "foreign-object".into(),
+            ..locator.clone()
+        };
+        assert!(verify_local_retained_content(&content, &version, &foreign).is_err());
+        let mut wrong_length = version.clone();
+        wrong_length.size_bytes = Some(bytes.len() as u64 + 1);
+        assert!(verify_local_retained_content(&content, &wrong_length, &locator).is_err());
+        // Fault the actual loose blob produced above without altering the
+        // captured hash or reservation. Presence and length alone are insufficient.
+        let hex = manifest.content_hash.strip_prefix("blake3:").unwrap();
+        let blob = root.path().join("blobs").join(&hex[..2]).join(hex);
+        assert_eq!(std::fs::read(&blob).unwrap(), bytes);
+        std::fs::write(&blob, vec![0x37; bytes.len()]).unwrap();
+        assert!(verify_local_retained_content(&content, &version, &locator).is_err());
+        assert!(
+            content
+                .read_manifest(version.object_id.as_str(), version.version.as_str())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn native_collected_version_is_not_rebound_from_its_retained_hash() {
+        use crate::authority::placement_work::native_tests::native_migration_cluster;
+        let (native, nodes) = native_migration_cluster("migration-retired-blob-binding", 1);
+        let root = native.data_dir(&nodes[0]).dfs_dir().join("content");
+        let content = sinomo_dfs::LocalContentStore::new(&root).unwrap();
+        let locator = MetadataSourceContentLocator {
+            object_id: "unreferenced-object".into(),
+            version: "unreferenced-version".into(),
+            content_version: None,
+        };
+        let bytes = b"actual unreferenced native content";
+        content
+            .put_object_version(&locator.object_id, "base", &bytes[..11])
+            .unwrap();
+        let manifest = content
+            .put_object_version_patch(
+                &locator.object_id,
+                "base",
+                &locator.version,
+                11,
+                &bytes[11..],
+            )
+            .unwrap();
+        let alias = content
+            .put_object_version_patch(
+                &locator.object_id,
+                "base",
+                "retained-alias",
+                11,
+                &bytes[11..],
+            )
+            .unwrap();
+        assert_eq!(alias.content_hash, manifest.content_hash);
+        assert!(!alias.extents.is_empty());
+        assert!(
+            !content
+                .blob_storage_candidate_exists(&manifest.content_hash)
+                .unwrap()
+        );
+        let version = captured_version(&manifest, &locator);
+        let mut control = native.shared_control_plane().unwrap();
+        let fs = native.file_system().file_system_id;
+        let config = control
+            .with_client(|kv| kv.get(&sinomo_dfs::file_system_config_key(&fs)))
+            .unwrap()
+            .unwrap()
+            .decode::<sinomo_dfs::DfsFileSystemConfig>()
+            .unwrap();
+        drop(control);
+        let shards = native.metadata_shards().unwrap();
+        let mut owner = native.client(&nodes[0]).unwrap();
+        let mut deleted = 0;
+        // Each pass obtains a new real complete catalog. The first releases
+        // the now-unreferenced reservation and records durable absence; the
+        // second may collect the version under that later catalog observation.
+        for _ in 0..2 {
+            let catalog = owner
+                .refresh_content_root_catalog(
+                    std::slice::from_ref(&config),
+                    &shards,
+                    &[],
+                    &root,
+                    &[],
+                    32,
+                )
+                .unwrap();
+            let validation = catalog
+                .validate_for_collection_with_head_watermark_policy(
+                    std::slice::from_ref(&config),
+                    &shards,
+                    &[],
+                    &[],
+                    false,
+                    time::OffsetDateTime::now_utc().unix_timestamp_nanos() as u64,
+                    std::time::Duration::from_secs(30),
+                )
+                .unwrap();
+            assert!(
+                validation.is_collection_authorized(),
+                "normal catalog denied collection: {:?}",
+                validation.reasons()
+            );
+            let report = owner
+                .run_lifecycle_maintenance(sinomo_dfs::DfsLifecycleMaintenanceOptions {
+                    content_root_catalog_validation: Some(validation),
+                    content_reservation_reconciliation: Some(
+                        sinomo_dfs::ContentStoreReservationReconciliationOptions::bounded(
+                            time::OffsetDateTime::now_utc().unix_timestamp_nanos() as u64,
+                            std::time::Duration::ZERO,
+                            32,
+                        ),
+                    ),
+                    version_gc: Some(sinomo_dfs::ContentStoreVersionGcOptions::delete_eligible(
+                        std::time::Duration::ZERO,
+                        1,
+                    )),
+                    ..Default::default()
+                })
+                .unwrap();
+            assert!(!report.content_gc_metadata_protection_unavailable);
+            deleted += report.version_gc.unwrap().deleted_version_count;
+        }
+        assert_eq!(deleted, 2);
+        assert!(
+            content
+                .object_version_is_deleted(&locator.object_id, &locator.version)
+                .unwrap()
+        );
+        assert_eq!(
+            content
+                .read_manifest(&locator.object_id, "retained-alias")
+                .unwrap(),
+            alias
+        );
+        assert!(
+            !content
+                .blob_storage_candidate_exists(&manifest.content_hash)
+                .unwrap()
+        );
+        assert!(
+            !content
+                .object_version_storage_candidate_exists(
+                    &locator.object_id,
+                    &locator.version,
+                    &manifest.content_hash,
+                )
+                .unwrap()
+        );
+        assert!(verify_local_retained_content(&content, &version, &locator).is_err());
+        let mut ingest = content
+            .begin_quarantined_blob_ingest(manifest.size_bytes, Some(&manifest.content_hash))
+            .unwrap();
+        let (_, mut reader) = content
+            .open_object_version_stream(&locator.object_id, "retained-alias")
+            .unwrap();
+        let mut buffer = [0; 64 * 1024];
+        loop {
+            let count = reader.read(&mut buffer).unwrap();
+            if count == 0 {
+                break;
+            }
+            ingest.write_chunk(&buffer[..count]).unwrap();
+        }
+        let verified = ingest.finish_quarantined().unwrap();
+        // This reaches the final atomic primitive with genuine exact bytes,
+        // independently of the verifier's earlier retirement veto.
+        assert!(
+            content
+                .bind_quarantined_blob_from_unretired_source(
+                    &locator.object_id,
+                    &locator.version,
+                    version.object_id.as_str(),
+                    version.version.as_str(),
+                    verified,
+                )
+                .is_err()
+        );
+        assert!(
+            content
+                .object_version_is_deleted(&locator.object_id, &locator.version)
+                .unwrap()
+        );
+        assert!(
+            content
+                .read_manifest(version.object_id.as_str(), version.version.as_str())
+                .is_err()
+        );
+        drop(reader);
+        drop(owner);
+        drop(content);
         native.close().unwrap();
     }
 

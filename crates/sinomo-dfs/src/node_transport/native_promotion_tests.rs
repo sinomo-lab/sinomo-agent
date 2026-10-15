@@ -3,12 +3,37 @@ use super::*;
 use crate::test_runtime::{DfsTestRuntime, FaultAction, FaultRule, RpcPhase};
 use crate::{DfsWriteIntentStatus, DfsWriteOptions};
 
+// Count only attempts made by this fixture's real promotion outbox. The
+// adapter forwards the original owned SOBJ call and response untouched to the
+// same registered native transport; unrelated host RPCs use their own adapter.
+struct ObservedPromotionPeer {
+    inner: Arc<dyn DfsPeerTransport>,
+    attempts: Arc<std::sync::atomic::AtomicUsize>,
+}
+impl DfsPeerTransport for ObservedPromotionPeer {
+    fn response_delivery_owner(&self) -> Option<Arc<crate::DfsRoutedResponseDelivery>> {
+        self.inner.response_delivery_owner()
+    }
+    fn call_object_rpc(
+        &self,
+        target: &NodeId,
+        call: ObjectRpcCall,
+        options: DfsObjectRpcSendOptions,
+    ) -> Result<ObjectRpcResult, DfsPeerTransportError> {
+        assert_eq!(call.request.route, crate::DFS_DATA_COMMIT_VERSION_ROUTE);
+        self.attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.call_object_rpc(target, call, options)
+    }
+}
+
 struct NativePromotions {
     runtime: DfsTestRuntime,
     source: NodeId,
     targets: Vec<NodeId>,
     transport: DfsNodeTransport,
     commands: Vec<crate::DfsCommitVersionCommand>,
+    attempts: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl NativePromotions {
@@ -33,7 +58,15 @@ impl NativePromotions {
                 .posix_write_file(
                     &format!("/promotion-{index}"),
                     format!("native promotion body {index}").as_bytes(),
-                    DfsWriteOptions::replicated_eventual(roster.clone()),
+                    DfsWriteOptions {
+                        // This fixture later promotes on every listed receiver.
+                        // The convenience Eventual helper caps desired replicas
+                        // at two, which cannot seed the three/four-node cases.
+                        policy: crate::DfsReplicationPolicy::new(1, roster.len()).unwrap(),
+                        replica_candidates: roster.clone(),
+                        wait_for_commit: true,
+                        foreground_replica_repair: true,
+                    },
                 )
                 .unwrap();
             let backend = service.metadata_backend().unwrap();
@@ -47,6 +80,7 @@ impl NativePromotions {
                         && intent.status == DfsWriteIntentStatus::Committed
                 })
                 .unwrap();
+            assert_eq!(intent.policy.desired_replicas, roster.len());
             commands.push(crate::DfsCommitVersionCommand {
                 request_id: sinomo_core::Id::generate().to_string(),
                 intent_id: intent.intent_id,
@@ -72,15 +106,31 @@ impl NativePromotions {
                     {
                         break;
                     }
+                    let remaining = deadline.saturating_duration_since(Instant::now());
                     assert!(
-                        Instant::now() < deadline,
+                        !remaining.is_zero(),
                         "normal foreground placement must finish before observing an exact promotion replay"
                     );
+                    // W=1 can return while the rest of the desired copies are
+                    // queued. Drive the same normal served owner inside the
+                    // original setup budget, without changing startup timers.
+                    let pass = runtime.maintenance_tick(&source, remaining).unwrap();
+                    assert!(
+                        pass.outcome.is_ok(),
+                        "native promotion setup: {:?}",
+                        pass.outcome
+                    );
+                    assert_eq!(pass.omitted_kv_event_count, 0);
                     std::thread::sleep(Duration::from_millis(1));
                 }
             }
         }
         let (sync, asynchronous) = runtime.peer_transports(&source).unwrap();
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sync = Arc::new(ObservedPromotionPeer {
+            inner: sync,
+            attempts: Arc::clone(&attempts),
+        });
         let transport = DfsNodeTransport::with_peer_transports_for_nodes_and_detached_state(
             source.clone(),
             targets.clone(),
@@ -95,6 +145,7 @@ impl NativePromotions {
             targets,
             transport,
             commands,
+            attempts,
         }
     }
     fn enqueue(&mut self, object: usize, target: usize) {
@@ -108,6 +159,9 @@ impl NativePromotions {
         self.transport
             .send_detached_routed_message(&self.targets[target], message)
             .unwrap();
+    }
+    fn promotion_dispatch_count(&self) -> usize {
+        self.attempts.load(std::sync::atomic::Ordering::SeqCst)
     }
     fn fault(&self, target: usize, action: FaultAction) {
         self.runtime.install_fault(FaultRule {
@@ -143,6 +197,66 @@ fn native_promotion_exact_ack_settles_and_suppresses_duplicate_identity() {
     case.finish();
 }
 
+#[test]
+fn native_deferred_worker_cancellation_releases_claim_and_preserves_real_outbox() {
+    let mut case = NativePromotions::new("native-promotion-worker-cancellation", 2, 2);
+    let runtime = Arc::new(crate::runtime_message::DfsDetachedSendRuntime::new());
+    case.transport.detached_send_state = runtime.detached_state();
+    case.enqueue(0, 0);
+    let worker = case.transport.fork_detached_send_worker();
+    let mut unpolled = None;
+    runtime.schedule_deferred_work(
+        worker.clone(),
+        BTreeSet::new(),
+        Duration::from_millis(10),
+        |task| unpolled = Some(task),
+    );
+    assert!(runtime.worker_is_active());
+    drop(
+        unpolled
+            .take()
+            .expect("the actual scheduled future has not been polled"),
+    );
+    assert!(
+        !runtime.worker_is_active(),
+        "unpolled cancellation releases the active claim"
+    );
+    assert_eq!(case.transport.pending_commit_promotion_count(), 1);
+    assert_eq!(case.transport.settled_commit_promotion_count(), 0);
+
+    let executor = case.runtime.runtime_handle();
+    for expected_settled in 1..=2 {
+        if expected_settled == 2 {
+            case.enqueue(1, 0);
+        }
+        let mut started = None;
+        runtime.schedule_deferred_work(
+            worker.clone(),
+            BTreeSet::new(),
+            Duration::from_millis(10),
+            |task| started = Some(executor.spawn(task)),
+        );
+        let task = started.expect("the cancelled worker cannot suppress a normal replacement");
+        executor.block_on(async {
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while case.transport.settled_commit_promotion_count() != expected_settled {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("actual receiver ACK settles the retained original promotion");
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+        });
+        assert!(
+            !runtime.worker_is_active(),
+            "polled cancellation also releases its claim"
+        );
+        assert_eq!(case.transport.pending_commit_promotion_count(), 0);
+    }
+    case.finish();
+}
+
 fn native_failed_promotion_retries_actual_receiver(action: FaultAction, label: &str) {
     let mut case = NativePromotions::new(label, 2, 1);
     case.fault(0, action);
@@ -155,14 +269,32 @@ fn native_failed_promotion_retries_actual_receiver(action: FaultAction, label: &
     );
     assert_eq!(case.transport.pending_commit_promotion_count(), 1);
     assert_eq!(case.transport.settled_commit_promotion_count(), 0);
-    let baseline = case.runtime.rpc_observations().len();
+    let baseline = case.promotion_dispatch_count();
+    assert_eq!(
+        baseline, 1,
+        "the original promotion attempt reached the native transport exactly once"
+    );
+    // An ordinary namespace lookup is independent of the frozen promotion
+    // retry clock. Keep real unrelated traffic in the observation window.
+    let before_lookup = case.runtime.rpc_observations().len();
+    let mut browser = case.runtime.client(&case.source).unwrap();
+    browser.posix_stat_distributed("/").unwrap();
+    drop(browser);
+    assert!(
+        case.runtime.rpc_observations()[before_lookup..]
+            .iter()
+            .any(|event| {
+                event.route == crate::DFS_DATA_NAMESPACE_ROUTE
+                    && event.phase == RpcPhase::BeforeDispatch
+            })
+    );
     case.transport
         .flush_detached_peer_sends_with_now(&|| start)
         .unwrap();
     assert_eq!(
-        case.runtime.rpc_observations().len(),
+        case.promotion_dispatch_count(),
         baseline,
-        "cooling makes no new dispatch"
+        "cooling makes no new dispatch of this actual promotion"
     );
     case.enqueue(0, 0);
     assert_eq!(case.transport.pending_commit_promotion_count(), 1);
@@ -172,6 +304,11 @@ fn native_failed_promotion_retries_actual_receiver(action: FaultAction, label: &
         .unwrap();
     assert_eq!(case.transport.pending_commit_promotion_count(), 0);
     assert_eq!(case.transport.settled_commit_promotion_count(), 1);
+    assert_eq!(
+        case.promotion_dispatch_count(),
+        baseline + 1,
+        "the same captured promotion retries only after its unchanged deadline"
+    );
     case.finish();
 }
 

@@ -498,6 +498,45 @@ fn write_configuration_browser_warm_options_and_committed_writes_keep_full_zero_
             .unwrap()
             .node_id()
             .clone();
+        // Warm-policy assertions require the actual published content roster,
+        // not merely mounted metadata routes. Observe normal startup before
+        // creating the zero-KV-read probe; do not inject candidate defaults.
+        let readiness = runtime.client(&owner).unwrap();
+        let wanted = nodes
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let ready_started = std::time::Instant::now();
+        let ready_deadline = ready_started + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+        loop {
+            let projection = readiness
+                .control_plane
+                .as_deref()
+                .unwrap()
+                .write_configuration_projection()
+                .unwrap();
+            if projection.as_ref().is_some_and(|projection| {
+                projection
+                    .content_replica_candidates()
+                    .unwrap()
+                    .into_iter()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    == wanted
+            }) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < ready_deadline,
+                "normal content roster did not publish before the existing readiness budget"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        eprintln!(
+            "NATIVE_BROWSER_ROSTER_READY nodes={} elapsed_ms={}",
+            nodes.len(),
+            ready_started.elapsed().as_millis()
+        );
+        drop(readiness);
         let backend = DfsBrowserBackend::for_component_data_dir(
             Arc::new(runtime.data_dir(&owner).clone()),
             &runtime.runtime_handle(),

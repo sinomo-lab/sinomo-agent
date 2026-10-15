@@ -169,12 +169,13 @@ The sole journal family is `PrepareOperationV7(payload)` followed by
 `CommitPreparedOperationV7(digest)`. The complete payload seals namespace
 changes, metadata effects, original read predicates, content receipts, intent
 transitions and terminal request outcomes before authority collection. The
-commit marker carries only the exact prepared digest and slot. If the complete
-shard cannot acknowledge, the operation may continue only after its
-purpose-specific DFS recovery quorum is satisfied and cluster Raft commits an
-operation-bound permit for that exact prepare, assignment, and epoch. A
-partition with only the content receipt threshold `W` is therefore
-insufficient.
+commit marker carries only the exact prepared digest and slot. Canonical
+publication requires the complete assigned metadata participant proof, the
+existing coherent configuration projection, and the actual held writer's
+bound generation and durable handoff fence. An incomplete participant set
+leaves the operation pending or unavailable. Content receipt threshold `W`
+cannot substitute for metadata evidence, and cluster KV cannot mint a
+metadata recovery permit.
 
 KV access on DFS operation paths is explicit. Namespace routing and policy reads
 reuse the existing retained configuration projections; peer routing and connection
@@ -258,9 +259,11 @@ since advanced, the publisher retains its last checkpointed cursor and prepares
 fresh work. It does not mistake the obsolete plan for proof of replica damage.
 Rejections against an unchanged source retain the existing snapshot-repair path.
 
-Operations that require global consistency retain it: publication revalidation,
-degraded operation permits, placement mutation permits, configuration CAS and
-handoff activation use their existing KV protocols. The `dfs_implicit_kv` Dylint
+Genuine cluster-wide configuration decisions retain existing authoritative KV
+reads and atomic transactions: placement policy changes, configuration CAS and
+proof-carrying handoff activation. Ordinary metadata publication and sync use
+retained projections and DFS-owned participant evidence. They do not request
+per-operation KV authority, degraded permits, floors, or watermarks. The `dfs_implicit_kv` Dylint
 rule rejects unapproved access through normal service/POSIX/browser entrypoints
 and local helper calls. Narrow configuration and consistency boundary markers
 record why each intentional use is required; see
@@ -281,6 +284,12 @@ read a committed successor, while records already planned by its caller retain
 their original predicates. Missing-replica pruning is a conditional update to
 locations and matching receipts, never a whole-object replacement.
 
+Durable hardlink alias frames retain their original physical shard, object
+versions and path occupants before yielding to the canonical shard. Resuming or
+reopening the job uses those same comparisons. An observed absence is distinct
+from a missing observation; neither can be replaced with a fresh parent version.
+The same saga applies when distinct physical shards share one primary.
+
 A terminal write outcome cannot be reopened by a delayed prepare or contradicted
 by repair cancellation. Current-primary recovery compares the exact observed
 intent and object atomically: a published target is committed, and a pending
@@ -288,12 +297,16 @@ write whose original base has been replaced is aborted. Missing objects alone
 retain the existing recovery grace period. Historical versions remain available
 to explicit history operations; they never replace the current head implicitly.
 
-This is intentionally not a second DFS election or commit-index protocol.
-Cluster KV already provides quorum election, a linearizable log, and
-compare-and-swap fencing. Reusing it for one bounded per-shard operation floor
-and exact head watermark avoids duplicating Raft inside DFS. KV never stores
-paths, intents, receipts, namespace transactions, journals, snapshots, object
-metadata, content bytes, or repair queues; those remain exclusively in DFS.
+Cluster KV retains its atomic transactional API and orders cluster
+configuration and authority changes. DFS does not add caller bindings,
+caller sessions, historical replay APIs, or substitute KV operation ledgers.
+An ambiguous configuration transaction is reconciled from its existing native
+outcome and exact guarded configuration state; DFS then resumes its own durable
+shard protocol. Paths, intents, receipts, namespace transactions, journals,
+snapshots, object metadata, bytes, repair queues, and metadata acknowledgement
+floors remain exclusively in DFS. Historical global metadata floors and
+watermarks may be interpreted only by migration to preserve old obligations;
+they do not authorize a current ordinary write.
 
 Hosted browser operations that share the namespace service wait in a FIFO async
 queue before occupying a blocking worker. Existing per-route concurrency and
@@ -352,8 +365,8 @@ CAS cannot activate a changed configuration. A proof-carrying handoff may
 either change membership while retaining the primary, or rotate the primary to
 an existing replica while preserving the exact member ring; mixed primary and
 membership changes are rejected. Either form advances exactly one epoch and
-atomically captures the highest Raft-committed DFS operation floor and head
-watermark. The resulting pending handoff is not itself a retiring-primary
+must preserve every accepted DFS-owned prepare, commit and acknowledgement
+floor through the exact retiring participant prefix. The resulting pending handoff is not itself a retiring-primary
 fence because an isolated primary may not have
 observed it and may still complete a valid write. Once the retiring primary
 reconnects, it takes the same publication guard used by canonical commits,
@@ -365,11 +378,21 @@ while still permitting replay, snapshot inspection, and handoff transfer.
 Activation transfers that immutable fenced prefix across the union of the
 retiring and desired metadata assignments and requires a joint-consensus
 certificate: a majority of each assignment plus explicit acknowledgements from
-both the retiring and desired primaries. The completion proof must equal the
-retiring primary's fence and may not precede the captured operation floor or
-exact watermark. This permits a configured replica to be offline during a
-fenced configuration handoff while ensuring the successor starts with a
-durable majority and neither side of a reconfiguration can activate alone. For
+both the retiring and desired primaries. For an ordinary membership handoff,
+the completion proof must equal the retiring primary's fence and may not
+precede any independently retained DFS participant acknowledgement obligation.
+A completed assignment is persistent configuration. Default reconciliation
+validates its scope and current authorized members and preserves its primary
+and replica ring. Discovery supplies initial defaults; only the exact initial
+singleton may expand after its native genesis commits. Later role changes and
+member growth use the explicit guarded handoff protocol, so discovery cannot
+silently undo an operator's completed handoff.
+A storage import separately binds the original source fence and ACK clock,
+the converted candidate's native target prefix, and its semantic image
+fingerprint. Those three domains are not interchangeable. This permits a
+configured replica to be offline during a fenced configuration handoff while
+ensuring the successor starts with a durable majority and neither side of a
+reconfiguration can activate alone. For
 same-primary membership changes, the completing backend instance
 advances its local marker and explicitly rebinds. For a primary rotation, the
 retiring instance records completion without binding the successor epoch and
@@ -385,15 +408,16 @@ prefix cannot bind. Independently opened instances remain fenced until they
 perform the same proof. Thus the quorum side may record replacement replicas
 while the old shard is isolated, but it cannot activate a replacement writer
 until the retiring primary has handed off every write completed before its
-local fence. Healthy full-shard writes remain off Raft. Degraded operations
-advance only a bounded per-shard permit/floor or watermark, and the next
-handoff carries that fence forward.
+local fence. Ordinary full-shard writes remain participant-scoped. An
+incomplete configured participant proof does not advance visibility or sync
+through a global KV substitute. A whole-root installation must carry the
+existing real native generation fence into the candidate before exposing it;
+retained handles and lagging projections cannot regain write authority.
 
 Membership-handoff synchronization is therefore a joint-quorum operation, not
-an ordinary publication barrier. It must not take the ordinary degraded
-operation fallback based only on a majority of the union: a desired-only
-quorum is not valid evidence for a retiring-epoch prefix, and a retiring-only
-quorum does not make the successor durable. Progress stays pending and
+an ordinary publication barrier. A majority of the union alone is insufficient:
+a desired-only quorum is not valid evidence for a retiring-epoch prefix, and a
+retiring-only quorum does not make the successor durable. Progress stays pending and
 retry-enabled until both assignment majorities and both primaries acknowledge,
 or the bounded attempt times out without activation. A timed-out attempt
 returns to durable pending state, retains the retiring write fence, and is
@@ -568,9 +592,9 @@ The commit path must preserve these properties:
 2. The authority validates its epoch, policy, and base version.
 3. Content is durable on the nodes required by policy.
 4. Matching receipts exist before the visible version advances.
-5. The exact complete operation prepare is durable on every
-   configured metadata-shard replica, or the purpose-specific DFS recovery
-   quorum has been fenced by an operation-bound cluster-Raft permit.
+5. The exact complete operation prepare is durable on every configured
+   metadata-shard participant; incomplete evidence remains pending or fails
+   without a KV metadata permit or lowered count.
 6. The metadata commit revalidates the typed authorization and compares the
    current version, path occupants, and write intent
    atomically.
@@ -586,7 +610,7 @@ described later in this document.
 
 | Layer | Authority and responsibility |
 |---|---|
-| Cluster KV | Filesystem configuration, metadata-shard placement, primary epochs, compact policies, service discovery, and bounded per-shard Raft permits, floors, watermarks, and handoff records. |
+| Cluster KV | Filesystem configuration, metadata-shard placement, primary epochs, compact policies, service discovery, and proof-carrying configuration handoff records. |
 | Metadata shards | Paths, object identity, versions, write intents, receipts, namespace transactions, durable jobs, and journals. |
 | Content stores | Immutable blobs, extent manifests, staging data, local quotas, and garbage collection. |
 | Network data plane | Bounded metadata batches, manifests, ranges, chunks, receipts, and repair traffic. |
@@ -595,8 +619,9 @@ described later in this document.
 The cluster KV is small enough to replicate to every control-plane participant.
 Per-path and per-version state remains in metadata shards, and bytes remain in
 content stores. This keeps large namespaces and objects out of Raft while using
-the existing cluster consensus to order configuration, authority changes, and
-the exact degraded DFS prefixes that failover must preserve.
+the existing cluster consensus to order configuration and authority changes.
+DFS participant journals, durable fences and acknowledgement floors preserve
+the exact metadata prefixes across those transitions.
 
 Local content reservations are durable roots until an authoritative catalog
 positively covers their exact object/version, or a later complete root cut
@@ -679,7 +704,7 @@ rotated generation therefore replays neither the superseded prefix nor a
 partial suffix; a crash before publication leaves the old snapshot, rotated
 generation, and active suffix authoritative.
 
-Current checkpoints use snapshot storage schema 9 and checksummed streamed SOBJ
+Current checkpoints use snapshot storage schema 10 and checksummed streamed SOBJ
 records. The normal DFS reader accepts this schema only. The operation journal
 uses the independent V7 prepare/commit family.
 
@@ -690,6 +715,9 @@ source records. Output is synchronized before progress; restart discards only
 an uncheckpointed staging suffix. Installation compares the captured source
 generation and publishes a current candidate through native authority. Old
 records and proofs are conversion data and cannot grant publication authority.
+Migration validates original native9 alias digests with their released encoding.
+An old frame that omits required original comparisons remains unavailable until
+source custody can establish them; a current table lookup cannot supply them.
 An incompatible daemon must be upgraded before joining the current execution
 path. See [storage migrations](developer/storage-migrations.md) for shared
 storage ownership and durable progress contracts.
@@ -929,9 +957,9 @@ Replicated-eventual and replicated-confirmed writes use this logical sequence:
 6. Journal the hidden intent/receipt prepare in DFS metadata, including the
    namespace transaction when this is first publication.
 7. Replicate and verify that exact prepare on every configured metadata-shard
-   replica. If a member is unavailable, require the DFS recovery quorum and
-   commit an operation-bound cluster-Raft permit for the same digest, sequence,
-   assignment, and epoch.
+   participant. If a member is unavailable, leave publication pending or fail
+   within the existing budget; preserve the participant count and DFS-owned
+   evidence.
 8. Atomically compare the authority epoch, base version, intent state, and
    receipt threshold.
 9. Advance the visible version and schedule any remaining repair.
@@ -1100,9 +1128,10 @@ evidence does not authorize suppression of a repair.
 
 The serial metadata portion of one hot shard is expected to occupy roughly one
 core because its primary orders that shard's namespace and version decisions.
-The default root, services, and users shards have three distinct primaries and
-can therefore use about three aggregate metadata cores under independent lane
-writes. More host parallelism comes from additional shards and concurrent
+When initial placement distributes root, services, and users across three
+primaries, they can use about three aggregate metadata cores under independent
+lane writes. The committed assignments determine that distribution. More host
+parallelism comes from additional shards and concurrent
 writes, plus content hashing, replica transfer, and transport work; one metadata
 shard is not designed to consume every host CPU.
 
@@ -1137,7 +1166,7 @@ temporarily reconstruct the sharded router from those same instances in
 canonical shard order. Dropping either lease returns the instances without
 reopen or recovery. Physical store lifecycle has its own generation, separate
 from the complete configuration projection and exact authority fence. Committed
-placement/history/display changes and watermark/handoff proof updates apply to
+placement/history/display changes and handoff proof updates apply to
 the retained projection immediately and continue to fence authority, while
 retaining the same physical stores, service lanes and repair ownership. Their
 control-plane clients consume the new projection on their next configuration
@@ -1263,6 +1292,18 @@ adoption, recovery proceeds forward; it does not roll back an already visible
 destination into an ambiguous state. Authority changes are re-resolved on
 resume, and both sides validate current epochs.
 
+A running rename coordinator reads its source through explicit metadata query
+variants carrying the complete recorded job and selected source frame or page
+cursor. The receiver checks the authenticated coordinator against current shard
+configuration, the source shard and epoch, and the canonical source path within
+the job's footprint. Only that job's read reservation is excluded; public reads,
+other reservations and all mutation guards retain their normal checks. The
+queries return canonical physical source rows without falling back to an older
+ancestor-shard copy. These rows are input data, not source/job writer custody or
+publication authority; capture and binding still verify the exact native bodies
+under their actual writers. Peers that do not implement these query variants
+reject them and must be upgraded before participating in this protocol.
+
 ## POSIX Synchronization and Partition Fencing
 
 The canonical DFS synchronization contract distinguishes advisory file locks,
@@ -1289,34 +1330,27 @@ blocking requests. A stale token cannot release a lock granted in the new
 epoch. The locks remain advisory: clients that bypass the lock protocol are not
 made safe by the existence of a grant.
 
-A partitioned lock holder may finish an already certified canonical operation
-only while all of these remain true:
+A partitioned lock holder can complete a new canonical publication only through
+the current primary with fresh exact-prefix evidence from every assigned
+metadata participant, validated content receipts, the coherent configuration
+projection and the actual writer's generation and durable handoff fence. A
+cached sender cursor, advisory lock grant or content receipt cannot substitute
+for a missing metadata acknowledgement. An incomplete participant set leaves
+the operation pending or unavailable within the existing request budget; there
+is no ordinary KV-backed quorum fallback.
 
-1. every metadata shard touched by the operation is present at the certified
-   current journal prefix on the holder's component;
-2. all required content is present and hash-validated; and
-3. the operation's strong permit remains valid;
-4. before publication, the combined model consumes an abstract proof token for
-   the configured content-receipt threshold and metadata prepare quorum. The
-   focused sync model verifies that their bounded recovery sets intersect; the
-   atomic publication point then forms the failover-recoverable commit
-   certificate. A direct refinement mapping between the two models remains
-   future work.
+Handoff activation requires the retiring primary's durable freeze, the exact
+frozen prefix, both assignment majorities and both primary acknowledgements.
+After activation, the former primary's writer, locks and reservations remain
+fenced. If the successor lacks required committed content, it stays in an
+explicit `pending-repair` state and cannot serve stale bytes or accept dependent
+writes until repair validates the canonical object, version and hash. Local
+shard or content presence alone never grants publication authority.
 
-Shard or content presence alone never grants authority. With renewable permits,
-the quorum component waits through the old permit's fencing deadline before it
-activates a higher epoch. If the holder lacks any required state, it suspends
-immediately and cannot commit while waiting for that barrier. Once a quorum
-activates the higher epoch, it wins regardless of how many content shards are
-currently reachable on either side. The old lock and reservation are fenced.
-If the winner lacks the latest committed content, it remains in an explicit
-`pending-repair` state and cannot serve stale bytes or accept dependent writes
-until repair validates the canonical object, version, and hash.
-
-This rule permits a complete holder to finish a bounded operation before its
-permit expires without allowing it to race a new quorum authority. Allowing a
-minority holder to commit while a quorum can immediately activate another epoch
-would create two canonical histories and is forbidden.
+Earlier formal targets describe renewable permits and degraded publication.
+Those models do not establish the current full-participant Rust contract or
+authorize a minority component to publish. Evidence must identify the model
+revision and the implemented transition it actually checks.
 
 The synchronization barriers are:
 
@@ -1339,17 +1373,18 @@ Obsolete locks and abandoned internal reservations must not create protocol
 deadlock. Multi-shard reservations use deterministic acquisition order,
 destination-visible jobs recover forward, expired/fenced locks do not block the
 current epoch, and terminal jobs release their effective reservations. Eventual
-completion still assumes eventual logical-time advancement, a stable quorum, a
+completion still assumes eventual logical-time advancement, a stable assignment
+with all required metadata participants available, a
 validated source for committed content, and fair recovery scheduling.
 
-The Rust DFS implements a bounded refinement of the advisory-lock and sync
-slices. Whole-file `F_GETLK`, `F_SETLK`, and `F_SETLKW` route to the
+The advisory-lock and sync contract covers a bounded surface. Whole-file
+`F_GETLK`, `F_SETLK`, and `F_SETLKW` route to the
 stable object's metadata primary; lock aggregates are journaled, replicated to
 every committed shard member on the healthy path, epoch-fenced, leased,
 renewed by mounted clients, and moved atomically with a cross-shard object
-adoption. A partial metadata recovery quorum may complete only after publishing
-an exact operation-bound head watermark through cluster Raft. The watermark
-fences authority; it does not replace the DFS prefix or its acknowledgements.
+adoption. A partial metadata participant set cannot complete a new canonical
+lock mutation or sync barrier through a cluster-KV watermark. The complete
+assigned proof and actual DFS writer-generation fence remain required.
 Blocking waits run outside the FUSE dispatch lane, and exact close/cancel
 transitions plus finite leases keep abandoned waiters from becoming protocol
 deadlocks. Partial byte ranges remain unsupported, and a conflicting blocking
@@ -1403,12 +1438,12 @@ for that prefix. A completed placement plan can therefore certify the same bytes
 after the original write's replica set has retired. A lazy authority lane restores
 only that prefix's pending repair owner before waiting for missing receipts. The
 barrier collects a fresh acknowledgement of the complete canonical materialized
-metadata checkpoint at the exact journal head, and intersects that recovery set
-with the content holders. When every committed shard member acknowledges, the
-barrier returns without a KV transaction. If a member is unavailable but the
-existing metadata-recovery quorum and content intersection are satisfied, the
-exceptional path publishes one epoch- and fingerprint-bound metadata-head
-watermark through cluster Raft before returning.
+metadata checkpoint at the exact journal head and validates the required
+content holders. Every assigned metadata participant must acknowledge before
+an ordinary barrier completes. A missing member leaves sync pending or
+unavailable within its existing budget. No KV head watermark, barrier or
+operation receipt can replace that participant evidence. Joint membership
+handoff retains its separate exact prefix and retiring/desired majority proof.
 The checkpoint probe has a restart-unique identity and carries an empty journal
 batch, so a delayed reply cannot satisfy another attempt and a rolling-upgrade
 peer cannot skip its replay cursor. A persisted replication cursor alone is
@@ -1432,15 +1467,16 @@ response is retained independently, and late siblings are aborted and dropped
 at the budget. The blocking compatibility path has the same two-worker cap and
 returns at the budget; a foreign blocking call already entered may outlive that
 return, so a per-transport worker-slot bound prevents repeated calls from
-accumulating detached threads. Direct fan-out is only an accelerator: the DFS
-recovery quorum, Raft fence, and later catch-up retain correctness when a peer
-is slow or rejected.
+accumulating detached threads. Direct fan-out is only an accelerator:
+missing current participant evidence leaves the ordinary operation unfinished,
+while later catch-up can earn the same required proof.
 
-This is not yet a full refinement of the combined partition model. Rust can
-continue when the complete committed metadata shard acknowledges even if Raft
-is unavailable. When the complete shard does not acknowledge, the degraded
-path also requires cluster-Raft quorum; without either authorization, new
-grants, renewals, and sync completion fail or wait. Explicit caller-selected
+This is not yet a full refinement of the combined partition model. The selected
+contract permits progress when the complete assigned metadata shard
+acknowledges under its valid local generation even if KV is unavailable.
+Without the complete participant proof, new grants, renewals, publication and
+ordinary sync completion fail or wait. Older KV-assisted degraded results do
+not establish this participant-only contract. Explicit caller-selected
 durable sync ids, byte-range locks,
 application-level wait-cycle detection, open-unlinked lifetime, and directory
 open-handle identity remain target hardening. FUSE data I/O targets the
@@ -1828,9 +1864,11 @@ must not require unbounded scans in the foreground write path.
 
 Benchmarks and integration tests are the source of truth for supported scale and
 performance. Formal models cover authority, routing freshness, namespace
-publication, receipt policy, full-shard and cluster-quorum authorization,
-replica fan-out and response scheduling, repair authorization, content
-validation, and the single-visible-history invariant.
+publication, receipt policy, full-shard authorization, replica fan-out and
+response scheduling, repair authorization, content validation, and the
+single-visible-history invariant. Historical results for superseded
+KV-assisted recovery remain limited to their exact models and source; they
+are not proof of the current participant-only contract.
 Network-session framing and body
 attestation are implementation-tested rather than modeled by the DFS specs. See
 the [formal verification guide](formal/cluster-verification.md).

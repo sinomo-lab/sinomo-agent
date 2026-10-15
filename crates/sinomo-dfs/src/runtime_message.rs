@@ -290,6 +290,32 @@ impl Default for DfsDetachedSendRuntime {
     }
 }
 
+// Own the active flag before spawning, including cancellation before first poll.
+// A cancelled loop returns its actual prepared payloads to the same runtime;
+// the next normal schedule can replace its transport while preserving custody.
+struct DfsDeferredWorkerOwner {
+    runtime: Arc<DfsDetachedSendRuntime>,
+    worker: Option<crate::DfsNodeDetachedSendWorker>,
+}
+
+impl Drop for DfsDeferredWorkerOwner {
+    fn drop(&mut self) {
+        let mut schedule = self
+            .runtime
+            .worker_schedule
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(previous) = self.worker.take() {
+            if let Some(latest) = schedule.latest_worker.as_mut() {
+                latest.retain_prepared_calls_from(&previous);
+            } else {
+                schedule.latest_worker = Some(previous);
+            }
+        }
+        self.runtime.worker_active.store(false, Ordering::Release);
+    }
+}
+
 impl DfsDetachedSendRuntime {
     pub fn new() -> Self {
         Self {
@@ -372,22 +398,29 @@ impl DfsDetachedSendRuntime {
         }
         if start_worker {
             let runtime = Arc::clone(self);
+            let owner = DfsDeferredWorkerOwner {
+                runtime: Arc::clone(self),
+                worker: None,
+            };
             spawn(Box::pin(async move {
-                runtime.run_deferred_worker(retry_delay).await;
+                runtime.run_deferred_worker(retry_delay, owner).await;
             }));
         }
     }
 
-    async fn run_deferred_worker(self: Arc<Self>, retry_delay: Duration) {
-        let mut worker: Option<crate::DfsNodeDetachedSendWorker> = None;
+    async fn run_deferred_worker(
+        self: Arc<Self>,
+        retry_delay: Duration,
+        mut owner: DfsDeferredWorkerOwner,
+    ) {
         loop {
             let observed_generation = match self.worker_schedule.lock() {
                 Ok(mut schedule) => {
                     if let Some(mut latest_worker) = schedule.latest_worker.take() {
-                        if let Some(previous) = worker.as_ref() {
+                        if let Some(previous) = owner.worker.as_ref() {
                             latest_worker.retain_prepared_calls_from(previous);
                         }
-                        worker = Some(latest_worker);
+                        owner.worker = Some(latest_worker);
                     }
                     schedule.generation
                 }
@@ -396,7 +429,7 @@ impl DfsDetachedSendRuntime {
                     break;
                 }
             };
-            let Some(active_worker) = worker.as_ref() else {
+            let Some(active_worker) = owner.worker.as_ref() else {
                 break;
             };
             let mut attempt_worker = active_worker.clone();
@@ -464,7 +497,6 @@ impl DfsDetachedSendRuntime {
                 tokio::time::sleep(retry_delay).await;
             }
         }
-        self.worker_active.store(false, Ordering::Release);
     }
 
     #[cfg(test)]
@@ -927,10 +959,15 @@ pub(crate) fn dfs_runtime_message_uses_content_read_lane(command: &DfsMessageCom
     }
 }
 
+// Repair replies have no wire shard. Only the host that still owns the exact
+// original local call may supply their scoped admission; unpaired ingress keeps
+// its existing global scope and current intent/policy validation.
 pub(crate) fn dfs_runtime_message_supports_exact_service_lane(command: &DfsMessageCommand) -> bool {
     matches!(
         &command.routed_message.message,
-        DfsNetworkMessage::MetadataJournalBatch(_) | DfsNetworkMessage::MetadataSnapshotInstall(_)
+        DfsNetworkMessage::MetadataJournalBatch(_)
+            | DfsNetworkMessage::MetadataSnapshotInstall(_)
+            | DfsNetworkMessage::RepairReplicaResponse(_)
     ) || matches!(
         &command.routed_message.message,
         DfsNetworkMessage::NamespaceRequest(namespace) if namespace.authority_shards.len() == 1
@@ -1128,6 +1165,7 @@ pub(crate) fn execute_runtime_message_command_with_verified_fetch<F>(
     execution_scope: &crate::DfsMessageExecutionScope,
     verified_fetch: Option<crate::service_fetch_transfer::VerifiedDfsBlobFetch>,
     publication_owners: Option<Arc<crate::publication_guard::DfsPublicationExecutionOwners>>,
+    publication_provider: Option<Arc<crate::DfsPublicationExecutionProvider>>,
     completed_phase: Option<crate::source_adoption::CompletedRemoteNamespacePhase>,
     persist_repair_records: F,
 ) -> Result<DfsRuntimeMessageExecution, crate::DfsError>
@@ -1163,6 +1201,10 @@ where
     }
     let _publication_scope =
         publication_owners.map(|owners| service_lane.service.publication_execution.install(owners));
+    // Cached idle lanes must not pin the daemon's OS owner. The provider and
+    // actual admission remain together only for this synchronous execution.
+    let _publication_provider_scope = publication_provider
+        .map(|provider| service_lane.service.publication_provider.install(provider));
     service_lane.refresh_peer_targets(peer_node_ids);
     let resident_metadata_scope = service_lane.resident_metadata_scope.clone();
     let backend_checkout_started = std::time::Instant::now();

@@ -21,6 +21,20 @@ pub enum DfsMetadataSelection {
     CurrentObject {
         object_id: DfsObjectId,
     },
+    /// Read the physical source of an existing rename job. Only the current
+    /// authenticated job coordinator may use its own reservation for this read.
+    /// Unknown variants are rejected by older peers; no public-read fallback.
+    CurrentObjectForNamespaceJob {
+        job: Box<DfsNamespaceJobRecord>,
+        source_path: String,
+        object_id: DfsObjectId,
+    },
+    DirectoryPageForNamespaceJob {
+        job: Box<DfsNamespaceJobRecord>,
+        path: String,
+        after: Option<DfsDirectoryPageCursor>,
+        limit: usize,
+    },
     /// Canonical identity and live content-reference evidence in one snapshot.
     ObjectLifecycle {
         object_id: DfsObjectId,
@@ -114,7 +128,10 @@ pub(crate) fn query_backend_metadata<B: DfsMetadataBackend + ?Sized>(
     query: &DfsMetadataShardQuery,
 ) -> Result<DfsMetadataQueryResult, MetadataBackendError> {
     match &query.selection {
-        DfsMetadataSelection::DirectoryPage { path, after, limit } => {
+        DfsMetadataSelection::DirectoryPage { path, after, limit }
+        | DfsMetadataSelection::DirectoryPageForNamespaceJob {
+            path, after, limit, ..
+        } => {
             let path = crate::posix_path::normalize_posix_path(path)
                 .map_err(|error| MetadataBackendError::Serde(error.to_string()))?;
             if after
@@ -196,6 +213,21 @@ pub(crate) fn query_backend_metadata<B: DfsMetadataBackend + ?Sized>(
                     &mut object.current_locations,
                 )?;
             }
+            Ok(DfsMetadataQueryResult::CurrentObject {
+                object: object.map(Box::new),
+            })
+        }
+        DfsMetadataSelection::CurrentObjectForNamespaceJob {
+            object_id,
+            source_path,
+            ..
+        } => {
+            // Source capture compares the canonical physical row, including
+            // its original locations and tombstone provenance. A public read's
+            // derived receipt locations are not that immutable source body.
+            let object = backend.get_object(object_id)?.filter(|object| {
+                object.file_system_id == query.file_system_id && object.path == *source_path
+            });
             Ok(DfsMetadataQueryResult::CurrentObject {
                 object: object.map(Box::new),
             })
@@ -437,6 +469,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         query: &DfsMetadataShardQuery,
     ) -> Result<DfsMetadataShardResponse, DfsError> {
+        let requester = self.node_id.clone();
+        self.serve_metadata_query_for_requester(query, &requester)
+    }
+
+    pub(crate) fn serve_metadata_query_for_requester(
+        &mut self,
+        query: &DfsMetadataShardQuery,
+        requester: &NodeId,
+    ) -> Result<DfsMetadataShardResponse, DfsError> {
         if self.control_plane.is_some() {
             let context = self.namespace_execution.context().ok_or_else(|| {
                 error("history query requires an authenticated authority context")
@@ -456,6 +497,131 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if let DfsMetadataSelection::DirectoryPage { path, .. } = &query.selection {
             self.ensure_path_not_in_cross_shard_flight(&query.file_system_id, path)?;
         }
+        let coordinated_job = match &query.selection {
+            DfsMetadataSelection::CurrentObjectForNamespaceJob {
+                job,
+                source_path,
+                object_id,
+            } => {
+                let selected = job.pending_frames.iter().any(|frame| match frame {
+                    DfsNamespaceJobFrame::CrossShardAdopt {
+                        moved_object,
+                        old_path,
+                        ..
+                    } => moved_object.object_id == *object_id && old_path == source_path,
+                    DfsNamespaceJobFrame::CrossShardDirScan {
+                        source_path: parent,
+                        ..
+                    } => crate::posix_path::parent_posix_path(source_path).as_ref() == Some(parent),
+                    _ => false,
+                });
+                if !selected {
+                    return Err(error(
+                        "source query is outside its recorded namespace job frame",
+                    ));
+                }
+                Some((job.as_ref(), source_path.as_str()))
+            }
+            DfsMetadataSelection::DirectoryPageForNamespaceJob {
+                job, path, after, ..
+            } => {
+                if !job.pending_frames.iter().any(|frame| {
+                    matches!(frame,
+                    DfsNamespaceJobFrame::CrossShardDirScan { source_path, cursor, .. }
+                    if source_path == path && cursor == after)
+                }) {
+                    return Err(error(
+                        "source directory query differs from its recorded job cursor",
+                    ));
+                }
+                Some((job.as_ref(), path.as_str()))
+            }
+            _ => None,
+        };
+        let coordinated_scope = if let Some((job, source_path)) = coordinated_job {
+            let context = self.namespace_execution.context().ok_or_else(|| {
+                error("namespace job source read has no current authority context")
+            })?;
+            if job.job_id.is_empty()
+                || job.file_system_id != query.file_system_id
+                || job.status != DfsNamespaceJobStatus::Running
+                || !matches!(
+                    job.kind,
+                    DfsNamespaceJobKind::RenameObjectAcrossShardPrimaries
+                        | DfsNamespaceJobKind::RenameDirectoryAcrossShardPrimaries
+                )
+                || job.root_path == "/"
+                || crate::posix_path::normalize_posix_path(source_path)
+                    .ok()
+                    .as_deref()
+                    != Some(source_path)
+                || !crate::posix_path::posix_path_is_at_or_under_prefix(source_path, &job.root_path)
+                || crate::posix_path::normalize_posix_path(&job.root_path)
+                    .ok()
+                    .as_ref()
+                    != Some(&job.root_path)
+            {
+                return Err(error(
+                    "source read has no valid original Running rename job",
+                ));
+            }
+            let source = crate::select_metadata_shard_config_for_path_strict_default_sifs_split(
+                &query.file_system_id,
+                &context.shards,
+                source_path,
+            )?
+            .ok_or_else(|| error("namespace job source path has no current authority"))?;
+            if source.shard_id != query.shard_id.0
+                || source.epoch != query.epoch
+                || source.primary_node_id != self.node_id
+            {
+                return Err(error(
+                    "source read path does not match the current queried shard",
+                ));
+            }
+            let coordinator =
+                crate::select_metadata_shard_config_for_path_strict_default_sifs_split(
+                    &job.file_system_id,
+                    &context.shards,
+                    &job.root_path,
+                )?
+                .ok_or_else(|| {
+                    error("namespace job source read has no current coordinator shard")
+                })?;
+            if coordinator.primary_node_id != *requester {
+                return Err(error(
+                    "namespace job source read requires its authenticated current coordinator",
+                ));
+            }
+            Some((
+                job.job_id.as_str(),
+                DfsMetadataShardId::new(coordinator.shard_id),
+                job.root_path.as_str(),
+            ))
+        } else {
+            None
+        };
+        let ensure_read = |file_system_id: &DfsFileSystemId, path: &str| {
+            let Some(path_key) = crate::posix_path::normalized_posix_path_key(path) else {
+                return Ok(());
+            };
+            let exemption = coordinated_scope
+                .as_ref()
+                .map(|(id, shard, root)| (*id, shard, *root));
+            if self.cross_shard_namespace_locks.blocks_except_verified_job(
+                file_system_id,
+                &path_key,
+                exemption,
+            ) {
+                return Err(DfsError::Busy {
+                    path: path.to_owned(),
+                });
+            }
+            Ok(())
+        };
+        if let DfsMetadataSelection::DirectoryPageForNamespaceJob { path, .. } = &query.selection {
+            ensure_read(&query.file_system_id, path)?;
+        }
         let backend = self
             .metadata_backend
             .as_mut()
@@ -467,7 +633,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         match &result {
             DfsMetadataQueryResult::DirectoryPage { entries, .. } => {
                 for (object, _) in entries {
-                    self.ensure_object_not_in_cross_shard_flight(object)?;
+                    ensure_read(&object.file_system_id, &object.path)?;
                 }
             }
             DfsMetadataQueryResult::CurrentObject {
@@ -477,17 +643,23 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 object: Some(object),
                 ..
             } => {
-                self.ensure_object_not_in_cross_shard_flight(object)?;
+                ensure_read(&object.file_system_id, &object.path)?;
             }
             DfsMetadataQueryResult::Version {
                 descriptor: Some(descriptor),
-            } => self.ensure_object_not_in_cross_shard_flight(&descriptor.current_object)?,
+            } => ensure_read(
+                &descriptor.current_object.file_system_id,
+                &descriptor.current_object.path,
+            )?,
             DfsMetadataQueryResult::RevisionMetadata {
                 descriptor: Some(descriptor),
-            } => self.ensure_object_not_in_cross_shard_flight(&descriptor.current_object)?,
+            } => ensure_read(
+                &descriptor.current_object.file_system_id,
+                &descriptor.current_object.path,
+            )?,
             DfsMetadataQueryResult::RetainedRevisions { entries, .. } => {
                 for entry in entries {
-                    self.ensure_path_not_in_cross_shard_flight(
+                    ensure_read(
                         &entry.current_object.file_system_id,
                         &entry.current_object.path,
                     )?;

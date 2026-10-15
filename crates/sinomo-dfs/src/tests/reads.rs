@@ -592,10 +592,16 @@ fn local_primary_lightweight_reads_pin_one_metadata_generation() {
     let directory = "/lightweight-read-snapshot/deep";
     let path = "/lightweight-read-snapshot/deep/tiny.txt";
     let payload = b"resident metadata snapshot";
-    let (runtime, mut dfs) = native_sifs_service(
+    let (runtime, client) = native_sifs_service(
         "local_primary_lightweight_reads_pin_one_metadata_generation",
         node_id.clone(),
     );
+    drop(client);
+    // This probe measures the actual current primary's retained generation,
+    // rather than a public requester shell which delegates its writes to Main.
+    let mut dfs = runtime
+        .metadata_primary_service(path)
+        .expect("current primary");
     dfs.posix_mkdir_all(directory).expect("fixture directory");
     dfs.posix_write_file(
         path,
@@ -690,41 +696,72 @@ fn local_primary_lightweight_reads_pin_one_metadata_generation() {
 }
 
 #[test]
-fn put_local_object_version_from_reader_streams_to_content_store() {
-    let root = temp_root("put-local-object-version-from-reader");
+fn native_distributed_reader_streams_to_content_store() {
+    let name = "put-local-object-version-from-reader";
     let node_id = NodeId::from_legacy_named("node_stream_local_object").expect("node");
-    let object_id = DfsObjectId::from_legacy_named("obj_stream_local_object").expect("object");
-    let (_runtime, mut dfs) = native_sifs_service(
-        "put_local_object_version_from_reader_streams_to_content_store",
-        node_id.clone(),
-    );
-    let mut metadata = file_metadata(node_id);
-    metadata.object_id = object_id.clone();
-    metadata.path = "/services/streamed.bin".to_string();
+    let (runtime, client) = native_sifs_service(name, node_id.clone());
+    drop(client);
+    let path = "/services/streamed.bin";
+    let mut dfs = runtime
+        .metadata_primary_service(path)
+        .expect("actual current producer");
+    let base = dfs
+        .posix_write_file(
+            path,
+            b"reader predecessor",
+            DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
+        )
+        .expect("canonical recorded predecessor");
     let size = 256 * 1024 + 31;
     let reader = std::io::repeat(0x42).take(size);
-
-    let content_hash = dfs
-        .put_local_object_version_from_reader(metadata, reader)
-        .expect("stream object");
-
+    let request = DfsWriteRequest {
+        file_system_id: base.file_system_id,
+        object_id: base.object_id.clone(),
+        target_version: crate::namespace::next_version(&base.version),
+        requesting_node_id: node_id.clone(),
+    };
+    // Managed DFS publishes through its canonical native reader path. The
+    // local object-version helper intentionally accepts only standalone work.
+    let outcome = dfs
+        .write_distributed_reader_with_candidates(
+            request,
+            reader,
+            vec![node_id.clone()],
+            DfsReplicationPolicy::new(1, 1).expect("one actual holder"),
+            DfsDistributedWriteOptions::default(),
+        )
+        .expect("stream canonical native object");
+    let outcome = dfs
+        .settle_ready_write_outcome(outcome, true)
+        .expect("actual publication");
+    let NetworkedDfsWriteOutcome::Committed {
+        content_hash: streamed_hash,
+        ..
+    } = outcome
+    else {
+        panic!("canonical streamed object must commit");
+    };
     let object = dfs
-        .current_read_object_metadata(&object_id)
+        .current_read_object_metadata(&base.object_id)
         .expect("streamed object metadata");
-    assert_eq!(object.content_hash.as_deref(), Some(content_hash.as_str()));
+    assert_eq!(object.content_hash.as_deref(), Some(streamed_hash.as_str()));
     assert_eq!(object.content_size_bytes, Some(size));
-    let bytes = dfs.content.read_blob(&content_hash).expect("streamed blob");
+    let bytes = dfs
+        .content
+        .read_blob(&streamed_hash)
+        .expect("streamed blob");
     assert_eq!(bytes.len() as u64, size);
     assert!(bytes.iter().all(|byte| *byte == 0x42));
+    assert_eq!(streamed_hash, content_hash(&bytes));
     assert!(
-        std::fs::read_dir(root.join("content/staging"))
-            .expect("content staging")
+        std::fs::read_dir(runtime.data_dir(&node_id).dfs_dir().join("content/staging"))
+            .expect("actual content staging")
             .next()
             .is_none(),
-        "streaming local object writes must clean temporary staging files"
+        "streaming native object writes must clean temporary staging files"
     );
-
-    std::fs::remove_dir_all(root).ok();
+    drop(dfs);
+    runtime.close().expect("ordinary native close");
 }
 
 #[test]
@@ -2024,7 +2061,6 @@ fn read_current_object_range_uses_bounded_hash_addressed_blob_slice() {
 
 #[test]
 fn exact_size_local_prefix_read_does_not_rehash_content() {
-    let root = temp_root("local-prefix-read-rejects-corrupt-blob");
     let node_id = NodeId::from_legacy_named("node_local_prefix_corrupt").expect("node");
     let path = "/services/local-prefix-corrupt.txt";
     let bytes = vec![0x5a; 20 * 1024];
@@ -2036,12 +2072,18 @@ fn exact_size_local_prefix_read_does_not_rehash_content() {
         .posix_write_file(
             path,
             &bytes,
-            DfsWriteOptions::replicated_eventual(vec![node_id]),
+            DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
         )
         .expect("local file write");
     let hash = stat.content_hash.expect("committed content hash");
     let hex = hash.strip_prefix("blake3:").expect("blake3 hash");
-    let blob_path = root.join("content").join("blobs").join(&hex[..2]).join(hex);
+    let blob_path = _runtime
+        .data_dir(&node_id)
+        .dfs_dir()
+        .join("content")
+        .join("blobs")
+        .join(&hex[..2])
+        .join(hex);
     let mut corrupt_bytes = bytes.clone();
     corrupt_bytes[0] ^= 0xff;
     std::fs::write(&blob_path, &corrupt_bytes).expect("corrupt local blob in place");
@@ -2051,61 +2093,82 @@ fn exact_size_local_prefix_read_does_not_rehash_content() {
         .expect("ordinary prefix reads do not rehash content");
     assert_eq!(read.bytes, corrupt_bytes);
 
-    std::fs::remove_dir_all(root).ok();
+    drop(dfs);
+    _runtime.close().expect("ordinary native close");
 }
 
 #[test]
 fn stale_read_skips_missing_stale_blobs() {
-    let root = temp_root("read-stale-skips-missing-blob");
     let node_id = NodeId::from_legacy_named("node_stale_skip").expect("node");
-    let object_id = DfsObjectId::from_legacy_named("obj_stale_skip").expect("object");
-    let version_1 = DfsVersion::from_legacy_named("version_1").expect("version");
-    let version_2 = DfsVersion::from_legacy_named("version_2").expect("version");
-    let version_3 = DfsVersion::from_legacy_named("version_3").expect("version");
-    let (_runtime, mut dfs) =
+    let (runtime, client) =
         native_sifs_service("stale_read_skips_missing_stale_blobs", node_id.clone());
+    drop(client);
+    let path = "/services/stale-read-missing-blobs.bin";
+    let mut dfs = runtime
+        .metadata_primary_service(path)
+        .expect("actual current producer");
+    let options = DfsWriteOptions::replicated_eventual(vec![node_id.clone()]);
     let readable_stale_bytes = vec![b's'; 17 * 1024];
     let missing_stale_bytes = vec![b'm'; 17 * 1024];
+    let missing_current_bytes = vec![b'c'; 17 * 1024];
+    // Each version and its metadata head come from genuine native publication.
+    // No synthetic object row stands in for a sealed same-object predecessor.
     let readable_stale = dfs
-        .content
-        .put_object_version(
-            object_id.as_str(),
-            version_1.as_str(),
-            &readable_stale_bytes,
-        )
-        .expect("readable stale");
+        .posix_write_file(path, &readable_stale_bytes, options.clone())
+        .expect("readable stale publication");
     let missing_stale = dfs
-        .content
-        .put_object_version(object_id.as_str(), version_2.as_str(), &missing_stale_bytes)
-        .expect("missing stale");
-    let hex = missing_stale
+        .posix_write_file(path, &missing_stale_bytes, options.clone())
+        .expect("later stale publication");
+    let current = dfs
+        .posix_write_file(path, &missing_current_bytes, options)
+        .expect("current publication");
+    assert_ne!(readable_stale.version, missing_stale.version);
+    assert_ne!(missing_stale.version, current.version);
+    let readable_hash = readable_stale
         .content_hash
-        .strip_prefix("blake3:")
-        .expect("blake3 hash");
-    std::fs::remove_file(root.join("content").join("blobs").join(&hex[..2]).join(hex))
-        .expect("remove missing stale blob");
-    let mut metadata = file_metadata(node_id);
-    metadata.object_id = object_id.clone();
-    metadata.policy = DfsObjectPolicy::ReplicatedEventual;
-    metadata.version = version_3;
-    metadata.content_hash = Some(content_hash(b"unavailable current"));
-    metadata.content_size_bytes = Some(b"unavailable current".len() as u64);
-    dfs.add_object_metadata(metadata).expect("metadata");
-
+        .clone()
+        .expect("readable stale hash");
+    let missing_stale_hash = missing_stale
+        .content_hash
+        .clone()
+        .expect("missing stale hash");
+    let current_hash = current.content_hash.clone().expect("current hash");
+    // Normal publication may keep only hash-addressed bytes. Cache the exact
+    // genuinely published generations through the normal content store before
+    // exercising stale-manifest selection; this creates no metadata receipt.
+    for (stat, bytes, hash) in [
+        (&readable_stale, &readable_stale_bytes, &readable_hash),
+        (&missing_stale, &missing_stale_bytes, &missing_stale_hash),
+        (&current, &missing_current_bytes, &current_hash),
+    ] {
+        let manifest = dfs
+            .content
+            .put_object_version(stat.object_id.as_str(), stat.version.as_str(), bytes)
+            .expect("cache the exact published content generation");
+        assert_eq!(&manifest.content_hash, hash);
+        assert_eq!(manifest.size_bytes, bytes.len() as u64);
+    }
+    // All three payloads exceed the unchanged small-inline threshold. Inject
+    // real missing byte faults in this runtime's actual store only.
+    dfs.content
+        .debug_remove_loose_blob(&missing_stale_hash)
+        .expect("remove later stale bytes");
+    dfs.content
+        .debug_remove_loose_blob(&current_hash)
+        .expect("remove current bytes");
     let outcome = dfs
-        .read_local_object_with_state(&object_id, true)
+        .read_local_object_with_state(&readable_stale.object_id, true)
         .expect("stale read skips missing blob");
-
-    assert!(matches!(
-        outcome,
-        NetworkedDfsReadOutcome::Found {
-            data,
-            freshness: NetworkedDfsReadFreshness::Stale { .. },
-        } if data.version == version_1
-            && data.content_hash.as_deref() == Some(readable_stale.content_hash.as_str())
-            && data.bytes == readable_stale_bytes
-    ));
-    std::fs::remove_dir_all(root).ok();
+    assert!(
+        matches!(&outcome,
+        NetworkedDfsReadOutcome::Found { data, freshness: NetworkedDfsReadFreshness::Stale { .. } }
+            if data.version == readable_stale.version
+                && data.content_hash.as_deref() == Some(readable_hash.as_str())
+                && data.bytes == readable_stale_bytes),
+        "actual stale-read outcome: {outcome:?}"
+    );
+    drop(dfs);
+    runtime.close().expect("ordinary native close");
 }
 
 #[test]
@@ -2290,10 +2353,14 @@ fn sifs_posix_list_dir_page_preserves_transient_overlays_across_pages() {
     let node_id = NodeId::from_legacy_named("node_sifs_list_page_overlays").expect("node");
     let dir_path = "/services/sandbox/instances/sandbox_list_page_overlays/work";
 
-    let (_runtime, mut dfs) = native_sifs_service(
+    let (_runtime, client) = native_sifs_service(
         "sifs_posix_list_dir_page_preserves_transient_overlays_across_pages",
         node_id.clone(),
     );
+    drop(client);
+    let mut dfs = _runtime
+        .metadata_primary_service(dir_path)
+        .expect("actual primary overlay owner");
     dfs.posix_mkdir_all(dir_path).expect("mkdir");
     let mut persisted = Vec::new();
     for index in 0..5 {
@@ -2525,7 +2592,32 @@ fn sifs_cluster_posix_contract_stale_cache_current_read_invalidation() {
     let new = b"new current content".to_vec();
     let mut observations = Vec::new();
     sifs_cluster_routed_posix_write(&mut cluster, path, &old);
-    assert_eq!(cluster.writer.posix_read_file(path).expect("old read"), old);
+    let old_stat = cluster.writer.posix_stat_distributed(path).unwrap();
+    let received_old = cluster
+        .writer
+        .posix_read_file_distributed(path)
+        .expect("normal distributed old-version read");
+    assert_eq!(received_old, old);
+    assert_eq!(old_stat.content_hash, Some(content_hash(&received_old)));
+    let cached = cluster
+        .writer
+        .content
+        .put_object_version(
+            old_stat.object_id.as_str(),
+            old_stat.version.as_str(),
+            &received_old,
+        )
+        .expect("cache only the exact genuinely returned content generation");
+    assert_eq!(Some(cached.content_hash), old_stat.content_hash);
+    assert_eq!(
+        cluster
+            .writer
+            .content
+            .read_object_version(old_stat.object_id.as_str(), old_stat.version.as_str())
+            .unwrap()
+            .1,
+        old
+    );
     cluster
         .primary
         .posix_write_file(
@@ -2665,8 +2757,25 @@ fn exact_resident_hydration_replaces_only_its_shard_namespace_guards() {
         .find(|job| job.root_path == root_path && job.target_path.as_deref() == Some(root_target))
         .unwrap();
     assert_eq!(root_job.status, DfsNamespaceJobStatus::Running);
-    let mut probe = runtime.client(&services_primary).unwrap();
-    probe.hydrate_from_metadata_backend().unwrap();
+    // Pin only a private inspection view. The real services-node Root replica
+    // remains available to acknowledge every subsequent native publication.
+    let inspection_root = default_dfs_metadata_shards_root(runtime.data_dir(&services_primary));
+    let mut inspection = LocalShardedMetadataBackend::open_for_inspection(
+        &inspection_root,
+        runtime.metadata_shards().unwrap(),
+    )
+    .unwrap();
+    inspection
+        .shard_backend_mut(&DfsMetadataShardId::new("root"))
+        .unwrap()
+        .begin_inspection_snapshot()
+        .unwrap();
+    let mut probe = runtime
+        .client(&services_primary)
+        .unwrap()
+        .with_cross_shard_namespace_lock_registry(Default::default())
+        .with_boxed_metadata_backend_lazy(Box::new(inspection))
+        .unwrap();
     assert!(
         matches!(
             probe.ensure_path_not_in_cross_shard_flight(&fs, root_path),
@@ -2674,34 +2783,36 @@ fn exact_resident_hydration_replaces_only_its_shard_namespace_guards() {
         ),
         "the replica reconstructed its genuine Running root-shard job guard"
     );
-    // Retain that actual older replica prefix while the root owner completes.
-    // All healthy author/receiver outcomes still come from the normal runtime.
+    // Keep the older Root read image without suppressing any assigned
+    // participant's journal or snapshot route. Full native completion still
+    // requires all three real metadata replicas.
     runtime.clear_faults();
-    for (source, target) in [
-        (&root_primary, &services_primary),
-        (&services_primary, &root_primary),
-    ] {
-        for route in [
-            crate::DFS_METADATA_JOURNAL_BATCH_ROUTE,
-            crate::DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE,
-            crate::DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
-            crate::DFS_DATA_METADATA_SNAPSHOT_INSTALL_ROUTE,
-        ] {
-            runtime.install_fault(crate::test_support::DfsTestFaultRule {
-                source: Some(source.clone()),
-                target: Some(target.clone()),
-                route: Some(route.into()),
-                call_id: None,
-                origin: Some(crate::test_support::DfsTestRpcOrigin::RegisteredHost),
-                remaining_hits: 32,
-                action: crate::test_support::DfsTestFaultAction::BudgetExhausted,
-            });
-        }
-    }
     let completed = root
         .posix_resume_namespace_job_bounded(&root_job.job_id, 512)
         .unwrap();
     assert_eq!(completed.status, DfsNamespaceJobStatus::Completed);
+    // The job and its original failed routed request are separate durable
+    // lifetimes. Finish that SAME request before starting the Services case.
+    let replayed = root
+        .posix_rename_with_operation_id(root_path, root_target, &root_operation)
+        .unwrap();
+    assert_eq!(replayed.path, root_target);
+    let root_requests = runtime
+        .metadata_primary_service(root_path)
+        .unwrap()
+        .metadata_backend()
+        .unwrap()
+        .list_namespace_requests()
+        .unwrap();
+    assert!(
+        root_requests
+            .iter()
+            .filter(|request| matches!(&request.operation,
+        DfsNamespaceOperation::Rename { from, to } if from == root_path && to == root_target))
+            .all(|request| request.status == DfsNamespaceRequestStatus::Completed),
+        "the original Root request must not remain for background replay: {root_requests:?}"
+    );
+
     runtime.install_fault(crate::test_support::DfsTestFaultRule {
         source: Some(services_primary.clone()),
         target: Some(users_primary.clone()),
@@ -2728,6 +2839,9 @@ fn exact_resident_hydration_replaces_only_its_shard_namespace_guards() {
         })
         .unwrap();
     assert_eq!(services_job.status, DfsNamespaceJobStatus::Running);
+    // Refresh the private Services view while its Root inspection is pinned.
+    // Only actual durable job rows populate this non-authoritative guard cache.
+    probe.hydrate_file_systems_from_metadata_backend().unwrap();
     assert!(matches!(
         probe.ensure_path_not_in_cross_shard_flight(&fs, root_path),
         Err(DfsError::Busy { .. })
@@ -2743,12 +2857,29 @@ fn exact_resident_hydration_replaces_only_its_shard_namespace_guards() {
         .find(|config| config.shard_id == "root")
         .unwrap();
     let shard = DfsMetadataShardId::new(config.shard_id.clone());
-    let image = root
-        .metadata_backend()
-        .unwrap()
-        .export_shard_snapshot_image(&shard)
-        .unwrap()
+    // Main delegated the completion to its actual owner; its previously
+    // opened inspection backend is not that owner's new writer generation.
+    // Capture the complete native image from the fresh Core at a coherent cut.
+    let mut snapshot_owner = runtime.metadata_primary_service(root_path).unwrap();
+    assert_eq!(snapshot_owner.node_id(), &root_primary);
+    let backend = snapshot_owner.metadata_backend_mut().unwrap();
+    backend
+        .begin_consistent_read_snapshot_for_path(&fs, root_path)
         .unwrap();
+    let exported = (|| -> Result<_, MetadataBackendError> {
+        let actual = backend
+            .get_namespace_job(&root_job.job_id)?
+            .expect("actual completed Root namespace job at the export cut");
+        assert_eq!(actual.status, DfsNamespaceJobStatus::Completed);
+        let image = backend
+            .export_shard_snapshot_image(&shard)?
+            .expect("actual native Root image");
+        image.validate()?;
+        Ok(image)
+    })();
+    backend.end_consistent_read_snapshot_for_path(&fs, root_path);
+    let image = exported.unwrap();
+    drop(snapshot_owner);
     let command = DfsMetadataSnapshotInstallCommand {
         request_id: sinomo_core::Id::generate().to_string(),
         source_node_id: root_primary.clone(),
@@ -2773,10 +2904,58 @@ fn exact_resident_hydration_replaces_only_its_shard_namespace_guards() {
     assert_eq!(installed.request_id, command.request_id);
     assert_eq!(installed.next_after_sequence, command.next_after_sequence);
     assert_eq!(installed.shard_id, command.shard_id);
+    assert!(
+        matches!(
+            &installed.result,
+            DfsMetadataSnapshotInstallResult::Installed { .. }
+        ),
+        "actual native Root snapshot response {installed:?}; exported cut {:?}",
+        command.snapshot,
+    );
+    // Hydrate the exact Root inspection with the production resident-snapshot
+    // method. This pool wraps the real read-only native files, holds no writer
+    // lock, and never substitutes for the runtime's available receiver pool.
+    probe
+        .metadata_backend_mut()
+        .unwrap()
+        .end_consistent_read_snapshot_for_path(&fs, root_path);
+    let root_inspection = LocalShardedMetadataBackend::open_for_inspection(
+        &inspection_root,
+        runtime.metadata_shards().unwrap(),
+    )
+    .unwrap()
+    .into_resident();
+    let root_handle = root_inspection.scope_shard(&fs, &command.shard_id).unwrap();
+    let root_lease = root_handle.checkout().unwrap();
+    // A fresh Main opener would rebind Services while its genuine Running
+    // source-adoption job still owns writer custody. This private read-only
+    // projection reuses the already-live probe's actual transport and owner.
+    let mut exact_shell = NetworkedDfsService::new(
+        probe.transport.fork_read_only_request(),
+        probe.content.clone(),
+    );
+    exact_shell
+        .publication_provider
+        .clone_from(&probe.publication_provider);
+    let mut exact_probe = exact_shell
+        .with_resident_metadata_shard_backend_lazy(root_lease)
+        .unwrap()
+        .with_cross_shard_namespace_lock_registry(probe.cross_shard_namespace_lock_registry());
+    // Attach first, then share the stale private registry, so only this exact
+    // snapshot hydration is allowed to remove its old Root job guard.
     assert!(matches!(
-        installed.result,
-        DfsMetadataSnapshotInstallResult::Installed { .. }
+        exact_probe.ensure_path_not_in_cross_shard_flight(&fs, root_path),
+        Err(DfsError::Busy { .. })
     ));
+    assert!(matches!(
+        exact_probe.ensure_path_not_in_cross_shard_flight(&fs, services_path),
+        Err(DfsError::Busy { .. })
+    ));
+    exact_probe
+        .hydrate_lazy_exact_replica_after_snapshot_install()
+        .unwrap();
+    drop(exact_probe);
+    drop(root_inspection);
     probe
         .ensure_path_not_in_cross_shard_flight(&fs, root_path)
         .unwrap();
@@ -2806,12 +2985,42 @@ fn sifs_cluster_posix_contract_damaged_replica_under_concurrent_reads() {
     let new = vec![0x55; 64 * 1024];
     let old_hash = content_hash(&old);
     let mut observations = Vec::new();
+    let holders = vec![cluster.writer_node.clone(), cluster.primary_node.clone()];
+    let mut placement = DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 2).unwrap();
+    placement.required_node_ids = holders.clone();
+    placement.forbidden_node_ids = vec![cluster.observer_node.clone()];
+    cluster
+        ._runtime
+        .apply_placement_policy(
+            &cluster.primary_node,
+            path,
+            DfsPlacementScope::SelfOnly,
+            placement,
+        )
+        .unwrap();
+    // Open the ordinary requester after the committed policy change so its
+    // retained native projection describes this fixture's real holder contract.
+    cluster.writer = cluster._runtime.client(&cluster.writer_node).unwrap();
+    let (_, _, replication) = cluster
+        .writer
+        .managed_replication_policy_for_path(path, DfsObjectPolicy::ReplicatedEventual, 2)
+        .unwrap();
+    assert_eq!(replication.min_commit_replicas, 1);
+    assert_eq!(replication.desired_replicas, 2);
+    assert_eq!(
+        replication
+            .required_node_ids
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        holders.iter().cloned().collect()
+    );
     let initial_write = cluster.writer.posix_write_file(
         path,
         &old,
         DfsWriteOptions {
-            policy: DfsReplicationPolicy::new(1, 2).expect("policy"),
-            replica_candidates: vec![cluster.writer_node.clone(), cluster.primary_node.clone()],
+            policy: replication,
+            replica_candidates: holders.clone(),
             wait_for_commit: true,
             foreground_replica_repair: true,
         },
@@ -2854,12 +3063,103 @@ fn sifs_cluster_posix_contract_damaged_replica_under_concurrent_reads() {
             .posix_read_file(path)
             .is_ok_and(|bytes| bytes == old)
     });
-    cluster
+    // W1 makes the write visible before N2 necessarily has two physical copies.
+    // Freeze the actual old identity and earn the normal full content barrier
+    // before damaging a replica; control-plane placement alone is not a copy.
+    let old_target = cluster
         .writer
-        .content
+        .posix_capture_file_sync_target(path, DfsPosixSyncKind::File)
+        .expect("capture the actual old committed content identity");
+    assert_eq!(old_target.content_hash, old_hash);
+    let synced = cluster
+        .writer
+        .posix_sync_file_target(&old_target)
+        .expect("normal exact-version N2 content and metadata durability");
+    assert_eq!(synced.target, old_target);
+    assert_eq!(synced.content_evidence.required_receipts, 2);
+    assert_eq!(
+        synced
+            .content_evidence
+            .receipt_node_ids
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        holders.iter().cloned().collect()
+    );
+    let old_stat = cluster
+        .writer
+        .posix_stat_distributed(path)
+        .expect("actual old metadata after its full content barrier");
+    assert_eq!(old_stat.object_id, old_target.object_id);
+    assert_eq!(old_stat.version, old_target.version);
+    assert_eq!(old_stat.content_hash.as_deref(), Some(old_hash.as_str()));
+    assert_eq!(old_stat.size_bytes, Some(old.len() as u64));
+    assert_eq!(
+        old_stat
+            .current_locations
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        holders.iter().cloned().collect()
+    );
+    record_posix_observation(
+        &mut observations,
+        scenario,
+        "old-full-content-sync",
+        &cluster.writer_node,
+        path,
+        Instant::now(),
+        format!(
+            "intent={} receipt_nodes={:?}",
+            synced.content_evidence.intent_id, synced.content_evidence.receipt_node_ids
+        ),
+        Some(&old_stat),
+    );
+
+    let writer_store = crate::runtime_host::open_dfs_runtime_content_store(
+        cluster._runtime.data_dir(&cluster.writer_node),
+    )
+    .expect("actual writer native content store");
+    let primary_store = crate::runtime_host::open_dfs_runtime_content_store(
+        cluster._runtime.data_dir(&cluster.primary_node),
+    )
+    .expect("actual primary native content store");
+    for (node, store) in [
+        (&cluster.writer_node, &writer_store),
+        (&cluster.primary_node, &primary_store),
+    ] {
+        let actual = store.read_blob(&old_hash).unwrap_or_else(|error| {
+            panic!("actual old content on holder {node} is unavailable: {error}")
+        });
+        assert_eq!(actual.len(), old.len());
+        assert_eq!(content_hash(&actual), old_target.content_hash);
+        assert_eq!(actual, old);
+    }
+    assert_eq!(
+        cluster
+            .writer
+            .content
+            .read_blob(&old_hash)
+            .expect("requester content store matches its real native holder"),
+        old
+    );
+    writer_store
         .debug_remove_loose_blob(&old_hash)
-        .expect("damage writer blob");
-    cluster
+        .expect("damage the exact old writer-native payload");
+    assert!(
+        !writer_store
+            .has_blob(&old_hash)
+            .expect("writer old payload availability after damage")
+    );
+    assert_eq!(
+        primary_store
+            .read_blob(&old_hash)
+            .expect("primary old bytes survive writer damage"),
+        old
+    );
+    drop(writer_store);
+    drop(primary_store);
+    let new_head = cluster
         .primary
         .posix_write_file(
             path,
@@ -2867,12 +3167,91 @@ fn sifs_cluster_posix_contract_damaged_replica_under_concurrent_reads() {
             sifs_cluster_write_options(&cluster.primary_node.clone()),
         )
         .expect("primary concurrent overwrite");
-    sifs_cluster_publish_metadata_until(&mut cluster, "writer sees new metadata", |cluster| {
-        cluster
-            .writer
-            .posix_stat(path)
-            .is_ok_and(|stat| stat.content_hash.as_deref() == Some(content_hash(&new).as_str()))
-    });
+    assert_eq!(new_head.file_system_id, old_target.file_system_id);
+    assert_eq!(new_head.object_id, old_target.object_id);
+    assert_ne!(new_head.version, old_target.version);
+    assert_eq!(
+        new_head.content_hash.as_deref(),
+        Some(content_hash(&new).as_str())
+    );
+    assert_eq!(new_head.size_bytes, Some(new.len() as u64));
+    record_posix_observation(
+        &mut observations,
+        scenario,
+        "primary-overwrite-returned",
+        &cluster.primary_node,
+        path,
+        Instant::now(),
+        "returned",
+        Some(&new_head),
+    );
+
+    // A local client stat is not a current-head witness after another Main
+    // writer publishes. Use the normal routed lookup under the original 10s
+    // window, without treating transport/authority errors as retryable absence.
+    let previous_deadline = cluster.writer.transport.operation_deadline();
+    let read_deadline = Instant::now() + SIFS_CLUSTER_PUMP_DEADLINE;
+    cluster.writer.set_transport_operation_deadline(Some(
+        previous_deadline.map_or(read_deadline, |previous| previous.min(read_deadline)),
+    ));
+    let convergence = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        sifs_cluster_publish_metadata_until(
+            &mut cluster,
+            "writer current lookup sees exact new head",
+            |cluster| match cluster.writer.posix_stat_distributed(path) {
+                Ok(stat) => {
+                    stat.file_system_id == new_head.file_system_id
+                        && stat.object_id == new_head.object_id
+                        && stat.version == new_head.version
+                        && stat.content_hash == new_head.content_hash
+                        && stat.size_bytes == new_head.size_bytes
+                }
+                Err(DfsPosixError::NotFound { .. }) => false,
+                Err(error) => panic!("current-head lookup failed without a retry waiver: {error}"),
+            },
+        );
+    }));
+    cluster
+        .writer
+        .set_transport_operation_deadline(previous_deadline);
+
+    // Copy fresh physical DATA even on a convergence failure, then preserve the
+    // original panic. No physical read/cut is promoted to publication authority.
+    let physical_head = (|| -> Result<(
+        DfsMetadataShardConfig, Option<DfsObjectMetadata>, Option<crate::NativeHeldMetadataSnapshotV1>
+    ), String> {
+        let scope = crate::select_metadata_shard_config_for_path(&new_head.file_system_id,
+            &cluster._runtime.metadata_shards()?, path)
+            .map_err(|error| error.to_string())?.ok_or("new head has no actual metadata scope")?;
+        let owner = cluster._runtime.metadata_primary_service(path)?;
+        let backend = owner.metadata_backend().ok_or("fresh owning Core has no backend")?;
+        let row = backend.get_object_by_path(&new_head.file_system_id, path)
+            .map_err(|error| error.to_string())?;
+        let cut = backend.native_held_snapshot_for_scope(&scope.file_system_id,
+            &DfsMetadataShardId::new(scope.shard_id.clone()));
+        drop(owner);
+        Ok((scope, row, cut))
+    })();
+    if let Err(original_panic) = convergence {
+        eprintln!(
+            "damaged-read convergence failure DATA: primary_return={new_head:?}; local_client_stat={:?}; fresh_physical_head={physical_head:?}",
+            cluster.writer.posix_stat(path)
+        );
+        std::panic::resume_unwind(original_panic);
+    }
+    let (scope, row, cut) = physical_head.expect("fresh physical head inspection");
+    assert_eq!(scope.primary_node_id, cluster.primary_node);
+    let row = row.expect("actual new head is physically materialized");
+    let cut = cut.expect("actual new head's loaded physical cut");
+    assert_eq!(row.file_system_id, new_head.file_system_id);
+    assert_eq!(row.object_id, new_head.object_id);
+    assert_eq!(row.version, new_head.version);
+    assert_eq!(row.content_hash, new_head.content_hash);
+    assert_eq!(row.content_size_bytes, new_head.size_bytes);
+    assert!(
+        cut.tables.objects.contains(&row),
+        "the exact new row must belong to this actual Core cut"
+    );
     let read = {
         let primary = &mut cluster.primary;
         let writer = &mut cluster.writer;
@@ -2885,7 +3264,15 @@ fn sifs_cluster_posix_contract_damaged_replica_under_concurrent_reads() {
             },
         )
     };
-    let stat = cluster.writer.posix_stat(path).expect("writer stat");
+    let stat = cluster
+        .writer
+        .posix_stat_distributed(path)
+        .expect("writer current stat after read");
+    assert_eq!(stat.file_system_id, new_head.file_system_id);
+    assert_eq!(stat.object_id, new_head.object_id);
+    assert_eq!(stat.version, new_head.version);
+    assert_eq!(stat.content_hash, new_head.content_hash);
+    assert_eq!(stat.size_bytes, new_head.size_bytes);
     record_posix_observation(
         &mut observations,
         scenario,
@@ -3024,11 +3411,11 @@ fn sifs_cluster_distributed_read_refreshes_metadata_after_local_location_prune()
 fn sifs_non_replica_node_reads_converge_via_sync_pulls() {
     let cluster = sifs_outsider_cluster("sifs-outsider-sync-pull-reads");
     let SifsPosixCluster {
+        _runtime,
         root,
         primary_node,
         primary,
         mut observer,
-        _runtime,
         ..
     } = cluster;
 
@@ -3042,17 +3429,6 @@ fn sifs_non_replica_node_reads_converge_via_sync_pulls() {
             DfsWriteOptions::replicated_eventual(vec![primary_node.clone()]),
         )
         .expect("primary local write");
-
-    let stop_primary = Arc::new(AtomicBool::new(false));
-    let primary_stop = Arc::clone(&stop_primary);
-    let primary_thread = std::thread::spawn(move || {
-        let mut primary = primary;
-        while !primary_stop.load(Ordering::SeqCst) {
-            primary.process_incoming().expect("primary pump");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        primary
-    });
 
     // The outsider never received a journal push; the distributed stat must
     // pull the shard journal from the primary and surface the file.
@@ -3076,20 +3452,22 @@ fn sifs_non_replica_node_reads_converge_via_sync_pulls() {
         Err(DfsPosixError::NotFound { .. })
     ));
 
-    stop_primary.store(true, Ordering::SeqCst);
-    primary_thread.join().expect("primary thread");
-    drop(_runtime);
+    drop(primary);
+    drop(observer);
+    _runtime
+        .close()
+        .expect("normal Main and native owner drain");
 }
 
 #[test]
 fn sifs_non_replica_prefix_read_reuses_authoritative_metadata_for_remote_range() {
     let cluster = sifs_outsider_cluster("sifs-outsider-prefix-range-read");
     let SifsPosixCluster {
+        _runtime,
         root,
         primary_node,
         primary,
         mut observer,
-        _runtime,
         ..
     } = cluster;
 
@@ -3121,15 +3499,34 @@ fn sifs_non_replica_prefix_read_reuses_authoritative_metadata_for_remote_range()
         .posix_write_file(
             corrupt_path,
             &corrupt_source_bytes,
-            DfsWriteOptions::replicated_eventual(vec![primary_node]),
+            DfsWriteOptions::replicated_eventual(vec![primary_node.clone()]),
         )
         .expect("primary soon-corrupt file write");
-    let corrupt_hash = corrupt_stat.content_hash.expect("corrupt-file hash");
+    let corrupt_hash = corrupt_stat
+        .content_hash
+        .as_ref()
+        .expect("corrupt-file hash");
+    assert_eq!(corrupt_hash, &content_hash(&corrupt_source_bytes));
+    // Corrupt a genuinely readable recorded holder, not a legacy fixture
+    // directory or an assumed requester/primary content role.
+    let holder = corrupt_stat
+        .current_locations
+        .iter()
+        .find(|node| {
+            let store =
+                crate::runtime_host::open_dfs_runtime_content_store(_runtime.data_dir(node))
+                    .expect("actual native content store");
+            store
+                .read_blob(corrupt_hash)
+                .is_ok_and(|bytes| bytes == corrupt_source_bytes)
+        })
+        .expect("published content has an actual readable recorded holder");
     let corrupt_hex = corrupt_hash
         .strip_prefix("blake3:")
         .expect("blake3 corrupt-file hash");
-    let corrupt_blob_path = root
-        .join("primary")
+    let corrupt_blob_path = _runtime
+        .data_dir(holder)
+        .dfs_dir()
         .join("content")
         .join("blobs")
         .join(&corrupt_hex[..2])
@@ -3138,16 +3535,6 @@ fn sifs_non_replica_prefix_read_reuses_authoritative_metadata_for_remote_range()
     corrupted_bytes[0] ^= 0xff;
     std::fs::write(&corrupt_blob_path, &corrupted_bytes)
         .expect("corrupt primary blob without changing its size");
-
-    let stop_primary = Arc::new(AtomicBool::new(false));
-    let primary_stop = Arc::clone(&stop_primary);
-    let primary_thread = std::thread::spawn(move || {
-        while !primary_stop.load(Ordering::SeqCst) {
-            primary.process_incoming().expect("primary pump");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        primary
-    });
 
     let prefix = observer
         .posix_read_file_prefix_distributed(path, 23)
@@ -3188,9 +3575,67 @@ fn sifs_non_replica_prefix_read_reuses_authoritative_metadata_for_remote_range()
         .expect("remote complete ranges do not rehash stored content");
     assert_eq!(corrupt_read.bytes, corrupted_bytes);
 
-    stop_primary.store(true, Ordering::SeqCst);
-    primary_thread.join().expect("primary thread");
-    drop(_runtime);
+    drop(primary);
+    drop(observer);
+    _runtime
+        .close()
+        .expect("normal Main and native owner drain");
+}
+
+// One foreground window only. A late completion constructed before this cursor
+// cannot stand in for the read's newly constructed native carrier invocation.
+fn assert_fresh_replica_lookup_without_sync_pull(
+    runtime: &crate::test_runtime::DfsTestRuntime,
+    capture: &crate::test_runtime::NativeNamespaceReadCapture,
+    cursor: usize,
+    source: &NodeId,
+    primary: &NodeId,
+    path: &str,
+) {
+    use crate::test_runtime::{RpcOrigin, RpcPhase};
+
+    let records = capture.records();
+    assert!(records.iter().any(|record| {
+        record.source_node_id == *source
+            && record.target_node_id == *primary
+            && matches!(&record.message, DfsNetworkMessage::NamespaceRequest(request)
+                if request.file_system_id == sifs_file_system_id()
+                    && request.requesting_node_id == *source
+                    && !request.include_metadata_journal_batches
+                    && matches!(&request.operation, DfsNamespaceOperation::LookupPath { path: actual, .. } if actual == path))
+    }), "the actual Main owner must receive this reader's exact path lookup");
+    assert!(!records.iter().any(|record| {
+        record.source_node_id == *source
+            && matches!(&record.message, DfsNetworkMessage::NamespaceRequest(request)
+                if request.file_system_id == sifs_file_system_id()
+                    && matches!(&request.operation, DfsNamespaceOperation::SyncPath { path: actual } if actual == path))
+    }), "this read must not request journal catch-up for its path");
+
+    assert_eq!(runtime.observation_dropped_count(), 0);
+    let observations = runtime.rpc_observations();
+    let fresh = &observations[cursor..];
+    assert!(
+        fresh.iter().any(|constructed| {
+            constructed.source == *source
+                && constructed.target == *primary
+                && constructed.route == DFS_DATA_NAMESPACE_ROUTE
+                && constructed.origin == RpcOrigin::RegisteredHost
+                && constructed.phase == RpcPhase::Constructed
+                && [RpcPhase::BeforeDispatch, RpcPhase::Completed]
+                    .into_iter()
+                    .all(|phase| {
+                        fresh.iter().any(|event| {
+                            event.call_id == constructed.call_id
+                                && event.source == *source
+                                && event.target == *primary
+                                && event.route == DFS_DATA_NAMESPACE_ROUTE
+                                && event.origin == RpcOrigin::RegisteredHost
+                                && event.phase == phase
+                        })
+                    })
+        }),
+        "one native lookup call must be constructed, dispatched and completed after this read's cursor"
+    );
 }
 
 #[test]
@@ -3201,22 +3646,70 @@ fn sifs_replica_distributed_read_prefers_primary_over_stale_local_hit() {
     let new = b"primary current payload must win the distributed read".to_vec();
 
     sifs_cluster_routed_posix_write(&mut cluster, path, &old);
+    let old_stat = cluster
+        .writer
+        .posix_stat_distributed(path)
+        .expect("actual old authoritative metadata");
+    let old_bytes = cluster
+        .writer
+        .posix_read_file_distributed(path)
+        .expect("actual old distributed content");
+    assert_eq!(old_bytes, old);
     assert_eq!(
-        cluster
-            .writer
-            .posix_read_file(path)
-            .expect("writer old read"),
-        old
+        old_stat.content_hash.as_deref(),
+        Some(content_hash(&old_bytes).as_str())
     );
-
-    cluster
-        .primary
-        .posix_write_file(
-            path,
-            &new,
-            sifs_cluster_write_options(&cluster.primary_node.clone()),
+    let old_object = {
+        let owner = cluster
+            ._runtime
+            .metadata_primary_service(path)
+            .expect("actual old owning Core read service");
+        let object = owner
+            .metadata_backend()
+            .expect("actual old owning backend")
+            .get_object_by_path(&sifs_file_system_id(), path)
+            .expect("actual old path lookup")
+            .expect("actual published old object");
+        assert_eq!(object.object_id, old_stat.object_id);
+        assert_eq!(object.version, old_stat.version);
+        assert_eq!(object.content_hash, old_stat.content_hash);
+        assert_eq!(object.content_size_bytes, Some(old_bytes.len() as u64));
+        // Release the ordinary owner before the next Main publication.
+        drop(owner);
+        object
+    };
+    // Distributed reads deliberately do not cache. Bind only the real returned
+    // version and verified bytes in the normal content store, without metadata
+    // changes, replica receipts or a synthetic location.
+    let cached = cluster
+        .writer
+        .content
+        .put_object_version(
+            old_stat.object_id.as_str(),
+            old_stat.version.as_str(),
+            &old_bytes,
         )
-        .expect("primary overwrite");
+        .expect("cache genuine old content version");
+    assert_eq!(
+        Some(cached.content_hash.as_str()),
+        old_stat.content_hash.as_deref()
+    );
+    assert_eq!(cached.size_bytes, old_bytes.len() as u64);
+    let assert_opened_old_content = |writer: &NetworkedDfsService<DfsNodeTransport>| {
+        let NetworkedDfsReadOutcome::Found { data, .. } = writer
+            .read_object_metadata_local_content_with_state(&old_object, false)
+            .expect("read the genuine opened old identity from local content")
+        else {
+            panic!("the actual opened old content must remain locally readable");
+        };
+        assert_eq!(data.object_id, old_object.object_id);
+        assert_eq!(data.version, old_object.version);
+        assert_eq!(data.content_hash, old_object.content_hash);
+        assert_eq!(data.bytes, old);
+    };
+    assert_opened_old_content(&cluster.writer);
+
+    sifs_cluster_primary_posix_write(&mut cluster, path, &new);
     assert_eq!(
         cluster
             .primary
@@ -3224,85 +3717,129 @@ fn sifs_replica_distributed_read_prefers_primary_over_stale_local_hit() {
             .expect("primary new read"),
         new
     );
-    assert_eq!(
-        cluster
-            .writer
-            .posix_read_file(path)
-            .expect("writer stale read"),
-        old,
-        "test setup must leave a stale local live entry on the writer"
-    );
+    // The current public path view may advance. The stale-hit witness is the
+    // exact previously opened metadata identity and its actual local bytes,
+    // independent of any client-local path projection.
+    assert_opened_old_content(&cluster.writer);
 
-    let read = {
-        let primary = &mut cluster.primary;
-        let writer = &mut cluster.writer;
-        sifs_cluster_blocking_distributed_read_with_pump(
-            writer,
-            path,
-            "replica current read prefers primary object",
-            || {
-                primary.process_incoming().expect("primary pump");
-            },
-        )
-    };
+    let capture = cluster
+        ._runtime
+        .capture_namespace_requests(&cluster.primary_node, 32)
+        .expect("actual primary namespace request window");
+    let cursor = cluster._runtime.rpc_observations().len();
+    let read = cluster
+        .writer
+        .posix_read_file_distributed(path)
+        .expect("replica current read prefers primary object");
     assert_eq!(
         read, new,
         "distributed/current reads must prefer the shard primary over a stale replica-local hit"
     );
+    assert_fresh_replica_lookup_without_sync_pull(
+        &cluster._runtime,
+        &capture,
+        cursor,
+        &cluster.writer_node,
+        &cluster.primary_node,
+        path,
+    );
 
-    drop(cluster);
+    let SifsPosixCluster {
+        _runtime,
+        primary,
+        writer,
+        observer,
+        ..
+    } = cluster;
+    drop(primary);
+    drop(writer);
+    drop(observer);
+    _runtime
+        .close_with_namespace_capture(capture)
+        .expect("normal Main and native owner drain with complete namespace coverage");
 }
 
 #[test]
 fn sifs_replica_read_miss_queries_primary_without_pulling_metadata() {
-    let cluster = sifs_posix_cluster("sifs-replica-read-no-sync-pull", "/users");
-    let SifsPosixCluster {
-        root,
-        primary_node,
-        mut primary,
-        mut observer,
-        _runtime,
-        ..
-    } = cluster;
+    let mut cluster = sifs_posix_cluster("sifs-replica-read-no-sync-pull", "/users");
     let path = "/users/replica-read-no-sync.txt";
     let bytes = b"replica reads query primary without local metadata writes".to_vec();
-    primary
-        .posix_write_file(
-            path,
-            &bytes,
-            DfsWriteOptions::replicated_eventual(vec![primary_node.clone()]),
-        )
-        .expect("primary local write");
+    sifs_cluster_primary_posix_write(&mut cluster, path, &bytes);
+    let SifsPosixCluster {
+        _runtime,
+        primary_node,
+        observer_node,
+        primary,
+        mut observer,
+        ..
+    } = cluster;
 
-    let stop_primary = Arc::new(AtomicBool::new(false));
-    let primary_stop = Arc::clone(&stop_primary);
-    let primary_thread = std::thread::spawn(move || {
-        let mut primary = primary;
-        while !primary_stop.load(Ordering::SeqCst) {
-            primary.process_incoming().expect("primary pump");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        primary
-    });
-
+    let selected = crate::select_metadata_shard_config_for_path(
+        &sifs_file_system_id(),
+        &_runtime
+            .metadata_shards()
+            .expect("actual current configuration"),
+        path,
+    )
+    .expect("actual path assignment")
+    .expect("assigned physical shard");
+    assert_eq!(selected.primary_node_id, primary_node);
+    assert!(selected.replica_node_ids.contains(&observer_node));
+    assert!(
+        matches!(
+            observer.posix_read_file(path),
+            Err(DfsPosixError::NotFound { .. })
+        ),
+        "the reader must genuinely miss local content before the distributed read"
+    );
+    let shard = DfsMetadataShardId::new(selected.shard_id.clone());
+    // Normal read-only lookup loads the exact physical scope. The held capture
+    // below performs no IO and cannot initialize another shard.
+    observer
+        .metadata_backend()
+        .expect("actual reader backend")
+        .get_object_by_path_on_shard(&shard, &selected.file_system_id, path)
+        .expect("actual replica path lookup");
+    let before = observer
+        .metadata_backend()
+        .expect("actual reader backend")
+        .native_held_snapshot_for_scope(&selected.file_system_id, &shard)
+        .expect("the local read loaded the actual assigned shard");
+    let capture = _runtime
+        .capture_namespace_requests(&primary_node, 32)
+        .expect("actual primary namespace request window");
+    let cursor = _runtime.rpc_observations().len();
     assert_eq!(
         observer
             .posix_read_file_distributed(path)
             .expect("replica miss queries primary and fetches content"),
         bytes
     );
-    assert!(
-        matches!(
-            observer.posix_stat(path),
-            Err(DfsPosixError::NotFound { .. })
-        ),
-        "distributed reads on a configured replica must not pull and replay metadata"
+    let after = observer
+        .metadata_backend()
+        .expect("same reader backend")
+        .native_held_snapshot_for_scope(&selected.file_system_id, &shard)
+        .expect("same held assigned shard after the read");
+    assert_eq!(
+        serde_json::to_value(&after).expect("actual after held view"),
+        serde_json::to_value(&before).expect("actual before held view"),
+        "distributed reads must not replay metadata into the reader's backend"
     );
-
-    stop_primary.store(true, Ordering::SeqCst);
-    primary_thread.join().expect("primary thread");
-
-    drop(_runtime);
+    assert_fresh_replica_lookup_without_sync_pull(
+        &_runtime,
+        &capture,
+        cursor,
+        &observer_node,
+        &primary_node,
+        path,
+    );
+    // A routed lookup may expose an in-memory object. posix_stat is therefore
+    // not a witness of physical replay or of physical namespace absence.
+    drop(primary);
+    drop(observer);
+    _runtime
+        .close_with_namespace_capture(capture)
+        .expect("normal Main and native owner drain with complete namespace coverage");
 }
 
 #[test]
@@ -3318,13 +3855,57 @@ fn native_replica_read_recovers_after_an_actual_content_location_is_lost() {
     runtime.start_nodes().unwrap();
     let path = "/native-lost-read-location.bin";
     let bytes = vec![0x72; 32 * 1024];
+    let mut placement = DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 2, 2).unwrap();
+    placement.required_node_ids = vec![nodes[0].clone(), nodes[1].clone()];
+    let accepted = runtime
+        .apply_placement_policy(&nodes[0], path, DfsPlacementScope::SelfOnly, placement)
+        .unwrap();
+    let control = runtime.shared_control_plane().unwrap();
+    let setup_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    loop {
+        let job = control
+            .with_client(|kv| {
+                DfsControlPlaneStore::new(kv.as_mut())
+                    .placement_reconciliation(&accepted.file_system_id, &accepted.job_id)
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.accepted_config, accepted.accepted_config);
+        assert_eq!(job.scanned_object_count, 0);
+        assert!(job.last_error.is_none());
+        if job.state == DfsPlacementReconciliationState::Completed {
+            break;
+        }
+        let remaining = setup_deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "actual empty-path Apply must finish within its existing network budget"
+        );
+        runtime
+            .maintenance_tick(&nodes[0], remaining)
+            .unwrap()
+            .outcome
+            .unwrap();
+    }
+    drop(control);
     let mut primary = runtime.client(&nodes[0]).unwrap();
+    let (_, _, policy) = primary
+        .managed_replication_policy_for_path(path, DfsObjectPolicy::ReplicatedEventual, 2)
+        .unwrap();
+    assert_eq!(
+        policy
+            .required_node_ids
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([nodes[0].clone(), nodes[1].clone()])
+    );
     let stat = primary
         .posix_write_file(
             path,
             &bytes,
             DfsWriteOptions {
-                policy: DfsReplicationPolicy::new(2, 2).unwrap(),
+                policy,
                 replica_candidates: vec![nodes[0].clone(), nodes[1].clone()],
                 wait_for_commit: true,
                 foreground_replica_repair: true,
@@ -3336,12 +3917,23 @@ fn native_replica_read_recovers_after_an_actual_content_location_is_lost() {
         .unwrap();
     drop(primary);
     let missing = runtime.client(&nodes[1]).unwrap();
-    missing
-        .content
-        .debug_remove_loose_blob(stat.content_hash.as_deref().unwrap())
-        .unwrap();
+    let hash = stat.content_hash.as_deref().unwrap();
+    assert_eq!(
+        missing.content().read_blob(hash).unwrap(),
+        bytes,
+        "the selected replica really holds the original 32KiB payload"
+    );
+    missing.content().debug_remove_loose_blob(hash).unwrap();
+    assert!(
+        missing.content().open_blob_stream(hash).is_err(),
+        "the actual selected replica storage path is unavailable"
+    );
     drop(missing);
     let mut observer = runtime.client(&nodes[2]).unwrap();
+    assert!(
+        !observer.content().has_blob(hash).unwrap(),
+        "the reader starts without a local copy"
+    );
     let shard = DfsMetadataShardId::new(runtime.root_shard().unwrap().shard_id);
     let before = observer
         .metadata_backend()

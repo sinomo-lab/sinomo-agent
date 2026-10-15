@@ -331,11 +331,15 @@ fn dfs_network_message_execution_scope(message: &DfsNetworkMessage) -> DfsMessag
                 command.operation,
                 DfsNamespaceOperation::Unlink { .. }
                     | DfsNamespaceOperation::ConditionalUnlink { .. }
+                    | DfsNamespaceOperation::Rename { .. }
+                    | DfsNamespaceOperation::ConditionalRename { .. }
             ) =>
         {
-            // Canonical unlink may promote a hardlink from another physical
-            // shard. Its one path stamp cannot prove that complete footprint;
-            // use the existing all-shard coordinator shell to discover it.
+            // Unlink and rename can mutate a hardlink's canonical inode on
+            // another physical shard, even when both rename paths share one
+            // primary. Path stamps do not prove that complete footprint; the
+            // existing all-shard coordinator discovers the actual inode and
+            // retains the separate canonical fence and alias comparisons.
             DfsMessageExecutionScope::GlobalExclusive
         }
         DfsNetworkMessage::NamespaceRequest(command)
@@ -868,11 +872,47 @@ mod tests {
             },
         }));
 
+        let DfsNetworkMessage::NamespaceRequest(namespace) = &command.routed_message.message else {
+            panic!("actual namespace command");
+        };
+        assert_eq!(
+            namespace.operation.involved_paths(),
+            ["/source/file", "/destination/file"]
+        );
         assert_eq!(
             dfs_message_execution_scope(&command),
+            DfsMessageExecutionScope::GlobalExclusive,
+            "rename path enumeration does not include a hardlink's canonical inode",
+        );
+
+        let mkdir_all = |authority_shards| {
+            message_command(DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
+                request_id: "scope-mkdir-all".into(),
+                file_system_id: file_system_id.clone(),
+                requesting_node_id: node_id("scope-source"),
+                include_metadata_journal_batches: false,
+                metadata_journal_after_sequences: Vec::new(),
+                authority_shards,
+                operation: DfsNamespaceOperation::MkdirAll {
+                    path: "/services/new/deep".into(),
+                },
+            }))
+        };
+        assert_eq!(
+            dfs_message_execution_scope(&mkdir_all(Vec::new())),
             DfsMessageExecutionScope::NamespacePaths {
+                file_system_id: file_system_id.clone(),
+                paths: vec!["/services/new/deep".into()],
+            }
+        );
+        assert_eq!(
+            dfs_message_execution_scope(&mkdir_all(vec![authority_shard(
+                &file_system_id,
+                "services"
+            )])),
+            DfsMessageExecutionScope::ExactShard {
                 file_system_id,
-                paths: vec!["/source/file".to_string(), "/destination/file".to_string()],
+                shard_id: DfsMetadataShardId::new("services"),
             }
         );
 
@@ -1002,11 +1042,28 @@ mod tests {
                     version: version("scope-canonical-version"),
                 },
             },
+            DfsNamespaceOperation::Rename {
+                from: "/services/existing".into(),
+                to: "/services/renamed".into(),
+            },
+            DfsNamespaceOperation::ConditionalRename {
+                from: "/services/existing".into(),
+                to: "/services/renamed".into(),
+                expected_source: crate::DfsNamespaceObjectPrecondition {
+                    object_id: object_id("scope-canonical-object"),
+                    version: version("scope-canonical-version"),
+                },
+                expected_destination: crate::DfsNamespaceDestinationPrecondition::Absent,
+            },
         ] {
-            for authority_shards in [Vec::new(), vec![shard.clone()]] {
-                let unlink =
+            for authority_shards in [
+                Vec::new(),
+                vec![shard.clone()],
+                vec![shard.clone(), authority_shard(&file_system_id, "root")],
+            ] {
+                let canonical_mutation =
                     message_command(DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
-                        request_id: "scope-canonical-unlink".into(),
+                        request_id: "scope-canonical-mutation".into(),
                         file_system_id: file_system_id.clone(),
                         requesting_node_id: node_id("scope-source"),
                         include_metadata_journal_batches: false,
@@ -1015,11 +1072,11 @@ mod tests {
                         operation: operation.clone(),
                     }));
                 assert_eq!(
-                    dfs_message_execution_scope(&unlink),
+                    dfs_message_execution_scope(&canonical_mutation),
                     DfsMessageExecutionScope::GlobalExclusive,
-                    "a path stamp cannot exclude an alias in another physical shard"
+                    "path stamps cannot exclude a canonical inode in another physical shard"
                 );
-                assert!(!dfs_message_is_read_only_request(&unlink));
+                assert!(!dfs_message_is_read_only_request(&canonical_mutation));
             }
         }
 

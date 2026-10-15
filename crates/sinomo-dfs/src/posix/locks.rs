@@ -31,9 +31,9 @@ const POSIX_LOCK_REMOTE_RESPONSE_MARGIN: Duration = Duration::from_secs(1);
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// Apply one idempotent advisory-lock command to the stable object visible
     /// at `path`. The current metadata primary durably prepares the resulting
-    /// lock journal prefix in DFS. Visibility requires either exact
-    /// acknowledgement by the complete shard or the DFS recovery quorum plus
-    /// an operation-bound cluster-Raft permit.
+    /// lock journal prefix in DFS. Visibility requires exact acknowledgement
+    /// by every configured metadata participant; a KV quorum or permit cannot
+    /// replace a missing shard member.
     pub fn posix_advisory_lock(
         &mut self,
         path: &str,
@@ -193,70 +193,85 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // exact-prefix barrier below is the authorization point: every
         // configured shard member must acknowledge the operation.
         let authority_epoch = self.local_metadata_owner_epoch_hint_for_object(&object)?;
-        let context = DfsAdvisoryLockTransitionContext {
-            authority_epoch,
-            now_unix_nanos: dfs_now_unix_nanos(),
-            lease_duration_nanos: DEFAULT_DFS_ADVISORY_LOCK_LEASE
-                .as_nanos()
-                .min(u64::MAX as u128) as u64,
-            max_clock_skew_nanos: DEFAULT_DFS_ADVISORY_LOCK_MAX_CLOCK_SKEW
-                .as_nanos()
-                .min(u64::MAX as u128) as u64,
-        };
         let scope = self.metadata_effect_scope_for_object(
             &object,
             format!("advisory-lock:{}", sinomo_core::Id::generate()),
         )?;
         let _execution = self.acquire_prepared_execution(&scope)?;
-        let backend = self.metadata_backend.as_ref().ok_or_else(|| {
+        let backend = self.metadata_backend.as_mut().ok_or_else(|| {
             DfsPosixError::Dfs(DfsError::Metadata {
                 message: "distributed advisory locks require current durable metadata".into(),
             })
         })?;
-        let before = backend
-            .export_shard_table_snapshot(&scope.shard_id)?
-            .ok_or_else(|| {
+        // The prefix, lock aggregate and anchor predicates must describe one
+        // refreshed immutable cut. A different local handle may have published
+        // since this handle's last export; mixing that export with fresh point
+        // reads creates a stale preparation even without concurrent mutation.
+        backend.begin_consistent_read_snapshot_for_path(&object.file_system_id, &object.path)?;
+        let plan: Result<_> = (|| {
+            let context = DfsAdvisoryLockTransitionContext {
+                authority_epoch,
+                now_unix_nanos: dfs_now_unix_nanos(),
+                lease_duration_nanos: DEFAULT_DFS_ADVISORY_LOCK_LEASE
+                    .as_nanos()
+                    .min(u64::MAX as u128) as u64,
+                max_clock_skew_nanos: DEFAULT_DFS_ADVISORY_LOCK_MAX_CLOCK_SKEW
+                    .as_nanos()
+                    .min(u64::MAX as u128) as u64,
+            };
+            let before = backend
+                .export_shard_table_snapshot(&scope.shard_id)?
+                .ok_or_else(|| {
+                    DfsPosixError::Dfs(DfsError::Metadata {
+                        message: "advisory-lock publication has no exact current shard cut".into(),
+                    })
+                })?;
+            let existing =
+                backend.get_advisory_lock_state(&object.file_system_id, &object.object_id)?;
+            let transition = crate::transition_advisory_lock_state(
+                existing.as_ref(),
+                &object.file_system_id,
+                &object.object_id,
+                context,
+                &command,
+            )
+            .map_err(|error| {
                 DfsPosixError::Dfs(DfsError::Metadata {
-                    message: "advisory-lock publication has no exact current shard cut".into(),
+                    message: error.to_string(),
                 })
             })?;
-        let existing =
-            backend.get_advisory_lock_state(&object.file_system_id, &object.object_id)?;
-        let transition = crate::transition_advisory_lock_state(
-            existing.as_ref(),
-            &object.file_system_id,
-            &object.object_id,
-            context,
-            &command,
-        )
-        .map_err(|error| {
-            DfsPosixError::Dfs(DfsError::Metadata {
-                message: error.to_string(),
-            })
-        })?;
-        if transition.changed {
-            let current = backend.get_object_on_shard(&scope.shard_id, &object.object_id)?;
-            let occupant = backend.get_object_by_path_on_shard(
-                &scope.shard_id,
-                &object.file_system_id,
-                &object.path,
-            )?;
-            let mut payload = crate::DfsPreparedOperationPayload::for_metadata_effects(
-                scope.clone(),
-                vec![crate::DfsNamespaceObjectVersionExpectation {
-                    object_id: object.object_id.clone(),
-                    expected_version: current.map(|row| row.version),
-                }],
-                vec![crate::DfsNamespacePathOccupantExpectation {
-                    path: object.path.clone(),
-                    expected_object_id: occupant.map(|row| row.object_id),
-                }],
-                vec![crate::DfsPreparedMetadataEffect::PutAdvisoryLockState {
-                    state: transition.state,
-                }],
-                time::OffsetDateTime::now_utc(),
-            )?;
-            payload.expected_journal_sequence = Some(before.prefix_proof.journal_sequence);
+            let payload = if transition.changed {
+                let current = backend.get_object_on_shard(&scope.shard_id, &object.object_id)?;
+                let occupant = backend.get_object_by_path_on_shard(
+                    &scope.shard_id,
+                    &object.file_system_id,
+                    &object.path,
+                )?;
+                let mut payload = crate::DfsPreparedOperationPayload::for_metadata_effects(
+                    scope.clone(),
+                    vec![crate::DfsNamespaceObjectVersionExpectation {
+                        object_id: object.object_id.clone(),
+                        expected_version: current.map(|row| row.version),
+                    }],
+                    vec![crate::DfsNamespacePathOccupantExpectation {
+                        path: object.path.clone(),
+                        expected_object_id: occupant.map(|row| row.object_id),
+                    }],
+                    vec![crate::DfsPreparedMetadataEffect::PutAdvisoryLockState {
+                        state: transition.state,
+                    }],
+                    time::OffsetDateTime::now_utc(),
+                )?;
+                payload.expected_journal_sequence = Some(before.prefix_proof.journal_sequence);
+                Some(payload)
+            } else {
+                None
+            };
+            Ok((transition.outcome, payload))
+        })();
+        backend.end_consistent_read_snapshot_for_path(&object.file_system_id, &object.path);
+        let (outcome, payload) = plan?;
+        if let Some(payload) = payload {
             self.publish_prepared_operation(payload)?;
         }
         let applied_shard_id = scope.shard_id;
@@ -288,7 +303,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }));
         }
         self.sync_metadata_shard_to_quorum(&metadata_target, timeout)?;
-        let mut outcome = transition.outcome;
+        let mut outcome = outcome;
         observe_advisory_lock_outcome_at(&mut outcome, dfs_now_unix_nanos());
         Ok(outcome)
     }
@@ -605,31 +620,101 @@ mod tests {
     }
 
     #[test]
-    fn clustered_lock_partial_shard_uses_operation_bound_quorum_fallback() {
+    fn clustered_lock_waits_for_all_metadata_replicas_without_kv_fallback() {
         let nodes = DfsTestRuntime::ordered_node_ids("lock-partial-shard", 3);
         let primary = nodes[0].clone();
         let replica_a = nodes[1].clone();
         let replica_b = nodes[2].clone();
-        let (runtime, mut service, object, txn_calls) =
-            clustered_lock_fixture(primary, vec![replica_a.clone(), replica_b], vec![replica_a]);
-
+        let (mut runtime, mut service, object, txn_calls) = clustered_lock_fixture(
+            primary,
+            vec![replica_a.clone(), replica_b.clone()],
+            vec![replica_a],
+        );
+        let command = DfsAdvisoryLockCommand::Acquire {
+            request_id: DfsAdvisoryLockRequestId::new("fallback-acquire"),
+            session_id: DfsAdvisoryLockSessionId::new("fallback-session"),
+            mode: DfsAdvisoryLockMode::Exclusive,
+            blocking: false,
+            process_id: Some(8),
+        };
+        let error = service
+            .posix_apply_advisory_lock_local(
+                &object.path,
+                &object.object_id,
+                &command,
+                Duration::from_secs(5),
+            )
+            .expect_err("two acknowledgements cannot publish a three-member lock grant");
+        assert!(
+            matches!(
+                error,
+                DfsPosixError::Dfs(DfsError::MetadataRecoveryQuorumUnavailable {
+                    required: 3,
+                    verified: 2,
+                    ..
+                })
+            ),
+            "{error}"
+        );
+        assert_eq!(txn_calls.txn_calls(), 0);
+        let backend = service.metadata_backend().unwrap();
+        assert!(
+            backend
+                .get_advisory_lock_state(&object.file_system_id, &object.object_id)
+                .unwrap()
+                .is_none()
+        );
+        let pending = backend.list_prepared_operations().unwrap().into_iter().filter(|record| {
+            record.metadata_effects.iter().any(|effect| matches!(effect,
+                crate::DfsPreparedMetadataEffect::PutAdvisoryLockState { state } if state.object_id == object.object_id))
+        }).collect::<Vec<_>>();
+        assert_eq!(pending.len(), 1);
+        let original = &pending[0];
+        assert!(original.expected_journal_sequence.is_some());
+        runtime.reopen_node(replica_b).unwrap();
+        // Reconcile the exact saved body, including its original grant clock
+        // and read set, before retrying the caller's unchanged lock command.
+        let recovered = service
+            .commit_stored_prepared_operation(&original.digest)
+            .unwrap();
+        assert_eq!(recovered.payload, original.payload);
+        let before = service
+            .metadata_backend()
+            .unwrap()
+            .export_shard_table_snapshot(&original.shard_id)
+            .unwrap()
+            .unwrap();
         let outcome = service
             .posix_apply_advisory_lock_local(
                 &object.path,
                 &object.object_id,
-                &DfsAdvisoryLockCommand::Acquire {
-                    request_id: DfsAdvisoryLockRequestId::new("fallback-acquire"),
-                    session_id: DfsAdvisoryLockSessionId::new("fallback-session"),
-                    mode: DfsAdvisoryLockMode::Exclusive,
-                    blocking: false,
-                    process_id: Some(8),
-                },
+                &command,
                 Duration::from_secs(5),
             )
-            .expect("operation-bound fallback lock grant");
-
+            .expect("full-participant exact lock replay");
         assert!(matches!(outcome, DfsAdvisoryLockOutcome::Acquired { .. }));
-        assert_eq!(txn_calls.txn_calls(), 1);
+        assert_eq!(txn_calls.txn_calls(), 0);
+        assert_eq!(
+            service
+                .metadata_backend()
+                .unwrap()
+                .export_shard_table_snapshot(&original.shard_id)
+                .unwrap()
+                .unwrap(),
+            before
+        );
+        let committed = service
+            .metadata_backend()
+            .unwrap()
+            .prepared_operation_record(&original.operation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(committed.digest, original.digest);
+        assert_eq!(committed.payload, original.payload);
+        assert_eq!(
+            committed.status,
+            crate::DfsPreparedOperationStatus::Committed
+        );
         drop(service);
         runtime
             .close()

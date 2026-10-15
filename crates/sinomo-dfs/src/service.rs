@@ -1160,6 +1160,8 @@ impl Service for DfsDataPlaneService {
                             command.routed_message.source_node_id
                         )));
                     }
+                    #[cfg(any(test, feature = "test-support"))]
+                    crate::test_runtime::observe_decoded_namespace_call(&command);
                     let message_response = service
                         .host
                         .handle_message(command, attachment, traceparent, encoded_value_bytes)
@@ -1239,7 +1241,7 @@ fn dfs_inspection(
 
 async fn authoritative_metadata_replica_shard_context(
     host: Option<&dyn DfsDataPlaneHost>,
-    cluster: Option<Arc<dyn ClusterAccess>>,
+    _cluster: Option<Arc<dyn ClusterAccess>>,
     data_dir: Arc<SinomoDataDir>,
     file_system_id: Option<DfsFileSystemId>,
     shard_id: DfsMetadataShardId,
@@ -1268,80 +1270,15 @@ async fn authoritative_metadata_replica_shard_context(
         return Ok(context);
     }
 
-    let Some(cluster) = cluster else {
-        // A resident local Raft projection can be internally coherent yet
-        // belong to a retired primary generation. Without a retained host
-        // proof or current-term ClusterAccess proof there is no authority to
-        // admit metadata replica writes, so fail closed immediately.
-        dfs_service_perf_trace(format_args!(
-            "metadata-replica-authority-context shard={} mode=authority-unavailable handoff={} total_ms={}",
-            shard_id.0,
-            primary_handoff_id.is_some(),
-            started_at.elapsed().as_millis(),
-        ));
-        return Ok(None);
-    };
-    let shard_key = metadata_shard_key(&file_system_id, &shard_id.0);
-    let handoff_key = metadata_shard_membership_handoff_key(&file_system_id, &shard_id.0);
-    let authority_keys = vec![shard_key, handoff_key];
-    let authority_read_started_at = Instant::now();
-    let authoritative = cluster
-        .kv_get_authoritative_exact_set_async(authority_keys.clone())
-        .await?;
-    let authority_read_ms = authority_read_started_at.elapsed().as_millis();
-    let authority_term = authoritative.authority.term;
-    let authority_revision = authoritative.authority.revision;
-    // Besides proving one current-term authority point for both records, this
-    // rejects wrong-order values and entries whose revisions exceed that proof.
-    sinomo_core::kv::validate_cluster_kv_authoritative_entries_read(
-        &authority_keys,
-        &authoritative,
-    )?;
-    let mut values = authoritative.value.into_iter();
-    let shard_entry = values.next().expect("validated exact-key-set length");
-    let handoff_entry = values.next().expect("validated exact-key-set length");
-    let shard = shard_entry
-        .map(|entry| entry.decode::<DfsMetadataShardConfig>())
-        .transpose()?;
-    let Some(shard) = shard else {
-        dfs_service_perf_trace(format_args!(
-            "metadata-replica-authority-context shard={} mode=authoritative-missing local_read_ms={} authority_read_ms={} authority_term={} authority_revision={} total_ms={}",
-            shard_id.0,
-            0,
-            authority_read_ms,
-            authority_term,
-            authority_revision.0,
-            started_at.elapsed().as_millis(),
-        ));
-        return Ok(None);
-    };
-    let pending_membership_handoff = handoff_entry
-        .map(|entry| entry.decode::<DfsMetadataShardMembershipHandoff>())
-        .transpose()?
-        .filter(|handoff| {
-            handoff.retiring_shard == shard
-                && handoff.desired_shard.file_system_id == shard.file_system_id
-                && handoff.desired_shard.shard_id == shard.shard_id
-                && handoff.desired_shard.epoch == shard.epoch.saturating_add(1)
-        });
-    let state =
-        sinomo_core::cluster::read_cluster_state_without_kv(&ClusterPaths::new(data_dir.as_ref()))?;
-    let context = DfsMetadataReplicaShardContext {
-        local_node_id: state.local_node_id,
-        shard,
-        pending_membership_handoff,
-    };
+    // A host without the existing retained authority contract is unavailable.
+    // Replica ingress never starts a second control-plane authority protocol.
     dfs_service_perf_trace(format_args!(
-        "metadata-replica-authority-context shard={} mode=authoritative local_read_ms={} authority_read_ms={} authority_term={} authority_revision={} handoff={} total_ms={}",
+        "metadata-replica-authority-context shard={} mode=authority-unavailable handoff={} total_ms={}",
         shard_id.0,
-        0,
-        authority_read_ms,
-        authority_term,
-        authority_revision.0,
         primary_handoff_id.is_some(),
         started_at.elapsed().as_millis(),
     ));
-    Ok(Some(context))
+    Ok(None)
 }
 
 fn authenticated_dfs_cluster_source_node_id(
@@ -1684,8 +1621,13 @@ mod tests {
             .expect("actual registered host");
         let old = runtime.root_shard().expect("actual initial assignment");
         let cluster = Arc::clone(&host.cluster);
+        let component = runtime.component_context(&nodes[1]).unwrap();
+        let data_plane = crate::runtime_host::DaemonDfsDataPlaneHost::new_on_runtime(
+            crate::runtime_host::DfsRuntimePaths::new(&data_dir),
+            component.runtime().unwrap(),
+        );
         let old_context = authoritative_metadata_replica_shard_context(
-            None,
+            Some(&data_plane),
             Some(Arc::clone(&cluster)),
             Arc::clone(&data_dir),
             Some(old.file_system_id.clone()),
@@ -1708,7 +1650,7 @@ mod tests {
             )
             .expect("normal freeze/joint acknowledgement/activation");
         let new_context = authoritative_metadata_replica_shard_context(
-            None,
+            Some(&data_plane),
             Some(cluster),
             data_dir,
             Some(old.file_system_id.clone()),
@@ -1724,6 +1666,8 @@ mod tests {
         assert_eq!(installed.epoch, old.epoch + 1);
         assert!(new_context.pending_membership_handoff.is_none());
         assert_ne!(new_context.shard, old_context.shard);
+        drop(data_plane);
+        drop(component);
         drop(host);
         runtime.close().expect("drain shared native owners");
     }
@@ -1964,13 +1908,37 @@ mod tests {
         let (mut runtime, node, data_dir, host) = native_surface_fixture("native-host-status");
         let registry =
             register_services_with_data_plane_host(ServiceRegistry::builder(), host).build();
-        let (disposition, response) =
-            dispatch_local(&registry, data_dir.clone(), DFS_STATUS_ROUTE, &()).await;
-        assert_eq!(disposition, ServiceDisposition::Continue);
-        let status: DfsOperatorStatus =
-            response.decode_body().expect("decode actual hosted status");
+        let deadline = tokio::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+        let status = loop {
+            let (disposition, response) = tokio::time::timeout_at(
+                deadline,
+                dispatch_local(&registry, data_dir.clone(), DFS_STATUS_ROUTE, &()),
+            )
+            .await
+            .expect("hosted status completes within its original request window");
+            assert_eq!(disposition, ServiceDisposition::Continue);
+            let status: DfsOperatorStatus =
+                response.decode_body().expect("decode actual hosted status");
+            let updating = !status.incomplete_reasons.is_empty()
+                && status.incomplete_reasons.iter().all(|reason|
+                    reason == "network error: DFS runtime network error at DFS message cache root identity: bounded DFS status unavailable while the resident generation cache is being updated"
+                    || reason == "network error: bounded DFS status unavailable while the resident generation cache is being updated");
+            if updating {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "hosted status remained incomplete: {status:#?}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                continue;
+            }
+            break status;
+        };
+        assert!(
+            status.blocking_incomplete_reasons().is_empty(),
+            "actual hosted status={status:#?}"
+        );
         assert!(status.file_system_count > 0);
-        assert!(status.object_count > 0);
+        assert!(status.object_count > 0, "actual hosted status={status:#?}");
         runtime.stop_node(&node).expect("stop actual data owner");
         let unavailable = dispatch_with_signer(
             &registry,
@@ -2012,30 +1980,221 @@ mod tests {
             .find(|node| **node != users.primary_node_id)
             .unwrap()
             .clone();
-        let status = |runtime: &crate::test_runtime::DfsTestRuntime| {
+        let mut placement =
+            crate::DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 2).unwrap();
+        placement.required_node_ids = vec![users.primary_node_id.clone(), target.clone()];
+        placement.forbidden_node_ids = nodes
+            .iter()
+            .filter(|node| **node != users.primary_node_id && **node != target)
+            .cloned()
+            .collect();
+        let accepted = runtime
+            .apply_placement_policy(
+                &users.primary_node_id,
+                "/users/status-scope-file",
+                crate::DfsPlacementScope::SelfOnly,
+                placement,
+            )
+            .unwrap();
+        let control = runtime.shared_control_plane().unwrap();
+        let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+        loop {
+            let job = control
+                .with_client(|kv| {
+                    crate::DfsControlPlaneStore::new(kv.as_mut())
+                        .placement_reconciliation(&accepted.file_system_id, &accepted.job_id)
+                })
+                .unwrap()
+                .unwrap();
+            assert_eq!(job.accepted_config, accepted.accepted_config);
+            assert!(job.last_error.is_none());
+            if job.state == crate::DfsPlacementReconciliationState::Completed {
+                break;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "empty status fixture policy must finish"
+            );
+            tokio::task::block_in_place(|| {
+                runtime.maintenance_tick(&users.primary_node_id, remaining)
+            })
+            .unwrap()
+            .outcome
+            .unwrap();
+        }
+        let status = |runtime: &crate::test_runtime::DfsTestRuntime, target: &NodeId| {
+            // Exact diagnostic summaries validate the bounded route's claims
+            // without asking that route to scan or hide declared omissions.
+            let observer = runtime.client(target).unwrap();
+            let backend = observer.metadata_backend().unwrap();
+            let inventory = backend.metadata_summary().unwrap();
+            let owned = backend.metadata_summary_for_local_primary_shards().unwrap();
+            drop(observer);
+            // As with the exact metadata inventory above, establish the real
+            // durable queue view outside the bounded status route. An idle
+            // replica need not have run repair maintenance before this query.
+            crate::LocalDfsRepairQueueStore::new(crate::default_dfs_repair_attempt_snapshot_path(
+                runtime.data_dir(target),
+            ))
+            .view()
+            .unwrap();
             let request =
                 ObjectRpcRequest::encode_body(DFS_STATUS_ROUTE, crate::DFS_RPC_CATEGORY, &())
                     .unwrap();
-            runtime
+            let bounded = runtime
                 .rpc_request(
                     &users.primary_node_id,
-                    &target,
+                    target,
                     request,
                     Duration::from_secs(5),
                 )
                 .unwrap()
                 .decode_body::<DfsOperatorStatus>()
-                .unwrap()
+                .unwrap();
+            let configurations = runtime.metadata_shards().unwrap();
+            assert_eq!(bounded.file_system_count, 1);
+            assert_eq!(bounded.metadata_shards.len(), configurations.len());
+            for config in &configurations {
+                let actual = bounded
+                    .metadata_shards
+                    .iter()
+                    .find(|shard| shard.shard_id.0 == config.shard_id)
+                    .unwrap();
+                assert_eq!(
+                    actual.primary_node_id.as_ref(),
+                    Some(&config.primary_node_id)
+                );
+                assert_eq!(actual.epoch, Some(config.epoch));
+            }
+            if !bounded.incomplete_reasons.is_empty() {
+                // Nonblocking status can observe a real cache transition. Its
+                // explicit unavailable result is not a zero inventory/work claim.
+                assert!(bounded.incomplete_reasons.iter().all(|reason| reason.contains(
+                    "bounded DFS status unavailable while the resident generation cache is being updated"
+                )), "unexpected unavailable status: {bounded:?}");
+                return (inventory, owned);
+            }
+            if bounded.bounded_omissions.is_empty() {
+                assert_eq!(bounded.object_count, inventory.object_count);
+                assert_eq!(bounded.pending_repair_count, owned.pending_repair_count);
+                assert_eq!(bounded.pending_write_count, owned.pending_write_count);
+                assert_eq!(
+                    bounded.pending_namespace_job_count,
+                    owned.pending_namespace_job_count
+                );
+                assert_eq!(
+                    bounded.failed_namespace_job_count,
+                    owned.failed_namespace_job_count
+                );
+            } else {
+                // Retained routing history requires an exact visibility scan.
+                // The bounded route must disclose that omission, never present
+                // its zero placeholders as a complete operational measurement.
+                assert!(bounded.bounded_omissions.iter().all(|omission| matches!(omission,
+                    crate::DfsOperatorStatusOmission::HistoricalRoutingTopology { generation_count, .. }
+                    if *generation_count > 0)), "unexpected bounded omission: {bounded:?}");
+                for metric in [
+                    crate::DfsOperatorStatusMetric::ObjectCount,
+                    crate::DfsOperatorStatusMetric::PendingRepairCount,
+                ] {
+                    assert!(
+                        bounded
+                            .bounded_omissions
+                            .iter()
+                            .any(|omission| omission.omitted_metrics().contains(&metric))
+                    );
+                }
+            }
+            (inventory, owned)
         };
-        let before = status(&runtime);
+        let (before_inventory, before) = status(&runtime, &target);
+        let (_, primary_before) = status(&runtime, &users.primary_node_id);
+        for route in [
+            crate::DFS_DATA_STAGE_BLOB_ROUTE,
+            crate::DFS_DATA_REPAIR_REPLICA_ROUTE,
+        ] {
+            runtime.install_fault(crate::test_runtime::FaultRule {
+                source: None,
+                target: Some(target.clone()),
+                route: Some(route.into()),
+                call_id: None,
+                origin: None,
+                remaining_hits: 32,
+                action: crate::test_runtime::FaultAction::BudgetExhausted,
+            });
+        }
         let mut writer = runtime.client(&users.primary_node_id).unwrap();
+        let (resolved, _, write_policy) = writer
+            .managed_replication_policy_for_path(
+                "/users/status-scope-file",
+                DfsObjectPolicy::ReplicatedEventual,
+                1,
+            )
+            .unwrap();
+        assert_eq!(
+            resolved
+                .policy
+                .required_node_ids
+                .iter()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            [users.primary_node_id.clone(), target.clone()]
+                .into_iter()
+                .collect()
+        );
+        assert_eq!(
+            write_policy.required_node_ids,
+            resolved.policy.required_node_ids
+        );
+        assert_eq!(
+            write_policy.forbidden_node_ids,
+            resolved.policy.forbidden_node_ids
+        );
         let object = writer
             .posix_write_file(
                 "/users/status-scope-file",
                 b"native foreign-authority data",
-                crate::DfsWriteOptions::replicated_eventual(vec![users.primary_node_id.clone()]),
+                crate::DfsWriteOptions {
+                    policy: write_policy,
+                    replica_candidates: vec![users.primary_node_id.clone(), target.clone()],
+                    wait_for_commit: true,
+                    foreground_replica_repair: false,
+                },
             )
             .unwrap();
+        // The real write commits before its asynchronous metadata publisher
+        // necessarily reaches every member. Observe the physical inventory
+        // only after a genuine metadata barrier; content repairs stay faulted.
+        let mut author = runtime
+            .metadata_primary_service("/users/status-scope-file")
+            .unwrap();
+        let sync_object = author
+            .metadata_backend()
+            .unwrap()
+            .get_object(&object.object_id)
+            .unwrap()
+            .unwrap();
+        let sync_target = author
+            .capture_metadata_quorum_sync_target(&sync_object)
+            .unwrap();
+        let certificate = author
+            .sync_metadata_shard_to_quorum(
+                &sync_target,
+                sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+            )
+            .unwrap();
+        assert_eq!(
+            certificate
+                .acknowledged_node_ids
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::iter::once(users.primary_node_id.clone())
+                .chain(users.replica_node_ids.iter().cloned())
+                .collect(),
+            "the complete actual metadata membership must contain this committed inventory cut"
+        );
+        drop(author);
         let mut receiver = runtime.client(&target).unwrap();
         assert_eq!(
             receiver
@@ -2044,12 +2203,47 @@ mod tests {
                 .object_id,
             object.object_id
         );
-        let after = status(&runtime);
+        let (after_inventory, after) = status(&runtime, &target);
+        let (_, primary_after) = status(&runtime, &users.primary_node_id);
         assert_eq!(
-            after.object_count, before.object_count,
-            "a foreign primary's replicated file is not counted as locally owned work"
+            after_inventory.object_count,
+            before_inventory.object_count + 1,
+            "inventory includes the actual replicated file"
         );
+        let actual_owner = runtime.metadata_primary_service("/users").unwrap();
+        let intents = actual_owner
+            .metadata_backend()
+            .unwrap()
+            .intents_for_object(&object.object_id)
+            .unwrap();
+        let receipts = actual_owner
+            .metadata_backend()
+            .unwrap()
+            .receipts_for_version(&object.object_id, &object.version)
+            .unwrap();
+        let queue =
+            crate::LocalDfsRepairQueueStore::new(crate::default_dfs_repair_attempt_snapshot_path(
+                runtime.data_dir(&users.primary_node_id),
+            ))
+            .view()
+            .unwrap();
+        assert_eq!(
+            primary_after.pending_repair_count,
+            primary_before.pending_repair_count + 1,
+            "the real unfinished repair belongs to the foreign primary; intents={intents:?}; receipts={receipts:?}; queue={:?}",
+            queue.records
+        );
+        drop(actual_owner);
         assert_eq!(after.pending_repair_count, before.pending_repair_count);
+        assert_eq!(after.pending_write_count, before.pending_write_count);
+        assert_eq!(
+            after.pending_namespace_job_count,
+            before.pending_namespace_job_count
+        );
+        assert_eq!(
+            after.failed_namespace_job_count,
+            before.failed_namespace_job_count
+        );
         drop((receiver, writer));
         runtime.close().unwrap();
     }
@@ -2147,6 +2341,10 @@ mod tests {
                 crate::DfsWriteOptions::replicated_eventual(vec![primary.clone()]),
             )
             .unwrap();
+        // Journal bytes and the expected snapshot must come from the same
+        // current owning Core, not the requester's older browser image.
+        drop(source);
+        let source = runtime.metadata_primary_service("/").unwrap();
         let shard = DfsMetadataShardId::new(config.shard_id.clone());
         let backend = source.metadata_backend().unwrap();
         let selected = backend
@@ -2513,7 +2711,22 @@ mod tests {
     async fn dfs_data_plane_route_binds_authenticated_caller_to_routed_source() {
         let (runtime, authenticated, data_dir, host) =
             native_surface_fixture("native-data-plane-source-binding");
-        let before = host.status().await.expect("actual before status");
+        let mut bootstrap = runtime.client(&authenticated).unwrap();
+        bootstrap.posix_sync_directory("/").unwrap();
+        drop(bootstrap);
+        let snapshot = || {
+            let observer = runtime.client(&authenticated).unwrap();
+            let backend = observer.metadata_backend().unwrap();
+            let summary = backend.metadata_summary().unwrap();
+            let prefixes = backend
+                .metadata_shard_statuses()
+                .unwrap()
+                .into_iter()
+                .map(|shard| (shard.shard_id, shard.journal_last_sequence))
+                .collect::<Vec<_>>();
+            (summary, prefixes)
+        };
+        let (before, before_prefixes) = snapshot();
         let registry =
             register_data_plane_services(ServiceRegistry::builder(), host.clone()).build();
         let command = DfsMessageCommand {
@@ -2536,7 +2749,7 @@ mod tests {
         };
         let error = dispatch_with_signer(
             &registry,
-            data_dir,
+            Arc::clone(&data_dir),
             crate::DFS_DATA_READ_ROUTE,
             &command,
             ServiceSigner::LocalNode {
@@ -2547,7 +2760,11 @@ mod tests {
         .await
         .expect_err("mismatched routed source must be rejected before real host dispatch");
         assert!(error.to_string().contains("does not match claimed source"));
-        let after = host.status().await.expect("actual after status");
+        let (after, after_prefixes) = snapshot();
+        assert_eq!(
+            after_prefixes, before_prefixes,
+            "rejected identity cannot append on any shard"
+        );
         assert_eq!(before.object_count, after.object_count);
         assert_eq!(before.version_count, after.version_count);
         assert_eq!(before.pending_write_count, after.pending_write_count);

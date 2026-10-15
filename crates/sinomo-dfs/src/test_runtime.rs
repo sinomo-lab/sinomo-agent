@@ -102,6 +102,8 @@ pub enum RpcPhase {
     Constructed,
     BeforeDispatch,
     AfterDispatch,
+    /// Normal Hosted decoder returned the actual namespace header.
+    Decoded,
     Completed,
     EndedWithoutResponse,
 }
@@ -110,7 +112,7 @@ pub struct RpcObservation {
     pub source: NodeId,
     pub target: NodeId,
     pub call_id: u64,
-    /// Actual inline repair head only; streamed values and body readers stay untouched.
+    /// Actual inline repair or normally decoded namespace head; observation never reads a body.
     pub dfs_frame_id: Option<u64>,
     pub dfs_intent_id: Option<String>,
     pub dfs_request_id: Option<String>,
@@ -119,12 +121,54 @@ pub struct RpcObservation {
     pub dfs_version: Option<crate::DfsVersion>,
     pub route: String,
     pub phase: RpcPhase,
+    /// Actual returned transport error, attached only to a retained terminal
+    /// observation. Cancellation without a returned error leaves this absent.
+    pub outcome_error: Option<String>,
     pub origin: RpcOrigin,
     pub options: ClusterObjectRpcOptions,
     pub observe_connectivity: bool,
     pub streamed_value: bool,
     pub body_bytes: Option<u64>,
 }
+// The context carries only one real carrier invocation's observation identity.
+// It wraps the unchanged registry future and never authorizes or modifies work.
+#[derive(Clone)]
+struct NativeRpcCallContext {
+    fabric: std::sync::Weak<Fabric>,
+    observation: RpcObservation,
+}
+tokio::task_local! {
+    static NATIVE_RPC_CALL_CONTEXT: NativeRpcCallContext;
+}
+
+/// Observe the command returned by the normal decoder after signer validation.
+/// Streamed value bodies have already been consumed by that ordinary decoder;
+/// this observer copies only existing scalar identity fields.
+pub(crate) fn observe_decoded_namespace_call(command: &crate::DfsMessageCommand) {
+    let crate::DfsNetworkMessage::NamespaceRequest(request) = &command.routed_message.message
+    else {
+        return;
+    };
+    let _ = NATIVE_RPC_CALL_CONTEXT.try_with(|context| {
+        let head = &command.routed_message;
+        if context.observation.route != crate::DFS_DATA_NAMESPACE_ROUTE
+            || context.observation.source != head.source_node_id
+            || context.observation.target != head.target_node_id
+        {
+            return;
+        }
+        let Some(fabric) = context.fabric.upgrade() else {
+            return;
+        };
+        let mut observation = context.observation.clone();
+        observation.phase = RpcPhase::Decoded;
+        observation.dfs_frame_id = Some(head.frame_id);
+        observation.dfs_request_id = Some(request.request_id.clone());
+        observation.dfs_file_system_id = Some(request.file_system_id.clone());
+        fabric.record(observation);
+    });
+}
+
 /// Bounded negative changes to replies already produced by native read RPC.
 #[derive(Clone, Copy)]
 pub enum ReadReplyFault {
@@ -206,6 +250,10 @@ pub enum FaultAction {
         captured: Arc<Mutex<Vec<CapturedFetchReply>>>,
     },
     BudgetExhausted,
+    /// Bind the negative fault to the first matching physical call identity.
+    /// Other calls remain outside its scope; repeated delivery of that exact
+    /// call still obeys the ordinary fail-closed exhausted-budget behavior.
+    BudgetExhaustedForFirstCall,
     /// Fail this real call with the normal transient route error category.
     TransientRouteFailureBeforeDispatch,
     /// Reject only a decoded actual source RPC subtype before dispatch.
@@ -239,14 +287,44 @@ struct Endpoint {
     data_dir: Arc<SinomoDataDir>,
     cluster: Arc<dyn ClusterAccess>,
     registry: ServiceRegistry,
+    kv_available: Arc<AtomicBool>,
     accepting: AtomicBool,
-    active: AtomicUsize,
-    idle: Notify,
+    active: Arc<AtomicUsize>,
+    idle: Arc<Notify>,
 }
+impl Endpoint {
+    fn admits_route(&self, route: &str) -> bool {
+        if sinomo_core::kv::CLUSTER_KV_RPC_ROUTES.contains(&route) {
+            self.kv_available.load(Ordering::Acquire) && self.registry.owns(route)
+        } else {
+            self.accepting.load(Ordering::Acquire)
+        }
+    }
+}
+
 struct Transfer {
     source: NodeId,
     target: NodeId,
     task: tokio::task::JoinHandle<Result<(), NetworkError>>,
+}
+struct RpcObservationCheckpoint {
+    path: std::path::PathBuf,
+    records: usize,
+    digest: blake3::Hash,
+}
+impl RpcObservationCheckpoint {
+    fn verify(&self) -> Result<(), String> {
+        let bytes = std::fs::read(&self.path).map_err(|error| error.to_string())?;
+        let records: Vec<String> =
+            serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+        if blake3::hash(&bytes) != self.digest || records.len() != self.records {
+            return Err(format!(
+                "RPC observation checkpoint changed: {}",
+                self.path.display()
+            ));
+        }
+        Ok(())
+    }
 }
 struct Fabric {
     dropped_observations: AtomicUsize,
@@ -255,9 +333,27 @@ struct Fabric {
     nodes: Mutex<BTreeMap<NodeId, Arc<Endpoint>>>,
     faults: Mutex<Vec<FaultRule>>,
     observations: Mutex<Vec<RpcObservation>>,
+    observation_checkpoints: Mutex<Vec<RpcObservationCheckpoint>>,
     transfers: Mutex<Vec<Transfer>>,
 }
 impl Fabric {
+    fn record_returned_error(&self, call_id: u64, error: &NetworkError) {
+        let detail = format!("{error:?}");
+        let mut bounded = detail.chars().take(2048).collect::<String>();
+        if bounded.len() < detail.len() {
+            bounded.push_str(" [diagnostic truncated]");
+        }
+        if let Ok(mut records) = self.observations.lock()
+            && let Some(observation) = records
+                .iter_mut()
+                .rev()
+                .find(|row| row.call_id == call_id && row.phase == RpcPhase::EndedWithoutResponse)
+        {
+            observation.outcome_error = Some(bounded);
+        }
+        // A checkpointed/evicted event remains immutable. Do not create a new
+        // event or conceal incomplete coverage by reconstructing a lost one.
+    }
     fn record(&self, observation: RpcObservation) {
         if let Ok(mut records) = self.observations.lock() {
             if records.len() < MAX_OBSERVATIONS {
@@ -310,9 +406,13 @@ impl Fabric {
             self.exhausted_budgets.fetch_add(1, Ordering::Relaxed);
             return Some(FaultAction::BudgetExhausted);
         }
+        if matches!(rule.action, FaultAction::BudgetExhaustedForFirstCall) {
+            rule.call_id.get_or_insert(observation.call_id);
+        }
         rule.remaining_hits -= 1;
         Some(match &rule.action {
-            FaultAction::BudgetExhaustedForSourcePhase(_) => FaultAction::BudgetExhausted,
+            FaultAction::BudgetExhaustedForSourcePhase(_)
+            | FaultAction::BudgetExhaustedForFirstCall => FaultAction::BudgetExhausted,
             _ => rule.action.clone(),
         })
     }
@@ -333,19 +433,20 @@ impl Fabric {
     }
 }
 struct Invocation {
-    endpoint: Arc<Endpoint>,
+    active: Arc<AtomicUsize>,
+    idle: Arc<Notify>,
     fabric: Arc<Fabric>,
     observation: RpcObservation,
     completed: bool,
 }
 impl Drop for Invocation {
     fn drop(&mut self) {
-        self.endpoint.active.fetch_sub(1, Ordering::AcqRel);
-        self.endpoint.idle.notify_waiters();
         if !self.completed {
             self.observation.phase = RpcPhase::EndedWithoutResponse;
             self.fabric.record(self.observation.clone());
         }
+        self.active.fetch_sub(1, Ordering::AcqRel);
+        self.idle.notify_waiters();
     }
 }
 #[derive(Clone)]
@@ -419,6 +520,7 @@ impl Carrier {
             dfs_version: repair.map(|(_, _, _, _, version, _)| version),
             route: call.request.route.clone(),
             phase: RpcPhase::Constructed,
+            outcome_error: None,
             origin: self.origin,
             options,
             observe_connectivity,
@@ -433,15 +535,29 @@ impl Carrier {
         mut observation: RpcObservation,
         dispatch_started: Arc<AtomicBool>,
     ) -> Result<ObjectRpcResult, NetworkError> {
+        // Drop order is part of the drain contract: every service-bearing
+        // endpoint/reference below must end before this counter-only guard
+        // publishes idle. Its notification cannot itself pin the old owner.
+        let mut _invocation;
         let endpoint = {
             let nodes = self.fabric.nodes.lock().expect("DFS test nodes");
+            let source = nodes
+                .get(&self.source)
+                .ok_or_else(|| NetworkError::UnknownNode {
+                    node_id: self.source.clone(),
+                })?;
+            if !source.admits_route(&call.request.route) {
+                return Err(NetworkError::UnknownNode {
+                    node_id: self.source.clone(),
+                });
+            }
             let endpoint = nodes
                 .get(target)
                 .cloned()
                 .ok_or_else(|| NetworkError::UnknownNode {
                     node_id: target.clone(),
                 })?;
-            if !endpoint.accepting.load(Ordering::Acquire) {
+            if !endpoint.admits_route(&call.request.route) {
                 return Err(NetworkError::UnknownNode {
                     node_id: target.clone(),
                 });
@@ -449,13 +565,14 @@ impl Carrier {
             endpoint.active.fetch_add(1, Ordering::AcqRel);
             endpoint
         };
-        let mut invocation = Invocation {
-            endpoint: endpoint.clone(),
+        _invocation = Invocation {
+            active: Arc::clone(&endpoint.active),
+            idle: Arc::clone(&endpoint.idle),
             fabric: self.fabric.clone(),
             observation: observation.clone(),
             completed: false,
         };
-        if !endpoint.accepting.load(Ordering::Acquire) {
+        if !endpoint.admits_route(&call.request.route) {
             return Err(NetworkError::UnknownNode {
                 node_id: target.clone(),
             });
@@ -472,10 +589,11 @@ impl Carrier {
                 ));
             }
             Some(FaultAction::TransientRouteFailureBeforeDispatch) => {
-                return Err(NetworkError::Io {
-                    operation: "cluster target rpc".into(),
-                    detail: "bounded injected no usable route before dispatch".into(),
-                });
+                return Err(NetworkError::delivery_failed(
+                    "cluster target rpc",
+                    NetworkDeliveryState::DefinitelyNotSent,
+                    "bounded injected no usable route before dispatch",
+                ));
             }
             Some(FaultAction::PauseBeforeDispatch(gate)) => {
                 let permit = gate.acquire().await.map_err(|_| {
@@ -489,7 +607,7 @@ impl Carrier {
             }
             _ => {}
         }
-        if !endpoint.accepting.load(Ordering::Acquire) {
+        if !endpoint.admits_route(&call.request.route) {
             return Err(NetworkError::delivery_failed(
                 "shared DFS test dispatch admission",
                 NetworkDeliveryState::DefinitelyNotSent,
@@ -559,6 +677,7 @@ impl Carrier {
             .lock()
             .expect("DFS test source identity")
             .get(&self.source)
+            .filter(|source| source.admits_route(&incoming.request.route))
             .map(|source| source.data_dir.clone());
         let source_data = source_state.ok_or_else(|| NetworkError::UnknownNode {
             node_id: self.source.clone(),
@@ -585,9 +704,15 @@ impl Carrier {
             Box::new(ReplySink(response_tx)),
         );
         dispatch_started.store(true, Ordering::Release);
-        endpoint
-            .registry
-            .dispatch(context, incoming.request)
+        let native_call = NativeRpcCallContext {
+            fabric: Arc::downgrade(&self.fabric),
+            observation: observation.clone(),
+        };
+        NATIVE_RPC_CALL_CONTEXT
+            .scope(
+                native_call,
+                endpoint.registry.dispatch(context, incoming.request),
+            )
             .await
             .map_err(|error| NetworkError::Io {
                 operation: "shared DFS native service dispatch".into(),
@@ -963,7 +1088,7 @@ impl Carrier {
             .transfer(target.clone(), self.source.clone(), response_transfer);
         observation.phase = RpcPhase::Completed;
         self.fabric.record(observation);
-        invocation.completed = true;
+        _invocation.completed = true;
         Ok(result)
     }
     async fn invoke(
@@ -973,9 +1098,10 @@ impl Carrier {
         observation: RpcObservation,
     ) -> Result<ObjectRpcResult, NetworkError> {
         let dispatch_started = Arc::new(AtomicBool::new(false));
+        let call_id = observation.call_id;
         let timeout = observation.options.overall_timeout();
         let operation = self.deliver(target, call, observation, dispatch_started.clone());
-        if let Some(timeout) = timeout {
+        let result = if let Some(timeout) = timeout {
             tokio::time::timeout(timeout, operation)
                 .await
                 .map_err(|_| {
@@ -989,10 +1115,15 @@ impl Carrier {
                             NetworkDeliveryState::DefinitelyNotSent
                         },
                     )
-                })?
+                })
+                .and_then(std::convert::identity)
         } else {
             operation.await
+        };
+        if let Err(error) = &result {
+            self.fabric.record_returned_error(call_id, error);
         }
+        result
     }
 }
 /// Negative body-only pause over the receiver's actual source. Its native head
@@ -1286,6 +1417,211 @@ impl NativeServedWorkCapture {
             .clone()
     }
 }
+
+// These records are observations of an existing owner/permit, never authority.
+#[cfg(test)]
+mod placement_authority_observation {
+    use super::*;
+
+    #[derive(Clone, Debug)]
+    pub(crate) struct PlacementAuthorityCall {
+        pub job_id: String,
+        /// Copied from the existing acquisition caller: None covers the whole
+        /// job, while Some identifies an individual object's validation.
+        pub path: Option<String>,
+        pub holder_id: Option<String>,
+        pub job_state: Option<crate::DfsPlacementReconciliationState>,
+        pub released: Option<bool>,
+        pub finished: bool,
+    }
+
+    struct Observations {
+        owner: std::sync::Weak<crate::runtime_host::DfsDataOwnerLock>,
+        calls: Mutex<Vec<PlacementAuthorityCall>>,
+        omitted: AtomicUsize,
+    }
+
+    static OBSERVERS: OnceLock<Mutex<BTreeMap<std::path::PathBuf, std::sync::Weak<Observations>>>> =
+        OnceLock::new();
+
+    #[derive(Clone)]
+    pub(crate) struct NativePlacementAuthorityReader(Arc<Observations>);
+    impl NativePlacementAuthorityReader {
+        pub(crate) fn records(&self) -> Vec<PlacementAuthorityCall> {
+            assert_eq!(
+                self.0.omitted.load(Ordering::Acquire),
+                0,
+                "placement authority observations must be complete"
+            );
+            self.0
+                .calls
+                .lock()
+                .expect("placement authority observations")
+                .clone()
+        }
+        pub(crate) fn group_acquisition_is_open(&self, job_id: &str) -> bool {
+            self.records().iter().any(|call| {
+                call.job_id == job_id
+                    && call.path.is_none()
+                    && !call.finished
+                    && call.holder_id.is_none()
+            })
+        }
+        pub(crate) fn group_holder_ids(&self, job_id: &str) -> Vec<String> {
+            self.records()
+                .into_iter()
+                .filter(|call| call.job_id == job_id && call.path.is_none())
+                .filter_map(|call| call.holder_id)
+                .collect()
+        }
+    }
+
+    pub(crate) struct NativePlacementAuthorityCapture {
+        root: std::path::PathBuf,
+        reader: NativePlacementAuthorityReader,
+    }
+    impl NativePlacementAuthorityCapture {
+        pub(crate) fn reader(&self) -> NativePlacementAuthorityReader {
+            self.reader.clone()
+        }
+    }
+    impl Drop for NativePlacementAuthorityCapture {
+        fn drop(&mut self) {
+            let mut observers = OBSERVERS
+                .get()
+                .unwrap()
+                .lock()
+                .expect("placement observers");
+            if observers
+                .get(&self.root)
+                .and_then(std::sync::Weak::upgrade)
+                .is_some_and(|actual| Arc::ptr_eq(&actual, &self.reader.0))
+            {
+                observers.remove(&self.root);
+            }
+        }
+    }
+
+    pub(crate) struct PlacementAuthorityCallObservation {
+        observed: Arc<Observations>,
+        index: usize,
+    }
+    impl std::fmt::Debug for PlacementAuthorityCallObservation {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("PlacementAuthorityCallObservation")
+                .field("index", &self.index)
+                .finish_non_exhaustive()
+        }
+    }
+    impl PlacementAuthorityCallObservation {
+        pub(crate) fn acquired(
+            &mut self,
+            holder_id: &str,
+            state: crate::DfsPlacementReconciliationState,
+        ) {
+            let mut calls = self
+                .observed
+                .calls
+                .lock()
+                .expect("placement authority observations");
+            calls[self.index].holder_id = Some(holder_id.into());
+            calls[self.index].job_state = Some(state);
+        }
+        pub(crate) fn released(&mut self, succeeded: bool) {
+            self.observed
+                .calls
+                .lock()
+                .expect("placement authority observations")[self.index]
+                .released = Some(succeeded);
+        }
+    }
+    impl Drop for PlacementAuthorityCallObservation {
+        fn drop(&mut self) {
+            self.observed
+                .calls
+                .lock()
+                .expect("placement authority observations")[self.index]
+                .finished = true;
+        }
+    }
+
+    pub(crate) fn observe_placement_authority_call(
+        root: &std::path::Path,
+        owner: &Arc<crate::runtime_host::DfsDataOwnerLock>,
+        job_id: &str,
+        path: Option<&str>,
+    ) -> Option<PlacementAuthorityCallObservation> {
+        let observed = OBSERVERS
+            .get()?
+            .lock()
+            .expect("placement observers")
+            .get(root)?
+            .upgrade()?;
+        if !std::sync::Weak::ptr_eq(&observed.owner, &Arc::downgrade(owner)) {
+            return None;
+        }
+        let index = {
+            let mut calls = observed
+                .calls
+                .lock()
+                .expect("placement authority observations");
+            if calls.len() == MAX_OBSERVATIONS {
+                observed.omitted.fetch_add(1, Ordering::Release);
+                return None;
+            }
+            let index = calls.len();
+            calls.push(PlacementAuthorityCall {
+                job_id: job_id.into(),
+                path: path.map(str::to_owned),
+                holder_id: None,
+                job_state: None,
+                released: None,
+                finished: false,
+            });
+            index
+        };
+        Some(PlacementAuthorityCallObservation { observed, index })
+    }
+
+    impl DfsTestRuntime {
+        pub(crate) fn capture_placement_authority_calls(
+            &self,
+            node: &NodeId,
+        ) -> Result<NativePlacementAuthorityCapture, String> {
+            let context = self.component_context(node)?;
+            let owner = crate::runtime_host::retain_component_data_owner(&context)
+                .map_err(|error| error.to_string())?;
+            let root = context.data_dir().root();
+            let observed = Arc::new(Observations {
+                owner: Arc::downgrade(&owner),
+                calls: Mutex::new(Vec::new()),
+                omitted: AtomicUsize::new(0),
+            });
+            let mut observers = OBSERVERS
+                .get_or_init(Default::default)
+                .lock()
+                .map_err(|_| "placement observer registry poisoned")?;
+            if observers
+                .get(&root)
+                .and_then(std::sync::Weak::upgrade)
+                .is_some()
+            {
+                return Err("actual owner already has a placement authority observer".into());
+            }
+            observers.insert(root.clone(), Arc::downgrade(&observed));
+            Ok(NativePlacementAuthorityCapture {
+                root,
+                reader: NativePlacementAuthorityReader(observed),
+            })
+        }
+    }
+}
+#[cfg(test)]
+pub(crate) use placement_authority_observation::{
+    NativePlacementAuthorityCapture, NativePlacementAuthorityReader,
+    PlacementAuthorityCallObservation, observe_placement_authority_call,
+};
 
 #[cfg(test)]
 #[derive(Clone, Debug)]
@@ -1769,6 +2105,7 @@ impl DfsTestRuntime {
             nodes: Mutex::new(BTreeMap::new()),
             faults: Mutex::new(Vec::new()),
             observations: Mutex::new(Vec::new()),
+            observation_checkpoints: Mutex::new(Vec::new()),
             transfers: Mutex::new(Vec::new()),
         });
         let mut nodes = BTreeMap::new();
@@ -2055,7 +2392,11 @@ impl DfsTestRuntime {
             sinomo_module::cluster_service_catalog_publisher_component_factory()
                 .map_err(|error| error.to_string())?,
         );
-        let mut factories = vec![catalog];
+        let hosted: Arc<dyn sinomo_module::ComponentFactory> = Arc::new(
+            crate::runtime_host::hosted_cluster_kv_test_factory(Arc::clone(&self.kv_peers))
+                .map_err(|error| error.to_string())?,
+        );
+        let mut factories = vec![hosted, catalog];
         if dfs_enabled {
             factories.insert(0, dfs);
         }
@@ -2135,9 +2476,10 @@ impl DfsTestRuntime {
                 .active_snapshot()
                 .registry()
                 .clone(),
+            kv_available: Arc::clone(&endpoint.kv_available),
             accepting: AtomicBool::new(false),
-            active: AtomicUsize::new(0),
-            idle: Notify::new(),
+            active: Arc::new(AtomicUsize::new(0)),
+            idle: Arc::new(Notify::new()),
         });
         self.fabric
             .nodes
@@ -2203,10 +2545,11 @@ impl DfsTestRuntime {
             fabric: self.fabric.clone(),
             origin: RpcOrigin::RegisteredHost,
         });
-        let cluster = crate::runtime_host::test_cluster_access_for_node_on_voter(
+        let cluster = crate::runtime_host::test_cluster_access_for_node_on_voter_with_rpc(
             &data_dir,
             self.data_dir(&self.primary),
             Some(Arc::clone(&self.kv_peers)),
+            Some(carrier.clone()),
         );
         let context = ComponentContext::new(data_dir.clone())
             .with_host_role(ComponentHostRole::Embedded)
@@ -2231,9 +2574,10 @@ impl DfsTestRuntime {
                 .active_snapshot()
                 .registry()
                 .clone(),
+            kv_available: Arc::clone(&self.nodes[node].kv_available),
             accepting: AtomicBool::new(false),
-            active: AtomicUsize::new(0),
-            idle: Notify::new(),
+            active: Arc::new(AtomicUsize::new(0)),
+            idle: Arc::new(Notify::new()),
         });
         self.fabric
             .nodes
@@ -2849,6 +3193,138 @@ impl DfsTestRuntime {
         Ok(actual)
     }
 
+    /// Observe only the exact original completed native handoff, including
+    /// its full proof and the retained retiring owner's activated freeze.
+    /// Reuse an already-open control client so a deliberately withheld peer
+    /// projection cannot turn this read into unrelated startup admission.
+    pub(crate) fn observe_completed_native_handoff(
+        &self,
+        control: &SharedDfsControlPlaneKvClient<Box<dyn DfsControlPlaneKvClient>>,
+        handoff: &DfsMetadataShardMembershipHandoff,
+        phase_deadline: std::time::Instant,
+    ) -> Result<Option<DfsMetadataShardConfig>, crate::DfsError> {
+        let file_system_id = &handoff.retiring_shard.file_system_id;
+        let shard_id = handoff.retiring_shard.shard_id.as_str();
+
+        let keys = [
+            crate::metadata_shard_key(file_system_id, shard_id),
+            crate::metadata_shard_membership_handoff_key(file_system_id, shard_id),
+            crate::metadata_shard_membership_handoff_proof_key(file_system_id, shard_id),
+        ];
+        let entries = control
+            .with_client(|kv| kv.get_authoritative_consistent_before(&keys, phase_deadline))?;
+        let [Some(active), None, Some(proof)] = entries.as_slice() else {
+            return Ok(None);
+        };
+        if entries
+            .iter()
+            .zip(&keys)
+            .any(|(entry, key)| entry.as_ref().is_some_and(|entry| &entry.key != key))
+        {
+            return Ok(None);
+        }
+        let active = active.decode::<DfsMetadataShardConfig>()?;
+        let proof = proof.decode::<crate::DfsMetadataShardMembershipHandoffProof>()?;
+        let Some(head) = handoff.required_head_watermark.as_ref() else {
+            return Ok(None);
+        };
+        if active != handoff.desired_shard
+            || proof.handoff_id != handoff.handoff_id
+            || proof.cause != handoff.cause
+            || proof.retiring_shard != handoff.retiring_shard
+            || proof.desired_shard != handoff.desired_shard
+            || head.file_system_id != handoff.retiring_shard.file_system_id
+            || head.shard_id != handoff.retiring_shard.shard_id
+            || head.primary_node_id != handoff.retiring_shard.primary_node_id
+            || head.epoch != handoff.retiring_shard.epoch
+            || proof.journal_sequence < head.journal_sequence
+            || proof.journal_sequence < handoff.required_prepared_sequence
+            || proof.state_fingerprint.is_empty()
+            || !crate::control_plane::metadata_shard_membership_handoff_acknowledgements_are_safe(
+                &proof.retiring_shard,
+                &proof.desired_shard,
+                &proof.acknowledged_node_ids.iter().cloned().collect(),
+            )
+        {
+            return Ok(None);
+        }
+        // The cold opener may reject after this exact original
+        // handoff activates. Observe its marker without reopening
+        // a metadata backend or acquiring a publication lane.
+        let context = self
+            .component_context(&handoff.retiring_shard.primary_node_id)
+            .map_err(|message| crate::DfsError::Metadata { message })?;
+        let owner =
+            crate::runtime_host::retain_component_data_owner(&context).map_err(|error| {
+                crate::DfsError::Metadata {
+                    message: error.to_string(),
+                }
+            })?;
+        let shard = DfsMetadataShardId::new(shard_id);
+        let root = crate::local_dfs_metadata_shard_path(context.data_dir(), &shard)
+            .canonicalize()
+            .map_err(|error| crate::DfsError::Metadata {
+                message: error.to_string(),
+            })?;
+        if context.data_dir().root()
+            != self
+                .data_dir(&handoff.retiring_shard.primary_node_id)
+                .root()
+            || !owner.owns_backend_root(&root)
+        {
+            return Ok(None);
+        }
+        let Some(marker) =
+            crate::read_local_dfs_metadata_shard_write_freeze(context.data_dir(), &shard)?
+        else {
+            return Ok(None);
+        };
+        if marker.handoff_id != handoff.handoff_id
+            || marker.retiring_epoch != handoff.retiring_shard.epoch
+            || marker.activated_epoch != Some(handoff.desired_shard.epoch)
+            || marker.journal_sequence != proof.journal_sequence
+            || marker.state_fingerprint != proof.state_fingerprint
+            || std::time::Instant::now() > phase_deadline
+        {
+            return Ok(None);
+        }
+        // The request's published watermark can precede the actual freeze.
+        // Authenticate every intervening immutable native frame; sequence
+        // advancement alone cannot prove that the frozen head extends it.
+        let Some(mut prefix) = DfsMetadataPrefixProof::from_digest(
+            head.journal_sequence,
+            head.state_fingerprint.clone(),
+        ) else {
+            return Ok(None);
+        };
+        while prefix.journal_sequence < proof.journal_sequence {
+            if std::time::Instant::now() > phase_deadline {
+                return Ok(None);
+            }
+            let end = proof
+                .journal_sequence
+                .min(prefix.journal_sequence.saturating_add(64));
+            let sequences = (prefix.journal_sequence + 1..=end).collect::<Vec<_>>();
+            for frame in crate::metadata_journal::read_segmented_journal_frames_at_sequences(
+                &root, &sequences,
+            )? {
+                let Some(frame) = frame else {
+                    return Ok(None);
+                };
+                prefix = crate::metadata_journal::metadata_prefix_proof_after_exact_frame(
+                    &prefix,
+                    frame.entry(),
+                    &shard,
+                    frame.exact_bytes(),
+                )?;
+            }
+        }
+        if prefix.digest != proof.state_fingerprint || std::time::Instant::now() > phase_deadline {
+            return Ok(None);
+        }
+        Ok(Some(active))
+    }
+
     /// Move an actual native assignment through ordinary freeze, receiver
     /// acknowledgement and joint activation. This does not seed configurations.
     pub fn reassign_metadata_shard(
@@ -2959,96 +3435,8 @@ impl DfsTestRuntime {
             let installed = if let Err(error) = reconciliation {
                 // The same normal Main owner can complete this original request
                 // while its explicit caller queues. No new effect is authorized.
-                let completed = (|| -> Result<Option<DfsMetadataShardConfig>, crate::DfsError> {
-                    let keys = [
-                        crate::metadata_shard_key(file_system_id, shard_id),
-                        crate::metadata_shard_membership_handoff_key(file_system_id, shard_id),
-                        crate::metadata_shard_membership_handoff_proof_key(
-                            file_system_id,
-                            shard_id,
-                        ),
-                    ];
-                    let entries = control.with_client(|kv| {
-                        kv.get_authoritative_consistent_before(&keys, phase_deadline)
-                    })?;
-                    let [Some(active), None, Some(proof)] = entries.as_slice() else {
-                        return Ok(None);
-                    };
-                    if entries
-                        .iter()
-                        .zip(&keys)
-                        .any(|(entry, key)| entry.as_ref().is_some_and(|entry| &entry.key != key))
-                    {
-                        return Ok(None);
-                    }
-                    let active = active.decode::<DfsMetadataShardConfig>()?;
-                    let proof = proof.decode::<crate::DfsMetadataShardMembershipHandoffProof>()?;
-                    let Some(head) = handoff.required_head_watermark.as_ref() else {
-                        return Ok(None);
-                    };
-                    if active != handoff.desired_shard
-                        || proof.handoff_id != handoff.handoff_id
-                        || proof.cause != handoff.cause
-                        || proof.retiring_shard != handoff.retiring_shard
-                        || proof.desired_shard != handoff.desired_shard
-                        || head.file_system_id != handoff.retiring_shard.file_system_id
-                        || head.shard_id != handoff.retiring_shard.shard_id
-                        || head.primary_node_id != handoff.retiring_shard.primary_node_id
-                        || head.epoch != handoff.retiring_shard.epoch
-                        || proof.journal_sequence != head.journal_sequence
-                        || proof.journal_sequence < handoff.required_prepared_sequence
-                        || proof.state_fingerprint != head.state_fingerprint
-                        || proof.state_fingerprint.is_empty()
-                        || !crate::control_plane::metadata_shard_membership_handoff_acknowledgements_are_safe(
-                            &proof.retiring_shard,
-                            &proof.desired_shard,
-                            &proof.acknowledged_node_ids.iter().cloned().collect(),
-                        )
-                    {
-                        return Ok(None);
-                    }
-                    // The cold opener may reject after this exact original
-                    // handoff activates. Observe its marker without reopening
-                    // a metadata backend or acquiring a publication lane.
-                    let context = self
-                        .component_context(&handoff.retiring_shard.primary_node_id)
-                        .map_err(|message| crate::DfsError::Metadata { message })?;
-                    let owner = crate::runtime_host::retain_component_data_owner(&context)
-                        .map_err(|error| crate::DfsError::Metadata {
-                            message: error.to_string(),
-                        })?;
-                    let shard = DfsMetadataShardId::new(shard_id);
-                    let root = crate::local_dfs_metadata_shard_path(context.data_dir(), &shard)
-                        .canonicalize()
-                        .map_err(|error| crate::DfsError::Metadata {
-                            message: error.to_string(),
-                        })?;
-                    if context.data_dir().root()
-                        != self
-                            .data_dir(&handoff.retiring_shard.primary_node_id)
-                            .root()
-                        || !owner.owns_backend_root(&root)
-                    {
-                        return Ok(None);
-                    }
-                    let Some(marker) = crate::read_local_dfs_metadata_shard_write_freeze(
-                        context.data_dir(),
-                        &shard,
-                    )?
-                    else {
-                        return Ok(None);
-                    };
-                    if marker.handoff_id != handoff.handoff_id
-                        || marker.retiring_epoch != handoff.retiring_shard.epoch
-                        || marker.activated_epoch != Some(handoff.desired_shard.epoch)
-                        || marker.journal_sequence != proof.journal_sequence
-                        || marker.state_fingerprint != proof.state_fingerprint
-                        || std::time::Instant::now() > phase_deadline
-                    {
-                        return Ok(None);
-                    }
-                    Ok(Some(active))
-                })();
+                let completed =
+                    self.observe_completed_native_handoff(&control, &handoff, phase_deadline);
                 match completed {
                     Ok(Some(active)) => active,
                     Ok(None) | Err(_) => return Err(error.to_string()),
@@ -3086,20 +3474,21 @@ impl DfsTestRuntime {
     }
     /// Dispatch the actual prepared call, including its owned native attachment,
     /// through the same authenticated Main endpoint and original caller budget.
-    pub fn rpc_call(
+    /// Preserve the actual semantic attachment so protocol tests can consume
+    /// it through the production decoder instead of a value-only adapter.
+    pub fn rpc_result(
         &self,
         source: &NodeId,
         target: &NodeId,
         call: ObjectRpcCall,
         timeout: Duration,
-    ) -> Result<ObjectRpcResponse, String> {
-        let deadline = std::time::Instant::now() + timeout;
+    ) -> Result<ObjectRpcResult, String> {
         let carrier = Carrier {
             source: source.clone(),
             fabric: self.fabric.clone(),
             origin: RpcOrigin::ExplicitFixtureRpc,
         };
-        let result = carrier
+        carrier
             .call(
                 target,
                 call,
@@ -3108,7 +3497,47 @@ impl DfsTestRuntime {
                     .cluster_rpc_options(),
                 true,
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())
+    }
+    /// The same authenticated native carrier as rpc_result, with its caller
+    /// future exposed for cancellation checks. No runtime/owner is synthesized.
+    pub fn rpc_result_future(
+        &self,
+        source: &NodeId,
+        target: &NodeId,
+        call: ObjectRpcCall,
+        timeout: Duration,
+    ) -> impl std::future::Future<Output = Result<ObjectRpcResult, String>> + Send + use<> {
+        let carrier = Carrier {
+            source: source.clone(),
+            fabric: Arc::clone(&self.fabric),
+            origin: RpcOrigin::ExplicitFixtureRpc,
+        };
+        let target = target.clone();
+        async move {
+            carrier
+                .call_async(
+                    &target,
+                    call,
+                    DfsObjectRpcSendOptions::default()
+                        .with_overall_timeout(timeout)
+                        .cluster_rpc_options(),
+                    true,
+                )
+                .await
+                .map_err(|error| error.to_string())
+        }
+    }
+
+    pub fn rpc_call(
+        &self,
+        source: &NodeId,
+        target: &NodeId,
+        call: ObjectRpcCall,
+        timeout: Duration,
+    ) -> Result<ObjectRpcResponse, String> {
+        let deadline = std::time::Instant::now() + timeout;
+        let result = self.rpc_result(source, target, call, timeout)?;
         run_rpc(Box::pin(async {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             let response = tokio::time::timeout(
@@ -3148,6 +3577,16 @@ impl DfsTestRuntime {
         )
     }
     pub fn install_fault(&self, rule: FaultRule) {
+        if matches!(rule.action, FaultAction::BudgetExhaustedForFirstCall) {
+            assert_eq!(
+                rule.remaining_hits, 1,
+                "first-call fault has one exact physical-call budget"
+            );
+            assert!(
+                rule.call_id.is_none(),
+                "the first actual matching call supplies its identity"
+            );
+        }
         assert!(
             (1..=32).contains(&rule.remaining_hits),
             "bounded fault rule required"
@@ -3156,6 +3595,24 @@ impl DfsTestRuntime {
         assert!(rules.len() < 64);
         rules.push(rule)
     }
+    /// Remove only the caller's exact configured negative transport rules.
+    /// Already-running calls retain their cloned actions; native state, replies,
+    /// other rules and sticky exhaustion accounting remain unchanged.
+    #[cfg(test)]
+    pub(crate) fn remove_faults_matching(
+        &self,
+        mut selected: impl FnMut(&FaultRule) -> bool,
+    ) -> usize {
+        let mut rules = self
+            .fabric
+            .faults
+            .lock()
+            .expect("native fixture fault rules");
+        let before = rules.len();
+        rules.retain(|rule| !selected(rule));
+        before - rules.len()
+    }
+
     /// Heal only configured transport faults. This neither acknowledges work
     /// nor changes persisted state; already-paused calls still own their gates.
     pub fn clear_faults(&self) {
@@ -3179,7 +3636,65 @@ impl DfsTestRuntime {
         self.fabric.dropped_observations.load(Ordering::Relaxed)
     }
 
-    /// Captured dispatch events from the actual registered transport adapters.
+    /// Seal a complete observation window to the fixture's disk before starting
+    /// another corpus batch. The live buffer remains bounded by MAX_OBSERVATIONS;
+    /// no event or omission counter is discarded. Normal close verifies every
+    /// complete segment, including its count and digest, before claiming coverage.
+    /// Observation readers subsequently see the new, explicitly selected window.
+    pub fn checkpoint_rpc_observation_window(&self) -> Result<usize, String> {
+        use std::io::Write;
+        let mut records = self
+            .fabric
+            .observations
+            .lock()
+            .map_err(|_| "observations poisoned")?;
+        if self.observation_dropped_count() != 0 {
+            return Err("cannot checkpoint a censored RPC observation window".into());
+        }
+        if records.is_empty() {
+            return Ok(0);
+        }
+        let mut checkpoints = self
+            .fabric
+            .observation_checkpoints
+            .lock()
+            .map_err(|_| "observation checkpoints poisoned")?;
+        let path = self
+            .root
+            .as_ref()
+            .ok_or("fixture root was retained")?
+            .join(format!("rpc-observations-{:06}.json", checkpoints.len()));
+        // Debug includes every field, including the carrier's private timeout
+        // and protection options. Do not replace it with a lossy route summary.
+        let bytes = serde_json::to_vec(
+            &records
+                .iter()
+                .map(|event| format!("{event:?}"))
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|error| error.to_string())?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|error| error.to_string())?;
+        file.write_all(&bytes)
+            .and_then(|_| file.sync_all())
+            .map_err(|error| error.to_string())?;
+        let checkpoint = RpcObservationCheckpoint {
+            path,
+            records: records.len(),
+            digest: blake3::hash(&bytes),
+        };
+        checkpoint.verify()?;
+        let count = records.len();
+        checkpoints.push(checkpoint);
+        records.clear();
+        Ok(count)
+    }
+
+    /// Actual adapter events in the current window. Only an explicit successful
+    /// checkpoint begins a new window; ordinary fixtures retain their lifetime.
     pub fn rpc_observations(&self) -> Vec<RpcObservation> {
         self.fabric
             .observations
@@ -3639,12 +4154,36 @@ impl DfsTestRuntime {
         run_unit(Box::pin(self.kv_peers.join(CLOSE_TIMEOUT)))?;
         self.join_transfers(None)?;
         self.assert_fault_budgets()?;
+        let checkpoints = self
+            .fabric
+            .observation_checkpoints
+            .lock()
+            .map_err(|_| "observation checkpoints poisoned")?;
+        for checkpoint in checkpoints.iter() {
+            checkpoint.verify()?;
+        }
+        let checkpointed_records: usize = checkpoints.iter().map(|entry| entry.records).sum();
+        drop(checkpoints);
         match namespace {
             Some(required) if required.omitted != 0 || required.records.is_empty() => {
                 return Err("DFS namespace observation window was empty or censored".into());
             }
             None if self.fabric.dropped_observations.load(Ordering::Relaxed) != 0 => {
-                return Err("DFS test observations were censored".into());
+                let records = self.rpc_observations();
+                let mut observed_routes = BTreeMap::<String, usize>::new();
+                for event in &records {
+                    *observed_routes
+                        .entry(format!(
+                            "{} {:?} {:?}",
+                            event.route, event.origin, event.phase
+                        ))
+                        .or_default() += 1;
+                }
+                return Err(format!(
+                    "DFS test observations were censored: retained={}, omitted={}, retained_routes={observed_routes:?}",
+                    records.len(),
+                    self.observation_dropped_count(),
+                ));
             }
             _ => {}
         }
@@ -3653,7 +4192,8 @@ impl DfsTestRuntime {
             .observations
             .lock()
             .map_err(|_| "lifetime observations poisoned")?
-            .len();
+            .len()
+            + checkpointed_records;
         let lifetime_omitted = self.fabric.dropped_observations.load(Ordering::Acquire);
         let coverage = DfsTestObservationCoverageReport {
             namespace_records: namespace.map(|required| required.records.len()),
@@ -3687,6 +4227,31 @@ impl DfsTestRuntime {
 }
 impl Drop for DfsTestRuntime {
     fn drop(&mut self) {
+        #[cfg(test)]
+        let preserve_panic = std::thread::panicking()
+            && std::env::var("SINOMO_DFS_TEST_PANIC_CAPTURE").is_ok_and(|value| value == "1");
+        #[cfg(test)]
+        if preserve_panic && let Some(root) = self.root.as_ref() {
+            let observations = match self.fabric.observations.try_lock() {
+                Ok(records) => format!("{records:#?}"),
+                Err(error) => format!("observations unavailable: {error:?}"),
+            };
+            let capture = format!(
+                "thread={:?}\nprimary={}\nomitted={}\nRPC observations BEFORE ordinary cleanup:\n{}",
+                std::thread::current().name(),
+                self.primary,
+                self.observation_dropped_count(),
+                observations
+            );
+            let result = std::fs::write(
+                root.path().join("native-panic-rpc-observations.txt"),
+                capture,
+            );
+            eprintln!(
+                "NATIVE_PANIC_CAPTURE root={:?} write={result:?}",
+                root.path()
+            );
+        }
         if !self.closed {
             if let Err(error) = self.close_inner(None) {
                 eprintln!("shared DFS test cleanup failed: {error}");
@@ -3698,6 +4263,14 @@ impl Drop for DfsTestRuntime {
                     eprintln!("retained DFS test root: {}", root.keep().display())
                 }
             }
+        }
+        #[cfg(test)]
+        if preserve_panic && let Some(root) = self.root.take() {
+            eprintln!(
+                "NATIVE_PANIC_RETAINED closed={} root={:?}",
+                self.closed,
+                root.keep()
+            );
         }
     }
 }
@@ -3849,7 +4422,31 @@ impl DfsTestRuntime {
         ),
         String,
     > {
-        let mut client = self.client(node)?;
+        Self::probe_actual_control_plane(self.client(node)?)
+    }
+
+    pub fn metadata_primary_service_with_control_plane_probe(
+        &self,
+        path: &str,
+    ) -> Result<
+        (
+            NetworkedDfsService<DfsNodeTransport>,
+            DfsTestControlPlaneProbe,
+        ),
+        String,
+    > {
+        Self::probe_actual_control_plane(self.metadata_primary_service(path)?)
+    }
+
+    fn probe_actual_control_plane(
+        mut client: NetworkedDfsService<DfsNodeTransport>,
+    ) -> Result<
+        (
+            NetworkedDfsService<DfsNodeTransport>,
+            DfsTestControlPlaneProbe,
+        ),
+        String,
+    > {
         let inner = client
             .control_plane
             .take()
@@ -3911,6 +4508,7 @@ pub(crate) fn observe_native_kv_request(
     }
     Ok(())
 }
+
 impl DfsTestRuntime {
     /// Observe/fail an actual native KV request before its ordinary admission.
     /// This hook can never supply a positive response, receipt or authority.
@@ -4194,5 +4792,254 @@ impl DfsTestRuntime {
             _registration: DfsTestNativeKvHookRegistration(entry),
             fault,
         })
+    }
+}
+
+#[cfg(test)]
+mod normal_native_kv_admission_tests {
+    use super::*;
+    use sinomo_core::kv::{KvOp, KvTxn, KvTxnRequest};
+
+    #[test]
+    fn mounted_native_kv_routes_work_before_dfs_preparation_and_stop_removes_admission() {
+        let name = "native-core-kv-before-dfs-prepared";
+        let node = DfsTestRuntime::ordered_node_ids(name, 1).remove(0);
+        let mut native = DfsTestRuntime::new(name, node.clone()).unwrap();
+        native.bootstrap_planned_cluster().unwrap();
+        native.prepare_projection(&node).unwrap();
+        let carrier = Carrier {
+            source: node.clone(),
+            fabric: Arc::clone(&native.fabric),
+            origin: RpcOrigin::RegisteredHost,
+        };
+        let request = KvTxnRequest::generated(KvTxn {
+            compares: Vec::new(),
+            success: vec![KvOp::Put {
+                key: "/test/core-kv-before-dfs-ready".into(),
+                value: b"actual native control before DFS preparation".to_vec(),
+                lease_id: None,
+            }],
+            failure: Vec::new(),
+        });
+        let payload = sinomo_core::kv::cluster_kv_txn_rpc_payload(&request).unwrap();
+        let call = || {
+            ObjectRpcCall::value(ObjectRpcRequest::from_encoded_body(
+                payload.route,
+                payload.category,
+                payload.body.clone(),
+            ))
+        };
+        assert!(
+            run_rpc(carrier.call_async(&node, call(), ClusterObjectRpcOptions::default(), true))
+                .is_err(),
+            "no mounted endpoint can admit control work"
+        );
+        native.mount_node(&node).unwrap();
+        let endpoint = Arc::clone(&native.fabric.nodes.lock().unwrap()[&node]);
+        assert!(
+            !endpoint.accepting.load(Ordering::Acquire),
+            "normal DFS preparation has not run"
+        );
+        assert!(endpoint.kv_available.load(Ordering::Acquire));
+        assert!(endpoint.admits_route(sinomo_core::kv::CLUSTER_KV_TXN_ROUTE));
+        assert!(!endpoint.admits_route(crate::DFS_DIRECT_READ_ROUTE));
+        let response =
+            run_rpc(carrier.call_async(&node, call(), ClusterObjectRpcOptions::default(), true))
+                .unwrap();
+        let response = executor()
+            .block_on(response.into_materialized_value_response(64 * 1024))
+            .unwrap();
+        let response: sinomo_core::kv::ClusterKvTxnRpcResponse = response.decode_body().unwrap();
+        assert!(response.txn_response.as_ref().unwrap().succeeded);
+        let outcome = executor()
+            .block_on(
+                endpoint
+                    .cluster
+                    .kv_request_outcome_authoritative_async(request.request_id.clone()),
+            )
+            .unwrap();
+        sinomo_core::kv::validate_cluster_kv_request_outcome_read(&outcome).unwrap();
+        let sinomo_core::kv::KvRequestOutcome::Committed(record) = outcome.outcome else {
+            panic!("normal Core route must have its actual committed native receipt");
+        };
+        assert_eq!(record.request_id, request.request_id);
+        assert_eq!(record.command_digest, response.command_digest);
+        assert_eq!(record.txn_response, response.txn_response);
+        let dfs = ObjectRpcCall::value(
+            ObjectRpcRequest::encode_body(crate::DFS_DIRECT_READ_ROUTE, "dfs", &()).unwrap(),
+        );
+        assert!(
+            run_rpc(carrier.call_async(&node, dfs, ClusterObjectRpcOptions::default(), true))
+                .is_err()
+        );
+        assert!(!endpoint.accepting.load(Ordering::Acquire));
+        // Negative control only: even a prepared DFS admission cannot replace
+        // the actual native KV owner's live flag. No request is dispatched.
+        endpoint.accepting.store(true, Ordering::Release);
+        endpoint.kv_available.store(false, Ordering::Release);
+        assert!(!endpoint.admits_route(sinomo_core::kv::CLUSTER_KV_TXN_ROUTE));
+        endpoint.accepting.store(false, Ordering::Release);
+        endpoint.kv_available.store(true, Ordering::Release);
+        let kv_available = Arc::clone(&endpoint.kv_available);
+        drop(endpoint); // Do not retain mounted DFS services/data owners over stop.
+        native.stop_node(&node).unwrap();
+        assert!(!kv_available.load(Ordering::Acquire));
+        assert!(!native.fabric.nodes.lock().unwrap().contains_key(&node));
+        let paths = ClusterPaths::new(native.data_dir(&node));
+        let wal = paths.kv_paths().raft_wal_paths(&node).wal;
+        let before = std::fs::read(&wal).unwrap();
+        assert!(
+            run_rpc(carrier.call_async(&node, call(), ClusterObjectRpcOptions::default(), true))
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&wal).unwrap(), before);
+        native.close().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod owned_fault_cleanup_tests {
+    use super::*;
+
+    #[test]
+    fn removing_owned_capture_rule_preserves_an_unknown_capture_with_the_same_selector() {
+        // Pure negative-rule configuration; no receiver, ACK, quorum or Ready
+        // outcome is manufactured or exercised by this utility test.
+        let name = "native-owned-fault-rule-cleanup-data";
+        let nodes = DfsTestRuntime::ordered_node_ids(name, 2);
+        let mut runtime = DfsTestRuntime::new(name, nodes[0].clone()).unwrap();
+        runtime.define_node(nodes[1].clone()).unwrap();
+        let owned = Arc::new(Mutex::new(StageExchangeCapture::default()));
+        let unknown = Arc::new(Mutex::new(StageExchangeCapture::default()));
+        let configured = |capture| FaultRule {
+            source: Some(nodes[0].clone()),
+            target: Some(nodes[1].clone()),
+            route: Some(crate::DFS_DATA_STAGE_BLOB_ROUTE.into()),
+            call_id: None,
+            origin: Some(RpcOrigin::RegisteredHost),
+            remaining_hits: 1,
+            action: FaultAction::CaptureStageExchangeAndLoseAfterDispatch(capture),
+        };
+        runtime.install_fault(configured(Arc::clone(&owned)));
+        runtime.install_fault(configured(Arc::clone(&unknown)));
+        let removed = runtime.remove_faults_matching(|rule| {
+            matches!(&rule.action, FaultAction::CaptureStageExchangeAndLoseAfterDispatch(capture)
+                if Arc::ptr_eq(capture, &owned))
+        });
+        assert_eq!(removed, 1);
+        assert_eq!(runtime.remove_faults_matching(|rule| {
+            matches!(&rule.action, FaultAction::CaptureStageExchangeAndLoseAfterDispatch(capture)
+                if Arc::ptr_eq(capture, &owned))
+        }), 0);
+        {
+            let remaining = runtime.fabric.faults.lock().unwrap();
+            assert_eq!(remaining.len(), 1);
+            assert_eq!(remaining[0].remaining_hits, 1);
+            assert!(matches!(&remaining[0].action,
+                FaultAction::CaptureStageExchangeAndLoseAfterDispatch(capture)
+                    if Arc::ptr_eq(capture, &unknown)));
+            assert_eq!(runtime.fabric.exhausted_budgets.load(Ordering::Relaxed), 0);
+        }
+        runtime.remove_faults_matching(|rule| {
+            matches!(&rule.action, FaultAction::CaptureStageExchangeAndLoseAfterDispatch(capture)
+                if Arc::ptr_eq(capture, &unknown))
+        });
+        runtime.close().unwrap();
+    }
+    #[test]
+    fn native_cancelled_invocation_releases_endpoint_before_idle_notification() {
+        use std::task::{Context, Poll, Wake, Waker};
+        struct DrainObservation {
+            endpoint: std::sync::Weak<Endpoint>,
+            observed: Mutex<Option<(usize, usize)>>,
+        }
+        impl DrainObservation {
+            fn observe(&self) {
+                let references = self.endpoint.strong_count();
+                let active = self
+                    .endpoint
+                    .upgrade()
+                    .unwrap()
+                    .active
+                    .load(Ordering::Acquire);
+                *self.observed.lock().unwrap() = Some((active, references));
+            }
+        }
+        impl Wake for DrainObservation {
+            fn wake(self: Arc<Self>) {
+                self.observe();
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.observe();
+            }
+        }
+        let (native, nodes) =
+            DfsTestRuntime::start_cluster("native-invocation-idle-owner-order", 1).unwrap();
+        let node = nodes[0].clone();
+        let endpoint = Arc::clone(&native.fabric.nodes.lock().unwrap()[&node]);
+        assert!(endpoint.registry.owns(crate::DFS_STATUS_ROUTE));
+        let carrier = Carrier {
+            source: node.clone(),
+            fabric: Arc::clone(&native.fabric),
+            origin: RpcOrigin::RegisteredHost,
+        };
+        let call = ObjectRpcCall::value(
+            ObjectRpcRequest::encode_body(crate::DFS_STATUS_ROUTE, crate::DFS_RPC_CATEGORY, &())
+                .unwrap(),
+        );
+        let observation =
+            carrier.observation(&node, &call, ClusterObjectRpcOptions::default(), true);
+        native.install_fault(FaultRule {
+            source: Some(node.clone()),
+            target: Some(node.clone()),
+            route: Some(crate::DFS_STATUS_ROUTE.into()),
+            call_id: Some(observation.call_id),
+            origin: Some(RpcOrigin::RegisteredHost),
+            remaining_hits: 1,
+            action: FaultAction::PauseBeforeDispatch(Arc::new(Semaphore::new(0))),
+        });
+        let mut call =
+            Box::pin(carrier.deliver(&node, call, observation, Arc::new(AtomicBool::new(false))));
+        let mut pending_context = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            call.as_mut().poll(&mut pending_context),
+            Poll::Pending
+        ));
+        // Withdraw the real native endpoint exactly as stop does. No new peer
+        // invocation can obscure the one admitted, paused call's drain edge.
+        endpoint.accepting.store(false, Ordering::Release);
+        endpoint.kv_available.store(false, Ordering::Release);
+        run_unit(Box::pin(native.kv_peers.join(CLOSE_TIMEOUT))).unwrap();
+        native.join_transfers(Some(&node)).unwrap();
+        let deadline = std::time::Instant::now() + CLOSE_TIMEOUT;
+        while endpoint.active.load(Ordering::Acquire) != 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "other native ingress did not drain"
+            );
+            std::thread::yield_now();
+        }
+        let observer = Arc::new(DrainObservation {
+            endpoint: Arc::downgrade(&endpoint),
+            observed: Mutex::new(None),
+        });
+        let waker = Waker::from(Arc::clone(&observer));
+        let mut context = Context::from_waker(&waker);
+        let mut idle = Box::pin(endpoint.idle.notified());
+        assert!(matches!(idle.as_mut().poll(&mut context), Poll::Pending));
+        drop(call);
+        let actual = *observer.observed.lock().unwrap();
+        drop(idle);
+        drop(endpoint);
+        drop(carrier);
+        native.clear_faults();
+        native.close().unwrap();
+        // Only the mounted registry and this test's observer reference may
+        // remain when idle is published. No call may still own a service lease.
+        assert_eq!(
+            actual,
+            Some((0, 2)),
+            "native idle notification retained a per-call endpoint capability"
+        );
     }
 }

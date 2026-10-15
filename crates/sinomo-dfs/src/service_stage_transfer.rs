@@ -849,15 +849,36 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         match response.result {
             DfsBlobTransferResult::Durable { ref content_hash }
             | DfsBlobTransferResult::Committed { ref content_hash } => {
-                if self
-                    .coordinator
-                    .intent(&response.intent_id)
-                    .is_some_and(|intent| {
-                        matches!(
-                            intent.state,
-                            DfsWriteIntentState::Aborted | DfsWriteIntentState::Rejected
-                        )
-                    })
+                // Another admitted Main lane can have committed the abort
+                // while this cached coordinator still awaits this real reply.
+                // The exact durable terminal tuple denies a new receipt; it
+                // grants no publication or recovery authority to the sender.
+                let durable_closed = self
+                    .metadata_backend
+                    .as_ref()
+                    .map(|backend| backend.get_intent(&response.object_id, &response.intent_id))
+                    .transpose()?
+                    .flatten()
+                    .is_some_and(|record| {
+                        record.file_system_id == response.file_system_id
+                            && record.object_id == response.object_id
+                            && record.intent_id == response.intent_id
+                            && record.target_version == response.version
+                            && matches!(
+                                record.status,
+                                DfsWriteIntentStatus::Aborted | DfsWriteIntentStatus::Rejected
+                            )
+                    });
+                if durable_closed
+                    || self
+                        .coordinator
+                        .intent(&response.intent_id)
+                        .is_some_and(|intent| {
+                            matches!(
+                                intent.state,
+                                DfsWriteIntentState::Aborted | DfsWriteIntentState::Rejected
+                            )
+                        })
                 {
                     let intent_id = response.intent_id.clone();
                     return Ok(Some(NetworkedDfsServiceEvent::BlobStageRejected {

@@ -933,9 +933,9 @@ fn daemon_metadata_authority_retries_preserve_one_absolute_deadline() {
 struct TestPlacementAuthorityPermitRecord {
     job_id: String,
     holder_id: String,
-    holder_cluster_id: Option<String>,
-    holder_node_id: Option<NodeId>,
-    holder_session_id: Option<String>,
+    holder_cluster_id: String,
+    holder_node_id: NodeId,
+    holder_session_id: String,
 }
 
 #[test]
@@ -1442,7 +1442,6 @@ fn replica_materialization_cancellation_retains_blocking_replay_capabilities() {
         "replica-materialization:{}",
         fixture.data_dir.root().display()
     ));
-    let owners_before = Arc::strong_count(&fixture.data_owner);
     fixture.pause.release();
     started
         .recv_timeout(Duration::from_secs(2))
@@ -1466,7 +1465,9 @@ fn replica_materialization_cancellation_retains_blocking_replay_capabilities() {
         );
         assert!(fixture.shard.try_checkout().unwrap().is_none());
         assert!(
-            Arc::strong_count(&fixture.data_owner) >= owners_before,
+            fixture
+                .pause
+                .blocking_replay_holds_owner(&fixture.data_owner),
             "the actual blocking replay retains the Main owner"
         );
         release.send(()).unwrap();
@@ -1480,6 +1481,11 @@ fn replica_materialization_cancellation_retains_blocking_replay_capabilities() {
             .await
             .unwrap()
             .unwrap(),
+        );
+        assert!(
+            !fixture
+                .pause
+                .blocking_replay_holds_owner(&fixture.data_owner)
         );
     });
     fixture.close();
@@ -2637,7 +2643,105 @@ fn background_repair_dispatch_releases_source_for_reciprocal_routine_admission()
     let sink_scheduler = Arc::clone(&source_scheduler);
     let sink_runtime = runtime.handle().clone();
     let sink_replies = Arc::clone(&replies);
-    worker.set_background_response_handler(move |message| {
+    let sink_original = native.commands[&target].clone();
+    let sink_shards = native.native.metadata_shards().unwrap();
+    let sink_local = source.clone();
+    let other_shard = sink_shards
+        .iter()
+        .find(|shard| shard.shard_id == "services")
+        .expect("the genuine native setup has the independent Services shard");
+    let reciprocal_scope = DfsMessageExecutionScope::ExactShard {
+        file_system_id: other_shard.file_system_id.clone(),
+        shard_id: sinomo_dfs::DfsMetadataShardId::new(&other_shard.shard_id),
+    };
+    worker.set_background_response_handler(move |message, original| {
+        let original =
+            original.expect("checkpointed reply retains its original locally owned request");
+        assert_eq!(original, &sink_original);
+        let scope = super::message_host::owned_repair_completion_scope(
+            original,
+            &message,
+            &sink_local,
+            &sink_shards,
+        )
+        .expect("the exact native request and reply select their current owning shard");
+        assert!(
+            matches!(&scope, DfsMessageExecutionScope::ExactShard { shard_id, .. }
+            if shard_id.0 == "root")
+        );
+        // Mutate only DATA clones of the actual native pair. None may earn even
+        // a scheduling scope, and none is dispatched or applied to a backend.
+        let mut foreign = original.clone();
+        foreign.source_node_id = original.target_node_id.clone();
+        assert!(
+            super::message_host::owned_repair_completion_scope(
+                &foreign,
+                &message,
+                &sink_local,
+                &sink_shards,
+            )
+            .is_err()
+        );
+        let mut stale = original.clone();
+        let DfsNetworkMessage::RepairReplica(request) = &mut stale.message else {
+            unreachable!()
+        };
+        request.authority_shard.as_mut().unwrap().epoch += 1;
+        assert!(
+            super::message_host::owned_repair_completion_scope(
+                &stale,
+                &message,
+                &sink_local,
+                &sink_shards,
+            )
+            .is_err()
+        );
+        let mut wrong_path = original.clone();
+        let DfsNetworkMessage::RepairReplica(request) = &mut wrong_path.message else {
+            unreachable!()
+        };
+        request.object_metadata.as_mut().unwrap().path = "/services/foreign-repair.bin".into();
+        assert!(
+            super::message_host::owned_repair_completion_scope(
+                &wrong_path,
+                &message,
+                &sink_local,
+                &sink_shards,
+            )
+            .is_err()
+        );
+        let mut wrong_version = message.clone();
+        let DfsNetworkMessage::RepairReplicaResponse(response) = &mut wrong_version.message else {
+            unreachable!()
+        };
+        response.version =
+            sinomo_core::Id::derived("test.owned-repair.foreign-version", b"negative");
+        assert!(
+            super::message_host::owned_repair_completion_scope(
+                original,
+                &wrong_version,
+                &sink_local,
+                &sink_shards,
+            )
+            .is_err()
+        );
+        let mut wrong_hash = message.clone();
+        let DfsNetworkMessage::RepairReplicaResponse(response) = &mut wrong_hash.message else {
+            unreachable!()
+        };
+        let DfsBlobTransferResult::Committed { content_hash } = &mut response.result else {
+            panic!("the actual native peer committed this repair body")
+        };
+        content_hash.push('0');
+        assert!(
+            super::message_host::owned_repair_completion_scope(
+                original,
+                &wrong_hash,
+                &sink_local,
+                &sink_shards,
+            )
+            .is_err()
+        );
         assert!(
             super::message_host::daemon_dfs_message_preempts_maintenance(&message.message),
             "ordinary unsolicited repair replies retain foreground classification"
@@ -2645,11 +2749,7 @@ fn background_repair_dispatch_releases_source_for_reciprocal_routine_admission()
         let admission = sink_runtime.block_on(async {
             tokio::time::timeout(
                 Duration::from_secs(1),
-                admit_daemon_dfs_message(
-                    &sink_scheduler,
-                    &DfsMessageExecutionScope::GlobalExclusive,
-                    false,
-                ),
+                admit_daemon_dfs_message(&sink_scheduler, &scope, false),
             )
             .await
             .expect("matched reply reacquires fresh source admission")
@@ -2677,24 +2777,22 @@ fn background_repair_dispatch_releases_source_for_reciprocal_routine_admission()
             .unwrap();
         let reciprocal = tokio::time::timeout(
             Duration::from_secs(1),
-            admit_daemon_dfs_message(
-                &source_scheduler,
-                &DfsMessageExecutionScope::GlobalExclusive,
-                false,
-            ),
+            admit_daemon_dfs_message(&source_scheduler, &reciprocal_scope, false),
         )
         .await
-        .expect("root namespace can enter the source while its repair waits")
+        .expect("independent Services work can enter while the Root repair waits")
         .unwrap();
         assert!(!source_interest.is_requested());
         assert!(!target_interest.is_requested());
-        drop(reciprocal);
+        // Keep the independent shard lease until the real repair return has
+        // completed its earned Root admission. A global restamp would stall.
         drop(target_owner);
         tokio::time::timeout(Duration::from_secs(1), dispatch)
             .await
             .expect("reciprocal work resolves without preempting either Routine")
             .unwrap()
             .unwrap();
+        drop(reciprocal);
     });
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(replies.load(Ordering::SeqCst), 1);
@@ -2760,7 +2858,7 @@ fn background_repair_worker_replacement_retains_parked_owned_payload() {
         .unwrap();
     let mut previous = service.detach_message_deferred_work();
     drop(service);
-    previous.set_background_response_handler(|_| panic!("an offline target must stay parked"));
+    previous.set_background_response_handler(|_, _| panic!("an offline target must stay parked"));
     previous.set_deferred_target_node_ids([target.clone()].into_iter().collect());
     assert!(previous.has_pending().unwrap());
     assert!(!previous.scheduling_snapshot().unwrap().0);
@@ -2780,7 +2878,11 @@ fn background_repair_worker_replacement_retains_parked_owned_payload() {
         "replacement must retain the previous reader"
     );
     let sink_replies = Arc::clone(&replies);
-    replacement.set_background_response_handler(move |message| {
+    replacement.set_background_response_handler(move |message, original| {
+        assert!(
+            original.is_some(),
+            "checkpointed reply retains its original locally owned request"
+        );
         assert!(
             matches!(message.message, DfsNetworkMessage::RepairReplicaResponse(response)
             if response.request_id == expected_request_id
@@ -2913,7 +3015,11 @@ fn assert_background_repair_same_policy_replacement_wakes(register_after_publica
         let mut replacement = replacement_service.detach_message_deferred_work();
         drop(replacement_service);
         let sink_replies = Arc::clone(&replies);
-        replacement.set_background_response_handler(move |message| {
+        replacement.set_background_response_handler(move |message, original| {
+            assert!(
+                original.is_some(),
+                "checkpointed reply retains its original locally owned request"
+            );
             assert!(
                 matches!(message.message, DfsNetworkMessage::RepairReplicaResponse(response)
                 if response.request_id == expected_request_id
@@ -3039,7 +3145,8 @@ fn background_repair_checkpoint_survives_cancellation_without_publishing_unpersi
             sinomo_dfs::LocalContentStore::new(root.join("checkpoint-source-content")).unwrap(),
         );
         let mut older_worker = service.prepare_background_replica_worker();
-        older_worker.set_background_response_handler(|_| panic!("an older holder must stay empty"));
+        older_worker
+            .set_background_response_handler(|_, _| panic!("an older holder must stay empty"));
         service.set_background_replica_dispatch(maintenance_kind.replica_dispatch_is_deferred());
         // Capture the new holder before the cancellable generation starts,
         // as both regular maintenance kinds do. Private preparations stay invisible.
@@ -3137,7 +3244,11 @@ fn background_repair_checkpoint_survives_cancellation_without_publishing_unpersi
         let sink_scheduler = Arc::clone(&scheduler);
         let sink_runtime = runtime.handle().clone();
         let sink_replies = Arc::clone(&replies);
-        worker.set_background_response_handler(move |message| {
+        worker.set_background_response_handler(move |message, original| {
+            assert!(
+                original.is_some(),
+                "checkpointed reply retains its original locally owned request"
+            );
             let admission = sink_runtime.block_on(async {
                 tokio::time::timeout(
                     Duration::from_secs(1),
@@ -3307,7 +3418,11 @@ fn assert_background_repair_batch_continues_after_error(unmatched_peer: bool) {
     let mut worker = service.detach_message_deferred_work();
     drop(service);
     let observed_healthy = Arc::clone(&healthy_replies);
-    worker.set_background_response_handler(move |message| {
+    worker.set_background_response_handler(move |message, original| {
+        assert!(
+            original.is_some(),
+            "checkpointed reply retains its original locally owned request"
+        );
         assert!(
             matches!(&message.message, DfsNetworkMessage::RepairReplicaResponse(response)
             if matches!(response.result, DfsBlobTransferResult::Committed { .. }))
@@ -3979,96 +4094,66 @@ fn committed_work_emitter_is_quiet_for_noop_and_retains_publish_edge() {
 
 #[test]
 fn metadata_publish_discovery_retains_global_edge_across_planning_failure() {
-    let root = temp_root("metadata-publish-discovery-retry");
-    let data_root = root.join("data");
-    let data_dir = SinomoDataDir::new(&data_root);
-    data_dir.ensure_root_layout().expect("data dir");
+    let (native, nodes) =
+        crate::test_runtime::DfsTestRuntime::start_cluster("native-metadata-discovery-recovery", 1)
+            .unwrap();
+    let data_dir = native.data_dir(&nodes[0]).clone();
     let cluster_paths = ClusterPaths::new(&data_dir);
-    let paths = DaemonPaths::new(&data_dir);
-    let control_owner =
-        Arc::new(DaemonDataOwnerLock::acquire(&paths).expect("control-loop data-owner capability"));
-    register_daemon_dfs_data_owner_lock(&paths, &control_owner)
-        .expect("register data-owner capability");
-    let runtime = daemon_test_runtime("metadata-publish-discovery-retry");
-
-    assert_eq!(
-        schedule_daemon_dfs_metadata_publish_for_data_dir_on_runtime(
-            data_dir.clone(),
-            cluster_paths.clone(),
-            runtime.handle(),
-            None,
-            None,
-        ),
-        DfsMetadataPublishScheduleStart::Started,
-        "the discovery lane must be retained before cluster planning succeeds"
+    let runtime = native.runtime_handle();
+    // Drain only this fixture's startup edge before injecting missing topology.
+    // All subsequent work stays in its actual registered component/task owner.
+    let startup_deadline = Instant::now() + Duration::from_secs(5);
+    while daemon_dfs_metadata_publish_discovery_is_active(&data_dir.root()) {
+        assert!(
+            Instant::now() < startup_deadline,
+            "normal discovery startup must drain"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let initial = daemon_dfs_metadata_publish_discovery_attempts(&data_dir.root());
+    let saved_state = cluster_paths
+        .state
+        .with_extension("discovery-recovery-saved");
+    std::fs::rename(&cluster_paths.state, &saved_state).unwrap();
+    assert!(sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths).is_err());
+    let start = schedule_daemon_dfs_metadata_publish_for_data_dir_on_runtime(
+        data_dir.clone(),
+        cluster_paths.clone(),
+        &runtime,
+        None,
+        None,
     );
     let first_deadline = Instant::now() + Duration::from_secs(2);
-    while daemon_dfs_metadata_publish_discovery_attempts(&data_dir.root()).0 == 0
+    while daemon_dfs_metadata_publish_discovery_attempts(&data_dir.root()).0 == initial.0
         && Instant::now() < first_deadline
     {
         std::thread::sleep(Duration::from_millis(10));
     }
-    let (failed_attempts, successes) =
-        daemon_dfs_metadata_publish_discovery_attempts(&data_dir.root());
-    assert!(failed_attempts > 0);
-    assert_eq!(successes, 0, "cluster state is intentionally absent");
-
-    let local = NodeId::from_legacy_named("node_dfs_discovery_retry").expect("node");
-    write_test_cluster_state(&data_root, &local);
-    let file_system = distributed_sifs(local.clone());
-    let shard = DfsMetadataShardConfig {
-        file_system_id: file_system.file_system_id.clone(),
-        shard_id: "root".to_string(),
-        primary_node_id: local.clone(),
-        replica_node_ids: Vec::new(),
-        epoch: 1,
-        assignment: DfsMetadataShardAssignment::Root,
-
-        default_policy: DfsObjectPolicy::ReplicatedEventual,
-    };
-    append_cluster_raft_command(
-        &cluster_paths,
-        &local,
-        sinomo_core::kv::KvCommand::Txn(sinomo_core::kv::KvTxn {
-            compares: Vec::new(),
-            success: vec![
-                sinomo_core::kv::KvOp::put_serde(
-                    file_system_config_key(&file_system.file_system_id),
-                    &DfsFileSystemConfig::from(&file_system),
-                    None,
-                )
-                .expect("filesystem config op"),
-                sinomo_core::kv::KvOp::put_serde(
-                    metadata_shard_key(&file_system.file_system_id, "root"),
-                    &shard,
-                    None,
-                )
-                .expect("metadata shard op"),
-            ],
-            failure: Vec::new(),
-        }),
-    )
-    .expect("install recovered topology");
-
+    let failed = daemon_dfs_metadata_publish_discovery_attempts(&data_dir.root());
+    // Restore the exact same durable identity before assertions/cleanup; no
+    // new configuration, artificial authority or second schedule wakes it.
+    std::fs::rename(&saved_state, &cluster_paths.state).unwrap();
+    assert_eq!(start, DfsMetadataPublishScheduleStart::Started);
+    assert!(failed.0 > initial.0);
+    assert_eq!(
+        failed.1, initial.1,
+        "absent topology cannot complete discovery"
+    );
     let recovery_deadline = Instant::now() + Duration::from_secs(5);
-    while daemon_dfs_metadata_publish_discovery_attempts(&data_dir.root()).1 == 0
+    while daemon_dfs_metadata_publish_discovery_attempts(&data_dir.root()).1 == initial.1
         && Instant::now() < recovery_deadline
     {
         std::thread::sleep(Duration::from_millis(10));
     }
     let mut settled = daemon_dfs_metadata_publish_discovery_attempts(&data_dir.root());
-    assert!(settled.0 >= 2, "the retained edge must retry planning");
     assert!(
-        settled.1 >= 1,
-        "topology recovery alone must drain the retained discovery edge"
+        settled.0 >= initial.0 + 2,
+        "the retained edge must retry planning"
     );
-
-    // Installing topology can produce another legitimate discovery edge:
-    // the exact lane opened by the retained attempt attaches its resident
-    // authority observer, which then publishes the newly observed semantic
-    // authority generation. Do not require an exact success count. Require
-    // the coalesced lane to become quiet after those bounded wakes instead,
-    // proving recovery does not turn the observer edge into a retry loop.
+    assert!(
+        settled.1 > initial.1,
+        "topology recovery alone must drain the retained edge"
+    );
     let quiet_window = Duration::from_millis(1_250);
     let drain_deadline = Instant::now() + Duration::from_secs(5);
     let mut unchanged_since = Instant::now();
@@ -4087,8 +4172,8 @@ fn metadata_publish_discovery_retains_global_edge_across_planning_failure() {
             "metadata discovery did not drain after topology recovery; last counts: {settled:?}"
         );
     }
+    native.close().expect("drain the actual embedded owner");
 }
-
 #[test]
 fn metadata_publish_missing_route_wakes_on_semantic_route_generation() {
     let root = temp_root("metadata-publish-route-generation");
@@ -4558,45 +4643,20 @@ fn run_daemon_dfs_maintenance_body_for_test(
     paths: &DaemonPaths,
     runtime: &tokio::runtime::Runtime,
 ) -> Result<(), DaemonError> {
-    let data_dir = SinomoDataDir::new(daemon_data_dir(paths)?);
-    let cluster_paths = ClusterPaths::new(&data_dir);
-    let cluster_state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)?;
-    let metadata_authority_preflight =
-        runtime.block_on(warm_daemon_dfs_metadata_authority_for_identity_async(
-            &cluster_paths,
-            &cluster_state.cluster_id,
-            &cluster_state.local_node_id,
+    // Enter the real owner/admission wrapper; calling the inner body cannot
+    // supply clustered publication custody.
+    runtime
+        .block_on(run_daemon_dfs_maintenance_tick_kind_on_runtime(
+            paths,
             runtime.handle(),
-        ))?;
-    let foreground_preemption =
-        daemon_dfs_mutation_scheduler(&data_dir)?.begin_maintenance_interest();
-    let mut deferred_work = None;
-    let result = runtime.block_on(run_daemon_dfs_maintenance_tick_with_admission(
-        data_dir,
-        cluster_paths.clone(),
-        runtime.handle(),
-        &metadata_authority_preflight,
-        DaemonDfsMaintenanceKind::AuthoritativeReconciliation {
-            content_gc_requested: true,
-            content_reservation_reconciliation_requested: true,
-            commit_promotion_recovery_requested: true,
-        },
-        sinomo_device::NodeResourceSnapshot::default(),
-        DfsCommittedWorkTracker::new(),
-        &mut deferred_work,
-        &mut None,
-        None,
-        &foreground_preemption,
-    ));
-    if let Some((detached_runtime, worker)) = deferred_work {
-        schedule_daemon_dfs_message_deferred_work(
-            runtime.handle(),
-            &cluster_paths,
-            detached_runtime,
-            worker,
-        );
-    }
-    result.map(|_| ())
+            DaemonDfsMaintenanceKind::AuthoritativeReconciliation {
+                content_gc_requested: true,
+                content_reservation_reconciliation_requested: true,
+                commit_promotion_recovery_requested: true,
+            },
+            sinomo_device::NodeResourceSnapshot::default(),
+        ))
+        .map(|_| ())
 }
 
 fn daemon_dfs_test_execution_scope(
@@ -4856,10 +4916,18 @@ fn daemon_dfs_pending_probe_does_not_schedule_unprotected_content_gc() {
         )
         .unwrap();
     let paths = DaemonPaths::new(native.data_dir(&node));
-    let before = daemon_dfs_pending_maintenance_work(&paths).unwrap();
+    let before = daemon_dfs_pending_reactive_maintenance_work_on_runtime(
+        &paths,
+        crate::test_runtime::executor().handle(),
+    )
+    .unwrap();
     assert_eq!(before.due_time_based_maintenance_count, 0);
     assert!(client.content().has_blob(&orphan.content_hash).unwrap());
-    let after = daemon_dfs_pending_maintenance_work(&paths).unwrap();
+    let after = daemon_dfs_pending_reactive_maintenance_work_on_runtime(
+        &paths,
+        crate::test_runtime::executor().handle(),
+    )
+    .unwrap();
     assert_eq!(after.due_time_based_maintenance_count, 0);
     assert_eq!(
         after.should_trigger_background_maintenance(),
@@ -5861,6 +5929,19 @@ fn daemon_data_plane_replica_ingress_reuses_one_resident_shard() {
     let marker = source
         .posix_mkdir("/native-resident-ingress-marker")
         .unwrap();
+    drop(source);
+    let mut source = native.metadata_primary_service("/").unwrap();
+    let completed = source.posix_sync_directory("/").unwrap();
+    assert_eq!(
+        completed
+            .metadata_certificate
+            .acknowledged_node_ids
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        [primary.clone(), replica.clone()].into_iter().collect(),
+        "duplicate-ingress setup must be durably complete on both real participants"
+    );
     let backend = source.metadata_backend().unwrap();
     let mut subscription = backend.subscribe(before);
     let batch = backend.poll_subscription(&mut subscription).unwrap();
@@ -5960,10 +6041,13 @@ fn daemon_data_plane_replica_ingress_reuses_one_resident_shard() {
         sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
     )
     .unwrap();
-    assert!(matches!(
-        response.result,
-        crate::DfsMetadataSnapshotInstallResult::Installed { .. }
-    ));
+    assert!(
+        matches!(
+            response.result,
+            crate::DfsMetadataSnapshotInstallResult::Installed { .. }
+        ),
+        "actual native snapshot response: {response:?}"
+    );
     assert_eq!(native.observation_dropped_count(), 0);
     native.assert_fault_budgets().unwrap();
     drop(actual_handle);
@@ -5985,7 +6069,8 @@ fn daemon_dfs_metadata_journal_batch_applies_to_local_backend() {
     let replica = shard.replica_node_ids[0].clone();
     let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
     let mut writer = runtime.client(&primary).unwrap();
-    let before = writer
+    let initial = runtime.metadata_primary_service("/").unwrap();
+    let before = initial
         .metadata_backend()
         .unwrap()
         .export_shard_table_snapshot(&shard_id)
@@ -5993,6 +6078,7 @@ fn daemon_dfs_metadata_journal_batch_applies_to_local_backend() {
         .unwrap()
         .prefix_proof
         .journal_sequence;
+    drop(initial);
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
     runtime.install_fault(crate::test_runtime::FaultRule {
         source: Some(primary.clone()),
@@ -6039,18 +6125,30 @@ fn daemon_dfs_metadata_journal_batch_applies_to_local_backend() {
             if !observed {
                 return Err("native prepare dispatch was not observed".into());
             }
-            let source = LocalSobjMetadataBackend::open_for_inspection(
-                shard_id.clone(),
-                crate::local_dfs_metadata_shard_path(
-                    runtime.data_dir(&shard.primary_node_id),
-                    &shard_id,
-                ),
-            )
-            .map_err(|error| error.to_string())?;
-            let batch = source
-                .journal_batch_for_shard_since_limited(&shard_id, before, 1, usize::MAX)
-                .map_err(|error| error.to_string())?
-                .ok_or("actual retained prepare frame missing")?;
+            // A peer dispatch can belong to an already queued publisher.
+            // Keep the original observation deadline and require the actual
+            // new source frame before constructing the native ingest request.
+            let (source, batch) = loop {
+                let source = LocalSobjMetadataBackend::open_for_inspection(
+                    shard_id.clone(),
+                    crate::local_dfs_metadata_shard_path(
+                        runtime.data_dir(&shard.primary_node_id),
+                        &shard_id,
+                    ),
+                )
+                .map_err(|error| error.to_string())?;
+                if let Some(batch) = source
+                    .journal_batch_for_shard_since_limited(&shard_id, before, 1, usize::MAX)
+                    .map_err(|error| error.to_string())?
+                {
+                    break (source, batch);
+                }
+                if Instant::now() >= deadline {
+                    return Err("actual new prepare frame did not appear within the original observation deadline".into());
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            };
+            assert_eq!(batch.entries[0].sequence, before + 1);
             assert!(matches!(
                 &batch.entries[0].mutation,
                 crate::DfsMetadataMutation::PrepareOperationV7 { .. }
@@ -6059,20 +6157,22 @@ fn daemon_dfs_metadata_journal_batch_applies_to_local_backend() {
                 &source, &batch,
             )
             .map_err(|error| error.to_string())?;
+            let command = crate::metadata_replication::dfs_metadata_durable_journal_batch_command(
+                &shard.primary_node_id,
+                &replica,
+                &shard.file_system_id,
+                shard.epoch,
+                frames,
+                false,
+            );
+            assert!(
+                command.durable_replication.is_some(),
+                "the actual frame carries its normal exact-prefix purpose"
+            );
             let request = sinomo_core::network::ObjectRpcRequest::encode_body(
                 crate::DFS_METADATA_JOURNAL_BATCH_ROUTE,
                 crate::DFS_RPC_CATEGORY,
-                &crate::DfsMetadataJournalBatchCommand {
-                    request_id: "native-first-replica-ingest".into(),
-                    source_node_id: Some(shard.primary_node_id.clone()),
-                    file_system_id: Some(shard.file_system_id.clone()),
-                    authority_epoch: Some(shard.epoch),
-                    verify_prefix_only: false,
-                    prefix_probe: None,
-                    authority_probe: None,
-                    durable_replication: None,
-                    batch: frames,
-                },
+                &command,
             )
             .map_err(|error| error.to_string())?;
             let response = runtime.rpc_request(
@@ -6083,6 +6183,18 @@ fn daemon_dfs_metadata_journal_batch_applies_to_local_backend() {
             )?;
             let response: crate::DfsMetadataJournalBatchResponse =
                 response.decode_body().map_err(|error| error.to_string())?;
+            let receiver = LocalSobjMetadataBackend::open_for_inspection(
+                shard_id.clone(),
+                crate::local_dfs_metadata_shard_path(runtime.data_dir(&replica), &shard_id),
+            )
+            .map_err(|error| error.to_string())?;
+            if receiver
+                .get_object_by_path(&shard.file_system_id, "/native-receiver-apply.bin")
+                .map_err(|error| error.to_string())?
+                .is_some()
+            {
+                return Err("a hidden Prepare must not expose the unpublished object".into());
+            }
             Ok(response)
         })();
         runtime.clear_faults();
@@ -6098,13 +6210,36 @@ fn daemon_dfs_metadata_journal_batch_applies_to_local_backend() {
             "one real complete Prepare frame first ingested"
         );
         let stat = published.expect("normal original RPC exact replay and commit complete");
-        let mut target = runtime.client(&replica).unwrap();
-        let object = target
-            .metadata_backend()
-            .unwrap()
-            .get_object(&stat.object_id)
-            .unwrap()
+        // The first ingest proved the hidden Prepare. Certify the actual
+        // subsequent Commit on every metadata member before inspecting it.
+        let mut source = runtime
+            .metadata_primary_service("/native-receiver-apply.bin")
             .unwrap();
+        let sync_target = source
+            .posix_capture_file_sync_target(
+                "/native-receiver-apply.bin",
+                crate::DfsPosixSyncKind::File,
+            )
+            .unwrap();
+        let synced = source
+            .posix_sync_file_local(&sync_target, sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
+            .unwrap();
+        assert_eq!(
+            synced
+                .metadata_certificate
+                .acknowledged_node_ids
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([shard.primary_node_id.clone(), replica.clone()])
+        );
+        drop(source);
+        let receiver = LocalSobjMetadataBackend::open_for_inspection(
+            shard_id.clone(),
+            crate::local_dfs_metadata_shard_path(runtime.data_dir(&replica), &shard_id),
+        )
+        .unwrap();
+        let object = receiver.get_object(&stat.object_id).unwrap().unwrap();
+        let mut target = runtime.client(&replica).unwrap();
         assert_eq!(object.version, stat.version);
         assert_eq!(
             target
@@ -6133,6 +6268,19 @@ fn daemon_dfs_metadata_journal_batch_uses_path_safe_shard_directory() {
     let shard_id = DfsMetadataShardId::new(config.shard_id.clone());
     let mut source = native.client(&primary).unwrap();
     source.posix_mkdir("/native-path-safe-marker").unwrap();
+    drop(source);
+    let mut source = native.metadata_primary_service("/").unwrap();
+    let setup = source.posix_sync_directory("/").unwrap();
+    assert_eq!(
+        setup
+            .metadata_certificate
+            .acknowledged_node_ids
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        [primary.clone(), replica.clone()].into_iter().collect(),
+        "finish the legitimate fixture publication before observing hostile input"
+    );
     let backend = source.metadata_backend().unwrap();
     let mut subscription = backend.subscribe(0);
     let batch = backend.poll_subscription(&mut subscription).unwrap();
@@ -6331,8 +6479,23 @@ fn daemon_dfs_maintenance_tick_resumes_namespace_jobs() {
         .unwrap();
     assert_eq!(job.status, DfsNamespaceJobStatus::Running);
     let paths = DaemonPaths::new(native.data_dir(&node));
-    let pending = daemon_dfs_pending_maintenance_work(&paths).unwrap();
-    assert_eq!(pending.pending_namespace_job_count, 1);
+    let observed_at = OffsetDateTime::now_utc();
+    let pending = daemon_dfs_pending_maintenance_work_on_runtime(
+        &paths,
+        crate::test_runtime::executor().handle(),
+    )
+    .unwrap();
+    let inspector = native.metadata_primary_service(old).unwrap();
+    let actual_job = inspector
+        .metadata_backend()
+        .unwrap()
+        .get_namespace_job(&job.job_id)
+        .unwrap();
+    drop(inspector);
+    assert_eq!(
+        pending.pending_namespace_job_count, 1,
+        "actual job at probe starting {observed_at}: {actual_job:?}; captured reply={job:?}"
+    );
     assert!(pending.should_trigger_background_maintenance());
     for _ in 0..8 {
         let tick = native
@@ -6366,9 +6529,12 @@ fn daemon_dfs_maintenance_tick_resumes_namespace_jobs() {
     assert_eq!(stored.status, DfsNamespaceJobStatus::Completed);
     assert!(stored.completed_at.is_some());
     assert_eq!(
-        daemon_dfs_pending_maintenance_work(&paths)
-            .unwrap()
-            .pending_namespace_job_count,
+        daemon_dfs_pending_maintenance_work_on_runtime(
+            &paths,
+            crate::test_runtime::executor().handle()
+        )
+        .unwrap()
+        .pending_namespace_job_count,
         0
     );
     assert_eq!(
@@ -7548,7 +7714,9 @@ fn daemon_dfs_offline_only_receipt_below_quorum_is_not_executable_work() {
     assert!(!pending.should_trigger_background_maintenance());
     drop(reader);
     fixture.native.reopen_node(fixture.primary.clone()).unwrap();
-    fixture.source = Some(fixture.native.client(&fixture.primary).unwrap());
+    let mut reopened = fixture.native.metadata_primary_service("/").unwrap();
+    reopened.hydrate_from_metadata_backend().unwrap();
+    fixture.source = Some(reopened);
     fixture.close();
 }
 
@@ -7925,33 +8093,40 @@ fn daemon_dfs_reactive_probe_retains_completed_promoted_primary_rebind_until_mai
     native.start_nodes().unwrap();
     let retiring = native.root_shard().unwrap();
     let control = native.shared_control_plane().unwrap();
-    let configs = control.with_client(|kv| {
-        crate::DfsControlPlaneStore::new(kv.as_mut())
-            .list_metadata_shards(&retiring.file_system_id)
-            .unwrap()
-    });
     let mut source = native.client(&retiring.primary_node_id).unwrap();
     source.posix_mkdir("/native-rebind-source-cut").unwrap();
     let promoted_data = native.data_dir(&nodes[1]).clone();
-    let scheduler = daemon_dfs_mutation_scheduler(&promoted_data).unwrap();
-    let admission = crate::test_runtime::executor()
-        .block_on(scheduler.admit(&crate::DfsMessageExecutionScope::GlobalExclusive))
-        .unwrap();
+    // Hold only local activation. Global admission also blocks the fresh
+    // replica proof required to complete the actual handoff itself.
+    let rebind_hold = install_daemon_dfs_pre_dispatch_test_hook(
+        &promoted_data,
+        Arc::new(|point, _, _| {
+            if matches!(point, DaemonDfsPreDispatchTestPoint::BeforeCompletedPrimaryRebind { shard_id }
+                if shard_id.0 == "root")
+            {
+                return Err(crate::DfsError::Cancelled {
+                    operation: "negative local completed-primary activation interruption",
+                });
+            }
+            Ok(())
+        }),
+    );
     let desired = DfsMetadataShardConfig {
         primary_node_id: nodes[1].clone(),
         replica_node_ids: vec![nodes[0].clone()],
         epoch: retiring.epoch + 1,
         ..retiring.clone()
     };
-    control.with_client(|kv| {
-        crate::DfsControlPlaneStore::new(kv.as_mut())
-            .begin_metadata_shard_membership_handoff(&retiring, &desired)
-            .unwrap()
-            .unwrap()
-    });
-    source
-        .reconcile_pending_metadata_shard_membership_handoffs(&configs, Duration::from_secs(5))
+    drop(source);
+    let installed = native
+        .reassign_metadata_shard(
+            &retiring.file_system_id,
+            "root",
+            desired.primary_node_id.clone(),
+            desired.replica_node_ids.clone(),
+        )
         .unwrap();
+    assert_eq!(installed, desired);
     let actual = control.with_client(|kv| {
         crate::DfsControlPlaneStore::new(kv.as_mut())
             .get_metadata_shard(&desired.file_system_id, "root")
@@ -7960,14 +8135,66 @@ fn daemon_dfs_reactive_probe_retains_completed_promoted_primary_rebind_until_mai
     });
     assert_eq!(actual, desired);
     let paths = DaemonPaths::new(&promoted_data);
-    let pending = daemon_dfs_pending_reactive_maintenance_work(&paths).unwrap();
+    let promoted_cluster = ClusterPaths::new(&promoted_data);
+    let state = sinomo_core::cluster::read_cluster_state_without_kv(&promoted_cluster).unwrap();
+    let runtime = native.runtime_handle();
+    let preflight = runtime
+        .block_on(warm_daemon_dfs_metadata_authority_for_identity_async(
+            &promoted_cluster,
+            &state.cluster_id,
+            &state.local_node_id,
+            &runtime,
+        ))
+        .unwrap();
+    let projection = preflight.authority.current_complete_prefix().unwrap();
+    let projected_shard = projection
+        .entries()
+        .iter()
+        .find(|entry| entry.key == crate::metadata_shard_key(&desired.file_system_id, "root"))
+        .unwrap()
+        .decode::<DfsMetadataShardConfig>()
+        .unwrap();
+    let projected_proof = projection
+        .entries()
+        .iter()
+        .find(|entry| {
+            entry.key
+                == crate::metadata_shard_membership_handoff_proof_key(
+                    &desired.file_system_id,
+                    "root",
+                )
+        })
+        .map(|entry| {
+            entry
+                .decode::<DfsMetadataShardMembershipHandoffProof>()
+                .unwrap()
+        });
+    eprintln!(
+        "promoted={} expected={desired:?} retained={projected_shard:?} proof={projected_proof:?} sorted={}",
+        nodes[1],
+        projection
+            .entries()
+            .windows(2)
+            .all(|pair| pair[0].key < pair[1].key)
+    );
+    let pending =
+        daemon_dfs_pending_reactive_maintenance_work_on_runtime(&paths, &runtime).unwrap();
     assert_eq!(pending.pending_local_membership_handoff_count, 0);
-    assert_eq!(pending.completed_local_primary_handoff_rebind_count, 1);
+    assert_eq!(
+        pending.completed_local_primary_handoff_rebind_count,
+        1,
+        "actual promoted marker: {:?}",
+        read_local_dfs_metadata_shard_write_freeze(
+            &promoted_data,
+            &DfsMetadataShardId::new("root"),
+        )
+        .unwrap()
+    );
     assert!(
         pending.should_trigger_background_maintenance(),
         "the actual unactivated receiver marker retains its completion wake"
     );
-    drop(admission);
+    drop(rebind_hold);
     let observed = native
         .maintenance_tick(&nodes[1], Duration::from_secs(5))
         .unwrap();
@@ -7984,16 +8211,17 @@ fn daemon_dfs_reactive_probe_retains_completed_promoted_primary_rebind_until_mai
     .unwrap();
     assert_eq!(marker.activated_epoch, Some(desired.epoch));
     assert_eq!(
-        daemon_dfs_pending_reactive_maintenance_work(&paths)
+        daemon_dfs_pending_reactive_maintenance_work_on_runtime(&paths, &runtime)
             .unwrap()
             .completed_local_primary_handoff_rebind_count,
         0
     );
+    drop(preflight);
     let mut promoted = native.client(&nodes[1]).unwrap();
     assert!(promoted.posix_stat("/native-rebind-source-cut").is_ok());
     promoted.posix_mkdir("/native-rebind-new-author").unwrap();
     drop(promoted);
-    drop(source);
+    drop(control);
     native.close().unwrap();
 }
 
@@ -8117,16 +8345,31 @@ fn daemon_dfs_maintenance_tick_runs_anti_entropy() {
         .content()
         .debug_remove_loose_blob(object.content_hash.as_deref().unwrap())
         .unwrap();
+    let paths = DaemonPaths::new(native.data_dir(&node));
     for _ in 0..8 {
-        let tick = native
-            .maintenance_tick(&node, Duration::from_secs(5))
-            .unwrap();
+        // Inventory reconciliation is explicit. Routine resident ticks are
+        // deliberately inventory-free and must remain quiet without this ask.
+        let started = Instant::now();
+        let executor = crate::test_runtime::executor();
+        let outcome = executor.block_on(run_daemon_dfs_maintenance_tick_kind_on_runtime(
+            &paths,
+            executor.handle(),
+            DaemonDfsMaintenanceKind::AuthoritativeReconciliation {
+                content_gc_requested: false,
+                content_reservation_reconciliation_requested: true,
+                commit_promotion_recovery_requested: false,
+            },
+            sinomo_device::NodeResourceSnapshot::default(),
+        ));
+        // Join the original native invocation before checking the same limit;
+        // never abandon a running data owner on a timeout.
+        assert!(started.elapsed() <= Duration::from_secs(5));
         assert!(
-            tick.outcome.is_ok(),
-            "ordinary actual anti-entropy owner: {:?}",
-            tick.outcome
+            outcome.is_ok(),
+            "explicit actual anti-entropy owner: {outcome:?}"
         );
-        if !client
+        let inspector = native.metadata_primary_service(path).unwrap();
+        if !inspector
             .current_read_object_metadata(&object.object_id)
             .unwrap()
             .current_locations
@@ -8135,11 +8378,12 @@ fn daemon_dfs_maintenance_tick_runs_anti_entropy() {
             break;
         }
     }
-    let current = client
+    let inspector = native.metadata_primary_service(path).unwrap();
+    let current = inspector
         .current_read_object_metadata(&object.object_id)
         .unwrap();
     assert!(!current.current_locations.contains(&node));
-    let version = client
+    let version = inspector
         .metadata_backend()
         .unwrap()
         .get_version(&object.object_id, &object.version)
@@ -8154,8 +8398,141 @@ fn daemon_dfs_maintenance_tick_runs_anti_entropy() {
         .exists(),
         "completed actual scan clears its cursor"
     );
+    drop(inspector);
     drop(client);
     native.close().unwrap();
+}
+
+// Establish real lag without allowing a publication with an incomplete ACK set.
+// The stopped receiver has durably accepted the exact hidden prepare; it has not
+// received the later commit marker when the publisher resumes.
+fn create_directory_with_replica_stopped_before_commit(
+    runtime: &mut crate::test_runtime::DfsTestRuntime,
+    source: &mut crate::NetworkedDfsService<crate::DfsNodeTransport>,
+    primary: &NodeId,
+    replica: &NodeId,
+    path: &str,
+) -> crate::DfsPreparedOperationDigest {
+    let (captured_tx, captured_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let pause = Mutex::new(Some((captured_tx, release_rx)));
+    let expected_path = path.to_string();
+    let hook: Arc<DaemonDfsPreDispatchTestHook> = Arc::new(move |point, command, _| {
+        if !matches!(point, DaemonDfsPreDispatchTestPoint::BeforeExecute { .. }) {
+            return Ok(());
+        }
+        let Some(command) = command else {
+            return Ok(());
+        };
+        let crate::DfsNetworkMessage::NamespaceRequest(request) = &command.routed_message.message
+        else {
+            return Ok(());
+        };
+        if !matches!(&request.operation, crate::DfsNamespaceOperation::MkdirAll { path } if path == &expected_path)
+        {
+            return Ok(());
+        }
+        let (captured, release) = pause
+            .lock()
+            .unwrap()
+            .take()
+            .expect("one native directory producer");
+        let path = expected_path.clone();
+        crate::publication_guard::AFTER_PREPARED_AUTHORIZATION.with(|hook| {
+            assert!(hook.borrow().is_none());
+            *hook.borrow_mut() = Some(Box::new(move |digest, payload| {
+                assert!(
+                    payload
+                        .transaction
+                        .objects
+                        .iter()
+                        .any(|object| object.path == path)
+                );
+                assert_eq!(digest.payload_digest, payload.canonical_digest().unwrap());
+                captured.send(digest.clone()).unwrap();
+                release
+                    .recv()
+                    .expect("test releases the real admitted writer");
+            }));
+        });
+        Ok(())
+    });
+    let hook = install_daemon_dfs_pre_dispatch_test_hook(runtime.data_dir(primary), hook);
+    struct Release(Option<std::sync::mpsc::Sender<()>>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+    let digest = std::thread::scope(|scope| {
+        let release = Release(Some(release_tx));
+        let publisher = scope.spawn(|| source.posix_mkdir_all(path));
+        let digest = captured_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("actual full-participant author guard");
+        runtime
+            .stop_node(replica)
+            .expect("stop acknowledged disposable replica before commit");
+        drop(release);
+        publisher
+            .join()
+            .unwrap()
+            .expect("publication uses its genuine complete prepare acknowledgements");
+        digest
+    });
+    drop(hook);
+    let replica_root = crate::default_dfs_metadata_shards_root(runtime.data_dir(replica))
+        .join(crate::metadata_keys::key_segment(&digest.shard_id.0));
+    let inspected = crate::LocalSobjMetadataBackend::open_for_inspection(
+        digest.shard_id.clone(),
+        &replica_root,
+    )
+    .unwrap();
+    let durable_head = digest.prepare_sequence;
+    assert!(
+        inspected
+            .journal_since_limited(durable_head, 1)
+            .unwrap()
+            .is_empty(),
+        "the paused author cannot have sent a later commit before the receiver stopped"
+    );
+    let frames = inspected
+        .journal_since_limited(digest.prepare_sequence - 1, 1)
+        .unwrap();
+    assert_eq!(
+        frames.len(),
+        1,
+        "the stopped receiver must retain its actual acknowledged Prepare"
+    );
+    assert_eq!(frames[0].sequence, digest.prepare_sequence);
+    assert!(matches!(&frames[0].mutation,
+        crate::DfsMetadataMutation::PrepareOperationV7 { record, .. } if record.digest == digest));
+    drop(inspected);
+    // A native ACK certifies the journal; its asynchronous table replay can
+    // still be pending when Main stops. Recover that same acknowledged log
+    // before asserting its materialized hidden record, without authoring work.
+    let backend =
+        crate::LocalSobjMetadataBackend::new(digest.shard_id.clone(), &replica_root).unwrap();
+    assert_eq!(
+        backend.journal_last_sequence(),
+        durable_head,
+        "materializing the acknowledged Prepare must not author another frame"
+    );
+    let original = backend
+        .prepared_operation_record(&digest.operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(original.digest, digest);
+    assert_eq!(original.status, crate::DfsPreparedOperationStatus::Prepared);
+    assert!(
+        backend
+            .get_object_by_path(&digest.file_system_id, path)
+            .unwrap()
+            .is_none()
+    );
+    digest
 }
 
 #[test]
@@ -8207,12 +8584,14 @@ fn daemon_dfs_status_reads_configured_sharded_metadata_backend() {
         .unwrap()
         .unwrap()
         .materialized_through_sequence;
-    runtime
-        .stop_node(&offline_node)
-        .expect("stop actual replica");
-    source
-        .posix_mkdir_all("/services/status-sharded")
-        .expect("current guarded metadata write with a real recovery majority");
+    let admitted = create_directory_with_replica_stopped_before_commit(
+        &mut runtime,
+        &mut source,
+        &source_node,
+        &offline_node,
+        "/services/status-sharded",
+    );
+    assert_eq!(admitted.prepare_sequence, before_sequence + 1);
     let status = sinomo_dfs::inspect_cluster_aware_dfs_status(&data_dir, &cluster_paths)
         .expect("current sharded status");
     assert_eq!(status.file_system_count, 1);
@@ -8239,18 +8618,63 @@ fn daemon_dfs_status_reads_configured_sharded_metadata_backend() {
         "the guarded directory mutation contributes one prepare and one commit"
     );
     assert!(services_status.replay_cursors.is_empty());
-    assert!(
-        services_status
-            .replica_lag
-            .iter()
-            .any(|lag| lag.target_node_id == offline_node && lag.lag_entries >= 2),
-        "the stopped native replica has not acknowledged the new operation"
+    let stopped_lag = services_status
+        .replica_lag
+        .iter()
+        .find(|lag| lag.target_node_id == offline_node)
+        .expect("stopped configured participant lag");
+    assert_eq!(
+        services_status.journal_last_sequence - admitted.prepare_sequence,
+        1,
+        "full-participant publication leaves only its commit marker behind the acknowledged preparation"
     );
+    assert_eq!(
+        stopped_lag.lag_entries,
+        services_status.journal_last_sequence - admitted.prepare_sequence,
+        "reported lag equals the proven native prefix gap, not an assumed degraded-write frame count"
+    );
+    // The prepare reached all participants; publication of its commit marker to
+    // the remaining live peer is asynchronous. Observe that actual durable ACK
+    // before asserting that the stopped participant is the only remaining work.
+    let publication_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    for target in services
+        .replica_node_ids
+        .iter()
+        .filter(|target| **target != offline_node)
+    {
+        loop {
+            let cursor = source
+                .metadata_backend()
+                .unwrap()
+                .metadata_replication_cursor(target, &services_id)
+                .unwrap();
+            if cursor >= services_status.journal_last_sequence {
+                break;
+            }
+            assert!(
+                Instant::now() < publication_deadline,
+                "live peer {target} must acknowledge the actual commit marker within the existing network budget; cursor={cursor}, head={}",
+                services_status.journal_last_sequence
+            );
+            std::thread::yield_now();
+        }
+    }
     let pending = daemon_dfs_pending_maintenance_work(&paths).expect("pending maintenance");
     assert_eq!(pending.pending_write_count, 0);
     assert_eq!(pending.pending_repair_count, 0);
     assert_eq!(pending.pending_namespace_job_count, 0);
-    assert!(pending.metadata_replica_lag_count > 0);
+    assert_eq!(
+        pending.metadata_replica_lag_count, 0,
+        "offline lag is not immediately executable work"
+    );
+    assert_eq!(
+        pending.deferred_work_count, 1,
+        "the stopped participant's exact commit-marker gap remains accounted for"
+    );
+    assert!(
+        !pending.has_work(),
+        "only the explicitly counted deferred publisher remains"
+    );
     assert_eq!(pending.pending_local_membership_handoff_count, 0);
     assert_eq!(pending.due_time_based_maintenance_count, 0);
     assert!(
@@ -8332,8 +8756,14 @@ fn late_native_replication_fixture(
     crate::NetworkedDfsService<crate::DfsNodeTransport>,
     DfsMetadataShardConfig,
 ) {
-    crate::test_support::current_native_metadata_service(name, 3, "/")
-        .expect("normal owned native metadata fixture")
+    let (native, requester, shard) =
+        crate::test_support::current_native_metadata_service(name, 3, "/")
+            .expect("normal owned native metadata fixture");
+    drop(requester);
+    let source = native
+        .metadata_primary_service("/")
+        .expect("actual owning Root Core producer");
+    (native, source, shard)
 }
 
 fn late_native_hidden_suffix(
@@ -8381,6 +8811,38 @@ fn late_native_hidden_suffix(
         .journal_last_sequence
 }
 
+fn late_native_publish_from_current_authority(
+    native: &crate::test_runtime::DfsTestRuntime,
+    local: &NodeId,
+    sender: DfsMetadataJournalBatchSender,
+    snapshot: crate::DfsMetadataSnapshotInstallSender,
+    options: crate::DfsMetadataJournalReplicationOptions,
+) -> Result<crate::DfsMetadataJournalReplicationReport, crate::DfsError> {
+    // Mounted owners lend their current configuration. The standalone cluster
+    // path reopens Raft state and can collide with this fixture's live KV owner.
+    // Keep the same normal publisher, physical journal, actual peer senders and
+    // per-attempt/target budgets; only obtain its inputs from the native owner.
+    let shards = native
+        .metadata_shards()
+        .expect("actual native shard projection");
+    let peers = shards
+        .iter()
+        .flat_map(|shard| {
+            std::iter::once(shard.primary_node_id.clone()).chain(shard.replica_node_ids.clone())
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut transport = crate::DfsMetadataNodeTransport::new(peers, sender, snapshot);
+    let mut host = crate::LocalDfsMetadataJournalPublisherHost::new(native.data_dir(local).clone());
+    crate::publish_dfs_metadata_journal_with_host(
+        crate::sifs_file_system_id(),
+        local,
+        shards,
+        &mut host,
+        &mut transport,
+        options,
+    )
+}
+
 fn late_native_publish_options() -> crate::DfsMetadataJournalReplicationOptions {
     crate::DfsMetadataJournalReplicationOptions {
         probe_caught_up_replicas: true,
@@ -8410,6 +8872,14 @@ fn daemon_dfs_metadata_journal_publish_replicates_all_local_primary_shards() {
         let installed = native
             .reassign_metadata_shard(&fs, &config.shard_id, local.clone(), members)
             .unwrap();
+        let mut source = native
+            .metadata_primary_service(if installed.shard_id == "root" {
+                "/"
+            } else {
+                "/services"
+            })
+            .unwrap();
+        late_native_hidden_suffix(&mut source, &installed, 1);
         expected.push(DfsMetadataShardId::new(installed.shard_id));
     }
     let (peer, _) = native.peer_transports(&local).unwrap();
@@ -8425,10 +8895,9 @@ fn daemon_dfs_metadata_journal_publish_replicates_all_local_primary_shards() {
         copied.lock().unwrap().push(command.batch.shard_id.clone());
         actual(node, command, budget)
     });
-    let data = native.data_dir(&local);
-    let report = crate::publish_cluster_dfs_metadata_journal(
-        data,
-        &ClusterPaths::new(data),
+    let report = late_native_publish_from_current_authority(
+        &native,
+        &local,
         sender,
         snapshot,
         late_native_publish_options(),
@@ -8475,10 +8944,9 @@ fn daemon_dfs_metadata_journal_publish_drains_bounded_batches() {
         }
         actual(node, command, budget)
     });
-    let data = native.data_dir(&local);
-    let report = crate::publish_cluster_dfs_metadata_journal(
-        data,
-        &ClusterPaths::new(data),
+    let report = late_native_publish_from_current_authority(
+        &native,
+        &local,
         sender,
         snapshot,
         late_native_publish_options(),
@@ -8556,10 +9024,9 @@ fn daemon_dfs_metadata_journal_publish_rejects_mismatched_ack_cursor() {
         }
         Ok(response)
     });
-    let data = native.data_dir(&local);
-    let report = crate::publish_cluster_dfs_metadata_journal(
-        data,
-        &ClusterPaths::new(data),
+    let report = late_native_publish_from_current_authority(
+        &native,
+        &local,
         sender,
         snapshot,
         late_native_publish_options(),
@@ -8618,7 +9085,7 @@ fn daemon_dfs_metadata_journal_publish_stops_after_replica_rejection() {
     let observed = Arc::clone(&attempts);
     let selected = target.clone();
     let sender: DfsMetadataJournalBatchSender = Arc::new(move |node, command, budget| {
-        if node != &selected {
+        if node != &selected || command.batch.shard_id != shard_id {
             return actual(node, command, budget);
         }
         observed.fetch_add(1, Ordering::SeqCst);
@@ -8626,10 +9093,9 @@ fn daemon_dfs_metadata_journal_publish_stops_after_replica_rejection() {
         invalid.authority_epoch = Some(shard.epoch.saturating_add(1));
         actual(node, &invalid, budget)
     });
-    let data = native.data_dir(&local);
-    let report = crate::publish_cluster_dfs_metadata_journal(
-        data,
-        &ClusterPaths::new(data),
+    let report = late_native_publish_from_current_authority(
+        &native,
+        &local,
         sender,
         snapshot,
         late_native_publish_options(),
@@ -8784,13 +9250,15 @@ fn daemon_dfs_metadata_journal_publish_bounds_endpoint_fallbacks_per_target() {
     let attempted = Arc::new(Mutex::new(Vec::new()));
     let observed = Arc::clone(&attempted);
     let sender: DfsMetadataJournalBatchSender = Arc::new(move |node, command, budget| {
-        observed.lock().unwrap().push(node.clone());
+        observed
+            .lock()
+            .unwrap()
+            .push((node.clone(), command.batch.shard_id.clone()));
         actual(node, command, budget)
     });
-    let data = native.data_dir(&local);
-    let report = crate::publish_cluster_dfs_metadata_journal(
-        data,
-        &ClusterPaths::new(data),
+    let report = late_native_publish_from_current_authority(
+        &native,
+        &local,
         sender,
         snapshot,
         late_native_publish_options(),
@@ -8803,7 +9271,7 @@ fn daemon_dfs_metadata_journal_publish_bounds_endpoint_fallbacks_per_target() {
             .lock()
             .unwrap()
             .iter()
-            .filter(|node| **node == target)
+            .filter(|(node, shard)| *node == target && shard.0 == "root")
             .count(),
         1,
         "publisher makes one target-level attempt; the normal carrier owns route fallback"
@@ -8832,7 +9300,6 @@ fn cancelled_daemon_dfs_rpc_retains_committed_work_edges() {
     .expect("actual cancellation capture before normal mounts");
     native.start_nodes().unwrap();
     let shard = native.root_shard().unwrap();
-    let mut source = native.client(&shard.primary_node_id).unwrap();
     let local = shard.primary_node_id.clone();
     let remote = shard.replica_node_ids[0].clone();
     let missing_replica = shard.replica_node_ids[1].clone();
@@ -8840,18 +9307,69 @@ fn cancelled_daemon_dfs_rpc_retains_committed_work_edges() {
     let paths = DaemonPaths::new(&data_dir);
     let file_system = native.file_system();
     let path = "/cancelled-publish-edge.txt";
+    let mut placement =
+        crate::DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 2).unwrap();
+    placement.required_node_ids = vec![local.clone(), missing_replica.clone()];
+    let accepted = native
+        .apply_placement_policy(&local, path, crate::DfsPlacementScope::SelfOnly, placement)
+        .unwrap();
+    let control = native.shared_control_plane().unwrap();
+    let setup_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    loop {
+        let job = control
+            .with_client(|kv| {
+                crate::DfsControlPlaneStore::new(kv.as_mut())
+                    .placement_reconciliation(&accepted.file_system_id, &accepted.job_id)
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.accepted_config, accepted.accepted_config);
+        assert_eq!(job.scanned_object_count, 0);
+        assert!(job.last_error.is_none());
+        if job.state == crate::DfsPlacementReconciliationState::Completed {
+            break;
+        }
+        let remaining = setup_deadline.saturating_duration_since(Instant::now());
+        assert!(!remaining.is_zero());
+        native
+            .maintenance_tick(&local, remaining)
+            .unwrap()
+            .outcome
+            .unwrap();
+    }
+    drop(control);
+    let mut source = native.metadata_primary_service(path).unwrap();
+    let (_, _, policy) = source
+        .managed_replication_policy_for_path(path, DfsObjectPolicy::ReplicatedEventual, 2)
+        .unwrap();
     let prior = source
         .posix_write_file(
             path,
             b"real previous head",
             DfsWriteOptions {
-                policy: DfsReplicationPolicy::new(1, 1).unwrap(),
-                replica_candidates: vec![local.clone()],
+                policy: policy.clone(),
+                replica_candidates: vec![local.clone(), missing_replica.clone()],
                 wait_for_commit: true,
-                foreground_replica_repair: false,
+                foreground_replica_repair: true,
             },
         )
         .unwrap();
+    let base_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    while source
+        .metadata_backend()
+        .unwrap()
+        .receipts_for_version(&prior.object_id, &prior.version)
+        .unwrap()
+        .len()
+        != 2
+    {
+        assert!(
+            Instant::now() < base_deadline,
+            "the real predecessor copies must settle before the cancellation fault"
+        );
+        source.retry_pending_repairs_bounded(1).unwrap();
+        source.process_incoming().unwrap();
+    }
     let original = source
         .metadata_backend()
         .unwrap()
@@ -8862,7 +9380,7 @@ fn cancelled_daemon_dfs_rpc_retains_committed_work_edges() {
     native.install_fault(crate::test_runtime::FaultRule {
         source: Some(local.clone()),
         target: Some(missing_replica.clone()),
-        route: None,
+        route: Some(crate::DFS_DATA_REPAIR_REPLICA_ROUTE.into()),
         call_id: None,
         origin: None,
         remaining_hits: 32,
@@ -8881,7 +9399,9 @@ fn cancelled_daemon_dfs_rpc_retains_committed_work_edges() {
     write.authority_shard = Some(shard.clone());
     write.requester_blob_pre_staged = false;
     write.desired_replica_nodes = vec![local.clone(), missing_replica];
-    write.policy = DfsReplicationPolicy::new(1, 2).expect("W=1, N=2 policy");
+    write.policy = policy;
+    let committed_version = write.request.target_version.clone();
+    let committed_hash = crate::content_hash(&write.bytes);
     write
         .object_metadata
         .as_mut()
@@ -8897,11 +9417,13 @@ fn cancelled_daemon_dfs_rpc_retains_committed_work_edges() {
     let (committed_rx, release_tx) =
         install_daemon_dfs_message_committed_edge_test_hook(request_id);
     let runtime = daemon_test_runtime("daemon-dfs-cancelled-rpc-publish-edge");
-    let task_paths = paths.clone();
-    let task_runtime = runtime.handle().clone();
-    let rpc = runtime.handle().spawn(async move {
-        handle_daemon_dfs_message_async(&task_paths, command, None, None, &task_runtime).await
-    });
+    let invocation = native.rpc_result_future(
+        &remote,
+        &local,
+        crate::dfs_message_rpc_call(&command).unwrap(),
+        sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+    );
+    let rpc = runtime.handle().spawn(invocation);
 
     committed_rx
         .recv_timeout(Duration::from_secs(3))
@@ -8915,8 +9437,9 @@ fn cancelled_daemon_dfs_rpc_retains_committed_work_edges() {
         .expect("reopen metadata backend")
         .get_object(&object_id)
         .expect("read committed object")
-        .is_some(),
-        "the mutation must be durable before the cancellable RPC boundary"
+        .is_some_and(|object| object.version == committed_version
+            && object.content_hash.as_deref() == Some(committed_hash.as_str())),
+        "the NEW mutation must be durable before the cancellable RPC boundary"
     );
     assert_eq!(
         LocalSobjMetadataBackend::new(
@@ -8987,7 +9510,9 @@ fn cancelled_daemon_dfs_rpc_retains_subscribed_replica_progress_edge() {
     .expect("actual cancellation capture before normal mounts");
     native.start_nodes().unwrap();
     let shard = native.root_shard().unwrap();
-    let mut source = native.client(&shard.primary_node_id).unwrap();
+    let mut source = native
+        .metadata_primary_service("/native-cancel-progress-marker")
+        .unwrap();
     let primary = shard.primary_node_id.clone();
     let replica = shard.replica_node_ids[0].clone();
     let data_dir = native.data_dir(&replica).clone();
@@ -9012,6 +9537,20 @@ fn cancelled_daemon_dfs_rpc_retains_subscribed_replica_progress_edge() {
         .get_object(&stat.object_id)
         .unwrap()
         .unwrap();
+    let target = source.capture_metadata_quorum_sync_target(&object).unwrap();
+    let certificate = source
+        .sync_metadata_shard_to_quorum(&target, sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
+        .unwrap();
+    assert_eq!(certificate.acknowledged_node_ids.len(), 3);
+    native.install_fault(crate::test_runtime::FaultRule {
+        source: Some(primary.clone()),
+        target: Some(replica.clone()),
+        route: None,
+        call_id: None,
+        origin: Some(crate::test_runtime::RpcOrigin::RegisteredHost),
+        remaining_hits: 32,
+        action: crate::test_runtime::FaultAction::BudgetExhausted,
+    });
     let before = source
         .metadata_backend()
         .unwrap()
@@ -9021,7 +9560,14 @@ fn cancelled_daemon_dfs_rpc_retains_subscribed_replica_progress_edge() {
         .find(|status| status.shard_id.0 == shard.shard_id)
         .unwrap()
         .journal_last_sequence;
-    late_native_hidden_suffix(&mut source, &shard, 1);
+    let after_sequence = late_native_hidden_suffix(&mut source, &shard, 1);
+    assert_eq!(after_sequence, before + 1);
+    let expected_prefix = source
+        .metadata_backend()
+        .unwrap()
+        .metadata_prefix_proof(&DfsMetadataShardId::new(&shard.shard_id))
+        .unwrap()
+        .unwrap();
     let batch = source
         .metadata_backend()
         .unwrap()
@@ -9055,30 +9601,31 @@ fn cancelled_daemon_dfs_rpc_retains_subscribed_replica_progress_edge() {
         request_id,
         DfsRoutedMessage {
             source_node_id: primary.clone(),
-            target_node_id: replica,
+            target_node_id: replica.clone(),
             frame_id: 90_102,
             message_id: 90_102,
-            message: DfsNetworkMessage::MetadataJournalBatch(DfsMetadataJournalBatchCommand {
-                request_id: "dfs_metadata_cancelled_replica_progress".to_string(),
-                source_node_id: Some(primary),
-                file_system_id: Some(file_system.file_system_id.clone()),
-                authority_epoch: Some(shard.epoch),
-                verify_prefix_only: false,
-                prefix_probe: None,
-                authority_probe: None,
-                durable_replication: None,
-                batch: framed,
-            }),
+            message: DfsNetworkMessage::MetadataJournalBatch(
+                crate::metadata_replication::dfs_metadata_durable_journal_batch_command(
+                    &primary,
+                    &replica,
+                    &file_system.file_system_id,
+                    shard.epoch,
+                    framed,
+                    false,
+                ),
+            ),
         },
     );
     let (committed_rx, release_tx) =
         install_daemon_dfs_message_committed_edge_test_hook(request_id);
     let runtime = daemon_test_runtime("daemon-dfs-cancelled-rpc-replica-progress");
-    let task_paths = paths.clone();
-    let task_runtime = runtime.handle().clone();
-    let rpc = runtime.handle().spawn(async move {
-        handle_daemon_dfs_message_async(&task_paths, command, None, None, &task_runtime).await
-    });
+    let invocation = native.rpc_result_future(
+        &primary,
+        &replica,
+        crate::dfs_message_rpc_call(&command).unwrap(),
+        sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+    );
+    let rpc = runtime.handle().spawn(invocation);
 
     committed_rx
         .recv_timeout(Duration::from_secs(3))
@@ -9095,6 +9642,23 @@ fn cancelled_daemon_dfs_rpc_retains_subscribed_replica_progress_edge() {
         Some(object.clone()),
         "the replica journal batch must be durable before RPC cancellation"
     );
+    let durable = LocalSobjMetadataBackend::open_for_inspection(
+        DfsMetadataShardId::new(&shard.shard_id),
+        crate::default_dfs_metadata_shards_root(&data_dir)
+            .join(crate::metadata_keys::key_segment(&shard.shard_id)),
+    )
+    .unwrap();
+    assert_eq!(
+        durable.journal_last_sequence(),
+        after_sequence,
+        "the actual new native frame is durable before caller cancellation"
+    );
+    assert_eq!(
+        durable.journal_since_limited(before, 1).unwrap(),
+        batch.entries,
+        "the receiver persisted the exact original frame, not just an old visible object"
+    );
+    drop(durable);
     rpc.abort();
     let cancelled = runtime
         .block_on(rpc)
@@ -9118,6 +9682,24 @@ fn cancelled_daemon_dfs_rpc_retains_subscribed_replica_progress_edge() {
             .expect("reconciliation wake channel remains open"),
         "a cancelled RPC must still emit the subscribed replica-progress generation"
     );
+    loop {
+        let materialized = LocalSobjMetadataBackend::open_for_inspection(
+            DfsMetadataShardId::new(&shard.shard_id),
+            crate::default_dfs_metadata_shards_root(&data_dir)
+                .join(crate::metadata_keys::key_segment(&shard.shard_id)),
+        )
+        .unwrap()
+        .metadata_prefix_proof()
+        .unwrap();
+        if materialized == expected_prefix {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the owned replay must materialize the exact prefix within the existing edge budget"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
     let cache_slot = daemon_dfs_message_service_cache()
         .root(&data_dir.root())
         .expect("actual root cache slot");
@@ -9152,6 +9734,7 @@ fn cancelled_daemon_dfs_rpc_retains_subscribed_replica_progress_edge() {
     if let Some(trace) = &trace {
         trace.close().unwrap();
     }
+    native.clear_faults();
     native.close().unwrap();
     if let Some(trace) = trace {
         trace.export().unwrap();
@@ -9448,6 +10031,15 @@ fn daemon_dfs_distributed_write_skips_cold_full_metadata_hydrate() {
     let lane_opens_before_write = daemon_dfs_test_message_service_lane_open_count(&data_dir);
     let runtime = daemon_test_runtime("native-cold-write-lane-observer");
     let cache_key = data_dir.root();
+    let invoke_native = |command: crate::DfsMessageCommand| {
+        let response = native.rpc_call(
+            &remote,
+            &local,
+            crate::dfs_message_rpc_call(&command).unwrap(),
+            sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+        )?;
+        crate::decode_dfs_message_rpc_response(&response).map_err(|error| error.to_string())
+    };
     let mut routed_message = test_dfs_write_routed_message(
         &remote,
         &local,
@@ -9469,11 +10061,10 @@ fn daemon_dfs_distributed_write_skips_cold_full_metadata_hydrate() {
         .as_mut()
         .expect("write object metadata")
         .current_locations = vec![local.clone()];
-    let response = handle_daemon_dfs_message_on_runtime(
-        &paths,
-        test_dfs_message_command("dfs_message_write_skips_cold_hydrate", routed_message),
-        runtime.handle(),
-    )
+    let response = invoke_native(test_dfs_message_command(
+        "dfs_message_write_skips_cold_hydrate",
+        routed_message,
+    ))
     .expect("distributed write DFS message");
     assert_eq!(response.request_id, "dfs_message_write_skips_cold_hydrate");
     let written_object_id = first_object.object_id.clone();
@@ -9725,19 +10316,15 @@ fn daemon_dfs_distributed_write_skips_cold_full_metadata_hydrate() {
         entry.resident_metadata_initialized = true;
     }
 
-    handle_daemon_dfs_message_on_runtime(
-        &paths,
-        test_dfs_message_command(
-            "dfs_message_read_survives_maintenance",
-            test_dfs_lookup_routed_message(
-                &remote,
-                &local,
-                2,
-                "/services/daemon-write-skips-cold-hydrate.txt",
-            ),
+    invoke_native(test_dfs_message_command(
+        "dfs_message_read_survives_maintenance",
+        test_dfs_lookup_routed_message(
+            &remote,
+            &local,
+            2,
+            "/services/daemon-write-skips-cold-hydrate.txt",
         ),
-        runtime.handle(),
-    )
+    ))
     .expect("lightweight lookup DFS message");
     {
         let cache_slot = daemon_dfs_message_service_cache()
@@ -9811,11 +10398,10 @@ fn daemon_dfs_distributed_write_skips_cold_full_metadata_hydrate() {
         .as_mut()
         .expect("write object metadata")
         .current_locations = vec![local.clone()];
-    handle_daemon_dfs_message_on_runtime(
-        &paths,
-        test_dfs_message_command("dfs_message_write_after_maintenance", second_write),
-        runtime.handle(),
-    )
+    invoke_native(test_dfs_message_command(
+        "dfs_message_write_after_maintenance",
+        second_write,
+    ))
     .expect("distributed write after maintenance");
     assert_eq!(
         daemon_dfs_test_message_service_lane_open_count(&data_dir),
@@ -9830,9 +10416,31 @@ fn daemon_dfs_distributed_write_skips_cold_full_metadata_hydrate() {
             .expect("repair snapshot parent directory"),
     )
     .expect("create repair snapshot directory");
-    fs::write(&repair_snapshot, b"invalid repair snapshot").expect("corrupt repair snapshot");
+    // Corrupt the real queue after outer scheduling has observed it, at the
+    // existing admitted maintenance entry. This exercises failure while the
+    // body owns its lane, rather than an earlier preflight rejection.
+    let corrupted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let triggered = Arc::clone(&corrupted);
+    let corrupt_path = repair_snapshot.clone();
+    let failure = install_daemon_dfs_pre_dispatch_test_hook(
+        &data_dir,
+        Arc::new(move |point, command, _| {
+            if matches!(
+                point,
+                DaemonDfsPreDispatchTestPoint::BeforeResidentPreflight
+            ) && command.is_none()
+                && !triggered.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                fs::write(&corrupt_path, b"invalid repair snapshot")
+                    .expect("corrupt actual repair snapshot");
+            }
+            Ok(())
+        }),
+    );
     let error = run_daemon_dfs_maintenance_body_for_test(&paths, &runtime)
         .expect_err("corrupt repair state must fail maintenance");
+    drop(failure);
+    assert!(corrupted.load(std::sync::atomic::Ordering::SeqCst));
     assert!(
         error.to_string().contains("repair"),
         "unexpected maintenance error: {error}"
@@ -9847,8 +10455,8 @@ fn daemon_dfs_distributed_write_skips_cold_full_metadata_hydrate() {
                 .as_ref()
                 .expect("cache entry")
                 .primary_service
-                .is_none(),
-            "failed maintenance must drop its backend-bearing mutation lane"
+                .is_some(),
+            "failed maintenance must return its unchanged owner/storage lane without discarding live custody"
         );
     }
     fs::remove_file(&repair_snapshot).expect("remove corrupt repair snapshot");
@@ -9873,26 +10481,43 @@ fn daemon_dfs_distributed_write_skips_cold_full_metadata_hydrate() {
         .as_mut()
         .expect("write object metadata")
         .current_locations = vec![local.clone()];
-    handle_daemon_dfs_message_on_runtime(
-        &paths,
-        test_dfs_message_command("dfs_message_write_after_failed_maintenance", third_write),
-        runtime.handle(),
-    )
+    invoke_native(test_dfs_message_command(
+        "dfs_message_write_after_failed_maintenance",
+        third_write,
+    ))
     .expect("distributed write after failed maintenance");
     assert_eq!(
         daemon_dfs_test_message_service_lane_open_count(&data_dir),
-        lane_open_count_before_maintenance.saturating_add(1),
-        "the first mutation after failed maintenance must open a new lane"
+        lane_open_count_before_maintenance,
+        "the first mutation after failed maintenance must reuse the checked returned lane"
     );
 
+    // Open the actual control client before taking global admission: its
+    // normal native opener itself needs a publication lease.
+    let control = native.shared_control_plane().unwrap();
     let current_state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
         .expect("cluster state before peer-only maintenance refresh");
+    // Match ordinary Main maintenance: join current configuration before
+    // acquiring its actual global mutation admission, then take that cut.
+    let warm = runtime
+        .block_on(warm_daemon_dfs_metadata_authority_for_identity_async(
+            &cluster_paths,
+            &current_state.cluster_id,
+            &local,
+            runtime.handle(),
+        ))
+        .unwrap();
+    let scheduler = daemon_dfs_mutation_scheduler(&data_dir).unwrap();
+    let admission = runtime
+        .block_on(scheduler.admit(&DfsMessageExecutionScope::GlobalExclusive))
+        .unwrap();
+    let admitted = warm.for_admission(&admission);
     let retained = take_daemon_dfs_message_mutation_service_for_maintenance(
         &data_dir,
         &cluster_paths,
         &current_state,
         runtime.handle(),
-        None,
+        Some(&admitted),
     )
     .expect("take mutation lane before peer-only refresh");
     let added_peer = remote.clone();
@@ -9902,12 +10527,21 @@ fn daemon_dfs_distributed_write_skips_cold_full_metadata_hydrate() {
         .iter_mut()
         .find(|member| member.node_id == added_peer)
         .unwrap();
-    let endpoint = member
-        .endpoints
-        .first_mut()
-        .expect("actual mounted peer endpoint");
-    endpoint.priority = endpoint.priority.saturating_add(1);
-    let control = native.shared_control_plane().unwrap();
+    let before_endpoints = member.endpoints.clone();
+    if let Some(endpoint) = member.endpoints.first_mut() {
+        endpoint.priority = endpoint.priority.saturating_add(1);
+    } else {
+        // The native component carrier has no socket endpoint. Change only
+        // routing DATA to a deliberately unusable address, never live health.
+        member
+            .endpoints
+            .push(sinomo_core::network::daemon_lan_endpoint(
+                &added_peer,
+                "127.0.0.1:9".to_string(),
+                5,
+            ));
+    }
+    assert_ne!(member.endpoints, before_endpoints);
     control
         .with_client(|kv| {
             kv.put(
@@ -9946,20 +10580,52 @@ fn daemon_dfs_distributed_write_skips_cold_full_metadata_hydrate() {
     }
     assert_eq!(
         daemon_dfs_test_message_service_lane_open_count(&data_dir),
-        lane_open_count_before_maintenance.saturating_add(1),
+        lane_open_count_before_maintenance,
         "peer-only maintenance refresh must retain the open metadata backend"
     );
 
+    drop(admission);
     let current_state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
         .expect("current cluster state");
-    let retained = take_daemon_dfs_message_mutation_service_for_maintenance(
+    // Match ordinary Main maintenance: join current configuration before
+    // acquiring its actual global mutation admission, then take that cut.
+    let warm = runtime
+        .block_on(warm_daemon_dfs_metadata_authority_for_identity_async(
+            &cluster_paths,
+            &current_state.cluster_id,
+            &local,
+            runtime.handle(),
+        ))
+        .unwrap();
+    let scheduler = daemon_dfs_mutation_scheduler(&data_dir).unwrap();
+    let admission = runtime
+        .block_on(scheduler.admit(&DfsMessageExecutionScope::GlobalExclusive))
+        .unwrap();
+    let admitted = warm.for_admission(&admission);
+    let mut retained = take_daemon_dfs_message_mutation_service_for_maintenance(
         &data_dir,
         &cluster_paths,
         &current_state,
         runtime.handle(),
-        None,
+        Some(&admitted),
     )
     .expect("take mutation lane for authority-change validation");
+    assert!(
+        retained
+            .lane
+            .service
+            .can_release_hydrated_metadata_projection()
+    );
+    // Retain the old service/signature for the handback check, but release our
+    // own resident checkout before the actual handoff needs the same store.
+    retained
+        .lane
+        .service
+        .release_resident_metadata_backend()
+        .unwrap();
+
+    drop(admission);
+
     let changed_root_shard = native
         .reassign_metadata_shard(
             &root_shard.file_system_id,
@@ -9977,6 +10643,41 @@ fn daemon_dfs_distributed_write_skips_cold_full_metadata_hydrate() {
         )
         .unwrap();
     assert_eq!(changed_root_shard.epoch, root_shard.epoch + 1);
+    // A completed handoff may leave a cold cache. Establish a real current
+    // mutation lane through ordinary Main ingress on this node's remaining
+    // Root authority before checking the delayed old service's handback.
+    let mut current_requester = native.client(&remote).unwrap();
+    current_requester
+        .posix_mkdir("/current-handoff-lane")
+        .unwrap();
+    drop(current_requester);
+    // Hold the same ordinary global admission as the handback owner. Native
+    // reactive maintenance can otherwise temporarily take this optional lane
+    // between the handoff and these pointer-identity observations.
+    let handback_admission = runtime
+        .block_on(scheduler.admit(&DfsMessageExecutionScope::GlobalExclusive))
+        .unwrap();
+    // The actual handoff can retain exact-shard lanes while leaving the global
+    // maintenance lane absent. Preserve every current lane and that absence:
+    // an old handback must neither replace an exact lane nor install itself.
+    let (current_signature, current_primary, current_exact) = {
+        let slot = daemon_dfs_message_service_cache().root(&cache_key).unwrap();
+        let cache = slot.lock().unwrap();
+        let entry = cache.as_ref().unwrap();
+        assert_ne!(
+            entry.signature.metadata_storage_generation,
+            retained.signature.metadata_storage_generation
+        );
+        assert!(
+            entry.primary_service.is_some() || !entry.exact_shard_services.is_empty(),
+            "actual handoff must retain a current served lane"
+        );
+        (
+            entry.signature.clone(),
+            entry.primary_service.clone(),
+            entry.exact_shard_services.clone(),
+        )
+    };
     assert!(
         !restore_daemon_dfs_message_mutation_service_after_maintenance(
             &data_dir,
@@ -9987,18 +10688,30 @@ fn daemon_dfs_distributed_write_skips_cold_full_metadata_hydrate() {
         .expect("validate changed maintenance signature"),
         "authority changes must reject a maintenance lane captured from the old generation"
     );
-    assert!(
-        daemon_dfs_message_service_cache()
-            .root(&cache_key)
-            .expect("actual root cache slot")
-            .lock()
-            .expect("cache lock")
-            .as_ref()
-            .expect("cache entry")
-            .primary_service
-            .is_none(),
-        "a rejected authority generation must leave the mutation lane empty"
-    );
+    {
+        let slot = daemon_dfs_message_service_cache().root(&cache_key).unwrap();
+        let cache = slot.lock().unwrap();
+        let entry = cache.as_ref().unwrap();
+        assert_eq!(entry.signature, current_signature);
+        match (&entry.primary_service, &current_primary) {
+            (Some(actual), Some(expected)) => assert!(Arc::ptr_eq(actual, expected)),
+            (None, None) => {}
+            _ => panic!("rejected old authority changed the current global lane"),
+        }
+        assert_eq!(
+            entry.exact_shard_services.keys().collect::<Vec<_>>(),
+            current_exact.keys().collect::<Vec<_>>(),
+            "rejected old authority changed the current exact-shard lane set"
+        );
+        for (key, expected) in &current_exact {
+            assert!(
+                Arc::ptr_eq(&entry.exact_shard_services[key], expected),
+                "rejected old authority replaced current exact-shard lane {key:?}"
+            );
+        }
+    }
+    drop((current_primary, current_exact));
+    drop(handback_admission);
     assert!(
         evict_daemon_dfs_message_service_cache(&data_dir).expect("evict message cache"),
         "shutdown must release the complete message cache"
@@ -11053,12 +11766,16 @@ fn daemon_dfs_stamped_lookup_is_cold_global_warm_exact_and_read_only() {
         .root(&data_dir.root())
         .expect("actual root cache slot");
     let cache = cache_slot.lock().expect("message cache");
-    let entry = cache.as_ref().expect("cache entry");
-    let exact_lanes_after_cold_poll = entry.exact_shard_services.len();
-    let has_users_lane = entry
-        .exact_shard_services
-        .keys()
-        .any(|key| key.file_system_id == file_system.file_system_id && key.shard_id.0 == "users");
+    // A correctly rejected cold poll may leave the cache entry absent.
+    // That is an observed zero-lane state, not unavailable lane-count evidence.
+    let exact_lanes_after_cold_poll = cache
+        .as_ref()
+        .map_or(0, |entry| entry.exact_shard_services.len());
+    let has_users_lane = cache.as_ref().is_some_and(|entry| {
+        entry.exact_shard_services.keys().any(|key| {
+            key.file_system_id == file_system.file_system_id && key.shard_id.0 == "users"
+        })
+    });
     drop(cache);
     if cold_poll_rejected {
         assert_eq!(
@@ -11193,6 +11910,17 @@ fn daemon_owned_dfs_clients_reuse_and_track_shared_metadata_authority_generation
         Some(&runtime),
     )
     .unwrap();
+    // Retain and warm the actual shared generation before measuring warm
+    // clients. Merely obtaining its weak-registry handle is not a ready cut.
+    let ready = runtime
+        .block_on(warm_daemon_dfs_metadata_authority_for_identity_async(
+            &cluster_paths,
+            &state.cluster_id,
+            &local,
+            &runtime,
+        ))
+        .unwrap();
+    assert!(authority.current_complete_prefix().is_some());
     let key = metadata_shard_key(&initial.file_system_id, &initial.shard_id);
     let read = |client: &dyn crate::DfsControlPlaneKvClient| {
         client
@@ -11202,8 +11930,24 @@ fn daemon_owned_dfs_clients_reuse_and_track_shared_metadata_authority_generation
             .decode::<DfsMetadataShardConfig>()
             .unwrap()
     };
+    // An explicit authority client still performs its real exact-set read;
+    // the daemon-client constructor is the retained-observation contract below.
+    let explicit = DaemonDfsControlPlaneKvClient::new_on_runtime(&cluster_paths, &runtime);
+    assert_eq!(read(&explicit), initial);
+    assert_eq!(
+        explicit
+            .authoritative_exact_set_calls
+            .load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(
+        explicit.authoritative_prefix_calls.load(Ordering::Relaxed),
+        0
+    );
+    drop(explicit);
     for _ in 0..8 {
-        let client = DaemonDfsControlPlaneKvClient::new_on_runtime(&cluster_paths, &runtime);
+        let client =
+            DaemonDfsControlPlaneKvClient::new_daemon_client_on_runtime(&cluster_paths, &runtime);
         assert_eq!(read(&client), initial);
         assert_eq!(
             client.authoritative_exact_set_calls.load(Ordering::Relaxed),
@@ -11217,7 +11961,8 @@ fn daemon_owned_dfs_clients_reuse_and_track_shared_metadata_authority_generation
         assert_eq!(read(shell.control_plane.as_deref().unwrap()), initial);
         drop(shell);
     }
-    let cached = DaemonDfsControlPlaneKvClient::new_on_runtime(&cluster_paths, &runtime);
+    let cached =
+        DaemonDfsControlPlaneKvClient::new_daemon_client_on_runtime(&cluster_paths, &runtime);
     assert_eq!(read(&cached), initial);
     let next_primary = initial.replica_node_ids[0].clone();
     let activated = native
@@ -11274,6 +12019,7 @@ fn daemon_owned_dfs_clients_reuse_and_track_shared_metadata_authority_generation
     );
     assert_eq!(cached.authoritative_prefix_calls.load(Ordering::Relaxed), 0);
     drop(cached);
+    drop(ready);
     drop(authority);
     native.close().unwrap();
 }
@@ -12700,8 +13446,10 @@ fn metadata_authority_discovery_rolls_resident_generation_without_publish_lanes(
         loop {
             match daemon_dfs_bounded_status_resident(&data_dir, &peer_snapshot) {
                 Err(sinomo_dfs::DfsError::Network { ref message })
-                    if message
+                    if (message
                         == "bounded DFS status unavailable while the resident generation cache is being updated"
+                        || message
+                            == "DFS runtime network error at DFS message cache root identity: bounded DFS status unavailable while the resident generation cache is being updated")
                         && Instant::now() < deadline =>
                 {
                     std::thread::sleep(Duration::from_millis(2));
@@ -14433,6 +15181,34 @@ fn default_cluster_metadata_shards_cover_root_users_and_services() {
         runtime.define_node(node.clone()).unwrap();
     }
     runtime.start_nodes().unwrap();
+    // Discovery preserves committed owners. Establish the requested spread
+    // through the same explicit guarded handoffs used by an operator.
+    let initial = runtime.metadata_shards().unwrap();
+    assert!(
+        initial
+            .iter()
+            .all(|shard| shard.primary_node_id == nodes[0])
+    );
+    for (shard, target) in [("services", &nodes[1]), ("users", &nodes[2])] {
+        let fs = initial
+            .iter()
+            .find(|config| config.shard_id == shard)
+            .unwrap()
+            .file_system_id
+            .clone();
+        runtime
+            .reassign_metadata_shard(
+                &fs,
+                shard,
+                target.clone(),
+                nodes
+                    .iter()
+                    .filter(|node| *node != target)
+                    .cloned()
+                    .collect(),
+            )
+            .unwrap();
+    }
     let by_id = runtime
         .metadata_shards()
         .unwrap()
@@ -14448,7 +15224,7 @@ fn default_cluster_metadata_shards_cover_root_users_and_services() {
         DfsMetadataShardAssignment::PathPrefix { prefix } if prefix == crate::SIFS_SERVICES_PATH));
     assert!(matches!(&by_id["users"].assignment,
         DfsMetadataShardAssignment::PathPrefix { prefix } if prefix == crate::SIFS_USERS_PATH));
-    // Ordinary certified expansion now completes the normal role placement.
+    // The explicit native handoffs above now own these exact roles.
     assert_eq!(by_id["root"].primary_node_id, nodes[0]);
     assert_eq!(by_id["services"].primary_node_id, nodes[1]);
     assert_eq!(by_id["users"].primary_node_id, nodes[2]);
@@ -14495,6 +15271,32 @@ fn default_cluster_metadata_shard_expands_replicas_before_primary_transfer() {
         runtime.define_node(node.clone()).unwrap();
     }
     runtime.start_nodes().unwrap();
+    let expanded = runtime
+        .metadata_shards()
+        .unwrap()
+        .into_iter()
+        .find(|config| config.shard_id == "services")
+        .unwrap();
+    assert_eq!(expanded.primary_node_id, nodes[0]);
+    assert_eq!(
+        std::iter::once(&expanded.primary_node_id)
+            .chain(&expanded.replica_node_ids)
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        nodes.iter().cloned().collect()
+    );
+    runtime
+        .reassign_metadata_shard(
+            &expanded.file_system_id,
+            "services",
+            nodes[1].clone(),
+            nodes
+                .iter()
+                .filter(|node| **node != nodes[1])
+                .cloned()
+                .collect(),
+        )
+        .unwrap();
     let actual = runtime
         .metadata_shards()
         .unwrap()
@@ -14582,25 +15384,29 @@ fn default_cluster_metadata_shard_transfers_after_candidate_replays_current_jour
         .expect("actual assignment")
         .expect("services");
     let mut source = fixture.client(&primary).expect("real source client");
-    fixture
-        .stop_node(&candidate)
-        .expect("stop actual candidate");
-    source
-        .posix_mkdir("/services/transfer-replay-witness")
-        .expect("actual metadata-majority publication");
-    let snapshot = source
+    let admitted = create_directory_with_replica_stopped_before_commit(
+        &mut fixture,
+        &mut source,
+        &primary,
+        &candidate,
+        "/services/transfer-replay-witness",
+    );
+    let current = fixture.metadata_primary_service("/services").unwrap();
+    let snapshot = current
         .metadata_backend()
         .expect("actual source backend")
         .export_shard_table_snapshot(&DfsMetadataShardId::new("services"))
         .expect("native source snapshot")
         .expect("services snapshot");
+    assert!(snapshot.materialized_through_sequence > admitted.prepare_sequence);
+    drop(current);
     let mut desired = actual.clone();
     desired.primary_node_id = candidate.clone();
     desired.replica_node_ids =
         crate::control_plane::topology_preserving_metadata_shard_replicas(&actual, &candidate)
             .expect("unchanged native member ring");
     desired.epoch += 1;
-    control
+    let handoff = control
         .with_client(|kv| {
             DfsControlPlaneStore::new(kv.as_mut())
                 .begin_metadata_shard_membership_handoff(&actual, &desired)
@@ -14625,9 +15431,17 @@ fn default_cluster_metadata_shard_transfers_after_candidate_replays_current_jour
     fixture
         .reopen_node(candidate.clone())
         .expect("normal candidate restart/replay");
-    source
-        .reconcile_pending_metadata_shard_membership_handoffs(&configs, Duration::from_secs(5))
-        .expect("real freeze/replay/joint activation");
+    let completion_deadline = Instant::now() + Duration::from_secs(5);
+    let explicit = source
+        .reconcile_pending_metadata_shard_membership_handoffs(&configs, Duration::from_secs(5));
+    let completed = fixture
+        .observe_completed_native_handoff(&control, &handoff, completion_deadline)
+        .expect("observe the original native handoff proof");
+    assert_eq!(
+        completed.as_ref(),
+        Some(&desired),
+        "real freeze/replay/joint activation must finish the original handoff; explicit caller={explicit:?}"
+    );
     let transferred = control
         .with_client(|kv| {
             DfsControlPlaneStore::new(kv.as_mut()).get_metadata_shard(&file_system_id, "services")
@@ -14680,6 +15494,14 @@ fn default_dfs_reactor_propagates_mandatory_recovery_failure() {
     sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
         .expect("sync cluster state");
     let runtime = daemon_test_runtime("default-dfs-bootstrap-recovery-required");
+    let recovery_error =
+        recover_prior_process_default_dfs_placement_authority(&paths, runtime.handle())
+            .expect_err("direct recovery requires actual data-owner custody");
+    assert!(
+        matches!(&recovery_error, DaemonError::Parse { detail }
+        if detail.contains("without a live exclusive main-daemon data-owner lock")),
+        "unexpected direct recovery error: {recovery_error}"
+    );
     let mut reactor =
         DaemonDefaultDfsReconciliationReactor::new(&cluster_paths, &local).expect("reactor");
 
@@ -14694,7 +15516,9 @@ fn default_dfs_reactor_propagates_mandatory_recovery_failure() {
         .expect_err("authoritative startup must propagate recovery failure");
 
     assert!(
-        matches!(&error, DaemonError::Parse { detail } if detail.contains("without a live exclusive main-daemon data-owner lock")),
+        matches!(&error, DaemonError::Network { address, detail }
+            if address == "DFS startup mounted-work replay"
+                && detail == "startup replay has no registered runtime host"),
         "unexpected recovery error: {error}"
     );
 }
@@ -14864,7 +15688,9 @@ fn default_dfs_reactor_defers_recovery_failure_on_non_voter() {
         ))
         .expect_err("non-voter recovery failure remains pending for retry");
     assert!(
-        matches!(&reactor_error, DaemonError::Parse { detail } if detail.contains("without a live exclusive main-daemon data-owner lock")),
+        matches!(&reactor_error, DaemonError::Network { address, detail }
+            if address == "DFS startup mounted-work replay"
+                && detail == "startup replay has no registered runtime host"),
         "unexpected reactor error: {reactor_error}"
     );
     assert_eq!(
@@ -14958,9 +15784,9 @@ fn seed_test_prior_process_placement_permit(
     let permit = TestPlacementAuthorityPermitRecord {
         job_id: format!("prior-process-{case}-job"),
         holder_id: format!("prior-process-{case}-holder"),
-        holder_cluster_id: Some(cluster_id.to_string()),
-        holder_node_id: Some(local_node_id.clone()),
-        holder_session_id: Some(format!("prior-process-{case}-session")),
+        holder_cluster_id: cluster_id.to_string(),
+        holder_node_id: local_node_id.clone(),
+        holder_session_id: format!("prior-process-{case}-session"),
     };
     append_cluster_raft_command(
         cluster_paths,
@@ -15111,6 +15937,7 @@ fn daemon_dfs_transactions_do_not_materialize_post_commit_snapshots() {
         local_data_dir: data_dir.clone(),
         authority_data_dir: data_dir.clone(),
         peers: None,
+        object_rpc: None,
         full_commit_calls: AtomicUsize::new(0),
         compact_commit_calls: AtomicUsize::new(0),
     });
@@ -15203,18 +16030,50 @@ fn daemon_intent_scan_cursor_survives_dropped_maintenance_shell_and_resets_with_
     drop(caller);
     let cluster_state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
         .expect("current bootstrap state");
+    // Retain native authority before admission across cache replacement. No
+    // background scan may run between eviction and observing the fresh owner.
+    let preflight = runtime
+        .block_on(warm_daemon_dfs_metadata_authority_for_identity_async(
+            &cluster_paths,
+            &cluster_state.cluster_id,
+            &cluster_state.local_node_id,
+            &runtime,
+        ))
+        .expect("retain exact authority across cache-owner replacement");
     let scheduler = daemon_dfs_mutation_scheduler(&data_dir).expect("scheduler");
     let admission = runtime
         .block_on(scheduler.admit(&DfsMessageExecutionScope::GlobalExclusive))
         .expect("exclusive maintenance ownership");
-    let retained = take_daemon_dfs_message_mutation_service_for_maintenance(
-        &data_dir,
-        &cluster_paths,
-        &cluster_state,
-        &runtime,
-        None,
-    )
-    .expect("take actual cached lane");
+    // Use the same retained ready generation selected under this actual global
+    // admission, including a completed provider update while admission queued.
+    let preflight = preflight.for_admission(&admission);
+    // Every independent lane selection consumes the generation currently
+    // retained by this same real global admission. Configuration can advance
+    // between selections even though competing metadata scans are excluded.
+    // As in normal Main, only a pre-effect stale-authority outcome can replan,
+    // at most twice; no guard error after execution is retried or accepted.
+    let take_current = || {
+        for replan in 0..=2 {
+            let current = preflight.for_admission(&admission);
+            match try_take_daemon_dfs_message_mutation_service_for_maintenance(
+                &data_dir,
+                &cluster_paths,
+                &cluster_state,
+                &runtime,
+                Some(&current),
+            ) {
+                Ok(retained) => return Ok(retained),
+                Err(DaemonDfsAuthorityPreExecutionError::AuthorityPreflightStale(_))
+                    if replan < 2 => {}
+                Err(DaemonDfsAuthorityPreExecutionError::AuthorityPreflightStale(stale)) => {
+                    return Err(stale.into_dfs_error());
+                }
+                Err(DaemonDfsAuthorityPreExecutionError::Failed(error)) => return Err(error),
+            }
+        }
+        unreachable!("bounded pre-effect selection returns its terminal result")
+    };
+    let retained = take_current().expect("take actual cached lane");
     let owner = Arc::clone(&retained.lane.service.write_intent_maintenance_scan);
     let key = |second| crate::DfsWriteIntentScanCursor {
         created_at: OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(second),
@@ -15227,9 +16086,19 @@ fn daemon_intent_scan_cursor_survives_dropped_maintenance_shell_and_resets_with_
         after: Some(key(2)),
         through: Some(key(9)),
     });
+    let initial_cursor = owner
+        .cursor()
+        .expect("actual admitted startup scan position");
     owner
-        .advance(&None, expected.clone())
+        .advance(&initial_cursor, expected.clone())
         .expect("complete raw page cursor");
+    assert_eq!(owner.cursor().unwrap(), expected);
+    owner.advance(&initial_cursor, None).unwrap();
+    assert_eq!(
+        owner.cursor().unwrap(),
+        expected,
+        "a stale compare cannot rewind the scan"
+    );
     // Cancellation/error destroys the taken service without returning it. The
     // cache's independent Arc must retain both after-key and frozen upper cut.
     drop(retained);
@@ -15250,14 +16119,7 @@ fn daemon_intent_scan_cursor_survives_dropped_maintenance_shell_and_resets_with_
             expected
         );
     }
-    let rebuilt = take_daemon_dfs_message_mutation_service_for_maintenance(
-        &data_dir,
-        &cluster_paths,
-        &cluster_state,
-        &runtime,
-        None,
-    )
-    .expect("rebuild a real maintenance service after cancellation");
+    let rebuilt = take_current().expect("rebuild a real maintenance service after cancellation");
     assert!(Arc::ptr_eq(
         &owner,
         &rebuilt.lane.service.write_intent_maintenance_scan
@@ -15276,29 +16138,7 @@ fn daemon_intent_scan_cursor_survives_dropped_maintenance_shell_and_resets_with_
     // Eviction is a real cache-owner replacement, unlike merely constructing
     // two services with a manually shared cursor. A fresh owner safely rewinds.
     assert!(evict_daemon_dfs_message_service_cache(&data_dir).unwrap());
-    // Eviction can release the last strong authority runtime along with the
-    // service cache. Production warms its replacement before global admission;
-    // retain that exact preflight through the new owner's synchronous take.
-    drop(admission);
-    let preflight = runtime
-        .block_on(warm_daemon_dfs_metadata_authority_for_identity_async(
-            &cluster_paths,
-            &cluster_state.cluster_id,
-            &cluster_state.local_node_id,
-            &runtime,
-        ))
-        .expect("rewarm exact authority before replacement maintenance admission");
-    let admission = runtime
-        .block_on(scheduler.admit(&DfsMessageExecutionScope::GlobalExclusive))
-        .expect("reacquire exclusive ownership after authority preflight");
-    let replaced = take_daemon_dfs_message_mutation_service_for_maintenance(
-        &data_dir,
-        &cluster_paths,
-        &cluster_state,
-        &runtime,
-        Some(&preflight),
-    )
-    .expect("new cache owner");
+    let replaced = take_current().expect("new cache owner");
     assert!(!Arc::ptr_eq(
         &owner,
         &replaced.lane.service.write_intent_maintenance_scan
@@ -15449,7 +16289,7 @@ fn stopped_runtime_joins_a_started_blocking_child_registered_during_drain() {
             join_registered_runtime_for_test(&join_data_dir, Duration::from_secs(5)).await
         });
         tokio::time::timeout(Duration::from_secs(1), async {
-            while !host.shutting_down.load(Ordering::Acquire) {
+            while !host.shutting_down.is_cancelled() {
                 tokio::task::yield_now().await;
             }
         })
@@ -15493,6 +16333,75 @@ fn stopped_runtime_joins_a_started_blocking_child_registered_during_drain() {
 }
 
 #[test]
+fn maintenance_peer_discovery_uses_owned_projection_without_authoritative_reads() {
+    let (native, mut requester, shard) = crate::test_support::current_native_metadata_service(
+        "native-maintenance-no-catalog-refetch",
+        3,
+        "/",
+    )
+    .unwrap();
+    requester
+        .posix_write_file(
+            "/peer-discovery-ready",
+            b"native readiness",
+            crate::DfsWriteOptions::replicated_eventual(vec![shard.primary_node_id.clone()]),
+        )
+        .unwrap();
+    drop(requester);
+    let data_dir = native.data_dir(&shard.primary_node_id).clone();
+    let paths = ClusterPaths::new(&data_dir);
+    let state = sinomo_core::cluster::read_cluster_state_without_kv(&paths).unwrap();
+    let runtime = native.runtime_handle();
+    let expected = std::iter::once(shard.primary_node_id.clone())
+        .chain(shard.replica_node_ids.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    let scheduler = daemon_dfs_mutation_scheduler(&data_dir).unwrap();
+    let admission = runtime
+        .block_on(scheduler.admit(&DfsMessageExecutionScope::GlobalExclusive))
+        .unwrap();
+    take_daemon_dfs_test_authoritative_prefix_call_count(&paths);
+    for _ in 0..8 {
+        let mut retained = take_daemon_dfs_message_mutation_service_for_maintenance(
+            &data_dir, &paths, &state, &runtime, None,
+        )
+        .unwrap();
+        assert_eq!(
+            retained
+                .peer_node_ids
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            expected
+        );
+        assert_eq!(
+            retained
+                .lane
+                .service
+                .placement_content_candidates()
+                .unwrap()
+                .into_iter()
+                .map(|candidate| candidate.node_id)
+                .collect::<BTreeSet<_>>(),
+            expected,
+            "content planning consumes the same coherent advertisements without metadata discovery"
+        );
+        assert!(
+            restore_daemon_dfs_message_mutation_service_after_maintenance(
+                &data_dir, &paths, &runtime, retained,
+            )
+            .unwrap()
+        );
+    }
+    assert_eq!(
+        take_daemon_dfs_test_authoritative_prefix_call_count(&paths),
+        0,
+        "maintenance lane handoff must not refetch the already-owned provider catalog"
+    );
+    drop(admission);
+    native.close().unwrap();
+}
+
+#[test]
 fn native_peer_projection_uses_owned_members_and_catalog_without_optional_checkpoint() {
     let nodes =
         crate::test_runtime::DfsTestRuntime::ordered_node_ids("native-owned-peer-projection", 3);
@@ -15517,23 +16426,21 @@ fn native_peer_projection_uses_owned_members_and_catalog_without_optional_checkp
     let host = registered_dfs_runtime_host(runtime.data_dir(&nodes[0]))
         .unwrap()
         .unwrap();
-    let state = sinomo_core::cluster::read_cluster_state_without_kv(&ClusterPaths::new(
-        runtime.data_dir(&nodes[0]),
-    ))
+    let paths = ClusterPaths::new(runtime.data_dir(&nodes[0]));
+    let state = sinomo_core::cluster::read_cluster_state_without_kv(&paths).unwrap();
+    // Derive the negative input from the same owned, applied projection as
+    // the normal peer reader. Optional local checkpoint reads can be older
+    // than the genuine mounted catalog this test just proved available.
+    let (members, mut entries) = read_native_dfs_peer_configuration(
+        &paths,
+        &state,
+        Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+    )
     .unwrap();
-    let members = host
-        .cluster
-        .kv_range_prefix_local("/cluster/members/")
-        .unwrap()
-        .value
+    let members = members
         .into_iter()
         .map(|entry| entry.decode::<sinomo_core::ClusterMemberRecord>().unwrap())
         .collect::<Vec<_>>();
-    let mut entries = host
-        .cluster
-        .kv_range_prefix_local(sinomo_core::service::CLUSTER_SERVICES_KV_PREFIX)
-        .unwrap()
-        .value;
     let mut changed = false;
     for entry in &mut entries {
         let mut instance = entry
@@ -15602,7 +16509,7 @@ fn with_native_create_proposal(
             action: crate::test_runtime::FaultAction::BudgetExhausted,
         });
     }
-    let mut source = native.client(&primary).unwrap();
+    let mut source = native.metadata_primary_service("/").unwrap();
     let options = DfsWriteOptions {
         policy: DfsReplicationPolicy::new(1, nodes.len()).unwrap(),
         replica_candidates: nodes.clone(),
@@ -15683,7 +16590,7 @@ fn native_pending_source_fixture(name: &str, patch: bool) -> NativePendingSource
     let config = native.root_shard().unwrap();
     let primary = config.primary_node_id.clone();
     let remote = nodes.iter().find(|node| **node != primary).unwrap().clone();
-    let mut source = native.client(&primary).unwrap();
+    let mut source = native.metadata_primary_service("/").unwrap();
     let path = "/native-pending-source.bin";
     let original = source
         .posix_write_file(
@@ -15780,6 +16687,7 @@ fn native_cold_root_cache_does_not_block_another_ready_root() {
     let first_node = first_nodes[0].clone();
     let second_node = second_nodes[0].clone();
     let mut ready = second.client(&second_node).unwrap();
+    let ready_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
     ready
         .posix_write_file(
             "/ready-cache-before",
@@ -15791,7 +16699,22 @@ fn native_cold_root_cache_does_not_block_another_ready_root() {
     let second_peer = read_daemon_dfs_message_peer_snapshot(&second_paths)
         .unwrap()
         .unwrap();
-    drop(daemon_dfs_bounded_status_resident(second.data_dir(&second_node), &second_peer).unwrap());
+    let observe_ready = |deadline: Instant| {
+        loop {
+            let observed =
+                daemon_dfs_bounded_status_resident(second.data_dir(&second_node), &second_peer);
+            let updating = observed.as_ref().is_err_and(|error| matches!(error,
+                sinomo_dfs::DfsError::Network { message }
+                if message == "bounded DFS status unavailable while the resident generation cache is being updated"
+                    || message == "DFS runtime network error at DFS message cache root identity: bounded DFS status unavailable while the resident generation cache is being updated"));
+            if updating && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+            break observed;
+        }
+    };
+    drop(observe_ready(ready_deadline).unwrap());
 
     let gate = Arc::new((Mutex::new(false), Condvar::new()));
     struct ReleaseOnDrop(Arc<(Mutex<bool>, Condvar)>);
@@ -15848,6 +16771,7 @@ fn native_cold_root_cache_does_not_block_another_ready_root() {
         (written, read)
     });
     let entered = entered_rx.recv_timeout(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT);
+    let independent_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
     let written = ready.posix_write_file(
         "/ready-cache-during",
         b"independent ready root",
@@ -15857,7 +16781,7 @@ fn native_cold_root_cache_does_not_block_another_ready_root() {
         .as_ref()
         .ok()
         .map(|_| ready.posix_read_file("/ready-cache-during"));
-    let resident = daemon_dfs_bounded_status_resident(second.data_dir(&second_node), &second_peer);
+    let resident = observe_ready(independent_deadline);
     // Resume before assertions or close so a failed independent-root check
     // cannot strand a genuine started child behind this negative test gate.
     drop(release);
@@ -16180,4 +17104,244 @@ fn native_object_rpc_route_capability_tracks_both_endpoint_lifetimes() {
     drop(current);
     drop(transport);
     native.close().unwrap();
+}
+
+#[test]
+fn rejected_shared_maintenance_take_keeps_the_actual_cached_service() {
+    let (native, nodes) =
+        crate::test_runtime::DfsTestRuntime::start_cluster("native-shared-maintenance-take", 1)
+            .unwrap();
+    let local = nodes[0].clone();
+    let data_dir = native.data_dir(&local).clone();
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    let runtime = native.runtime_handle();
+    let command = test_dfs_message_command(
+        "native-shared-lane-warm",
+        test_dfs_lookup_routed_message(&local, &local, 1, "/services"),
+    );
+    let response = native
+        .rpc_call(
+            &local,
+            &local,
+            crate::dfs_message_rpc_call(&command).unwrap(),
+            sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+        )
+        .unwrap();
+    assert_eq!(
+        crate::decode_dfs_message_rpc_response(&response)
+            .unwrap()
+            .request_id,
+        command.request_id
+    );
+    let warm = native
+        .maintenance_tick(&local, Duration::from_secs(5))
+        .unwrap();
+    assert!(
+        warm.outcome.is_ok(),
+        "actual native global lane warmup: {warm:?}"
+    );
+    let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths).unwrap();
+    let preflight = runtime
+        .block_on(warm_daemon_dfs_metadata_authority_for_identity_async(
+            &cluster_paths,
+            &state.cluster_id,
+            &local,
+            &runtime,
+        ))
+        .unwrap();
+    let scheduler = daemon_dfs_mutation_scheduler(&data_dir).unwrap();
+    let admission = runtime
+        .block_on(scheduler.admit(&DfsMessageExecutionScope::GlobalExclusive))
+        .unwrap();
+    let slot = daemon_dfs_message_service_cache()
+        .existing_root(&data_dir.root())
+        .unwrap()
+        .unwrap();
+    let observed = slot
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .primary_service
+        .as_ref()
+        .unwrap()
+        .clone();
+    let opens = daemon_dfs_test_message_service_lane_open_count(&data_dir);
+    let admitted = preflight.for_admission(&admission);
+    let error = match take_daemon_dfs_message_mutation_service_for_maintenance(
+        &data_dir,
+        &cluster_paths,
+        &state,
+        &runtime,
+        Some(&admitted),
+    ) {
+        Ok(_) => panic!("a shared actual service cannot be consumed exclusively"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("remained referenced"),
+        "{error:?}"
+    );
+    {
+        let cache = slot.lock().unwrap();
+        let retained = cache
+            .as_ref()
+            .unwrap()
+            .primary_service
+            .as_ref()
+            .expect("failed exclusive take must retain the original cached service");
+        assert!(Arc::ptr_eq(retained, &observed));
+    }
+    drop(admission);
+    let (empty_observations, replacements, shared_rejections) = std::thread::scope(|scope| {
+        let worker = scope.spawn(|| {
+            let mut shared_rejections = 0;
+            for _ in 0..64 {
+                let admission = runtime
+                    .block_on(scheduler.admit(&DfsMessageExecutionScope::GlobalExclusive))
+                    .unwrap();
+                let admitted = preflight.for_admission(&admission);
+                match try_take_daemon_dfs_message_mutation_service_for_maintenance(
+                    &data_dir,
+                    &cluster_paths,
+                    &state,
+                    &runtime,
+                    Some(&admitted),
+                ) {
+                    Ok(_) => panic!("observed actual service cannot be consumed exclusively"),
+                    Err(DaemonDfsAuthorityPreExecutionError::Failed(error))
+                        if error.to_string().contains("remained referenced") =>
+                    {
+                        shared_rejections += 1
+                    }
+                    Err(DaemonDfsAuthorityPreExecutionError::AuthorityPreflightStale(_)) => {}
+                    Err(error) => panic!("unexpected maintenance admission failure: {error:?}"),
+                }
+            }
+            shared_rejections
+        });
+        let mut empty_observations = 0;
+        let mut replacements = 0;
+        while !worker.is_finished() {
+            let cache = slot.lock().unwrap();
+            match cache.as_ref().unwrap().primary_service.as_ref() {
+                Some(retained) => replacements += usize::from(!Arc::ptr_eq(retained, &observed)),
+                None => empty_observations += 1,
+            }
+            drop(cache);
+            std::thread::yield_now();
+        }
+        (empty_observations, replacements, worker.join().unwrap())
+    });
+    assert!(
+        shared_rejections > 0,
+        "actual shared-owner rejection must be exercised"
+    );
+    assert_eq!(
+        empty_observations, 0,
+        "a rejected take must not expose an empty cache slot to another observer"
+    );
+    assert_eq!(
+        replacements, 0,
+        "the observed cached service identity must remain unchanged"
+    );
+    let admission = runtime
+        .block_on(scheduler.admit(&DfsMessageExecutionScope::GlobalExclusive))
+        .unwrap();
+    drop(observed);
+    let admitted = preflight.for_admission(&admission);
+    let taken = take_daemon_dfs_message_mutation_service_for_maintenance(
+        &data_dir,
+        &cluster_paths,
+        &state,
+        &runtime,
+        Some(&admitted),
+    )
+    .unwrap();
+    assert!(
+        restore_daemon_dfs_message_mutation_service_after_maintenance(
+            &data_dir,
+            &cluster_paths,
+            &runtime,
+            taken,
+        )
+        .unwrap()
+    );
+    assert_eq!(
+        daemon_dfs_test_message_service_lane_open_count(&data_dir),
+        opens
+    );
+    drop(admission);
+    drop(preflight);
+    native.close().unwrap();
+}
+
+#[test]
+fn daemon_smoke_revalidates_a_concurrently_advanced_metadata_cache() {
+    let local =
+        crate::test_runtime::DfsTestRuntime::ordered_node_ids("native-smoke-coherent-cut", 1)
+            .remove(0);
+    let mut fixture =
+        crate::test_runtime::DfsTestRuntime::new("native-smoke-coherent-cut", local.clone())
+            .unwrap();
+    fixture.start_nodes().unwrap();
+    let data_dir = fixture.data_dir(&local).clone();
+    let paths = ClusterPaths::new(&data_dir);
+    let runtime = fixture.runtime_handle();
+    let peers = read_daemon_dfs_message_peer_snapshot(&paths)
+        .unwrap()
+        .unwrap();
+    let preflight = runtime
+        .block_on(warm_daemon_dfs_metadata_authority_for_peer_snapshot_async(
+            &paths, &peers, &runtime,
+        ))
+        .unwrap();
+    let control = fixture.shared_control_plane().unwrap();
+    let changed = Arc::new(AtomicBool::new(false));
+    let observed = Arc::clone(&changed);
+    let changed_node = local.clone();
+    crate::smoke::SMOKE_CONFIGURATION_CAPTURED.with(|hook| {
+        assert!(hook.borrow().is_none());
+        *hook.borrow_mut() = Some(Box::new(move || {
+            super::control_plane::AFTER_CACHED_METADATA_SYNC.with(|slot| {
+                assert!(slot.borrow().is_none());
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    control.with_client(|kv| {
+                        let mut store = sinomo_dfs::DfsControlPlaneStore::new(kv.as_mut());
+                        let mut advertisement =
+                            store.content_service(&changed_node).unwrap().unwrap();
+                        advertisement.advertisement_generation += 1;
+                        store.advertise_content_service(&advertisement).unwrap();
+                    });
+                    observed.store(true, Ordering::SeqCst);
+                }));
+            });
+        }));
+    });
+    let (peer, _) = fixture.peer_transports(&local).unwrap();
+    let result = {
+        let _entered = runtime.enter();
+        sinomo_dfs::run_default_cluster_dfs_smoke_with_peer_transport(
+            &data_dir,
+            &paths,
+            peer,
+            super::publish_host::daemon_dfs_smoke_options(),
+        )
+    };
+    crate::smoke::SMOKE_CONFIGURATION_CAPTURED.with(|hook| {
+        assert!(
+            hook.borrow().is_none(),
+            "smoke returned before capture: {result:?}"
+        )
+    });
+    drop(preflight);
+    fixture.close().unwrap();
+    assert!(changed.load(Ordering::SeqCst));
+    let report = result
+        .expect("the retained smoke cut remains complete across the actual provider update")
+        .unwrap();
+    assert_eq!(report.requested_replica_node_ids, vec![local.clone()]);
+    assert_eq!(report.committed_replica_node_ids, vec![local]);
+    assert_eq!(report.attempts.len(), 1);
+    assert!(report.attempts[0].committed);
 }

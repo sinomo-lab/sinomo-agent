@@ -341,9 +341,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<(), DfsError> {
         if self.coordinator.is_commit_ready(intent_id)? {
             if let Err(error) = self.apply_committed_intent(intent_id) {
-                // A failed CAS can leave a durable prepare. Reconcile that
-                // exact record, without treating transport/authority failure
-                // or missing create metadata as proof that it was aborted.
+                // A failed author attempt may have found a different immutable
+                // prepare with the same ID. It cannot authorize publication of
+                // that body. Recognize only an already committed outcome here;
+                // pending work retains its ordinary maintenance/exact-retry
+                // recovery path and is never automatically aborted.
                 let record = self.coordinator.intent(intent_id).and_then(|intent| {
                     self.metadata_backend.as_ref().and_then(|backend| {
                         backend
@@ -353,7 +355,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     })
                 });
                 if let Some(record) = record {
-                    match self.reconcile_observed_write_intent(&record, false) {
+                    match self.reconcile_observed_write_intent_with_policy(&record, false, true) {
                         Ok(Some(updated)) if updated.status == DfsWriteIntentStatus::Committed => {
                             return Ok(());
                         }
@@ -699,6 +701,50 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         job: &DistributedRepairJob,
     ) -> Result<RepairProducerCustodyReadiness, DfsError> {
+        if let Some(pending) = self.writes.pending_writes.get(&job.intent_id).cloned()
+            && let Some(kv) = self.control_plane.as_ref()
+            && let Some(projection) = kv.write_configuration_projection()?
+        {
+            if pending.object_id != job.object_id || pending.version != job.version {
+                return Err(DfsError::Metadata {
+                    message: "resident repair differs from its actual job body".into(),
+                });
+            }
+            let object = self.current_read_object_metadata(&pending.object_id)?;
+            if object.file_system_id != job.file_system_id {
+                return Err(DfsError::Metadata {
+                    message: "resident repair object names another filesystem".into(),
+                });
+            }
+            let prefix = format!("{}/", crate::metadata_shards_prefix(&job.file_system_id));
+            let entries = projection
+                .entries(&prefix)
+                .ok_or_else(|| DfsError::Metadata {
+                    message: "retained repair configuration does not cover its actual scope".into(),
+                })?;
+            let mut index = crate::metadata_shard_index_from_authority_entries(entries);
+            let shards = index
+                .remove(&job.file_system_id.to_string())
+                .ok_or_else(|| DfsError::Metadata {
+                    message: "retained repair configuration has no actual filesystem shards".into(),
+                })?
+                .map_err(|message| DfsError::Metadata { message })?;
+            let shard = crate::select_metadata_shard_config_for_path_strict_default_sifs_split(
+                &job.file_system_id,
+                &shards,
+                &object.path,
+            )?
+            .ok_or_else(|| DfsError::Metadata {
+                message: "retained repair configuration has no actual object shard".into(),
+            })?;
+            if shard.primary_node_id != self.node_id {
+                // A real handoff can invalidate this old provider's generation.
+                // Stop only its volatile executor before borrowing that queue;
+                // original durable custody and all unresolved IDs stay intact.
+                self.suppress_repair_retries_for_lost_authority(&job.intent_id, None, true);
+                return Ok(RepairProducerCustodyReadiness::Parked);
+            }
+        }
         // Reconstruct the metadata owner without replacing existing producer
         // state. Physical custody below is DATA, not new repair authority.
         if self.writes.pending_writes.contains_key(&job.intent_id) {
@@ -724,6 +770,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             store.records_for_targets(&job.intent_id, &intent.desired_replica_nodes)?;
         use sinomo_api::dfs::maintenance::DfsRepairTransferKind;
         let mut parked = false;
+        let mut locally_owned = BTreeSet::new();
         for record in &mut records {
             if record.intent_id != job.intent_id
                 || record.object_id != pending.object_id
@@ -733,6 +780,43 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 return Err(DfsError::Metadata {
                     message: "foreground repair custody differs from its immutable owner".into(),
                 });
+            }
+            if !record.in_flight
+                && record.transfer_request_id.is_none()
+                && record.completed_transfer_request_id.is_none()
+                && record.transfer_delivery_state
+                    == Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent)
+                && let Some(prior) = self.repair_attempt_records.get(&(
+                    record.intent_id.clone(),
+                    record.missing_replica_node_id.clone(),
+                ))
+                && prior.object_id == pending.object_id
+                && prior.version == pending.version
+                && prior.content_hash == pending.content_hash
+                && prior.transfer_kind == record.transfer_kind
+                && let Some(request) = prior.transfer_request_id.as_ref()
+                && match prior.transfer_kind {
+                    Some(DfsRepairTransferKind::Repair) => {
+                        pending
+                            .repair_inflight_request_ids
+                            .get(&record.missing_replica_node_id)
+                            == Some(request)
+                    }
+                    Some(DfsRepairTransferKind::Stage) => {
+                        pending
+                            .stage_inflight_request_ids
+                            .get(&record.missing_replica_node_id)
+                            == Some(request)
+                    }
+                    None => false,
+                }
+            {
+                // The unclaimed durable birth does not supersede this lane's
+                // actual named producer. Keep its request/delivery/backoff and
+                // original reply owner; do not import the older unclaimed row
+                // or publish this private request as another lane's custody.
+                locally_owned.insert(record.missing_replica_node_id.clone());
+                continue;
             }
             parked |= record.missing_replica_node_id == job.missing_replica_node_id
                 && crate::service_repair::repair_record_has_unidentified_producer(record);
@@ -833,7 +917,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(RepairProducerCustodyReadiness::Parked);
         }
         // Other targets retain their actual producer maps, including UNKNOWN.
-        records.retain(|record| record.missing_replica_node_id == job.missing_replica_node_id);
+        records.retain(|record| {
+            record.missing_replica_node_id == job.missing_replica_node_id
+                && !locally_owned.contains(&record.missing_replica_node_id)
+        });
         self.restore_repair_attempt_records_merging(&records);
         Ok(RepairProducerCustodyReadiness::Ready)
     }
@@ -1119,6 +1206,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let mut effects = Vec::new();
         if let Some(existing) = existing.as_ref() {
             record.created_at = existing.created_at;
+            if existing.status == DfsWriteIntentStatus::Committed
+                && crate::intent::distributed_intent_from_record(existing) == *intent
+                && existing.content_hash.as_deref() == Some(content_hash)
+            {
+                // Replica repair may change the current object's locations.
+                // Replaying the same terminal intent preserves its original
+                // captured object and timestamps; new receipts remain effects.
+                record = existing.clone();
+            }
         }
         let mut comparable = record.clone();
         if let Some(existing) = existing.as_ref() {
@@ -1760,6 +1856,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.coordinator
             .commit_intent(&intent.intent_id)
             .map_err(DfsError::from)?;
+        // Publication can reach W while desired replicas are still missing.
+        // Hand off the work produced by this intent, without waking repair for
+        // a fully replicated write or unrelated coordinator jobs.
+        if intent.desired_replica_nodes.iter().any(|node| {
+            self.coordinator
+                .repair_job_for_target(&intent.intent_id, node)
+                .is_some()
+        }) {
+            self.record_message_committed_work(DfsMessageCommittedWork {
+                repair_maintenance: true,
+                ..Default::default()
+            });
+        }
         drop(coordinator_span);
         let coordinator_ms = coordinator_started.elapsed().as_millis();
         let memory_started = Instant::now();
@@ -1825,6 +1934,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .ok_or_else(|| DfsError::Metadata {
                 message: "recorded write outcome lost its immutable body".into(),
             })?;
+        Self::validate_recorded_write_retry(&payload, intent, content_hash, content_size_bytes)?;
+        Ok(Some(digest))
+    }
+
+    fn validate_recorded_write_retry(
+        payload: &DfsPreparedOperationPayload,
+        intent: &DistributedWriteIntent,
+        content_hash: &str,
+        content_size_bytes: u64,
+    ) -> Result<(), DfsError> {
         let recorded = payload
             .prepared_intent
             .as_ref()
@@ -1862,7 +1981,42 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 message: "recorded write retry differs from its original input".into(),
             });
         }
-        Ok(Some(digest))
+        Ok(())
+    }
+
+    pub(crate) fn recover_prepared_write_for_retry(
+        &mut self,
+        intent: &DistributedWriteIntent,
+        content_hash: &str,
+        content_size_bytes: u64,
+    ) -> Result<(), DfsError> {
+        if !self
+            .coordinator
+            .intent(&intent.intent_id)
+            .is_some_and(|resident| resident.state == DfsWriteIntentState::AwaitingReceipts)
+        {
+            return Ok(());
+        }
+        let Some(backend) = self.metadata_backend.as_ref() else {
+            return Ok(());
+        };
+        let Some(record) = backend
+            .prepared_operation_record(&format!("write:{}", intent.intent_id))?
+            .filter(|record| record.status == DfsPreparedOperationStatus::Prepared)
+        else {
+            return Ok(());
+        };
+        Self::validate_recorded_write_retry(
+            &record.payload,
+            intent,
+            content_hash,
+            content_size_bytes,
+        )?;
+        // An explicit replay resumes only this complete original body. The
+        // ordinary recovery guard still requires the current certified owner
+        // and fresh acknowledgements from every assigned metadata participant.
+        self.recover_one_prepared_operation(record)?;
+        Ok(())
     }
 
     /// A base version can belong to transient, not-yet-published metadata.
@@ -1950,6 +2104,65 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 actual: manifest.content_hash,
             });
         }
+        Ok(())
+    }
+
+    /// Adopt only an exact durable terminal into this resident projection.
+    /// This is response/recovery bookkeeping, never publication authority.
+    pub(crate) fn refresh_committed_write_projection(
+        &mut self,
+        intent_id: &str,
+    ) -> Result<(), DfsError> {
+        let Some(intent) = self
+            .coordinator
+            .intent(intent_id)
+            .filter(|intent| intent.state == DfsWriteIntentState::AwaitingReceipts)
+            .cloned()
+        else {
+            return Ok(());
+        };
+        let Some(backend) = self.metadata_backend.as_ref() else {
+            return Ok(());
+        };
+        let record = match backend.get_intent(&intent.object_id, intent_id)? {
+            Some(record) => Some(record),
+            None => backend
+                .get_intent_receipt(&intent.object_id, intent_id)?
+                .map(|receipt| receipt.to_intent_record()),
+        };
+        let Some(record) = record.filter(|record| record.status == DfsWriteIntentStatus::Committed)
+        else {
+            return Ok(());
+        };
+        let content_size = backend
+            .get_version(&record.object_id, &record.target_version)?
+            .and_then(|version| version.size_bytes);
+        let mut recorded = crate::intent::distributed_intent_from_record(&record);
+        // Guarded recovery can advance the owner epoch; it cannot change the
+        // caller, original base, target, policy, or operation identity.
+        let epoch_advanced = recorded.owner_epoch >= intent.owner_epoch;
+        recorded.owner_epoch = intent.owner_epoch;
+        recorded.state = intent.state.clone();
+        if !epoch_advanced
+            || recorded != intent
+            || self
+                .writes
+                .pending_writes
+                .get(intent_id)
+                .is_some_and(|pending| {
+                    record.content_hash.as_deref() != Some(pending.content_hash.as_str())
+                        || content_size != Some(pending.size_bytes)
+                })
+        {
+            return Err(DfsError::Metadata {
+                message: "committed write record differs from the original resident intent".into(),
+            });
+        }
+        self.restore_recorded_content_receipts(&record)?;
+        self.coordinator
+            .restore_recorded_committed_intent(intent_id)?;
+        self.apply_backend_object_to_service_state(&record.object_id)?;
+        self.clear_active_replica_stage(&record.object_id, &record.target_version);
         Ok(())
     }
 

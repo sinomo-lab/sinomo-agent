@@ -306,12 +306,31 @@ impl DfsCrossShardNamespaceLockRegistry {
     }
 
     pub(crate) fn blocks(&self, file_system_id: &DfsFileSystemId, path: &str) -> bool {
+        self.blocks_except_verified_job(file_system_id, path, None)
+    }
+
+    /// The caller has authenticated the current coordinator and checked the
+    /// recorded Running job and read footprint. This filters only that job's
+    /// read reservation; every other guard and every mutation check remains.
+    pub(crate) fn blocks_except_verified_job(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        path: &str,
+        verified: Option<(&str, &DfsMetadataShardId, &str)>,
+    ) -> bool {
         self.locks_by_job
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .values()
-            .any(|lock| {
+            .iter()
+            .any(|(job_id, lock)| {
                 lock.file_system_id == *file_system_id
+                    && !verified.is_some_and(|(expected_job, shard, root)| {
+                        job_id == expected_job
+                            && lock.shard_id.as_ref() == Some(shard)
+                            && lock.paths.len() == 1
+                            && lock.paths[0] == root
+                            && crate::posix_path::posix_path_is_at_or_under_prefix(path, root)
+                    })
                     && lock.paths.iter().any(|locked_path| {
                         crate::posix_path::posix_path_is_at_or_under_prefix(path, locked_path)
                             || crate::posix_path::posix_path_is_at_or_under_prefix(

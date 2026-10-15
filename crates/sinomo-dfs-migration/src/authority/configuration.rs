@@ -532,8 +532,14 @@ impl NativeImportAuthority {
                     "retained native plan differs from live exact StorageImport",
                 ));
             }
-            let replay = self.commit(plan.stage_request.clone())?;
+            let replay = self.observe_original_import_commit(&plan, plan.stage_request.clone())?;
             Self::require_committed(&replay)?;
+            let (after, _) = self.read_exact(&[entry.key.clone()])?;
+            if after[0].entry.as_ref() != Some(&entry) {
+                return Err(error(
+                    "current StorageImport changed while its original stage receipt was observed",
+                ));
+            }
             if let Some(original) = &plan.source_cut.original_handoff {
                 required.push(original.clone());
             }

@@ -45,13 +45,25 @@ pub fn discovered_cluster_dfs_provider_node_ids(
     cluster_paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Result<Vec<NodeId>, DfsError> {
-    let kv_members = sinomo_core::cluster::read_cluster_members_from_kv(cluster_paths)
+    // Discovery must join membership and the catalog from the same observed
+    // generation. The materialized checkpoint can trail the mounted catalog.
+    let Some(snapshot) =
+        sinomo_core::cluster::read_cluster_kv_latest_observed_snapshot_arc_if_present(
+            cluster_paths,
+        )
+        .map_err(DfsError::from_network)?
+    else {
+        return Ok(Vec::new());
+    };
+    let kv_members = sinomo_core::cluster::read_cluster_members_from_snapshot(&snapshot)
         .map_err(DfsError::from_network)?;
-    let entries = sinomo_core::kv::read_cluster_kv_prefix_entries(
-        &cluster_paths.kv_paths(),
-        sinomo_core::service::CLUSTER_SERVICES_KV_PREFIX,
-    )
-    .map_err(DfsError::from)?;
+    let entries = snapshot
+        .range_prefix_limited_by_payload_bytes(
+            sinomo_core::service::CLUSTER_SERVICES_KV_PREFIX,
+            sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES,
+            sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_PAYLOAD_BYTES,
+        )
+        .map_err(DfsError::from)?;
     dfs_provider_node_ids_from_current_entries(state, &kv_members, &entries)
 }
 

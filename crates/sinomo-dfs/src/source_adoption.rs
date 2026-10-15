@@ -139,6 +139,20 @@ pub(crate) enum DfsSourceAdoptionOutcome {
 struct TargetClaim {
     witness: Option<Weak<DfsSourceAdoptionWitness>>,
     revoked: bool,
+    // Constructed only at the guarded native kernel's materialized commit.
+    // This is a live terminal fact, not incoming DATA or publication authority.
+    terminal: Option<NativeTargetTerminal>,
+}
+#[derive(Clone)]
+struct NativeTargetTerminal {
+    offer: DfsSourceAdoptionOffer,
+    scope: crate::publication_guard::DfsPublicationOwnerScope,
+    configuration: DfsMetadataShardConfig,
+    generation: u64,
+    storage: crate::metadata_table_store::MetadataTableStorageGeneration,
+    prefix: crate::DfsMetadataPrefixProof,
+    digest: DfsPreparedOperationDigest,
+    commit: crate::DfsPreparedOperationCommitReference,
 }
 struct SourceSession {
     capture: Arc<crate::DfsSourceAdoptionSourceCapture>,
@@ -687,6 +701,9 @@ impl DfsSourceAdoptionActor {
             {
                 return Err(error("target may still own an admitted effect"));
             }
+            let cancelled_scope = session.capture.scope().clone();
+            let cancelled_generation = session.generation;
+            let cancelled_storage_generation = self.authority.storage_generation();
             self.release_original_job(offer, None)?;
             sessions.remove(&offer.session_id);
             RETAINED
@@ -694,6 +711,17 @@ impl DfsSourceAdoptionActor {
                 .lock()
                 .map_err(|_| error("source custody registry poisoned"))?
                 .remove(&(self.data_root.clone(), offer.session_id.clone()));
+            // Only this present/exact/unclaimed guarded retirement revokes a
+            // Bound memo. Missing/completed sessions prove no cancellation.
+            // Release the registry before preparation locks (normal register
+            // acquires those locks in the opposite nesting order).
+            drop(sessions);
+            self.revoke_cancelled_bound_preparation(
+                offer,
+                cancelled_scope,
+                cancelled_generation,
+                cancelled_storage_generation,
+            )?;
         }
         Ok(())
     }
@@ -970,14 +998,19 @@ impl DfsSourceAdoptionActor {
         request: &DfsSourceAdoptionRequest,
         deadline: Option<std::time::Instant>,
     ) -> Result<DfsSourceAdoptionRpcResponse> {
+        // Shadow hosts deliberately have no DFS routes or source custody.
+        let options = sinomo_core::network::ClusterObjectRpcOptions::default()
+            .with_destination_process_affinity(
+                sinomo_core::network::DestinationProcessAffinity::MainDaemon,
+            );
         let options = if let Some(deadline) = deadline {
             let remaining = deadline
                 .checked_duration_since(std::time::Instant::now())
                 .filter(|remaining| !remaining.is_zero())
                 .ok_or_else(|| error("native source phase deadline elapsed before dispatch"))?;
-            sinomo_core::network::ClusterObjectRpcOptions::default().with_overall_timeout(remaining)
+            options.with_overall_timeout(remaining)
         } else {
-            sinomo_core::network::ClusterObjectRpcOptions::default()
+            options
         };
         let request = sinomo_core::network::ObjectRpcRequest::encode_body(
             SOURCE_ADOPTION_ROUTE,
@@ -1157,6 +1190,105 @@ impl DfsSourceAdoptionActor {
             bound_digest: OnceLock::new(),
         })))
     }
+    fn inspect_kernel_terminal(
+        &self,
+        offer: &DfsSourceAdoptionOffer,
+        scope: &DfsPreparedOperationScope,
+        hash: &str,
+        expected: Option<&DfsPreparedOperationDigest>,
+        current: &DfsMetadataShardConfig,
+        terminal: &NativeTargetTerminal,
+    ) -> Result<Option<DfsSourceAdoptionOutcome>> {
+        if terminal.offer != *offer
+            || terminal.digest.file_system_id != scope.file_system_id
+            || terminal.digest.shard_id != scope.shard_id
+            || terminal.digest.owner_epoch != scope.owner_epoch
+            || terminal.digest.operation_id != scope.operation_id
+            || terminal.digest.payload_digest != hash
+            || expected.is_some_and(|expected| expected != &terminal.digest)
+        {
+            return Err(error(
+                "native target outcome changes its guarded kernel terminal identity",
+            ));
+        }
+        terminal.commit.validate(&terminal.digest)?;
+        if *self.shutdown.borrow()
+            || self.shutdown.has_changed().is_err()
+            || current != &terminal.configuration
+            || current != &offer.target_config
+            || terminal.prefix.version != 2
+            || !terminal.prefix.is_well_formed()
+            || terminal.prefix.journal_sequence < terminal.commit.sequence
+        {
+            return Ok(None);
+        }
+        let (generation, ready) = self
+            .authority
+            .shard_projection_state(&scope.file_system_id, &scope.shard_id);
+        if !ready || generation != terminal.generation {
+            return Ok(None);
+        }
+        let root = crate::default_dfs_metadata_shards_root(
+            &sinomo_core::local::SinomoDataDir::new(&self.data_root),
+        )
+        .join(crate::metadata_keys::key_segment(&scope.shard_id.0));
+        let actual = crate::publication_guard::DfsPublicationOwnerScope::for_backend(
+            &root,
+            scope.file_system_id.clone(),
+            scope.shard_id.clone(),
+        )?;
+        let registered = crate::runtime_host::publication_runtime_owner(&root).map_err(error)?;
+        if actual != terminal.scope
+            || registered
+                .as_ref()
+                .is_none_or(|owner| !Arc::ptr_eq(owner, &self._owner))
+        {
+            return Ok(None);
+        }
+        let before = crate::metadata_table_store::metadata_table_storage_generation(&root)?;
+        if !terminal.storage.is_compatible_with(&before)
+            || terminal.storage.active_log_len().is_some_and(|captured| {
+                before
+                    .active_log_len()
+                    .is_none_or(|current| current < captured)
+            })
+        {
+            return Ok(None);
+        }
+        let after = crate::metadata_table_store::metadata_table_storage_generation(&root)?;
+        let current_scope = crate::publication_guard::DfsPublicationOwnerScope::for_backend(
+            &root,
+            scope.file_system_id.clone(),
+            scope.shard_id.clone(),
+        )?;
+        let owner = crate::runtime_host::publication_runtime_owner(&root).map_err(error)?;
+        let current_projection = self.authority.projection_generation();
+        let configurations = self
+            .authority
+            .cached_metadata_shards(&scope.file_system_id, current_projection)
+            .map_err(error)?;
+        if before != after
+            || current_scope != terminal.scope
+            || owner
+                .as_ref()
+                .is_none_or(|owner| !Arc::ptr_eq(owner, &self._owner))
+            || self
+                .authority
+                .shard_projection_state(&scope.file_system_id, &scope.shard_id)
+                != (terminal.generation, true)
+            || configurations
+                .as_ref()
+                .is_none_or(|configurations| !configurations.contains(current))
+            || *self.shutdown.borrow()
+            || self.shutdown.has_changed().is_err()
+        {
+            return Ok(None);
+        }
+        Ok(Some(DfsSourceAdoptionOutcome::Committed {
+            digest: terminal.digest.clone(),
+            commit: terminal.commit.clone(),
+        }))
+    }
     fn inspect_target_outcome(
         &self,
         source: &NodeId,
@@ -1194,7 +1326,17 @@ impl DfsSourceAdoptionActor {
             .lock()
             .map_err(|_| error("target custody registry poisoned"))?;
         let state = claims.entry(offer.session_id.clone()).or_default();
-        let outcome = if state.witness.as_ref().and_then(Weak::upgrade).is_some() {
+        let retained = state
+            .terminal
+            .as_ref()
+            .map(|terminal| {
+                self.inspect_kernel_terminal(offer, scope, hash, expected, cfg, terminal)
+            })
+            .transpose()?
+            .flatten();
+        let outcome = if let Some(outcome) = retained {
+            outcome
+        } else if state.witness.as_ref().and_then(Weak::upgrade).is_some() {
             DfsSourceAdoptionOutcome::Active
         } else {
             let root = crate::default_dfs_metadata_shards_root(
@@ -1387,6 +1529,97 @@ impl DfsSourceAdoptionWitness {
         };
         Ok(Some(family))
     }
+    pub(crate) fn record_kernel_terminal(
+        &self,
+        scope: &crate::publication_guard::DfsPublicationOwnerScope,
+        configuration: &DfsMetadataShardConfig,
+        owner: &Arc<DfsDataOwnerLock>,
+        digest: &DfsPreparedOperationDigest,
+        commit: &crate::DfsPreparedOperationCommitReference,
+        prefix: &crate::DfsMetadataPrefixProof,
+        storage: crate::metadata_table_store::MetadataTableStorageGeneration,
+    ) -> Result<()> {
+        if !self.supplies_source_family() {
+            return Ok(());
+        }
+        commit.validate(digest)?;
+        if !Arc::ptr_eq(owner, &self.actor._owner)
+            || configuration != &self.offer.target_config
+            || configuration.primary_node_id != self.actor.node
+            || scope.file_system_id() != &digest.file_system_id
+            || scope.shard_id() != &digest.shard_id
+            || digest.file_system_id != self.target_scope.file_system_id
+            || digest.shard_id != self.target_scope.shard_id
+            || digest.owner_epoch != self.target_scope.owner_epoch
+            || digest.operation_id != self.target_scope.operation_id
+            || digest.payload_digest != self.target_payload_digest
+            || prefix.version != 2
+            || !prefix.is_well_formed()
+            || prefix.journal_sequence < commit.sequence
+        {
+            return Err(error(
+                "kernel terminal cut changes its actual source witness/owner/scope",
+            ));
+        }
+        let bound = self.bound_digest.get_or_init(|| digest.clone());
+        if bound != digest {
+            return Err(error(
+                "kernel terminal cut changes the actual native prepare slot",
+            ));
+        }
+        let (generation, ready) = self
+            .actor
+            .authority
+            .shard_projection_state(&digest.file_system_id, &digest.shard_id);
+        if !ready || *self.actor.shutdown.borrow() || self.actor.shutdown.has_changed().is_err() {
+            return Err(error(
+                "kernel terminal cut lost its current native target context",
+            ));
+        }
+        let mut claims = self
+            .actor
+            .target_claims
+            .lock()
+            .map_err(|_| error("target custody registry poisoned"))?;
+        let state = claims
+            .get_mut(&self.offer.session_id)
+            .ok_or_else(|| error("kernel terminal cut has no actual target claim"))?;
+        if state.revoked
+            || state
+                .witness
+                .as_ref()
+                .and_then(Weak::upgrade)
+                .is_none_or(|witness| !std::ptr::eq(witness.as_ref(), self))
+        {
+            return Err(error(
+                "kernel terminal cut is not its actual claimed source witness",
+            ));
+        }
+        if let Some(terminal) = &state.terminal {
+            if terminal.offer != self.offer
+                || terminal.scope != *scope
+                || terminal.configuration != *configuration
+                || terminal.digest != *digest
+                || terminal.commit != *commit
+            {
+                return Err(error(
+                    "kernel terminal replay changes its original native outcome",
+                ));
+            }
+            return Ok(());
+        }
+        state.terminal = Some(NativeTargetTerminal {
+            offer: self.offer.clone(),
+            scope: scope.clone(),
+            configuration: configuration.clone(),
+            generation,
+            storage,
+            prefix: prefix.clone(),
+            digest: digest.clone(),
+            commit: commit.clone(),
+        });
+        Ok(())
+    }
     pub(crate) fn supplies_source_family(&self) -> bool {
         matches!(self.purpose, DfsSourceAdoptionPurpose::Adoption(_))
     }
@@ -1492,7 +1725,10 @@ impl RemoteTargetNamespacePhase {
             crate::DfsNamespaceOperation::AdoptObjectAtPath { source_offer, .. } => {
                 Ok(Some(source_offer))
             }
-            crate::DfsNamespaceOperation::FinalizeObjectFamilyAdoption { .. } => Ok(None),
+            crate::DfsNamespaceOperation::FinalizeObjectFamilyAdoption { .. }
+            | crate::DfsNamespaceOperation::AdoptHardlinkAlias { .. }
+            | crate::DfsNamespaceOperation::InstallHardlinkTargetFence { .. }
+            | crate::DfsNamespaceOperation::CommitHardlinkTargetFence { .. } => Ok(None),
             _ => Err(error(
                 "owned target phase contains another namespace operation",
             )),
@@ -1547,17 +1783,46 @@ impl RemoteTargetNamespacePhase {
             &envelope,
             &self.actor.runtime,
         );
-        let mut result = self
-            .actor
-            .transport
-            .call(
-                &self.pending.primary_node_id,
-                call,
-                sinomo_core::network::ClusterObjectRpcOptions::default()
-                    .with_overall_timeout(remaining),
-                true,
-            )
-            .map_err(crate::DfsError::from_network)?;
+        let mut result = match self.actor.transport.call(
+            &self.pending.primary_node_id,
+            call,
+            sinomo_core::network::ClusterObjectRpcOptions::default()
+                .with_destination_process_affinity(
+                    sinomo_core::network::DestinationProcessAffinity::MainDaemon,
+                )
+                .with_overall_timeout(remaining),
+            true,
+        ) {
+            Ok(result) => result,
+            Err(cause) => {
+                // THIS native carrier attests that this attempt never reached
+                // the target. Release only its exact still-unclaimed source
+                // offer through the existing custody owner. The durable job
+                // and original command remain unfinished for normal recovery.
+                // An earlier admitted claim makes cancellation fail closed;
+                // unknown delivery and all post-dispatch failures retain it.
+                // Both custodians must be this actor: local retirement adds no
+                // network wait beyond the original absolute operation budget.
+                if cause.delivery_state()
+                    == Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent)
+                    && let Some(offer) = offer
+                    && offer.source_node_id == self.actor.node
+                    && offer.job_offer.coordinator_node_id == self.actor.node
+                {
+                    if let Err(error) = self.actor.cancel_unclaimed(offer) {
+                        tracing::warn!(
+                            source_session = %offer.session_id,
+                            job = %offer.job_id,
+                            carrier_error = %cause,
+                            custody_error = %error,
+                            "definitely-not-sent namespace source custody could not be cancelled"
+                        );
+                        return Err(crate::DfsError::from(error));
+                    }
+                }
+                return Err(crate::DfsError::from_network(cause));
+            }
+        };
         tokio::task::block_in_place(|| {
             self.actor
                 .runtime
@@ -1648,5 +1913,148 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
         self.completed_remote_namespace_phases
             .insert(request, outcome);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod guarded_kernel_terminal_tests {
+    use super::*;
+    use crate::{DfsNamespaceOperation, DfsNetworkMessage, DfsWriteOptions};
+
+    #[test]
+    fn actual_native_terminal_cut_survives_a_busy_writer_without_authoring_or_missing_proof() {
+        let node = NodeId::generate();
+        let mut runtime = crate::test_runtime::DfsTestRuntime::new(
+            "native-source-kernel-terminal-busy-writer",
+            node.clone(),
+        )
+        .unwrap();
+        runtime.start_nodes().unwrap();
+        let from = "/users/kernel-terminal-source";
+        let to = "/services/kernel-terminal-target";
+        let mut requester = runtime.client(&node).unwrap();
+        let original = requester
+            .posix_write_file(
+                from,
+                b"actual source terminal bytes",
+                DfsWriteOptions::replicated_eventual(vec![node.clone()]),
+            )
+            .unwrap();
+        let pause = runtime.pause_remote_namespace_phase(&node).unwrap();
+        let (captured, moved) = std::thread::scope(|scope| {
+            let work = scope.spawn(move || requester.posix_rename(from, to));
+            let captured = pause.wait_captured(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT);
+            // Always release and join the actual native producer before assertions.
+            pause.release();
+            (captured, work.join().unwrap())
+        });
+        let captured = captured.expect("actual native adoption offer");
+        let DfsNetworkMessage::NamespaceRequest(command) = captured.routed_message.message else {
+            panic!("actual native namespace request");
+        };
+        let DfsNamespaceOperation::AdoptObjectAtPath {
+            source_offer: offer,
+            ..
+        } = command.operation
+        else {
+            panic!("actual native target adoption");
+        };
+        assert_eq!(moved.unwrap().object_id, original.object_id);
+        let actor = actor_for_root(&runtime.data_dir(&node).root()).unwrap();
+        let terminal = actor
+            .target_claims
+            .lock()
+            .unwrap()
+            .get(&offer.session_id)
+            .unwrap()
+            .terminal
+            .clone()
+            .expect("only the guarded actual native kernel records this cut");
+        assert_eq!(terminal.offer, offer);
+        terminal.commit.validate(&terminal.digest).unwrap();
+        let shard = terminal.digest.shard_id.clone();
+        let actual_prefix = || {
+            runtime
+                .metadata_primary_service(to)
+                .unwrap()
+                .metadata_backend()
+                .unwrap()
+                .metadata_prefix_proof(&shard)
+                .unwrap()
+                .unwrap()
+        };
+        let before = actual_prefix();
+        let query = DfsSourceAdoptionRequest::InspectOutcome {
+            offer: offer.clone(),
+            target_scope: DfsPreparedOperationScope {
+                file_system_id: terminal.digest.file_system_id.clone(),
+                shard_id: terminal.digest.shard_id.clone(),
+                owner_epoch: terminal.digest.owner_epoch,
+                operation_id: terminal.digest.operation_id.clone(),
+            },
+            payload_digest: terminal.digest.payload_digest.clone(),
+            expected_digest: Some(terminal.digest.clone()),
+        };
+        let root = terminal.scope.root().to_owned();
+        let writer = crate::metadata_lock::metadata_write_lock(
+            root.clone(),
+            crate::metadata_cursor::journal_write_lock_path(&root),
+        )
+        .unwrap();
+        let result = actor.call(&node, &query).unwrap();
+        assert!(matches!(result.outcome,
+            Some(DfsSourceAdoptionOutcome::Committed { digest, commit })
+                if digest == terminal.digest && commit == terminal.commit));
+        let mut changed = query.clone();
+        let DfsSourceAdoptionRequest::InspectOutcome {
+            expected_digest, ..
+        } = &mut changed
+        else {
+            unreachable!();
+        };
+        expected_digest.as_mut().unwrap().prepare_sequence += 1;
+        let rejected = actor.call(&node, &changed).unwrap_err();
+        assert!(
+            rejected
+                .to_string()
+                .contains("native target outcome changes its guarded kernel terminal identity")
+        );
+        let retained = actor
+            .target_claims
+            .lock()
+            .unwrap()
+            .get_mut(&offer.session_id)
+            .unwrap()
+            .terminal
+            .take()
+            .unwrap();
+        let missing = actor.call(&node, &query).unwrap();
+        assert!(
+            matches!(missing.outcome, Some(DfsSourceAdoptionOutcome::Unavailable)),
+            "a busy actual writer without its kernel cut remains unavailable"
+        );
+        actor
+            .target_claims
+            .lock()
+            .unwrap()
+            .get_mut(&offer.session_id)
+            .unwrap()
+            .terminal = Some(retained);
+        drop(writer);
+        assert_eq!(
+            actual_prefix(),
+            before,
+            "inspection and rejection publish no frames"
+        );
+        assert_eq!(
+            runtime
+                .client(&node)
+                .unwrap()
+                .posix_read_file_distributed(to)
+                .unwrap(),
+            b"actual source terminal bytes"
+        );
+        drop(actor);
+        runtime.close().unwrap();
     }
 }

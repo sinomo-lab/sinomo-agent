@@ -4,10 +4,10 @@
 //! lower metadata primitive shared by file and directory sync. A caller first
 //! freezes a shard journal head while it is the current primary. The healthy
 //! path obtains a fresh exact-prefix acknowledgement from every configured
-//! shard member without touching Raft. If a member is unavailable, the
-//! existing recovery-quorum requirements still apply and a compact,
-//! operation-bound cluster-quorum head watermark fences failover and membership
-//! movement before the prefix is certified.
+//! shard member. Ordinary sync cannot certify a partial participant set;
+//! unavailable members leave the barrier pending until its existing deadline.
+//! Membership handoff retains its exact joint-participant proof and separate
+//! configuration transition.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -22,8 +22,8 @@ use crate::{
     DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT, DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
     DfsControlPlaneStore, DfsError, DfsFileSystemId, DfsMessageTransport, DfsMetadataBackend,
     DfsMetadataJournalBatch, DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResult,
-    DfsMetadataPrefixProbe, DfsMetadataShardConfig, DfsMetadataShardHeadWatermark,
-    DfsMetadataShardId, DfsMetadataShardMembershipHandoff, DfsMetadataShardMembershipHandoffFence,
+    DfsMetadataPrefixProbe, DfsMetadataShardConfig, DfsMetadataShardId,
+    DfsMetadataShardMembershipHandoff, DfsMetadataShardMembershipHandoffFence,
     DfsMetadataShardMembershipHandoffProof, DfsMetadataSnapshotInstallCommand, DfsNetworkMessage,
     DfsObjectMetadata, DfsRoutedCall, DfsRoutedSend, MetadataBackendError, NetworkedDfsService,
     NetworkedDfsServiceEvent, PendingMetadataReplication,
@@ -35,8 +35,7 @@ pub const DEFAULT_DFS_POSIX_SYNC_TIMEOUT: Duration = Duration::from_secs(45);
 
 const DFS_POSIX_SYNC_IDLE_WAIT: Duration = Duration::from_millis(10);
 /// Give every member of a healthy shard one normal round trip to answer before
-/// evaluating the purpose-specific DFS recovery quorum and, for ordinary
-/// durability, the Raft-backed partition fence.
+/// evaluating the joint participant proof for a membership handoff.
 const DFS_POSIX_FULL_SHARD_ACK_GRACE: Duration = Duration::from_millis(250);
 /// Two canonical routed probes may run at once so one unavailable shard member
 /// cannot prevent every later reachable quorum member from being attempted.
@@ -210,7 +209,43 @@ pub const fn dfs_metadata_replica_quorum_size(replica_count: usize) -> usize {
     replica_count.div_ceil(2) + 1
 }
 
+#[cfg(test)]
+thread_local! {
+    static BEFORE_REBIND_WRITER_LOCK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
 pub(crate) fn rebind_completed_metadata_shard_membership_handoff(
+    backend: &mut dyn DfsMetadataBackend,
+    local_node_id: &NodeId,
+    active: &DfsMetadataShardConfig,
+    pending: Option<&DfsMetadataShardMembershipHandoff>,
+    proof: Option<&DfsMetadataShardMembershipHandoffProof>,
+) -> Result<bool, DfsError> {
+    // Another already-bound writer can append after the read-side lineage
+    // check and before the backend acquires its write gate. Retry only that
+    // typed comparison failure, re-reading the marker and revalidating the
+    // complete proof/lineage each time. Never relax the under-lock comparison.
+    let mut prefix_retries = 2;
+    loop {
+        match rebind_completed_metadata_shard_membership_handoff_once(
+            backend,
+            local_node_id,
+            active,
+            pending,
+            proof,
+        ) {
+            Err(DfsError::MetadataRejection {
+                code: crate::DfsMetadataRejectionCode::PrefixMismatch,
+                ..
+            }) if prefix_retries > 0 => {
+                prefix_retries -= 1;
+            }
+            result => return result,
+        }
+    }
+}
+
+fn rebind_completed_metadata_shard_membership_handoff_once(
     backend: &mut dyn DfsMetadataBackend,
     local_node_id: &NodeId,
     active: &DfsMetadataShardConfig,
@@ -239,13 +274,26 @@ pub(crate) fn rebind_completed_metadata_shard_membership_handoff(
     let marker_matches_active_epoch = freeze
         .activated_epoch
         .is_none_or(|activated_epoch| activated_epoch == active.epoch);
+    let proof_matches_target = match &proof.cause {
+        crate::DfsMetadataShardHandoffCause::Membership => {
+            proof.state_fingerprint == freeze.state_fingerprint
+        }
+        crate::DfsMetadataShardHandoffCause::StorageImport { cut } => {
+            cut.target_prefix.version == 2
+                && cut.target_prefix.is_well_formed()
+                && !cut.converted_image_fingerprint.is_empty()
+                && cut.target_prefix.journal_sequence == freeze.journal_sequence
+                && cut.target_prefix.digest == freeze.state_fingerprint
+                && proof.state_fingerprint == cut.converted_image_fingerprint
+        }
+    };
     let proof_matches_marker_and_active = proof.handoff_id == freeze.handoff_id
         && proof.retiring_shard.file_system_id == active.file_system_id
         && proof.retiring_shard.shard_id == active.shard_id
         && proof.retiring_shard.epoch == freeze.retiring_epoch
         && proof.desired_shard == *active
         && proof.journal_sequence == freeze.journal_sequence
-        && proof.state_fingerprint == freeze.state_fingerprint
+        && proof_matches_target
         && proof.acknowledged_node_ids.contains(local_node_id);
     if exact_successor_epoch != Some(active.epoch)
         || !marker_matches_active_epoch
@@ -270,6 +318,28 @@ pub(crate) fn rebind_completed_metadata_shard_membership_handoff(
         .as_ref()
         .and_then(|_| backend.native_held_snapshot_for_scope(&active.file_system_id, &shard_id));
     if active.primary_node_id == *local_node_id {
+        if let crate::DfsMetadataShardHandoffCause::StorageImport { cut } = &proof.cause {
+            // A new physical image has a new native journal clock. Its actual
+            // import ACKs can restore the minimum delivery cursor after cold
+            // open/loss of the non-durable hint; they never authorize a prepare.
+            // Unacknowledged replicas still require ordinary actual catch-up.
+            for peer in &active.replica_node_ids {
+                if proof.acknowledged_node_ids.contains(peer)
+                    && backend.metadata_replication_cursor(peer, &shard_id)?
+                        < cut.target_prefix.journal_sequence
+                {
+                    backend.put_metadata_replication_cursor(
+                        peer,
+                        &shard_id,
+                        cut.target_prefix.journal_sequence,
+                    )?;
+                }
+            }
+        }
+        #[cfg(test)]
+        if let Some(before_lock) = BEFORE_REBIND_WRITER_LOCK.with(|hook| hook.borrow_mut().take()) {
+            before_lock();
+        }
         let rebound = backend.clear_metadata_shard_membership_handoff_freeze(
             &shard_id,
             &freeze.handoff_id,
@@ -323,9 +393,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         expected: &DfsMetadataShardConfig,
     ) -> Result<bool, DfsError> {
+        // An empty, quiescent lane has no prior operational projection to
+        // replace. Preserve its lazy state just as the fresh Core opener does;
+        // the exact instance rebind still validates the full completion proof.
+        let was_lazy =
+            self.metadata.objects.is_empty() && self.can_release_hydrated_metadata_projection();
         let rebound = self.rebind_completed_local_metadata_shard_instance_if_frozen(expected)?;
         if rebound {
-            self.hydrate_from_metadata_backend()?;
+            if was_lazy {
+                self.hydrate_file_systems_from_metadata_backend()?;
+            } else {
+                self.hydrate_from_metadata_backend()?;
+            }
         }
         Ok(rebound)
     }
@@ -373,6 +452,22 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         };
         #[cfg(any(test, feature = "test-support"))]
         let native_owner = self.native_publication_owner_for_observation();
+        #[cfg(test)]
+        if pending.is_none()
+            && proof.is_some()
+            && let Some((root, _)) = native_owner.as_ref()
+            && let Some(hook) = crate::runtime_host::daemon_dfs_pre_dispatch_test_hook(
+                &sinomo_core::local::SinomoDataDir::new(root),
+            )
+        {
+            hook(
+                crate::runtime_host::DaemonDfsPreDispatchTestPoint::BeforeCompletedPrimaryRebind {
+                    shard_id: &shard_id,
+                },
+                None,
+                None,
+            )?;
+        }
         let rebound = {
             #[cfg(any(test, feature = "test-support"))]
             let _native_context = native_owner.as_ref().map(|(root, owner)| {
@@ -491,6 +586,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         };
         let mut rebound = 0usize;
         for (active, pending, proof) in observed {
+            #[cfg(test)]
+            if pending.is_none()
+                && proof.is_some()
+                && let Some((root, _)) = native_owner.as_ref()
+                && let Some(hook) = crate::runtime_host::daemon_dfs_pre_dispatch_test_hook(
+                    &sinomo_core::local::SinomoDataDir::new(root),
+                )
+            {
+                hook(crate::runtime_host::DaemonDfsPreDispatchTestPoint::BeforeCompletedPrimaryRebind {
+                    shard_id: &DfsMetadataShardId::new(&active.shard_id),
+                }, None, None)?;
+            }
             #[cfg(any(test, feature = "test-support"))]
             let _native_context = native_owner.as_ref().map(|(root, owner)| {
                 crate::native_shard_trace::enter_boundary_context(
@@ -596,37 +703,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             if should_cancel() {
                 return Ok(None);
             }
-            let shard_id = DfsMetadataShardId::new(handoff.retiring_shard.shard_id.clone());
-            let cancelled_for_prepare_drain = if handoff.retiring_primary_fence.is_none()
-                && self.has_recoverable_standalone_namespace_prepare_on_shard(&shard_id)?
-            {
-                // Handoff creation can race recovery of a prepare that was
-                // already durable under the retiring assignment. Until the
-                // retiring-primary fence exists, the assignment has not
-                // changed and no successor can activate. Withdraw that exact
-                // decision under the publication guard, drain the prepare
-                // through normal canonical authorization, and let placement
-                // propose a fresh handoff from the resulting head.
-                let _publication_guard = self.metadata_shard_fence_guard(
-                    &handoff.retiring_shard.file_system_id,
-                    &handoff.retiring_shard.shard_id,
-                )?;
-                self.refresh_control_plane_latest()?;
-                let Some(control_plane) = self.control_plane.as_mut() else {
-                    return Ok(Some(completed));
-                };
-                DfsControlPlaneStore::new(control_plane.as_mut())
-                    .cancel_unfenced_metadata_shard_membership_handoff(&handoff)?
-            } else {
-                false
-            };
-            if cancelled_for_prepare_drain {
-                self.recover_durable_namespace_prepares()?;
-                if should_cancel() {
-                    return Ok(None);
-                }
-                continue;
-            }
+            // The accepted transfer is itself the durable desired assignment.
+            // Preserve it while freezing the complete prefix, including any
+            // unfinished prepares. The successor's normal epoch recovery
+            // re-certifies those exact bodies and retires their old reservations;
+            // deleting this proposal would lose an explicit operator request.
             if self.reconcile_metadata_shard_membership_handoff(&handoff, timeout)? {
                 completed += 1;
                 // An actual activation can invalidate the admitted owner cut.
@@ -962,7 +1043,35 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         object: &DfsObjectMetadata,
     ) -> Result<DfsMetadataQuorumSyncTarget, DfsError> {
-        let configured = self.select_metadata_shard_for_object(object)?;
+        let configured = if let Some(control) = self.control_plane.as_ref() {
+            let projection =
+                control
+                    .write_configuration_projection()?
+                    .ok_or_else(|| DfsError::Metadata {
+                        message: "ordinary metadata sync has no retained qualified configuration"
+                            .into(),
+                    })?;
+            let prefix = format!(
+                "{}/",
+                crate::control_plane::metadata_shards_prefix(&object.file_system_id)
+            );
+            let entries = projection
+                .entries(&prefix)
+                .ok_or_else(|| DfsError::Metadata {
+                    message: "ordinary metadata sync configuration omits its shard scope".into(),
+                })?;
+            let shards = entries
+                .iter()
+                .map(|entry| entry.decode())
+                .collect::<Result<Vec<DfsMetadataShardConfig>, _>>()?;
+            crate::control_plane::select_metadata_shard_config_for_path_strict_default_sifs_split(
+                &object.file_system_id,
+                &shards,
+                &object.path,
+            )?
+        } else {
+            None
+        };
         if configured.is_none() && self.control_plane.is_some() {
             return Err(DfsError::Distributed {
                 message: format!(
@@ -1027,7 +1136,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // A sharded backend reports the authority metadata it was opened
         // with. After a certified primary transfer that storage status is
         // intentionally stale; the current control-plane shard config above
-        // is the authority source for clustered syncs. Local/unconfigured
+        // is retained configuration for clustered syncs. Local/unconfigured
         // backends have no control-plane certification, so retain the storage
         // authority guard for that case.
         if configured.is_none()
@@ -1263,13 +1372,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             && metadata_sync_progress_satisfies(&progress, required_intersection)
         {
             return self
-                .finalize_metadata_full_shard_sync(target, progress)
+                .finalize_metadata_full_shard_sync(target, progress, purpose)
                 .map(Some);
         }
-        if metadata_sync_progress_satisfies(&progress, required_intersection)
+        if matches!(purpose, MetadataQuorumSyncPurpose::MembershipHandoff { .. })
+            && metadata_sync_progress_satisfies(&progress, required_intersection)
             && started_at.elapsed() >= full_shard_grace
             && let Some(certificate) =
-                self.try_finalize_metadata_quorum_sync_fallback(target, progress, purpose)?
+                self.try_finalize_metadata_handoff_sync(target, progress, purpose)?
         {
             return Ok(Some(certificate));
         }
@@ -1327,10 +1437,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // appends do not force this barrier to chase an unbounded moving head;
         // a later prefix remains a valid stronger target only when a receiver
         // rejection proves the requested historical head is no longer usable.
-        self.refresh_metadata_sync_target_to_current_head(&mut target)?;
+        self.refresh_metadata_sync_target_to_current_head(&mut target, purpose)?;
         loop {
             self.check_cancelled("metadata quorum sync")?;
-            self.revalidate_metadata_quorum_sync_authority(&target)?;
+            self.revalidate_metadata_quorum_sync_authority(&target, purpose)?;
             if let Some(certificate) = self.try_finalize_metadata_sync_progress(
                 &target,
                 &freshly_acknowledged,
@@ -1378,7 +1488,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 &mut freshly_acknowledged,
             ));
             if !rejected_nodes.is_empty()
-                && self.refresh_metadata_sync_target_to_current_head(&mut target)?
+                && self.refresh_metadata_sync_target_to_current_head(&mut target, purpose)?
             {
                 self.clear_superseded_metadata_sync_requests(
                     &mut pending_prefix_probes,
@@ -1431,7 +1541,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 &mut freshly_acknowledged,
             ));
             if !rejected_nodes.is_empty()
-                && self.refresh_metadata_sync_target_to_current_head(&mut target)?
+                && self.refresh_metadata_sync_target_to_current_head(&mut target, purpose)?
             {
                 self.clear_superseded_metadata_sync_requests(
                     &mut pending_prefix_probes,
@@ -1489,7 +1599,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 &mut freshly_acknowledged,
             ));
             if !rejected_nodes.is_empty()
-                && self.refresh_metadata_sync_target_to_current_head(&mut target)?
+                && self.refresh_metadata_sync_target_to_current_head(&mut target, purpose)?
             {
                 self.clear_superseded_metadata_sync_requests(
                     &mut pending_prefix_probes,
@@ -1523,12 +1633,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 metadata_sync_progress_from_fresh_acknowledgements(&target, &freshly_acknowledged);
             let elapsed = started_at.elapsed();
             if elapsed >= timeout {
-                if metadata_sync_progress_satisfies(&progress, required_intersection)
-                    && let Some(certificate) = self.try_finalize_metadata_quorum_sync_fallback(
-                        &target,
-                        progress.clone(),
-                        purpose,
-                    )?
+                if matches!(purpose, MetadataQuorumSyncPurpose::MembershipHandoff { .. })
+                    && metadata_sync_progress_satisfies(&progress, required_intersection)
+                    && let Some(certificate) =
+                        self.try_finalize_metadata_handoff_sync(&target, progress.clone(), purpose)?
                 {
                     return Ok(certificate);
                 }
@@ -1606,8 +1714,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     fn refresh_metadata_sync_target_to_current_head(
         &mut self,
         target: &mut DfsMetadataQuorumSyncTarget,
+        purpose: &MetadataQuorumSyncPurpose,
     ) -> Result<bool, DfsError> {
-        self.revalidate_metadata_quorum_sync_authority(target)?;
+        self.revalidate_metadata_quorum_sync_authority(target, purpose)?;
         let backend = self
             .metadata_backend
             .as_deref_mut()
@@ -2452,8 +2561,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         target: &DfsMetadataQuorumSyncTarget,
         progress: DfsMetadataQuorumSyncProgress,
+        purpose: &MetadataQuorumSyncPurpose,
     ) -> Result<DfsMetadataQuorumSyncCertificate, DfsError> {
-        self.revalidate_metadata_quorum_sync_authority(target)?;
+        self.revalidate_metadata_quorum_sync_authority(target, purpose)?;
         if !metadata_sync_progress_is_full_shard(target, &progress) {
             return Err(DfsError::Distributed {
                 message: format!(
@@ -2465,18 +2575,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(metadata_sync_certificate(target, progress))
     }
 
-    /// Partition fallback for an exact prefix that already satisfies its
-    /// purpose-specific DFS durability certificate. Ordinary sync publishes
-    /// one bounded per-shard head watermark through cluster Raft. Membership
-    /// handoff instead requires joint majorities plus both primaries and stores
-    /// that evidence in its activation proof.
-    fn try_finalize_metadata_quorum_sync_fallback(
+    /// Membership handoff can certify an exact frozen prefix from joint
+    /// majorities plus both primaries. Ordinary sync requires every assigned
+    /// participant and has no global-KV durability fallback.
+    fn try_finalize_metadata_handoff_sync(
         &mut self,
         target: &DfsMetadataQuorumSyncTarget,
         progress: DfsMetadataQuorumSyncProgress,
         purpose: &MetadataQuorumSyncPurpose,
     ) -> Result<Option<DfsMetadataQuorumSyncCertificate>, DfsError> {
-        self.revalidate_metadata_quorum_sync_authority(target)?;
+        self.revalidate_metadata_quorum_sync_authority(target, purpose)?;
         if let MetadataQuorumSyncPurpose::MembershipHandoff {
             retiring_shard,
             desired_shard,
@@ -2497,54 +2605,73 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .then(|| metadata_sync_certificate(target, progress)),
             );
         }
-        let Some(expected_shard) = target.expected_shard.as_ref() else {
-            return Ok(None);
-        };
-        // The fallback is valid only for the exact active assignment. A wider
-        // or narrower target could otherwise certify an unconfigured node.
-        let expected_node_ids = std::iter::once(expected_shard.primary_node_id.clone())
-            .chain(expected_shard.replica_node_ids.iter().cloned())
-            .collect::<BTreeSet<_>>();
-        let target_node_ids = std::iter::once(target.primary_node_id.clone())
-            .chain(target.replica_node_ids.iter().cloned())
-            .collect::<BTreeSet<_>>();
-        if target_node_ids != expected_node_ids {
-            return Ok(None);
-        }
-        if target.journal_sequence == 0 || target.state_fingerprint.is_empty() {
-            return Err(DfsError::Metadata {
-                message: format!(
-                    "metadata shard {} has an incomplete operation-bound POSIX sync prefix",
-                    target.shard_id.0
-                ),
-            });
-        }
-        let watermark = DfsMetadataShardHeadWatermark {
-            file_system_id: target.file_system_id.clone(),
-            shard_id: target.shard_id.0.clone(),
-            primary_node_id: target.primary_node_id.clone(),
-            epoch: expected_shard.epoch,
-            journal_sequence: target.journal_sequence,
-            state_fingerprint: target.state_fingerprint.clone(),
-            acknowledged_node_ids: progress.acknowledged_node_ids.clone(),
-        };
-        let Some(control_plane) = self.control_plane.as_mut() else {
-            return Ok(None);
-        };
-        let published = DfsControlPlaneStore::new(control_plane.as_mut())
-            .publish_metadata_shard_head_watermark(expected_shard, &watermark)?;
-        if !published {
-            self.revalidate_metadata_quorum_sync_authority(target)?;
-            return Ok(None);
-        }
-        self.revalidate_metadata_quorum_sync_authority(target)?;
-        Ok(Some(metadata_sync_certificate(target, progress)))
+        Ok(None)
     }
 
     fn revalidate_metadata_quorum_sync_authority(
         &mut self,
         target: &DfsMetadataQuorumSyncTarget,
+        purpose: &MetadataQuorumSyncPurpose,
     ) -> Result<(), DfsError> {
+        if matches!(purpose, MetadataQuorumSyncPurpose::OrdinaryDurability) {
+            let backend = self
+                .metadata_backend
+                .as_deref()
+                .ok_or_else(|| DfsError::Metadata {
+                    message: "ordinary metadata sync has no actual durable backend".into(),
+                })?;
+            if backend.metadata_shard_instance_writes_frozen(&target.shard_id)?
+                || backend
+                    .metadata_shard_write_freeze(&target.shard_id)?
+                    .is_some_and(|freeze| freeze.activated_epoch != target.authority_epoch)
+            {
+                return Err(DfsError::Metadata {
+                    message:
+                        "ordinary metadata sync backend is fenced by another authority generation"
+                            .into(),
+                });
+            }
+            let Some(epoch) = target.authority_epoch else {
+                return if self.control_plane.is_none()
+                    && target.expected_shard.is_none()
+                    && target.replica_node_ids.is_empty()
+                    && target.primary_node_id == self.node_id
+                {
+                    Ok(())
+                } else {
+                    Err(DfsError::Metadata {
+                        message:
+                            "ordinary local metadata sync has a configured participant assignment"
+                                .into(),
+                    })
+                };
+            };
+            let context = self
+                .retained_metadata_replica_context(&target.file_system_id, &target.shard_id)?
+                .ok_or_else(|| DfsError::Metadata {
+                    message: "ordinary metadata sync has no retained qualified shard context"
+                        .into(),
+                })?;
+            if context.pending_membership_handoff.is_some()
+                || target.expected_shard.as_ref() != Some(&context.shard)
+                || context.shard.epoch != epoch
+                || context.shard.primary_node_id != self.node_id
+                || target.primary_node_id != self.node_id
+                || target.replica_node_ids
+                    != normalized_replica_node_ids(
+                        &self.node_id,
+                        context.shard.replica_node_ids.clone(),
+                    )
+            {
+                return Err(DfsError::StaleOwnerEpoch {
+                    file_system_id: target.file_system_id.clone(),
+                    local_node_id: self.node_id.clone(),
+                    primary_node_id: context.shard.primary_node_id,
+                    epoch: context.shard.epoch,
+                });
+            }
+            return Ok(());
+        }
         let Some(expected_epoch) = target.authority_epoch else {
             if self.control_plane.is_none() {
                 return Ok(());
@@ -2566,7 +2693,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
         })?;
         let shard = self
-            .current_metadata_sync_shard_config(target)?
+            .current_metadata_handoff_sync_shard_config(target)?
             .ok_or_else(|| DfsError::Distributed {
                 message: format!(
                     "metadata shard {} configuration disappeared during POSIX sync",
@@ -2587,7 +2714,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(())
     }
 
-    fn current_metadata_sync_shard_config(
+    // sinomo:kv-consistency: Validate the exact retiring assignment only for the existing joint handoff.
+    fn current_metadata_handoff_sync_shard_config(
         &mut self,
         target: &DfsMetadataQuorumSyncTarget,
     ) -> Result<Option<DfsMetadataShardConfig>, DfsError> {
@@ -3017,6 +3145,321 @@ mod tests {
     }
 
     #[test]
+    fn native_rebind_rechecks_a_prefix_advanced_after_its_read() {
+        let (runtime, initial, active) = crate::test_support::current_native_metadata_service(
+            "native-rebind-prefix-advance",
+            2,
+            "/services",
+        )
+        .unwrap();
+        drop(initial);
+        let owner = active.primary_node_id.clone();
+        let shard_id = DfsMetadataShardId::new(&active.shard_id);
+        let control = runtime.shared_control_plane().unwrap();
+        let proof = control
+            .with_client(|kv| {
+                DfsControlPlaneStore::new(kv.as_mut()).get_metadata_shard_membership_handoff_proof(
+                    &active.file_system_id,
+                    &active.shard_id,
+                )
+            })
+            .unwrap()
+            .unwrap();
+        drop(control);
+        assert_eq!(proof.desired_shard, active);
+        let mut writer = runtime.metadata_primary_service("/services").unwrap();
+        let mut cold = crate::LocalSobjMetadataBackend::open_for_inspection(
+            shard_id.clone(),
+            crate::default_dfs_metadata_shards_root(runtime.data_dir(&owner))
+                .join(crate::metadata_keys::key_segment(&active.shard_id)),
+        )
+        .unwrap();
+        assert!(
+            cold.metadata_shard_instance_writes_frozen(&shard_id)
+                .unwrap()
+        );
+        let initial_prefix = DfsMetadataBackend::metadata_prefix_proof(&cold, &shard_id)
+            .unwrap()
+            .unwrap();
+        for invalidity in ["epoch", "digest", "ack"] {
+            let mut invalid = proof.clone();
+            match invalidity {
+                "epoch" => invalid.desired_shard.epoch += 1,
+                "digest" => invalid.state_fingerprint.push_str("-negative"),
+                "ack" => invalid.acknowledged_node_ids.clear(),
+                _ => unreachable!(),
+            }
+            assert!(
+                !rebind_completed_metadata_shard_membership_handoff(
+                    &mut cold,
+                    &owner,
+                    &active,
+                    None,
+                    Some(&invalid)
+                )
+                .unwrap()
+            );
+            assert!(
+                cold.metadata_shard_instance_writes_frozen(&shard_id)
+                    .unwrap()
+            );
+            assert_eq!(
+                DfsMetadataBackend::metadata_prefix_proof(&cold, &shard_id)
+                    .unwrap()
+                    .unwrap(),
+                initial_prefix
+            );
+        }
+        struct ClearHook;
+        impl Drop for ClearHook {
+            fn drop(&mut self) {
+                BEFORE_REBIND_WRITER_LOCK.with(|hook| {
+                    hook.borrow_mut().take();
+                });
+            }
+        }
+        let clear_hook = ClearHook;
+        BEFORE_REBIND_WRITER_LOCK.with(|hook| {
+            assert!(hook.borrow().is_none());
+            *hook.borrow_mut() = Some(Box::new(move || {
+                // Another genuine bound writer appends after the cold handle's
+                // proof read. No prefix or authority observation is fabricated.
+                writer
+                    .posix_mkdir_all("/services/native-rebind-concurrent-write")
+                    .unwrap();
+            }));
+        });
+        assert!(
+            rebind_completed_metadata_shard_membership_handoff(
+                &mut cold,
+                &owner,
+                &active,
+                None,
+                Some(&proof)
+            )
+            .unwrap()
+        );
+        assert!(
+            !cold
+                .metadata_shard_instance_writes_frozen(&shard_id)
+                .unwrap()
+        );
+        let final_prefix = DfsMetadataBackend::metadata_prefix_proof(&cold, &shard_id)
+            .unwrap()
+            .unwrap();
+        assert!(final_prefix.journal_sequence > initial_prefix.journal_sequence);
+        assert!(
+            cold.get_object_by_path(
+                &active.file_system_id,
+                "/services/native-rebind-concurrent-write"
+            )
+            .unwrap()
+            .is_some()
+        );
+        drop(cold);
+        // Continuous real appends cannot turn bounded retry into unchecked
+        // authority or an unbounded cold-open loop.
+        fn arm_append(
+            writer: std::sync::Arc<std::sync::Mutex<NetworkedDfsService<crate::DfsNodeTransport>>>,
+            hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+            remaining: usize,
+        ) {
+            BEFORE_REBIND_WRITER_LOCK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    let index = hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    writer
+                        .lock()
+                        .unwrap()
+                        .posix_mkdir_all(&format!("/services/native-rebind-busy-{index}"))
+                        .unwrap();
+                    if remaining > 1 {
+                        arm_append(writer, hits, remaining - 1);
+                    }
+                }));
+            });
+        }
+        let writer = std::sync::Arc::new(std::sync::Mutex::new(
+            runtime.metadata_primary_service("/services").unwrap(),
+        ));
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut cold = crate::LocalSobjMetadataBackend::open_for_inspection(
+            shard_id.clone(),
+            crate::default_dfs_metadata_shards_root(runtime.data_dir(&owner))
+                .join(crate::metadata_keys::key_segment(&active.shard_id)),
+        )
+        .unwrap();
+        arm_append(
+            std::sync::Arc::clone(&writer),
+            std::sync::Arc::clone(&hits),
+            4,
+        );
+        let error = rebind_completed_metadata_shard_membership_handoff(
+            &mut cold,
+            &owner,
+            &active,
+            None,
+            Some(&proof),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            DfsError::MetadataRejection {
+                code: crate::DfsMetadataRejectionCode::PrefixMismatch,
+                ..
+            }
+        ));
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert!(
+            cold.metadata_shard_instance_writes_frozen(&shard_id)
+                .unwrap()
+        );
+        drop(clear_hook);
+        drop(writer);
+        assert!(
+            rebind_completed_metadata_shard_membership_handoff(
+                &mut cold,
+                &owner,
+                &active,
+                None,
+                Some(&proof)
+            )
+            .unwrap()
+        );
+        assert!(
+            !cold
+                .metadata_shard_instance_writes_frozen(&shard_id)
+                .unwrap()
+        );
+        drop(cold);
+        runtime.close().unwrap();
+    }
+
+    #[cfg(feature = "storage-conversion")]
+    #[test]
+    fn storage_import_rebind_checks_target_prefix_and_separate_image_identity() {
+        let name = "native-import-target-prefix-rebind";
+        let nodes = crate::test_runtime::DfsTestRuntime::ordered_node_ids(name, 1);
+        let fixture = configured_normal_sync_fixture(name, Vec::new());
+        let handle = fixture.runtime.runtime_handle();
+        let _entered = handle.enter();
+        let dir = sinomo_testdir::TestDir::new(name);
+        let shard = DfsMetadataShardId::new(&fixture.shard.shard_id);
+        let mut backend = LocalSobjMetadataBackend::new(shard.clone(), dir.path()).unwrap();
+        let identity = inspect_metadata_candidate(dir.path()).unwrap();
+        let freeze = backend
+            .freeze_metadata_shard_for_membership_handoff(&shard, name, fixture.shard.epoch)
+            .unwrap()
+            .unwrap();
+        let active = DfsMetadataShardConfig {
+            epoch: fixture.shard.epoch + 1,
+            ..fixture.shard.clone()
+        };
+        backend
+            .mark_metadata_shard_membership_handoff_activated(&shard, name, active.epoch)
+            .unwrap();
+        // Local rebind contract test only: the production caller obtains this
+        // exact completion from its fresh native configuration read.
+        let proof = DfsMetadataShardMembershipHandoffProof {
+            cause: DfsMetadataShardHandoffCause::StorageImport {
+                cut: DfsMetadataStorageImportCut {
+                    source_cut_digest: name.into(),
+                    source_journal_sequence: freeze.journal_sequence,
+                    source_state_fingerprint: freeze.state_fingerprint.clone(),
+                    target_prefix: identity.prefix_proof.clone(),
+                    converted_image_fingerprint: identity.state_fingerprint.clone(),
+                    pending_mapping_digest: name.into(),
+                },
+            },
+            handoff_id: name.into(),
+            retiring_shard: fixture.shard.clone(),
+            desired_shard: active.clone(),
+            journal_sequence: freeze.journal_sequence,
+            state_fingerprint: identity.state_fingerprint.clone(),
+            acknowledged_node_ids: vec![nodes[0].clone()],
+        };
+        assert_ne!(proof.state_fingerprint, freeze.state_fingerprint);
+        for invalidity in ["prefix", "image", "ack", "membership"] {
+            let mut changed = proof.clone();
+            match invalidity {
+                "prefix" => {
+                    if let DfsMetadataShardHandoffCause::StorageImport { cut } = &mut changed.cause
+                    {
+                        cut.target_prefix.digest.push('0');
+                    }
+                }
+                "image" => changed.state_fingerprint.push('0'),
+                "ack" => changed.acknowledged_node_ids.clear(),
+                "membership" => changed.cause = DfsMetadataShardHandoffCause::Membership,
+                _ => unreachable!(),
+            }
+            assert!(
+                !rebind_completed_metadata_shard_membership_handoff(
+                    &mut backend,
+                    &nodes[0],
+                    &active,
+                    None,
+                    Some(&changed),
+                )
+                .unwrap(),
+                "{invalidity}"
+            );
+        }
+        assert!(
+            !rebind_completed_metadata_shard_membership_handoff(
+                &mut backend,
+                &nodes[0],
+                &active,
+                None,
+                None,
+            )
+            .unwrap()
+        );
+        assert!(
+            backend
+                .metadata_shard_instance_writes_frozen(&shard)
+                .unwrap()
+        );
+        assert!(
+            rebind_completed_metadata_shard_membership_handoff(
+                &mut backend,
+                &nodes[0],
+                &active,
+                None,
+                Some(&proof),
+            )
+            .unwrap()
+        );
+        assert!(
+            !backend
+                .metadata_shard_instance_writes_frozen(&shard)
+                .unwrap()
+        );
+        drop(backend);
+        let mut cold = LocalSobjMetadataBackend::new(shard.clone(), dir.path()).unwrap();
+        assert!(cold.metadata_shard_instance_writes_frozen(&shard).unwrap());
+        assert!(
+            rebind_completed_metadata_shard_membership_handoff(
+                &mut cold,
+                &nodes[0],
+                &active,
+                None,
+                Some(&proof),
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            cold.metadata_shard_write_freeze(&shard)
+                .unwrap()
+                .unwrap()
+                .rebind_prefix_proof,
+            identity.prefix_proof
+        );
+        drop(cold);
+        drop(_entered);
+        fixture.finish();
+    }
+
+    #[test]
     fn metadata_quorum_size_counts_primary_and_configured_replicas() {
         assert_eq!(dfs_metadata_replica_quorum_size(0), 1);
         assert_eq!(dfs_metadata_replica_quorum_size(1), 2);
@@ -3224,6 +3667,8 @@ mod tests {
                 &target.state_fingerprint,
             )
             .expect("build valid supplied checkpoint");
+            let mut valid_target = target.clone();
+            valid_target.checkpoint_snapshot = Some(snapshot.clone());
             match invalidity {
                 "sequence" => {
                     target.journal_sequence = target.journal_sequence.saturating_add(1);
@@ -3240,16 +3685,7 @@ mod tests {
                 _ => unreachable!(),
             }
             target.checkpoint_snapshot = Some(snapshot);
-            let before_calls = fixture
-                .runtime
-                .rpc_observations()
-                .iter()
-                .filter(|observation| {
-                    observation.origin == crate::test_runtime::RpcOrigin::RegisteredHost
-                        && observation.source == fixture.shard.primary_node_id
-                        && observation.target == replica
-                })
-                .count();
+            let owned_attempts = fixture.service.transport.observe_routed_calls_for_test();
             let rejected = BTreeSet::from([replica.clone()]);
             let mut attempts = BTreeMap::new();
             reset_metadata_sync_snapshot_build_calls();
@@ -3275,18 +3711,9 @@ mod tests {
             );
             assert_eq!(metadata_sync_snapshot_build_calls(), 0);
             assert_eq!(
-                fixture
-                    .runtime
-                    .rpc_observations()
-                    .iter()
-                    .filter(|observation| {
-                        observation.origin == crate::test_runtime::RpcOrigin::RegisteredHost
-                            && observation.source == fixture.shard.primary_node_id
-                            && observation.target == replica
-                    })
-                    .count(),
-                before_calls,
-                "invalid supplied snapshot cannot dispatch a peer call"
+                owned_attempts.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "invalid supplied snapshot cannot dispatch through its own transport"
             );
             assert!(attempts.is_empty());
             assert!(
@@ -3300,6 +3727,21 @@ mod tests {
                 fixture.service.transport.pending_incoming_count().unwrap(),
                 Some(0)
             );
+            // Calibrate the same observer against a valid native snapshot call.
+            // Other host clients retain their own transports and cannot affect it.
+            fixture
+                .service
+                .send_metadata_sync_checkpoint_snapshots(
+                    &valid_target,
+                    "valid-owned-observation-control",
+                    &rejected,
+                    &BTreeSet::new(),
+                    &mut BTreeMap::new(),
+                    &MetadataQuorumSyncPurpose::OrdinaryDurability,
+                )
+                .unwrap();
+            assert_eq!(owned_attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+            fixture.service.process_incoming().unwrap();
             fixture.finish();
         }
     }
@@ -3348,7 +3790,7 @@ mod tests {
     #[test]
     fn native_cached_sender_cursor_cannot_replace_a_fresh_receiver_ack() {
         let name = "native-sync-cursor-not-proof";
-        let nodes = crate::test_runtime::DfsTestRuntime::ordered_node_ids(name, 2);
+        let nodes = crate::test_runtime::DfsTestRuntime::ordered_node_ids(name, 3);
         let mut fixture = configured_normal_sync_fixture(name, nodes[1..].to_vec());
         let target = fixture
             .service
@@ -3358,11 +3800,67 @@ mod tests {
             .service
             .sync_metadata_shard_to_quorum(&target, Duration::from_secs(5))
             .unwrap();
-        fixture.runtime.stop_node(&nodes[1]).unwrap();
+        fixture.runtime.stop_node(&nodes[2]).unwrap();
+        // Obtain a new real attempt identity while retaining the exact prefix
+        // already covered by the sender's persisted scheduling cursor.
+        let partial = fixture
+            .service
+            .capture_metadata_quorum_sync_target(&fixture.object)
+            .unwrap();
+        assert_ne!(partial.barrier_id, target.barrier_id);
+        assert_eq!(partial.expected_shard, target.expected_shard);
+        assert_eq!(partial.replica_node_ids, target.replica_node_ids);
+        assert_eq!(partial.journal_sequence, target.journal_sequence);
+        assert_eq!(partial.state_fingerprint, target.state_fingerprint);
+        let source_trace = crate::test_support::capture_native_shard_trace(
+            &fixture.runtime.data_dir(&nodes[0]).root(),
+            partial.shard_id.clone(),
+        )
+        .unwrap();
+        let receiver_trace = crate::test_support::capture_native_shard_trace(
+            &fixture.runtime.data_dir(&nodes[1]).root(),
+            partial.shard_id.clone(),
+        )
+        .unwrap();
+        let before = fixture.control_plane_probe.txn_calls();
+        assert_eq!(fixture.runtime.observation_dropped_count(), 0);
+        let observation_cursor = fixture.runtime.rpc_observations().len();
+        let partial_started = Instant::now();
         let error = fixture
             .service
-            .sync_metadata_shard_to_quorum(&target, Duration::from_millis(100))
-            .expect_err("an earlier sender cursor is not a new receiver acknowledgement");
+            .sync_metadata_shard_to_quorum(&partial, Duration::from_millis(500))
+            .expect_err("a remaining quorum cannot replace a full assigned-participant proof");
+        let partial_elapsed = partial_started.elapsed();
+        assert!(
+            partial_elapsed >= DFS_POSIX_FULL_SHARD_ACK_GRACE,
+            "the actual partial attempt crosses the unchanged fallback grace"
+        );
+        source_trace.close();
+        receiver_trace.close();
+        assert_eq!(fixture.control_plane_probe.txn_calls(), before);
+        assert_eq!(fixture.runtime.observation_dropped_count(), 0);
+        let observations = fixture.runtime.rpc_observations();
+        let window = &observations[observation_cursor..];
+        assert!(
+            window.iter().any(|completed| {
+                completed.source == nodes[0]
+                    && completed.target == nodes[1]
+                    && completed.route == crate::DFS_METADATA_JOURNAL_BATCH_ROUTE
+                    && completed.phase == crate::test_runtime::RpcPhase::Completed
+                    && window.iter().any(|began| {
+                        began.call_id == completed.call_id
+                            && began.source == completed.source
+                            && began.target == completed.target
+                            && began.route == completed.route
+                            && matches!(
+                                began.phase,
+                                crate::test_runtime::RpcPhase::Constructed
+                                    | crate::test_runtime::RpcPhase::BeforeDispatch
+                            )
+                    })
+            }),
+            "the partial attempt completes a newly constructed actual metadata peer call"
+        );
         assert!(matches!(
             error,
             DfsError::Network { .. } | DfsError::NetworkDelivery { .. }
@@ -3375,13 +3873,141 @@ mod tests {
                 .is_empty(),
             "failed barrier releases only its own pending probe slots"
         );
-        fixture.runtime.reopen_node(nodes[1].clone()).unwrap();
-        let fresh = fixture
+        fixture.runtime.reopen_node(nodes[2].clone()).unwrap();
+        let healed = fixture
             .service
-            .sync_metadata_shard_to_quorum(&target, Duration::from_secs(5))
+            .sync_metadata_shard_to_quorum(&partial, Duration::from_secs(5))
             .unwrap();
-        assert!(fresh.acknowledged_node_ids.contains(&nodes[1]));
+        assert_eq!(healed.acknowledged_node_ids.len(), 3);
+        for node in &nodes {
+            assert!(healed.acknowledged_node_ids.contains(node));
+        }
+        assert_eq!(fixture.control_plane_probe.txn_calls(), before);
+        assert_eq!(fixture.runtime.observation_dropped_count(), 0);
+        let expected_shard = fixture.shard.clone();
         fixture.finish();
+        // Export after ordinary owner drain. Closing observation admission
+        // alone does not prove that any already-owned native attempt settled.
+        let mut source_bytes = Vec::new();
+        let mut receiver_bytes = Vec::new();
+        source_trace.export_raw(&mut source_bytes).unwrap();
+        receiver_trace.export_raw(&mut receiver_bytes).unwrap();
+        let source: serde_json::Value = serde_json::from_slice(&source_bytes).unwrap();
+        let receiver: serde_json::Value = serde_json::from_slice(&receiver_bytes).unwrap();
+        for capture in [&source, &receiver] {
+            assert_eq!(capture["closed"], true);
+            assert_eq!(capture["actual_owner_stopped"], true);
+            for counter in ["dropped", "incomplete", "in_flight"] {
+                assert_eq!(capture[counter], "0");
+            }
+        }
+        let source_facts = source["boundary_packets"].as_array().unwrap();
+        let receiver_facts = receiver["boundary_packets"].as_array().unwrap();
+        let request_prefix = format!("dfs_sync_probe_{}-", partial.barrier_id);
+        let consumed = source_facts
+            .iter()
+            .map(|row| &row["facts"])
+            .find(|fact| {
+                fact["phase"] == "source-journal-response-accepted"
+                    && fact["authenticated_source_node_id"] == nodes[1].as_str()
+                    && fact["expected_target_node_id"] == nodes[1].as_str()
+                    && fact["response"]["request_id"]
+                        .as_str()
+                        .is_some_and(|id| id.starts_with(&request_prefix))
+                    && fact["response"]["shard_id"] == partial.shard_id.0
+                    && fact["response"]["next_after_sequence"].as_u64()
+                        == Some(partial.journal_sequence)
+                    && fact["response"]["verified_prefix_only"] == true
+                    && fact["response"]["result"] == "applied"
+            })
+            .expect("this invocation consumed the surviving peer's actual accepted prefix ACK");
+        let start = source_facts
+            .iter()
+            .map(|row| &row["facts"])
+            .find(|fact| {
+                fact["phase"] == "direct-journal-rpc-attempt-started"
+                    && fact["target_node_id"] == nodes[1].as_str()
+                    && fact["route"] == crate::DFS_METADATA_JOURNAL_BATCH_ROUTE
+                    && fact["command"]["request_id"] == consumed["response"]["request_id"]
+            })
+            .expect("this invocation actually polled a fresh native prefix probe");
+        let command: DfsMetadataJournalBatchCommand =
+            serde_json::from_value(start["command"].clone()).unwrap();
+        assert_eq!(command.source_node_id.as_ref(), Some(&nodes[0]));
+        assert_eq!(
+            command.file_system_id.as_ref(),
+            Some(&partial.file_system_id)
+        );
+        assert_eq!(command.authority_epoch, partial.authority_epoch);
+        assert!(command.verify_prefix_only);
+        assert!(command.batch.journal_frames.is_empty());
+        assert_eq!(command.batch.shard_id, partial.shard_id);
+        assert_eq!(command.batch.next_after_sequence, partial.journal_sequence);
+        let probe = command.prefix_probe.as_ref().unwrap();
+        assert!(
+            probe
+                .barrier_id
+                .starts_with(&format!("{}-", partial.barrier_id))
+        );
+        assert_eq!(probe.file_system_id, command.file_system_id);
+        assert_eq!(probe.authority_epoch, partial.authority_epoch);
+        assert_eq!(probe.shard_id, partial.shard_id);
+        assert_eq!(probe.journal_sequence, partial.journal_sequence);
+        assert_eq!(probe.state_fingerprint, partial.state_fingerprint);
+        assert!(probe.primary_handoff_id.is_none());
+        let returned = source_facts
+            .iter()
+            .map(|row| &row["facts"])
+            .find(|fact| {
+                fact["phase"] == "direct-journal-rpc-attempt-returned"
+                    && fact["attempt_id"] == start["attempt_id"]
+            })
+            .expect("the SAME native attempt returned an actual response");
+        assert!(returned["error_detail"].is_null());
+        assert!(returned["delivery_state"].is_null());
+        let response: DfsMetadataJournalBatchResponse =
+            serde_json::from_value(returned["response"].clone()).unwrap();
+        assert_eq!(response.request_id, command.request_id);
+        assert_eq!(response.shard_id, partial.shard_id);
+        assert_eq!(response.next_after_sequence, partial.journal_sequence);
+        assert_eq!(response.applied_entries, 0);
+        assert!(response.verified_prefix_only);
+        assert!(response.verified_authority_probe_id.is_none());
+        assert_eq!(response.result, DfsMetadataJournalBatchResult::Applied);
+        let accepted = source_facts
+            .iter()
+            .map(|row| &row["facts"])
+            .find(|fact| {
+                fact["phase"] == "source-journal-response-accepted"
+                    && fact["authenticated_source_node_id"] == nodes[1].as_str()
+                    && fact["expected_target_node_id"] == nodes[1].as_str()
+                    && fact["response"] == returned["response"]
+            })
+            .expect("the actual sync owner consumed the survivor's SAME accepted prefix ACK");
+        assert_eq!(
+            accepted["expected_next_after_sequence"].as_u64(),
+            Some(partial.journal_sequence)
+        );
+        assert_eq!(accepted["expected_prefix_only"], true);
+        assert!(accepted["expected_confirmation_id"].is_null());
+        let received = receiver_facts
+            .iter()
+            .map(|row| &row["facts"])
+            .find(|fact| {
+                fact["phase"] == "replica-prefix-probe-accepted"
+                    && fact["local_node_id"] == nodes[1].as_str()
+                    && fact["command"] == start["command"]
+                    && fact["response"] == returned["response"]
+            })
+            .expect("the actual surviving receiver verified this invocation's exact full prefix");
+        assert_eq!(
+            serde_json::from_value::<DfsMetadataShardConfig>(
+                received["actual_source_config"].clone()
+            )
+            .unwrap(),
+            expected_shard
+        );
+        assert!(received["actual_pending_handoff"].is_null());
     }
 
     #[test]
@@ -3455,15 +4081,27 @@ mod tests {
             .unwrap();
         drop(promoted);
         drop(fixture.service);
+        fixture.runtime.stop_node(&nodes[0]).unwrap();
         fixture.runtime.reopen_node(nodes[0].clone()).unwrap();
         fixture.service = fixture.runtime.client(&nodes[0]).unwrap();
+        let retired_marker = fixture
+            .service
+            .metadata_backend()
+            .unwrap()
+            .metadata_shard_write_freeze(&shard_id)
+            .unwrap()
+            .expect("retired replica retains its actual ingest fence");
+        assert_eq!(retired_marker.handoff_id, proof.handoff_id);
+        assert_eq!(retired_marker.retiring_epoch, fixture.shard.epoch);
+        assert_eq!(retired_marker.activated_epoch, Some(active.epoch));
+        assert_eq!(fixture.runtime.root_shard().unwrap(), active);
+        assert_ne!(active.primary_node_id, *fixture.service.node_id());
+        // A reopened replica's node-scoped author projection is not a frozen
+        // primary. Its actual marker and current assignment still deny that role.
         assert!(
-            fixture
-                .service
-                .metadata_backend()
-                .unwrap()
-                .metadata_shard_authoritative_writes_frozen(&shard_id)
-                .unwrap()
+            matches!(fixture.service.capture_metadata_quorum_sync_target(&fixture.object),
+            Err(DfsError::StaleOwnerEpoch { primary_node_id, epoch, .. })
+            if primary_node_id == active.primary_node_id && epoch == active.epoch)
         );
         assert_eq!(
             fixture
@@ -3476,7 +4114,7 @@ mod tests {
         assert!(
             fixture
                 .service
-                .posix_stat("/native-after-primary-handoff")
+                .posix_stat_distributed("/native-after-primary-handoff")
                 .is_ok()
         );
         fixture.finish();
@@ -3540,12 +4178,40 @@ mod tests {
                 vec![nodes[0].clone()],
             )
             .unwrap();
-        assert!(matches!(
+        let active = fixture.runtime.root_shard().unwrap();
+        assert_eq!(active.primary_node_id, nodes[1]);
+        assert_eq!(active.epoch, fixture.shard.epoch + 1);
+        let marker = fixture
+            .service
+            .metadata_backend()
+            .unwrap()
+            .metadata_shard_write_freeze(&target.shard_id)
+            .unwrap()
+            .unwrap();
+        assert_ne!(marker.activated_epoch, target.authority_epoch);
+        let before = fixture
+            .service
+            .metadata_backend()
+            .unwrap()
+            .metadata_prefix_proof(&target.shard_id)
+            .unwrap();
+        let outcome = fixture
+            .service
+            .sync_metadata_shard_to_quorum(&target, Duration::from_millis(100));
+        assert!(
+            matches!(&outcome, Err(DfsError::Metadata { message })
+            if message == "ordinary metadata sync backend is fenced by another authority generation"),
+            "the actual native freeze must reject the original stale target: {outcome:?}"
+        );
+        assert_eq!(
             fixture
                 .service
-                .sync_metadata_shard_to_quorum(&target, Duration::from_millis(100)),
-            Err(DfsError::StaleOwnerEpoch { .. })
-        ));
+                .metadata_backend()
+                .unwrap()
+                .metadata_prefix_proof(&target.shard_id)
+                .unwrap(),
+            before
+        );
         fixture.finish();
     }
 

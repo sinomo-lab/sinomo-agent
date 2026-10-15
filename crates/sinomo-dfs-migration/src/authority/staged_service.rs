@@ -39,6 +39,7 @@ const ROUTES: &[&str] = &[
 pub(super) struct ContentStageRequest {
     pub(super) command: sinomo_dfs::DfsMessageCommand,
     pub(super) size_bytes: u64,
+    pub(super) verification: super::content_work::ContentVerificationRequest,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -104,6 +105,76 @@ pub(super) struct SourceFloorResponse {
     pub(super) request_id: String,
     pub(super) handoff_id: String,
     pub(super) floors: Vec<SourceFloor>,
+    pub(super) checkpoints: Vec<crate::metadata::source_ancestry::SourceCheckpointAnchor>,
+}
+/// Released f5 saved DATA only. The current network response always requires
+/// its explicit checkpoint field; this shape supplies no authority or defaults.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetainedF5SourceFloors {
+    request_id: String,
+    handoff_id: String,
+    floors: Vec<SourceFloor>,
+}
+fn decode_recorded_source_floors(
+    bytes: &[u8],
+    challenge: &SourceFloorChallenge,
+    actual_floors: &[crate::metadata::ack_floor::LegacyAcknowledgement],
+    actual_checkpoints: &[crate::metadata::source_ancestry::SourceCheckpointAnchor],
+) -> Result<(SourceFloorResponse, bool)> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).map_err(error)?;
+    let retained_f5 = value.get("checkpoints").is_none();
+    let response = if retained_f5 {
+        let old: RetainedF5SourceFloors = serde_json::from_value(value).map_err(error)?;
+        if !actual_checkpoints.is_empty()
+            || serde_json::to_value(&old.floors).map_err(error)?
+                != serde_json::to_value(
+                    actual_floors
+                        .iter()
+                        .map(SourceFloor::from)
+                        .collect::<Vec<_>>(),
+                )
+                .map_err(error)?
+        {
+            return Err(error(
+                "retained f5 ancestry requires unchanged full ACK floors and no new checkpoint obligation",
+            ));
+        }
+        // Run the actual existing verifier; a missing/forked/advanced original
+        // anchor cannot gain a proof from an absent saved DATA field.
+        crate::metadata::source_ancestry::SourceAncestryVerifier::new(
+            &challenge.plan.source_cut,
+            actual_floors,
+            &[],
+        )?;
+        SourceFloorResponse {
+            request_id: old.request_id,
+            handoff_id: old.handoff_id,
+            floors: old.floors,
+            checkpoints: Vec::new(),
+        }
+    } else {
+        serde_json::from_value(value).map_err(error)?
+    };
+    if response.request_id != challenge.request_id
+        || response.handoff_id != challenge.plan.expected_handoff.handoff_id
+    {
+        return Err(error(
+            "recorded source floors change the exact immutable request/handoff",
+        ));
+    }
+    Ok((response, retained_f5))
+}
+fn recorded_source_checkpoints(
+    root: &Path,
+    retained_f5: bool,
+) -> Result<Vec<crate::metadata::SourceCheckpointCapture>> {
+    let path = root.join("source-checkpoints.json");
+    match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(error),
+        Err(cause) if retained_f5 && cause.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(cause) => Err(error(cause)),
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -131,6 +202,48 @@ pub(super) struct StagedImportService {
     pub(super) component_context: sinomo_module::ComponentContext,
 }
 impl NativeImportAuthority {
+    fn authorize_content_stage(
+        &self,
+        source: &sinomo_core::node::NodeId,
+        stage: &ContentStageRequest,
+    ) -> Result<()> {
+        self.authorize_content_verification(source, &stage.verification)?;
+        let routed = &stage.command.routed_message;
+        let sinomo_dfs::DfsNetworkMessage::StageRetainedBlob(command) = &routed.message else {
+            return Err(error("import content route accepts only retained stages"));
+        };
+        let verification = &stage.verification;
+        let clock = blake3::hash(stage.command.request_id.as_bytes());
+        let frame_id = u64::from_le_bytes(
+            clock.as_bytes()[..8]
+                .try_into()
+                .expect("BLAKE3 identity prefix"),
+        );
+        if verification.export_bytes
+            || verification.object.policy == sinomo_core::DfsObjectPolicy::LocalOwned
+            || stage.command.request_id.is_empty()
+            || stage.command.request_id != command.request_id
+            || command.intent_id != format!("storage-import-content:{}", command.request_id)
+            || &routed.source_node_id != source
+            || routed.target_node_id != self.local_node()?
+            || routed.frame_id != frame_id
+            || routed.message_id != frame_id
+            || command.file_system_id != verification.version.file_system_id
+            || command.object_id != verification.version.object_id
+            || command.version != verification.version.version
+            || Some(command.content_hash.as_str()) != verification.version.content_hash.as_deref()
+            || verification.version.size_bytes != Some(stage.size_bytes)
+            || command.object_metadata.as_ref() != Some(&verification.object)
+            || command.authority_shard.as_ref() != Some(&verification.authority)
+            || command.expected_base_version.is_some()
+            || !command.bytes.is_empty()
+        {
+            return Err(error(
+                "retained content stage changes its exact original verification/command/byte binding",
+            ));
+        }
+        Ok(())
+    }
     pub(super) fn receiver_root_for(
         &self,
         fs: &sinomo_dfs::DfsFileSystemId,
@@ -298,6 +411,7 @@ impl NativeImportAuthority {
             &command.shard_id,
             &envelope.plan,
             &envelope.ancestry_request_id,
+            None,
         )?;
         let DfsMetadataShardHandoffCause::StorageImport { cut } = &pending.cause else {
             unreachable!()
@@ -405,8 +519,13 @@ impl NativeImportAuthority {
             &std::fs::read(root.join("source-ancestry-request.json")).map_err(error)?,
         )
         .map_err(error)?;
-        let _fences =
-            self.verify_staged_source_ancestry(fs, &probe.shard_id, &plan, &ancestry_request_id)?;
+        let _fences = self.verify_staged_source_ancestry(
+            fs,
+            &probe.shard_id,
+            &plan,
+            &ancestry_request_id,
+            None,
+        )?;
         let actual = sinomo_dfs::inspect_metadata_candidate(&root)?;
         if actual.prefix_proof != cut.target_prefix
             || actual.state_fingerprint != cut.converted_image_fingerprint
@@ -437,7 +556,7 @@ impl NativeImportAuthority {
         cut: &MetadataSourceCut,
         shard: &sinomo_dfs::DfsMetadataShardId,
     ) -> Result<bool> {
-        if cut.source_format_version != Some(6) {
+        if !matches!(cut.source_format_version, Some(3 | 6)) {
             return Ok(false);
         }
         Self::source_has_physical_shard_clock(cut, shard)
@@ -496,17 +615,23 @@ impl NativeImportAuthority {
             }
         }
         let parts: Vec<_> = relative.split('/').collect();
+        let current_target = format!(
+            "target-format-{}",
+            sinomo_dfs::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION
+        );
+        let supported_target = |value: &str| value == "target-format-9" || value == current_target;
         match parts.as_slice() {
-            [actual_key, "target-format-9", "current-image"] => {
-                Ok(*actual_key == key && capsules.is_empty())
+            [actual_key, target, "current-image"] => {
+                Ok(supported_target(target) && *actual_key == key && capsules.is_empty())
             }
             [
                 actual_key,
-                "target-format-9",
+                target,
                 "data-goals",
                 actual_goal,
                 "current-image",
-            ] => Ok(*actual_key == key
+            ] => Ok(supported_target(target)
+                && *actual_key == key
                 && !capsules.is_empty()
                 && *actual_goal
                     == crate::metadata::data_goal_digest(&cut.source_root, shard, &capsules)?),
@@ -526,7 +651,7 @@ impl NativeImportAuthority {
         // conversion DATA. A combined root serving another logical shard does
         // not qualify: its actual source-root role differs from that shard.
         let legacy_shard_clock = Self::legacy_source_has_shard_clock(cut, shard)?;
-        let local_current = crate::metadata::current_root(root)?;
+        let local_current = crate::metadata::original_native_root_format(root)?.is_some();
         let native_prefix = cut.source_exact_prefix.as_ref().is_some_and(|prefix| {
             prefix.version == 2 && prefix.journal_sequence == cut.source_journal_sequence
         });
@@ -562,7 +687,7 @@ impl NativeImportAuthority {
         let actual_header = if local_current {
             true
         } else if legacy_shard_clock {
-            crate::metadata::metadata_root_at_format(root, 6)?
+            crate::metadata::legacy_source_checkpoint_header(root)?.is_some()
         } else {
             crate::metadata::native_source_root(root, cut.source_format_version)?
         };
@@ -590,6 +715,7 @@ impl NativeImportAuthority {
     ) -> Result<(
         Vec<Arc<std::fs::File>>,
         Vec<crate::metadata::ack_floor::LegacyAcknowledgement>,
+        Vec<crate::metadata::SourceCheckpointCapture>,
     )> {
         let mut roots = BTreeSet::from([
             self.metadata_root.join(&shard.0),
@@ -598,6 +724,7 @@ impl NativeImportAuthority {
         roots.retain(|root| root.exists());
         let mut fences = Vec::new();
         let mut floors = Vec::new();
+        let mut checkpoints = Vec::new();
         let requested_root = self.metadata_root.join(&shard.0);
         if requested_root.exists() {
             let fence = crate::metadata::retain_source_fence(&requested_root)?;
@@ -614,7 +741,7 @@ impl NativeImportAuthority {
             let current_source = self.current_source_root_for_plan(&root, fs, shard, plan)?;
             if root == self.metadata_root.join(&shard.0)
                 && !root.join("metadata-import-v7.json").is_file()
-                && crate::metadata::current_root(&root)?
+                && crate::metadata::original_native_root_format(&root)?.is_some()
                 && !current_source
             {
                 return Err(error(
@@ -629,13 +756,28 @@ impl NativeImportAuthority {
             } else {
                 crate::metadata::retain_source_fence(&source)?
             };
-            let local_current = current_source && crate::metadata::current_root(&source)?;
-            let local_format = if local_current {
-                Some(sinomo_dfs::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION)
+            let local_native_format = if current_source {
+                crate::metadata::original_native_root_format(&source)?
             } else {
-                current_source
-                    .then_some(plan.source_cut.source_format_version)
-                    .flatten()
+                None
+            };
+            let local_current = local_native_format.is_some();
+            let local_header = if current_source && !local_current {
+                crate::metadata::legacy_source_checkpoint_header(&source)?
+            } else {
+                None
+            };
+            let local_format = if local_current {
+                local_native_format
+            } else {
+                local_header
+                    .as_ref()
+                    .map(|value| value.source_format_version)
+                    .or_else(|| {
+                        current_source
+                            .then_some(plan.source_cut.source_format_version)
+                            .flatten()
+                    })
             };
             let actual = crate::metadata::ack_floor::acknowledged_source_floors_for_root(
                 &source,
@@ -643,6 +785,31 @@ impl NativeImportAuthority {
                 local_format,
                 shard,
             )?;
+            let ack_anchors = actual
+                .iter()
+                .map(|floor| {
+                    crate::metadata::source_ancestry::source_ack_prefix_anchor(
+                        floor,
+                        local_format,
+                        shard,
+                        plan.source_cut.source_journal_sequence,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let needs_checkpoint = actual.iter().zip(&ack_anchors).any(|(floor, proof)| {
+                floor.shard_id == *shard
+                    && proof.is_none()
+                    && !actual.iter().zip(&ack_anchors).any(|(anchor, proof)| {
+                        anchor.shard_id == floor.shard_id
+                            && anchor.journal_sequence >= floor.journal_sequence
+                            && proof.is_some()
+                    })
+            });
+            let checkpoint = if needs_checkpoint && current_source && !local_current {
+                crate::metadata::capture_legacy_source_checkpoint(&source, shard)?
+            } else {
+                None
+            };
             if local_current
                 && plan.source_cut.source_format_version
                     != Some(sinomo_dfs::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION)
@@ -671,8 +838,13 @@ impl NativeImportAuthority {
                 crate::metadata::source_ancestry::SourceAncestryVerifier::new(
                     &plan.source_cut,
                     &actual,
+                    &checkpoint
+                        .iter()
+                        .map(|value| value.anchor.clone())
+                        .collect::<Vec<_>>(),
                 )?;
             }
+            checkpoints.extend(checkpoint);
             floors.extend(actual);
             fences.push(fence);
         }
@@ -680,7 +852,7 @@ impl NativeImportAuthority {
         for floor in floors {
             exact.insert(serde_json::to_vec(&floor).map_err(error)?, floor);
         }
-        Ok((fences, exact.into_values().collect()))
+        Ok((fences, exact.into_values().collect(), checkpoints))
     }
     fn original_source_root(&self, root: &Path, current_source: bool) -> Result<Option<PathBuf>> {
         if current_source {
@@ -734,26 +906,63 @@ impl NativeImportAuthority {
         if actual.cause != h.cause || actual.desired_shard != h.desired_shard {
             return Err(error("source floor challenge was superseded"));
         }
-        let (_fences, floors) = self.capture_local_source_floors(
+        let (_fences, floors, checkpoints) = self.capture_local_source_floors(
             &h.retiring_shard.file_system_id,
             &challenge.plan.source_cut.scope_shard,
             &challenge.plan,
         )?;
         // This validates the exact actual anchors; no chain, height or state
         // claim from the sender can replace the receiver's retained floors.
+        let anchors = checkpoints
+            .iter()
+            .map(|value| value.anchor.clone())
+            .collect::<Vec<_>>();
         crate::metadata::source_ancestry::SourceAncestryVerifier::new(
             &challenge.plan.source_cut,
             &floors,
+            &anchors,
         )?;
         let response = SourceFloorResponse {
             request_id: challenge.request_id.clone(),
             handoff_id: h.handoff_id.clone(),
             floors: floors.iter().map(SourceFloor::from).collect(),
+            checkpoints: anchors,
         };
         let root = self.source_ancestry_root(&h.handoff_id, &challenge.request_id)?;
         std::fs::create_dir_all(&root).map_err(error)?;
+        if root.join("floors.json").is_file() {
+            let recorded: SourceFloorChallenge =
+                serde_json::from_slice(&std::fs::read(root.join("challenge.json")).map_err(error)?)
+                    .map_err(error)?;
+            if recorded.request_id != challenge.request_id
+                || digest(&recorded.plan)? != digest(&challenge.plan)?
+            {
+                return Err(error(
+                    "retained ancestry retry changes its exact immutable plan/request",
+                ));
+            }
+            let (retained, old_f5) = decode_recorded_source_floors(
+                &std::fs::read(root.join("floors.json")).map_err(error)?,
+                &challenge,
+                &floors,
+                &response.checkpoints,
+            )?;
+            let recorded_checkpoints = recorded_source_checkpoints(&root, old_f5)?;
+            if serde_json::to_value(&retained.floors).map_err(error)?
+                != serde_json::to_value(&response.floors).map_err(error)?
+                || retained.checkpoints != response.checkpoints
+                || recorded_checkpoints != checkpoints
+            {
+                return Err(error(
+                    "retained ancestry retry changes its original complete source constraints",
+                ));
+            }
+            // Preserve the original saved floors/ACKs/chunks and request bytes.
+            return Ok(retained);
+        }
         Self::save_blueprint(&root, "challenge.json", &challenge)?;
         Self::save_blueprint(&root, "floors.json", &response)?;
+        Self::save_blueprint(&root, "source-checkpoints.json", &checkpoints)?;
         Ok(response)
     }
     pub(super) fn receive_source_ancestry_chunk(
@@ -787,9 +996,6 @@ impl NativeImportAuthority {
             &h.handoff_id,
             &source,
         )?;
-        let floors: SourceFloorResponse =
-            serde_json::from_slice(&std::fs::read(root.join("floors.json")).map_err(error)?)
-                .map_err(error)?;
         let progress = {
             let mut registry = self
                 .source_verifiers
@@ -798,6 +1004,27 @@ impl NativeImportAuthority {
             if let Some(progress) = registry.get(&root) {
                 Arc::clone(progress)
             } else {
+                let (_fresh_fences, fresh_floors, fresh_checkpoints) = self
+                    .capture_local_source_floors(
+                        &h.retiring_shard.file_system_id,
+                        &challenge.plan.source_cut.scope_shard,
+                        &challenge.plan,
+                    )?;
+                let fresh_anchors = fresh_checkpoints
+                    .iter()
+                    .map(|capture| capture.anchor.clone())
+                    .collect::<Vec<_>>();
+                let (floors, old_f5) = decode_recorded_source_floors(
+                    &std::fs::read(root.join("floors.json")).map_err(error)?,
+                    &challenge,
+                    &fresh_floors,
+                    &fresh_anchors,
+                )?;
+                if recorded_source_checkpoints(&root, old_f5)? != fresh_checkpoints {
+                    return Err(error(
+                        "source chunk retry changes its original checkpoint custody",
+                    ));
+                }
                 let actual = floors
                     .floors
                     .into_iter()
@@ -806,6 +1033,7 @@ impl NativeImportAuthority {
                 let mut verifier = crate::metadata::source_ancestry::SourceAncestryVerifier::new(
                     &challenge.plan.source_cut,
                     &actual,
+                    &floors.checkpoints,
                 )?;
                 let next_ordinal = Self::replay_source_chunks(&root, &mut verifier, None)?;
                 let progress = Arc::new(Mutex::new(SourceTransferVerifier {
@@ -920,6 +1148,7 @@ impl NativeImportAuthority {
         shard: &sinomo_dfs::DfsMetadataShardId,
         plan: &MetadataImportPlan,
         request_id: &str,
+        local_exact_prefix: Option<&sinomo_dfs::DfsMetadataPrefixProof>,
     ) -> Result<Vec<Arc<std::fs::File>>> {
         let root = self.source_ancestry_root(&plan.expected_handoff.handoff_id, request_id)?;
         let challenge: SourceFloorChallenge =
@@ -928,18 +1157,51 @@ impl NativeImportAuthority {
         if digest(&challenge.plan)? != digest(plan)? {
             return Err(error("source ancestry belongs to another immutable plan"));
         }
-        let (fences, floors) = self.capture_local_source_floors(fs, shard, plan)?;
-        let response: SourceFloorResponse =
-            serde_json::from_slice(&std::fs::read(root.join("floors.json")).map_err(error)?)
-                .map_err(error)?;
-        if response.floors != floors.iter().map(SourceFloor::from).collect::<Vec<_>>() {
+        let (fences, floors, checkpoints) = self.capture_local_source_floors(fs, shard, plan)?;
+        let anchors = checkpoints
+            .iter()
+            .map(|capture| capture.anchor.clone())
+            .collect::<Vec<_>>();
+        let (response, old_f5) = decode_recorded_source_floors(
+            &std::fs::read(root.join("floors.json")).map_err(error)?,
+            &challenge,
+            &floors,
+            &anchors,
+        )?;
+        let recorded_checkpoints = recorded_source_checkpoints(&root, old_f5)?;
+        if response.floors != floors.iter().map(SourceFloor::from).collect::<Vec<_>>()
+            || recorded_checkpoints != checkpoints
+            || response.checkpoints
+                != checkpoints
+                    .iter()
+                    .map(|value| value.anchor.clone())
+                    .collect::<Vec<_>>()
+        {
             return Err(error(
-                "actual source ACK floors changed after the ancestry challenge",
+                "actual source ACK floors or LOCAL checkpoint custody changed after the ancestry challenge",
             ));
+        }
+        let mut constraints = response.checkpoints.clone();
+        if let Some(prefix) = local_exact_prefix {
+            if !self.current_source_root_for_plan(
+                &self.metadata_root.join(&shard.0),
+                fs,
+                shard,
+                plan,
+            )? {
+                return Err(error(
+                    "legacy receiver changes its actual local shard/source role",
+                ));
+            }
+            constraints.push(crate::metadata::source_ancestry::SourceCheckpointAnchor {
+                shard_id: shard.clone(),
+                prefix_proof: prefix.clone(),
+            });
         }
         let mut verifier = crate::metadata::source_ancestry::SourceAncestryVerifier::new(
             &plan.source_cut,
             &floors,
+            &constraints,
         )?;
         Self::replay_source_chunks(&root, &mut verifier, None)?;
         verifier.finish()?;
@@ -951,6 +1213,7 @@ impl NativeImportAuthority {
         provenance_plan_root: &Path,
         actual_source_root: &Path,
         original_local_source_root: &Path,
+        local_exact_prefix: Option<&sinomo_dfs::DfsMetadataPrefixProof>,
     ) -> Result<Vec<Arc<std::fs::File>>> {
         let request_id: String = serde_json::from_slice(
             &std::fs::read(provenance_plan_root.join("source-ancestry-request.json"))
@@ -967,8 +1230,9 @@ impl NativeImportAuthority {
             ));
         }
         let source_fence = crate::metadata::retain_source_fence(actual_source_root)?;
-        let local_current = crate::metadata::current_root(actual_source_root)?;
-        if local_current {
+        let local_native_format = crate::metadata::original_native_root_format(actual_source_root)?;
+        let local_current = local_native_format.is_some();
+        if local_current || local_exact_prefix.is_some() {
             let retiring = &plan.expected_handoff.retiring_shard;
             let local_parent = original_local_source_root
                 .parent()
@@ -1001,7 +1265,10 @@ impl NativeImportAuthority {
             }
         }
         let local_format = if local_current {
-            Some(sinomo_dfs::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION)
+            local_native_format
+        } else if local_exact_prefix.is_some() {
+            crate::metadata::legacy_source_checkpoint_header(actual_source_root)?
+                .map(|header| header.source_format_version)
         } else {
             plan.source_cut.source_format_version
         };
@@ -1030,9 +1297,44 @@ impl NativeImportAuthority {
                 ));
             }
         }
-        let response: SourceFloorResponse =
-            serde_json::from_slice(&std::fs::read(root.join("floors.json")).map_err(error)?)
-                .map_err(error)?;
+        let ack_anchors = actual
+            .iter()
+            .map(|floor| {
+                crate::metadata::source_ancestry::source_ack_prefix_anchor(
+                    floor,
+                    local_format,
+                    &plan.source_cut.scope_shard,
+                    plan.source_cut.source_journal_sequence,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let needs_checkpoint = actual.iter().zip(&ack_anchors).any(|(floor, proof)| {
+            floor.shard_id == plan.source_cut.scope_shard
+                && proof.is_none()
+                && !actual.iter().zip(&ack_anchors).any(|(anchor, proof)| {
+                    anchor.shard_id == floor.shard_id
+                        && anchor.journal_sequence >= floor.journal_sequence
+                        && proof.is_some()
+                })
+        });
+        let checkpoint = if local_current || !needs_checkpoint {
+            None
+        } else {
+            crate::metadata::capture_legacy_source_checkpoint(
+                actual_source_root,
+                &plan.source_cut.scope_shard,
+            )?
+        };
+        let anchors = checkpoint
+            .iter()
+            .map(|capture| capture.anchor.clone())
+            .collect::<Vec<_>>();
+        let (response, old_f5) = decode_recorded_source_floors(
+            &std::fs::read(root.join("floors.json")).map_err(error)?,
+            &challenge,
+            &actual,
+            &anchors,
+        )?;
         let challenged = response
             .floors
             .into_iter()
@@ -1043,9 +1345,51 @@ impl NativeImportAuthority {
                 "recovered original source has an unverified ACK floor",
             ));
         }
+        let recorded_checkpoints = recorded_source_checkpoints(&root, old_f5)?;
+        if !recorded_checkpoints.is_empty() {
+            let actual_checkpoint = crate::metadata::capture_legacy_source_checkpoint(
+                actual_source_root,
+                &plan.source_cut.scope_shard,
+            )?
+            .ok_or_else(|| error("recovered original source lost its captured LOCAL checkpoint"))?;
+            if !recorded_checkpoints.iter().all(|recorded| {
+                // A qualified independent clock has one physical source. The
+                // verified installation may rename that exact source, but every
+                // retained capture must preserve its full byte/clock identity.
+                recorded.source_identity == actual_checkpoint.source_identity
+                    && recorded.snapshot_fingerprint == actual_checkpoint.snapshot_fingerprint
+                    && recorded.source_format_version == actual_checkpoint.source_format_version
+                    && recorded.generation == actual_checkpoint.generation
+                    && recorded.semantic_state_fingerprint
+                        == actual_checkpoint.semantic_state_fingerprint
+                    && recorded.anchor == actual_checkpoint.anchor
+            }) {
+                return Err(error(
+                    "recovered LOCAL original checkpoint changed its full custody",
+                ));
+            }
+        }
+        if response.checkpoints
+            != recorded_checkpoints
+                .iter()
+                .map(|value| value.anchor.clone())
+                .collect::<Vec<_>>()
+        {
+            return Err(error(
+                "recovered checkpoint anchors changed their captured provenance",
+            ));
+        }
+        let mut constraints = response.checkpoints.clone();
+        if let Some(prefix) = local_exact_prefix {
+            constraints.push(crate::metadata::source_ancestry::SourceCheckpointAnchor {
+                shard_id: plan.source_cut.scope_shard.clone(),
+                prefix_proof: prefix.clone(),
+            });
+        }
         let mut verifier = crate::metadata::source_ancestry::SourceAncestryVerifier::new(
             &plan.source_cut,
             &challenged,
+            &constraints,
         )?;
         Self::replay_source_chunks(&root, &mut verifier, None)?;
         verifier.finish()?;
@@ -1056,6 +1400,7 @@ impl NativeImportAuthority {
         fs: &sinomo_dfs::DfsFileSystemId,
         shard: &sinomo_dfs::DfsMetadataShardId,
         source: &MetadataSourceCut,
+        local_exact_prefix: Option<&sinomo_dfs::DfsMetadataPrefixProof>,
     ) -> Result<Vec<Arc<std::fs::File>>> {
         // Certificate paths use the already persisted exact source challenge;
         // they never grant an ACK from a larger source/target clock.
@@ -1081,7 +1426,7 @@ impl NativeImportAuthority {
             &std::fs::read(root.join("source-ancestry-request.json")).map_err(error)?,
         )
         .map_err(error)?;
-        self.verify_staged_source_ancestry(fs, shard, &plan, &request_id)
+        self.verify_staged_source_ancestry(fs, shard, &plan, &request_id, local_exact_prefix)
     }
     pub(super) fn receive_activation_blueprint(
         &self,
@@ -1113,6 +1458,7 @@ impl NativeImportAuthority {
             &envelope.plan.source_cut.scope_shard,
             &envelope.plan,
             &ancestry_request_id,
+            None,
         )?;
         let retained: MetadataImportPlan = serde_json::from_slice(
             &std::fs::read(root.join("native-import-plan.json")).map_err(error)?,
@@ -1306,6 +1652,10 @@ impl Service for StagedImportService {
                     let stage = context
                         .decode_request_body::<ContentStageRequest>(&request)
                         .await?;
+                    tokio::task::block_in_place(|| {
+                        self.authority.authorize_content_stage(&source, &stage)
+                    })
+                    .map_err(|e| ServiceError::Service(e.to_string()))?;
                     let mut receiver = sinomo_dfs::runtime_host::DfsStorageImportContentReceiver::for_authenticated_request(
                         &self.component_context,
                         &context,
@@ -1342,8 +1692,19 @@ impl Service for StagedImportService {
                         input.finish_quarantined()
                     })
                     .map_err(|e| ServiceError::Service(e.to_string()))?;
+                    // Re-read the same native source/config/plan after full
+                    // quarantine, before the ordinary owned receiver's effects.
+                    tokio::task::block_in_place(|| {
+                        self.authority.authorize_content_stage(&source, &stage)
+                    })
+                    .map_err(|e| ServiceError::Service(e.to_string()))?;
                     let result = super::block_native(&self.authority.runtime, async {
                         receiver.process(stage.command, Some(blob))
+                    })
+                    .map_err(|e| ServiceError::Service(e.to_string()))?;
+                    tokio::task::block_in_place(|| {
+                        self.authority
+                            .authorize_content_verification(&source, &stage.verification)
                     })
                     .map_err(|e| ServiceError::Service(e.to_string()))?;
                     context.respond_value(CONTENT_STAGE_ROUTE, result.response)?;
@@ -1511,6 +1872,7 @@ mod ancestry_ledger_tests {
         let mut verifier = crate::metadata::source_ancestry::SourceAncestryVerifier::new(
             &empty_cut(root.path()),
             &[],
+            &[],
         )
         .unwrap();
         assert!(
@@ -1531,6 +1893,7 @@ mod ancestry_ledger_tests {
         let mut verifier = crate::metadata::source_ancestry::SourceAncestryVerifier::new(
             &empty_cut(root.path()),
             &[],
+            &[],
         )
         .unwrap();
         assert!(
@@ -1543,6 +1906,7 @@ mod ancestry_ledger_tests {
         std::fs::write(root.join("00000000000000000000.sobj"), [0xff, 0x03, 0x01]).unwrap();
         let mut verifier = crate::metadata::source_ancestry::SourceAncestryVerifier::new(
             &empty_cut(root.path()),
+            &[],
             &[],
         )
         .unwrap();
@@ -1785,5 +2149,70 @@ mod ancestry_ledger_tests {
         assert!(!crate::metadata::metadata_root_at_format(&local, 8).unwrap());
         std::fs::write(&path, b"not-a-valid-stream-header").unwrap();
         assert!(!crate::metadata::metadata_root_at_format(&local, 6).unwrap());
+    }
+    #[test]
+    fn legacy_local_binding_requires_original_checkpoint_and_own_v2_prefix() {
+        // Original framing DATA only: this cannot construct a native seal,
+        // certificate, activation receipt, marker or Ready result.
+        let dir = sinomo_testdir::TestDir::new("legacy-local-receiver-prefix");
+        let root = dir.join("users");
+        let snapshot = root.join("records/tables/snapshot.sobj");
+        let prefix = sinomo_dfs::DfsMetadataPrefixProof {
+            version: 2,
+            journal_sequence: 10,
+            digest: format!("dfs-metadata-prefix-v2:blake3:{}", "a".repeat(64)),
+        };
+        assert!(crate::metadata::legacy_receiver_prefix(&root, Some(&prefix)).is_err());
+        std::fs::create_dir_all(snapshot.parent().unwrap()).unwrap();
+        let generation =
+            blake3::hash(&serde_json::to_vec(&(3u16, Some(10u64), Some(&prefix))).unwrap())
+                .to_hex()
+                .to_string();
+        let header = serde_json::json!({
+            "format_version": 3,
+            "materialized_through_sequence": 10,
+            "prefix_proof": prefix,
+            "generation": generation,
+        });
+        let write = |value: &serde_json::Value| {
+            if snapshot.exists() {
+                std::fs::remove_file(&snapshot).unwrap();
+            }
+            let bytes = sinomo_core::object::serde_ext::to_bytes(
+                value,
+                1,
+                sinomo_core::object::LengthMode::U32,
+            )
+            .unwrap();
+            let mut writer =
+                sinomo_core::storage::migration::stream::MigrationStreamWriter::resume(
+                    &snapshot,
+                    &bytes,
+                    &Default::default(),
+                )
+                .unwrap();
+            writer.finish().unwrap();
+        };
+        write(&header);
+        assert_eq!(
+            crate::metadata::legacy_receiver_prefix(&root, Some(&prefix)).unwrap(),
+            Some((3, prefix.clone()))
+        );
+        assert!(crate::metadata::legacy_receiver_prefix(&root, None).is_err());
+        let mut foreign = prefix.clone();
+        foreign.digest = format!("dfs-metadata-prefix-v2:blake3:{}", "b".repeat(64));
+        assert!(crate::metadata::legacy_receiver_prefix(&root, Some(&foreign)).is_err());
+        let mut old = prefix.clone();
+        old.version = 1;
+        old.digest = format!("dfs-metadata-prefix-v1:blake3:{}", "a".repeat(64));
+        assert!(crate::metadata::legacy_receiver_prefix(&root, Some(&old)).is_err());
+        let mut tampered = header.clone();
+        tampered["generation"] = serde_json::json!("0".repeat(64));
+        write(&tampered);
+        assert!(crate::metadata::legacy_receiver_prefix(&root, Some(&prefix)).is_err());
+        let mut pure_v1 = header;
+        pure_v1["prefix_proof"] = serde_json::to_value(old).unwrap();
+        write(&pure_v1);
+        assert!(crate::metadata::legacy_receiver_prefix(&root, Some(&prefix)).is_err());
     }
 }

@@ -15,8 +15,7 @@ use crate::*;
 const DFS_METADATA_AUTHORITY_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 /// Bound authority-side preparation when an inbound served request carries no
 /// caller deadline. Healthy operations finish far inside this cap; reaching it
-/// means the optional all-replica fast path should yield to the exact quorum
-/// fence instead of holding the served write lane indefinitely.
+/// means full-participant publication is unavailable for this operation.
 const DFS_METADATA_AUTHORITY_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
 // Namespace ACKs share one durable exact-frame path regardless of record
 // count. Give that path enough time to get behind an already-running bounded
@@ -83,9 +82,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .map_or(0, |shard| shard.epoch))
     }
 
-    /// Return the exact shard assignment after refreshing cluster
-    /// configuration, not merely the epoch from an earlier object-to-shard
-    /// selection.
+    /// Select the retained route. Publication separately requires coherent host
+    /// configuration, all assigned participants and the held writer generation.
     pub(crate) fn certified_local_metadata_owner_shard_for_object(
         &mut self,
         object: &DfsObjectMetadata,
@@ -112,35 +110,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             });
         }
 
-        let operation_deadline = self.transport.operation_deadline();
-        let certified = self
-            .control_plane
-            .as_mut()
-            .map(|kv| {
-                DfsControlPlaneStore::new(kv.as_mut())
-                    .metadata_shard_authority_is_current_before(&shard, operation_deadline)
-            })
-            .transpose()?
-            .unwrap_or(false);
-        if !certified {
-            self.refresh_control_plane_latest()?;
-            let refreshed = self
-                .select_metadata_shard_for_object(object)?
-                .unwrap_or_else(|| shard.clone());
-            return Err(DfsError::StaleOwnerEpoch {
-                file_system_id: object.file_system_id.clone(),
-                local_node_id: self.node_id.clone(),
-                primary_node_id: refreshed.primary_node_id,
-                epoch: refreshed.epoch,
-            });
-        }
         Ok(Some(shard))
     }
 
     /// Capture the locally committed shard epoch for a new intent without a
     /// Raft write barrier. This is only an intent hint: every visible commit
     /// must still call `ensure_intent_epoch_current*`, which obtains fresh
-    /// operation-bound full-shard or cluster-quorum authorization at the
+    /// operation-bound full-shard authorization at the
     /// metadata publication boundary.
     pub(crate) fn local_metadata_owner_epoch_hint_for_object(
         &mut self,
@@ -173,17 +149,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     /// Authorize one exact canonical mutation against one metadata shard.
-    ///
-    /// The healthy path requires a fresh, operation-bound acknowledgement from
-    /// every configured shard member and does not touch Raft. When a member is
-    /// unavailable, the exact prepared operation may instead be fenced through
-    /// cluster KV's existing consensus log. KV carries only the permit and
-    /// assignment/epoch comparison; DFS remains the owner of the prepare,
-    /// journal, metadata, and repair state.
-    /// The caller must pass this evidence to `validate_canonical_authorization`
-    /// immediately before publication. That check reads the exact assignment
-    /// under the publication guard and holds the guard through the metadata
-    /// CAS; a second, unguarded assignment read here adds no publication safety.
+    /// Every configured member must acknowledge the same durable preparation.
+    /// Missing participants leave the operation unavailable; content receipts
+    /// and KV voting majorities grant no alternate publication authority.
+    /// The publication guard consumes this proof with the actual retained
+    /// configuration and holds the native writer/epoch/freeze through its CAS.
     #[tracing::instrument(
         target = "sinomo.perf",
         level = "trace",
@@ -245,7 +215,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // Metadata object RPC encodes every typed value into credit-bounded
         // transport segments. Large prepares therefore use the same stream-
         // native replica path as small ones; semantic record count must never
-        // select the degraded KV-only authorization path.
+        // change the required participant set.
         let probe_timeout = metadata_authority_probe_timeout(shard, operation, prepared_batch);
         let probe_started = Instant::now();
         let acknowledged_node_ids = self.fresh_metadata_shard_authority_acknowledgements(
@@ -283,138 +253,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 prepare_sequence: prepared_batch.next_after_sequence,
             });
         }
-        // This certificate is data-plane evidence for this exact prepare.
-        // A native Raft permit fences its publication but stores no prepared
-        // metadata payload, so it cannot replace missing DFS recovery evidence.
-        let recovery_quorum = required_node_ids.len() / 2 + 1;
-        let verified_recovery = acknowledged_node_ids
-            .intersection(&required_node_ids)
-            .count();
-        if !acknowledged_node_ids.contains(&shard.primary_node_id)
-            || verified_recovery < recovery_quorum
-        {
-            dfs_perf_trace(format_args!(
-                "metadata_authority action=reject reason=metadata_recovery_quorum shard={} epoch={} prepare={} verified={} required={}",
-                shard.shard_id,
-                shard.epoch,
-                prepared_batch.next_after_sequence,
-                verified_recovery,
-                recovery_quorum,
-            ));
-            return Err(DfsError::MetadataRecoveryQuorumUnavailable {
-                file_system_id: shard.file_system_id.clone(),
-                shard_id: shard.shard_id.clone(),
-                required: recovery_quorum,
-                verified: verified_recovery,
-            });
-        }
-        dfs_perf_trace(format_args!(
-            "metadata_authority action=cluster_quorum_fallback shard={} epoch={} prepare={} acknowledgements={} required={}",
-            shard.shard_id,
-            shard.epoch,
-            metadata_authority_operation_prepare_sequence(operation),
-            acknowledged_node_ids.len(),
-            required_node_ids.len(),
-        ));
-        let quorum_started = Instant::now();
-        let Some(permit) = self.certify_exact_metadata_shard_operation(
-            shard,
-            operation_digest,
-            metadata_authority_operation_prepare_sequence(operation),
-        )?
-        else {
-            return Err(DfsError::StaleOwnerEpoch {
-                file_system_id: shard.file_system_id.clone(),
-                local_node_id: self.node_id.clone(),
-                primary_node_id: shard.primary_node_id.clone(),
-                epoch: shard.epoch,
-            });
-        };
-        #[cfg(any(test, feature = "test-support"))]
-        if let Some((root, owner)) = self.native_publication_owner_for_observation() {
-            if let Some(mut trace) = crate::native_shard_trace::boundary_interest(
-                &root,
-                Some(&owner),
-                &prepared_batch.shard_id,
-            ) {
-                let held = self.metadata_backend.as_ref().and_then(|backend| {
-                    backend.native_held_snapshot_for_scope(
-                        &shard.file_system_id,
-                        &prepared_batch.shard_id,
-                    )
-                });
-                trace.observe(
-                    crate::native_shard_trace::NativeBoundaryFactsV1::RecoveryPermitIssued {
-                        expected: shard.clone(),
-                        operation: operation.clone(),
-                        permit: permit.clone(),
-                        authenticated_recovery_node_ids: acknowledged_node_ids
-                            .iter()
-                            .cloned()
-                            .collect(),
-                    },
-                    held.clone(),
-                    held,
-                );
-            }
-        }
-        let trace_quorum_ms = quorum_started.elapsed().as_millis();
-        dfs_perf_trace(format_args!(
-            "metadata-authority-confirmation node={} shard={} epoch={} mode=cluster-quorum required={} acknowledged={} probe_ms={} assignment_ms=0 quorum_ms={} total_ms={}",
-            self.node_id,
-            shard.shard_id,
-            shard.epoch,
-            required_node_ids.len(),
-            trace_acknowledged,
-            trace_probe_ms,
-            trace_quorum_ms,
-            trace_started.elapsed().as_millis()
-        ));
-        Ok(DfsCanonicalAuthorization::ClusterQuorum {
-            operation_digest: operation_digest.to_string(),
-            expected_shard: shard.clone(),
-            permit_id: permit.permit_id.clone(),
-            native_permit: Some(permit),
-            acknowledged_node_ids: acknowledged_node_ids.into_iter().collect(),
+        Err(DfsError::MetadataRecoveryQuorumUnavailable {
+            file_system_id: shard.file_system_id.clone(),
+            shard_id: shard.shard_id.clone(),
+            required: required_node_ids.len(),
+            verified: acknowledged_node_ids
+                .intersection(&required_node_ids)
+                .count(),
         })
-    }
-
-    pub(crate) fn metadata_shard_assignment_still_exact(
-        &mut self,
-        expected: &DfsMetadataShardConfig,
-    ) -> Result<bool, DfsError> {
-        let operation_deadline = self.transport.operation_deadline();
-        let Some(control_plane) = self.control_plane.as_mut() else {
-            return Ok(false);
-        };
-        DfsControlPlaneStore::new(control_plane.as_mut())
-            .metadata_shard_authority_is_current_before(expected, operation_deadline)
-            .map_err(DfsError::from)
-    }
-
-    /// Revalidate typed evidence immediately before the backend publication
-    /// call. Payload/digest/epoch mismatches fail closed; callers never reduce
-    /// authorization to an unstructured boolean.
-
-    fn certify_exact_metadata_shard_operation(
-        &mut self,
-        shard: &DfsMetadataShardConfig,
-        operation_digest: &str,
-        prepare_sequence: u64,
-    ) -> Result<Option<DfsMetadataOperationPermit>, DfsError> {
-        self.control_plane
-            .as_mut()
-            .map(|kv| {
-                DfsControlPlaneStore::new(kv.as_mut())
-                    .certify_metadata_shard_operation_with_native_authority(
-                        shard,
-                        operation_digest,
-                        prepare_sequence,
-                    )
-            })
-            .transpose()
-            .map_err(DfsError::from)
-            .map(Option::flatten)
     }
 
     #[tracing::instrument(
@@ -465,7 +311,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         match result {
             // Delivery uncertainty concerns this optional hidden-prepare
             // probe, not permission to publish the user's mutation. Missing
-            // acknowledgements still require the existing exact Raft permit.
+            // acknowledgements still deny publication on the full assigned set.
             Err(DfsError::Network { .. } | DfsError::NetworkDelivery { .. }) => {
                 Ok(BTreeSet::from([self.node_id.clone()]))
             }
@@ -496,6 +342,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if Instant::now() >= operation_deadline {
             return Ok(acknowledged_node_ids);
         }
+        verify_persisted_metadata_authority_operation(
+            self.metadata_backend
+                .as_deref()
+                .ok_or_else(|| DfsError::Metadata {
+                    message: "metadata authority probe has no durable metadata backend".into(),
+                })?,
+            shard,
+            operation,
+        )?;
         let prepared_prefix = self
             .metadata_backend
             .as_deref()
@@ -507,7 +362,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(acknowledged_node_ids);
         }
         let Some(prepared_prefix) = prepared_prefix.filter(|prefix| {
-            prefix.is_well_formed() && prefix.journal_sequence == prepared_batch.next_after_sequence
+            prefix.is_well_formed() && prefix.journal_sequence >= prepared_batch.next_after_sequence
         }) else {
             // The fast path is optional. A missing or moving exact prefix
             // cannot authorize publication.
@@ -543,8 +398,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             for (replicated_through_sequence, target_node_ids) in
                 targets_by_replicated_through_sequence
             {
-                let target_batch = self
-                    .metadata_authority_batch_since(replicated_through_sequence, prepared_batch)?;
+                let target_batch = self.metadata_authority_batch_since(
+                    replicated_through_sequence,
+                    prepared_batch,
+                    prepared_prefix.journal_sequence,
+                )?;
                 if Instant::now() >= operation_deadline {
                     return Ok(acknowledged_node_ids);
                 }
@@ -561,7 +419,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         message: "metadata frame selection requires current durable storage".into(),
                     })?
                     .journal_frames_for_batch(&target_batch)?;
-                if journal_frames.len() != target_batch.entries.len() || journal_frames.is_empty() {
+                if journal_frames.len() != target_batch.entries.len() {
                     return Err(DfsError::Metadata {
                         message: "current authority frame selection omitted journal entries".into(),
                     });
@@ -587,8 +445,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         prepared_prefix: prepared_prefix.clone(),
                     }),
                     // Include every entry the target has not yet acknowledged,
-                    // through the exact prepare. The receiver refuses gaps
-                    // and confirms only its complete durable current prefix.
+                    // through the complete captured current cut. The receiver
+                    // refuses gaps and separately verifies the named original
+                    // preparation's full body, slot, epoch and live status.
                     durable_replication: None,
                     batch: wire_batch,
                 };
@@ -778,7 +637,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             .collect::<Vec<_>>();
                         let cursors = acknowledged_replicas
                             .into_iter()
-                            .map(|node| (node, prepared_batch.next_after_sequence))
+                            .map(|node| (node, prepared_prefix.journal_sequence))
                             .collect::<Vec<_>>();
                         self.record_metadata_authority_replication_cursors(
                             &prepared_batch.shard_id,
@@ -831,25 +690,35 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &self,
         replicated_through_sequence: u64,
         prepared_batch: &DfsMetadataJournalBatch,
+        current_cut_sequence: u64,
     ) -> Result<Option<DfsMetadataJournalBatch>, DfsError> {
-        if replicated_through_sequence >= prepared_batch.next_after_sequence {
-            // Exact retries still carry the prepare entry so a current peer can
-            // re-read it and echo the fresh request nonce without mutating its
-            // replay cursor.
-            return Ok(Some(prepared_batch.clone()));
+        if current_cut_sequence < prepared_batch.next_after_sequence {
+            return Ok(None);
         }
-        let prepared_batch_is_exact_suffix =
-            prepared_batch.entries.first().is_some_and(|entry| {
-                entry.sequence == replicated_through_sequence.saturating_add(1)
-            }) && prepared_batch
+        if replicated_through_sequence >= current_cut_sequence {
+            // A cursor is only a scheduling hint. Ask the receiver to verify
+            // its actual stored operation and exact prefix with a fresh nonce.
+            // A checkpoint can legitimately omit original covered frames.
+            return Ok(Some(DfsMetadataJournalBatch {
+                shard_id: prepared_batch.shard_id.clone(),
+                entries: Vec::new(),
+                next_after_sequence: current_cut_sequence,
+            }));
+        }
+        let prepared_batch_covers_cut = prepared_batch.next_after_sequence == current_cut_sequence
+            && prepared_batch
                 .entries
                 .last()
                 .is_some_and(|entry| entry.sequence == prepared_batch.next_after_sequence)
-                && prepared_batch
-                    .entries
-                    .windows(2)
-                    .all(|entries| entries[1].sequence == entries[0].sequence.saturating_add(1));
-        if prepared_batch_is_exact_suffix {
+            && prepared_batch
+                .entries
+                .windows(2)
+                .all(|entries| entries[1].sequence == entries[0].sequence.saturating_add(1));
+        if prepared_batch_covers_cut
+            && prepared_batch.entries.first().is_some_and(|entry| {
+                entry.sequence == replicated_through_sequence.saturating_add(1)
+            })
+        {
             // The foreground authority path already owns this exact decoded
             // suffix. Re-reading it from the journal serializes and decodes the
             // same multi-megabyte prepare before any network work can begin.
@@ -860,25 +729,43 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 message: "metadata authority probe has no durable metadata backend".to_string(),
             });
         };
-        let Some(batch) = backend.journal_batch_for_shard_since_limited(
+        let batch = backend.journal_batch_for_shard_since_limited(
             &prepared_batch.shard_id,
             replicated_through_sequence,
             DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
             DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT,
-        )?
-        else {
+        )?;
+        // This bounded batch must contain every frame through the captured
+        // current cut. Neither an incomplete suffix nor a newer moving head
+        // can stand in for that exact prefix. The original body may already be
+        // retained by the receiver, including in a snapshot-covered record.
+        if let Some(batch) = batch.filter(|batch| batch.next_after_sequence == current_cut_sequence)
+        {
+            return Ok(Some(batch));
+        }
+        // A promoted primary may have no outgoing cursor for a peer that
+        // already holds the complete handoff prefix. That advisory absence
+        // must not prevent a fresh operation-bound challenge. Send the original
+        // prepare and every later frame through the captured cut; a genuinely
+        // lagging receiver still rejects the gap before append or ACK.
+        let Some(first) = prepared_batch.entries.first() else {
             return Ok(None);
         };
-        let prepare_sequence = prepared_batch.next_after_sequence;
-        if batch.next_after_sequence < prepare_sequence
-            || !batch
-                .entries
-                .iter()
-                .any(|entry| entry.sequence == prepare_sequence)
-        {
+        let original_after = first.sequence.saturating_sub(1);
+        if original_after <= replicated_through_sequence {
             return Ok(None);
         }
-        Ok(Some(batch))
+        if prepared_batch_covers_cut {
+            return Ok(Some(prepared_batch.clone()));
+        }
+        Ok(backend
+            .journal_batch_for_shard_since_limited(
+                &prepared_batch.shard_id,
+                original_after,
+                DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
+                DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT,
+            )?
+            .filter(|batch| batch.next_after_sequence == current_cut_sequence))
     }
 
     fn record_metadata_authority_replication_cursors(
@@ -1422,8 +1309,8 @@ pub(crate) fn metadata_authority_probe_confirmation_id(
     let prefix = &probe.prepared_prefix;
     if probe.probe_id.is_empty()
         || !prefix.is_well_formed()
-        || prefix.journal_sequence
-            != metadata_authority_operation_prepare_sequence(&probe.operation)
+        || metadata_authority_operation_prepare_sequence(&probe.operation) == 0
+        || prefix.journal_sequence < metadata_authority_operation_prepare_sequence(&probe.operation)
     {
         return None;
     }
@@ -1479,7 +1366,7 @@ pub(crate) fn verify_persisted_metadata_authority_probe_after_apply(
     verify_persisted_metadata_authority_probe_inner(backend, shard, probe, operation_verified)
 }
 
-fn verify_persisted_metadata_authority_probe_inner(
+pub(crate) fn verify_persisted_metadata_authority_probe_inner(
     backend: &dyn DfsMetadataBackend,
     shard: &DfsMetadataShardConfig,
     probe: &DfsMetadataAuthorityProbe,
@@ -1529,29 +1416,102 @@ pub(crate) fn verify_persisted_metadata_authority_operation(
     shard: &DfsMetadataShardConfig,
     operation: &DfsMetadataAuthorityOperation,
 ) -> Result<(), DfsError> {
-    let DfsMetadataAuthorityOperation::PreparedOperation {
-        operation_id,
-        file_system_id,
-        shard_id,
-        owner_epoch,
-        prepare_sequence,
-        payload_digest,
-    } = operation;
-    let digest = backend
-        .prepared_operation_digest(operation_id)?
+    let DfsMetadataAuthorityOperation::PreparedOperation { operation_id, .. } = operation;
+    let record = backend
+        .prepared_operation_record(operation_id)?
         .ok_or_else(|| DfsError::Metadata {
             message: "authority operation has no durable complete preparation".into(),
         })?;
-    if digest.file_system_id != *file_system_id
-        || digest.shard_id != *shard_id
-        || digest.owner_epoch != *owner_epoch
-        || digest.prepare_sequence != *prepare_sequence
-        || digest.payload_digest != *payload_digest
-        || !metadata_authority_operation_is_well_formed_for_shard(operation, shard)
-    {
+    crate::metadata_api::validated_metadata_authority_operation_digest(&record, operation)?;
+    if !metadata_authority_operation_is_well_formed_for_shard(operation, shard) {
         return Err(DfsError::Metadata {
             message: "authority operation differs from actual durable preparation".into(),
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod authority_cursor_tests {
+    use super::*;
+
+    #[test]
+    fn unknown_outgoing_cursor_still_challenges_the_exact_original_and_current_cut() {
+        let (runtime, requester, shard) = crate::test_support::current_native_metadata_service(
+            "native-authority-unknown-cursor",
+            3,
+            "/",
+        )
+        .unwrap();
+        drop(requester);
+        let mut service = runtime.metadata_primary_service("/").unwrap();
+        let shard_id = DfsMetadataShardId::new(&shard.shard_id);
+        let file_system = runtime.file_system();
+        let prepare = |service: &mut NetworkedDfsService<crate::DfsNodeTransport>, index: usize| {
+            service
+                .metadata_backend
+                .as_mut()
+                .unwrap()
+                .prepare_operation(
+                    DfsPreparedOperationPayload::for_metadata_effects(
+                        DfsPreparedOperationScope {
+                            file_system_id: shard.file_system_id.clone(),
+                            shard_id: shard_id.clone(),
+                            owner_epoch: shard.epoch,
+                            operation_id: format!("unknown-cursor-{index}"),
+                        },
+                        Vec::new(),
+                        Vec::new(),
+                        vec![DfsPreparedMetadataEffect::PutFileSystem {
+                            file_system: file_system.clone(),
+                        }],
+                        time::OffsetDateTime::now_utc(),
+                    )
+                    .unwrap(),
+                    None,
+                )
+                .unwrap()
+        };
+        // Actual journal DATA larger than one bounded catch-up batch. This
+        // test grants no ACKs: receiver gap/fork tests own that boundary.
+        for index in 0..DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT {
+            prepare(&mut service, index);
+        }
+        let original = prepare(&mut service, DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT);
+        let original_batch = service
+            .metadata_backend
+            .as_ref()
+            .unwrap()
+            .journal_batch_for_shard_since_limited(
+                &shard_id,
+                original.prepare_sequence - 1,
+                1,
+                DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT,
+            )
+            .unwrap()
+            .unwrap();
+        let challenge = service
+            .metadata_authority_batch_since(0, &original_batch, original.prepare_sequence)
+            .unwrap()
+            .expect("an unknown scheduling cursor must not suppress a fresh proof request");
+        assert_eq!(challenge.entries, original_batch.entries);
+        let later = prepare(&mut service, DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT + 1);
+        let challenge = service
+            .metadata_authority_batch_since(0, &original_batch, later.prepare_sequence)
+            .unwrap()
+            .unwrap();
+        assert_eq!(challenge.entries.len(), 2);
+        assert_eq!(challenge.entries[0].sequence, original.prepare_sequence);
+        assert_eq!(challenge.entries[1].sequence, later.prepare_sequence);
+        assert_eq!(challenge.next_after_sequence, later.prepare_sequence);
+        // A captured cut that omits later durable frames cannot be proved.
+        assert!(
+            service
+                .metadata_authority_batch_since(0, &original_batch, later.prepare_sequence + 1)
+                .unwrap()
+                .is_none()
+        );
+        drop(service);
+        runtime.close().unwrap();
+    }
 }

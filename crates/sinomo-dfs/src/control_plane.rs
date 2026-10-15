@@ -141,6 +141,8 @@ pub(crate) struct DfsPlacementAuthorityPermit {
     file_system_id: DfsFileSystemId,
     record: DfsPlacementAuthorityPermitRecord,
     released: bool,
+    #[cfg(test)]
+    observation: Option<crate::test_runtime::PlacementAuthorityCallObservation>,
 }
 
 /// Opaque daemon-incarnation identity embedded in every new placement permit.
@@ -231,6 +233,26 @@ impl Drop for DfsPlacementAuthorityPermit {
             // that this bounded mutation's stack has exited. Preserve the
             // exact handle process-wide so a fresh service can finish release.
             queue_placement_authority_release(self);
+        }
+    }
+}
+
+#[cfg(test)]
+impl DfsPlacementAuthorityPermit {
+    pub(crate) fn with_native_observation(
+        mut self,
+        mut observation: Option<crate::test_runtime::PlacementAuthorityCallObservation>,
+        state: crate::DfsPlacementReconciliationState,
+    ) -> Self {
+        if let Some(observation) = observation.as_mut() {
+            observation.acquired(&self.record.holder_id, state);
+        }
+        self.observation = observation;
+        self
+    }
+    pub(crate) fn observe_native_release(&mut self, succeeded: bool) {
+        if let Some(observation) = self.observation.as_mut() {
+            observation.released(succeeded);
         }
     }
 }
@@ -2647,6 +2669,8 @@ impl<'a> DfsControlPlaneStore<'a> {
             file_system_id: expected_job.file_system_id.clone(),
             record,
             released: false,
+            #[cfg(test)]
+            observation: None,
         };
         let response = self.kv.txn(KvTxn {
             compares: vec![
@@ -10016,12 +10040,13 @@ mod tests {
 
     #[test]
     fn primary_handoff_request_is_idempotent_and_does_not_activate_without_proof() {
-        let (runtime, mut source, current) = crate::test_support::current_native_metadata_service(
-            "native-cp-idempotent-role-request",
-            3,
-            "/",
-        )
-        .unwrap();
+        let (mut runtime, mut source, current) =
+            crate::test_support::current_native_metadata_service(
+                "native-cp-idempotent-role-request",
+                3,
+                "/",
+            )
+            .unwrap();
         // SAME normal source serialization gate: pause background freeze while
         // observing the request producer. This guard grants no publication.
         let gate = source
@@ -10100,17 +10125,31 @@ mod tests {
         );
         drop(gate);
         drop(source);
+        // All request-only assertions above were observed while the real source
+        // fence prevented activation. Finish that same requested transition
+        // before shutting down its native owner and background reconciliation.
+        let desired = first.desired_shard;
+        let activated = runtime
+            .reassign_metadata_shard(
+                &desired.file_system_id,
+                &desired.shard_id,
+                desired.primary_node_id.clone(),
+                desired.replica_node_ids.clone(),
+            )
+            .unwrap();
+        assert_eq!(activated, desired);
         runtime.close().unwrap();
     }
 
     #[test]
     fn metadata_shard_primary_role_handoff_requires_exact_existing_member_rotation() {
-        let (runtime, mut source, current) = crate::test_support::current_native_metadata_service(
-            "native-cp-exact-role-rotation",
-            3,
-            "/",
-        )
-        .unwrap();
+        let (mut runtime, mut source, current) =
+            crate::test_support::current_native_metadata_service(
+                "native-cp-exact-role-rotation",
+                3,
+                "/",
+            )
+            .unwrap();
         let desired =
             metadata_shard_primary_handoff_target(&current, &current.replica_node_ids[0]).unwrap();
         let mut wrong_order = desired.clone();
@@ -10154,6 +10193,19 @@ mod tests {
         );
         drop(gate);
         drop(source);
+        // All request-only assertions above were observed while the real source
+        // fence prevented activation. Finish that same requested transition
+        // before shutting down its native owner and background reconciliation.
+        let desired = handoff.desired_shard;
+        let activated = runtime
+            .reassign_metadata_shard(
+                &desired.file_system_id,
+                &desired.shard_id,
+                desired.primary_node_id.clone(),
+                desired.replica_node_ids.clone(),
+            )
+            .unwrap();
+        assert_eq!(activated, desired);
         runtime.close().unwrap();
     }
 
@@ -10911,21 +10963,6 @@ mod tests {
                 .take()
                 .expect("actual peer control plane");
             drop(peer);
-            let unavailable = shard.replica_node_ids.last().unwrap().clone();
-            for route in [
-                crate::DFS_METADATA_JOURNAL_BATCH_ROUTE,
-                crate::DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE,
-            ] {
-                runtime.install_fault(crate::test_support::DfsTestFaultRule {
-                    source: Some(shard.primary_node_id.clone()),
-                    target: Some(unavailable.clone()),
-                    route: Some(route.into()),
-                    call_id: None,
-                    origin: None,
-                    remaining_hits: 32,
-                    action: crate::test_support::DfsTestFaultAction::BudgetExhausted,
-                });
-            }
             Self {
                 runtime,
                 service,
@@ -10938,6 +10975,24 @@ mod tests {
                     compare_misses: 0,
                 },
                 observed_create_command: Arc::new(Mutex::new(None)),
+            }
+        }
+        fn deny_last_metadata_participant(&self) {
+            let unavailable = self.shard.replica_node_ids.last().unwrap().clone();
+            for route in [
+                crate::DFS_METADATA_JOURNAL_BATCH_ROUTE,
+                crate::DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE,
+            ] {
+                self.runtime
+                    .install_fault(crate::test_support::DfsTestFaultRule {
+                        source: Some(self.shard.primary_node_id.clone()),
+                        target: Some(unavailable.clone()),
+                        route: Some(route.into()),
+                        call_id: None,
+                        origin: None,
+                        remaining_hits: 32,
+                        action: crate::test_support::DfsTestFaultAction::BudgetExhausted,
+                    });
             }
         }
         fn floor_key(&self) -> String {
@@ -11071,7 +11126,7 @@ mod tests {
                     &operation_id,
                 );
             drop(capture);
-            created.expect("actual native degraded root create");
+            created.expect("actual full-participant native root create");
             let payload = captured
                 .lock()
                 .unwrap()
@@ -11088,6 +11143,10 @@ mod tests {
                     .is_some(),
                 "actual producer must retain its exact terminal commit witness"
             );
+            // Normal native publication does not consume a KV degraded permit.
+            // Exercise this retained compatibility API explicitly with the
+            // actual committed prepare identity and native Raft producer.
+            self.certify(&record);
             // A later normal prepared operation can advance the floor before
             // this create returns. Verify its actual immutable body and commit,
             // while retaining the captured create identity for restart checks.
@@ -11197,6 +11256,7 @@ mod tests {
             crate::DfsPreparedOperationRecord,
             crate::test_support::DfsTestNativeConfigurationFault,
         ) {
+            self.deny_last_metadata_participant();
             let fault = self
                 .runtime
                 .metadata_operation_floor_fault(&self.shard.primary_node_id)
@@ -11223,8 +11283,15 @@ mod tests {
                 );
             drop(capture);
             let error = created.unwrap_err();
-            assert!(error.to_string().contains("retry the read"), "{error}");
-            assert!(fault.denied_operation_floor_reads() > 1);
+            assert!(
+                error.to_string().contains("recovery quorum unavailable"),
+                "{error}"
+            );
+            assert_eq!(
+                fault.denied_operation_floor_reads(),
+                0,
+                "normal full-participant publication must not fall back to an implicit KV floor read"
+            );
             let payload = captured
                 .lock()
                 .unwrap()
@@ -11232,6 +11299,19 @@ mod tests {
                 .expect("actual denied-create payload");
             let record = self.record_for_payload(path, &payload);
             assert_eq!(record.status, crate::DfsPreparedOperationStatus::Prepared);
+            let floor_error =
+                DfsControlPlaneStore::new(self.service.control_plane.as_mut().unwrap().as_mut())
+                    .certify_metadata_shard_operation_with_native_authority(
+                        &self.shard,
+                        &record.digest.payload_digest,
+                        record.digest.prepare_sequence,
+                    )
+                    .unwrap_err();
+            assert!(
+                floor_error.to_string().contains("retry the read"),
+                "{floor_error}"
+            );
+            assert!(fault.denied_operation_floor_reads() > 1);
             let pending = self
                 .service
                 .metadata_backend()
@@ -11280,6 +11360,19 @@ mod tests {
                 permit.native_commit.is_some(),
                 "the current producer must return actual native authority"
             );
+            if record.status == crate::DfsPreparedOperationStatus::Prepared {
+                let retained = self
+                    .service
+                    .metadata_backend()
+                    .unwrap()
+                    .prepared_operation_record(&record.operation_id)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    retained, *record,
+                    "a compatibility KV permit alone cannot publish or rewrite the native prepare"
+                );
+            }
             permit
         }
         fn recover_and_close(mut self, path: &str, record: &crate::DfsPreparedOperationRecord) {
@@ -11589,6 +11682,7 @@ mod tests {
         fixture.write("/native-floor-a.bin");
         let (exact, replayed) = fixture.floor_record();
         let stale = fixture.capture_observations();
+        fixture.deny_last_metadata_participant();
         // The already denied real replica is also the promoted target. Its
         // mandatory acknowledgement cannot be replaced by another member.
         let promoted = fixture.shard.replica_node_ids.last().unwrap().clone();
@@ -11614,6 +11708,17 @@ mod tests {
         drop(fixture.control);
         drop(fixture.service);
         fixture.runtime.clear_faults();
+        let desired = handoff.desired_shard;
+        let active = fixture
+            .runtime
+            .reassign_metadata_shard(
+                &desired.file_system_id,
+                &desired.shard_id,
+                desired.primary_node_id.clone(),
+                desired.replica_node_ids.clone(),
+            )
+            .unwrap();
+        assert_eq!(active, desired);
         fixture.runtime.close().unwrap();
     }
 
@@ -11644,24 +11749,8 @@ mod tests {
             .runtime
             .client(&fixture.shard.primary_node_id)
             .unwrap();
-        let unavailable = fixture.shard.replica_node_ids.last().unwrap().clone();
-        for route in [
-            crate::DFS_METADATA_JOURNAL_BATCH_ROUTE,
-            crate::DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE,
-        ] {
-            fixture
-                .runtime
-                .install_fault(crate::test_support::DfsTestFaultRule {
-                    source: Some(fixture.shard.primary_node_id.clone()),
-                    target: Some(unavailable.clone()),
-                    route: Some(route.into()),
-                    call_id: None,
-                    origin: None,
-                    remaining_hits: 32,
-                    action: crate::test_support::DfsTestFaultAction::BudgetExhausted,
-                });
-        }
         fixture.write("/native-floor-a.bin");
+        fixture.deny_last_metadata_participant();
         let (floor, record) = fixture.floor_record();
         let mut wrong_digest = record.digest.payload_digest.clone();
         wrong_digest.push_str("-negative");
@@ -11758,7 +11847,6 @@ mod tests {
     fn degraded_head_watermark_is_exact_and_monotonic() {
         let mut fixture = NativeFloorFixture::new("native-cp-sync-watermark");
         let unavailable = fixture.shard.replica_node_ids.last().unwrap().clone();
-        fixture.runtime.stop_node(&unavailable).unwrap();
         let first = fixture.write("/native-floor-a.bin");
         let first_object = first
             .transaction
@@ -11766,14 +11854,39 @@ mod tests {
             .iter()
             .find(|object| object.path == "/native-floor-a.bin")
             .unwrap();
-        let first_target = fixture
-            .service
+        let mut barrier_owner = fixture.runtime.metadata_primary_service("/").unwrap();
+        let first_target = barrier_owner
             .capture_metadata_quorum_sync_target(first_object)
             .unwrap();
-        let first_certificate = fixture
-            .service
+        let first_certificate = barrier_owner
             .sync_metadata_shard_to_quorum(&first_target, std::time::Duration::from_secs(5))
             .unwrap();
+        let watermark = |certificate: &crate::DfsMetadataQuorumSyncCertificate| {
+            let target = &certificate.target;
+            assert_eq!(
+                certificate.acknowledged_node_ids.len(),
+                1 + target.replica_node_ids.len()
+            );
+            DfsMetadataShardHeadWatermark {
+                file_system_id: target.file_system_id.clone(),
+                shard_id: target.shard_id.0.clone(),
+                primary_node_id: target.primary_node_id.clone(),
+                epoch: target.authority_epoch.unwrap(),
+                journal_sequence: target.journal_sequence,
+                state_fingerprint: target.state_fingerprint.clone(),
+                acknowledged_node_ids: certificate.acknowledged_node_ids.clone(),
+            }
+        };
+        // This compatibility control record consumes an actual full native
+        // certificate; it is not an implicit fallback for partial DFS Sync.
+        assert!(
+            DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+                .publish_metadata_shard_head_watermark(
+                    &fixture.shard,
+                    &watermark(&first_certificate)
+                )
+                .unwrap()
+        );
         let low = DfsControlPlaneStore::new(fixture.control.inner.as_mut())
             .get_metadata_shard_head_watermark(
                 &fixture.shard.file_system_id,
@@ -11787,21 +11900,49 @@ mod tests {
             low.acknowledged_node_ids,
             first_certificate.acknowledged_node_ids
         );
+        drop(barrier_owner);
         let second = fixture.write("/native-floor-b.bin");
+        let mut barrier_owner = fixture.runtime.metadata_primary_service("/").unwrap();
         let second_object = second
             .transaction
             .objects
             .iter()
             .find(|object| object.path == "/native-floor-b.bin")
             .unwrap();
-        let second_target = fixture
-            .service
+        let second_target = barrier_owner
             .capture_metadata_quorum_sync_target(second_object)
             .unwrap();
-        let second_certificate = fixture
-            .service
+        fixture.runtime.stop_node(&unavailable).unwrap();
+        assert!(
+            barrier_owner
+                .sync_metadata_shard_to_quorum(
+                    &second_target,
+                    std::time::Duration::from_millis(100)
+                )
+                .is_err(),
+            "a previously certified head cannot satisfy a new full-participant barrier while a member is stopped"
+        );
+        assert_eq!(
+            DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+                .get_metadata_shard_head_watermark(
+                    &fixture.shard.file_system_id,
+                    &fixture.shard.shard_id
+                )
+                .unwrap(),
+            Some(low.clone())
+        );
+        fixture.runtime.reopen_node(unavailable).unwrap();
+        let second_certificate = barrier_owner
             .sync_metadata_shard_to_quorum(&second_target, std::time::Duration::from_secs(5))
             .unwrap();
+        assert!(
+            DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+                .publish_metadata_shard_head_watermark(
+                    &fixture.shard,
+                    &watermark(&second_certificate)
+                )
+                .unwrap()
+        );
         let high = DfsControlPlaneStore::new(fixture.control.inner.as_mut())
             .get_metadata_shard_head_watermark(
                 &fixture.shard.file_system_id,
@@ -11830,7 +11971,7 @@ mod tests {
                 .unwrap(),
             Some(high)
         );
-        fixture.runtime.reopen_node(unavailable).unwrap();
+        drop(barrier_owner);
         fixture.recover_and_close("/native-floor-b.bin", &second);
     }
 

@@ -119,11 +119,33 @@ impl NativePlacementFixture {
                     .unwrap(),
             );
         }
+        if remote {
+            // A client facade never replays journal replies into Main's store.
+            // Certify the actual authored cut on both metadata participants
+            // before opening the replica view used by physical page checks.
+            let mut source = runtime.metadata_primary_service(path).unwrap();
+            let target = source
+                .capture_metadata_quorum_sync_target(objects.last().unwrap())
+                .unwrap();
+            let certificate = source
+                .sync_metadata_shard_to_quorum(
+                    &target,
+                    sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+                )
+                .unwrap();
+            assert_eq!(
+                certificate
+                    .acknowledged_node_ids
+                    .into_iter()
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from([primary.clone(), root_primary.clone()]),
+                "both actual metadata participants must acknowledge the authored cut"
+            );
+        }
         let mut service = runtime.client(&root_primary).unwrap();
         if remote {
-            // LookupPaths returns selected rows without hydrating this facade's
-            // durable replica. Receive the actual primary journal through the
-            // normal authority-checked route before testing physical pages.
+            // The ordinary lookup remains part of the fixture, but its reply
+            // cannot substitute for the physical acknowledgement above.
             let synced = service
                 .route_namespace_operation_to_metadata_primary_with_timeout_and_options(
                     sifs_file_system_id(),
@@ -411,7 +433,12 @@ fn native_local_placement_preserves_actual_content_owner_and_bytes() {
         .unwrap();
     let object = owner.current_read_object_metadata(&stat.object_id).unwrap();
     assert_eq!(object.owner_node_id, nodes[1]);
-    let mut primary = runtime.client(&nodes[0]).unwrap();
+    let mut primary = runtime.metadata_primary_service(&path).unwrap();
+    assert_eq!(primary.node_id(), &nodes[0]);
+    let cached_before = primary
+        .content()
+        .has_blob(object.content_hash.as_ref().unwrap())
+        .unwrap();
     let control = runtime.shared_control_plane().unwrap();
     let config = control.with_client(|kv| {
         DfsControlPlaneStore::new(kv.as_mut())
@@ -448,12 +475,20 @@ fn native_local_placement_preserves_actual_content_owner_and_bytes() {
             &placement.plan.desired_replica_nodes,
         )
         .unwrap();
-    assert!(
-        !primary
+    assert_eq!(
+        primary
             .content()
             .has_blob(object.content_hash.as_ref().unwrap())
             .unwrap(),
-        "local-owner reconciliation cannot move the owner's bytes to the metadata primary"
+        cached_before,
+        "local-owner reconciliation must not add a cache copy; the initial routed write may already have cached its input"
+    );
+    assert_eq!(
+        primary
+            .current_read_object_metadata(&object.object_id)
+            .unwrap(),
+        object,
+        "the actual metadata primary must preserve the owner's canonical locations and generation"
     );
     assert_eq!(owner.posix_read_file(&path).unwrap(), bytes);
     assert_eq!(
@@ -700,18 +735,29 @@ async fn native_remote_noop_proof_binds_complete_config_assignment_and_row_once(
 
 #[test]
 fn native_placement_preserves_actual_retained_durability_and_repair_owner_after_gc() {
-    native_placement_retirement(true);
+    native_placement_retirement(true, false);
 }
 
 #[test]
 fn native_completed_placement_does_not_resurrect_superseded_repairs_after_reopen() {
-    native_placement_retirement(false);
+    native_placement_retirement(false, false);
 }
 
-fn native_placement_retirement(retain: bool) {
-    let mut case =
-        NativePlacementFixture::with_nodes("native-placement-retained-grant", false, 1, 2);
-    let nodes = DfsTestRuntime::ordered_node_ids("native-placement-retained-grant", 2);
+#[test]
+fn native_placement_replay_after_handoff_preserves_original_committed_obligation() {
+    native_placement_retirement(true, true);
+}
+
+fn native_placement_retirement(retain: bool, replay_after_handoff: bool) {
+    let label = if replay_after_handoff {
+        "native-placement-replay-handoff"
+    } else if retain {
+        "native-placement-retained-grant"
+    } else {
+        "native-placement-retirement"
+    };
+    let mut case = NativePlacementFixture::with_nodes(label, false, 1, 2);
+    let nodes = DfsTestRuntime::ordered_node_ids(label, 2);
     let original = case.job.accepted_config.clone();
     let mut policy = DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedConfirmed, 2, 2).unwrap();
     policy.required_node_ids = nodes.clone();
@@ -841,6 +887,68 @@ fn native_placement_retirement(retain: bool) {
             &placement.plan.desired_replica_nodes,
         )
         .unwrap();
+    if replay_after_handoff {
+        let intent_id = format!(
+            "placement:{}:{}:{}",
+            job.job_id, object.object_id, object.version
+        );
+        let recorded = case
+            .service
+            .metadata_backend()
+            .unwrap()
+            .get_intent(&object.object_id, &intent_id)
+            .unwrap()
+            .unwrap();
+        let promoted = nodes[1].clone();
+        case.runtime
+            .reassign_metadata_shard(
+                &object.file_system_id,
+                "services",
+                promoted.clone(),
+                vec![case.primary.clone()],
+            )
+            .unwrap();
+        let (resolved, replication, placement) =
+            reconciliation_placement_for_object(&one_copy, &job, &object).unwrap();
+        // Let the real serving Main own admission; a direct Core invocation
+        // can race the normal reconciler's live placement transaction.
+        case.service.refresh_control_plane_latest().unwrap();
+        case.service
+            .route_namespace_operation(
+                promoted.clone(),
+                DfsNamespaceOperation::ReconcilePlacement {
+                    job_id: job.job_id.clone(),
+                    path: object.path.clone(),
+                    object_id: object.object_id.clone(),
+                    expected_version: object.version.clone(),
+                    object_policy: resolved.policy.consistency,
+                    replication_policy: replication,
+                    desired_replica_node_ids: placement.plan.desired_replica_nodes,
+                },
+            )
+            .expect("the actual new owner must replay the same immutable placement obligation");
+        let owner = case.runtime.metadata_primary_service(&path).unwrap();
+        assert_eq!(owner.node_id(), &promoted);
+        assert_eq!(
+            owner
+                .metadata_backend()
+                .unwrap()
+                .get_intent(&object.object_id, &intent_id)
+                .unwrap()
+                .unwrap(),
+            recorded
+        );
+        assert_eq!(
+            owner
+                .current_read_object_metadata(&object.object_id)
+                .unwrap()
+                .current_locations,
+            object.current_locations
+        );
+        drop(owner);
+        case.close();
+        return;
+    }
     assert_eq!(
         case.service
             .current_read_object_metadata(&object.object_id)
@@ -919,8 +1027,9 @@ fn native_placement_retirement(retain: bool) {
         );
         let primary = case.primary.clone();
         drop(case.service);
+        case.runtime.stop_node(&primary).unwrap();
         case.runtime.reopen_node(primary.clone()).unwrap();
-        case.service = case.runtime.client(&primary).unwrap();
+        case.service = case.runtime.metadata_primary_service(&path).unwrap();
         assert!(
             !case
                 .service
@@ -1439,10 +1548,11 @@ async fn native_routed_noop_revalidates_live_permit_without_namespace_journal_ch
 
 #[test]
 fn native_served_maintenance_skips_parked_job_for_tail_and_retires_superseded_head() {
-    let (runtime, nodes, jobs, gate, _) = super::native_repair_authority_tests::native_managed_work(
-        "native-parked-placement-tail",
-        &[("/", DfsPlacementScope::Subtree)],
-    );
+    let (runtime, nodes, jobs, gate, _, _) =
+        super::native_repair_authority_tests::native_managed_work(
+            "native-parked-placement-tail",
+            &[("/", DfsPlacementScope::Subtree)],
+        );
     let control = runtime.shared_control_plane().unwrap();
     let fs = runtime.file_system().file_system_id;
     let head = control.with_client(|kv| {
@@ -1477,34 +1587,50 @@ fn native_served_maintenance_skips_parked_job_for_tail_and_retires_superseded_he
             .compare_and_put_placement_update(&config, &config, &tail)
             .unwrap()
     }));
-    let result = runtime
-        .maintenance_tick(&nodes[0], Duration::from_secs(5))
-        .unwrap();
-    assert!(
-        result.outcome.is_ok(),
-        "ordinary served owner: {:?}",
-        result.outcome
-    );
-    assert_eq!(result.omitted_kv_event_count, 0);
-    let (parked, advanced) = control.with_client(|kv| {
-        let store = DfsControlPlaneStore::new(kv.as_mut());
-        (
-            store
-                .placement_reconciliation(&fs, &head.job_id)
-                .unwrap()
-                .unwrap(),
-            store
-                .placement_reconciliation(&fs, &tail.job_id)
-                .unwrap()
-                .unwrap(),
-        )
-    });
-    assert_eq!(
-        parked, head,
-        "pending durable repair work parks the head's object pass"
-    );
-    assert!(advanced.revision > tail.revision);
-    assert_eq!(advanced.state, DfsPlacementReconciliationState::Completed);
+    // An empty scan still checkpoints Repairing before its verification pass
+    // can complete. Drive both real phases within the original total budget.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut previous_revision = tail.revision;
+    for expected in [
+        DfsPlacementReconciliationState::Repairing,
+        DfsPlacementReconciliationState::Completed,
+    ] {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "tail must finish within the original five-second budget"
+        );
+        let result = runtime.maintenance_tick(&nodes[0], remaining).unwrap();
+        assert!(
+            result.outcome.is_ok(),
+            "ordinary served owner: {:?}",
+            result.outcome
+        );
+        assert_eq!(result.omitted_kv_event_count, 0);
+        let (parked, advanced) = control.with_client(|kv| {
+            let store = DfsControlPlaneStore::new(kv.as_mut());
+            (
+                store
+                    .placement_reconciliation(&fs, &head.job_id)
+                    .unwrap()
+                    .unwrap(),
+                store
+                    .placement_reconciliation(&fs, &tail.job_id)
+                    .unwrap()
+                    .unwrap(),
+            )
+        });
+        assert_eq!(
+            parked, head,
+            "pending durable repair work parks the head's object pass"
+        );
+        assert!(advanced.revision > previous_revision);
+        previous_revision = advanced.revision;
+        assert_eq!(advanced.state, expected);
+        assert_eq!(advanced.matched_object_count, 0);
+        assert_eq!(advanced.pending_repair_count, 0);
+    }
+    assert!(std::time::Instant::now() < deadline);
     let mut current = config.clone();
     upsert_placement_rule(
         &mut current.subtree_policies,

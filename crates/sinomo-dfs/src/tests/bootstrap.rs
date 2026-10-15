@@ -278,12 +278,32 @@ fn cluster_dfs_metadata_publish_after_events_uses_default_cluster_publish() {
 fn cold_sifs_scale_fixture_stays_preemptible() {
     let node =
         crate::test_runtime::DfsTestRuntime::ordered_node_ids("native-cold-scale", 1).remove(0);
-    let (mut runtime, mut writer) = native_sifs_service("native-cold-scale", node.clone());
+    let (mut runtime, browser) = native_sifs_service("native-cold-scale", node.clone());
+    drop(browser);
+    // Populate the real one-node corpus through its actual Core author. The
+    // boundary under test is cold hydration, not thousands of loopback RPCs.
+    let mut writer = runtime.metadata_primary_service("/services").unwrap();
+    let before_objects = writer
+        .metadata_backend()
+        .unwrap()
+        .metadata_summary()
+        .unwrap()
+        .object_count;
     for index in 0..2048 {
         writer
             .posix_mkdir(&format!("/services/scale-fixture-{index:04}"))
             .unwrap();
     }
+    assert_eq!(
+        writer
+            .metadata_backend()
+            .unwrap()
+            .metadata_summary()
+            .unwrap()
+            .object_count,
+        before_objects + 2048
+    );
+    assert_eq!(runtime.observation_dropped_count(), 0);
     let configs = runtime.metadata_shards().unwrap();
     let fs = runtime.file_system().file_system_id;
     let shard = select_metadata_shard_config_for_path(&fs, &configs, "/services")
@@ -441,12 +461,54 @@ fn sifs_cluster_bulk_local_eventual_splits_mixed_primary_batch() {
     let services_thread =
         std::thread::spawn(move || pump_sifs_service_until_stop(services_primary, services_stop));
 
+    let admitted_batches = Arc::new(Mutex::new(Vec::new()));
+    let mut batch_hooks = Vec::new();
+    for owner in [&users_primary_node, &services_primary_node] {
+        let observed = Arc::clone(&admitted_batches);
+        batch_hooks.push(crate::runtime_host::install_daemon_dfs_pre_dispatch_test_hook(
+            _runtime.data_dir(owner),
+            Arc::new(move |point, command, _| {
+                if let crate::runtime_host::DaemonDfsPreDispatchTestPoint::BeforeExecute { admission_held } = point
+                    && let Some(command) = command
+                    && matches!(&command.routed_message.message,
+                        DfsNetworkMessage::NamespaceRequest(request)
+                        if matches!(&request.operation, DfsNamespaceOperation::CommitLocalEventualBatch { .. }))
+                {
+                    observed.lock().unwrap().push((
+                        command.routed_message.source_node_id.clone(),
+                        command.routed_message.target_node_id.clone(), admission_held,
+                    ));
+                }
+                Ok(())
+            }),
+        ));
+    }
     let stats = users_primary
         .posix_write_files_local_eventual_with_known_parents(vec![
             (local_path, local_bytes),
             (remote_path, remote_bytes),
         ])
         .expect("mixed-primary bulk write");
+    drop(batch_hooks);
+    let admitted = admitted_batches.lock().unwrap();
+    assert_eq!(
+        admitted.len(),
+        2,
+        "both local and remote groups must execute on their actual Main owner: {admitted:?}"
+    );
+    assert!(
+        admitted
+            .iter()
+            .all(|(source, _, owned)| source == &users_primary_node && *owned)
+    );
+    assert_eq!(
+        admitted
+            .iter()
+            .map(|(_, target, _)| target.clone())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([users_primary_node.clone(), services_primary_node.clone()])
+    );
+    drop(admitted);
     assert_eq!(stats.len(), 2);
     assert_eq!(stats[0].path, local_path);
     assert_eq!(
@@ -558,7 +620,45 @@ fn clustered_bootstrap_ensures_filesystem_only_on_authoritative_shard_and_probe_
             .any(|file_system| { file_system.file_system_id == sifs_file_system_id() }),
         "the actual services owner must retain its filesystem definition"
     );
-    let batch = backend
+    // A native handoff may install a snapshot covering the genesis frames.
+    // The complete original body and exact commit reference remain canonical
+    // in that same certified table cut even when the historical log is gone.
+    let prepared = services
+        .tables
+        .prepared_operations_v7
+        .iter()
+        .find(|record| {
+            record.status == DfsPreparedOperationStatus::Committed
+                && record.payload.metadata_effects.iter().any(|effect| {
+                    matches!(effect,
+                DfsPreparedMetadataEffect::PutFileSystem { file_system }
+                    if file_system.file_system_id == sifs_file_system_id())
+                })
+        })
+        .expect("filesystem is sealed in one complete services preparation");
+    prepared
+        .validate()
+        .expect("the actual stored body, slot and commit identity validate");
+    assert_eq!(prepared.payload.file_system_id, sifs_file_system_id());
+    assert_eq!(prepared.payload.shard_id, services_id);
+    assert_eq!(
+        prepared.digest.payload_digest,
+        prepared.payload.canonical_digest().unwrap()
+    );
+    let committed = prepared
+        .committed_entry
+        .as_deref()
+        .expect("exact native commit reference");
+    assert_eq!(committed.digest, prepared.digest);
+    assert_eq!(committed.shard_id, services_id);
+    assert!(
+        committed.sequence > prepared.digest.prepare_sequence,
+        "the complete filesystem preparation precedes its digest-only commit"
+    );
+    assert!(committed.sequence <= services.prefix_proof.journal_sequence);
+    // When raw history is retained, it must agree with the canonical record;
+    // do not reconstruct an entry or substitute a synthetic prefix.
+    if let Some(batch) = backend
         .journal_batch_for_shard_since_limited(
             &services_id,
             0,
@@ -566,36 +666,24 @@ fn clustered_bootstrap_ensures_filesystem_only_on_authoritative_shard_and_probe_
             DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT,
         )
         .unwrap()
-        .expect("actual bootstrap journal");
-    let (prepare_entry, prepared) = batch
-        .entries
-        .iter()
-        .find_map(|entry| match &entry.mutation {
-            DfsMetadataMutation::PrepareOperationV7 { record, .. }
-                if record.payload.metadata_effects.iter().any(|effect| {
-                    matches!(effect,
-                DfsPreparedMetadataEffect::PutFileSystem { file_system }
-                    if file_system.file_system_id == sifs_file_system_id())
-                }) =>
-            {
-                Some((entry, record))
+    {
+        for entry in &batch.entries {
+            if entry.sequence == prepared.digest.prepare_sequence {
+                let DfsMetadataMutation::PrepareOperationV7 { record, .. } = &entry.mutation else {
+                    panic!("original preparation slot contains another native operation");
+                };
+                assert_eq!(record.digest, prepared.digest);
+                assert_eq!(record.payload, prepared.payload);
             }
-            _ => None,
-        })
-        .expect("filesystem is sealed in one complete services preparation");
-    assert_eq!(prepared.payload.file_system_id, sifs_file_system_id());
-    assert_eq!(prepared.payload.shard_id, services_id);
-    assert_eq!(prepared.digest.prepare_sequence, prepare_entry.sequence);
-    assert_eq!(
-        prepared.digest.payload_digest,
-        prepared.payload.canonical_digest().unwrap()
-    );
-    assert!(
-        batch.entries.iter().any(|entry| matches!(&entry.mutation,
-        DfsMetadataMutation::CommitPreparedOperationV7 { digest, .. }
-            if digest == &prepared.digest && entry.sequence > prepare_entry.sequence)),
-        "the complete filesystem preparation precedes its digest-only commit"
-    );
+            if entry.sequence == committed.sequence {
+                assert_eq!(
+                    DfsPreparedOperationCommitReference::from_journal_entry(entry).unwrap(),
+                    *committed
+                );
+            }
+        }
+    }
+    let expected_record = prepared.clone();
     let sealed_body = prepared.payload.clone();
     let operation_id = prepared.digest.operation_id.clone();
     let expected_prefix = services.prefix_proof;
@@ -620,5 +708,120 @@ fn clustered_bootstrap_ensures_filesystem_only_on_authoritative_shard_and_probe_
         "the actual receiver prefix includes the full filesystem body"
     );
     assert_eq!(replicated.status, DfsPreparedOperationStatus::Committed);
+    assert_eq!(
+        replicated, expected_record,
+        "the receiver retains the same exact original digest and native commit reference"
+    );
     cluster.close();
+}
+
+#[test]
+fn default_reconciliation_preserves_activated_metadata_layout_after_native_reopen() {
+    let name = "native-persistent-metadata-layout";
+    let (mut runtime, service, initial) =
+        crate::test_support::current_native_metadata_service(name, 3, "/services").unwrap();
+    drop(service);
+    // These are the real initial members after native genesis and expansion.
+    // No current assignment or acknowledgement is inserted by this fixture.
+    let nodes = crate::test_runtime::DfsTestRuntime::ordered_node_ids(name, 3);
+    let members = std::iter::once(initial.primary_node_id.clone())
+        .chain(initial.replica_node_ids.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(members, nodes.iter().cloned().collect());
+    let new_primary = initial.replica_node_ids[0].clone();
+    let activated = runtime
+        .reassign_metadata_shard(
+            &initial.file_system_id,
+            &initial.shard_id,
+            new_primary.clone(),
+            vec![initial.primary_node_id.clone()],
+        )
+        .unwrap();
+    assert_eq!(activated.primary_node_id, new_primary);
+    assert_eq!(
+        activated.replica_node_ids,
+        vec![initial.primary_node_id.clone()]
+    );
+    assert!(activated.epoch > initial.epoch);
+    let control = runtime.shared_control_plane().unwrap();
+    let proof = control
+        .with_client(|kv| {
+            DfsControlPlaneStore::new(kv.as_mut()).get_metadata_shard_membership_handoff_proof(
+                &activated.file_system_id,
+                &activated.shard_id,
+            )
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(proof.desired_shard, activated);
+    assert!(
+        proof
+            .acknowledged_node_ids
+            .contains(&initial.primary_node_id)
+    );
+    assert!(proof.acknowledged_node_ids.contains(&new_primary));
+    drop(control);
+    // Normal stopped-owner startup necessarily runs the recurring default
+    // reconciler; preserving a transient service view is insufficient.
+    for node in nodes.iter().rev() {
+        runtime.stop_node(node).unwrap();
+    }
+    runtime.start_nodes().unwrap();
+    let restored = runtime
+        .metadata_shards()
+        .unwrap()
+        .into_iter()
+        .find(|config| config.shard_id == activated.shard_id)
+        .unwrap();
+    assert_eq!(restored, activated);
+    let control = runtime.shared_control_plane().unwrap();
+    let retained = control
+        .with_client(|kv| {
+            DfsControlPlaneStore::new(kv.as_mut()).get_metadata_shard_membership_handoff_proof(
+                &activated.file_system_id,
+                &activated.shard_id,
+            )
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(retained, proof);
+    drop(control);
+    let path = "/services/persistent-layout.bin";
+    let mut policy = DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 1).unwrap();
+    policy.required_node_ids = vec![new_primary.clone()];
+    policy.forbidden_node_ids = nodes
+        .iter()
+        .filter(|node| **node != new_primary)
+        .cloned()
+        .collect();
+    runtime
+        .apply_placement_policy(&new_primary, path, DfsPlacementScope::Subtree, policy)
+        .unwrap();
+    let mut client = runtime.client(&new_primary).unwrap();
+    let (resolved, _, replication) = client
+        .managed_replication_policy_for_path(path, DfsObjectPolicy::ReplicatedEventual, 1)
+        .unwrap();
+    assert_eq!(
+        resolved.policy.consistency,
+        DfsObjectPolicy::ReplicatedEventual
+    );
+    assert_eq!(replication.required_node_ids, vec![new_primary.clone()]);
+    let written = client
+        .posix_write_file(
+            path,
+            b"actual activated owner bytes",
+            DfsWriteOptions {
+                replica_candidates: vec![new_primary.clone()],
+                policy: replication,
+                wait_for_commit: true,
+                foreground_replica_repair: false,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        client.posix_read_file_distributed(&written.path).unwrap(),
+        b"actual activated owner bytes"
+    );
+    drop(client);
+    runtime.close().unwrap();
 }

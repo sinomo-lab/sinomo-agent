@@ -1034,6 +1034,8 @@ impl DfsPreparedMetadataJournalBatchRpc {
 pub struct DfsNodeTransport {
     #[cfg(test)]
     test_metadata_direct_probe: Option<DfsTestMetadataDirectRpcProbe>,
+    #[cfg(test)]
+    test_routed_call_attempts: Option<Arc<StdAtomicUsize>>,
     local_node_id: NodeId,
     known_remote_nodes: BTreeSet<NodeId>,
     incoming_messages: VecDeque<DfsRoutedMessage>,
@@ -1099,8 +1101,13 @@ pub struct DfsNodeDetachedSendWorker {
     transport: DfsNodeTransport,
     deferred_target_node_ids: BTreeSet<NodeId>,
     prepared_replica_calls: Arc<std::sync::Mutex<Vec<DfsCheckpointedReplicaCall>>>,
-    background_response_handler:
-        Option<Arc<dyn Fn(DfsRoutedMessage) -> Result<(), DfsError> + Send + Sync>>,
+    background_response_handler: Option<
+        Arc<
+            dyn Fn(DfsRoutedMessage, Option<&DfsRoutedMessage>) -> Result<(), DfsError>
+                + Send
+                + Sync,
+        >,
+    >,
     background_delivery_handler: Option<
         Arc<
             dyn Fn(
@@ -1203,11 +1210,15 @@ impl DfsNodeDetachedSendWorker {
         (background.and(ordinary), background_retry)
     }
 
-    /// Deliver authenticated RPC returns through the host's ordinary message
-    /// validation after dispatch has released its source mutation owner.
+    /// Deliver authenticated RPC returns through the existing admitted handler
+    /// after releasing source mutation custody. The optional original is DATA
+    /// from this SAME checkpointed local repair call, never peer authority.
     pub(crate) fn set_background_response_handler<F>(&mut self, handler: F)
     where
-        F: Fn(DfsRoutedMessage) -> Result<(), DfsError> + Send + Sync + 'static,
+        F: Fn(DfsRoutedMessage, Option<&DfsRoutedMessage>) -> Result<(), DfsError>
+            + Send
+            + Sync
+            + 'static,
     {
         self.background_response_handler = Some(Arc::new(handler));
     }
@@ -1330,9 +1341,10 @@ impl DfsNodeDetachedSendWorker {
             }
         };
         for message in returned {
-            let matching = match &message.message {
-                DfsNetworkMessage::RepairReplicaResponse(response) => {
-                    expected.iter().any(|(target, original, _, _)| {
+            let original = match &message.message {
+                DfsNetworkMessage::RepairReplicaResponse(response) => expected
+                    .iter()
+                    .find(|(target, original, _, _)| {
                         let DfsNetworkMessage::RepairReplica(command) = &original.message else {
                             return false;
                         };
@@ -1346,16 +1358,16 @@ impl DfsNodeDetachedSendWorker {
                             && response.object_id == command.object_id
                             && response.version == command.version
                     })
-                }
-                _ => false,
+                    .map(|(_, original, _, _)| original),
+                _ => None,
             };
-            if !matching {
+            let Some(original) = original else {
                 first_error.get_or_insert_with(|| DfsError::Network {
                     message: "background DFS repair returned an unmatched response identity".into(),
                 });
                 continue;
-            }
-            if let Err(error) = handler(message) {
+            };
+            if let Err(error) = handler(message, Some(original)) {
                 first_error.get_or_insert(error);
             }
         }
@@ -1596,6 +1608,8 @@ impl Clone for DfsNodeTransport {
         Self {
             #[cfg(test)]
             test_metadata_direct_probe: self.test_metadata_direct_probe.clone(),
+            #[cfg(test)]
+            test_routed_call_attempts: self.test_routed_call_attempts.clone(),
             local_node_id: self.local_node_id.clone(),
             known_remote_nodes: self.known_remote_nodes.clone(),
             incoming_messages: if self.served_message.is_some() {
@@ -2078,6 +2092,8 @@ impl DfsNodeTransport {
         Self {
             #[cfg(test)]
             test_metadata_direct_probe: None,
+            #[cfg(test)]
+            test_routed_call_attempts: None,
             local_node_id,
             known_remote_nodes,
             incoming_messages: VecDeque::new(),
@@ -2858,7 +2874,13 @@ impl DfsNodeTransport {
     fn flush_detached_peer_sends_excluding_targets(
         &mut self,
         deferred_target_node_ids: &BTreeSet<NodeId>,
-        response_handler: Option<&(dyn Fn(DfsRoutedMessage) -> Result<(), DfsError> + Send + Sync)>,
+        response_handler: Option<
+            &(
+                 dyn Fn(DfsRoutedMessage, Option<&DfsRoutedMessage>) -> Result<(), DfsError>
+                     + Send
+                     + Sync
+             ),
+        >,
     ) -> Result<(), NetworkError> {
         self.flush_detached_peer_sends_with_now_mode(
             &Instant::now,
@@ -2871,7 +2893,13 @@ impl DfsNodeTransport {
     fn flush_detached_peer_sends_exclusive_excluding_targets(
         &mut self,
         deferred_target_node_ids: &BTreeSet<NodeId>,
-        response_handler: Option<&(dyn Fn(DfsRoutedMessage) -> Result<(), DfsError> + Send + Sync)>,
+        response_handler: Option<
+            &(
+                 dyn Fn(DfsRoutedMessage, Option<&DfsRoutedMessage>) -> Result<(), DfsError>
+                     + Send
+                     + Sync
+             ),
+        >,
     ) -> Result<(), NetworkError> {
         self.flush_detached_peer_sends_with_now_mode(
             &Instant::now,
@@ -2894,7 +2922,13 @@ impl DfsNodeTransport {
         now: &F,
         wait_for_drain_gate: bool,
         deferred_target_node_ids: &BTreeSet<NodeId>,
-        response_handler: Option<&(dyn Fn(DfsRoutedMessage) -> Result<(), DfsError> + Send + Sync)>,
+        response_handler: Option<
+            &(
+                 dyn Fn(DfsRoutedMessage, Option<&DfsRoutedMessage>) -> Result<(), DfsError>
+                     + Send
+                     + Sync
+             ),
+        >,
     ) -> Result<(), NetworkError>
     where
         F: Fn() -> Instant + ?Sized,
@@ -3221,7 +3255,13 @@ impl DfsNodeTransport {
         &mut self,
         returned_messages: Vec<DfsRoutedMessage>,
         fetch: Option<&DfsRoutedMessage>,
-        response_handler: Option<&(dyn Fn(DfsRoutedMessage) -> Result<(), DfsError> + Send + Sync)>,
+        response_handler: Option<
+            &(
+                 dyn Fn(DfsRoutedMessage, Option<&DfsRoutedMessage>) -> Result<(), DfsError>
+                     + Send
+                     + Sync
+             ),
+        >,
     ) -> Result<(), NetworkError> {
         for returned_message in returned_messages {
             if let (Some(original), Some(handler)) = (fetch, response_handler) {
@@ -3247,7 +3287,7 @@ impl DfsNodeTransport {
                         detail: "detached DFS fetch returned an unmatched response identity".into(),
                     });
                 }
-                handler(returned_message).map_err(|error| NetworkError::Io {
+                handler(returned_message, None).map_err(|error| NetworkError::Io {
                     operation: "deliver detached DFS fetch response to Main".into(),
                     detail: error.to_string(),
                 })?;
@@ -4639,6 +4679,10 @@ impl DfsMessageTransport for DfsNodeTransport {
         target_node_id: &NodeId,
         call: DfsRoutedCall,
     ) -> Result<(), NetworkError> {
+        #[cfg(test)]
+        if let Some(attempts) = &self.test_routed_call_attempts {
+            attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         if self.served_message.is_some() {
             return self.send_served_routed_call(target_node_id, call);
         }
@@ -7148,6 +7192,13 @@ impl DfsNodeTransport {
             self.served_mut().inbound_messages.push_back(message);
             return Ok(());
         }
+        if attachment.is_none() && dfs_network_message_is_committed_write_response(&message.message)
+        {
+            // The caller's own response was retained above. A different
+            // requester's completed write is replay-safe delivery work; it
+            // must not hold this served lane or maintenance admission over I/O.
+            return self.send_routed_message_to_peer_detached(target_node_id, message, true);
+        }
         self.send_routed_call_to_peer(
             target_node_id,
             DfsRoutedCall {
@@ -7206,6 +7257,11 @@ impl DfsNodeTransport {
                     .await?;
                 self.served_mut().inbound_messages.push_back(message);
                 return Ok(());
+            }
+            if attachment.is_none()
+                && dfs_network_message_is_committed_write_response(&message.message)
+            {
+                return self.send_routed_message_to_peer_detached(target_node_id, message, true);
             }
             self.send_routed_call_to_peer_async(
                 target_node_id,
@@ -7578,6 +7634,13 @@ impl DfsNodeTransport {
             .map(|state| state.inbound_messages.drain(..).collect())
             .unwrap_or_default()
     }
+}
+
+fn dfs_network_message_is_committed_write_response(message: &DfsNetworkMessage) -> bool {
+    matches!(message, DfsNetworkMessage::DistributedWriteResponse(response)
+    if matches!(&response.result, crate::DfsDistributedWriteResult::Outcome {
+        outcome: crate::NetworkedDfsWriteOutcome::Committed { .. }
+    }))
 }
 
 fn dfs_network_message_is_served_call_response(message: &DfsNetworkMessage) -> bool {
@@ -8166,6 +8229,12 @@ mod response_delivery_tests;
 
 #[cfg(test)]
 impl DfsNodeTransport {
+    pub(crate) fn observe_routed_calls_for_test(&mut self) -> Arc<StdAtomicUsize> {
+        let attempts = Arc::new(StdAtomicUsize::new(0));
+        self.test_routed_call_attempts = Some(Arc::clone(&attempts));
+        attempts
+    }
+
     pub(crate) fn metadata_direct_rpc_probe_for_test(&mut self) -> DfsTestMetadataDirectRpcProbe {
         let probe = DfsTestMetadataDirectRpcProbe::default();
         self.test_metadata_direct_probe = Some(probe.clone());

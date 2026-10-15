@@ -293,6 +293,12 @@ pub(super) fn has_migration_source_data(root: &Path) -> Result<bool> {
     if !root.exists() {
         return Ok(false);
     }
+    // A native writer may still be publishing the initial current generation.
+    // Probe only its stable, owned cut; temporary files are never filtered out.
+    let _source_fence = super::retain_source_fence(root)?;
+    if super::current_root(root)? {
+        return Ok(false);
+    }
     let inventory = discover(root)?;
     for file in &inventory.files {
         if file.relative == Path::new("records/local-materialization/cursor.sobj") {
@@ -614,18 +620,33 @@ fn next_inner(root: &Path, cursor: &mut SourceCursor) -> Result<Option<SourceRec
                             } else if let Some(record) =
                                 object.get("Prepared").and_then(|value| value.get("record"))
                             {
-                                let current: sinomo_dfs::DfsPreparedOperationRecord =
-                                    serde_json::from_value(record.clone()).map_err(invalid)?;
-                                current.validate()?;
                                 if object.len() != 1
                                     || object["Prepared"]
                                         .as_object()
                                         .is_none_or(|fields| fields.len() != 1)
-                                    || serde_json::to_value(&current).map_err(invalid)? != *record
                                 {
                                     return Err(invalid(
-                                        "current prepared snapshot record changed its source shape",
+                                        "prepared snapshot record changed its source envelope",
                                     ));
+                                }
+                                // Select an ORIGINAL serializer from the actual
+                                // record declaration. Current DFS never enters
+                                // this private SourceCursor. Keep raw old8/9
+                                // bodies/digests for later conversion or a typed
+                                // missing-custody rejection; do not current-
+                                // decode them before that boundary.
+                                let generation = u16::from_le_bytes([bytes[4], bytes[5]]);
+                                if matches!(generation, 8 | 9) {
+                                    crate::legacy_wire::validate_original_v7_record(record)?;
+                                } else {
+                                    let current: sinomo_dfs::DfsPreparedOperationRecord =
+                                        serde_json::from_value(record.clone()).map_err(invalid)?;
+                                    current.validate()?;
+                                    if serde_json::to_value(&current).map_err(invalid)? != *record {
+                                        return Err(invalid(
+                                            "current prepared snapshot record changed its source shape",
+                                        ));
+                                    }
                                 }
                                 SourceRecord::SnapshotRow {
                                     table: "prepared_operations_v7".into(),
@@ -745,6 +766,31 @@ fn next_inner(root: &Path, cursor: &mut SourceCursor) -> Result<Option<SourceRec
         }
         return Ok(Some(record));
     }
+}
+
+/// Read only known original journal families for a modeled-source fixture.
+/// The complete captured donor inventory is still verified on both sides; this
+/// decoder subset is observation DATA and is never a source-authority claim.
+#[cfg(test)]
+pub(super) fn fixture_journal_frames(root: &Path) -> Result<Vec<SourceRecord>> {
+    let captured = discover(root)?;
+    captured.verify(root)?;
+    let mut journal = captured.clone();
+    journal
+        .files
+        .retain(|file| matches!(file.kind, Kind::JournalSegment | Kind::JournalLoose));
+    let mut cursor = SourceCursor::new(journal);
+    let mut frames = Vec::new();
+    while let Some(record) = next(root, &mut cursor)? {
+        if !matches!(record, SourceRecord::JournalFrame { .. }) {
+            return Err(invalid(
+                "original fixture journal decoder returned another family",
+            ));
+        }
+        frames.push(record);
+    }
+    captured.verify(root)?;
+    Ok(frames)
 }
 
 #[cfg(test)]

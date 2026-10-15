@@ -41,6 +41,174 @@ pub(in crate::authority) fn canonical_migration_runtime(
     runtime
 }
 
+/// Continue only an unfinished actual source-writer admission. The caller owns
+/// the immutable request/plan and one acceptance deadline across all stages.
+/// An in-flight normal RPC keeps its existing transport limits.
+pub(in crate::authority) fn continue_native_source_step<T>(
+    source_root: &std::path::Path,
+    deadline: std::time::Instant,
+    mut step: impl FnMut() -> std::result::Result<T, MetadataBackendError>,
+) -> std::result::Result<T, MetadataBackendError> {
+    let source_root = source_root.canonicalize().map_err(error)?;
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return Err(error(
+                "native source stage exceeded its single acceptance deadline",
+            ));
+        }
+        match step() {
+            Err(MetadataBackendError::StoragePreparationPending {
+                root,
+                processed_records: 0,
+            }) if root == source_root => std::thread::yield_now(),
+            Ok(value) if std::time::Instant::now() < deadline => return Ok(value),
+            Ok(_) => {
+                return Err(error(
+                    "native source stage completed after its acceptance deadline",
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Await current authority through the SAME normal native reader and request ID.
+/// Only structured unavailable-authority responses continue; no outcome is
+/// synthesized and all other failures/invalid proofs remain terminal.
+pub(in crate::authority) fn native_request_outcome_before(
+    runtime: &tokio::runtime::Handle,
+    cluster: &Arc<dyn sinomo_core::service::ClusterAccess>,
+    request_id: &KvRequestId,
+    deadline: std::time::Instant,
+) -> std::result::Result<sinomo_core::kv::ClusterKvRequestOutcomeRead, MetadataBackendError> {
+    use sinomo_core::{network::NetworkError, service::ServiceError};
+    block_native(runtime, async {
+        loop {
+            if std::time::Instant::now() >= deadline {
+                return Err(ServiceError::Service(
+                    "native current-authority read exceeded its original acceptance deadline"
+                        .into(),
+                ));
+            }
+            match cluster
+                .kv_request_outcome_authoritative_async(request_id.clone())
+                .await
+            {
+                Ok(read) => {
+                    sinomo_core::kv::validate_cluster_kv_request_outcome_read(&read)?;
+                    if matches!(&read.outcome, sinomo_core::kv::KvRequestOutcome::Committed(record) if &record.request_id != request_id)
+                    {
+                        return Err(ServiceError::Service(
+                            "native outcome names another request".into(),
+                        ));
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        return Err(ServiceError::Service("native current-authority read completed after its original acceptance deadline".into()));
+                    }
+                    return Ok(read);
+                }
+                Err(error @ ServiceError::Network(NetworkError::ClusterReadOnly { .. })) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(error);
+                    }
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    })
+}
+
+fn native_evaluation_before<T>(
+    deadline: std::time::Instant,
+    mut evaluate: impl FnMut() -> std::result::Result<T, crate::authority::NativeEvaluationError>,
+) -> std::result::Result<T, MetadataBackendError> {
+    use sinomo_core::{network::NetworkError, service::ServiceError};
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return Err(error(
+                "native evaluation exceeded its original acceptance deadline",
+            ));
+        }
+        match evaluate() {
+            Err(crate::authority::NativeEvaluationError::Native(ServiceError::Network(
+                NetworkError::ClusterReadOnly { .. },
+            ))) => std::thread::yield_now(),
+            Err(error) => return Err(error.into_metadata()),
+            Ok(value) if std::time::Instant::now() < deadline => return Ok(value),
+            Ok(_) => {
+                return Err(error(
+                    "native evaluation completed after its original acceptance deadline",
+                ));
+            }
+        }
+    }
+}
+
+#[test]
+fn native_source_continuation_requires_actual_own_writer_release_and_keeps_other_errors_closed() {
+    use fs2::FileExt as _;
+    let directory = sinomo_testdir::TestDir::new("native-source-continuation-guards");
+    let own = directory.path().join("own");
+    let foreign = directory.path().join("foreign");
+    for root in [&own, &foreign] {
+        std::fs::create_dir_all(root.join("journal")).unwrap();
+    }
+    let writer = std::fs::File::create(foreign.join("journal/write.lock")).unwrap();
+    writer.lock_exclusive().unwrap();
+    let deadline = std::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    let mut attempts = 0;
+    let foreign_result = continue_native_source_step(&own, deadline, || {
+        attempts += 1;
+        crate::metadata::retain_source_fence(&foreign)
+    });
+    assert!(
+        matches!(foreign_result, Err(MetadataBackendError::StoragePreparationPending {
+        root, processed_records: 0
+    }) if root == foreign.canonicalize().unwrap())
+    );
+    assert_eq!(attempts, 1, "foreign custody cannot enter the continuation");
+    let mut own_writer = Some(std::fs::File::create(own.join("journal/write.lock")).unwrap());
+    own_writer.as_ref().unwrap().lock_exclusive().unwrap();
+    let mut own_attempts = 0;
+    let fence = continue_native_source_step(&own, deadline, || {
+        own_attempts += 1;
+        let result = crate::metadata::retain_source_fence(&own);
+        if own_attempts == 1 {
+            assert!(
+                matches!(&result, Err(MetadataBackendError::StoragePreparationPending {
+                root, processed_records: 0
+            }) if *root == own.canonicalize().unwrap())
+            );
+            drop(own_writer.take());
+        }
+        result
+    })
+    .unwrap();
+    assert_eq!(
+        own_attempts, 2,
+        "the original writer must actually release custody"
+    );
+    drop(fence);
+    std::fs::remove_file(own.join("journal/write.lock")).unwrap();
+    std::fs::create_dir(own.join("journal/write.lock")).unwrap();
+    assert!(matches!(
+        continue_native_source_step(&own, deadline, || {
+            crate::metadata::retain_source_fence(&own)
+        }),
+        Err(MetadataBackendError::Serde(_))
+    ));
+    let mut attempted_after_deadline = false;
+    assert!(
+        continue_native_source_step(&own, std::time::Instant::now(), || {
+            attempted_after_deadline = true;
+            crate::metadata::retain_source_fence(&own)
+        })
+        .is_err()
+    );
+    assert!(!attempted_after_deadline);
+}
+
 #[derive(Serialize)]
 struct OriginalV0Job<'a> {
     job_id: &'a str,
@@ -278,6 +446,8 @@ fn pending_v0_goal_imports_actual_native8_sources_and_publishes_current_job() {
                 .load(std::sync::atomic::Ordering::Acquire),
         "captured DATA conversion cannot revoke the actual factory readiness fact"
     );
+    let receipt_deadline =
+        std::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
     for original_scope in required {
         let root = runtime
             .metadata_root
@@ -291,14 +461,14 @@ fn pending_v0_goal_imports_actual_native8_sources_and_publishes_current_job() {
             cut.source_format_version,
             Some(sinomo_dfs::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION)
         );
-        let (plan, stage, activation, proof) = runtime
-            .authority
-            .recover_scope_retirement(
+        let (plan, stage, activation, proof) = native_evaluation_before(receipt_deadline, || {
+            runtime.authority.evaluate_scope_retirement(
                 &fs,
                 &sinomo_dfs::DfsMetadataShardId::new(&original_scope.assignment.shard_id),
             )
-            .unwrap()
-            .expect("actual activated import plus persisted exact native receipts");
+        })
+        .unwrap()
+        .expect("actual activated import plus persisted exact native receipts");
         NativeImportAuthority::require_committed(&stage).unwrap();
         NativeImportAuthority::require_committed(&activation).unwrap();
         assert!(
@@ -452,6 +622,22 @@ fn received_uncommitted_v1_custody_data_never_becomes_its_first_native_effect() 
         request: proposal.clone(),
         blueprints: Vec::new(),
     };
+    let wrong_id = KvRequestId::generate();
+    let proof_deadline = std::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    for id in [&proposal.request_id, &wrong_id] {
+        let outcome = native_request_outcome_before(
+            &runtime.authority.runtime,
+            runtime.authority.cluster().unwrap(),
+            id,
+            proof_deadline,
+        )
+        .unwrap();
+        current_authority(&outcome.authority).unwrap();
+        assert!(matches!(
+            outcome.outcome,
+            sinomo_core::kv::KvRequestOutcome::Unknown { .. }
+        ));
+    }
     let stored = runtime
         .authority
         .receive_placement_custody(
@@ -463,10 +649,12 @@ fn received_uncommitted_v1_custody_data_never_becomes_its_first_native_effect() 
         .unwrap();
     assert_eq!(stored.stored_request_id, Some(proposal.request_id.clone()));
     assert!(
-        !runtime
-            .authority
-            .replay_confirmed_placement_custody(goal, &envelope)
-            .unwrap(),
+        !native_evaluation_before(proof_deadline, || {
+            runtime
+                .authority
+                .evaluate_received_placement_custody(goal, &envelope)
+        })
+        .unwrap(),
         "unknown received proposal DATA with missing actual retirements must not commit"
     );
     let after = runtime.authority.read_exact(&[key.clone()]).unwrap().0[0]
@@ -477,37 +665,27 @@ fn received_uncommitted_v1_custody_data_never_becomes_its_first_native_effect() 
         after, goal.job.entry,
         "archive custody must leave the exact old row unchanged"
     );
-    let outcome = block_native(
-        &runtime.authority.runtime,
-        runtime
-            .authority
-            .cluster()
-            .unwrap()
-            .kv_request_outcome_authoritative_async(proposal.request_id.clone()),
-    )
-    .unwrap();
-    current_authority(&outcome.authority).unwrap();
-    assert!(matches!(
-        outcome.outcome,
-        sinomo_core::kv::KvRequestOutcome::Unknown { .. }
-    ));
     let mut wrong = envelope.clone();
-    wrong.request.request_id = KvRequestId::generate();
+    wrong.request.request_id = wrong_id.clone();
     assert!(
-        !runtime
-            .authority
-            .replay_confirmed_placement_custody(goal, &wrong)
-            .unwrap()
+        !native_evaluation_before(proof_deadline, || {
+            runtime
+                .authority
+                .evaluate_received_placement_custody(goal, &wrong)
+        })
+        .unwrap()
     );
     let mut changed = envelope.clone();
     changed.request.txn.success.push(KvOp::Delete {
         key: "/unrelated-received-data".into(),
     });
     assert!(
-        !runtime
-            .authority
-            .replay_confirmed_placement_custody(goal, &changed)
-            .unwrap()
+        !native_evaluation_before(proof_deadline, || {
+            runtime
+                .authority
+                .evaluate_received_placement_custody(goal, &changed)
+        })
+        .unwrap()
     );
     assert_eq!(
         runtime.authority.read_exact(&[key]).unwrap().0[0]
@@ -515,6 +693,20 @@ fn received_uncommitted_v1_custody_data_never_becomes_its_first_native_effect() 
             .as_ref(),
         Some(&goal.job.entry)
     );
+    for id in [&proposal.request_id, &wrong_id] {
+        let outcome = native_request_outcome_before(
+            &runtime.authority.runtime,
+            runtime.authority.cluster().unwrap(),
+            id,
+            proof_deadline,
+        )
+        .unwrap();
+        current_authority(&outcome.authority).unwrap();
+        assert!(matches!(
+            outcome.outcome,
+            sinomo_core::kv::KvRequestOutcome::Unknown { .. }
+        ));
+    }
     drop(runtime);
     drop(context);
     native.close().unwrap();
@@ -653,6 +845,32 @@ fn terminal_v1_without_routing_uses_actual_native_owner_and_shared_winning_recei
             .entry
             .is_none()
     );
+    let author_envelope = runtimes[author]
+        .authority
+        .saved_placement_custody(&all_goals[author], PlacementCustodyPhase::Retirement)
+        .unwrap()
+        .unwrap();
+    let before = block_native(
+        &runtimes[author].authority.runtime,
+        runtimes[author]
+            .authority
+            .cluster()
+            .unwrap()
+            .kv_request_outcome_authoritative_async(author_envelope.request.request_id.clone()),
+    )
+    .unwrap();
+    sinomo_core::kv::validate_cluster_kv_request_outcome_read(&before).unwrap();
+    current_authority(&before.authority).unwrap();
+    let sinomo_core::kv::KvRequestOutcome::Committed(original_receipt) = before.outcome else {
+        panic!("actual administrative owner must have its original winning receipt")
+    };
+    NativeImportAuthority::validate_original_command_preimage(
+        &author_envelope.request,
+        &chosen.node_id,
+        &chosen.guards,
+        &original_receipt.command_digest,
+    )
+    .unwrap();
     let peer = (author + 1) % runtimes.len();
     // Native startup has one voter and a learner. Administrative custody is
     // retained on the actual voter cohort; the learner fetches its winning
@@ -680,7 +898,7 @@ fn terminal_v1_without_routing_uses_actual_native_owner_and_shared_winning_recei
         .unwrap()
         .unwrap();
     // Missing old key alone cannot advance: the SAME exact native winning
-    // request must be authoritatively known and replayed on this actual peer.
+    // request must be authoritatively known and observed on this actual peer.
     assert!(
         runtimes[peer]
             .authority
@@ -700,6 +918,24 @@ fn terminal_v1_without_routing_uses_actual_native_owner_and_shared_winning_recei
             .entry
             .is_none(),
         "terminal cleanup never fabricates current DFS publication"
+    );
+    let after = block_native(
+        &runtimes[peer].authority.runtime,
+        runtimes[peer]
+            .authority
+            .cluster()
+            .unwrap()
+            .kv_request_outcome_authoritative_async(envelope.request.request_id.clone()),
+    )
+    .unwrap();
+    sinomo_core::kv::validate_cluster_kv_request_outcome_read(&after).unwrap();
+    current_authority(&after.authority).unwrap();
+    let sinomo_core::kv::KvRequestOutcome::Committed(observed) = after.outcome else {
+        panic!("peer custody must preserve the actual original receipt")
+    };
+    assert_eq!(
+        observed, original_receipt,
+        "pure observation preserves original body/term/index/revision/outcome"
     );
     let mut wrong_id = envelope.clone();
     wrong_id.request.request_id = KvRequestId::generate();
@@ -843,7 +1079,7 @@ fn owned_saved_attempts_repeat_custody_after_save_before_fanout_for_both_phases(
         assert!(
             runtime
                 .authority
-                .placement_outcome(&request)
+                .placement_outcome(&request, &coordinator.node_id, &coordinator.guards)
                 .unwrap()
                 .is_none()
         );
@@ -872,7 +1108,7 @@ fn owned_saved_attempts_repeat_custody_after_save_before_fanout_for_both_phases(
             assert!(
                 runtime
                     .authority
-                    .placement_outcome(&request)
+                    .placement_outcome(&request, &coordinator.node_id, &coordinator.guards)
                     .unwrap()
                     .is_none()
             );

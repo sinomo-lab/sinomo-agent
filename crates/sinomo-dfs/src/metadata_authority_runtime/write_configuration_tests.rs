@@ -31,6 +31,7 @@ struct NativeProjectionHost {
     tasks: Mutex<VecDeque<DfsMetadataAuthorityTask>>,
     spawned: AtomicUsize,
     content_gate: PrefixGate,
+    floor_observer: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 fn fixture_entry(key: &str, value: Vec<u8>, revision: u64) -> KvEntry {
@@ -101,6 +102,7 @@ impl NativeProjectionHost {
             tasks: Mutex::new(VecDeque::new()),
             spawned: AtomicUsize::new(0),
             content_gate: PrefixGate::default(),
+            floor_observer: Mutex::new(None),
         });
         if configured {
             host.set_configuration(10);
@@ -219,6 +221,10 @@ impl DfsMetadataAuthorityHost for NativeProjectionHost {
     }
 
     fn write_configuration_floor(&self) -> Result<KvLocalRead<Option<KvEntry>>, DfsError> {
+        let observer = self.floor_observer.lock().unwrap().take();
+        if let Some(observer) = observer {
+            observer();
+        }
         let inputs = self.inputs.lock().unwrap();
         if inputs.floor_unavailable {
             return Err(DfsError::Network {
@@ -1525,4 +1531,452 @@ async fn zero_revision_discontinuity_requires_fresh_native_bootstrap_certificate
     assert_eq!(runtime.storage_generation(), storage_generation);
     assert_eq!(host.queued_count(), 0);
     assert_eq!(host.spawned.load(Ordering::Acquire), 2);
+}
+
+#[tokio::test]
+async fn required_revision_withdraws_configuration_before_queued_refresh_runs() {
+    let host = NativeProjectionHost::new(true);
+    let runtime = attach(&host);
+    runtime.request_authoritative_refresh();
+    host.run_next().await;
+    let before = runtime.write_configuration_projection().unwrap().unwrap();
+    assert_eq!(before.revision, KvRevision(10));
+    let storage_generation = runtime.storage_generation();
+    let reads = host.read_count();
+    let spawned = host.spawned.load(Ordering::Acquire);
+    {
+        let mut inputs = host.inputs.lock().unwrap();
+        inputs.authority.revision = KvRevision(11);
+        inputs.authority.commit_index = 111;
+        inputs.floor.revision = KvRevision(11);
+        inputs.floor.applied_index = 111;
+        let mut content = crate::DfsNodeAdvertisement::content(host.local.clone());
+        content.zone = Some("new-authoritative-zone".into());
+        inputs.scopes[1] = vec![fixture_entry(
+            &crate::content_service_key(&host.local),
+            encode_kv_value(&content).unwrap(),
+            11,
+        )];
+    }
+    // The normal owner is queued but has not yet polled its refresh body. A
+    // synchronous caller must not open on the previous configuration here.
+    runtime.require_authoritative_revision(KvRevision(11));
+    assert_eq!(runtime.state.current_complete_prefix_revision(), None);
+    assert!(matches!(
+        runtime.write_configuration_readiness().unwrap(),
+        crate::DfsWriteConfigurationReadiness::Pending
+    ));
+    assert_eq!(host.read_count(), reads);
+    assert_eq!(host.queued_count(), 1);
+    let mut ready = Box::pin(runtime.ensure_write_configuration_ready_async());
+    require_pending(ready.as_mut()).await;
+    assert_eq!(host.spawned.load(Ordering::Acquire), spawned + 1);
+    host.run_next().await;
+    tokio::time::timeout(std::time::Duration::from_secs(1), ready)
+        .await
+        .unwrap()
+        .unwrap();
+    let current = runtime.write_configuration_projection().unwrap().unwrap();
+    assert_eq!(current.revision, KvRevision(11));
+    assert_eq!(
+        runtime.state.current_complete_prefix_revision(),
+        Some(KvRevision(11))
+    );
+    assert_eq!(
+        current.content_advertisements().unwrap()[0].zone.as_deref(),
+        Some("new-authoritative-zone")
+    );
+    assert_eq!(host.read_count(), reads + 3);
+    assert_eq!(host.queued_count(), 0);
+    assert_eq!(runtime.storage_generation(), storage_generation);
+}
+
+#[tokio::test]
+async fn native_host_preflight_joins_configuration_after_first_prefix_is_published() {
+    let host = NativeProjectionHost::new(true);
+    let runtime = attach(&host);
+    host.content_gate.armed.store(true, Ordering::Release);
+    runtime.request_authoritative_refresh();
+    let refresh = tokio::spawn(host.take_task().unwrap());
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        host.content_gate.entered.notified(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        runtime.state.current_complete_prefix_revision(),
+        Some(KvRevision(10))
+    );
+    assert!(matches!(
+        runtime.write_configuration_readiness().unwrap(),
+        crate::DfsWriteConfigurationReadiness::Pending
+    ));
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+    let mut preflight = Box::pin(
+        crate::runtime_host::warm_daemon_dfs_metadata_authority_before_deadline(
+            Arc::clone(&runtime),
+            deadline,
+            None,
+        ),
+    );
+    require_pending(preflight.as_mut()).await;
+    assert_eq!(host.spawned.load(Ordering::Acquire), 1);
+    host.content_gate.release.notify_one();
+    refresh.await.unwrap();
+    let _admitted = tokio::time::timeout_at(deadline, preflight)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        runtime.state.current_complete_prefix_revision(),
+        Some(KvRevision(10))
+    );
+    assert!(matches!(
+        runtime.write_configuration_readiness().unwrap(),
+        crate::DfsWriteConfigurationReadiness::Ready(Some(_))
+    ));
+    assert_eq!(host.read_count(), 3);
+    assert_eq!(host.queued_count(), 0);
+}
+
+#[tokio::test]
+async fn admission_fence_rejects_partial_configuration_after_same_generation_refresh() {
+    let host = NativeProjectionHost::new(true);
+    let runtime = attach(&host);
+    runtime.request_authoritative_refresh();
+    host.run_next().await;
+    let generation = runtime.generation();
+    assert!(crate::runtime_host::test_retained_authority_admission_is_ready(&runtime, generation));
+    {
+        let mut inputs = host.inputs.lock().unwrap();
+        inputs.authority.revision = KvRevision(11);
+        inputs.authority.commit_index = 111;
+        inputs.floor.revision = KvRevision(11);
+        inputs.floor.applied_index = 111;
+    }
+    host.content_gate.armed.store(true, Ordering::Release);
+    runtime.require_authoritative_revision(KvRevision(11));
+    let refresh = tokio::spawn(host.take_task().unwrap());
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        host.content_gate.entered.notified(),
+    )
+    .await
+    .unwrap();
+    let paused_generation = runtime.generation();
+    let prefix = runtime.state.current_complete_prefix_revision();
+    let pending = matches!(
+        runtime.write_configuration_readiness().unwrap(),
+        crate::DfsWriteConfigurationReadiness::Pending
+    );
+    let admitted =
+        crate::runtime_host::test_retained_authority_admission_is_ready(&runtime, generation);
+    // Drain the original shared owner before any diagnostic assertion fails.
+    host.content_gate.release.notify_one();
+    refresh.await.unwrap();
+    assert_eq!(paused_generation, generation);
+    assert_eq!(prefix, Some(KvRevision(11)));
+    assert!(pending);
+    assert!(
+        !admitted,
+        "metadata-prefix readiness alone must not admit execution while the shared configuration is incomplete"
+    );
+    assert!(
+        crate::runtime_host::test_retained_authority_admission_is_ready(
+            &runtime,
+            runtime.generation()
+        )
+    );
+    assert_eq!(host.read_count(), 6);
+    assert_eq!(host.queued_count(), 0);
+}
+
+#[tokio::test]
+async fn configuration_published_between_pending_read_and_waiter_check_is_revalidated() {
+    let host = NativeProjectionHost::new(true);
+    let runtime = attach(&host);
+    runtime.request_authoritative_refresh();
+    host.run_next().await;
+    let original = runtime.write_configuration_projection().unwrap().unwrap();
+    let generation = runtime.generation();
+    let reads = host.read_count();
+    let publications = host.spawned.load(Ordering::Acquire);
+    // Retain the actual three-prefix native publication. Deliver it at the
+    // precise read/check boundary, as the existing refresh owner can do.
+    let published = Mutex::new(Some(std::mem::take(
+        &mut *runtime.write_configuration.lock().unwrap(),
+    )));
+    let publish = || {
+        if let Some(configuration) = published.lock().unwrap().take() {
+            *runtime.write_configuration.lock().unwrap() = configuration;
+        }
+    };
+    let result = runtime
+        .ensure_write_configuration_ready_with_pending_observer(Some(&publish))
+        .await;
+    assert!(published.lock().unwrap().is_none());
+    assert_eq!(host.read_count(), reads);
+    assert_eq!(host.spawned.load(Ordering::Acquire), publications);
+    assert_eq!(runtime.generation(), generation);
+    assert!(Arc::ptr_eq(
+        &original,
+        &runtime.write_configuration_projection().unwrap().unwrap()
+    ));
+    result.expect(
+        "a concurrently completed native publication must replace the earlier pending observation",
+    );
+}
+
+#[tokio::test]
+async fn retained_control_client_joins_configuration_after_early_filesystem_prefix() {
+    let host = NativeProjectionHost::new(true);
+    let runtime = attach(&host);
+    host.content_gate.armed.store(true, Ordering::Release);
+    runtime.request_authoritative_refresh();
+    let refresh = tokio::spawn(host.take_task().unwrap());
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        host.content_gate.entered.notified(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        runtime.state.current_complete_prefix_revision(),
+        Some(KvRevision(10))
+    );
+    assert!(matches!(
+        runtime.write_configuration_readiness().unwrap(),
+        crate::DfsWriteConfigurationReadiness::Pending
+    ));
+    let directory = sinomo_testdir::TestDir::new("retained-client-configuration-boundary");
+    let paths = sinomo_core::network::ClusterPaths::new(&sinomo_core::local::SinomoDataDir::new(
+        directory.path(),
+    ));
+    let mut synchronization = Box::pin(
+        crate::runtime_host::test_retained_client_configuration_sync(Arc::clone(&runtime), &paths),
+    );
+    let first_poll = std::future::poll_fn(|context| {
+        std::task::Poll::Ready(synchronization.as_mut().poll(context))
+    })
+    .await;
+    // Drain the original native-proof owner before asserting the boundary.
+    host.content_gate.release.notify_one();
+    refresh.await.unwrap();
+    assert!(
+        first_poll.is_pending(),
+        "a required configuration client cannot return after only the filesystem prefix: {first_poll:?}"
+    );
+    synchronization.await.unwrap();
+    crate::runtime_host::test_retained_client_configuration_sync(Arc::clone(&runtime), &paths)
+        .await
+        .unwrap();
+    host.inputs.lock().unwrap().floor_unavailable = true;
+    assert!(
+        crate::runtime_host::test_retained_client_configuration_sync(Arc::clone(&runtime), &paths)
+            .await
+            .is_err(),
+        "an unavailable native floor remains terminal on a warm client"
+    );
+    assert_eq!(host.read_count(), 3);
+    assert_eq!(host.spawned.load(Ordering::Acquire), 1);
+    assert_eq!(host.queued_count(), 0);
+}
+
+#[tokio::test]
+async fn queued_refresh_preserves_configuration_completed_by_committed_delta() {
+    let host = NativeProjectionHost::new(true);
+    let runtime = attach(&host);
+    let inputs = host.inputs.lock().unwrap().clone();
+    let mut reads: [KvAuthoritativeRead<Vec<KvEntry>>; 3] =
+        std::array::from_fn(|scope| KvAuthoritativeRead {
+            value: inputs.scopes[scope].clone(),
+            authority: inputs.authority,
+        });
+    for read in &mut reads[1..] {
+        read.authority.revision = KvRevision(11);
+        read.authority.commit_index = 111;
+    }
+    let mut floor = inputs.floor;
+    floor.revision = KvRevision(11);
+    floor.applied_index = 111;
+    host.inputs.lock().unwrap().floor = floor.clone();
+    assert!(
+        runtime.install_authoritative_projection(
+            DfsAuthoritativePrefixProjection::complete(
+                DFS_METADATA_AUTHORITY_PREFIX,
+                reads[0].value.clone(),
+                KvRevision(10)
+            )
+            .unwrap()
+        )
+    );
+    {
+        let mut configuration = runtime.write_configuration.lock().unwrap();
+        let token = configuration.begin_refresh();
+        assert!(
+            !configuration
+                .install_bootstrap(token, reads, floor)
+                .unwrap()
+        );
+    }
+    // Queue the real singleflight while the complete native bundle still
+    // awaits its filesystem delta. Do not poll this owner until that delta
+    // has actually published the already-validated bundle.
+    runtime.require_authoritative_revision(KvRevision(11));
+    assert_eq!(host.queued_count(), 1);
+    let mut entry = inputs.scopes[0][0].clone();
+    entry.modify_revision = KvRevision(11);
+    entry.version = KvVersion(2);
+    {
+        let mut current = host.inputs.lock().unwrap();
+        current.authority.revision = KvRevision(11);
+        current.authority.commit_index = 111;
+        current.scopes[0][0] = entry.clone();
+    }
+    let observation = runtime.observe_delta_observation(&ClusterKvCommittedDelta {
+        revision: KvRevision(11),
+        compacted_revision: KvRevision::ZERO,
+        events: vec![KvEvent {
+            revision: KvRevision(11),
+            key: entry.key.clone(),
+            kind: KvEventKind::Put {
+                value: entry.value.clone(),
+            },
+        }]
+        .into(),
+        final_key_states: vec![ClusterKvCommittedKeyState {
+            key: entry.key.clone(),
+            entry: Some(entry),
+        }]
+        .into(),
+    });
+    assert!(
+        !observation.accepted,
+        "the withdrawn standalone prefix requires the full bundle rebind"
+    );
+    assert_eq!(
+        runtime.state.current_complete_prefix_revision(),
+        Some(KvRevision(11))
+    );
+    let ready = runtime.write_configuration_projection().unwrap().unwrap();
+    let generation = runtime.generation();
+    let storage_generation = runtime.storage_generation();
+    let reads_before = host.read_count();
+    host.content_gate.armed.store(true, Ordering::Release);
+    let mut refresh = host.take_task().unwrap();
+    let first_poll =
+        std::future::poll_fn(|context| std::task::Poll::Ready(refresh.as_mut().poll(context)))
+            .await;
+    let remained_ready = matches!(
+        runtime.write_configuration_readiness().unwrap(),
+        crate::DfsWriteConfigurationReadiness::Ready(Some(_))
+    );
+    // Drain a regressing implementation before failing its assertion.
+    if first_poll.is_pending() {
+        host.content_gate.release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(1), refresh)
+            .await
+            .unwrap();
+    }
+    assert!(
+        remained_ready,
+        "a delayed refresh owner must not withdraw the configuration already completed by its committed delta"
+    );
+    assert!(first_poll.is_ready());
+    assert!(Arc::ptr_eq(
+        &ready,
+        &runtime.write_configuration_projection().unwrap().unwrap()
+    ));
+    assert_eq!(host.read_count(), reads_before);
+    assert_eq!(runtime.generation(), generation);
+    assert_eq!(runtime.storage_generation(), storage_generation);
+    assert_eq!(host.spawned.load(Ordering::Acquire), 1);
+    assert_eq!(host.queued_count(), 0);
+}
+
+#[tokio::test]
+async fn retained_control_client_revalidates_a_ready_generation_changed_during_floor_read() {
+    let host = NativeProjectionHost::new(true);
+    let runtime = attach(&host);
+    runtime.request_authoritative_refresh();
+    host.run_next().await;
+    assert_eq!(
+        runtime
+            .write_configuration_projection()
+            .unwrap()
+            .unwrap()
+            .revision(),
+        KvRevision(10)
+    );
+    let generation = runtime.generation();
+    let weak_host = Arc::downgrade(&host);
+    let weak_runtime = Arc::downgrade(&runtime);
+    *host.floor_observer.lock().unwrap() = Some(Box::new(move || {
+        let host = weak_host.upgrade().unwrap();
+        let runtime = weak_runtime.upgrade().unwrap();
+        let mut advertisement = crate::DfsNodeAdvertisement::content(host.local.clone());
+        advertisement.zone = Some("updated-during-floor-read".into());
+        let entry = fixture_entry(
+            &crate::content_service_key(&host.local),
+            encode_kv_value(&advertisement).unwrap(),
+            11,
+        );
+        {
+            let mut inputs = host.inputs.lock().unwrap();
+            inputs.authority.revision = KvRevision(11);
+            inputs.authority.commit_index = 111;
+            inputs.floor.revision = KvRevision(11);
+            inputs.floor.applied_index = 111;
+            inputs.scopes[1] = vec![entry.clone()];
+        }
+        runtime.observe_delta(&ClusterKvCommittedDelta {
+            revision: KvRevision(11),
+            compacted_revision: KvRevision::ZERO,
+            events: vec![KvEvent {
+                revision: KvRevision(11),
+                key: entry.key.clone(),
+                kind: KvEventKind::Put {
+                    value: entry.value.clone(),
+                },
+            }]
+            .into(),
+            final_key_states: vec![ClusterKvCommittedKeyState {
+                key: entry.key.clone(),
+                entry: Some(entry),
+            }]
+            .into(),
+        });
+        assert!(runtime.generation() > generation);
+    }));
+    let directory = sinomo_testdir::TestDir::new("retained-client-ready-generation-change");
+    let paths = sinomo_core::network::ClusterPaths::new(&sinomo_core::local::SinomoDataDir::new(
+        directory.path(),
+    ));
+    let view = crate::runtime_host::test_retained_client_configuration_projection(
+        Arc::clone(&runtime),
+        &paths,
+    )
+    .expect(
+        "a complete changed generation must be revalidated within the existing local replan bound",
+    )
+    .unwrap();
+    assert_eq!(view.revision(), KvRevision(11));
+    let entry = &view.entries(DFS_WRITE_CONFIGURATION_PREFIXES[1]).unwrap()[0];
+    let advertisement: crate::DfsNodeAdvertisement = entry.decode().unwrap();
+    assert_eq!(
+        advertisement.zone.as_deref(),
+        Some("updated-during-floor-read")
+    );
+    assert_eq!(
+        host.read_count(),
+        3,
+        "revalidation uses the already-owned complete bundle"
+    );
+    assert_eq!(host.queued_count(), 0);
+    host.inputs.lock().unwrap().floor_unavailable = true;
+    assert!(
+        crate::runtime_host::test_retained_client_configuration_projection(runtime, &paths)
+            .is_err()
+    );
 }

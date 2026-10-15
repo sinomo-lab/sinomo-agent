@@ -1298,7 +1298,7 @@ mod tests {
             runtime.define_node(node.clone()).unwrap();
         }
         runtime.start_nodes().unwrap();
-        let mut writer = runtime.client(&nodes[0]).unwrap();
+        let mut writer = runtime.metadata_primary_service("/").unwrap();
         let path = "/operator-staging.bin";
         let original = writer
             .posix_write_file(
@@ -1321,6 +1321,10 @@ mod tests {
         policy.required_node_ids = vec![nodes[0].clone(), nodes[2].clone()];
         file_system.subtree_policies.push(policy);
         writer.add_file_system(file_system).unwrap();
+        drop(writer);
+        let mut writer = runtime.metadata_primary_service("/").unwrap();
+        let mut pending_policy = DfsReplicationPolicy::new(2, 2).unwrap();
+        pending_policy.required_node_ids = vec![nodes[0].clone(), nodes[2].clone()];
         runtime.install_fault(DfsTestFaultRule {
             source: None,
             target: Some(nodes[2].clone()),
@@ -1340,7 +1344,7 @@ mod tests {
                 },
                 b"pending actual W2 bytes".to_vec(),
                 vec![nodes[0].clone(), nodes[2].clone()],
-                DfsReplicationPolicy::new(2, 2).unwrap(),
+                pending_policy,
             )
             .unwrap();
         let crate::NetworkedDfsWriteOutcome::Pending {
@@ -1531,7 +1535,36 @@ mod tests {
             OffsetDateTime::now_utc(),
         )
         .unwrap();
+        // The custom corpus is authored by the actual Root Core. Keep the
+        // original all-shard reader count and inspect through a fresh Main
+        // browser after publication, rather than using it as a producer.
+        drop(writer);
+        let mut writer = runtime.metadata_primary_service(path).unwrap();
         crate::test_support::publish_current_payload(&mut writer, payload).unwrap();
+        // The kernel helper has committed the 1,024-row setup corpus, while
+        // replicas may still hold only its hidden prepare. Complete that setup
+        // through the normal directory durability barrier before creating the
+        // independent pending-repair object inspected below.
+        let corpus_head = writer
+            .metadata_backend()
+            .unwrap()
+            .journal_last_sequence()
+            .unwrap();
+        let corpus = writer.posix_sync_directory("/").unwrap();
+        assert_eq!(
+            corpus.metadata_certificate.target.journal_sequence,
+            corpus_head
+        );
+        assert_eq!(
+            corpus
+                .metadata_certificate
+                .acknowledged_node_ids
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            nodes.iter().cloned().collect(),
+            "every configured member must acknowledge the exact complete corpus"
+        );
         let stat = writer
             .posix_write_file(
                 path,
@@ -1544,7 +1577,9 @@ mod tests {
                 },
             )
             .unwrap();
-        let backend = writer.metadata_backend().unwrap();
+        drop(writer);
+        let reader = runtime.client(&nodes[0]).unwrap();
+        let backend = reader.metadata_backend().unwrap();
         let inspector = DfsOperatorInspector::new(backend);
         let all = inspector
             .repairs(Some(&stat.file_system_id), Some(&stat.object_id))
@@ -1594,7 +1629,7 @@ mod tests {
                 .state,
             DfsAgentObjectState::PendingRepair
         );
-        drop(writer);
+        drop(reader);
         runtime.close().unwrap();
     }
 
@@ -1790,7 +1825,7 @@ mod tests {
             runtime.define_node(node.clone()).unwrap();
         }
         runtime.start_nodes().unwrap();
-        let mut writer = runtime.client(&nodes[0]).unwrap();
+        let mut writer = runtime.metadata_primary_service("/").unwrap();
         let fs_id = runtime.file_system().file_system_id;
         let baseline = writer
             .metadata_backend()
@@ -1815,8 +1850,12 @@ mod tests {
             file_system.subtree_policies.push(policy);
         }
         writer.add_file_system(file_system).unwrap();
+        drop(writer);
+        let mut writer = runtime.metadata_primary_service("/").unwrap();
+        let mut pending_policy = DfsReplicationPolicy::new(2, 2).unwrap();
+        pending_policy.required_node_ids = vec![nodes[0].clone(), nodes[2].clone()];
         let options = crate::DfsWriteOptions {
-            policy: DfsReplicationPolicy::new(2, 2).unwrap(),
+            policy: pending_policy.clone(),
             replica_candidates: nodes.clone(),
             wait_for_commit: true,
             foreground_replica_repair: true,
@@ -1836,12 +1875,14 @@ mod tests {
             remaining_hits: 32,
             action: DfsTestFaultAction::BudgetExhausted,
         });
+        let mut alpha_policy = DfsReplicationPolicy::new(1, 2).unwrap();
+        alpha_policy.required_node_ids = vec![nodes[0].clone(), nodes[2].clone()];
         let alpha = writer
             .posix_write_file(
                 "/operator-alpha.bin",
                 b"new alpha",
                 crate::DfsWriteOptions {
-                    policy: DfsReplicationPolicy::new(1, 2).unwrap(),
+                    policy: alpha_policy,
                     replica_candidates: nodes.clone(),
                     wait_for_commit: true,
                     foreground_replica_repair: false,
@@ -1860,7 +1901,7 @@ mod tests {
                 },
                 b"pending beta".to_vec(),
                 vec![nodes[0].clone(), nodes[2].clone()],
-                DfsReplicationPolicy::new(2, 2).unwrap(),
+                pending_policy,
             )
             .unwrap();
         let crate::NetworkedDfsWriteOutcome::Pending {

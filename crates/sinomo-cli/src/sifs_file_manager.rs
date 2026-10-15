@@ -1637,6 +1637,72 @@ impl SifsFileManagerBackend {
         )
     }
 
+    /// Capture the ordinary managed write options before an interruption.
+    /// The retained DATA never substitutes for current Main publication guards.
+    pub(crate) fn ordinary_write_options_until(
+        &self,
+        path: &str,
+        deadline: Instant,
+    ) -> Result<DfsWriteOptions, String> {
+        let path = normalize_sifs_path(path)?;
+        let mut service = self.lock_service_for_mutation(Some(deadline))?;
+        self.refresh_service_peer_targets_with_deadline(&mut service, Some(deadline));
+        sifs_operation_remaining(Some(deadline), "capturing ordinary write options")?;
+        sifs_write_options(&mut service, &path, &self.replica_candidates)
+    }
+
+    /// Keep the typed result and caller-owned ID on the existing normal Main
+    /// route. Setup failures remain separate from the actual write result.
+    pub(crate) fn write_file_with_original_operation_until(
+        &self,
+        path: &str,
+        bytes: &[u8],
+        operation_id: &str,
+        options: DfsWriteOptions,
+        deadline: Instant,
+    ) -> Result<Result<DfsStat, sinomo_runtime::dfs::DfsPosixError>, String> {
+        let path = normalize_sifs_path(path)?;
+        sifs_operation_remaining(Some(deadline), "stable ordinary write")?;
+        let mut service = self.lock_service_for_mutation(Some(deadline))?;
+        self.refresh_service_peer_targets_with_deadline(&mut service, Some(deadline));
+        let previous = service.set_transport_operation_deadline(Some(deadline));
+        let result =
+            service.posix_write_file_with_operation_id(&path, bytes, options, operation_id);
+        service.set_transport_operation_deadline(previous);
+        Ok(result)
+    }
+
+    pub(crate) fn reconcile_original_write_until(
+        &self,
+        path: &str,
+        object_id: &sinomo_runtime::dfs::DfsObjectId,
+        operation_id: &str,
+        content_hash: &str,
+        size: u64,
+        deadline: Instant,
+    ) -> Result<
+        Result<
+            sinomo_runtime::dfs::DfsStableWriteOperationReconciliation,
+            sinomo_runtime::dfs::DfsError,
+        >,
+        String,
+    > {
+        let path = normalize_sifs_path(path)?;
+        sifs_operation_remaining(Some(deadline), "reconciling original write")?;
+        let mut service = self.lock_service_for_mutation(Some(deadline))?;
+        self.refresh_service_peer_targets_with_deadline(&mut service, Some(deadline));
+        let previous = service.set_transport_operation_deadline(Some(deadline));
+        let result = service.reconcile_stable_write_operation(
+            &path,
+            object_id,
+            operation_id,
+            content_hash,
+            size,
+        );
+        service.set_transport_operation_deadline(previous);
+        Ok(result)
+    }
+
     pub(crate) fn write_file_wait_for_commit_with_deadline(
         &self,
         path: &str,

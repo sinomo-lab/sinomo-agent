@@ -599,8 +599,11 @@ fn sifs_posix_write_at_replicates_large_extent_patch_in_chunks_without_full_blob
 
 #[test]
 fn sifs_posix_write_at_retries_lost_patch_stage_as_patch() {
-    let (mut runtime, owner, replica, mut owner_dfs, replica_dfs) =
+    let (mut runtime, owner, replica, owner_browser, replica_dfs) =
         native_patch_services("sifs_posix_write_at_retries_lost_patch_stage_as_patch");
+    drop(owner_browser);
+    // Inspect and retry the same real Core that owns this pending patch.
+    let mut owner_dfs = runtime.metadata_primary_service("/services").unwrap();
     let path = "/services/retry-write-at-patch.bin";
 
     let mut initial = vec![0_u8; 256 * 1024 + 31];
@@ -653,6 +656,14 @@ fn sifs_posix_write_at_retries_lost_patch_stage_as_patch() {
         "the actual first stage must attempt a patch RPC"
     );
     for _ in 0..16 {
+        // The pending patch belongs to this actual Core producer. Advance its
+        // normal retry state before Main publishes the resulting durable work.
+        owner_dfs
+            .retry_pending_repairs()
+            .expect("actual producer patch retry");
+        owner_dfs
+            .process_incoming()
+            .expect("actual producer patch completion");
         runtime
             .maintenance_tick(&owner, Duration::from_secs(5))
             .expect("normal pending-patch repair pass");
@@ -672,8 +683,11 @@ fn sifs_posix_write_at_retries_lost_patch_stage_as_patch() {
 
 #[test]
 fn sifs_posix_write_at_retries_lost_patch_attachment() {
-    let (mut runtime, owner, replica, mut owner_dfs, replica_dfs) =
+    let (mut runtime, owner, replica, owner_browser, replica_dfs) =
         native_patch_services("sifs_posix_write_at_retries_lost_patch_attachment");
+    drop(owner_browser);
+    // Inspect and retry the same real Core that owns this pending patch.
+    let mut owner_dfs = runtime.metadata_primary_service("/services").unwrap();
     let path = "/services/retry-write-at-patch.bin";
 
     let mut initial = vec![0_u8; 512 * 1024 + 11];
@@ -785,6 +799,14 @@ fn sifs_posix_write_at_retries_lost_patch_attachment() {
         "the actual first stage must attempt a patch RPC"
     );
     for _ in 0..16 {
+        // The pending patch belongs to this actual Core producer. Advance its
+        // normal retry state before Main publishes the resulting durable work.
+        owner_dfs
+            .retry_pending_repairs()
+            .expect("actual producer patch retry");
+        owner_dfs
+            .process_incoming()
+            .expect("actual producer patch completion");
         runtime
             .maintenance_tick(&owner, Duration::from_secs(5))
             .expect("normal pending-patch repair pass");
@@ -923,7 +945,10 @@ fn sifs_cluster_posix_contract_concurrent_write_at_truncate_races() {
             .posix_stat(path)
             .is_ok_and(|stat| stat.size_bytes == Some(12))
     });
-    let extended = cluster.writer.posix_read_file(path).expect("extended read");
+    let extended = cluster
+        .writer
+        .posix_read_file_distributed(path)
+        .expect("extended read");
     assert_eq!(
         &extended[final_bytes.len().min(12)..],
         vec![0; 12usize.saturating_sub(final_bytes.len())].as_slice(),
@@ -960,21 +985,27 @@ fn sifs_cluster_posix_write_at_beyond_eof_reads_back_zero_filled_hole() {
     sifs_posix_cluster_pump_until(&mut cluster, "write_at hole commit", |cluster| {
         cluster
             .writer
-            .posix_stat(path)
+            .posix_stat_distributed(path)
             .is_ok_and(|stat| stat.content_hash.as_deref() == Some(expected_hash.as_str()))
     });
 
     // POSIX hole semantics: bytes between the old EOF and the write offset
     // must read back as zeros.
-    let read = cluster.writer.posix_read_file(path).expect("writer read");
+    let read = cluster
+        .writer
+        .posix_read_file_distributed(path)
+        .expect("writer read");
     assert_eq!(read, expected);
-    let stat = cluster.writer.posix_stat(path).expect("writer stat");
+    let stat = cluster
+        .writer
+        .posix_stat_distributed(path)
+        .expect("writer stat");
     assert_eq!(stat.size_bytes, Some(expected.len() as u64));
 
     // Range reads observe the same bytes (hole inclusive).
     let range = cluster
         .writer
-        .posix_read_file_range(path, base.len() as u64, expected.len())
+        .posix_read_file_range_distributed(path, base.len() as u64, expected.len())
         .expect("writer range read");
     assert_eq!(range, expected[base.len()..].to_vec());
 
@@ -989,6 +1020,21 @@ fn sifs_cluster_posix_write_at_beyond_eof_reads_back_zero_filled_hole() {
 fn sifs_cluster_routed_posix_write_at_from_reader_streams_fallback_overlay() {
     let mut cluster = sifs_posix_cluster("sifs-cluster-routed-reader-overlay", "/users");
     let path = "/users/routed-reader-overlay.bin";
+    // The final assertion reads locally on the writer. Make its intended
+    // one-copy placement explicit for both the base and streamed replacement.
+    let mut placement = DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 1).unwrap();
+    placement.required_node_ids = vec![cluster.writer_node.clone()];
+    let accepted = cluster
+        ._runtime
+        .apply_placement_policy(
+            &cluster.primary_node,
+            path,
+            DfsPlacementScope::Subtree,
+            placement,
+        )
+        .unwrap();
+    super::writes::finish_native_placement_fixture_apply(&cluster._runtime, &accepted);
+
     let base = (0..256 * 1024 + 17)
         .map(|index| (index % 251) as u8)
         .collect::<Vec<_>>();
@@ -1060,6 +1106,16 @@ fn sifs_cluster_routed_posix_write_at_from_reader_streams_fallback_overlay() {
                 .posix_stat(path)
                 .is_ok_and(|stat| stat.content_hash.as_deref() == Some(expected_hash.as_str()))
     });
+
+    assert_eq!(
+        cluster
+            .writer
+            .posix_stat_distributed(path)
+            .unwrap()
+            .current_locations,
+        vec![cluster.writer_node.clone()],
+        "the streamed overlay has a committed writer copy"
+    );
 
     assert!(
         bulk_reads.load(Ordering::SeqCst) > 2,

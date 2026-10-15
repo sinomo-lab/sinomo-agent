@@ -14,8 +14,9 @@ pub(crate) use sinomo_runtime::dfs::cli::default_dfs_file_system_id;
 #[cfg(test)]
 pub(crate) use sinomo_runtime::dfs::cli::default_nfs_mount_bind;
 pub(crate) use sinomo_runtime::dfs::cli::{
-    DfsCommonOptions, DfsHostMountOptions, DfsMetadataShardTransferPrimaryOptions, DfsMountOptions,
-    DfsNfsCliCommand, DfsNfsMountCliOptions, DfsNfsServerCliOptions, DfsPinCliCommand,
+    DfsCommonOptions, DfsHostMountOptions, DfsMetadataShardSetReplicasOptions,
+    DfsMetadataShardTransferPrimaryOptions, DfsMountOptions, DfsNfsCliCommand,
+    DfsNfsMountCliOptions, DfsNfsServerCliOptions, DfsPinCliCommand,
     DfsPlacementAuthorityCliCommand, DfsPlacementAuthorityRecovery,
 };
 
@@ -112,6 +113,19 @@ struct DfsMetadataShardTransferPrimaryReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pending_handoff: Option<sinomo_runtime::dfs::DfsMetadataShardMembershipHandoff>,
     /// Current assignment. A pending handoff's desired assignment is not active.
+    shard: DfsMetadataShardConfig,
+}
+
+#[derive(Debug, Serialize)]
+struct DfsMetadataShardSetReplicasReport {
+    file_system_id: DfsFileSystemId,
+    shard_id: String,
+    previous_epoch: u64,
+    new_epoch: u64,
+    changed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pending_handoff: Option<sinomo_runtime::dfs::DfsMetadataShardMembershipHandoff>,
+    /// Current active assignment; the desired assignment requires native activation.
     shard: DfsMetadataShardConfig,
 }
 
@@ -541,6 +555,9 @@ pub(crate) fn run_dfs_cli_command(command: DfsCliCommand) -> Result<(), CliError
             }
             Ok(())
         }
+        DfsCliCommand::MetadataShardSetReplicas(options) => {
+            run_dfs_metadata_shard_set_replicas(options)
+        }
         DfsCliCommand::MetadataShardTransferPrimary(options) => {
             run_dfs_metadata_shard_transfer_primary(options)
         }
@@ -732,6 +749,129 @@ fn dfs_placement_authority_refusal_label(
             "the identified removed-node permit must use normal recovery".to_string()
         }
     }
+}
+
+fn run_dfs_metadata_shard_set_replicas(
+    options: DfsMetadataShardSetReplicasOptions,
+) -> Result<(), CliError> {
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    data_dir.ensure_root_layout()?;
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    default_main_daemon_status()?.ok_or_else(|| CliError::DaemonNotRunning {
+        detail: "DFS metadata replica assignment requires the local main daemon".into(),
+    })?;
+    let mut kv = SifsControlPlaneKvClient::new(&data_dir, &cluster_paths);
+    sinomo_runtime::dfs::DfsControlPlaneKvClient::refresh_latest(&mut kv)?;
+    let report = request_metadata_shard_replica_assignment(
+        &mut sinomo_runtime::dfs::DfsControlPlaneStore::new(&mut kv),
+        &options,
+    )?;
+    if options.json {
+        print_json("<dfs-metadata-shard-set-replicas>", &report)?;
+    } else if let Some(handoff) = &report.pending_handoff {
+        println!(
+            "DFS metadata replica assignment requested: {} shard={} epoch {} -> {} handoff={} (activation pending)",
+            report.file_system_id,
+            report.shard_id,
+            report.previous_epoch,
+            report.new_epoch,
+            handoff.handoff_id,
+        );
+    } else {
+        println!(
+            "DFS metadata replicas unchanged: {} shard={} epoch={}",
+            report.file_system_id, report.shard_id, report.new_epoch
+        );
+    }
+    Ok(())
+}
+
+fn request_metadata_shard_replica_assignment(
+    store: &mut sinomo_runtime::dfs::DfsControlPlaneStore<'_>,
+    options: &DfsMetadataShardSetReplicasOptions,
+) -> Result<DfsMetadataShardSetReplicasReport, CliError> {
+    let previous = store
+        .get_metadata_shard(&options.file_system_id, &options.shard_id)?
+        .ok_or_else(|| CliError::Parse {
+            detail: format!(
+                "DFS metadata shard {}/{} was not found",
+                options.file_system_id, options.shard_id
+            ),
+        })?;
+    if previous.epoch != options.expected_epoch {
+        return Err(CliError::ClusterReadOnly {
+            detail: format!(
+                "DFS metadata shard {} epoch is {}, expected {}",
+                options.shard_id, previous.epoch, options.expected_epoch
+            ),
+        });
+    }
+    let replicas = options
+        .replica_node_ids
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    if replicas.is_empty()
+        || replicas.len() != options.replica_node_ids.len()
+        || replicas.contains(&previous.primary_node_id)
+    {
+        return Err(CliError::Parse {
+            detail: "metadata replicas must be a nonempty unique set excluding the current primary"
+                .into(),
+        });
+    }
+    let mut desired = previous.clone();
+    let unchanged = replicas == previous.replica_node_ids.iter().cloned().collect();
+    if !unchanged {
+        desired.replica_node_ids = replicas.into_iter().collect();
+        desired.epoch = previous
+            .epoch
+            .checked_add(1)
+            .ok_or_else(|| CliError::Parse {
+                detail: "metadata shard authority epoch is exhausted".into(),
+            })?;
+    }
+    let (handoff, changed) = if let Some(handoff) =
+        store.get_metadata_shard_membership_handoff(&options.file_system_id, &options.shard_id)?
+    {
+        if handoff.retiring_shard != previous
+            || handoff.desired_shard != desired
+            || handoff.cause != sinomo_runtime::dfs::DfsMetadataShardHandoffCause::Membership
+        {
+            return Err(CliError::ClusterReadOnly {
+                detail: format!(
+                    "DFS metadata shard {} has a different pending handoff {}",
+                    options.shard_id, handoff.handoff_id
+                ),
+            });
+        }
+        (Some(handoff), false)
+    } else if unchanged {
+        (None, false)
+    } else {
+        // Existing admission compares bind every requested member's current
+        // authorized identity and prepared-operation capability policy in the CAS.
+        let handoff = store
+            .begin_metadata_shard_membership_handoff(&previous, &desired)?
+            .ok_or_else(|| CliError::ClusterReadOnly {
+                detail: format!(
+                    "DFS metadata shard {} changed while requesting its replica assignment",
+                    options.shard_id
+                ),
+            })?;
+        (Some(handoff), true)
+    };
+    Ok(DfsMetadataShardSetReplicasReport {
+        file_system_id: previous.file_system_id.clone(),
+        shard_id: previous.shard_id.clone(),
+        previous_epoch: previous.epoch,
+        new_epoch: handoff
+            .as_ref()
+            .map_or(previous.epoch, |h| h.desired_shard.epoch),
+        changed,
+        pending_handoff: handoff,
+        shard: previous,
+    })
 }
 
 fn run_dfs_metadata_shard_transfer_primary(
@@ -3512,5 +3652,168 @@ pub(crate) fn join_labels<T: ToString>(values: &[T]) -> String {
             .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join(",")
+    }
+}
+
+#[cfg(test)]
+mod metadata_replica_assignment_tests {
+    use super::*;
+
+    #[test]
+    fn metadata_replica_assignment_expands_native_members_before_primary_transfer() {
+        use sinomo_runtime::dfs::test_support::DfsTestRuntime;
+        use sinomo_runtime::dfs::{DfsControlPlaneStore, DfsMetadataShardHandoffCause};
+        let (runtime, nodes) =
+            DfsTestRuntime::start_cluster("cli-native-replica-expansion", 3).unwrap();
+        let fs = runtime.file_system().file_system_id;
+        let initial = runtime
+            .metadata_shards()
+            .unwrap()
+            .into_iter()
+            .find(|shard| shard.shard_id == "root")
+            .unwrap();
+        let retained_replica = initial.replica_node_ids[0].clone();
+        let retiring = runtime
+            .reassign_metadata_shard(
+                &fs,
+                "root",
+                initial.primary_node_id.clone(),
+                vec![retained_replica],
+            )
+            .unwrap();
+        let replicas = nodes
+            .iter()
+            .filter(|node| **node != retiring.primary_node_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut control = runtime.control_plane_client().unwrap();
+        let mut store = DfsControlPlaneStore::new(control.as_mut());
+        let options = DfsMetadataShardSetReplicasOptions {
+            file_system_id: fs.clone(),
+            shard_id: "root".into(),
+            replica_node_ids: replicas.clone(),
+            expected_epoch: retiring.epoch,
+            json: true,
+        };
+        let mut primary_in_replicas = options.clone();
+        primary_in_replicas
+            .replica_node_ids
+            .push(retiring.primary_node_id.clone());
+        assert!(matches!(
+            request_metadata_shard_replica_assignment(&mut store, &primary_in_replicas),
+            Err(CliError::Parse { .. })
+        ));
+        let mut stale = options.clone();
+        stale.expected_epoch -= 1;
+        assert!(matches!(
+            request_metadata_shard_replica_assignment(&mut store, &stale),
+            Err(CliError::ClusterReadOnly { .. })
+        ));
+        let mut foreign = options.clone();
+        foreign
+            .replica_node_ids
+            .push(NodeId::from_legacy_named("cli-native-replica-foreign").unwrap());
+        assert!(
+            matches!(request_metadata_shard_replica_assignment(&mut store, &foreign),
+            Err(CliError::Kv(sinomo_runtime::kv::KvError::Serialization { detail }))
+                if detail == format!("metadata shard root cannot activate prepared-v7 namespace prepares: assigned node {} has no authoritative cluster member capability record",
+                    foreign.replica_node_ids.last().unwrap()))
+        );
+        assert_eq!(
+            store.get_metadata_shard(&fs, "root").unwrap(),
+            Some(retiring.clone())
+        );
+        assert!(
+            store
+                .get_metadata_shard_membership_handoff(&fs, "root")
+                .unwrap()
+                .is_none()
+        );
+        let report = request_metadata_shard_replica_assignment(&mut store, &options).unwrap();
+        assert!(report.changed);
+        let handoff = report.pending_handoff.unwrap();
+        assert_eq!(handoff.retiring_shard, retiring);
+        assert_eq!(
+            handoff.desired_shard.primary_node_id,
+            retiring.primary_node_id
+        );
+        assert_eq!(handoff.cause, DfsMetadataShardHandoffCause::Membership);
+        drop(store);
+        drop(control);
+        let expanded = runtime
+            .reassign_metadata_shard(&fs, "root", retiring.primary_node_id.clone(), replicas)
+            .unwrap();
+        assert_eq!(expanded, handoff.desired_shard);
+        let control = runtime.shared_control_plane().unwrap();
+        let expansion_proof = control
+            .with_client(|kv| {
+                DfsControlPlaneStore::new(kv.as_mut())
+                    .get_metadata_shard_membership_handoff_proof(&fs, "root")
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(expansion_proof.handoff_id, handoff.handoff_id);
+        assert_eq!(expansion_proof.retiring_shard, retiring);
+        assert_eq!(expansion_proof.desired_shard, expanded);
+        assert!(
+            sinomo_runtime::dfs::test_support::metadata_handoff_proof_acknowledgements_are_safe(
+                &expansion_proof
+            )
+        );
+        let promoted = expanded.replica_node_ids[0].clone();
+        let mut ring = vec![expanded.primary_node_id.clone()];
+        ring.extend(expanded.replica_node_ids.clone());
+        let at = ring.iter().position(|node| *node == promoted).unwrap();
+        let next_replicas = (1..ring.len())
+            .map(|offset| ring[(at + offset) % ring.len()].clone())
+            .collect::<Vec<_>>();
+        let rotated = runtime
+            .reassign_metadata_shard(&fs, "root", promoted.clone(), next_replicas.clone())
+            .unwrap();
+        assert_eq!(rotated.primary_node_id, promoted);
+        assert_eq!(rotated.replica_node_ids, next_replicas);
+        assert_eq!(rotated.epoch, expanded.epoch + 1);
+        let role_proof = control
+            .with_client(|kv| {
+                DfsControlPlaneStore::new(kv.as_mut())
+                    .get_metadata_shard_membership_handoff_proof(&fs, "root")
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(role_proof.retiring_shard, expanded);
+        assert_eq!(role_proof.desired_shard, rotated);
+        assert!(
+            sinomo_runtime::dfs::test_support::metadata_handoff_proof_acknowledgements_are_safe(
+                &role_proof
+            )
+        );
+        assert!(
+            control
+                .with_client(|kv| DfsControlPlaneStore::new(kv.as_mut())
+                    .get_metadata_shard_membership_handoff(&fs, "root"))
+                .unwrap()
+                .is_none()
+        );
+        drop(control);
+        let path = "/cli-native-replica-expansion.txt";
+        let body = b"native membership expansion then primary rotation";
+        let mut requester = runtime.client(&nodes[0]).unwrap();
+        requester
+            .posix_write_file(
+                path,
+                body,
+                sinomo_runtime::dfs::DfsWriteOptions {
+                    policy: sinomo_runtime::dfs::DfsReplicationPolicy::new(1, 1).unwrap(),
+                    replica_candidates: nodes.clone(),
+                    wait_for_commit: true,
+                    foreground_replica_repair: false,
+                },
+            )
+            .unwrap();
+        drop(requester);
+        let mut reader = runtime.client(&nodes[2]).unwrap();
+        assert_eq!(reader.posix_read_file_distributed(path).unwrap(), body);
+        drop(reader);
+        runtime.close().unwrap();
     }
 }

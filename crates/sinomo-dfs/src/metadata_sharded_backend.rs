@@ -89,10 +89,16 @@ const ROUTING_TOPOLOGY_HISTORY_LIMIT: usize = 4;
 
 #[cfg(test)]
 thread_local! {
+    static SHARDED_METADATA_STATUS_QUERY_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static SHARDED_METADATA_OBJECT_ID_LOOKUP_COUNT: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
     static SHARDED_CONSISTENT_READ_SNAPSHOT_SHARDS: std::cell::RefCell<Vec<DfsMetadataShardId>> =
         const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+pub(crate) fn take_sharded_metadata_status_query_count() -> usize {
+    SHARDED_METADATA_STATUS_QUERY_COUNT.replace(0)
 }
 
 #[cfg(test)]
@@ -3536,6 +3542,22 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         self.shard_backend(&digest.shard_id)?
             .prepared_operation_record(operation_id)
     }
+    fn prepared_operation_read_context(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        file_system_id: &DfsFileSystemId,
+        operation_id: &str,
+    ) -> Result<(Option<DfsFileSystem>, Option<DfsPreparedOperationRecord>)> {
+        self.shard_backend(shard_id)?
+            .prepared_operation_read_context(shard_id, file_system_id, operation_id)
+    }
+    fn prepared_operation_reservations(
+        &self,
+        payload: &crate::DfsPreparedOperationPayload,
+    ) -> Result<Vec<DfsPreparedOperationRecord>> {
+        self.shard_backend(&payload.shard_id)?
+            .prepared_operation_reservations(payload)
+    }
     fn list_prepared_operations(&self) -> Result<Vec<DfsPreparedOperationRecord>> {
         let mut records = Vec::new();
         for shard in self.shards.keys() {
@@ -3649,10 +3671,21 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         shard_id: &DfsMetadataShardId,
         digest: &DfsPreparedOperationDigest,
         source: Option<&crate::DfsSourceAdoptionWitness>,
+        provider: Option<&crate::publication_guard::DfsPublicationExecutionProvider>,
+        execution: Option<&crate::publication_guard::DfsPublicationExecutionOwners>,
+        clustered: Option<&crate::DfsMetadataShardConfig>,
     ) -> Result<crate::publication_guard::DfsPublicationWriterSession> {
         self.require_prepared_operation_shard(file_system_id, shard_id)?;
         self.shard_backend_mut(shard_id)?
-            .publication_writer_session(file_system_id, shard_id, digest, source)
+            .publication_writer_session(
+                file_system_id,
+                shard_id,
+                digest,
+                source,
+                provider,
+                execution,
+                clustered,
+            )
     }
 
     fn publication_writer_file_system(
@@ -6006,6 +6039,9 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
     }
 
     fn metadata_shard_statuses(&self) -> Result<Vec<DfsMetadataShardStatus>> {
+        #[cfg(test)]
+        SHARDED_METADATA_STATUS_QUERY_COUNT
+            .set(SHARDED_METADATA_STATUS_QUERY_COUNT.get().saturating_add(1));
         let mut statuses = Vec::new();
         for shard in self.shard_configs.values() {
             let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
@@ -6054,6 +6090,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         batch: &DfsMetadataJournalBatch,
         frames: &[DfsMetadataJournalFrameRecord],
         expected_target_prefix: &DfsMetadataPrefixProof,
+        expected_operation: &crate::DfsMetadataAuthorityOperation,
     ) -> Result<DfsMetadataReplicaApplyReport> {
         self.require_replica_ingest_permit_for_shard(permit, &batch.shard_id)?;
         self.shard_backend_mut(&batch.shard_id)?
@@ -6062,6 +6099,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
                 batch,
                 frames,
                 expected_target_prefix,
+                expected_operation,
             )
     }
 

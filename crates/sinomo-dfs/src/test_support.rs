@@ -140,6 +140,33 @@ pub fn now_unix_nanos() -> u64 {
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
+    /// Retain the actual opened backend while releasing its normal service,
+    /// provider and data-owner capabilities. This binds no epoch or authority.
+    pub fn test_into_retained_metadata_backend(
+        mut self,
+    ) -> Result<Box<dyn DfsMetadataBackend>, DfsError> {
+        if self.publication_execution.current().is_some() {
+            return Err(DfsError::Metadata {
+                message: "cannot detach a backend during actual publication execution".into(),
+            });
+        }
+        let backend = self
+            .metadata_backend
+            .take()
+            .ok_or_else(|| DfsError::Metadata {
+                message: "normal service has no actual metadata backend to retain".into(),
+            })?;
+        let crate::service_state::DfsMetadataBackendOwner::Owned(backend) = backend else {
+            return Err(DfsError::Metadata {
+                message: "retained backend fixture requires an independently owned backend, not a resident runtime lease".into(),
+            });
+        };
+        drop(self);
+        Ok(backend)
+    }
+}
+
+impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub fn test_pending_write_contains(&self, intent: &str) -> bool {
         self.writes.pending_writes.contains_key(intent)
     }

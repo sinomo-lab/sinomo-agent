@@ -1091,6 +1091,19 @@ impl DistributedEventualCoordinator {
     /// Change execution eligibility without changing the durable intent or
     /// canonical head. Only the service's current authority/root checks may
     /// reactivate historical work. Return the exact newly scheduled targets.
+    /// Restore activity only after the caller verifies the stored owner's live
+    /// roots. Bulk restore still rebuilds jobs once after all receipts/owners;
+    /// an older inactive projection must not suppress a newly live owner.
+    pub(crate) fn restore_committed_repair_active_deferring_rebuild(&mut self, intent_id: &str) {
+        if self
+            .intents
+            .get(intent_id)
+            .is_some_and(|intent| intent.state == DfsWriteIntentState::Committed)
+        {
+            self.inactive_repair_intent_ids.remove(intent_id);
+        }
+    }
+
     pub(crate) fn set_committed_repair_active(
         &mut self,
         intent_id: &str,

@@ -440,33 +440,50 @@ fn sifs_posix_rename_records_old_path_tombstone() {
         DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
     )
     .expect("write old");
-    let old_version = dfs.posix_stat(old_path).expect("old stat").version;
+    let old_version = dfs
+        .posix_stat_distributed(old_path)
+        .expect("old stat")
+        .version;
     dfs.posix_rename(old_path, new_path).expect("rename");
 
     assert!(matches!(
-        dfs.posix_stat(old_path),
+        dfs.posix_stat_distributed(old_path),
         Err(DfsPosixError::NotFound { .. })
     ));
-    assert_eq!(dfs.posix_read_file(new_path).expect("read new"), b"content");
-    let tombstone = dfs
-        .metadata
+    assert_eq!(
+        dfs.posix_read_file_distributed(new_path).expect("read new"),
+        b"content"
+    );
+    let owner = runtime.metadata_primary_service(new_path).unwrap();
+    let current = owner
+        .metadata_backend()
+        .unwrap()
+        .export_shard_table_snapshot(&DfsMetadataShardId::new("services"))
+        .unwrap()
+        .unwrap();
+    let tombstone = current
+        .tables
         .objects
-        .values()
+        .iter()
         .find(|object| object.path == old_path && object.kind == DfsObjectKind::Tombstone)
         .expect("old path tombstone");
     assert_ne!(tombstone.version, old_version);
 
-    let reloaded = runtime.client(&node_id).unwrap();
+    let mut reloaded = runtime.client(&node_id).unwrap();
     assert!(matches!(
-        reloaded.posix_stat(old_path),
+        reloaded.posix_stat_distributed(old_path),
         Err(DfsPosixError::NotFound { .. })
     ));
     assert_eq!(
         reloaded
-            .posix_read_file(new_path)
+            .posix_read_file_distributed(new_path)
             .expect("reloaded read new"),
         b"content"
     );
+    drop(reloaded);
+    drop(owner);
+    drop(dfs);
+    runtime.close().unwrap();
 }
 
 #[test]
@@ -684,7 +701,10 @@ fn routed_mkdir_all_prefers_live_path_shard_over_late_source_tombstone() {
         .replica
         .posix_mkdir_all("/users/moved-tree")
         .unwrap();
-    let old = cluster.replica.posix_stat("/users/moved-tree").unwrap();
+    let old = cluster
+        .replica
+        .posix_stat_distributed("/users/moved-tree")
+        .unwrap();
     cluster
         .replica
         .posix_rename("/users/moved-tree", "/services/moved-tree")
@@ -704,7 +724,7 @@ fn routed_mkdir_all_prefers_live_path_shard_over_late_source_tombstone() {
     assert_eq!(
         cluster
             .replica
-            .posix_stat("/services/moved-tree")
+            .posix_stat_distributed("/services/moved-tree")
             .unwrap()
             .object_id,
         old.object_id
@@ -712,13 +732,13 @@ fn routed_mkdir_all_prefers_live_path_shard_over_late_source_tombstone() {
     assert_eq!(
         cluster
             .replica
-            .posix_stat("/services/moved-tree/a/b")
+            .posix_stat_distributed("/services/moved-tree/a/b")
             .unwrap()
             .kind,
         DfsObjectKind::Directory
     );
     assert!(matches!(
-        cluster.replica.posix_stat("/users/moved-tree"),
+        cluster.replica.posix_stat_distributed("/users/moved-tree"),
         Err(DfsPosixError::NotFound { .. })
     ));
     cluster.close();
@@ -730,13 +750,63 @@ fn sifs_replica_distributed_stat_prefers_primary_tombstone_over_stale_local_hit(
     let path = "/users/stat-stale-live.txt";
     let bytes = b"writer-local stale entry should lose to primary tombstone".to_vec();
 
+    // This case needs an actual writer-local predecessor, not just W1 commit
+    // on whichever node supplied the first receipt. Establish its intended
+    // one-copy placement through the normal managed Apply before writing.
+    let mut placement = DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 1).unwrap();
+    placement.required_node_ids = vec![cluster.writer_node.clone()];
+    let accepted = cluster
+        ._runtime
+        .apply_placement_policy(
+            &cluster.primary_node,
+            path,
+            DfsPlacementScope::Subtree,
+            placement,
+        )
+        .unwrap();
+    super::writes::finish_native_placement_fixture_apply(&cluster._runtime, &accepted);
+
     sifs_cluster_routed_posix_write(&mut cluster, path, &bytes);
+    assert_eq!(
+        cluster
+            .writer
+            .posix_stat_distributed(path)
+            .unwrap()
+            .current_locations,
+        vec![cluster.writer_node.clone()],
+        "the stale-local fixture owns an actual committed writer copy"
+    );
     assert_eq!(
         cluster.writer.posix_read_file(path).expect("writer read"),
         bytes
     );
     assert!(cluster.writer.posix_stat(path).is_ok());
 
+    // Pin an actual old read image in this browser only. Its mounted native
+    // replica stays available for every full-shard prepare and commit.
+    let root = default_dfs_metadata_shards_root(cluster._runtime.data_dir(&cluster.writer_node));
+    let mut inspection = LocalShardedMetadataBackend::open_for_inspection(
+        &root,
+        cluster._runtime.metadata_shards().unwrap(),
+    )
+    .unwrap();
+    inspection
+        .shard_backend_mut(&DfsMetadataShardId::new("users"))
+        .unwrap()
+        .begin_inspection_snapshot()
+        .unwrap();
+    let writer = cluster
+        ._runtime
+        .client(&cluster.writer_node)
+        .unwrap()
+        .with_boxed_metadata_backend_lazy(Box::new(inspection))
+        .unwrap();
+    let original_writer = std::mem::replace(&mut cluster.writer, writer);
+    drop(original_writer);
+    assert!(
+        cluster.writer.posix_stat(path).is_ok(),
+        "actual pinned live predecessor"
+    );
     cluster.primary.posix_unlink(path).expect("primary unlink");
     assert!(matches!(
         cluster.primary.posix_stat(path),

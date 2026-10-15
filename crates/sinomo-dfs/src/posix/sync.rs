@@ -796,9 +796,44 @@ mod tests {
 
     #[test]
     fn file_sync_reports_an_uncommitted_returned_write_as_pending() {
-        let mut fixture = sync_fixture("pending_write");
-        let offline =
-            NodeId::from_legacy_named("node_posix_sync_pending_offline").expect("offline node id");
+        let nodes = crate::test_runtime::DfsTestRuntime::ordered_node_ids("pending_write", 2);
+        let mut runtime =
+            crate::test_runtime::DfsTestRuntime::new("pending_write", nodes[0].clone()).unwrap();
+        runtime.define_node(nodes[1].clone()).unwrap();
+        runtime.start_nodes().unwrap();
+        let mut configuration = runtime.client(&nodes[0]).unwrap();
+        let mut file_system = runtime.file_system();
+        let mut policy = crate::DfsSubtreePolicy::new(
+            "/services/pending-sync.txt",
+            sinomo_core::DfsObjectPolicy::ReplicatedConfirmed,
+            2,
+            2,
+        );
+        policy.required_node_ids = nodes.clone();
+        file_system.subtree_policies.push(policy);
+        configuration.add_file_system(file_system).unwrap();
+        drop(configuration);
+        let service = runtime
+            .metadata_primary_service("/services/pending-sync.txt")
+            .unwrap();
+        let owner = service.node_id().clone();
+        let missing = nodes.iter().find(|node| **node != owner).unwrap().clone();
+        // Both nodes remain eligible and available to metadata authority. Only
+        // the actual second content transfer fails, leaving exactly one receipt.
+        runtime.install_fault(crate::test_runtime::FaultRule {
+            source: None,
+            target: Some(missing),
+            route: Some(crate::DFS_DATA_STAGE_BLOB_ROUTE.into()),
+            call_id: None,
+            origin: None,
+            remaining_hits: 32,
+            action: crate::test_runtime::FaultAction::BudgetExhausted,
+        });
+        let mut fixture = PosixSyncFixture {
+            owner,
+            service,
+            _runtime: runtime,
+        };
         let stat = fixture
             .service
             .posix_write_file(
@@ -806,7 +841,7 @@ mod tests {
                 b"not yet at the two-replica commit threshold",
                 DfsWriteOptions {
                     policy: DfsReplicationPolicy::new(2, 2).expect("confirmed policy"),
-                    replica_candidates: vec![fixture.owner.clone(), offline],
+                    replica_candidates: nodes,
                     wait_for_commit: false,
                     foreground_replica_repair: false,
                 },
@@ -833,5 +868,23 @@ mod tests {
             ),
             "unexpected sync result: {error:?}"
         );
+        let pending = fixture
+            .service
+            .writes
+            .pending_writes
+            .iter()
+            .find(|(_, pending)| {
+                pending.object_id == stat.object_id && pending.version == stat.version
+            })
+            .map(|(intent, _)| intent.clone())
+            .expect("same actual pending producer");
+        let aborted = fixture.service.abort_pending_write(&pending).unwrap();
+        assert_eq!(aborted.state, crate::DfsWriteIntentState::Aborted);
+        let PosixSyncFixture {
+            service, _runtime, ..
+        } = fixture;
+        drop(service);
+        _runtime.clear_faults();
+        _runtime.close().unwrap();
     }
 }

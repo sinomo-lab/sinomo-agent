@@ -1232,10 +1232,25 @@ impl LocalContentStore {
     // source. Keep one initializer and every current marker/intent/owner check.
     fn initialize_current(root: PathBuf) -> Result<Self> {
         let marker = root.join("content-reservations/00/batch-format-v1.sobj");
-        let has_current_marker = fs::read(&marker)
-            .ok()
-            .and_then(|bytes| decode_content_reservation_batch_sentinel(&bytes).ok())
-            .is_some_and(|sentinel| validate_content_reservation_batch_sentinel(&sentinel).is_ok());
+        let has_marker = || {
+            fs::read(&marker)
+                .ok()
+                .and_then(|bytes| decode_content_reservation_batch_sentinel(&bytes).ok())
+                .is_some_and(|sentinel| {
+                    validate_content_reservation_batch_sentinel(&sentinel).is_ok()
+                })
+        };
+        let mut has_current_marker = has_marker();
+        let _initialization = if has_current_marker {
+            None
+        } else {
+            create_dir_all(root.clone())?;
+            let guard = initialization::InitializationGuard::acquire(&root)?;
+            // A preceding initializer can finish while this opener waits.
+            // Never publish a new intent from an earlier empty-root read.
+            has_current_marker = has_marker();
+            Some(guard)
+        };
         if root.exists()
             && !has_current_marker
             && !initialization::pending(&root)?
@@ -1912,6 +1927,28 @@ impl LocalContentStore {
             blob.size_bytes,
             &blob.synced_file,
         )
+    }
+
+    /// Bind verified bytes only while both the captured source identity and
+    /// canonical destination remain unretired. Source and native authorization
+    /// are caller obligations; this guard supplies no publication permission.
+    pub fn bind_quarantined_blob_from_unretired_source(
+        &self,
+        source_object_id: &str,
+        source_version: &str,
+        object_id: &str,
+        version: &str,
+        blob: ContentStoreQuarantinedBlob,
+    ) -> Result<ContentManifest> {
+        let _owner = self.content_mutation_guard()?;
+        if self.object_version_is_deleted(source_object_id, source_version)?
+            || self.object_version_is_deleted(object_id, version)?
+        {
+            return Err(ContentStoreError::InvalidContentLayout {
+                message: "retained source or canonical identity was explicitly collected".into(),
+            });
+        }
+        self.bind_quarantined_blob(object_id, version, blob)
     }
 
     /// Stores one already-materialized DFS value after validating its expected
@@ -3427,6 +3464,16 @@ impl LocalContentStore {
         Self::open_for_inspection(root).blob_storage_candidate_exists(hash)
     }
 
+    /// Reports explicit retirement in the current native binding ledger.
+    /// Absence is not retirement, byte availability, or permission to bind.
+    pub fn object_version_is_deleted(&self, object_id: &str, version: &str) -> Result<bool> {
+        let _owner = self.content_mutation_guard()?;
+        Ok(matches!(
+            self.inline_version_state(object_id, version)?,
+            Some(InlineVersionState::Deleted { .. })
+        ))
+    }
+
     /// Checks whether the exact object version has addressable local storage
     /// without reading or hashing its payload bytes.
     ///
@@ -3440,10 +3487,7 @@ impl LocalContentStore {
         expected_hash: &str,
     ) -> Result<bool> {
         let _owner = self.content_mutation_guard()?;
-        if matches!(
-            self.inline_version_state(object_id, version)?,
-            Some(InlineVersionState::Deleted { .. })
-        ) {
+        if self.object_version_is_deleted(object_id, version)? {
             return Ok(false);
         }
         let manifest = match self.read_manifest(object_id, version) {
