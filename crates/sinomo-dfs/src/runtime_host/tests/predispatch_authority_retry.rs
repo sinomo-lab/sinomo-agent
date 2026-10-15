@@ -108,6 +108,20 @@ impl RetryFixture {
         test_dfs_message_command(request, routed)
     }
 
+    fn warm_global_lane(&self) {
+        // The reuse cases compare existing resident lanes. Run one ordinary
+        // owned maintenance pass before their opening/identity baseline.
+        self.native
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .maintenance_tick(&self.local, sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
+            .expect("normal global maintenance warm-up")
+            .outcome
+            .expect("ordinary maintenance completes before the provider-only test");
+    }
+
     fn require_unchanged_journal(&self) {
         evict_daemon_dfs_message_service_cache(&self.data_dir)
             .expect("close resident lane before durable journal assertion");
@@ -515,11 +529,19 @@ fn provider_delta_after_first_fence(changed_attempts: usize) {
         "postfence-provider-churn"
     });
     let command = f.command(90, "postfence-provider-original");
+    f.warm_global_lane();
+    let retained_cache_slot = daemon_dfs_message_service_cache()
+        .root(&f.data_dir.root())
+        .unwrap();
+    let capture_admission = f
+        .runtime
+        .block_on(
+            f.scheduler
+                .admit(&DfsMessageExecutionScope::GlobalExclusive),
+        )
+        .unwrap();
     let (primary, exact, scan_owner, storage_generation) = {
-        let cache_slot = daemon_dfs_message_service_cache()
-            .root(&f.data_dir.root())
-            .expect("actual root cache slot");
-        let cache = cache_slot.lock().unwrap();
+        let cache = retained_cache_slot.lock().unwrap();
         let entry = cache.as_ref().unwrap();
         (
             entry.primary_service.clone(),
@@ -528,6 +550,11 @@ fn provider_delta_after_first_fence(changed_attempts: usize) {
             entry.signature.metadata_storage_generation,
         )
     };
+    assert!(
+        primary.is_some(),
+        "the global lane is resident before the provider-only comparison"
+    );
+    drop(capture_admission);
     let opens = daemon_dfs_test_message_service_lane_open_count(&f.data_dir);
     let (seen, hook) = f.provider_change_hook(command.clone(), changed_attempts);
     let _hook = install_daemon_dfs_pre_dispatch_test_hook(&f.data_dir, hook);
@@ -570,6 +597,10 @@ fn provider_delta_after_first_fence(changed_attempts: usize) {
         let cache_slot = daemon_dfs_message_service_cache()
             .root(&f.data_dir.root())
             .expect("actual root cache slot");
+        assert!(
+            Arc::ptr_eq(&retained_cache_slot, &cache_slot),
+            "the active observed root slot remains exact"
+        );
         let cache = cache_slot.lock().unwrap();
         let entry = cache.as_ref().unwrap();
         assert_eq!(
@@ -605,6 +636,7 @@ fn provider_delta_after_first_fence(changed_attempts: usize) {
     // Release cloned owners before proving that no durable read effects exist.
     drop(primary);
     drop(exact);
+    drop(retained_cache_slot);
     f.require_unchanged_journal();
 }
 
@@ -1198,11 +1230,19 @@ fn publisher_provider_delta_before_plan(changed_attempts: usize, expire_handoff:
     } else {
         "publish-planning-provider-churn"
     });
+    f.warm_global_lane();
+    let retained_cache_slot = daemon_dfs_message_service_cache()
+        .root(&f.data_dir.root())
+        .unwrap();
+    let capture_admission = f
+        .runtime
+        .block_on(
+            f.scheduler
+                .admit(&DfsMessageExecutionScope::GlobalExclusive),
+        )
+        .unwrap();
     let (primary, exact, scan_owner, storage_generation) = {
-        let cache_slot = daemon_dfs_message_service_cache()
-            .root(&f.data_dir.root())
-            .expect("actual root cache slot");
-        let cache = cache_slot.lock().unwrap();
+        let cache = retained_cache_slot.lock().unwrap();
         let entry = cache.as_ref().unwrap();
         (
             entry.primary_service.clone(),
@@ -1211,6 +1251,11 @@ fn publisher_provider_delta_before_plan(changed_attempts: usize, expire_handoff:
             entry.signature.metadata_storage_generation,
         )
     };
+    assert!(
+        primary.is_some(),
+        "the global lane is resident before the provider-only comparison"
+    );
+    drop(capture_admission);
     let opens = daemon_dfs_test_message_service_lane_open_count(&f.data_dir);
     let seen = Arc::new(RetryObservations::default());
     let state = Arc::clone(&seen);
@@ -1416,6 +1461,10 @@ fn publisher_provider_delta_before_plan(changed_attempts: usize, expire_handoff:
         let cache_slot = daemon_dfs_message_service_cache()
             .root(&f.data_dir.root())
             .expect("actual root cache slot");
+        assert!(
+            Arc::ptr_eq(&retained_cache_slot, &cache_slot),
+            "the active observed root slot remains exact"
+        );
         let cache = cache_slot.lock().unwrap();
         let entry = cache.as_ref().unwrap();
         assert_eq!(
@@ -1450,6 +1499,7 @@ fn publisher_provider_delta_before_plan(changed_attempts: usize, expire_handoff:
     );
     drop(primary);
     drop(exact);
+    drop(retained_cache_slot);
     f.require_unchanged_journal();
 }
 
