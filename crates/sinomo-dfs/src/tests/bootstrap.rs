@@ -620,7 +620,45 @@ fn clustered_bootstrap_ensures_filesystem_only_on_authoritative_shard_and_probe_
             .any(|file_system| { file_system.file_system_id == sifs_file_system_id() }),
         "the actual services owner must retain its filesystem definition"
     );
-    let batch = backend
+    // A native handoff may install a snapshot covering the genesis frames.
+    // The complete original body and exact commit reference remain canonical
+    // in that same certified table cut even when the historical log is gone.
+    let prepared = services
+        .tables
+        .prepared_operations_v7
+        .iter()
+        .find(|record| {
+            record.status == DfsPreparedOperationStatus::Committed
+                && record.payload.metadata_effects.iter().any(|effect| {
+                    matches!(effect,
+                DfsPreparedMetadataEffect::PutFileSystem { file_system }
+                    if file_system.file_system_id == sifs_file_system_id())
+                })
+        })
+        .expect("filesystem is sealed in one complete services preparation");
+    prepared
+        .validate()
+        .expect("the actual stored body, slot and commit identity validate");
+    assert_eq!(prepared.payload.file_system_id, sifs_file_system_id());
+    assert_eq!(prepared.payload.shard_id, services_id);
+    assert_eq!(
+        prepared.digest.payload_digest,
+        prepared.payload.canonical_digest().unwrap()
+    );
+    let committed = prepared
+        .committed_entry
+        .as_deref()
+        .expect("exact native commit reference");
+    assert_eq!(committed.digest, prepared.digest);
+    assert_eq!(committed.shard_id, services_id);
+    assert!(
+        committed.sequence > prepared.digest.prepare_sequence,
+        "the complete filesystem preparation precedes its digest-only commit"
+    );
+    assert!(committed.sequence <= services.prefix_proof.journal_sequence);
+    // When raw history is retained, it must agree with the canonical record;
+    // do not reconstruct an entry or substitute a synthetic prefix.
+    if let Some(batch) = backend
         .journal_batch_for_shard_since_limited(
             &services_id,
             0,
@@ -628,36 +666,24 @@ fn clustered_bootstrap_ensures_filesystem_only_on_authoritative_shard_and_probe_
             DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT,
         )
         .unwrap()
-        .expect("actual bootstrap journal");
-    let (prepare_entry, prepared) = batch
-        .entries
-        .iter()
-        .find_map(|entry| match &entry.mutation {
-            DfsMetadataMutation::PrepareOperationV7 { record, .. }
-                if record.payload.metadata_effects.iter().any(|effect| {
-                    matches!(effect,
-                DfsPreparedMetadataEffect::PutFileSystem { file_system }
-                    if file_system.file_system_id == sifs_file_system_id())
-                }) =>
-            {
-                Some((entry, record))
+    {
+        for entry in &batch.entries {
+            if entry.sequence == prepared.digest.prepare_sequence {
+                let DfsMetadataMutation::PrepareOperationV7 { record, .. } = &entry.mutation else {
+                    panic!("original preparation slot contains another native operation");
+                };
+                assert_eq!(record.digest, prepared.digest);
+                assert_eq!(record.payload, prepared.payload);
             }
-            _ => None,
-        })
-        .expect("filesystem is sealed in one complete services preparation");
-    assert_eq!(prepared.payload.file_system_id, sifs_file_system_id());
-    assert_eq!(prepared.payload.shard_id, services_id);
-    assert_eq!(prepared.digest.prepare_sequence, prepare_entry.sequence);
-    assert_eq!(
-        prepared.digest.payload_digest,
-        prepared.payload.canonical_digest().unwrap()
-    );
-    assert!(
-        batch.entries.iter().any(|entry| matches!(&entry.mutation,
-        DfsMetadataMutation::CommitPreparedOperationV7 { digest, .. }
-            if digest == &prepared.digest && entry.sequence > prepare_entry.sequence)),
-        "the complete filesystem preparation precedes its digest-only commit"
-    );
+            if entry.sequence == committed.sequence {
+                assert_eq!(
+                    DfsPreparedOperationCommitReference::from_journal_entry(entry).unwrap(),
+                    *committed
+                );
+            }
+        }
+    }
+    let expected_record = prepared.clone();
     let sealed_body = prepared.payload.clone();
     let operation_id = prepared.digest.operation_id.clone();
     let expected_prefix = services.prefix_proof;
@@ -682,6 +708,10 @@ fn clustered_bootstrap_ensures_filesystem_only_on_authoritative_shard_and_probe_
         "the actual receiver prefix includes the full filesystem body"
     );
     assert_eq!(replicated.status, DfsPreparedOperationStatus::Committed);
+    assert_eq!(
+        replicated, expected_record,
+        "the receiver retains the same exact original digest and native commit reference"
+    );
     cluster.close();
 }
 
