@@ -121,6 +121,9 @@ pub struct RpcObservation {
     pub dfs_version: Option<crate::DfsVersion>,
     pub route: String,
     pub phase: RpcPhase,
+    /// Actual returned transport error, attached only to a retained terminal
+    /// observation. Cancellation without a returned error leaves this absent.
+    pub outcome_error: Option<String>,
     pub origin: RpcOrigin,
     pub options: ClusterObjectRpcOptions,
     pub observe_connectivity: bool,
@@ -334,6 +337,23 @@ struct Fabric {
     transfers: Mutex<Vec<Transfer>>,
 }
 impl Fabric {
+    fn record_returned_error(&self, call_id: u64, error: &NetworkError) {
+        let detail = format!("{error:?}");
+        let mut bounded = detail.chars().take(2048).collect::<String>();
+        if bounded.len() < detail.len() {
+            bounded.push_str(" [diagnostic truncated]");
+        }
+        if let Ok(mut records) = self.observations.lock()
+            && let Some(observation) = records
+                .iter_mut()
+                .rev()
+                .find(|row| row.call_id == call_id && row.phase == RpcPhase::EndedWithoutResponse)
+        {
+            observation.outcome_error = Some(bounded);
+        }
+        // A checkpointed/evicted event remains immutable. Do not create a new
+        // event or conceal incomplete coverage by reconstructing a lost one.
+    }
     fn record(&self, observation: RpcObservation) {
         if let Ok(mut records) = self.observations.lock() {
             if records.len() < MAX_OBSERVATIONS {
@@ -500,6 +520,7 @@ impl Carrier {
             dfs_version: repair.map(|(_, _, _, _, version, _)| version),
             route: call.request.route.clone(),
             phase: RpcPhase::Constructed,
+            outcome_error: None,
             origin: self.origin,
             options,
             observe_connectivity,
@@ -1077,9 +1098,10 @@ impl Carrier {
         observation: RpcObservation,
     ) -> Result<ObjectRpcResult, NetworkError> {
         let dispatch_started = Arc::new(AtomicBool::new(false));
+        let call_id = observation.call_id;
         let timeout = observation.options.overall_timeout();
         let operation = self.deliver(target, call, observation, dispatch_started.clone());
-        if let Some(timeout) = timeout {
+        let result = if let Some(timeout) = timeout {
             tokio::time::timeout(timeout, operation)
                 .await
                 .map_err(|_| {
@@ -1093,10 +1115,15 @@ impl Carrier {
                             NetworkDeliveryState::DefinitelyNotSent
                         },
                     )
-                })?
+                })
+                .and_then(std::convert::identity)
         } else {
             operation.await
+        };
+        if let Err(error) = &result {
+            self.fabric.record_returned_error(call_id, error);
         }
+        result
     }
 }
 /// Negative body-only pause over the receiver's actual source. Its native head

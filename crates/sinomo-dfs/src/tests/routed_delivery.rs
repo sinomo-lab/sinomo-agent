@@ -115,6 +115,7 @@ fn native_delivery_case(body: Body, uncertain: bool, close_owner: bool) {
         .unwrap()
         .unwrap();
     let mut client = runtime.client(&requester).unwrap();
+    let client_calls = client.transport.observe_routed_calls_for_test();
     let target = DfsVersion::generate();
     let operation = sinomo_core::Id::generate().to_string();
     let baseline = runtime.rpc_observations().len();
@@ -133,7 +134,32 @@ fn native_delivery_case(body: Body, uncertain: bool, close_owner: bool) {
     });
     let error = route(&mut client, &object, &shard, &target, &operation, body).unwrap_err();
     assert!(
+        client_calls.load(Ordering::SeqCst) > 0,
+        "the actual first routed write calibrates its own transport observation"
+    );
+    assert!(
         matches!(error, DfsError::NetworkDelivery { delivery_state, .. } if delivery_state == if uncertain { NetworkDeliveryState::PossiblyApplied } else { NetworkDeliveryState::DefinitelyNotSent })
+    );
+    assert!(
+        runtime.rpc_observations()[baseline..]
+            .iter()
+            .any(|event| event.source == requester
+                && event.target == primary
+                && event.route == crate::DFS_DATA_DISTRIBUTED_WRITE_ROUTE
+                && event.phase == RpcPhase::EndedWithoutResponse
+                && event
+                    .outcome_error
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains(if uncertain {
+                        "PossiblyApplied"
+                    } else {
+                        "DefinitelyNotSent"
+                    }) && detail.contains(if uncertain {
+                        "lost response"
+                    } else {
+                        "before-dispatch fault"
+                    }))),
+        "bounded native diagnostics retain the actual returned delivery error"
     );
     if uncertain {
         let pending = client.writes.pending_routed_writes[&operation].clone();
@@ -150,12 +176,13 @@ fn native_delivery_case(body: Body, uncertain: bool, close_owner: bool) {
             runtime.stop_node(&requester).unwrap();
             let previous = client.writes.pending_routed_writes.clone();
             let before = runtime.rpc_observations().len();
+            let calls_before = client_calls.load(Ordering::SeqCst);
             assert!(route(&mut client, &object, &shard, &target, &operation, body).is_err());
             assert_eq!(client.writes.pending_routed_writes, previous);
             let after = runtime.rpc_observations();
             assert_eq!(
-                after.len(),
-                before,
+                client_calls.load(Ordering::SeqCst),
+                calls_before,
                 "closed response custody rejects before dispatch; new observations={:?}",
                 &after[before..]
             );
