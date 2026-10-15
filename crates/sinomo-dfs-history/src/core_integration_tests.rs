@@ -3718,6 +3718,8 @@ fn file_history_restore_runs_on_the_primary_with_the_original_requester_identity
         .unwrap()
         .get_namespace_request(&owner, &source_release.operation_id)
         .unwrap();
+    // The effect opener owns only the destination shard. Query the complete
+    // filesystem through the normal requester, preserving its authority routing.
     if checkpoint.cleanup_complete {
         assert_eq!(job.status, DfsNamespaceJobStatus::Completed);
         assert!(job.completed_at.is_some());
@@ -3738,18 +3740,10 @@ fn file_history_restore_runs_on_the_primary_with_the_original_requester_identity
                 request: source_release.clone()
             }
         );
-        assert!(
-            !actual_primary
-                .content_reference_present(&source_reference)
-                .unwrap()
-        );
+        assert!(!client.content_reference_present(&source_reference).unwrap());
     } else {
         assert_eq!(job.status, DfsNamespaceJobStatus::Running);
-        assert!(
-            actual_primary
-                .content_reference_present(&source_reference)
-                .unwrap()
-        );
+        assert!(client.content_reference_present(&source_reference).unwrap());
     }
     drop(actual_primary);
     let complete = client
@@ -3795,11 +3789,7 @@ fn file_history_restore_runs_on_the_primary_with_the_original_requester_identity
             "resume preserves its whole actual release receipt"
         );
     }
-    assert!(
-        !actual_primary
-            .content_reference_present(&source_reference)
-            .unwrap()
-    );
+    assert!(!client.content_reference_present(&source_reference).unwrap());
     let state = core_test::content_copy_job_state(&after).unwrap();
     assert_eq!(state.source_release.as_ref(), Some(&source_release));
     assert_eq!(state.requester_node_id, requester);
