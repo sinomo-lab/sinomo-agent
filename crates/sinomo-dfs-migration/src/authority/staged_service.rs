@@ -1413,10 +1413,9 @@ impl NativeImportAuthority {
             .decode()
             .map_err(error)?;
         let root = self.receiver_root_for(fs, &shard.0, &proof.handoff_id)?;
-        let plan: MetadataImportPlan = serde_json::from_slice(
-            &std::fs::read(root.join("native-import-plan.json")).map_err(error)?,
-        )
-        .map_err(error)?;
+        let plan = self
+            .retained_plan_file
+            .read(&root.join("native-import-plan.json"))?;
         if digest(&plan.source_cut)? != digest(source)? {
             return Err(error("source floor verification changed its original cut"));
         }
@@ -1458,11 +1457,10 @@ impl NativeImportAuthority {
             &ancestry_request_id,
             None,
         )?;
-        let retained: MetadataImportPlan = serde_json::from_slice(
-            &std::fs::read(root.join("native-import-plan.json")).map_err(error)?,
-        )
-        .map_err(error)?;
-        if digest(&retained)? != digest(&envelope.plan)? {
+        let retained = self
+            .retained_plan_file
+            .read(&root.join("native-import-plan.json"))?;
+        if digest(retained.as_ref())? != digest(&envelope.plan)? {
             return Err(error(
                 "activation request changes the acknowledged source blueprint",
             ));
