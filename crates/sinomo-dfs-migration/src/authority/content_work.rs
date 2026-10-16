@@ -1792,20 +1792,29 @@ mod tests {
                     sinomo_dfs::metadata_shard_head_watermark_key(&fs, &shard.0),
                 ];
                 let observed = runtime.authority.read_exact(&keys).unwrap();
-                let actual = observed
-                    .0
-                    .iter()
-                    .map(|row| {
-                        (
-                            &row.key,
-                            row.entry
-                                .as_ref()
-                                .map(|entry| entry.decode::<serde_json::Value>().unwrap()),
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                eprintln!("NATIVE_FENCE_CAS_MISS expected={source_fence:?} actual={actual:?}");
-                panic!("actual same source fence must commit");
+                // A concurrent normal Main owner can publish this exact fence
+                // first. A missed CAS grants nothing: accept only the complete
+                // intended handoff from the fresh authoritative read above.
+                let active: sinomo_dfs::DfsMetadataShardConfig = observed.0[0]
+                    .entry
+                    .as_ref()
+                    .expect("actual current assignment")
+                    .decode()
+                    .unwrap();
+                let actual: sinomo_dfs::DfsMetadataShardMembershipHandoff = observed.0[1]
+                    .entry
+                    .as_ref()
+                    .expect("actual original import handoff")
+                    .decode()
+                    .unwrap();
+                let mut expected = plan.expected_handoff.clone();
+                expected.retiring_primary_fence = Some(source_fence.clone());
+                assert_eq!(active, expected.retiring_shard);
+                assert_eq!(
+                    actual, expected,
+                    "a competing or incomplete fence is not confirmation"
+                );
+                actual
             });
         assert!(NativeImportAuthority::content_handoff_matches_plan(
             &pending,
