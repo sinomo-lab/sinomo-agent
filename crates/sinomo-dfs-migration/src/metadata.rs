@@ -549,7 +549,21 @@ enum ConversionEvent {
     },
     Tail(Value),
 }
+// Process-local custody of an already durable DATA checkpoint. Restart rebuilds
+// and verifies these values through the ordinary source/candidate replay path.
+// Neither variant contains a certificate or a publication capability.
+enum Finalization {
+    Plan {
+        cut: MetadataSourceCut,
+        digest: String,
+    },
+    Certify {
+        proposal: MetadataImportProposal,
+        digest: String,
+    },
+}
 struct Session {
+    finalization: Option<Finalization>,
     _source_lock: Arc<File>,
     source_root: PathBuf,
     destination_root: PathBuf,
@@ -1258,6 +1272,15 @@ impl MetadataConverter {
             }
             session.replay_validated = true;
         }
+        // One lifecycle turn is one durable event batch. No source cursor is
+        // acknowledged until its entire bounded stream prefix is synced below.
+        // On error the warm session is discarded; restart replays only the
+        // saved checkpoint and truncates this private ledger's unacknowledged tail.
+        let mut event_batch = if matches!(session.progress.phase, Phase::Build) {
+            None
+        } else {
+            Some(open_event_batch(session)?)
+        };
         while processed < budget {
             match session.progress.phase {
                 Phase::Source => {
@@ -1265,16 +1288,18 @@ impl MetadataConverter {
                     let mut cursor = std::mem::take(&mut session.progress.source);
                     let point = cursor.point();
                     if let Some(record) = source::next(&root, &mut cursor)? {
-                        append_event(session, ConversionEvent::Source { record, point })?;
+                        append_event(
+                            session,
+                            ConversionEvent::Source { record, point },
+                            event_batch.as_mut().expect("source phase owns its batch"),
+                        )?;
                         session.progress.source = cursor;
-                        save_progress(&session)?;
                         processed += 1;
                     } else {
                         session.progress.source = cursor;
                         validate_source_snapshot(&session)?;
                         session.progress.tail_after = session.materialized_through;
                         session.progress.phase = Phase::JournalTail;
-                        save_progress(&session)?;
                     }
                 }
                 Phase::JournalTail => {
@@ -1303,9 +1328,12 @@ impl MetadataConverter {
                             sequence,
                             &session.journal_frame_digests,
                         )?;
-                        append_event(session, ConversionEvent::Tail(entry))?;
+                        append_event(
+                            session,
+                            ConversionEvent::Tail(entry),
+                            event_batch.as_mut().expect("journal phase owns its batch"),
+                        )?;
                         session.progress.tail_after = sequence;
-                        save_progress(&session)?;
                         processed += 1;
                     } else {
                         if session.source_head > session.progress.tail_after {
@@ -1313,16 +1341,33 @@ impl MetadataConverter {
                         }
                         session.inventory.verify(&session.source_root)?;
                         session.progress.phase = Phase::Build;
-                        save_progress(&session)?;
                     }
                 }
                 Phase::Build => break,
             }
         }
+        if let Some(mut writer) = event_batch {
+            checkpoint_event_batch(session, &mut writer)?;
+        }
         if !matches!(session.progress.phase, Phase::Build) {
             return Ok(DfsStoragePreparation::Pending {
                 processed_records: processed,
             });
+        }
+        if processed == budget {
+            return Ok(DfsStoragePreparation::Pending {
+                processed_records: processed,
+            });
+        }
+        if let Some(finalization) = session.finalization.take() {
+            return self.advance_finalization(
+                session,
+                shard,
+                budget - processed,
+                goal_capsules,
+                finalization,
+                completion,
+            );
         }
         let ids = session.projection.source_file_system_ids()?;
         authority.validate_owned_source(&session.source_root, shard, &ids)?;
@@ -1516,6 +1561,11 @@ impl MetadataConverter {
             });
         }
         processed = budget - remaining;
+        if remaining == 0 {
+            return Ok(DfsStoragePreparation::Pending {
+                processed_records: processed,
+            });
+        }
         if matches!(
             session.header.get("format_version").and_then(Value::as_u64),
             Some(8 | 9)
@@ -1553,8 +1603,9 @@ impl MetadataConverter {
         };
         require_placement_goal_refs(&cut, goal_capsules)?;
         let cut_path = session.staged_root.join("source-cut.json");
-        if cut_path.is_file() {
-            let retained: MetadataSourceCut = read_json(&cut_path)?;
+        let cut_digest = if cut_path.is_file() {
+            let bytes = fs::read(&cut_path).map_err(error)?;
+            let retained: MetadataSourceCut = serde_json::from_slice(&bytes).map_err(error)?;
             if retained.source_identity != session.inventory.fingerprint
                 || retained.current_image_fingerprint != identity.state_fingerprint
                 || retained.target_exact_prefix != identity.prefix_proof
@@ -1565,122 +1616,178 @@ impl MetadataConverter {
             }
             require_placement_goal_refs(&retained, &goal_capsules)?;
             cut = retained;
+            blake3::hash(&bytes).to_hex().to_string()
         } else {
-            write_json(&cut_path, &cut)?;
-        }
-        let dependencies = authority.pending_original_source_scopes(&cut)?;
-        if !dependencies.is_empty() {
-            for (fs, original) in dependencies {
-                if !cut
-                    .projection_assignments
-                    .iter()
-                    .any(|config| config.file_system_id == fs && config.shard_id == original.0)
-                {
-                    return Err(error(
-                        "original source scope is absent from actual captured assignments",
-                    ));
-                }
-                // The provider's normal metadata store layout is indexed by
-                // the actual configured shard ID, never an inferred label.
-                if std::path::Path::new(&original.0).components().count() != 1
-                    || matches!(
-                        std::path::Path::new(&original.0).components().next(),
-                        Some(std::path::Component::ParentDir | std::path::Component::CurDir)
-                    )
-                {
-                    return Err(error(
-                        "configured original scope is not an owned metadata path segment",
-                    ));
-                }
-                let original_root = destination
-                    .parent()
-                    .ok_or_else(|| error("metadata scope has no owning store root"))?
-                    .join(&original.0);
-                let key = canonical_destination(&original_root)?;
-                let busy = self
-                    .roots
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .get(&key)
-                    .is_some_and(|slot| match slot.session.try_lock() {
-                        Ok(_) => false,
-                        Err(std::sync::TryLockError::WouldBlock) => true,
-                        Err(std::sync::TryLockError::Poisoned(_)) => false,
-                    });
-                if !busy {
-                    let _ = self.prepare_with_source(
-                        &original_root,
-                        &session.source_root,
-                        &original,
-                        budget,
-                    )?;
-                }
-            }
-            return Ok(DfsStoragePreparation::Pending {
-                processed_records: processed,
-            });
-        }
-        let plan = authority.plan(&cut)?;
-        require_placement_goal_refs(&plan.source_cut, &goal_capsules)?;
-        if plan.current_image_fingerprint != cut.current_image_fingerprint
-            || plan.target_exact_prefix != cut.target_exact_prefix
-            || plan.expected_assignments != cut.projection_assignments
-        {
-            return Err(error(
-                "native import plan changes the completed candidate identity or routing cut",
-            ));
-        }
-        let facts = MetadataImportProposalFacts {
-            source_root: cut.source_root.clone(),
-            source_identity: cut.source_identity.clone(),
-            source_snapshot_fingerprint: cut.source_snapshot_fingerprint.clone(),
-            source_exact_prefix: cut.source_exact_prefix.clone(),
-            current_image_fingerprint: cut.current_image_fingerprint.clone(),
-            staged_root: cut.staged_root.clone(),
-            scope_shard: shard.clone(),
-            file_system_ids: cut.file_system_ids.clone(),
-            expected_assignments: plan.expected_assignments.clone(),
-            target_exact_prefix: Some(plan.target_exact_prefix.clone()),
-            preserved_pending_operations: plan.pending_operation_mapping.clone(),
-            captured_floor_and_watermark_entries: match &plan {
-                MetadataImportPlan::Native(native) => native
-                    .captured_entries
-                    .iter()
-                    .map(serde_json::to_value)
-                    .collect::<std::result::Result<_, _>>()
-                    .map_err(error)?,
-                MetadataImportPlan::Standalone(_) => Vec::new(),
-            },
-            source_cut: plan.source_cut.clone(),
+            write_json_checkpoint(&cut_path, &cut)?
         };
-        let proposal = match plan {
-            MetadataImportPlan::Native(native) => {
-                MetadataImportProposal::Native(NativeMetadataImportProposal {
-                    facts,
-                    stage_request: native.stage_request,
-                    expected_handoff: native.expected_handoff,
-                    activation_request: native.activation_request,
-                })
-            }
-            MetadataImportPlan::Standalone(local) => {
-                MetadataImportProposal::Standalone(StandaloneMetadataImportProposal {
-                    facts,
-                    owner_binding: local.owner_binding,
-                    source_owner_evidence: local.source_owner_evidence,
-                })
-            }
-        };
-        write_json(&session.staged_root.join("import-proposal.json"), &proposal)?;
-        let certificate = authority.certify(&proposal)?;
-        validate_certificate(&proposal, &certificate)?;
+        session.finalization = Some(Finalization::Plan {
+            cut,
+            digest: cut_digest,
+        });
+        // The saved source-cut is one actual durable checkpoint record. It is
+        // incomplete preparation; source admission and image checks are retained.
+        Ok(DfsStoragePreparation::Pending {
+            processed_records: processed + 1,
+        })
+    }
+
+    fn advance_finalization(
+        &self,
+        session: &mut Session,
+        shard: &DfsMetadataShardId,
+        budget: usize,
+        goal_capsules: &[Value],
+        finalization: Finalization,
+        completion: &mut Option<InstalledCompletion>,
+    ) -> Result<DfsStoragePreparation> {
+        debug_assert!(budget > 0);
+        let authority = self
+            .authority
+            .as_ref()
+            .ok_or_else(|| error("finalization requires the actual import owner"))?;
+        let destination = session.destination_root.clone();
         session.inventory.verify(&session.source_root)?;
-        install_certified_stage(&session, &proposal, &certificate, authority.as_ref())?;
-        *completion = Some(InstalledCompletion::Certified(
-            proposal.source_cut.clone(),
-            certificate,
-            destination.to_owned(),
-        ));
-        Ok(DfsStoragePreparation::Ready)
+        match finalization {
+            Finalization::Plan { cut, digest } => {
+                verify_json_checkpoint(&session.staged_root.join("source-cut.json"), &digest)?;
+                authority.validate_owned_source(
+                    &session.source_root,
+                    shard,
+                    &cut.file_system_ids,
+                )?;
+                require_placement_goal_refs(&cut, goal_capsules)?;
+                let dependencies = authority.pending_original_source_scopes(&cut)?;
+                if !dependencies.is_empty() {
+                    for (fs, original) in dependencies {
+                        if !cut.projection_assignments.iter().any(|config| {
+                            config.file_system_id == fs && config.shard_id == original.0
+                        }) {
+                            return Err(error(
+                                "original source scope is absent from actual captured assignments",
+                            ));
+                        }
+                        // The provider's normal metadata store layout is indexed by
+                        // the actual configured shard ID, never an inferred label.
+                        if std::path::Path::new(&original.0).components().count() != 1
+                            || matches!(
+                                std::path::Path::new(&original.0).components().next(),
+                                Some(
+                                    std::path::Component::ParentDir | std::path::Component::CurDir
+                                )
+                            )
+                        {
+                            return Err(error(
+                                "configured original scope is not an owned metadata path segment",
+                            ));
+                        }
+                        let original_root = destination
+                            .parent()
+                            .ok_or_else(|| error("metadata scope has no owning store root"))?
+                            .join(&original.0);
+                        let key = canonical_destination(&original_root)?;
+                        let busy = self
+                            .roots
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .get(&key)
+                            .is_some_and(|slot| match slot.session.try_lock() {
+                                Ok(_) => false,
+                                Err(std::sync::TryLockError::WouldBlock) => true,
+                                Err(std::sync::TryLockError::Poisoned(_)) => false,
+                            });
+                        if !busy {
+                            let _ = self.prepare_with_source(
+                                &original_root,
+                                &session.source_root,
+                                &original,
+                                budget,
+                            )?;
+                        }
+                    }
+                    session.finalization = Some(Finalization::Plan { cut, digest });
+                    return Ok(DfsStoragePreparation::Pending {
+                        processed_records: 0,
+                    });
+                }
+                let plan = authority.plan(&cut)?;
+                require_placement_goal_refs(&plan.source_cut, &goal_capsules)?;
+                if plan.current_image_fingerprint != cut.current_image_fingerprint
+                    || plan.target_exact_prefix != cut.target_exact_prefix
+                    || plan.expected_assignments != cut.projection_assignments
+                {
+                    return Err(error(
+                        "native import plan changes the completed candidate identity or routing cut",
+                    ));
+                }
+                let facts = MetadataImportProposalFacts {
+                    source_root: cut.source_root.clone(),
+                    source_identity: cut.source_identity.clone(),
+                    source_snapshot_fingerprint: cut.source_snapshot_fingerprint.clone(),
+                    source_exact_prefix: cut.source_exact_prefix.clone(),
+                    current_image_fingerprint: cut.current_image_fingerprint.clone(),
+                    staged_root: cut.staged_root.clone(),
+                    scope_shard: shard.clone(),
+                    file_system_ids: cut.file_system_ids.clone(),
+                    expected_assignments: plan.expected_assignments.clone(),
+                    target_exact_prefix: Some(plan.target_exact_prefix.clone()),
+                    preserved_pending_operations: plan.pending_operation_mapping.clone(),
+                    captured_floor_and_watermark_entries: match &plan {
+                        MetadataImportPlan::Native(native) => native
+                            .captured_entries
+                            .iter()
+                            .map(serde_json::to_value)
+                            .collect::<std::result::Result<_, _>>()
+                            .map_err(error)?,
+                        MetadataImportPlan::Standalone(_) => Vec::new(),
+                    },
+                    source_cut: plan.source_cut.clone(),
+                };
+                let proposal = match plan {
+                    MetadataImportPlan::Native(native) => {
+                        MetadataImportProposal::Native(NativeMetadataImportProposal {
+                            facts,
+                            stage_request: native.stage_request,
+                            expected_handoff: native.expected_handoff,
+                            activation_request: native.activation_request,
+                        })
+                    }
+                    MetadataImportPlan::Standalone(local) => {
+                        MetadataImportProposal::Standalone(StandaloneMetadataImportProposal {
+                            facts,
+                            owner_binding: local.owner_binding,
+                            source_owner_evidence: local.source_owner_evidence,
+                        })
+                    }
+                };
+                let digest = write_json_checkpoint(
+                    &session.staged_root.join("import-proposal.json"),
+                    &proposal,
+                )?;
+                session.finalization = Some(Finalization::Certify { proposal, digest });
+                Ok(DfsStoragePreparation::Pending {
+                    processed_records: 1,
+                })
+            }
+            Finalization::Certify { proposal, digest } => {
+                verify_json_checkpoint(&session.staged_root.join("import-proposal.json"), &digest)?;
+                authority.validate_owned_source(
+                    &session.source_root,
+                    shard,
+                    &proposal.file_system_ids,
+                )?;
+                require_placement_goal_refs(&proposal.source_cut, goal_capsules)?;
+                let certificate = authority.certify(&proposal)?;
+                validate_certificate(&proposal, &certificate)?;
+                session.inventory.verify(&session.source_root)?;
+                install_certified_stage(&session, &proposal, &certificate, authority.as_ref())?;
+                *completion = Some(InstalledCompletion::Certified(
+                    proposal.source_cut.clone(),
+                    certificate,
+                    destination.to_owned(),
+                ));
+                Ok(DfsStoragePreparation::Ready)
+            }
+        }
     }
 }
 struct SourceCustody {
@@ -1821,13 +1928,41 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
     .map_err(error)
 }
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    write_json_checkpoint(path, value).map(|_| ())
+}
+fn write_json_checkpoint<T: Serialize>(path: &Path, value: &T) -> Result<String> {
+    let bytes = serde_json::to_vec(value).map_err(error)?;
     sinomo_core::storage::durable_file::write_file_atomic(
         path,
-        &serde_json::to_vec(value).map_err(error)?,
+        &bytes,
         sinomo_core::storage::durable_file::DurableAtomicFileOptions::new("import", "tmp")
             .sync_all(),
     )
-    .map_err(error)
+    .map_err(error)?;
+    Ok(blake3::hash(&bytes).to_hex().to_string())
+}
+fn verify_json_checkpoint(path: &Path, expected: &str) -> Result<()> {
+    let bytes = fs::read(path).map_err(error)?;
+    if blake3::hash(&bytes).to_hex().as_str() != expected {
+        return Err(error(
+            "retained finalization checkpoint changed across preparation turns",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn finalization_checkpoint_for_test(
+    root: &Path,
+    shard: &DfsMetadataShardId,
+    name: &str,
+) -> Result<Option<PathBuf>> {
+    if !matches!(name, "source-cut.json" | "import-proposal.json") {
+        return Err(error("unknown finalization observation"));
+    }
+    let root = canonical_destination(root)?;
+    let path = conversion_stage_base_path(&root, shard)?.join(name);
+    Ok(path.is_file().then_some(path))
 }
 /// Prior native generations keep their own exact clocks while being imported.
 /// This classifier is conversion DATA, never admission to the current DFS reader.
@@ -2239,6 +2374,7 @@ fn open_session_shell(
     };
     let replay_source = source::SourceCursor::new(inventory.clone());
     Ok(Session {
+        finalization: None,
         _source_lock: lock,
         source_root: source.to_owned(),
         destination_root: destination.to_owned(),
@@ -2854,25 +2990,55 @@ fn event_header(session: &Session) -> Result<Vec<u8>> {
     )
     .map_err(error)
 }
-fn append_event(session: &mut Session, event: ConversionEvent) -> Result<()> {
-    let header = event_header(session)?;
-    let mut writer = sinomo_core::storage::migration::stream::MigrationStreamWriter::resume(
+fn open_event_batch(
+    session: &mut Session,
+) -> Result<sinomo_core::storage::migration::stream::MigrationStreamWriter> {
+    if session.replayed_events != session.progress.events.records {
+        return Err(error(
+            "source batch cannot skip retained event reconstruction",
+        ));
+    }
+    let writer = sinomo_core::storage::migration::stream::MigrationStreamWriter::resume(
         &session.staged_root.join("events.slog"),
-        &header,
+        &event_header(session)?,
         &session.progress.events,
     )
     .map_err(error)?;
+    // A new stream has a real header cursor even when this turn finds no rows.
+    session.progress.events = writer.cursor().clone();
+    session.replay_cursor = writer.cursor().clone();
+    Ok(writer)
+}
+fn append_event(
+    session: &mut Session,
+    event: ConversionEvent,
+    writer: &mut sinomo_core::storage::migration::stream::MigrationStreamWriter,
+) -> Result<()> {
     let bytes =
         sinomo_core::object::serde_ext::to_bytes(&event, 7, sinomo_core::object::LengthMode::U32)
             .map_err(error)?;
     writer.append(&bytes).map_err(error)?;
-    let durable = writer.checkpoint().map_err(error)?;
     apply_event(session, &event)?;
-    session.progress.events = durable.clone();
-    session.replay_cursor = durable;
+    // This cursor is still private to the owned call. checkpoint_event_batch
+    // syncs its exact bytes before save_progress makes it restart-visible.
+    session.progress.events = writer.cursor().clone();
+    session.replay_cursor = writer.cursor().clone();
     session.replayed_events += 1;
     Ok(())
 }
+fn checkpoint_event_batch(
+    session: &Session,
+    writer: &mut sinomo_core::storage::migration::stream::MigrationStreamWriter,
+) -> Result<()> {
+    let durable = writer.checkpoint().map_err(error)?;
+    if durable != session.progress.events {
+        return Err(error(
+            "event batch differs from its exact source progress cursor",
+        ));
+    }
+    save_progress(session)
+}
+
 fn validate_replayed_event(session: &mut Session, event: &ConversionEvent) -> Result<()> {
     match event {
         ConversionEvent::Source { point, record } => {
@@ -4789,6 +4955,100 @@ mod current_layout_data_tests {
 #[cfg(test)]
 mod recovery_session_tests {
     use super::*;
+
+    #[test]
+    fn source_batch_restarts_from_only_its_acknowledged_checkpoint() {
+        use sinomo_core::object::{LengthMode, serde_ext};
+        use sinomo_core::storage::migration::stream::MigrationStreamReader;
+        let dir = sinomo_testdir::TestDir::new("metadata-event-batch-checkpoint");
+        let source = dir.join("source");
+        let path = source.join("records/tables/snapshot.sobj");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // A source-format DATA fixture only; this test neither certifies an
+        // image nor grants native authority or readiness.
+        let original = serde_ext::to_bytes(
+            &serde_json::json!({"format_version":2,"tables":{}}),
+            1,
+            LengthMode::U32,
+        )
+        .unwrap();
+        fs::write(&path, &original).unwrap();
+        let destination = dir.join("destination");
+        let shard = DfsMetadataShardId::new("root");
+        let mut session = open_session(&destination, &source, &shard).unwrap();
+        let progress_path = session.staged_root.join("progress.json");
+        let before = fs::read(&progress_path).unwrap();
+        let mut cursor = session.progress.source.clone();
+        let point = cursor.point();
+        let record = source::next(&source, &mut cursor).unwrap().unwrap();
+        let event = ConversionEvent::Source { point, record };
+        let bytes = serde_ext::to_bytes(&event, 7, LengthMode::U32).unwrap();
+        let mut writer = open_event_batch(&mut session).unwrap();
+        append_event(&mut session, event, &mut writer).unwrap();
+        session.progress.source = cursor;
+        writer.checkpoint().unwrap(); // Crash after event sync, before cursor publication.
+        assert_eq!(fs::read(&progress_path).unwrap(), before);
+        drop(writer);
+        drop(session);
+
+        let mut resumed = open_session(&destination, &source, &shard).unwrap();
+        assert_eq!(resumed.progress.events.records, 0);
+        let mut writer = open_event_batch(&mut resumed).unwrap();
+        assert_eq!(writer.cursor().records, 0);
+        let mut cursor = resumed.progress.source.clone();
+        let point = cursor.point();
+        let record = source::next(&source, &mut cursor).unwrap().unwrap();
+        let event = ConversionEvent::Source { point, record };
+        assert_eq!(
+            serde_ext::to_bytes(&event, 7, LengthMode::U32).unwrap(),
+            bytes
+        );
+        append_event(&mut resumed, event, &mut writer).unwrap();
+        resumed.progress.source = cursor;
+        checkpoint_event_batch(&resumed, &mut writer).unwrap();
+        let expected = resumed.progress.events.clone();
+        let ledger = resumed.staged_root.join("events.slog");
+        drop(writer);
+        drop(resumed);
+        let recovered = open_session(&destination, &source, &shard).unwrap();
+        assert_eq!(recovered.progress.events, expected);
+        let mut reader = MigrationStreamReader::open(&ledger).unwrap();
+        assert_eq!(reader.next_record(64 * 1024 * 1024).unwrap(), Some(bytes));
+        assert_eq!(reader.cursor(), &expected);
+        // This is an open conversion ledger, not a finished snapshot stream.
+        // Its saved cursor is the boundary; EOF must not fabricate a finish seal.
+        assert!(matches!(reader.next_record(64 * 1024 * 1024),
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof));
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert!(!destination.join("metadata-import-v7.json").exists());
+    }
+
+    #[test]
+    fn empty_source_batch_acknowledges_only_its_exact_header_cursor() {
+        let dir = sinomo_testdir::TestDir::new("metadata-empty-event-batch");
+        let source = dir.join("source");
+        fs::create_dir(&source).unwrap();
+        let destination = dir.join("destination");
+        let shard = DfsMetadataShardId::new("root");
+        let mut session = open_session(&destination, &source, &shard).unwrap();
+        let mut writer = open_event_batch(&mut session).unwrap();
+        let expected = writer.cursor().clone();
+        assert_eq!(expected.records, 0);
+        assert!(expected.offset > 0 && !expected.digest.is_empty());
+        checkpoint_event_batch(&session, &mut writer).unwrap();
+        drop(writer);
+        drop(session);
+        let mut recovered = open_session(&destination, &source, &shard).unwrap();
+        assert_eq!(recovered.progress.events, expected);
+        assert_eq!(
+            open_event_batch(&mut recovered).unwrap().cursor(),
+            &expected
+        );
+        assert!(
+            !destination.exists(),
+            "a header checkpoint is not publication"
+        );
+    }
 
     #[test]
     fn prior_storage_generation_is_discovered_without_current_admission() {

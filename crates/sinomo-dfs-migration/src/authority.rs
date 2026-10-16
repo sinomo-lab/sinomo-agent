@@ -2307,7 +2307,31 @@ mod provider_lifecycle_tests {
 
     #[test]
     fn native_metadata_preparation_advances_multiple_batches_before_ready() {
-        native_released_namespace_source_reopens_scaled(false, false, false, false, 256);
+        native_released_namespace_source_reopens_scaled(false, false, false, false, 256, None);
+    }
+
+    #[test]
+    fn native_candidate_checkpoint_restarts_with_exact_source_and_real_authority() {
+        native_released_namespace_source_reopens_scaled(
+            false,
+            false,
+            false,
+            false,
+            0,
+            Some("source-cut.json"),
+        );
+    }
+
+    #[test]
+    fn native_proposal_checkpoint_restarts_with_exact_source_and_real_authority() {
+        native_released_namespace_source_reopens_scaled(
+            false,
+            false,
+            false,
+            false,
+            0,
+            Some("import-proposal.json"),
+        );
     }
 
     fn native_released_namespace_source_reopens(
@@ -2322,6 +2346,7 @@ mod provider_lifecycle_tests {
             interrupt_metadata_confirmation,
             retained_root_exchange,
             0,
+            None,
         );
     }
 
@@ -2331,6 +2356,7 @@ mod provider_lifecycle_tests {
         interrupt_metadata_confirmation: bool,
         retained_root_exchange: bool,
         additional_source_files: usize,
+        pause_finalization: Option<&'static str>,
     ) {
         use sinomo_core::object::{LengthMode, serde_ext};
         use sinomo_dfs::{
@@ -2338,7 +2364,11 @@ mod provider_lifecycle_tests {
             DfsNamespacePathOccupantExpectation, DfsNamespaceTransaction,
             DfsPreparedOperationStatus, test_support::DfsTestRuntime,
         };
-        let name = if additional_source_files > 0 {
+        let name = if pause_finalization == Some("source-cut.json") {
+            "native-finalization-candidate-restart"
+        } else if pause_finalization.is_some() {
+            "native-finalization-proposal-restart"
+        } else if additional_source_files > 0 {
             "native-metadata-preparation-multiple-batches"
         } else if retained_root_exchange {
             "native-certified-retained-root-exchange-cold"
@@ -2363,11 +2393,33 @@ mod provider_lifecycle_tests {
         let mut native = DfsTestRuntime::new(name, node.clone()).unwrap();
         let pending_batches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observe_pending = Arc::clone(&pending_batches);
+        let hold_checkpoint = Arc::new(std::sync::atomic::AtomicBool::new(
+            pause_finalization.is_some(),
+        ));
+        let checkpoint: Arc<Mutex<Option<(PathBuf, PathBuf, Vec<u8>)>>> =
+            Arc::new(Mutex::new(None));
+        let provider_hold = Arc::clone(&hold_checkpoint);
+        let provider_checkpoint = Arc::clone(&checkpoint);
         let builder: sinomo_dfs::DfsStoragePreparationProviderBuilder =
             Arc::new(move |context, lifecycle| {
                 let provider = storage_preparation_provider(context, lifecycle)?;
                 let pending = Arc::clone(&observe_pending);
+                let hold = Arc::clone(&provider_hold);
+                let observed = Arc::clone(&provider_checkpoint);
                 Ok(Arc::new(move |root, scope, budget| {
+                    if hold.load(std::sync::atomic::Ordering::SeqCst)
+                        && observed
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .is_some_and(|(actual, _, _)| actual == root)
+                    {
+                        // Negative admission only, after the real provider has
+                        // completed and acknowledged its actual checkpoint.
+                        return Ok(sinomo_dfs::DfsStoragePreparation::Pending {
+                            processed_records: 0,
+                        });
+                    }
                     let result = provider(root, scope, budget)?;
                     if matches!(scope, sinomo_dfs::DfsStoragePreparationScope::Metadata(_)) {
                         if let sinomo_dfs::DfsStoragePreparation::Pending { processed_records } =
@@ -2377,6 +2429,19 @@ mod provider_lifecycle_tests {
                             assert!(processed_records <= budget);
                             if processed_records > 0 {
                                 pending.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                if hold.load(std::sync::atomic::Ordering::SeqCst)
+                                    && let Some(name) = pause_finalization
+                                    && let sinomo_dfs::DfsStoragePreparationScope::Metadata(shard) =
+                                        scope
+                                    && let Some(path) =
+                                        crate::metadata::finalization_checkpoint_for_test(
+                                            root, shard, name,
+                                        )?
+                                {
+                                    let bytes = std::fs::read(&path).unwrap();
+                                    *observed.lock().unwrap() =
+                                        Some((root.to_owned(), path, bytes));
+                                }
                             }
                         }
                     }
@@ -3098,9 +3163,49 @@ mod provider_lifecycle_tests {
             pause_completed_install.store(false, std::sync::atomic::Ordering::Release);
         }
         assert!(!crate::metadata::current_root(&root).unwrap() || retained_root_exchange);
+        let retained_checkpoint = if pause_finalization.is_some() {
+            let blocked = native.reopen_node(node.clone());
+            assert!(
+                blocked.is_err(),
+                "a checkpoint alone cannot make native storage ready"
+            );
+            let (actual_root, path, bytes) = checkpoint
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("real provider reached the selected durable checkpoint");
+            assert_eq!(actual_root, root);
+            assert!(!crate::metadata::current_root(&root).unwrap());
+            let competing = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(root.join("journal/write.lock"))
+                .unwrap();
+            assert_eq!(
+                fs2::FileExt::try_lock_exclusive(&competing)
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::WouldBlock,
+                "Pending retains the actual source writer fence"
+            );
+            drop(competing);
+            native.stop_node(&node).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            hold_checkpoint.store(false, std::sync::atomic::Ordering::SeqCst);
+            Some((path, bytes))
+        } else {
+            None
+        };
         native
             .reopen_node(node.clone())
             .expect("normal cold Main and real MIG provider must admit the released source");
+        if let Some((path, original)) = retained_checkpoint {
+            assert_eq!(
+                std::fs::read(path).unwrap(),
+                original,
+                "restart must preserve the exact checkpoint and original native request identities"
+            );
+        }
         assert!(crate::metadata::current_root(&root).unwrap());
         let current = native.root_shard().unwrap();
         assert_eq!(current.file_system_id, assignment.file_system_id);

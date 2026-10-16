@@ -3,6 +3,61 @@ use super::*;
 use sinomo_core::object::{LengthMode, TypeId, serde_ext};
 use std::io::{Read, Seek, SeekFrom};
 
+// The durable cursor names consumed source bytes, never the underlying file's
+// read-ahead position. Keep a bounded standard buffer for field reads and
+// relative seeks while retaining every physical file-length check below.
+struct CursorFile {
+    reader: std::io::BufReader<File>,
+    position: u64,
+}
+impl CursorFile {
+    fn open(path: &Path) -> std::io::Result<Self> {
+        Ok(Self {
+            reader: std::io::BufReader::new(File::open(path)?),
+            position: 0,
+        })
+    }
+    fn metadata(&self) -> std::io::Result<std::fs::Metadata> {
+        self.reader.get_ref().metadata()
+    }
+}
+impl Read for CursorFile {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        let count = self.reader.read(bytes)?;
+        self.position = self.position.checked_add(count as u64).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "source position overflow")
+        })?;
+        Ok(count)
+    }
+}
+impl Seek for CursorFile {
+    fn seek(&mut self, from: SeekFrom) -> std::io::Result<u64> {
+        let target = match from {
+            SeekFrom::Start(target) => target,
+            SeekFrom::Current(delta) => {
+                self.position.checked_add_signed(delta).ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "source seek overflow")
+                })?
+            }
+            SeekFrom::End(_) => {
+                self.position = self.reader.seek(from)?;
+                return Ok(self.position);
+            }
+        };
+        match i64::try_from(i128::from(target) - i128::from(self.position)) {
+            Ok(delta) => self.reader.seek_relative(delta)?,
+            Err(_) => {
+                self.reader.seek(SeekFrom::Start(target))?;
+            }
+        }
+        self.position = target;
+        Ok(target)
+    }
+    fn stream_position(&mut self) -> std::io::Result<u64> {
+        Ok(self.position)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Cursor {
     offset: u64,
@@ -23,17 +78,17 @@ pub(crate) enum Item {
 fn fail(e: impl std::fmt::Display) -> MetadataBackendError {
     MetadataBackendError::Serde(e.to_string())
 }
-fn byte(file: &mut File) -> Result<u8> {
+fn byte(file: &mut CursorFile) -> Result<u8> {
     let mut value = [0];
     file.read_exact(&mut value).map_err(fail)?;
     Ok(value[0])
 }
-fn number(file: &mut File, mode: LengthMode) -> Result<u64> {
+fn number(file: &mut CursorFile, mode: LengthMode) -> Result<u64> {
     let mut value = [0; 8];
     file.read_exact(&mut value[..mode.width()]).map_err(fail)?;
     Ok(u64::from_le_bytes(value))
 }
-fn seek(file: &mut File, count: u64) -> Result<()> {
+fn seek(file: &mut CursorFile, count: u64) -> Result<()> {
     let position = file.stream_position().map_err(fail)?;
     let end = position
         .checked_add(count)
@@ -44,7 +99,7 @@ fn seek(file: &mut File, count: u64) -> Result<()> {
     file.seek(SeekFrom::Start(end)).map_err(fail)?;
     Ok(())
 }
-fn string(file: &mut File, mode: LengthMode) -> Result<String> {
+fn string(file: &mut CursorFile, mode: LengthMode) -> Result<String> {
     let count = number(file, mode)?;
     if count > 1024 * 1024 {
         return Err(fail("retained SOBJ key exceeds conversion bound"));
@@ -61,7 +116,7 @@ enum Descriptor {
     Array(Box<Descriptor>),
     Optional(Box<Descriptor>),
 }
-fn descriptor(file: &mut File, depth: usize) -> Result<Descriptor> {
+fn descriptor(file: &mut CursorFile, depth: usize) -> Result<Descriptor> {
     if depth > 64 {
         return Err(fail(
             "retained SOBJ descriptor nesting exceeds conversion bound",
@@ -80,7 +135,12 @@ fn descriptor(file: &mut File, depth: usize) -> Result<Descriptor> {
         }
     })
 }
-fn skip_typed(file: &mut File, mode: LengthMode, shape: &Descriptor, depth: usize) -> Result<()> {
+fn skip_typed(
+    file: &mut CursorFile,
+    mode: LengthMode,
+    shape: &Descriptor,
+    depth: usize,
+) -> Result<()> {
     match shape {
         Descriptor::Builtin(k) => skip(file, mode, *k, depth),
         Descriptor::Object => skip(file, mode, TypeId::Object, depth),
@@ -103,7 +163,7 @@ fn skip_typed(file: &mut File, mode: LengthMode, shape: &Descriptor, depth: usiz
         },
     }
 }
-fn skip(file: &mut File, mode: LengthMode, kind: TypeId, depth: usize) -> Result<()> {
+fn skip(file: &mut CursorFile, mode: LengthMode, kind: TypeId, depth: usize) -> Result<()> {
     if depth > 64 {
         return Err(fail("retained SOBJ value nesting exceeds conversion bound"));
     }
@@ -163,7 +223,7 @@ fn skip(file: &mut File, mode: LengthMode, kind: TypeId, depth: usize) -> Result
     }
 }
 fn decode_original(
-    file: &mut File,
+    file: &mut CursorFile,
     mode: LengthMode,
     kind: u8,
 ) -> Result<(Value, super::source_document::SourceRawDocument)> {
@@ -190,7 +250,7 @@ fn decode_original(
         super::source_document::SourceRawDocument::row(document),
     ))
 }
-fn decode(file: &mut File, mode: LengthMode, kind: u8) -> Result<Value> {
+fn decode(file: &mut CursorFile, mode: LengthMode, kind: u8) -> Result<Value> {
     decode_original(file, mode, kind).map(|(value, _)| value)
 }
 impl Cursor {
@@ -198,7 +258,7 @@ impl Cursor {
         self.offset
     }
     pub(crate) fn open(path: &Path) -> Result<Self> {
-        let mut file = File::open(path).map_err(fail)?;
+        let mut file = CursorFile::open(path).map_err(fail)?;
         let mut header = [0; 8];
         file.read_exact(&mut header).map_err(fail)?;
         if &header[..4] != b"SOBJ" {
@@ -231,7 +291,7 @@ impl Cursor {
         Ok(cursor)
     }
     pub(crate) fn next(&mut self, path: &Path) -> Result<Option<Item>> {
-        let mut file = File::open(path).map_err(fail)?;
+        let mut file = CursorFile::open(path).map_err(fail)?;
         file.seek(SeekFrom::Start(self.offset)).map_err(fail)?;
         let mode = LengthMode::from_code(self.mode).map_err(fail)?;
         loop {
@@ -425,7 +485,7 @@ mod tests {
         let (_root, path, mut bytes) = fixture("mig-empty-sobj-sequence-count", false, false);
         let mut cursor = Cursor::open(&path).unwrap();
         assert!(cursor.next(&path).unwrap().is_some());
-        let mut file = File::open(&path).unwrap();
+        let mut file = CursorFile::open(&path).unwrap();
         file.seek(SeekFrom::Start(cursor.offset)).unwrap();
         assert_eq!(string(&mut file, LengthMode::U32).unwrap(), "ops");
         assert_eq!(byte(&mut file).unwrap(), TypeId::List.byte());

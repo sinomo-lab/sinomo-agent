@@ -107,6 +107,34 @@ waiting caller does not cancel the owner or release source custody. A poisoned
 session is discarded under the same slot before the source can be reacquired;
 reconstruction still validates the last durable checkpoint.
 
+Source replay checkpoints one bounded lifecycle batch at a time. Each record
+keeps its original bytes, source point and chained stream digest. The private
+event stream is synchronized before the combined source/event cursor is
+published. An error discards the partial warm projection. Restart validates the
+saved source and event cursors, discards only the unacknowledged private stream
+suffix, and reconstructs the acknowledged prefix under the same record limit.
+A synchronized event tail without a published cursor is not acknowledged work;
+an empty stream header is not a completed conversion or publication seal.
+
+Finalization returns to the same lifecycle after recording the verified candidate
+source cut and again after recording its import proposal. The same slot retains
+the physical source lock and the typed checkpoint across these yields. Each
+continuation checks the exact retained checkpoint bytes, source inventory and
+current owner before advancing. A completed checkpoint counts as one durable
+record of progress; contention and dependencies that have not advanced report
+zero. Neither checkpoint reports `Ready` or contains a reusable certificate.
+
+Cancellation between calls preserves this pending state. A process restart
+reconstructs the source projection under the original record budget, verifies
+the staged candidate and reuses the retained native plan and request identities.
+Certification and installation remain one publication turn: they obtain actual
+native receipts and full participant proof, recheck the source/image, retain the
+target writer fence, and use the existing durable installation intent before
+exchange. Interrupted installation reobserves native authority and exact bytes;
+saved JSON alone cannot establish readiness. The candidate/proposal restart
+tests stop the real disposable native owner at each checkpoint and require
+eventual native readiness, unchanged source data and exact checkpoint replay.
+
 The converter retains original source bytes and digests, synchronizes output
 before progress, and discards only an uncheckpointed staging suffix on restart.
 It stages a hidden current candidate. Installation binds the captured source

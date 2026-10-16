@@ -315,9 +315,18 @@ fn apply_record(tables: &mut DfsMetadataTables, record: SnapshotRecord) -> Resul
     Ok(())
 }
 pub(crate) fn read_snapshot(root: &Path, file: fs::File) -> Result<DfsMetadataTableState> {
-    let mut state = decode_snapshot_image(file, None)?;
+    read_snapshot_with_verified_fingerprint(root, file).map(|(state, _)| state)
+}
+
+/// Retain the semantic result checked by the same decoder. This is image DATA,
+/// not authority; callers still check the actual file, prefix and native owner.
+pub(crate) fn read_snapshot_with_verified_fingerprint(
+    root: &Path,
+    file: fs::File,
+) -> Result<(DfsMetadataTableState, String)> {
+    let (mut state, fingerprint) = decode_snapshot_image_with_verified_fingerprint(file, None)?;
     state.snapshot_fingerprint = metadata_table_snapshot_fingerprint(root)?;
-    Ok(state)
+    Ok((state, fingerprint))
 }
 
 /// SAME row decoder for native storage and a durably staged incoming image.
@@ -327,6 +336,13 @@ pub(crate) fn decode_snapshot_image(
     file: fs::File,
     expected: Option<&crate::metadata_records::DfsMetadataSnapshotImageDescriptor>,
 ) -> Result<DfsMetadataTableState> {
+    decode_snapshot_image_with_verified_fingerprint(file, expected).map(|(state, _)| state)
+}
+
+fn decode_snapshot_image_with_verified_fingerprint(
+    file: fs::File,
+    expected: Option<&crate::metadata_records::DfsMetadataSnapshotImageDescriptor>,
+) -> Result<(DfsMetadataTableState, String)> {
     let len = file.metadata().map_err(error)?.len();
     if expected.is_some_and(|expected| expected.total_size_bytes != len) {
         return Err(error(
@@ -375,14 +391,18 @@ pub(crate) fn decode_snapshot_image(
             "current snapshot semantic checksum mismatch".into(),
         ));
     }
-    Ok(DfsMetadataTableState {
-        tables,
-        materialized_through_sequence: Some(stored.materialized_through_sequence),
-        prefix_proof: Some(stored.prefix_proof),
-        snapshot_format_version: Some(SNAPSHOT_FORMAT),
-        snapshot_fingerprint: None,
-        ..Default::default()
-    })
+    let fingerprint = stored.semantic_state_fingerprint;
+    Ok((
+        DfsMetadataTableState {
+            tables,
+            materialized_through_sequence: Some(stored.materialized_through_sequence),
+            prefix_proof: Some(stored.prefix_proof),
+            snapshot_format_version: Some(SNAPSHOT_FORMAT),
+            snapshot_fingerprint: None,
+            ..Default::default()
+        },
+        fingerprint,
+    ))
 }
 #[derive(Debug)]
 pub(crate) struct StagedSnapshot {
