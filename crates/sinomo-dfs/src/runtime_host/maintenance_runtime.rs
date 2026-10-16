@@ -348,6 +348,12 @@ async fn run_daemon_dfs_maintenance_tick_kind_inner(
     let mut authority_replans = 0;
     let mut completed_remote_phase = None;
     loop {
+        // Snapshot only the existing scheduling owner before waiting for
+        // admission. No backend/lane/admission is retained by this handle.
+        let saved_turn = retained_daemon_dfs_maintenance_turn(
+            &data_dir,
+            metadata_authority_preflight.generation,
+        )?;
         let foreground_preemption =
             daemon_dfs_mutation_scheduler(&data_dir)?.begin_maintenance_interest();
         let Some(admission) = acquire_daemon_dfs_maintenance_admission_until_foreground_waits(
@@ -359,7 +365,21 @@ async fn run_daemon_dfs_maintenance_tick_kind_inner(
         else {
             metrics::counter!("sinomo.dfs.background.deferred", "reason" => "admission")
                 .increment(1);
-            return Ok(DaemonDfsMaintenanceTickOutcome::Deferred);
+            // Reads still preempt admission. An already-started pass keeps its
+            // existing continuation instead of becoming a new five-second
+            // lease retry merely because this reentry made no progress.
+            return Ok(
+                if saved_turn
+                    .as_ref()
+                    .map(|owner| owner.has_unfinished_turn())
+                    .transpose()?
+                    .unwrap_or(false)
+                {
+                    DaemonDfsMaintenanceTickOutcome::Continued
+                } else {
+                    DaemonDfsMaintenanceTickOutcome::Deferred
+                },
+            );
         };
         let DaemonDfsMaintenanceAdmission {
             _lifecycle_guard: lifecycle_guard,
@@ -413,10 +433,17 @@ async fn run_daemon_dfs_maintenance_tick_kind_inner(
         )
         .instrument(maintenance_span.clone())
         .await;
-        let retained_progress = match turn_progress {
-            Some((owner, before)) => owner.unfinished_progress_since(before),
+        let retained_progress = match turn_progress.as_ref() {
+            Some((owner, before)) => owner.unfinished_progress_since(*before),
             None => Ok(false),
         };
+        let preempted_turn_pending = turn_progress
+            .as_ref()
+            .map(|(owner, _)| owner)
+            .or(saved_turn.as_ref())
+            .map(|owner| owner.has_unfinished_turn())
+            .transpose()?
+            .unwrap_or(false);
         // The cancellable broad generation has been collapsed or destroyed at
         // this point. Return its freed pages while maintenance still owns message
         // admission: trimming after releasing admission can contend on glibc
@@ -534,7 +561,7 @@ async fn run_daemon_dfs_maintenance_tick_kind_inner(
             DaemonDfsMaintenancePreemptionOutcome::ForegroundWaiting => {
                 metrics::counter!("sinomo.dfs.background.deferred", "reason" => "foreground")
                     .increment(1);
-                if retained_progress {
+                if retained_progress || preempted_turn_pending {
                     DaemonDfsMaintenanceTickOutcome::Continued
                 } else {
                     DaemonDfsMaintenanceTickOutcome::Deferred
@@ -1137,6 +1164,23 @@ pub(super) fn daemon_dfs_maintenance_report_reached_limit(
     report: &DfsMaintenanceTickReport,
 ) -> bool {
     sinomo_dfs::dfs_maintenance_report_reached_limit(report)
+}
+
+/// Clone only an existing turn under the normal short cache bookkeeping lock.
+fn retained_daemon_dfs_maintenance_turn(
+    data_dir: &SinomoDataDir,
+    authority_generation: u64,
+) -> Result<Option<Arc<crate::maintenance::DfsMaintenanceProgressState>>, DaemonError> {
+    let Some(slot) =
+        crate::runtime_message::dfs_runtime_message_cache().existing_root(&data_dir.root())?
+    else {
+        return Ok(None);
+    };
+    let cache = slot.lock().map_err(|_| daemon_dfs_cache_lock_error())?;
+    Ok(cache
+        .as_ref()
+        .filter(|entry| entry.signature.metadata_authority_generation == authority_generation)
+        .map(|entry| Arc::clone(&entry.maintenance_progress)))
 }
 
 /// Run the complete DFS maintenance future from Tokio's blocking pool.

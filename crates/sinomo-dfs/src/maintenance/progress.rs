@@ -112,6 +112,13 @@ impl DfsMaintenanceProgressState {
         Ok(state.progress_epoch != epoch && state.checkpoint.is_some())
     }
 
+    /// A foreground waiter can interrupt reentry before this turn advances.
+    /// Retain that unfinished continuation without inventing a progress epoch.
+    pub(crate) fn has_unfinished_turn(&self) -> Result<bool, DfsError> {
+        let state = self.0.lock().map_err(|_| poisoned())?;
+        Ok(state.checkpoint.is_some())
+    }
+
     pub(super) fn begin(self: &Arc<Self>, mut scope: Scope) -> Result<Turn, DfsError> {
         let mut state = self.0.lock().map_err(|_| poisoned())?;
         if state.active {
@@ -300,6 +307,32 @@ mod tests {
             resumed.checkpoint.as_ref().unwrap().scope.options,
             scope().options
         );
+    }
+
+    #[test]
+    fn repeated_preemption_retains_pending_turn_without_inventing_progress() {
+        let owner = Arc::new(DfsMaintenanceProgressState::default());
+        owner.bind_native_generation(3, 4).unwrap();
+        assert!(!owner.has_unfinished_turn().unwrap());
+        let mut first = owner.begin(scope()).unwrap();
+        first.advance(Phase::Repair);
+        drop(first);
+        let saved_epoch = owner.epoch().unwrap();
+        for _ in 0..8 {
+            let resumed = owner.begin(scope()).unwrap();
+            assert_eq!(resumed.phase(), Phase::Repair);
+            drop(resumed);
+            assert!(owner.has_unfinished_turn().unwrap());
+            assert!(!owner.unfinished_progress_since(saved_epoch).unwrap());
+        }
+        // The scheduling continuation grants neither authority nor completion.
+        owner.bind_native_generation(4, 4).unwrap();
+        assert!(!owner.has_unfinished_turn().unwrap());
+        let mut current = owner.begin(scope()).unwrap();
+        assert_eq!(current.phase(), Phase::Handoff);
+        current.advance(Phase::Complete);
+        current.finish().unwrap();
+        assert!(!owner.has_unfinished_turn().unwrap());
     }
 
     #[test]

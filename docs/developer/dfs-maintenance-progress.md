@@ -30,11 +30,19 @@ from its retained native authority; other callers conservatively use their
 supplied projection revision. A changed scope, generation or budget restarts
 phase bookkeeping. It does not grant a new owner or undo any durable effect.
 
-Main reports `Continued` only when an unfinished retained checkpoint actually
-changed during the call. That incomplete outcome requests immediate resumption
-through the existing scheduler even if a transient queue probe is empty. It
-cannot acknowledge mounted recovery or completed reconciliation. A call with no
-retained progress remains `Deferred`, with the existing retry pacing.
+Main reports `Continued` when an unfinished retained checkpoint advances, or
+when foreground preemption interrupts reentry to an already-saved turn. The
+latter retains its scheduling continuation without inventing a progress epoch.
+This includes preemption while acquiring admission, before the service lane is
+borrowed. Only an existing cache owner matching the preflight authority generation
+can supply that saved turn; the actual resumed pass still validates its full
+native generation and scope before effects.
+
+That incomplete outcome requests resumption through the existing scheduler even
+if a transient queue probe is empty. It cannot acknowledge mounted recovery or
+completed reconciliation. A call with no saved turn, and a source-fence Pending
+that makes no progress, remain `Deferred` with the existing retry pacing. Protocol
+reads continue to preempt both admission and execution.
 
 A returned phase error restarts advisory phase bookkeeping on the next call.
 Earlier phases may need to advance the failed phase's dependencies, such as a
@@ -50,6 +58,24 @@ scheduling record. Producer captures are retained until the queue owner
 acknowledges their checkpoint. If that write fails, another producer phase cannot
 run before the retained captures are retried. Placement and lifecycle work
 checkpoint new captures before yielding.
+
+A resident background receipt read, publication planner or replica materializer
+tries the existing physical metadata writer fence once. Contention retains the
+same native source owner and yields the background turn; it does not pin a read
+snapshot, advance a replay cursor or report successful materialization. This
+allows the source owner's in-flight remote operation to receive protocol replies
+without a background waiter holding global mutation admission. Ordinary protocol
+read classification and foreground read semantics remain unchanged.
+
+A successful attempt performs the same writer-fenced journal certification,
+exact table refresh and prefix validation as before. An already-pinned nested
+read keeps its existing cut. A multi-shard attempt releases any earlier pins if
+a later shard is busy. Stable corruption and authority errors remain errors.
+Background publication/materialization retains its existing retry owner and
+pacing; an incomplete repair page keeps its cursor. Producer captures are
+checkpointed through the existing queue writer before a source attempt can
+return Pending, including captures produced by earlier rows of a partial restore.
+Failed queue persistence retains those captures for the next bounded turn.
 
 Repair attempt reservations and queue updates precede payload handoff. The
 existing detached-send owner retains the actual request identity, immutable
