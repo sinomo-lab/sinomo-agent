@@ -697,6 +697,11 @@ impl sinomo_network::ClusterDirectory for KvClusterDirectory {
     }
 }
 
+// Route-establishment fixtures must share this same guard with registry
+// replacement fixtures: the routing generation is process-wide.
+#[cfg(test)]
+pub(crate) static TEST_NETWORK_MODULE_REGISTRY_LOCK: Mutex<()> = Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -713,7 +718,6 @@ mod tests {
 
     struct TestIrohRoleModule;
 
-    static TEST_NETWORK_MODULE_REGISTRY_LOCK: Mutex<()> = Mutex::new(());
     static TEST_IROH_DIALED_ENDPOINTS: Mutex<Vec<ClusterEndpointId>> = Mutex::new(Vec::new());
 
     struct TestRouteIdentity(NodeId);
