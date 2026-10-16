@@ -666,8 +666,7 @@ impl NativeImportAuthority {
     ) -> Result<Option<MetadataImportPlan>> {
         let path = source.staged_root.join("native-import-plan.json");
         let plan = if path.exists() {
-            serde_json::from_slice::<MetadataImportPlan>(&std::fs::read(&path).map_err(error)?)
-                .map_err(error)?
+            self.retained_plan_file.read(&path)?.as_ref().clone()
         } else {
             let input = source.staged_root.join("native-import-input.json");
             if !input.exists() {
@@ -947,14 +946,13 @@ impl NativeImportAuthority {
         let Some(proof) = Self::activation_proof(request)? else {
             return Ok(());
         };
-        let plan: MetadataImportPlan = serde_json::from_slice(
-            &std::fs::read(root.join("native-import-plan.json")).map_err(error)?,
-        )
-        .map_err(error)?;
+        let plan = self
+            .retained_plan_file
+            .read(&root.join("native-import-plan.json"))?;
         self.validate_activation_request(request, &plan, &proof)?;
         Self::save_blueprint(root, "native-activation-request.json", request)?;
         let envelope = staged_service::ActivationBlueprint {
-            plan,
+            plan: plan.as_ref().clone(),
             request: request.clone(),
         };
         for node in &proof.acknowledged_node_ids {

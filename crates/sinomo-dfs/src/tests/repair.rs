@@ -1971,6 +1971,64 @@ fn committed_remote_manifest_repair_fetches_from_durable_requester() {
     runtime.close().unwrap();
 }
 
+// Observe the intended before-dispatch transport fault and its real durable
+// retry checkpoint BEFORE withdrawing the source endpoint. Otherwise stop can
+// substitute an unrelated "unknown source node" failure; restart correctly
+// wakes that connectivity error and creates a second ten-second retry.
+fn wait_for_native_injected_self_fetch_failure(
+    runtime: &crate::test_support::DfsTestRuntime,
+    primary: &NodeId,
+    requester: &NodeId,
+    intent: &DfsWriteIntentRecord,
+) {
+    let deadline = std::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    let queue_path = crate::default_dfs_repair_attempt_snapshot_path(runtime.data_dir(primary));
+    loop {
+        let recorded_failure = runtime.rpc_observations().iter().any(|event| {
+            event.source == *primary
+                && event.target == *requester
+                && event.route == DFS_DATA_FETCH_BLOB_ROUTE
+                && event.phase == crate::test_support::DfsTestRpcPhase::EndedWithoutResponse
+                && event
+                    .outcome_error
+                    .as_ref()
+                    .is_some_and(|error| error.contains("bounded injected carrier failure"))
+        });
+        let state = crate::read_dfs_repair_attempt_snapshot(&queue_path).unwrap();
+        if recorded_failure
+            && let Some(row) = state.as_ref().and_then(|state| {
+                state.records.iter().find(|row| {
+                    row.intent_id == intent.intent_id
+                        && row.missing_replica_node_id == *primary
+                        && !row.in_flight
+                        && row
+                            .last_error
+                            .as_ref()
+                            .is_some_and(|error| error.contains("bounded injected carrier failure"))
+                })
+            })
+        {
+            assert_eq!(row.object_id, intent.object_id);
+            assert_eq!(row.version, intent.target_version);
+            assert_eq!(Some(&row.content_hash), intent.content_hash.as_ref());
+            assert_eq!(
+                row.attempts, 1,
+                "fixture captures the first actual failed fetch"
+            );
+            assert_eq!(
+                row.transfer_delivery_state,
+                Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent)
+            );
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the intended native failed fetch must settle within the original network budget; state={state:#?}"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 #[test]
 fn committed_remote_manifest_self_repair_fetches_from_durable_requester() {
     let (mut runtime, primary, requester, _, mut writer, request, manifest, outcome) =
@@ -1993,6 +2051,7 @@ fn committed_remote_manifest_self_repair_fetches_from_durable_requester() {
             .is_err()
     );
     drop(inspect);
+    wait_for_native_injected_self_fetch_failure(&runtime, &primary, &requester, &native_intent);
     runtime.stop_node(&primary).unwrap();
     runtime.reopen_node(primary.clone()).unwrap();
     let mut restored = runtime.client(&primary).unwrap();
@@ -2135,6 +2194,7 @@ fn nonforeground_remote_manifest_self_repair_defers_fetch_from_durable_requester
             .is_err()
     );
     drop(inspect);
+    wait_for_native_injected_self_fetch_failure(&runtime, &primary, &requester, &native_intent);
     runtime.stop_node(&primary).unwrap();
     runtime.reopen_node(primary.clone()).unwrap();
     let mut restored = runtime.client(&primary).unwrap();

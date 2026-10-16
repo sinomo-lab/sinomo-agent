@@ -277,16 +277,35 @@ fn native_staged_overwrite_keeps_captured_metadata_after_real_prior_version_repa
                             && receipt.content_hash == written.content_hash)
                 );
             }
-            let history = backend
-                .object_write_intent_history(&written.object_id)
+            // Intent compaction can retain a terminal receipt while removing
+            // the live intent row. The original committed preparation still
+            // seals its exact terminal body and must remain the proof here.
+            let snapshot = backend
+                .export_shard_table_snapshot(&DfsMetadataShardId::new(&shard.shard_id))
+                .unwrap()
                 .unwrap();
-            let mut original = history
-                .intents
+            let mut original = snapshot
+                .tables
+                .prepared_operations_v7
                 .iter()
-                .filter(|record| record.operation_id.as_deref() == Some(operation.as_str()));
-            let terminal = original
+                .filter(|record| {
+                    record
+                        .payload
+                        .terminal_intent
+                        .as_ref()
+                        .is_some_and(|intent| {
+                            intent.operation_id.as_deref() == Some(operation.as_str())
+                        })
+                });
+            let prepared = original
                 .next()
-                .expect("the original intent has a durable terminal record");
+                .expect("the original committed preparation retains its exact terminal body");
+            prepared.validate().unwrap();
+            assert_eq!(
+                prepared.status,
+                sinomo_dfs::DfsPreparedOperationStatus::Committed
+            );
+            let terminal = prepared.payload.terminal_intent.as_ref().unwrap();
             assert!(
                 original.next().is_none(),
                 "one original mutation owns the terminal body"
@@ -3342,74 +3361,125 @@ fn native_whole_shard_partial_metadata_probe_uses_actual_operation_bound_native_
     }
     let mut client = runtime.client(&cfg.primary_node_id).unwrap();
     let bytes = b"real partial metadata probe and native permit";
-    let stat = client
-        .posix_write_file(
-            "/native-whole-shard-degraded.bin",
-            bytes,
-            sinomo_dfs::DfsWriteOptions {
-                policy: DfsReplicationPolicy::new(1, 1).unwrap(),
-                replica_candidates: vec![cfg.primary_node_id.clone()],
-                wait_for_commit: true,
-                foreground_replica_repair: false,
-            },
-        )
-        .unwrap();
-    assert_eq!(
-        client
-            .posix_read_file("/native-whole-shard-degraded.bin")
-            .unwrap(),
-        bytes
+    // This named trace fixture covers the former partial-proof path. Current
+    // publication requires every configured metadata participant; content W1
+    // and cluster KV cannot mint an operation-bound recovery permit.
+    let path = "/native-whole-shard-degraded.bin";
+    let operation = "native-partial-shard-original";
+    let options = sinomo_dfs::DfsWriteOptions {
+        policy: DfsReplicationPolicy::new(1, 1).unwrap(),
+        replica_candidates: vec![cfg.primary_node_id.clone()],
+        wait_for_commit: true,
+        foreground_replica_repair: false,
+    };
+    let rejected = client
+        .posix_write_file_with_operation_id(path, bytes, options.clone(), operation)
+        .expect_err("two participants cannot publish through a three-participant assignment");
+    assert!(
+        rejected
+            .to_string()
+            .contains("recovery quorum unavailable: verified 2, required 3"),
+        "actual native metadata rejection: {rejected}"
     );
     let shard = DfsMetadataShardId::new("root");
-    // Main published this operation through the real receiver path. The
-    // requester's cached shard view is not its current durable body inventory.
-    let snapshot = runtime
-        .metadata_primary_service("/native-whole-shard-degraded.bin")
-        .unwrap()
-        .metadata_backend()
-        .unwrap()
+    let source = runtime.metadata_primary_service(path).unwrap();
+    let backend = source.metadata_backend().unwrap();
+    let snapshot = backend
         .export_shard_table_snapshot(&shard)
         .unwrap()
         .unwrap();
-    let record =
-        snapshot
-            .tables
-            .prepared_operations_v7
-            .iter()
-            .find(|record| {
-                record.payload.transaction.objects.iter().any(|object| {
-                    object.object_id == stat.object_id && object.version == stat.version
-                })
-            })
-            .unwrap();
-    assert_eq!(
-        record.status,
-        sinomo_dfs::DfsPreparedOperationStatus::Committed
-    );
-    #[derive(serde::Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct ActualOperationFloor {
-        operation_digest: String,
-        prepared_sequence: u64,
-        authority_epoch: u64,
-        permit_id: String,
-    }
-    let control = runtime.shared_control_plane().unwrap();
-    let entry = control
-        .with_client(|kv| {
-            kv.get(&sinomo_dfs::metadata_shard_operation_floor_key(
-                &cfg.file_system_id,
-                "root",
-            ))
+    let records = snapshot
+        .tables
+        .prepared_operations_v7
+        .iter()
+        .filter(|record| {
+            record
+                .payload
+                .transaction
+                .objects
+                .iter()
+                .any(|object| object.path == path)
         })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        records.len(),
+        1,
+        "one exact durable original remains recoverable"
+    );
+    let original = records[0].clone();
+    original.validate().unwrap();
+    assert_eq!(
+        original.status,
+        sinomo_dfs::DfsPreparedOperationStatus::Prepared
+    );
+    let object = original
+        .payload
+        .transaction
+        .objects
+        .iter()
+        .find(|object| object.path == path)
+        .unwrap()
+        .clone();
+    assert!(
+        backend.get_object(&object.object_id).unwrap().is_none(),
+        "an incomplete participant proof cannot expose the prepared object"
+    );
+    let control = runtime.shared_control_plane().unwrap();
+    let floor_key = sinomo_dfs::metadata_shard_operation_floor_key(&cfg.file_system_id, "root");
+    assert!(
+        control
+            .with_client(|kv| kv.get(&floor_key))
+            .unwrap()
+            .is_none(),
+        "current authority cannot manufacture a KV recovery permit"
+    );
+    drop(source);
+
+    // Heal the actual receiver and replay the SAME original caller identity.
+    // Readiness, content and the terminal digest must come from native recovery.
+    runtime.clear_faults();
+    let stat = client
+        .posix_write_file_with_operation_id(path, bytes, options, operation)
+        .unwrap();
+    assert_eq!(stat.object_id, object.object_id);
+    assert_eq!(stat.version, object.version);
+    assert_eq!(client.posix_read_file(path).unwrap(), bytes);
+    let source = runtime.metadata_primary_service(path).unwrap();
+    let backend = source.metadata_backend().unwrap();
+    let committed = backend
+        .prepared_operation_record(&original.digest.operation_id)
         .unwrap()
         .unwrap();
-    let floor: ActualOperationFloor = sinomo_core::object::serde_ext::from_bytes(&entry.value)
-        .expect("decode the actual committed operation floor");
-    assert!(!floor.permit_id.is_empty());
-    assert_eq!(floor.operation_digest, record.digest.payload_digest);
-    assert_eq!(floor.prepared_sequence, record.digest.prepare_sequence);
-    assert_eq!(floor.authority_epoch, record.digest.owner_epoch);
+    assert_eq!(committed.digest, original.digest);
+    assert_eq!(committed.payload, original.payload);
+    assert_eq!(
+        committed.status,
+        sinomo_dfs::DfsPreparedOperationStatus::Committed
+    );
+    // The primary's exact durable prepare/commit is checked above. Replica
+    // acknowledgements use their own native durable authority floors.
+    for node in &cfg.replica_node_ids {
+        let receiver = sinomo_dfs::LocalSobjMetadataBackend::new(
+            shard.clone(),
+            sinomo_dfs::default_dfs_metadata_shards_root(runtime.data_dir(node)).join(&shard.0),
+        )
+        .unwrap();
+        assert!(
+            receiver
+                .metadata_authority_ack_floor(&shard)
+                .unwrap()
+                .is_some_and(|floor| floor.journal_sequence >= original.digest.prepare_sequence),
+            "each actual replica must durably acknowledge the original prepare: {node}"
+        );
+    }
+    assert!(
+        control
+            .with_client(|kv| kv.get(&floor_key))
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(runtime.observation_dropped_count(), 0);
+    drop(source);
     drop(client);
     if let Some(trace) = &trace {
         trace.close().unwrap();

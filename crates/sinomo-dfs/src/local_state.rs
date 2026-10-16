@@ -831,6 +831,27 @@ impl DfsClusterTopologyProjection {
         })
     }
 
+    /// sinomo:kv-configuration: Observe exact topology keys from the same bounded resident cut without copying unrelated placement payloads or refreshing authority.
+    fn observed_local_topology(
+        cluster_paths: &ClusterPaths,
+        matches_key: fn(&str) -> bool,
+    ) -> Result<Self, DfsError> {
+        let state = sinomo_core::cluster::read_cluster_state_without_kv(cluster_paths)
+            .map_err(DfsError::from_network)?;
+        let read = sinomo_core::kv::read_cluster_kv_resident_local_prefix_matching(
+            &cluster_paths.kv_paths(),
+            &state.local_node_id,
+            "/dfs/filesystems/",
+            matches_key,
+        )?;
+        Ok(Self {
+            entries: read.value,
+            revision: read.revision,
+            complete: true,
+            authoritative: false,
+        })
+    }
+
     pub(crate) fn require_destructive_authority(&self) -> Result<(), DfsError> {
         if self.authoritative && self.complete {
             Ok(())
@@ -966,8 +987,11 @@ pub(crate) fn sifs_metadata_shards_from_authoritative_topology(
 pub fn cluster_dfs_all_metadata_shards(
     cluster_paths: &ClusterPaths,
 ) -> Result<Vec<DfsMetadataShardConfig>, DfsError> {
-    DfsClusterTopologyProjection::observed_local_prefix(cluster_paths, "/dfs/filesystems/")?
-        .all_metadata_shards()
+    DfsClusterTopologyProjection::observed_local_topology(
+        cluster_paths,
+        dfs_metadata_shard_config_key_is_exact,
+    )?
+    .all_metadata_shards()
 }
 
 /// Return every configured filesystem whose namespace shares this node's
@@ -976,8 +1000,11 @@ pub fn cluster_dfs_all_metadata_shards(
 pub fn cluster_dfs_all_file_system_configs(
     cluster_paths: &ClusterPaths,
 ) -> Result<Vec<DfsFileSystemConfig>, DfsError> {
-    DfsClusterTopologyProjection::observed_local_prefix(cluster_paths, "/dfs/filesystems/")?
-        .all_file_system_configs()
+    DfsClusterTopologyProjection::observed_local_topology(
+        cluster_paths,
+        dfs_file_system_config_key_is_exact,
+    )?
+    .all_file_system_configs()
 }
 
 /// Return every in-progress metadata membership handoff across the shared
@@ -986,15 +1013,21 @@ pub fn cluster_dfs_all_file_system_configs(
 pub fn cluster_dfs_all_metadata_shard_membership_handoffs(
     cluster_paths: &ClusterPaths,
 ) -> Result<Vec<DfsMetadataShardMembershipHandoff>, DfsError> {
-    DfsClusterTopologyProjection::observed_local_prefix(cluster_paths, "/dfs/filesystems/")?
-        .all_metadata_shard_membership_handoffs()
+    DfsClusterTopologyProjection::observed_local_topology(
+        cluster_paths,
+        dfs_metadata_shard_membership_handoff_key_is_exact,
+    )?
+    .all_metadata_shard_membership_handoffs()
 }
 
 pub fn cluster_dfs_all_metadata_shard_head_watermarks(
     cluster_paths: &ClusterPaths,
 ) -> Result<Vec<DfsMetadataShardHeadWatermark>, DfsError> {
-    DfsClusterTopologyProjection::observed_local_prefix(cluster_paths, "/dfs/filesystems/")?
-        .all_metadata_shard_head_watermarks()
+    DfsClusterTopologyProjection::observed_local_topology(
+        cluster_paths,
+        dfs_metadata_shard_head_watermark_key_is_exact,
+    )?
+    .all_metadata_shard_head_watermarks()
 }
 
 /// Read an already-resident local Raft prefix for observation or explicit
@@ -1446,6 +1479,186 @@ mod tests {
 
     fn test_node(value: &str) -> NodeId {
         NodeId::from_legacy_named(value).expect("node id")
+    }
+
+    #[test]
+    fn topology_observation_excludes_unrelated_payload_without_losing_shards_or_completeness() {
+        let root = sinomo_testdir::TestDir::new("dfs-native-topology-production-payload");
+        let data = SinomoDataDir::new(root.path());
+        data.ensure_root_layout().unwrap();
+        let paths = ClusterPaths::new(&data);
+        let node = test_node("native-topology-production-payload-owner");
+        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            sinomo_core::node::ClusterId::from_legacy_named("native-topology-production-payload")
+                .unwrap(),
+            "topology payload",
+            node.clone(),
+            "local",
+            "public-key",
+            time::OffsetDateTime::now_utc(),
+        );
+        sinomo_core::cluster::write_cluster_state(&paths, &state).unwrap();
+        let store = sinomo_core::kv::ClusterKvRaftStore::new(
+            paths.kv_paths(),
+            sinomo_core::kv::ClusterKvRaftCompactionPolicy {
+                max_snapshot_bytes: u64::MAX,
+                max_snapshot_events: sinomo_core::kv::MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS,
+            },
+        );
+        let mut writer = sinomo_core::kv::ClusterKvRaftLocalCommandStorage::new(
+            store,
+            node.clone(),
+            sinomo_core::kv::cluster_kv_key_can_defer_materialized_snapshot,
+        );
+        let mut put = |key: String, value: Vec<u8>| {
+            let entry = writer
+                .append_uncommitted(sinomo_core::kv::KvCommandRequest::generated(
+                    sinomo_core::kv::KvCommand::Op(sinomo_core::kv::KvOp::Put {
+                        key,
+                        value,
+                        lease_id: None,
+                    }),
+                ))
+                .unwrap();
+            writer.commit_index_compact(entry.index).unwrap();
+        };
+        let fs = sifs_file_system_id();
+        let mut expected = Vec::new();
+        for name in ["root", "services", "users"] {
+            let row = DfsMetadataShardConfig {
+                file_system_id: fs.clone(),
+                shard_id: name.into(),
+                primary_node_id: node.clone(),
+                replica_node_ids: Vec::new(),
+                epoch: 1,
+                assignment: if name == "root" {
+                    DfsMetadataShardAssignment::Root
+                } else {
+                    DfsMetadataShardAssignment::PathPrefix {
+                        prefix: format!("/{name}"),
+                    }
+                },
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            };
+            put(
+                crate::metadata_shard_key(&fs, name),
+                sinomo_core::kv::encode_kv_value(&row).unwrap(),
+            );
+            expected.push(row);
+        }
+        // Retained production DATA had 838 placement-job rows and only three
+        // shard configs (1,299 key/value bytes). Opaque unrelated values here
+        // reproduce the >8MiB prefix shape; they confer no DFS authority.
+        for index in 0..129 {
+            put(
+                format!(
+                    "/dfs/filesystems/{fs}/placement-reconciliations-v1/retained-data-{index:03}"
+                ),
+                vec![0x5a; 65_536],
+            );
+        }
+        drop(put);
+        writer.release_session_after_commit();
+        let before =
+            sinomo_core::kv::read_cluster_kv_local_snapshot(&paths.kv_paths(), &node).unwrap();
+        let broad = sinomo_core::kv::read_cluster_kv_resident_local_prefix(
+            &paths.kv_paths(),
+            &node,
+            "/dfs/filesystems/",
+        );
+        assert!(
+            matches!(
+                broad,
+                Err(sinomo_core::kv::KvError::RangePayloadLimit {
+                    max_bytes: 8_388_608,
+                    ..
+                })
+            ),
+            "the ordinary full-prefix budget must remain unchanged: {broad:?}"
+        );
+        let selected = cluster_dfs_all_metadata_shards(&paths)
+            .expect("small complete topology remains observable beside retained job DATA");
+        assert_eq!(selected, expected);
+        let oversized_selection = sinomo_core::kv::read_cluster_kv_resident_local_prefix_matching(
+            &paths.kv_paths(),
+            &node,
+            "/dfs/filesystems/",
+            |_| true,
+        );
+        assert!(
+            matches!(
+                oversized_selection,
+                Err(sinomo_core::kv::KvError::RangePayloadLimit {
+                    max_bytes: 8_388_608,
+                    ..
+                })
+            ),
+            "selection cannot increase the ordinary returned-payload budget"
+        );
+        assert!(
+            DfsClusterTopologyProjection::observed_local_topology(
+                &paths,
+                dfs_metadata_shard_config_key_is_exact,
+            )
+            .unwrap()
+            .require_destructive_authority()
+            .is_err(),
+            "complete observation does not grant mutation authority"
+        );
+        let status =
+            inspect_incomplete_dfs_status(&data, &paths, "metadata preparation is still pending")
+                .unwrap();
+        assert_eq!(status.metadata_shards.len(), 3);
+        assert_eq!(status.file_system_count, 1);
+        assert!(
+            status
+                .incomplete_reasons
+                .iter()
+                .any(|reason| reason == "metadata preparation is still pending")
+        );
+        assert!(
+            !status
+                .incomplete_reasons
+                .iter()
+                .any(|reason| reason.contains("topology observation unavailable"))
+        );
+        let after =
+            sinomo_core::kv::read_cluster_kv_local_snapshot(&paths.kv_paths(), &node).unwrap();
+        assert_eq!(
+            after, before,
+            "topology observation preserves every unrelated row and native revision"
+        );
+        // A large number of unrelated keys still consumes the full scan
+        // budget. Returning the three early matches would hide incompleteness.
+        for index in 0..(sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES + 1 - 132) {
+            let entry = writer
+                .append_uncommitted(sinomo_core::kv::KvCommandRequest::generated(
+                    sinomo_core::kv::KvCommand::Op(sinomo_core::kv::KvOp::Put {
+                        key: format!("/dfs/filesystems/{fs}/unrelated-scan-tail/{index:04}"),
+                        value: Vec::new(),
+                        lease_id: None,
+                    }),
+                ))
+                .unwrap();
+            writer.commit_index_compact(entry.index).unwrap();
+        }
+        writer.release_session_after_commit();
+        let scan = sinomo_core::kv::read_cluster_kv_resident_local_prefix_matching(
+            &paths.kv_paths(),
+            &node,
+            "/dfs/filesystems/",
+            dfs_metadata_shard_config_key_is_exact,
+        );
+        assert!(
+            matches!(
+                scan,
+                Err(sinomo_core::kv::KvError::RangeLimit {
+                    max_entries: 4096,
+                    ..
+                })
+            ),
+            "every scanned key counts; no partial topology on exhaustion: {scan:?}"
+        );
     }
 
     fn empty_status() -> DfsOperatorStatus {

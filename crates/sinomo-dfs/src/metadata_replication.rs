@@ -395,7 +395,15 @@ pub fn prepare_cluster_dfs_metadata_shard_publish_with_backend_and_authority(
             )
         }
         Some(shard) => {
-            backend.refresh_metadata_shard_durable_view(&shard_id)?;
+            if options.background_publication {
+                if backend.try_materialize_resident_journal()?.is_none() {
+                    return Err(DfsError::Busy {
+                        path: expected_shard_root.display().to_string(),
+                    });
+                }
+            } else {
+                backend.refresh_metadata_shard_durable_view(&shard_id)?;
+            }
             prepare_dfs_metadata_journal_publish_for_primary_shard(
                 &mut **backend,
                 local_node_id,
@@ -1353,6 +1361,13 @@ impl DfsMetadataPublishScheduler {
     /// The run loop remains the only consumer which clears this bit.
     pub fn has_pending_request(&self) -> bool {
         self.pending.load(Ordering::Acquire)
+    }
+
+    /// Read-only test observation while the actual producer admission is held.
+    /// Read running last: a finishing worker can consume an older pending edge.
+    #[cfg(test)]
+    pub(crate) fn is_idle_while_producers_excluded(&self) -> bool {
+        !self.pending.load(Ordering::Acquire) && !self.running.load(Ordering::Acquire)
     }
 
     /// Consume queued input edges after the worker owns the producer's exact

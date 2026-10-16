@@ -471,17 +471,17 @@ where
     .await
 }
 
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 static DFS_BROWSER_BACKEND_OPEN_COUNTS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
 
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 fn record_dfs_browser_backend_open(data_dir: &SinomoDataDir) {
     let counts = DFS_BROWSER_BACKEND_OPEN_COUNTS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut counts = counts.lock().expect("DFS browser open-count lock");
     *counts.entry(data_dir.root()).or_default() += 1;
 }
 
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 pub fn dfs_browser_backend_open_count(data_dir: &SinomoDataDir) -> usize {
     DFS_BROWSER_BACKEND_OPEN_COUNTS
         .get_or_init(|| Mutex::new(HashMap::new()))
@@ -553,7 +553,7 @@ impl DfsBrowserBackend {
         runtime: &tokio::runtime::Handle,
         host: Arc<dyn DfsBrowserServiceHost>,
     ) -> Result<Self, ServiceError> {
-        #[cfg(feature = "test-support")]
+        #[cfg(any(test, feature = "test-support"))]
         record_dfs_browser_backend_open(&data_dir);
         let cluster_paths = ClusterPaths::new(&data_dir);
         let control_plane = host.control_plane_client(&cluster_paths, runtime);
@@ -1873,6 +1873,24 @@ impl Service for HostedDfsBrowserService {
                     let include_health = payload.include_health;
                     let task_data_dir = Arc::clone(&data_dir);
                     let task = move || {
+                        if !include_health {
+                            // Identity discovery does not require a filesystem
+                            // open. In particular a cold browser must not start
+                            // or wait behind representation preparation merely
+                            // to identify the already-mounted native owner.
+                            let _owner = backend_host.operation_guard()?.ok_or_else(|| {
+                                dfs_browser_service_error("DFS component owner is unavailable")
+                            })?;
+                            let state = sinomo_core::cluster::read_cluster_state_without_kv(
+                                &ClusterPaths::new(&task_data_dir),
+                            )
+                            .map_err(dfs_browser_service_error)?;
+                            return Ok(crate::DaemonDfsBrowserStatusResponse {
+                                node_id: state.local_node_id.to_string(),
+                                health: None,
+                                health_error: None,
+                            });
+                        }
                         let backend = DfsBrowserBackend::for_data_dir(
                             task_data_dir,
                             &runtime,
@@ -3927,7 +3945,7 @@ mod tests {
             .unwrap();
             let service = HostedDfsBrowserService::new(
                 Some(tokio::runtime::Handle::current()),
-                Arc::new(UnusedHost::default()),
+                dfs_browser_component_host(&data_dir).unwrap(),
             );
             tokio::time::timeout(Duration::from_secs(1), service.handle(ctx, request))
                 .await
@@ -3941,6 +3959,159 @@ mod tests {
         drop(slot);
         drop(backend);
         native.close().expect("normal native browser shutdown");
+    }
+
+    #[test]
+    fn cold_hosted_node_identity_does_not_enter_storage_preparation() {
+        struct Sink(tokio::sync::oneshot::Sender<sinomo_core::network::ObjectRpcOutgoingResponse>);
+        impl sinomo_core::service::ResponseSink for Sink {
+            fn send(
+                self: Box<Self>,
+                response: sinomo_core::network::ObjectRpcOutgoingResponse,
+            ) -> Result<(), ServiceError> {
+                self.0
+                    .send(response)
+                    .map_err(|_| ServiceError::Service("test response dropped".into()))
+            }
+        }
+        let root = sinomo_testdir::TestDir::new("native-cold-browser-identity-pending-storage");
+        let data = Arc::new(SinomoDataDir::new(root.path()));
+        let (native, node) = crate::test_support::DfsTestRuntime::start_single_node_in_data_dir(
+            "native-cold-browser-identity-pending-storage",
+            (*data).clone(),
+        )
+        .unwrap();
+        let host = dfs_browser_component_host(&data).unwrap();
+        let slot = browser_backend_slot(&data).unwrap();
+        assert!(
+            slot.backend.lock().unwrap().is_none(),
+            "this regression must exercise a cold browser"
+        );
+        assert_eq!(dfs_browser_backend_open_count(&data), 0);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        // A negative-only representation barrier. It never supplies readiness,
+        // progress, a receipt or authority, and does not alter retained DATA.
+        let blocked = crate::register_dfs_storage_preparation_provider(
+            data.root(),
+            Arc::new(move |_, _, budget| {
+                assert_eq!(budget, crate::DFS_STORAGE_PREPARATION_RECORD_BUDGET);
+                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(crate::DfsStoragePreparation::Pending {
+                    processed_records: 0,
+                })
+            }),
+            None,
+        )
+        .unwrap();
+        let retired_host = Arc::clone(&host);
+        let hosted = HostedDfsBrowserService::new(Some(native.runtime_handle()), host);
+        let (outcome, response, health_result) = admission_runtime().block_on(async {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let ctx = ServiceContext::new(
+                data.clone(),
+                None,
+                ServiceSigner::Local,
+                sinomo_core::network::ObjectRpcIncomingBody::empty(),
+                Box::new(Sink(tx)),
+            );
+            let request = ObjectRpcRequest::encode_body(
+                DAEMON_DFS_BROWSER_STATUS_ROUTE,
+                DAEMON_RPC_CATEGORY,
+                &crate::DaemonDfsBrowserStatusRequest::node_only(),
+            )
+            .unwrap();
+            let cold_initialization = slot.backend.lock().unwrap();
+            assert!(cold_initialization.is_none());
+            let outcome =
+                tokio::time::timeout(Duration::from_secs(1), hosted.handle(ctx, request)).await;
+            drop(cold_initialization);
+            let response = if matches!(&outcome, Ok(Ok(_))) {
+                let response = rx.await.unwrap();
+                let bytes = response.body.collect_to_vec(16 * 1024).await.unwrap();
+                let status: crate::DaemonDfsBrowserStatusResponse =
+                    sinomo_core::network::ObjectRpcResponse::from_encoded_body(
+                        response.response.route,
+                        bytes,
+                    )
+                    .decode_body()
+                    .unwrap();
+                assert_eq!(
+                    dfs_browser_backend_open_count(&data),
+                    0,
+                    "identity performs no browser storage open; autonomous Main preparation is separate"
+                );
+                Some(status)
+            } else {
+                None
+            };
+            let (tx, _rx) = tokio::sync::oneshot::channel();
+            let ctx = ServiceContext::new(
+                data.clone(),
+                None,
+                ServiceSigner::Local,
+                sinomo_core::network::ObjectRpcIncomingBody::empty(),
+                Box::new(Sink(tx)),
+            );
+            let request = ObjectRpcRequest::encode_body(
+                DAEMON_DFS_BROWSER_STATUS_ROUTE,
+                DAEMON_RPC_CATEGORY,
+                &crate::DaemonDfsBrowserStatusRequest::with_health(),
+            )
+            .unwrap();
+            let health =
+                tokio::time::timeout(Duration::from_secs(1), hosted.handle(ctx, request)).await;
+            assert_eq!(dfs_browser_backend_open_count(&data), 1,
+                "the actual health request calibrates the same browser-open observer");
+            (outcome, response, health)
+        });
+        drop(blocked);
+        drop(hosted);
+        drop(slot);
+        native.close().unwrap();
+        assert!(ClusterPaths::new(&data).state.exists());
+        admission_runtime().block_on(async {
+            let retired =
+                HostedDfsBrowserService::new(Some(tokio::runtime::Handle::current()), retired_host);
+            let (tx, _rx) = tokio::sync::oneshot::channel();
+            let ctx = ServiceContext::new(
+                data.clone(),
+                None,
+                ServiceSigner::Local,
+                sinomo_core::network::ObjectRpcIncomingBody::empty(),
+                Box::new(Sink(tx)),
+            );
+            let request = ObjectRpcRequest::encode_body(
+                DAEMON_DFS_BROWSER_STATUS_ROUTE,
+                DAEMON_RPC_CATEGORY,
+                &crate::DaemonDfsBrowserStatusRequest::node_only(),
+            )
+            .unwrap();
+            let error = tokio::time::timeout(Duration::from_secs(1), retired.handle(ctx, request))
+                .await
+                .expect("retired identity rejection stays bounded")
+                .expect_err("a saved node identity cannot replace the retired component owner");
+            assert!(error.to_string().contains("no longer active"), "{error}");
+            assert_eq!(
+                dfs_browser_backend_open_count(&data),
+                1,
+                "retired owner rejection must precede a storage open"
+            );
+        });
+        outcome
+            .expect("node-only status retains its existing one-second test budget")
+            .expect("cold node identity must not open the metadata backend");
+        let response = response.unwrap();
+        assert_eq!(response.node_id, node.to_string());
+        assert!(response.health.is_none() && response.health_error.is_none());
+        assert!(
+            matches!(health_result, Ok(Err(_))),
+            "actual health must remain unavailable behind storage preparation"
+        );
+        assert!(
+            calls.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "health still observes the real negative preparation boundary"
+        );
     }
 
     #[test]

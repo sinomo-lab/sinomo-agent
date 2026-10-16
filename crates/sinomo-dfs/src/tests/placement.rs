@@ -910,6 +910,23 @@ fn placement_reconciliation_resumes_durable_phase_and_updates_existing_file() {
         DfsObjectPolicy::ReplicatedEventual
     );
 
+    // The published job also wakes normal Main. Keep its lifecycle work out
+    // of this fixture's explicit first page and stopped checkpoint; otherwise
+    // Main can correctly finish before the test observes a Repairing page.
+    let data = runtime.data_dir(&local);
+    crate::runtime_host::daemon_dfs_mutation_scheduler(data)
+        .unwrap()
+        .request_foreground_admission();
+    let lifecycle = crate::runtime_host::daemon_default_dfs_lifecycle_gate(&data.root()).unwrap();
+    let first_page_owner = runtime.runtime_handle().block_on(async {
+        tokio::time::timeout(
+            sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+            lifecycle.lock_owned(),
+        )
+        .await
+        .expect("normal lifecycle admission before publishing the fixture job")
+    });
+
     let now = dfs_now_unix_nanos();
     let job = control_plane.with_client(|kv| {
         let mut store = DfsControlPlaneStore::new(kv.as_mut());
@@ -977,6 +994,7 @@ fn placement_reconciliation_resumes_durable_phase_and_updates_existing_file() {
     drop(service);
 
     runtime.stop_node(&local).unwrap();
+    drop(first_page_owner);
     runtime.reopen_node(local.clone()).unwrap();
     let mut reopened = runtime.client(&local).unwrap();
     let mut completed = None;

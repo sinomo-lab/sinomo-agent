@@ -6,7 +6,6 @@ use crate::metadata_records::{
 };
 use crate::metadata_table_store::{
     metadata_table_snapshot_path, metadata_tables_from_table_snapshot, metadata_tables_snapshot,
-    snapshot_semantic_fingerprint,
 };
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -247,7 +246,8 @@ impl DfsMetadataCandidateWriter {
 pub fn read_metadata_candidate(root: &Path) -> Result<DfsMetadataTableSnapshot> {
     let path = metadata_table_snapshot_path(root);
     let file = File::open(&path).map_err(|source| MetadataBackendError::Io { path, source })?;
-    let state = crate::metadata_snapshot::read_snapshot(root, file)?;
+    let (state, fingerprint) =
+        crate::metadata_snapshot::read_snapshot_with_verified_fingerprint(root, file)?;
     let proof = state
         .prefix_proof
         .ok_or_else(|| MetadataBackendError::Serde("current image has no prefix".into()))?;
@@ -257,7 +257,7 @@ pub fn read_metadata_candidate(root: &Path) -> Result<DfsMetadataTableSnapshot> 
     Ok(DfsMetadataTableSnapshot {
         format_version: crate::metadata_table_store::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
         materialized_through_sequence: sequence,
-        semantic_state_fingerprint: snapshot_semantic_fingerprint(&state.tables, Some(sequence))?,
+        semantic_state_fingerprint: fingerprint,
         tables: Box::new(metadata_tables_snapshot(&state.tables)),
         prefix_proof: proof,
     })
@@ -269,15 +269,7 @@ pub fn read_metadata_candidate(root: &Path) -> Result<DfsMetadataTableSnapshot> 
 pub fn read_metadata_candidate_image(root: &Path) -> Result<crate::DfsMetadataSnapshotImage> {
     let path = metadata_table_snapshot_path(root);
     let file = File::open(&path).map_err(|source| MetadataBackendError::Io { path, source })?;
-    let state = crate::metadata_snapshot::read_snapshot(root, file)?;
-    let proof = state
-        .prefix_proof
-        .as_ref()
-        .ok_or_else(|| MetadataBackendError::Serde("current candidate has no prefix".into()))?;
-    let sequence = state
-        .materialized_through_sequence
-        .ok_or_else(|| MetadataBackendError::Serde("current candidate has no cut".into()))?;
-    crate::DfsMetadataSnapshotImage::capture(root, &state.tables, sequence, proof)
+    crate::DfsMetadataSnapshotImage::capture_existing(root, file)
 }
 
 /// Stage actual native image DATA with the ordinary candidate lock/parser and
@@ -288,14 +280,8 @@ pub fn write_metadata_candidate_image(
     fs: &crate::DfsFileSystemId,
 ) -> Result<DfsMetadataCandidateIdentity> {
     image.validate_file_system(fs)?;
-    let state = image.state()?;
     let writer = DfsMetadataCandidateWriter::open(root)?;
-    crate::metadata_snapshot::persist_snapshot(
-        &writer.root,
-        &state.tables,
-        Some(image.materialized_through_sequence),
-        Some(&image.prefix_proof),
-    )?;
+    image.install_candidate_copy(&writer.root)?;
     inspect_metadata_candidate(root)
 }
 
@@ -324,8 +310,21 @@ pub async fn receive_metadata_candidate_image(
 }
 pub fn inspect_metadata_candidate(root: &Path) -> Result<DfsMetadataCandidateIdentity> {
     use std::io::Read;
-    let snapshot = read_metadata_candidate(root)?;
+    // Inspect the actual native rows once and retain that verified result. An
+    // identity query needs no second table projection or semantic serialization.
     let path = metadata_table_snapshot_path(root);
+    let file = File::open(&path).map_err(|source| MetadataBackendError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    let (state, fingerprint) =
+        crate::metadata_snapshot::read_snapshot_with_verified_fingerprint(root, file)?;
+    let proof = state
+        .prefix_proof
+        .ok_or_else(|| MetadataBackendError::Serde("current image has no prefix".into()))?;
+    state
+        .materialized_through_sequence
+        .ok_or_else(|| MetadataBackendError::Serde("current image has no cut".into()))?;
     let mut file = File::open(&path).map_err(|source| MetadataBackendError::Io {
         path: path.clone(),
         source,
@@ -345,9 +344,9 @@ pub fn inspect_metadata_candidate(root: &Path) -> Result<DfsMetadataCandidateIde
         hasher.update(&buffer[..count]);
     }
     Ok(DfsMetadataCandidateIdentity {
-        state_fingerprint: snapshot.semantic_state_fingerprint,
+        state_fingerprint: fingerprint,
         file_fingerprint: format!("blake3:{}", hasher.finalize().to_hex()),
-        prefix_proof: snapshot.prefix_proof,
+        prefix_proof: proof,
     })
 }
 

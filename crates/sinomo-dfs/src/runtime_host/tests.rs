@@ -443,6 +443,24 @@ fn mounted_mutation_classifier_fences_live_work_and_recovery_retains_bounded_pas
 
     let claim = store
         .try_claim_recovery(&marker_id)
+        .expect("reclaim exact marker for retained continuation")
+        .expect("same exact recovery claim");
+    complete_daemon_dfs_mounted_mutation_recovery(
+        DaemonDfsMountedMutationRecoveryBatch::from_claims_for_test(vec![claim], Vec::new(), false),
+        DaemonDfsMaintenanceTickOutcome::Continued,
+    )
+    .expect("retain unfinished checkpoint marker");
+    assert!(matches!(
+        store
+            .marker(&marker_id)
+            .expect("marker")
+            .expect("same marker")
+            .phase,
+        sinomo_dfs::MountedSifsMutationOutboxPhase::Captured { .. }
+    ));
+
+    let claim = store
+        .try_claim_recovery(&marker_id)
         .expect("reclaim exact marker")
         .expect("exact recovery claim");
     complete_daemon_dfs_mounted_mutation_recovery(
@@ -4955,6 +4973,7 @@ fn repair_reconciliation_retains_bounded_pass_and_exact_namespace_compaction_sco
             .unwrap();
     for outcome in [
         DaemonDfsMaintenanceTickOutcome::Deferred,
+        DaemonDfsMaintenanceTickOutcome::Continued,
         DaemonDfsMaintenanceTickOutcome::Completed {
             reached_limit: true,
         },
@@ -11070,21 +11089,6 @@ fn daemon_dfs_resident_mutation_lanes_are_scoped_by_exact_shard() {
         .unwrap();
     assert_eq!(root_shard.primary_node_id, local);
     assert_eq!(services_shard.primary_node_id, local);
-    let peer_snapshot = read_daemon_dfs_message_peer_snapshot(&cluster_paths)
-        .unwrap()
-        .expect("actual native peer projection");
-    let warm = runtime
-        .block_on(warm_daemon_dfs_metadata_authority_for_peer_snapshot_async(
-            &cluster_paths,
-            &peer_snapshot,
-            &runtime,
-        ))
-        .unwrap();
-    let scheduler = daemon_dfs_mutation_scheduler(&data_dir).unwrap();
-    let admission = runtime
-        .block_on(scheduler.admit(&DfsMessageExecutionScope::GlobalExclusive))
-        .expect("normal global generation admission");
-    let preflight = warm.for_admission(&admission);
     let root_key = DaemonDfsMutationLaneKey {
         file_system_id: root_shard.file_system_id.clone(),
         shard_id: DfsMetadataShardId::new(root_shard.shard_id.clone()),
@@ -11093,60 +11097,152 @@ fn daemon_dfs_resident_mutation_lanes_are_scoped_by_exact_shard() {
         file_system_id: services_shard.file_system_id.clone(),
         shard_id: DfsMetadataShardId::new(services_shard.shard_id.clone()),
     };
-    let (had_root, had_services, prior_global, prior_exact_count) = {
-        let cache_slot = daemon_dfs_message_service_cache()
-            .root(&data_dir.root())
-            .expect("actual root cache slot");
-        let cache = cache_slot.lock().unwrap();
-        let entry = cache.as_ref().expect("normal Main resident generation");
-        (
-            entry.exact_shard_services.contains_key(&root_key),
-            entry.exact_shard_services.contains_key(&services_key),
-            entry.primary_service.clone(),
-            entry.exact_shard_services.len(),
-        )
-    };
-    let opens_before = daemon_dfs_test_message_service_lane_open_count(&data_dir);
-    let select = |kind| {
-        let rollover = matches!(&kind, DaemonDfsMessageLaneKind::MutationGlobal);
-        daemon_dfs_message_lane(
-            &data_dir,
-            &cluster_paths,
-            &peer_snapshot,
-            &runtime,
-            kind,
-            rollover,
-            Some(&preflight),
-        )
-        .map(|(lane, _)| lane)
-        .expect("normal admitted resident lane selection")
-    };
-    let root_lane = select(DaemonDfsMessageLaneKind::MutationExact(root_key.clone()));
-    let same_root_lane = select(DaemonDfsMessageLaneKind::MutationExact(root_key.clone()));
-    let services_lane = select(DaemonDfsMessageLaneKind::MutationExact(services_key));
-    let added_exact = usize::from(!had_root) + usize::from(!had_services);
-    {
-        let cache_slot = daemon_dfs_message_service_cache()
-            .root(&data_dir.root())
-            .expect("actual root cache slot");
-        let cache = cache_slot.lock().unwrap();
-        let entry = cache.as_ref().unwrap();
-        assert_eq!(
-            entry.exact_shard_services.len(),
-            prior_exact_count + added_exact
-        );
-        match (&prior_global, &entry.primary_service) {
-            (Some(before), Some(after)) => assert!(Arc::ptr_eq(before, after)),
-            (None, None) => {}
-            _ => panic!("exact selection changed the all-shard service"),
+    let scheduler = daemon_dfs_mutation_scheduler(&data_dir).unwrap();
+    let deadline = tokio::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    let mut replans = 0;
+    let (
+        peer_snapshot,
+        admission,
+        preflight,
+        root_lane,
+        same_root_lane,
+        services_lane,
+        global_lane,
+        prior_global,
+        opens_before,
+        added_exact,
+    ) = loop {
+        let peer_snapshot = read_daemon_dfs_message_peer_snapshot(&cluster_paths)
+            .unwrap()
+            .expect("actual native peer projection");
+        let warm = runtime.block_on(async {
+            tokio::time::timeout_at(
+                deadline,
+                warm_daemon_dfs_metadata_authority_for_peer_snapshot_async(
+                    &cluster_paths,
+                    &peer_snapshot,
+                    &runtime,
+                ),
+            )
+            .await
+            .expect("original native preflight budget")
+            .unwrap()
+        });
+        let admission = runtime.block_on(async {
+            tokio::time::timeout_at(
+                deadline,
+                scheduler.admit(&DfsMessageExecutionScope::GlobalExclusive),
+            )
+            .await
+            .expect("original native admission budget")
+            .unwrap()
+        });
+        let preflight = warm.for_admission(&admission);
+        let selected = (|| -> Result<_, DaemonDfsAuthorityPreExecutionError> {
+            let (had_root, had_services, prior_global, prior_exact_count) = {
+                let cache_slot = daemon_dfs_message_service_cache()
+                    .root(&data_dir.root())
+                    .expect("actual root cache slot");
+                let cache = cache_slot.lock().unwrap();
+                let entry = cache.as_ref().expect("normal Main resident generation");
+                (
+                    entry.exact_shard_services.contains_key(&root_key),
+                    entry.exact_shard_services.contains_key(&services_key),
+                    entry.primary_service.clone(),
+                    entry.exact_shard_services.len(),
+                )
+            };
+            let opens_before = daemon_dfs_test_message_service_lane_open_count(&data_dir);
+            let select = |kind| {
+                let rollover = matches!(&kind, DaemonDfsMessageLaneKind::MutationGlobal);
+                daemon_dfs_message_lane_with_typed_preflight_for_test(
+                    &data_dir,
+                    &cluster_paths,
+                    &peer_snapshot,
+                    &runtime,
+                    kind,
+                    rollover,
+                    &preflight,
+                )
+            };
+            let root_lane = select(DaemonDfsMessageLaneKind::MutationExact(root_key.clone()))?;
+            let same_root_lane = select(DaemonDfsMessageLaneKind::MutationExact(root_key.clone()))?;
+            let services_lane = select(DaemonDfsMessageLaneKind::MutationExact(
+                services_key.clone(),
+            ))?;
+            let added_exact = usize::from(!had_root) + usize::from(!had_services);
+            {
+                let cache_slot = daemon_dfs_message_service_cache()
+                    .root(&data_dir.root())
+                    .expect("actual root cache slot");
+                let cache = cache_slot.lock().unwrap();
+                let entry = cache.as_ref().unwrap();
+                assert_eq!(
+                    entry.exact_shard_services.len(),
+                    prior_exact_count + added_exact
+                );
+                match (&prior_global, &entry.primary_service) {
+                    (Some(before), Some(after)) => assert!(Arc::ptr_eq(before, after)),
+                    (None, None) => {}
+                    _ => panic!("exact selection changed the all-shard service"),
+                }
+            }
+            assert_eq!(
+                daemon_dfs_test_message_service_lane_open_count(&data_dir),
+                opens_before + added_exact,
+                "exact selection opens only absent request shells"
+            );
+            let global_lane = select(DaemonDfsMessageLaneKind::MutationGlobal)?;
+
+            Ok((
+                root_lane,
+                same_root_lane,
+                services_lane,
+                global_lane,
+                prior_global,
+                opens_before,
+                added_exact,
+            ))
+        })();
+        match selected {
+            Ok((
+                root_lane,
+                same_root_lane,
+                services_lane,
+                global_lane,
+                prior_global,
+                opens_before,
+                added_exact,
+            )) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "original lane setup budget"
+                );
+                break (
+                    peer_snapshot,
+                    admission,
+                    preflight,
+                    root_lane,
+                    same_root_lane,
+                    services_lane,
+                    global_lane,
+                    prior_global,
+                    opens_before,
+                    added_exact,
+                );
+            }
+            Err(DaemonDfsAuthorityPreExecutionError::AuthorityPreflightStale(_)) => {
+                // Match the normal pre-execution replan bound. No storage error
+                // is retried and no admission is retained through refresh.
+                drop(admission);
+                replans += 1;
+                assert!(replans <= 2, "normal pre-execution replan limit");
+            }
+            Err(DaemonDfsAuthorityPreExecutionError::Failed(error)) => {
+                panic!("normal admitted resident lane selection: {error}")
+            }
         }
-    }
-    assert_eq!(
-        daemon_dfs_test_message_service_lane_open_count(&data_dir),
-        opens_before + added_exact,
-        "exact selection opens only absent request shells"
-    );
-    let global_lane = select(DaemonDfsMessageLaneKind::MutationGlobal);
+    };
     assert!(Arc::ptr_eq(&root_lane, &same_root_lane));
     assert!(!Arc::ptr_eq(&root_lane, &services_lane));
     assert!(!Arc::ptr_eq(&root_lane, &global_lane) && !Arc::ptr_eq(&services_lane, &global_lane));
@@ -15434,9 +15530,21 @@ fn default_cluster_metadata_shard_transfers_after_candidate_replays_current_jour
     let completion_deadline = Instant::now() + Duration::from_secs(5);
     let explicit = source
         .reconcile_pending_metadata_shard_membership_handoffs(&configs, Duration::from_secs(5));
-    let completed = fixture
-        .observe_completed_native_handoff(&control, &handoff, completion_deadline)
-        .expect("observe the original native handoff proof");
+    // This explicit caller can return zero while the normal Main owner is
+    // completing the SAME handoff. Keep observing its full proof and local
+    // freeze boundary within the original shared completion deadline.
+    let completed = loop {
+        let completed = fixture
+            .observe_completed_native_handoff(&control, &handoff, completion_deadline)
+            .expect("observe the original native handoff proof");
+        if completed.is_some() || Instant::now() >= completion_deadline {
+            break completed;
+        }
+        std::thread::sleep(
+            Duration::from_millis(1)
+                .min(completion_deadline.saturating_duration_since(Instant::now())),
+        );
+    };
     assert_eq!(
         completed.as_ref(),
         Some(&desired),
@@ -17344,4 +17452,55 @@ fn daemon_smoke_revalidates_a_concurrently_advanced_metadata_cache() {
     assert_eq!(report.committed_replica_node_ids, vec![local]);
     assert_eq!(report.attempts.len(), 1);
     assert!(report.attempts[0].committed);
+}
+
+#[test]
+fn actual_runtime_shutdown_cancels_running_maintenance_with_open_component_watch() {
+    let (native, nodes) = crate::test_runtime::DfsTestRuntime::start_cluster(
+        "native-runtime-shutdown-maintenance-owner",
+        1,
+    )
+    .unwrap();
+    let data = native.data_dir(&nodes[0]).clone();
+    let host = registered_dfs_runtime_host(&data).unwrap().unwrap();
+    let scheduler = daemon_dfs_mutation_scheduler(&data).unwrap();
+    let runtime = native.runtime_handle();
+    let held = runtime
+        .block_on(scheduler.admit(&DfsMessageExecutionScope::GlobalExclusive))
+        .unwrap();
+    let (component_stop, component_watch) = tokio::sync::watch::channel(false);
+    let task = runtime.spawn(run_daemon_dfs_maintenance_tick_in_blocking_task(
+        DfsRuntimePaths::new(&data),
+        runtime.clone(),
+        sinomo_device::NodeResourceSnapshot::default(),
+        component_watch,
+    ));
+    runtime.block_on(async {
+        tokio::time::timeout(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT, async {
+            while scheduler.maintenance_interest_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("actual blocking maintenance reached admission while the writer is held");
+    });
+    let outcome = runtime.block_on(host.shutdown_and_wait(
+        tokio::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+    ));
+    // Cleanup also drains the old failing implementation before asserting.
+    component_stop.send_replace(true);
+    drop(held);
+    runtime.block_on(async {
+        let _ = tokio::time::timeout(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT, task).await;
+        host.shutdown_and_wait(
+            tokio::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+        )
+        .await
+        .unwrap();
+    });
+    native.close().unwrap();
+    assert!(
+        outcome.is_ok(),
+        "runtime cancellation must wake its already-running blocking child independently of the component watch: {outcome:?}"
+    );
 }

@@ -685,12 +685,25 @@ pub fn read_current_metadata_table_log_prefix(
             prefix = decode_current_metadata_table_batch(&record.bytes, &path)?.prefix_proof;
         }
     }
-    if !before.is_compatible_with(&metadata_table_storage_generation(root)?) {
-        return Err(MetadataBackendError::Serde(
-            "current metadata log generation changed during layout classification".into(),
-        ));
-    }
+    require_stable_current_metadata_layout(root, &before)?;
     Ok(prefix)
+}
+
+#[cfg(feature = "storage-conversion")]
+fn require_stable_current_metadata_layout(
+    root: &Path,
+    before: &MetadataTableStorageGeneration,
+) -> Result<()> {
+    if !before.is_compatible_with(&metadata_table_storage_generation(root)?) {
+        // A live producer replaced the observed layout. No prefix or Ready is
+        // established by this attempt; the normal bounded lifecycle reselects
+        // the current generation. Stable malformed records remain decoder errors.
+        return Err(MetadataBackendError::StoragePreparationPending {
+            root: root.to_owned(),
+            processed_records: 0,
+        });
+    }
+    Ok(())
 }
 
 #[tracing::instrument(target = "sinomo.perf", level = "trace", name = "dfs.metadata.table_replay",
@@ -1394,6 +1407,27 @@ pub(crate) fn truncate_metadata_table_log(root: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    #[cfg(feature = "storage-conversion")]
+    #[test]
+    fn current_layout_change_yields_typed_pending_without_accepting_the_old_generation() {
+        let directory = sinomo_testdir::TestDir::new("current-layout-replaced-during-observation");
+        let root = directory.path();
+        let before = super::metadata_table_storage_generation(root).unwrap();
+        let snapshot = super::metadata_table_snapshot_path(root);
+        std::fs::create_dir_all(snapshot.parent().unwrap()).unwrap();
+        // Negative physical replacement only; these bytes grant no layout or
+        // publication authority and are never accepted as a current snapshot.
+        let replacement = b"unclassified replacement generation";
+        std::fs::write(&snapshot, replacement).unwrap();
+        let result = super::require_stable_current_metadata_layout(root, &before);
+        assert!(
+            matches!(result, Err(crate::MetadataBackendError::StoragePreparationPending {
+            root: actual, processed_records: 0,
+        }) if actual == root)
+        );
+        assert_eq!(std::fs::read(snapshot).unwrap(), replacement);
+    }
     use super::*;
     fn genesis() -> DfsMetadataPrefixProof {
         crate::metadata_records::dfs_metadata_prefix_proof_genesis(&crate::DfsMetadataShardId::new(

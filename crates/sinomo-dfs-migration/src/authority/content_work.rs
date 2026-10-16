@@ -1764,6 +1764,9 @@ mod tests {
         else {
             panic!("actual native plan required");
         };
+        if matches!(setup, NativeContentSetup::Published) {
+            crate::authority::plan_file::assert_exact_native_plan_retention(&plan);
+        }
         let staged = runtime
             .authority
             .commit(plan.stage_request.clone())
@@ -1784,7 +1787,38 @@ mod tests {
                 &source_fence,
             )
             .unwrap()
-            .expect("actual same source fence must commit");
+            .unwrap_or_else(|| {
+                let keys = [
+                    sinomo_dfs::metadata_shard_key(&fs, &shard.0),
+                    sinomo_dfs::metadata_shard_membership_handoff_key(&fs, &shard.0),
+                    sinomo_dfs::metadata_shard_operation_floor_key(&fs, &shard.0),
+                    sinomo_dfs::metadata_shard_head_watermark_key(&fs, &shard.0),
+                ];
+                let observed = runtime.authority.read_exact(&keys).unwrap();
+                // A concurrent normal Main owner can publish this exact fence
+                // first. A missed CAS grants nothing: accept only the complete
+                // intended handoff from the fresh authoritative read above.
+                let active: sinomo_dfs::DfsMetadataShardConfig = observed.0[0]
+                    .entry
+                    .as_ref()
+                    .expect("actual current assignment")
+                    .decode()
+                    .unwrap();
+                let actual: sinomo_dfs::DfsMetadataShardMembershipHandoff = observed.0[1]
+                    .entry
+                    .as_ref()
+                    .expect("actual original import handoff")
+                    .decode()
+                    .unwrap();
+                let mut expected = plan.expected_handoff.clone();
+                expected.retiring_primary_fence = Some(source_fence.clone());
+                assert_eq!(active, expected.retiring_shard);
+                assert_eq!(
+                    actual, expected,
+                    "a competing or incomplete fence is not confirmation"
+                );
+                actual
+            });
         assert!(NativeImportAuthority::content_handoff_matches_plan(
             &pending,
             &plan.expected_handoff,
@@ -2157,6 +2191,37 @@ mod tests {
                 .is_err(),
             "a plan context must not substitute for actual current byte verification"
         );
+        // These cases validate unchanged/changed ancestry bytes. Hold the
+        // actual native source fence so a concurrent Main writer cannot turn
+        // a semantic rejection into an unrelated no-progress contention result.
+        // This is source custody only; the real peer RPC still supplies every
+        // signer, assignment, floor, snapshot and prefix check.
+        let peer_source_root = sinomo_dfs::local_dfs_metadata_shard_path(
+            native.data_dir(&peer),
+            &request.source.scope_shard,
+        );
+        let retain_peer_source = || {
+            let deadline =
+                std::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+            loop {
+                match crate::metadata::retain_source_fence(&peer_source_root) {
+                    Ok(fence) => break fence,
+                    Err(MetadataBackendError::StoragePreparationPending {
+                        processed_records: 0,
+                        ..
+                    }) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(
+                            std::time::Duration::from_millis(1)
+                                .min(deadline.saturating_duration_since(std::time::Instant::now())),
+                        );
+                    }
+                    result => panic!(
+                        "native source custody must be available within the unchanged network budget: {result:?}"
+                    ),
+                }
+            }
+        };
+        let peer_source_fence = (!unpublished_peer).then(&retain_peer_source);
         let old_floor_ledger = if !unpublished_peer {
             let peer_context = native.component_context(&peer).unwrap();
             let peer_runtime = canonical_migration_runtime(&peer_context);
@@ -2275,10 +2340,13 @@ mod tests {
         } else {
             None
         };
-        // No peer context/runtime/data-owner borrow is retained by this fixture.
+        drop(peer_source_fence);
+        // No peer context/runtime/data-owner borrow or source fence is retained
+        // by this fixture across the actual stop/reopen boundary.
         native.stop_node(&peer).unwrap();
         native.reopen_node(peer.clone()).unwrap();
         if let Some((floor_path, old_bytes)) = &old_floor_ledger {
+            let _source_fence = retain_peer_source();
             let data = request.import_plan.as_ref().unwrap();
             // The normal repeat challenge and staged snapshot/prefix receiver
             // MUST re-read the old ledger; content-context Ready is insufficient.

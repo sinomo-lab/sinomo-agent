@@ -465,6 +465,25 @@ impl AsMut<dyn DfsMetadataBackend> for DfsMetadataBackendOwner {
 }
 
 impl DfsMetadataBackendOwner {
+    /// Only native resident maintenance uses nonblocking physical snapshot
+    /// admission. Other backend owners retain their existing read contract.
+    pub(crate) fn try_begin_resident_read_snapshot_for_path(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        path: &str,
+    ) -> crate::metadata_error::Result<bool> {
+        match self {
+            Self::Owned(backend) => {
+                backend.begin_consistent_read_snapshot_for_path(file_system_id, path)?;
+                Ok(true)
+            }
+            Self::ResidentShard(lease) => lease.try_begin_resident_read_snapshot(),
+            Self::ResidentSharded(lease) => {
+                lease.try_begin_resident_read_snapshot_for_path(file_system_id, path)
+            }
+        }
+    }
+
     pub(crate) fn resident_exact_shard_id(&self) -> Option<&DfsMetadataShardId> {
         match self {
             Self::ResidentShard(lease) => Some(lease.shard_id()),
@@ -526,6 +545,7 @@ pub struct NetworkedDfsService<T> {
     /// preemption or shell destruction cannot repeatedly rewind a settled prefix.
     pub(crate) write_intent_maintenance_scan:
         Arc<crate::metadata_intent_maintenance::DfsWriteIntentMaintenanceScanState>,
+    pub(crate) maintenance_progress: Arc<crate::maintenance::DfsMaintenanceProgressState>,
     pub(crate) routed_namespace_settle_depth: usize,
     pub(crate) cross_shard_namespace_locks: DfsCrossShardNamespaceLockRegistry,
     pub(crate) last_events: Vec<NetworkedDfsServiceEvent>,

@@ -533,102 +533,148 @@ fn fetch_response_reuses_existing_local_blob_without_rehashing_payload() {
 
 #[test]
 fn rejected_streamed_stage_does_not_reserve_version_for_later_valid_content() {
-    let root = temp_root("rejected-streamed-stage-does-not-reserve-version");
-    let owner = NodeId::from_legacy_named("node_streamed_stage_owner").expect("node");
-    let replica = NodeId::from_legacy_named("node_streamed_stage_replica").expect("node");
-    let object_id = DfsObjectId::from_legacy_named("obj_streamed_stage").expect("object");
-    let stale_version =
-        DfsVersion::from_legacy_named("version_streamed_stage_stale").expect("stale version");
-    let version_1 =
-        DfsVersion::from_legacy_named("version_streamed_stage_1").expect("base version");
-    let version_2 =
-        DfsVersion::from_legacy_named("version_streamed_stage_2").expect("target version");
-    let (_runtime, mut dfs) = native_sifs_service(
-        "rejected_streamed_stage_does_not_reserve_version_for_later_valid_content",
-        replica.clone(),
+    use crate::runtime_host::{
+        DaemonDfsPreDispatchTestPoint, install_daemon_dfs_pre_dispatch_test_hook,
+    };
+    use std::sync::{Arc, Mutex};
+    let (runtime, nodes) = crate::test_runtime::DfsTestRuntime::start_cluster(
+        "rejected-streamed-stage-native-base",
+        2,
+    )
+    .unwrap();
+    let owner = runtime
+        .metadata_shards()
+        .unwrap()
+        .into_iter()
+        .find(|shard| shard.shard_id == "root")
+        .unwrap()
+        .primary_node_id;
+    let replica = nodes.iter().find(|node| **node != owner).unwrap().clone();
+    let path = "/streamed-stage-base.bin";
+    let mut client = runtime.client(&owner).unwrap();
+    let base = client
+        .posix_write_file(
+            path,
+            b"actual native base",
+            DfsWriteOptions {
+                policy: DfsReplicationPolicy::new(1, 1).unwrap(),
+                replica_candidates: vec![owner.clone()],
+                wait_for_commit: true,
+                foreground_replica_repair: false,
+            },
+        )
+        .unwrap();
+    client.posix_sync_directory("/").unwrap();
+    drop(client);
+    let captured = Arc::new(Mutex::new(None::<DfsStageBlobCommand>));
+    let capture = Arc::clone(&captured);
+    let receiver_hook = install_daemon_dfs_pre_dispatch_test_hook(
+        runtime.data_dir(&replica),
+        Arc::new(move |point, command, _| {
+            if matches!(point, DaemonDfsPreDispatchTestPoint::BeforeExecute { .. })
+                && let Some(command) = command
+                && let DfsNetworkMessage::StageBlob(stage) = &command.routed_message.message
+            {
+                let mut saved = capture.lock().unwrap();
+                if saved.is_none() {
+                    *saved = Some(stage.clone());
+                }
+                return Err(DfsError::Cancelled {
+                    operation: "capture actual native Stage before receiver effects",
+                });
+            }
+            Ok(())
+        }),
     );
-    let mut metadata = file_metadata(owner.clone());
-    metadata.object_id = object_id.clone();
-    metadata.version = version_1.clone();
-    metadata.policy = DfsObjectPolicy::ReplicatedEventual;
-    metadata.current_locations = vec![owner.clone()];
-    dfs.add_object_metadata(metadata).expect("metadata");
+    let background = runtime
+        .deny_background_replica_before_claim(&owner)
+        .unwrap();
+    let valid_bytes = b"later valid streamed stage bytes";
+    let target_version = crate::namespace::next_version(&base.version);
+    let mut policy = DfsReplicationPolicy::new(2, 2).unwrap();
+    policy.required_node_ids = nodes.clone();
+    let mut writer = runtime.metadata_primary_service(path).unwrap();
+    let outcome = writer
+        .write_distributed_reader_with_candidates(
+            DfsWriteRequest {
+                file_system_id: base.file_system_id.clone(),
+                object_id: base.object_id.clone(),
+                target_version: target_version.clone(),
+                requesting_node_id: owner.clone(),
+            },
+            std::io::Cursor::new(valid_bytes),
+            nodes,
+            policy,
+            DfsDistributedWriteOptions::default(),
+        )
+        .unwrap();
+    let NetworkedDfsWriteOutcome::Pending { intent_id, .. } = outcome else {
+        panic!("actual denied Stage keeps W2 pending")
+    };
+    let stage = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("actual native Stage command");
+    assert_eq!(stage.intent_id, intent_id);
+    assert_eq!(stage.object_id, base.object_id);
+    assert_eq!(stage.version, target_version);
+    assert_eq!(stage.expected_base_version.as_ref(), Some(&base.version));
+    drop(receiver_hook);
+    let mut dfs = runtime.client(&replica).unwrap();
+    assert!(
+        dfs.content
+            .read_manifest(base.object_id.as_str(), target_version.as_str())
+            .is_err()
+    );
 
     let rejected_bytes = b"stale streamed stage bytes";
     let rejected_hash = content_hash(rejected_bytes);
     let mut rejected_ingest = dfs
         .content
-        .begin_quarantined_blob_ingest(rejected_bytes.len() as u64, Some(rejected_hash.as_str()))
-        .expect("begin rejected quarantine");
-    rejected_ingest
-        .write_chunk(rejected_bytes)
-        .expect("write rejected quarantine");
-    let rejected_blob = rejected_ingest
-        .finish_quarantined()
-        .expect("finish rejected quarantine");
+        .begin_quarantined_blob_ingest(rejected_bytes.len() as u64, Some(&rejected_hash))
+        .unwrap();
+    rejected_ingest.write_chunk(rejected_bytes).unwrap();
+    let rejected_blob = rejected_ingest.finish_quarantined().unwrap();
+    let mut stale = stage.clone();
+    stale.request_id.push_str("-negative-stale-base");
+    stale.expected_base_version =
+        Some(DfsVersion::from_legacy_named("version_streamed_stage_stale").unwrap());
+    assert_ne!(stale.expected_base_version, stage.expected_base_version);
+    stale.content_hash = rejected_hash;
     let rejected = dfs
-        .handle_preingested_stage_blob(
-            owner.clone(),
-            DfsStageBlobCommand {
-                request_id: "dfs_streamed_stage_rejected".to_string(),
-                intent_id: "dfs_streamed_stage_rejected_intent".to_string(),
-                file_system_id: sifs_file_system_id(),
-                object_id: object_id.clone(),
-                expected_base_version: Some(stale_version),
-                version: version_2.clone(),
-                content_hash: rejected_hash,
-                bytes: Vec::new(),
-                object_metadata: None,
-                authority_shard: None,
-            },
-            rejected_blob,
-        )
+        .handle_preingested_stage_blob(owner.clone(), stale, rejected_blob)
         .expect("rejected stage response event");
-    assert!(matches!(
-        rejected,
-        NetworkedDfsServiceEvent::BlobStageRejected { .. }
-    ));
+    assert!(
+        matches!(
+            &rejected,
+            NetworkedDfsServiceEvent::BlobStageRejected { reason, .. }
+                if reason.contains("stale DFS stage base")
+        ),
+        "the original stale-base check must reject before content persistence: {rejected:?}"
+    );
     assert!(
         dfs.content
-            .read_manifest(object_id.as_str(), version_2.as_str())
+            .read_manifest(base.object_id.as_str(), target_version.as_str())
             .is_err(),
         "rejected streamed stage must not reserve its requested version"
     );
 
-    let valid_bytes = b"later valid streamed stage bytes";
     let valid_hash = content_hash(valid_bytes);
+    assert_eq!(stage.content_hash, valid_hash);
     let mut valid_ingest = dfs
         .content
-        .begin_quarantined_blob_ingest(valid_bytes.len() as u64, Some(valid_hash.as_str()))
-        .expect("begin valid quarantine");
-    valid_ingest
-        .write_chunk(valid_bytes)
-        .expect("write valid quarantine");
-    let valid_blob = valid_ingest
-        .finish_quarantined()
-        .expect("finish valid quarantine");
+        .begin_quarantined_blob_ingest(valid_bytes.len() as u64, Some(&valid_hash))
+        .unwrap();
+    valid_ingest.write_chunk(valid_bytes).unwrap();
+    let valid_blob = valid_ingest.finish_quarantined().unwrap();
     let valid = dfs
-        .handle_preingested_stage_blob(
-            owner,
-            DfsStageBlobCommand {
-                request_id: "dfs_streamed_stage_valid".to_string(),
-                intent_id: "dfs_streamed_stage_valid_intent".to_string(),
-                file_system_id: sifs_file_system_id(),
-                object_id: object_id.clone(),
-                expected_base_version: Some(version_1),
-                version: version_2.clone(),
-                content_hash: valid_hash.clone(),
-                bytes: Vec::new(),
-                object_metadata: None,
-                authority_shard: None,
-            },
-            valid_blob,
-        )
+        .handle_preingested_stage_blob(owner, stage, valid_blob)
         .expect("valid stage response event");
     assert!(matches!(valid, NetworkedDfsServiceEvent::BlobStaged { .. }));
     let manifest = dfs
         .content
-        .read_manifest(object_id.as_str(), version_2.as_str())
+        .read_manifest(base.object_id.as_str(), target_version.as_str())
         .expect("valid stage manifest");
     assert_eq!(manifest.content_hash, valid_hash);
     assert_eq!(
@@ -637,8 +683,10 @@ fn rejected_streamed_stage_does_not_reserve_version_for_later_valid_content() {
             .expect("valid stage blob"),
         valid_bytes
     );
-
-    std::fs::remove_dir_all(root).ok();
+    drop(dfs);
+    drop(writer);
+    drop(background);
+    runtime.close().unwrap();
 }
 
 #[test]

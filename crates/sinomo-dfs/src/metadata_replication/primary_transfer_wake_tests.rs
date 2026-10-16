@@ -35,6 +35,28 @@ fn native_checkpoint_fixture(
             },
         )
         .unwrap();
+    // A W1 write return does not finish the producer's asynchronous journal
+    // publication. Observe the actual full-shard durability barrier before
+    // this fixture treats the saved peer cursor as a completed checkpoint.
+    let certificate = writer
+        .posix_sync_directory("/")
+        .unwrap()
+        .metadata_certificate;
+    assert_eq!(certificate.target.file_system_id, shard.file_system_id);
+    assert_eq!(
+        certificate.target.shard_id,
+        DfsMetadataShardId::new(shard.shard_id.clone())
+    );
+    assert_eq!(
+        certificate
+            .acknowledged_node_ids
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        std::iter::once(shard.primary_node_id.clone())
+            .chain(shard.replica_node_ids.iter().cloned())
+            .collect()
+    );
     drop(writer);
     // The browser retains its pre-write inspection image. Select the actual
     // owning Root journal that produced the acknowledged native write instead.
@@ -46,6 +68,7 @@ fn native_checkpoint_fixture(
         .unwrap()
         .journal_last_sequence()
         .unwrap();
+    assert_eq!(certificate.target.journal_sequence, head);
     drop(source);
     let mut reactor = DefaultDfsReconciliationRuntime::new(
         &ClusterPaths::new(&data_dir),

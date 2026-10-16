@@ -3087,6 +3087,9 @@ mod tests {
 
     #[test]
     fn nonleader_point_and_exact_set_forward_dispatch_bypasses_dynamic_kv_projection() {
+        let _registry_guard = crate::kv_read_model::TEST_NETWORK_MODULE_REGISTRY_LOCK
+            .lock()
+            .expect("network module registry lock");
         let (root, mut state) = forward_test_state(false);
         let data_dir = sinomo_local::SinomoDataDir::new(root.path());
         data_dir.ensure_root_layout().expect("data root");

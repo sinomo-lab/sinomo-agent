@@ -30,6 +30,7 @@ mod handoff;
 mod namespace_work;
 pub(crate) mod placement_job_source;
 mod placement_work;
+mod plan_file;
 mod plan_wire;
 mod routing_cache;
 pub(crate) mod source_retirement;
@@ -135,6 +136,7 @@ struct NativeImportAuthority {
     owner: Arc<sinomo_dfs::runtime_host::DfsDataOwnerLock>,
     namespace_work: Arc<Mutex<BTreeMap<String, namespace_work::JobOutcome>>>,
     content_plan_contexts: Arc<Mutex<content_work::verification_context::PlanContexts>>,
+    retained_plan_file: Arc<plan_file::RetainedPlanFile>,
     source_verifiers:
         Arc<Mutex<BTreeMap<PathBuf, Arc<Mutex<staged_service::SourceTransferVerifier>>>>>,
 }
@@ -588,9 +590,7 @@ impl MetadataImportAuthority for NativeImportAuthority {
             if !path.is_file() {
                 continue;
             }
-            let plan: MetadataImportPlan =
-                serde_json::from_slice(&std::fs::read(path).map_err(error)?).map_err(error)?;
-            Self::validate_plan(&plan)?;
+            let plan = self.retained_plan_file.read(&path)?;
             if plan.source_cut.scope_shard != *shard {
                 continue;
             }
@@ -691,11 +691,9 @@ impl MetadataImportAuthority for NativeImportAuthority {
         if !root.join("native-import-plan.json").exists() {
             return Ok(None);
         }
-        let plan: MetadataImportPlan = serde_json::from_slice(
-            &std::fs::read(root.join("native-import-plan.json")).map_err(error)?,
-        )
-        .map_err(error)?;
-        Self::validate_plan(&plan)?;
+        let plan = self
+            .retained_plan_file
+            .read(&root.join("native-import-plan.json"))?;
         let actual = self
             .check_handoff_state(&plan)?
             .ok_or_else(|| error("receiver activation ceased to be current"))?;
@@ -1180,11 +1178,9 @@ impl MetadataImportAuthority for NativeImportAuthority {
             &proposal.source_identity,
             &proposal.source_snapshot_fingerprint,
         )?;
-        let plan: MetadataImportPlan = serde_json::from_slice(
-            &std::fs::read(provenance_plan_root.join("native-import-plan.json")).map_err(error)?,
-        )
-        .map_err(error)?;
-        Self::validate_plan(&plan)?;
+        let plan = self
+            .retained_plan_file
+            .read(&provenance_plan_root.join("native-import-plan.json"))?;
         if digest(&plan.source_cut)? != digest(&proposal.source_cut)?
             || plan.stage_request != proposal.stage_request
             || plan.expected_handoff != proposal.expected_handoff
@@ -1313,9 +1309,7 @@ impl MetadataImportAuthority for NativeImportAuthority {
             &proposal.source_snapshot_fingerprint,
         )?;
         let path = provenance_plan_root.join("native-import-plan.json");
-        let plan: MetadataImportPlan =
-            serde_json::from_slice(&std::fs::read(&path).map_err(error)?).map_err(error)?;
-        Self::validate_plan(&plan)?;
+        let plan = self.retained_plan_file.read(&path)?;
         if digest(&plan.source_cut)? != digest(&proposal.source_cut)?
             || plan.stage_request != proposal.stage_request
             || plan.expected_handoff != proposal.expected_handoff
@@ -1767,6 +1761,7 @@ fn shared_runtime(
         owner: Arc::clone(&owner),
         namespace_work: Arc::new(Mutex::new(BTreeMap::new())),
         content_plan_contexts: Arc::new(Mutex::new(Default::default())),
+        retained_plan_file: Arc::new(Default::default()),
         source_verifiers: Arc::new(Mutex::new(BTreeMap::new())),
     });
     let value = Arc::new(MigrationRuntime {
@@ -2305,11 +2300,93 @@ mod provider_lifecycle_tests {
         native_released_namespace_source_reopens(false, false, false, true);
     }
 
+    #[test]
+    fn native_metadata_preparation_advances_multiple_batches_before_ready() {
+        native_released_namespace_source_reopens_scaled(false, false, false, false, 256, None);
+    }
+
+    #[test]
+    fn native_production_sized_metadata_preparation_keeps_original_browser_deadline() {
+        // An additional production-cardinality fixture, not a replacement for
+        // the existing 256-file test with its original five-second deadline.
+        native_released_namespace_source_reopens_with_browser_budget(
+            false,
+            false,
+            false,
+            false,
+            3072,
+            None,
+            Some(std::time::Duration::from_secs(60)),
+        );
+    }
+
+    #[test]
+    fn native_candidate_checkpoint_restarts_with_exact_source_and_real_authority() {
+        native_released_namespace_source_reopens_scaled(
+            false,
+            false,
+            false,
+            false,
+            0,
+            Some("source-cut.json"),
+        );
+    }
+
+    #[test]
+    fn native_proposal_checkpoint_restarts_with_exact_source_and_real_authority() {
+        native_released_namespace_source_reopens_scaled(
+            false,
+            false,
+            false,
+            false,
+            0,
+            Some("import-proposal.json"),
+        );
+    }
+
     fn native_released_namespace_source_reopens(
         omit_source_durability: bool,
         same_version_placement: bool,
         interrupt_metadata_confirmation: bool,
         retained_root_exchange: bool,
+    ) {
+        native_released_namespace_source_reopens_scaled(
+            omit_source_durability,
+            same_version_placement,
+            interrupt_metadata_confirmation,
+            retained_root_exchange,
+            0,
+            None,
+        );
+    }
+
+    fn native_released_namespace_source_reopens_scaled(
+        omit_source_durability: bool,
+        same_version_placement: bool,
+        interrupt_metadata_confirmation: bool,
+        retained_root_exchange: bool,
+        additional_source_files: usize,
+        pause_finalization: Option<&'static str>,
+    ) {
+        native_released_namespace_source_reopens_with_browser_budget(
+            omit_source_durability,
+            same_version_placement,
+            interrupt_metadata_confirmation,
+            retained_root_exchange,
+            additional_source_files,
+            pause_finalization,
+            None,
+        );
+    }
+
+    fn native_released_namespace_source_reopens_with_browser_budget(
+        omit_source_durability: bool,
+        same_version_placement: bool,
+        interrupt_metadata_confirmation: bool,
+        retained_root_exchange: bool,
+        additional_source_files: usize,
+        pause_finalization: Option<&'static str>,
+        production_browser_budget: Option<std::time::Duration>,
     ) {
         use sinomo_core::object::{LengthMode, serde_ext};
         use sinomo_dfs::{
@@ -2317,7 +2394,15 @@ mod provider_lifecycle_tests {
             DfsNamespacePathOccupantExpectation, DfsNamespaceTransaction,
             DfsPreparedOperationStatus, test_support::DfsTestRuntime,
         };
-        let name = if retained_root_exchange {
+        let name = if production_browser_budget.is_some() {
+            "native-production-sized-metadata-preparation"
+        } else if pause_finalization == Some("source-cut.json") {
+            "native-finalization-candidate-restart"
+        } else if pause_finalization.is_some() {
+            "native-finalization-proposal-restart"
+        } else if additional_source_files > 0 {
+            "native-metadata-preparation-multiple-batches"
+        } else if retained_root_exchange {
             "native-certified-retained-root-exchange-cold"
         } else if interrupt_metadata_confirmation {
             "native-interrupted-metadata-prepare-cold-conversion"
@@ -2338,14 +2423,66 @@ mod provider_lifecycle_tests {
         );
         let node = nodes[0].clone();
         let mut native = DfsTestRuntime::new(name, node.clone()).unwrap();
+        let pending_batches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observe_pending = Arc::clone(&pending_batches);
+        let hold_checkpoint = Arc::new(std::sync::atomic::AtomicBool::new(
+            pause_finalization.is_some(),
+        ));
+        let checkpoint: Arc<Mutex<Option<(PathBuf, PathBuf, Vec<u8>)>>> =
+            Arc::new(Mutex::new(None));
+        let provider_hold = Arc::clone(&hold_checkpoint);
+        let provider_checkpoint = Arc::clone(&checkpoint);
+        let builder: sinomo_dfs::DfsStoragePreparationProviderBuilder =
+            Arc::new(move |context, lifecycle| {
+                let provider = storage_preparation_provider(context, lifecycle)?;
+                let pending = Arc::clone(&observe_pending);
+                let hold = Arc::clone(&provider_hold);
+                let observed = Arc::clone(&provider_checkpoint);
+                Ok(Arc::new(move |root, scope, budget| {
+                    if hold.load(std::sync::atomic::Ordering::SeqCst)
+                        && observed
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .is_some_and(|(actual, _, _)| actual == root)
+                    {
+                        // Negative admission only, after the real provider has
+                        // completed and acknowledged its actual checkpoint.
+                        return Ok(sinomo_dfs::DfsStoragePreparation::Pending {
+                            processed_records: 0,
+                        });
+                    }
+                    let result = provider(root, scope, budget)?;
+                    if matches!(scope, sinomo_dfs::DfsStoragePreparationScope::Metadata(_)) {
+                        if let sinomo_dfs::DfsStoragePreparation::Pending { processed_records } =
+                            result
+                        {
+                            assert_eq!(budget, sinomo_dfs::DFS_STORAGE_PREPARATION_RECORD_BUDGET);
+                            assert!(processed_records <= budget);
+                            if processed_records > 0 {
+                                pending.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                if hold.load(std::sync::atomic::Ordering::SeqCst)
+                                    && let Some(name) = pause_finalization
+                                    && let sinomo_dfs::DfsStoragePreparationScope::Metadata(shard) =
+                                        scope
+                                    && let Some(path) =
+                                        crate::metadata::finalization_checkpoint_for_test(
+                                            root, shard, name,
+                                        )?
+                                {
+                                    let bytes = std::fs::read(&path).unwrap();
+                                    *observed.lock().unwrap() =
+                                        Some((root.to_owned(), path, bytes));
+                                }
+                            }
+                        }
+                    }
+                    Ok(result)
+                }))
+            });
         native
             .configure_component_factories(vec![
-                Arc::new(
-                    sinomo_dfs::component_factory_with_storage_preparation(Arc::new(
-                        storage_preparation_provider,
-                    ))
-                    .unwrap(),
-                ),
+                Arc::new(sinomo_dfs::component_factory_with_storage_preparation(builder).unwrap()),
                 Arc::new(staged_import_component_factory().unwrap()),
             ])
             .unwrap();
@@ -2401,6 +2538,24 @@ mod provider_lifecycle_tests {
         let object = client
             .posix_write_file(path, first, options.clone())
             .unwrap();
+        if additional_source_files > 0 {
+            client.posix_mkdir_all("/preparation-records").unwrap();
+            let paths = (0..additional_source_files)
+                .map(|index| format!("/preparation-records/file-{index:04}"))
+                .collect::<Vec<_>>();
+            for chunk in paths.chunks(64) {
+                let committed = client
+                    .posix_write_files_local_eventual_with_known_parents(chunk.iter().map(|path| {
+                        (
+                            path.as_str(),
+                            b"native bounded-preparation source".as_slice(),
+                        )
+                    }))
+                    .unwrap();
+                assert_eq!(committed.len(), chunk.len());
+            }
+        }
+
         if same_version_placement {
             client
                 .posix_sync_file(path, sinomo_dfs::DfsPosixSyncKind::File)
@@ -2527,6 +2682,17 @@ mod provider_lifecycle_tests {
         )
         .unwrap();
         let snapshot = observed.export_table_snapshot();
+        if additional_source_files > 0 {
+            assert!(snapshot.tables.objects.len() >= additional_source_files);
+            assert!(snapshot.tables.versions.len() >= additional_source_files);
+            eprintln!(
+                "ACTUAL_METADATA_SOURCE objects={} versions={} receipts={}",
+                snapshot.tables.objects.len(),
+                snapshot.tables.versions.len(),
+                snapshot.tables.receipts.len()
+            );
+        }
+
         let exchange_source_checkpoint = retained_root_exchange.then(|| {
             // An image owns a staged file at the original root pathname. Copy
             // it while this stopped-source kernel and its real export are live,
@@ -3029,9 +3195,75 @@ mod provider_lifecycle_tests {
             pause_completed_install.store(false, std::sync::atomic::Ordering::Release);
         }
         assert!(!crate::metadata::current_root(&root).unwrap() || retained_root_exchange);
-        native
-            .reopen_node(node.clone())
-            .expect("normal cold Main and real MIG provider must admit the released source");
+        if production_browser_budget.is_some() {
+            let records = crate::metadata::count_stopped_source_records_for_test(&root).unwrap();
+            assert!(
+                records >= 19_808,
+                "fixture must cover the retained real root's record count: {records}"
+            );
+            eprintln!("PRODUCTION_SHAPE_SOURCE records={records} files={additional_source_files}");
+        }
+        let retained_checkpoint = if pause_finalization.is_some() {
+            let blocked = native.reopen_node(node.clone());
+            assert!(
+                blocked.is_err(),
+                "a checkpoint alone cannot make native storage ready"
+            );
+            let (actual_root, path, bytes) = checkpoint
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("real provider reached the selected durable checkpoint");
+            assert_eq!(actual_root, root);
+            assert!(!crate::metadata::current_root(&root).unwrap());
+            let competing = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(root.join("journal/write.lock"))
+                .unwrap();
+            assert_eq!(
+                fs2::FileExt::try_lock_exclusive(&competing)
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::WouldBlock,
+                "Pending retains the actual source writer fence"
+            );
+            drop(competing);
+            native.stop_node(&node).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            hold_checkpoint.store(false, std::sync::atomic::Ordering::SeqCst);
+            Some((path, bytes))
+        } else {
+            None
+        };
+        let recovery_started = std::time::Instant::now();
+        let recovered = if let Some(budget) = production_browser_budget {
+            native.reopen_node_with_startup_deadline(
+                node.clone(),
+                tokio::time::Instant::now() + budget,
+            )
+        } else {
+            native.reopen_node(node.clone())
+        };
+        if let Some(budget) = production_browser_budget {
+            eprintln!(
+                "PRODUCTION_SHAPE_RECOVERY elapsed_ms={} budget_ms={} result={recovered:?}",
+                recovery_started.elapsed().as_millis(),
+                budget.as_millis()
+            );
+            assert!(
+                recovery_started.elapsed() < budget,
+                "original browser completion deadline"
+            );
+        }
+        recovered.expect("normal cold Main and real MIG provider must admit the released source");
+        if let Some((path, original)) = retained_checkpoint {
+            assert_eq!(
+                std::fs::read(path).unwrap(),
+                original,
+                "restart must preserve the exact checkpoint and original native request identities"
+            );
+        }
         assert!(crate::metadata::current_root(&root).unwrap());
         let current = native.root_shard().unwrap();
         assert_eq!(current.file_system_id, assignment.file_system_id);
@@ -3180,6 +3412,33 @@ mod provider_lifecycle_tests {
         drop(owner);
         let mut client = native.client(&node).unwrap();
         assert_eq!(client.posix_read_file_distributed(path).unwrap(), first);
+        if production_browser_budget.is_some() {
+            // Check every original generated pathname and body after actual
+            // native publication. No sampled subset or count-only acceptance.
+            let mut checkpointed = native.checkpoint_rpc_observation_window().unwrap();
+            for index in 0..additional_source_files {
+                assert_eq!(
+                    client
+                        .posix_read_file_distributed(&format!(
+                            "/preparation-records/file-{index:04}"
+                        ))
+                        .unwrap(),
+                    b"native bounded-preparation source"
+                );
+                if (index + 1) % 64 == 0 {
+                    checkpointed += native.checkpoint_rpc_observation_window().unwrap();
+                }
+            }
+            checkpointed += native.checkpoint_rpc_observation_window().unwrap();
+            assert!(
+                checkpointed > 4096,
+                "full source validation exceeds one observation window"
+            );
+            assert_eq!(native.observation_dropped_count(), 0);
+            eprintln!(
+                "PRODUCTION_SHAPE_EXACT_READS files={additional_source_files} checkpointed_rpc_records={checkpointed} dropped=0"
+            );
+        }
         let after = b"normal native writer after released-source admission";
         let after_options = if same_version_placement {
             let (_, _, policy) = client
@@ -3288,6 +3547,12 @@ mod provider_lifecycle_tests {
         drop(client);
         drop(install_hook);
         drop(exchange_facts);
+        if additional_source_files > 0 {
+            assert!(
+                pending_batches.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+                "actual metadata source must require multiple unchanged preparation batches"
+            );
+        }
         native.close().unwrap();
     }
 

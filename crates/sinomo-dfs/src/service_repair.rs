@@ -132,6 +132,8 @@ pub(crate) const DFS_REPAIR_EXAMINED_RECORDS_PER_PAGE: usize = 16;
 
 #[derive(Default)]
 pub(crate) struct DfsRepairPageProgress {
+    /// No source snapshot was acquired; keep the same durable page pending.
+    pub(crate) source_read_pending: bool,
     pub(crate) scheduled: Vec<DistributedRepairJob>,
     pub(crate) error: Option<DfsError>,
     /// Physical bounded input visits; distinct from checkpointable keys.
@@ -1865,11 +1867,41 @@ where
         skipped_targets: Option<&BTreeSet<(String, NodeId)>>,
         advance_retry_tick: bool,
     ) -> Result<DfsRepairPageProgress, DfsError> {
+        self.retry_pending_repair_page_with_resident_yield(
+            max_scheduled,
+            repair_attempts,
+            execution_exclusions,
+            scoped_targets,
+            skipped_targets,
+            advance_retry_tick,
+            false,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn retry_pending_repair_page_with_resident_yield(
+        &mut self,
+        max_scheduled: usize,
+        repair_attempts: &[DfsRepairAttemptRecord],
+        execution_exclusions: &DfsMaintenanceExecutionExclusions,
+        scoped_targets: Option<&BTreeSet<(String, NodeId)>>,
+        skipped_targets: Option<&BTreeSet<(String, NodeId)>>,
+        advance_retry_tick: bool,
+        yield_on_source_fence: bool,
+    ) -> Result<DfsRepairPageProgress, DfsError> {
         if max_scheduled == 0 {
             return Ok(DfsRepairPageProgress::default());
         }
         self.prune_idle_transfer_state();
-        let restored = self.restore_pending_writes_for_repair_attempt_records(repair_attempts)?;
+        let Some(restored) = self
+            .restore_pending_writes_with_source_read_mode(repair_attempts, yield_on_source_fence)?
+        else {
+            return Ok(DfsRepairPageProgress {
+                source_read_pending: true,
+                ..Default::default()
+            });
+        };
         let repair_attempts = restored.as_slice();
         self.restore_repair_attempt_records_merging(repair_attempts);
         let settled_keys = repair_attempts
@@ -2194,6 +2226,7 @@ where
         }
 
         Ok(DfsRepairPageProgress {
+            source_read_pending: false,
             scheduled,
             error,
             examined_record_count,
@@ -4070,6 +4103,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     fn stored_repair_record_for_queue(
         &self,
         records: &[DfsRepairAttemptRecord],
+        orphaned_custody: &mut BTreeSet<String>,
     ) -> Result<Option<(DfsWriteIntentRecord, bool)>, DfsError> {
         let Some(first) = records.first() else {
             return Ok(None);
@@ -4104,6 +4138,37 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 row.next_retry_unix_nanos == u64::MAX && repair_transfer_custody_unresolved(row)
             }) {
                 return Ok(None);
+            }
+            // History GC may remove the executable owner before a cold lane
+            // observes the carrier's parked deadline. Preserve only the SAME
+            // unresolved records actually held by this owner's durable queue.
+            // An incoming tuple or fresh NotSent row cannot establish custody.
+            if records.iter().all(|row| {
+                repair_transfer_custody_unresolved(row)
+                    && row.transfer_kind.is_some()
+                    && row.transfer_request_id.is_some()
+                    && row.completed_transfer_request_id.is_none()
+                    && row.attempts > 0
+                    && row.last_attempt_unix_nanos > 0
+            }) && self
+                .coordinator
+                .intent(&first.intent_id)
+                .is_none_or(|intent| intent.state == DfsWriteIntentState::Committed)
+            {
+                if let Some(store) = self.owned_repair_queue_store()? {
+                    let targets = records
+                        .iter()
+                        .map(|row| row.missing_replica_node_id.clone())
+                        .collect::<Vec<_>>();
+                    let actual = store.records_for_targets(&first.intent_id, &targets)?;
+                    if records
+                        .iter()
+                        .all(|row| actual.iter().any(|stored| stored == row))
+                    {
+                        orphaned_custody.insert(first.intent_id.clone());
+                        return Ok(None);
+                    }
+                }
             }
             return Err(unknown());
         };
@@ -4165,21 +4230,30 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         record: &DfsWriteIntentRecord,
         scheduling: &[DfsRepairAttemptRecord],
-    ) -> Result<bool, DfsError> {
+        yield_on_source_fence: bool,
+    ) -> Result<Option<bool>, DfsError> {
         if !record.publication.is_current()
             || record.status != DfsWriteIntentStatus::Committed
             || self.coordinator.intent(&record.intent_id)
                 != Some(&crate::intent::distributed_intent_from_record(record))
         {
-            return Ok(false);
+            return Ok(Some(false));
         }
         let Some(backend) = self.metadata_backend.as_mut() else {
-            return Ok(false);
+            return Ok(Some(false));
         };
         let Some(first) = backend.get_object(&record.object_id)? else {
-            return Ok(false);
+            return Ok(Some(false));
         };
-        backend.begin_consistent_read_snapshot_for_path(&first.file_system_id, &first.path)?;
+        if yield_on_source_fence {
+            if !backend
+                .try_begin_resident_read_snapshot_for_path(&first.file_system_id, &first.path)?
+            {
+                return Ok(None);
+            }
+        } else {
+            backend.begin_consistent_read_snapshot_for_path(&first.file_system_id, &first.path)?;
+        }
         let cut = (|| -> Result<_, DfsError> {
             Ok((
                 backend.get_object(&record.object_id)?,
@@ -4189,7 +4263,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         })();
         backend.end_consistent_read_snapshot_for_path(&first.file_system_id, &first.path);
         let (Some(object), Some(version), receipts) = cut? else {
-            return Ok(false);
+            return Ok(Some(false));
         };
         if object.file_system_id != record.file_system_id
             || object.version != record.target_version
@@ -4201,7 +4275,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             || version.content_hash != record.content_hash
             || object.content_size_bytes != version.size_bytes
         {
-            return Ok(false);
+            return Ok(Some(false));
         }
         let receipts = receipts
             .into_iter()
@@ -4231,7 +4305,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         .repair_job_for_target(&record.intent_id, &receipt.replica_node_id)
                         .is_some())
         }) {
-            return Ok(false);
+            return Ok(Some(false));
         }
         if scheduling.iter().any(|row| {
             row.intent_id != record.intent_id
@@ -4263,7 +4337,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     receipt.replica_node_id,
                 )?;
         }
-        Ok(true)
+        Ok(Some(true))
+    }
+
+    fn restore_pending_writes_for_repair_attempt_records(
+        &mut self,
+        records: &[DfsRepairAttemptRecord],
+    ) -> Result<Vec<DfsRepairAttemptRecord>, DfsError> {
+        self.restore_pending_writes_with_source_read_mode(records, false)?
+            .ok_or_else(|| DfsError::Metadata {
+                message: "blocking repair source restoration unexpectedly deferred".into(),
+            })
     }
 
     #[tracing::instrument(target = "sinomo.perf", level = "trace", name = "dfs.repair.restore",
@@ -4271,10 +4355,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             attempt_records = records.len(), distinct_intents = tracing::field::Empty,
             checked_intents = tracing::field::Empty, candidate_records = tracing::field::Empty,
             restored_records = tracing::field::Empty, outcome = "error"))]
-    fn restore_pending_writes_for_repair_attempt_records(
+    fn restore_pending_writes_with_source_read_mode(
         &mut self,
         records: &[DfsRepairAttemptRecord],
-    ) -> Result<Vec<DfsRepairAttemptRecord>, DfsError> {
+        yield_on_source_fence: bool,
+    ) -> Result<Option<Vec<DfsRepairAttemptRecord>>, DfsError> {
         let span = tracing::Span::current();
         let mut distinct_intents = 0u64;
         let mut checked_intents = 0u64;
@@ -4292,10 +4377,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             let mut pending_records = Vec::with_capacity(intents.len());
             let mut replaced_owners = BTreeSet::new();
             let mut compacted_identities = BTreeSet::new();
+            let mut orphaned_custody = BTreeSet::new();
             for queued in intents.values() {
                 checked_intents += 1;
                 if let Some((record, replaces_compacted_identity)) =
-                    self.stored_repair_record_for_queue(queued)?
+                    self.stored_repair_record_for_queue(queued, &mut orphaned_custody)?
                 {
                     if replaces_compacted_identity {
                         replaced_owners.insert(record.intent_id.clone());
@@ -4312,11 +4398,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             for id in &compacted_identities {
                 self.writes.pending_writes.remove(id);
             }
+            // Only derived execution is withdrawn. Existing retirement retains
+            // uncertain request/delivery evidence and its real transfer owner.
+            self.retire_committed_repairs(&orphaned_custody);
             candidate_records = pending_records.len() as u64;
             // Use the same deferred restoration primitives as startup hydration.
             // Rebuilding the complete repair list after each queued intent and
             // receipt made every bounded retry pass quadratic in its backlog.
             let mut restored = false;
+            let mut source_read_pending = false;
             let restore_result = (|| {
                 for record in &pending_records {
                     if record.publication.is_current()
@@ -4328,14 +4418,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         restored = true;
                         self.restore_metadata_successor_head(record)?;
                         self.restore_backend_receipt_pages_for_intent(record, false)?;
-                    } else if self.refresh_current_repair_receipt_projection(
-                        record,
-                        intents
-                            .get(&record.intent_id)
-                            .map(Vec::as_slice)
-                            .unwrap_or(&[]),
-                    )? {
-                        restored = true;
+                    } else {
+                        match self.refresh_current_repair_receipt_projection(
+                            record,
+                            intents
+                                .get(&record.intent_id)
+                                .map(Vec::as_slice)
+                                .unwrap_or(&[]),
+                            yield_on_source_fence,
+                        )? {
+                            Some(changed) => restored |= changed,
+                            None => {
+                                source_read_pending = true;
+                                break;
+                            }
+                        }
                     }
                 }
                 Ok::<_, DfsError>(())
@@ -4346,7 +4443,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 self.coordinator.rebuild_repair_jobs();
             }
             restore_result?;
+            if source_read_pending {
+                // No page cursor or transfer identity advanced. Keep restored
+                // DATA in this same lane and retry the unchanged durable page.
+                return Ok(None);
+            }
             let mut scheduling = records.to_vec();
+            for row in &mut scheduling {
+                if orphaned_custody.contains(&row.intent_id) {
+                    // Preserve kind, request, completion, attempts and delivery.
+                    // The existing observed queue checkpoint performs the CAS.
+                    row.next_retry_unix_nanos = u64::MAX;
+                }
+            }
             for record in &pending_records {
                 if !record.publication.is_current()
                     || record.status != DfsWriteIntentStatus::Committed
@@ -4588,13 +4697,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     self.coordinator.capture_active_repair_jobs(&intent_id);
                 }
             }
-            Ok(scheduling)
+            Ok(Some(scheduling))
         })();
         span.record("distinct_intents", distinct_intents);
         span.record("checked_intents", checked_intents);
         span.record("candidate_records", candidate_records);
         span.record("restored_records", restored_records);
-        span.record("outcome", if result.is_ok() { "ok" } else { "error" });
+        span.record(
+            "outcome",
+            match &result {
+                Ok(Some(_)) => "ok",
+                Ok(None) => "pending",
+                Err(_) => "error",
+            },
+        );
         result
     }
 

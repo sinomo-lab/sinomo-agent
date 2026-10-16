@@ -1714,6 +1714,40 @@ impl DerefMut for ResidentLocalShardedMetadataBackendLease {
     }
 }
 
+impl ResidentLocalShardedMetadataBackendLease {
+    pub(crate) fn try_begin_resident_read_snapshot_for_path(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        path: &str,
+    ) -> Result<bool> {
+        let router = &mut **self;
+        let shard_ids = router.consistent_read_shard_ids_for_path(file_system_id, path)?;
+        #[cfg(test)]
+        SHARDED_CONSISTENT_READ_SNAPSHOT_SHARDS
+            .with(|observed| observed.borrow_mut().extend_from_slice(&shard_ids));
+        for (index, shard_id) in shard_ids.iter().enumerate() {
+            // A global resident lease owns already-opened kernels. Do not
+            // cold-open an unrelated root or borrow another owner's backend.
+            let begin = router
+                .shards
+                .get_mut(shard_id)
+                .expect("routed resident shard remains installed")
+                .opened_backend_mut()
+                .ok_or_else(|| {
+                    MetadataBackendError::Serde(
+                        "resident read snapshot lost its checked-out kernel".into(),
+                    )
+                })
+                .and_then(LocalSobjMetadataBackend::try_begin_resident_read_snapshot);
+            if !matches!(begin, Ok(true)) {
+                router.end_consistent_read_snapshot_for_shards(&shard_ids[..index]);
+                return begin;
+            }
+        }
+        Ok(true)
+    }
+}
+
 impl Drop for ResidentLocalShardedMetadataBackendLease {
     fn drop(&mut self) {
         let Some(backend) = self.backend.take() else {

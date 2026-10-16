@@ -88,6 +88,44 @@ pub(crate) fn metadata_write_lock(root: PathBuf, lock_path: PathBuf) -> Result<M
     metadata_write_lock_after_path_guard(path_guard, lock_path)
 }
 
+/// Try the same physical writer fence without waiting for its current owner.
+/// A failed attempt releases only its own path registration, never the busy
+/// owner's lock. Callers must keep their work pending until a later attempt.
+pub(crate) fn try_metadata_write_lock(
+    root: PathBuf,
+    lock_path: PathBuf,
+) -> Result<Option<MetadataWriteLock>> {
+    let mut activity = MetadataWriteActivityRegistration::begin(root.clone());
+    let Some(path_guard) = MetadataPathWriteGuard::try_lock(root) else {
+        return Ok(None);
+    };
+    activity.acquired();
+    if let Some(parent) = lock_path.parent() {
+        create_dir_all(parent.to_owned())?;
+    }
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|source| MetadataBackendError::Io {
+            path: lock_path.clone(),
+            source,
+        })?;
+    match FileExt::try_lock_exclusive(&file) {
+        Ok(()) => Ok(Some(MetadataWriteLock {
+            _path_guard: path_guard,
+            _file: file,
+        })),
+        Err(source) if source.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(source) => Err(MetadataBackendError::Io {
+            path: lock_path,
+            source,
+        }),
+    }
+}
+
 /// Acquire the metadata writer lock for rebuildable checkpoint work.
 ///
 /// Checkpoint admission observes ordinary writer waiters before rotating a

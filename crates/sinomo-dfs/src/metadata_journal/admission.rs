@@ -22,7 +22,7 @@ struct Generation {
     files: Vec<FileGeneration>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct Certificate {
     generation: Generation,
     shard_id: DfsMetadataShardId,
@@ -163,6 +163,81 @@ pub(crate) fn current_owned_materialized_prefix(
                 && prefix.journal_sequence.checked_add(1) == Some(certificate.next_sequence)
         })
         .cloned())
+}
+
+/// An existing certificate captured under the canonical writer immediately
+/// before a background checkpoint installs its already-validated image. This
+/// owns only a cache transition; it grants no author or replica-ingest permit.
+#[derive(Debug)]
+pub(crate) struct OwnedCheckpointAdmission {
+    root: PathBuf,
+    certificate: Certificate,
+}
+
+pub(crate) fn capture_owned_checkpoint_admission(
+    root: &Path,
+) -> Result<Option<OwnedCheckpointAdmission>> {
+    let Some(states) = ADMISSION.get() else {
+        return Ok(None);
+    };
+    let key = owner_key(root)?;
+    let current = generation(&key)?;
+    let states = states.lock().unwrap_or_else(|error| error.into_inner());
+    let certificate = states
+        .get(&key)
+        .filter(|state| !state.uncertain)
+        .and_then(|state| state.certificate.as_ref())
+        .filter(|certificate| {
+            certificate.generation == current
+                && can_reuse(&current)
+                && certificate.prefix.as_ref().is_none_or(|proof| {
+                    proof.is_well_formed() && proof.journal_sequence < certificate.next_sequence
+                })
+        });
+    Ok(certificate
+        .cloned()
+        .map(|certificate| OwnedCheckpointAdmission {
+            root: key,
+            certificate,
+        }))
+}
+
+impl OwnedCheckpointAdmission {
+    /// Call only after the SAME writer completed snapshot installation and
+    /// journal pruning. A lost/changed owner cannot clear admission uncertainty.
+    pub(crate) fn record_installed(self, checkpoint: &DfsMetadataPrefixProof) -> Result<()> {
+        if !checkpoint.is_well_formed()
+            || checkpoint.journal_sequence >= self.certificate.next_sequence
+        {
+            return Err(MetadataBackendError::replica_diverged(
+                "owned checkpoint is ahead of its captured journal certificate".into(),
+            ));
+        }
+        {
+            let states = ADMISSION
+                .get()
+                .expect("captured admission registry")
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let same_owner = states.get(&self.root).is_some_and(|state| {
+                !state.uncertain && state.certificate.as_ref() == Some(&self.certificate)
+            });
+            if !same_owner {
+                return Err(MetadataBackendError::replica_diverged(
+                    "owned checkpoint lost its captured journal certificate".into(),
+                ));
+            }
+        }
+        // Reuse the existing exact-source transition, including retained-file
+        // identities, pruned-segment coverage, equal-height conflict rejection,
+        // and preservation of a stronger certified deferred journal prefix.
+        record_owned_materialization(
+            &self.root,
+            &self.certificate.shard_id,
+            self.certificate.next_sequence,
+            Some(checkpoint.clone()),
+        )
+    }
 }
 
 /// Record a successful table append/checkpoint owned by the current shard
@@ -436,6 +511,24 @@ mod tests {
         let before = metadata_journal_tail_recovery_calls();
         assert_eq!(certify_for_write(root.path(), &shard).unwrap(), 1);
         assert_eq!(metadata_journal_tail_recovery_calls(), before);
+    }
+
+    #[test]
+    fn captured_checkpoint_cannot_clear_later_uncertainty() {
+        let root = empty_owner("journal-checkpoint-lost-certificate");
+        let shard = DfsMetadataShardId::new("services");
+        assert_eq!(certify_for_write(root.path(), &shard).unwrap(), 1);
+        let captured = capture_owned_checkpoint_admission(root.path())
+            .unwrap()
+            .unwrap();
+        mark_uncertain(root.path()).unwrap();
+        let genesis = crate::metadata_records::dfs_metadata_prefix_proof_genesis(&shard);
+        assert!(captured.record_installed(&genesis).is_err());
+        assert!(
+            capture_owned_checkpoint_admission(root.path())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

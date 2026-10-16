@@ -2379,7 +2379,10 @@ fn file_history_expired_rule_retires_repairs_even_during_retry_backoff() {
         3,
     );
     let remote = remotes[0].clone();
-    deny_history_content_targets(&runtime, &owner, &[remote.clone()]);
+    // Managed placement can select any eligible remote despite candidate hints.
+    // Keep the real W1/N2 plan, and deny every actual missing-N target.
+    let denied_targets = remotes.clone();
+    deny_history_content_targets(&runtime, &owner, &denied_targets);
     let first = dfs
         .posix_write_file(
             "/services/expiring-history",
@@ -2423,6 +2426,15 @@ fn file_history_expired_rule_retires_repairs_even_during_retry_backoff() {
         .unwrap()
         .unwrap();
     assert!(retained.history_capture().unwrap().policy_capture.is_some());
+    let recorded_plan = retained.content_durability.as_ref().unwrap();
+    assert!(
+        recorded_plan
+            .desired_replica_node_ids
+            .iter()
+            .all(|node| node == &owner || denied_targets.contains(node)),
+        "expiry/backoff setup must block every actual captured target: plan={:?} denied={denied_targets:?}",
+        recorded_plan.desired_replica_node_ids,
+    );
     let store = LocalDfsRepairQueueStore::new(
         sinomo_dfs::default_dfs_repair_attempt_snapshot_path(runtime.data_dir(&owner)),
     );
@@ -5774,10 +5786,22 @@ fn fail_native_history_repairs(
 ) {
     // Ask the actual Main to reconstruct/dispatch its own persisted work
     // while the original native denial is still active.
+    let deadline = Instant::now() + Duration::from_secs(5);
     service.process_incoming().unwrap();
-    native_history_owner_tick(runtime, owner);
+    runtime.request_repair_reconciliation(owner).unwrap();
+    let remaining = deadline.saturating_duration_since(Instant::now());
     assert!(
-        runtime.rpc_observations().iter().any(|event| {
+        !remaining.is_zero(),
+        "original native failure-observation budget"
+    );
+    let pass = runtime.maintenance_tick(owner, remaining).unwrap();
+    pass.outcome.unwrap();
+    assert_eq!(pass.omitted_kv_event_count, 0);
+    // The owner releases admission before its real deferred receiver work.
+    // Observe that child's outcome within the SAME deadline; do not infer an
+    // RPC failure from scheduling or issue another maintenance invocation.
+    loop {
+        if runtime.rpc_observations().iter().any(|event| {
             &event.source == owner
                 && event.origin == sinomo_dfs::test_support::DfsTestRpcOrigin::RegisteredHost
                 && event.phase == sinomo_dfs::test_support::DfsTestRpcPhase::EndedWithoutResponse
@@ -5786,9 +5810,15 @@ fn fail_native_history_repairs(
                     sinomo_dfs::DFS_DATA_REPAIR_REPLICA_ROUTE,
                 ]
                 .contains(&event.route.as_str())
-        }),
-        "the missing replica must be grounded in an actual failed native content RPC"
-    );
+        }) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the missing replica must be grounded in an actual failed native content RPC"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
 
 fn drain_native_history_repairs(
