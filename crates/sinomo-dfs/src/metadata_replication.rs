@@ -395,7 +395,15 @@ pub fn prepare_cluster_dfs_metadata_shard_publish_with_backend_and_authority(
             )
         }
         Some(shard) => {
-            backend.refresh_metadata_shard_durable_view(&shard_id)?;
+            if options.background_publication {
+                if backend.try_materialize_resident_journal()?.is_none() {
+                    return Err(DfsError::Busy {
+                        path: expected_shard_root.display().to_string(),
+                    });
+                }
+            } else {
+                backend.refresh_metadata_shard_durable_view(&shard_id)?;
+            }
             prepare_dfs_metadata_journal_publish_for_primary_shard(
                 &mut **backend,
                 local_node_id,

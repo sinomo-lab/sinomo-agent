@@ -2603,7 +2603,14 @@ impl DaemonDfsReplicaMaterializationLane {
                 &self.lane.shard_id,
             )
         });
-        let result = DfsMetadataBackend::materialize_pending_replica_journal(&mut *shard);
+        let result = shard
+            .try_materialize_resident_journal()
+            .and_then(|materialized| {
+                materialized.ok_or_else(|| sinomo_dfs::MetadataBackendError::Io {
+                    path: shard.shard_root().join("journal/write.lock"),
+                    source: std::io::Error::from(std::io::ErrorKind::WouldBlock),
+                })
+            });
         #[cfg(any(test, feature = "test-support"))]
         if let (Some(trace), Ok(materialized)) = (native_boundary.as_mut(), &result) {
             trace.observe(

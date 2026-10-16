@@ -2981,15 +2981,19 @@ where
             .map(crate::local_state::DfsClusterTopologyProjection::from_authoritative_prefix)
             .transpose()?;
         if fair_resume && turn.needs_repair_turn() {
-            run_maintenance_repair_phase(
+            let Some(repair) = run_maintenance_repair_phase(
                 service,
                 maintenance_host,
                 execution_exclusions,
                 options,
                 false,
+                fair_resume,
             )
             .await?
-            .apply(turn.report());
+            else {
+                return Ok(None);
+            };
+            repair.apply(turn.report());
             turn.defer_after_repair();
             return Ok(None);
         }
@@ -3102,15 +3106,19 @@ where
             tokio::task::yield_now().await;
         }
         if turn.phase() == Phase::Repair {
-            run_maintenance_repair_phase(
+            let Some(repair) = run_maintenance_repair_phase(
                 service,
                 maintenance_host,
                 execution_exclusions,
                 options,
                 true,
+                fair_resume,
             )
             .await?
-            .apply(turn.report());
+            else {
+                return Ok(None);
+            };
+            repair.apply(turn.report());
             turn.advance(Phase::Publish);
             tokio::task::yield_now().await;
         }
@@ -3167,28 +3175,22 @@ async fn run_maintenance_repair_phase<T>(
     execution_exclusions: &DfsMaintenanceExecutionExclusions,
     options: DfsMaintenanceTickOptions,
     yield_before_followup: bool,
-) -> Result<RepairPhaseReport, DfsError>
+    yield_on_source_fence: bool,
+) -> Result<Option<RepairPhaseReport>, DfsError>
 where
     T: AsyncDfsMessageTransport + DfsTransportIdentity + DfsMessageTransport,
 {
     let repair_page_limit = options
         .repair_max_jobs
         .min(crate::service_repair::DFS_REPAIR_EXAMINED_RECORDS_PER_PAGE);
-    // Capture work authored by earlier phases even when the observed queue
-    // was empty. The same queue observation governs enrollment and retirement.
-    let captures = {
-        let captures = service.take_message_committed_repair_queue_records();
-        service.coordinator.ensure_message_repair_job_capture();
-        captures
-    };
-    // Observe the bounded execution page after placement/lifecycle publication.
-    // External changes after this cut still fail the unchanged enrollment CAS.
-    let current_repair_page = maintenance_host.load_repair_maintenance_page(repair_page_limit)?;
-    let mut page = maintenance_host.enroll_repair_maintenance_page(
-        &current_repair_page,
-        repair_page_limit,
-        &captures,
-    )?;
+    // Enrollment alone proposes rows; it does not persist them. Keep producer
+    // captures in the existing progress owner until the ordinary queue writer
+    // acknowledges them, before any source read can yield or return an error.
+    let progress_owner = Arc::clone(&service.maintenance_progress);
+    progress_owner.checkpoint_births(service, maintenance_host)?;
+    // Observe the same bounded execution page after that durable checkpoint.
+    // Pending source admission cannot acknowledge or advance its scan cursor.
+    let mut page = maintenance_host.load_repair_maintenance_page(repair_page_limit)?;
     // Own scheduling Set changes the durable queue generation. Capture a
     // current SAME bounded page before executing it, rather than retaining the
     // pre-wake observation and rejecting our own later checkpoint as stale.
@@ -3239,15 +3241,23 @@ where
             }
         }
         let mut progress = service
-            .retry_pending_repair_page(
+            .retry_pending_repair_page_with_resident_yield(
                 options.repair_max_jobs,
                 &eligible,
                 &repair_execution_exclusions,
                 Some(&scoped_targets),
                 Some(&removed_wake_keys),
                 true,
+                yield_on_source_fence,
             )
             .await?;
+        if progress.source_read_pending {
+            // Earlier rows may have restored actual producer work before a
+            // later source was busy. Retain those captures across cancellation
+            // and generation retirement without claiming any page completion.
+            progress_owner.checkpoint_births(service, maintenance_host)?;
+            return Ok(None);
+        }
         progress.examined.extend(parked.iter().map(|record| {
             (
                 record.intent_id.clone(),
@@ -3436,14 +3446,14 @@ where
             repair_page_checkpoint,
         )
     };
-    Ok(RepairPhaseReport {
+    Ok(Some(RepairPhaseReport {
         scheduled_repairs,
         followup_events,
         repair_attempts_before,
         repair_attempts_after,
         repair_budget_exhausted,
         repair_page_checkpoint,
-    })
+    }))
 }
 
 #[cfg(test)]

@@ -1814,6 +1814,45 @@ impl LocalSobjMetadataBackend {
         metadata_write_lock(self.root.clone(), self.journal_write_lock_path())
     }
 
+    /// A resident maintenance reader must not wait on an adopted source's
+    /// physical fence while retaining the node's mutation admission. A held
+    /// fence is Pending; a successful attempt performs the ordinary exact
+    /// writer-fenced refresh before pinning the same coherent read scope.
+    #[tracing::instrument(
+        target = "sinomo.perf",
+        level = "trace",
+        name = "dfs.metadata.read_snapshot",
+        skip_all,
+        fields(stage = "dfs.metadata.read_snapshot")
+    )]
+    pub(crate) fn try_begin_resident_read_snapshot(&mut self) -> Result<bool> {
+        if self.consistent_read_snapshot_depth == 0
+            && self.try_materialize_resident_journal()?.is_none()
+        {
+            return Ok(false);
+        }
+        self.consistent_read_snapshot_depth = self.consistent_read_snapshot_depth.saturating_add(1);
+        Ok(true)
+    }
+
+    /// Preserve the exact ordinary refresh/replay boundary, but let a native
+    /// background owner relinquish admission while another source holds the
+    /// physical fence. None is no acquired view and no replay completion.
+    pub(crate) fn try_materialize_resident_journal(&mut self) -> Result<Option<usize>> {
+        let before = self.materialized_through_sequence;
+        let Some(_lock) = crate::metadata_lock::try_metadata_write_lock(
+            self.root.clone(),
+            self.journal_write_lock_path(),
+        )?
+        else {
+            return Ok(None);
+        };
+        self.refresh_after_metadata_write_lock()?;
+        Ok(Some(
+            self.materialized_through_sequence.saturating_sub(before) as usize,
+        ))
+    }
+
     fn reload_durable_metadata_table_state(&mut self) -> Result<()> {
         #[cfg(test)]
         METADATA_DURABLE_TABLE_RELOADS.set(METADATA_DURABLE_TABLE_RELOADS.get().saturating_add(1));
