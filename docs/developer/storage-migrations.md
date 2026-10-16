@@ -124,6 +124,14 @@ current owner before advancing. A completed checkpoint counts as one durable
 record of progress; contention and dependencies that have not advanced report
 zero. Neither checkpoint reports `Ready` or contains a reusable certificate.
 
+The migration component retains at most one decoded native plan between calls.
+Every reuse reads and compares the complete current file bytes against the bytes
+that passed full plan validation. A different file body is parsed and validated
+again; missing or truncated files fail normally. This retains immutable DATA
+only: source custody, current assignment, native receipts, participant proof and
+installed-image checks still run at their original boundaries. A new component
+owner starts with no retained plan, and no parsed plan is an authority token.
+
 Cancellation between calls preserves this pending state. A process restart
 reconstructs the source projection under the original record budget, verifies
 the staged candidate and reuses the retained native plan and request identities.

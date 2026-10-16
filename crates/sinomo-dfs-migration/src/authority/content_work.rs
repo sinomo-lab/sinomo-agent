@@ -1764,6 +1764,9 @@ mod tests {
         else {
             panic!("actual native plan required");
         };
+        if matches!(setup, NativeContentSetup::Published) {
+            crate::authority::plan_file::assert_exact_native_plan_retention(&plan);
+        }
         let staged = runtime
             .authority
             .commit(plan.stage_request.clone())

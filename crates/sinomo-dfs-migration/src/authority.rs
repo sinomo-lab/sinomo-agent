@@ -30,6 +30,7 @@ mod handoff;
 mod namespace_work;
 pub(crate) mod placement_job_source;
 mod placement_work;
+mod plan_file;
 mod plan_wire;
 mod routing_cache;
 pub(crate) mod source_retirement;
@@ -135,6 +136,7 @@ struct NativeImportAuthority {
     owner: Arc<sinomo_dfs::runtime_host::DfsDataOwnerLock>,
     namespace_work: Arc<Mutex<BTreeMap<String, namespace_work::JobOutcome>>>,
     content_plan_contexts: Arc<Mutex<content_work::verification_context::PlanContexts>>,
+    retained_plan_file: Arc<plan_file::RetainedPlanFile>,
     source_verifiers:
         Arc<Mutex<BTreeMap<PathBuf, Arc<Mutex<staged_service::SourceTransferVerifier>>>>>,
 }
@@ -588,9 +590,7 @@ impl MetadataImportAuthority for NativeImportAuthority {
             if !path.is_file() {
                 continue;
             }
-            let plan: MetadataImportPlan =
-                serde_json::from_slice(&std::fs::read(path).map_err(error)?).map_err(error)?;
-            Self::validate_plan(&plan)?;
+            let plan = self.retained_plan_file.read(&path)?;
             if plan.source_cut.scope_shard != *shard {
                 continue;
             }
@@ -691,11 +691,9 @@ impl MetadataImportAuthority for NativeImportAuthority {
         if !root.join("native-import-plan.json").exists() {
             return Ok(None);
         }
-        let plan: MetadataImportPlan = serde_json::from_slice(
-            &std::fs::read(root.join("native-import-plan.json")).map_err(error)?,
-        )
-        .map_err(error)?;
-        Self::validate_plan(&plan)?;
+        let plan = self
+            .retained_plan_file
+            .read(&root.join("native-import-plan.json"))?;
         let actual = self
             .check_handoff_state(&plan)?
             .ok_or_else(|| error("receiver activation ceased to be current"))?;
@@ -1180,11 +1178,9 @@ impl MetadataImportAuthority for NativeImportAuthority {
             &proposal.source_identity,
             &proposal.source_snapshot_fingerprint,
         )?;
-        let plan: MetadataImportPlan = serde_json::from_slice(
-            &std::fs::read(provenance_plan_root.join("native-import-plan.json")).map_err(error)?,
-        )
-        .map_err(error)?;
-        Self::validate_plan(&plan)?;
+        let plan = self
+            .retained_plan_file
+            .read(&provenance_plan_root.join("native-import-plan.json"))?;
         if digest(&plan.source_cut)? != digest(&proposal.source_cut)?
             || plan.stage_request != proposal.stage_request
             || plan.expected_handoff != proposal.expected_handoff
@@ -1313,9 +1309,7 @@ impl MetadataImportAuthority for NativeImportAuthority {
             &proposal.source_snapshot_fingerprint,
         )?;
         let path = provenance_plan_root.join("native-import-plan.json");
-        let plan: MetadataImportPlan =
-            serde_json::from_slice(&std::fs::read(&path).map_err(error)?).map_err(error)?;
-        Self::validate_plan(&plan)?;
+        let plan = self.retained_plan_file.read(&path)?;
         if digest(&plan.source_cut)? != digest(&proposal.source_cut)?
             || plan.stage_request != proposal.stage_request
             || plan.expected_handoff != proposal.expected_handoff
@@ -1767,6 +1761,7 @@ fn shared_runtime(
         owner: Arc::clone(&owner),
         namespace_work: Arc::new(Mutex::new(BTreeMap::new())),
         content_plan_contexts: Arc::new(Mutex::new(Default::default())),
+        retained_plan_file: Arc::new(Default::default()),
         source_verifiers: Arc::new(Mutex::new(BTreeMap::new())),
     });
     let value = Arc::new(MigrationRuntime {

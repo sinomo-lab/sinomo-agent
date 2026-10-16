@@ -505,11 +505,9 @@ impl NativeImportAuthority {
             unreachable!()
         };
         let root = self.staged_receiver_root(&pending)?;
-        let plan: MetadataImportPlan = serde_json::from_slice(
-            &std::fs::read(root.join("native-import-plan.json")).map_err(error)?,
-        )
-        .map_err(error)?;
-        Self::validate_plan(&plan)?;
+        let plan = self
+            .retained_plan_file
+            .read(&root.join("native-import-plan.json"))?;
         if plan.expected_handoff.handoff_id != pending.handoff_id
             || plan.expected_handoff.cause != pending.cause
         {
