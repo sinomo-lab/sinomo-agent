@@ -1119,9 +1119,46 @@ fn metadata_authority_probe_rejects_a_gap_before_the_hidden_prepare() {
             .unwrap(),
         None
     );
-    let pause = runtime
-        .pause_replica_materialization(&replica, &shard_id)
-        .unwrap();
+    // A prior materializer can have published base_head while its task is
+    // still draining. A new request then joins that existing worker instead
+    // of registering the pause. Exclude actual producers while observing idle
+    // and installing the next boundary, then release admission before the RPC.
+    let pause_deadline = Instant::now() + Duration::from_secs(5);
+    let materializer = crate::runtime_host::daemon_dfs_metadata_materialization_lane_scheduler(
+        runtime.data_dir(&replica),
+        &shard.file_system_id,
+        &shard_id,
+    )
+    .unwrap();
+    let scheduler =
+        crate::runtime_host::daemon_dfs_mutation_scheduler(runtime.data_dir(&replica)).unwrap();
+    let scope = crate::DfsMessageExecutionScope::ExactShard {
+        file_system_id: shard.file_system_id.clone(),
+        shard_id: shard_id.clone(),
+    };
+    let pause = loop {
+        let remaining = pause_deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "native materializer must drain inside the original pause budget"
+        );
+        scheduler.request_foreground_admission();
+        let admission = crate::test_runtime::executor().block_on(async {
+            tokio::time::timeout(remaining, scheduler.admit(&scope))
+                .await
+                .expect("original materialization pause admission budget")
+                .unwrap()
+        });
+        if materializer.is_idle_while_producers_excluded() {
+            let pause = runtime
+                .pause_replica_materialization(&replica, &shard_id)
+                .unwrap();
+            drop(admission);
+            break pause;
+        }
+        drop(admission);
+        std::thread::sleep(Duration::from_millis(1));
+    };
     let missing = backend
         .journal_batch_for_shard_since_limited(
             &shard_id,
@@ -1158,7 +1195,10 @@ fn metadata_authority_probe_rejects_a_gap_before_the_hidden_prepare() {
         )
     );
     let capture = runtime
-        .wait_paused_materialization(&pause, Duration::from_secs(5))
+        .wait_paused_materialization(
+            &pause,
+            pause_deadline.saturating_duration_since(Instant::now()),
+        )
         .unwrap();
     assert_eq!(capture.unavailable, None);
     assert_eq!(capture.durable_sequence, Some(first.prepare_sequence));

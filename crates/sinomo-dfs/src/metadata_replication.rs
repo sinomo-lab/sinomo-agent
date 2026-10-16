@@ -1355,6 +1355,13 @@ impl DfsMetadataPublishScheduler {
         self.pending.load(Ordering::Acquire)
     }
 
+    /// Read-only test observation while the actual producer admission is held.
+    /// Read running last: a finishing worker can consume an older pending edge.
+    #[cfg(test)]
+    pub(crate) fn is_idle_while_producers_excluded(&self) -> bool {
+        !self.pending.load(Ordering::Acquire) && !self.running.load(Ordering::Acquire)
+    }
+
     /// Consume queued input edges after the worker owns the producer's exact
     /// admission gate. The guarded operation must cover all input accepted
     /// before this claim; later producers will enqueue another edge.
