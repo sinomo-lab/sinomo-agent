@@ -18,6 +18,13 @@ pub(super) enum DaemonDfsMaintenanceKind {
 }
 
 impl DaemonDfsMaintenanceKind {
+    fn retains_requested_recovery(self) -> bool {
+        // These callers already own an unfinished reconciliation/recovery
+        // request. Foreground preemption cannot convert it into idle routine
+        // work merely because its first phase has not reached a checkpoint.
+        !matches!(self, Self::Routine)
+    }
+
     pub(super) fn replica_dispatch_is_deferred(self) -> bool {
         matches!(
             self,
@@ -365,15 +372,16 @@ async fn run_daemon_dfs_maintenance_tick_kind_inner(
         else {
             metrics::counter!("sinomo.dfs.background.deferred", "reason" => "admission")
                 .increment(1);
-            // Reads still preempt admission. An already-started pass keeps its
-            // existing continuation instead of becoming a new five-second
-            // lease retry merely because this reentry made no progress.
+            // Reads still preempt admission. Keep the caller's actual pending
+            // recovery request, including before its first phase or after an
+            // authority generation invalidated the old phase checkpoint.
             return Ok(
-                if saved_turn
-                    .as_ref()
-                    .map(|owner| owner.has_unfinished_turn())
-                    .transpose()?
-                    .unwrap_or(false)
+                if maintenance_kind.retains_requested_recovery()
+                    || saved_turn
+                        .as_ref()
+                        .map(|owner| owner.has_unfinished_turn())
+                        .transpose()?
+                        .unwrap_or(false)
                 {
                     DaemonDfsMaintenanceTickOutcome::Continued
                 } else {
@@ -561,7 +569,10 @@ async fn run_daemon_dfs_maintenance_tick_kind_inner(
             DaemonDfsMaintenancePreemptionOutcome::ForegroundWaiting => {
                 metrics::counter!("sinomo.dfs.background.deferred", "reason" => "foreground")
                     .increment(1);
-                if retained_progress || preempted_turn_pending {
+                if maintenance_kind.retains_requested_recovery()
+                    || retained_progress
+                    || preempted_turn_pending
+                {
                     DaemonDfsMaintenanceTickOutcome::Continued
                 } else {
                     DaemonDfsMaintenanceTickOutcome::Deferred

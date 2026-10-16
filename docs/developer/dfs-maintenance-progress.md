@@ -38,10 +38,16 @@ borrowed. Only an existing cache owner matching the preflight authority generati
 can supply that saved turn; the actual resumed pass still validates its full
 native generation and scope before effects.
 
+An authoritative reconciliation or mounted-recovery caller also retains its
+unfinished request when foreground preemption happens before the first phase
+checkpoint, including after an authority generation rollover. The next turn
+still acquires current authority and starts fresh phase bookkeeping when the
+old generation was retired; it cannot reuse old publication permission.
+
 That incomplete outcome requests resumption through the existing scheduler even
 if a transient queue probe is empty. It cannot acknowledge mounted recovery or
-completed reconciliation. A call with no saved turn, and a source-fence Pending
-that makes no progress, remain `Deferred` with the existing retry pacing. Protocol
+completed reconciliation. A routine call with no saved turn, and a source-fence
+Pending that makes no progress, remain `Deferred` with the existing retry pacing. Protocol
 reads continue to preempt both admission and execution.
 
 A returned phase error restarts advisory phase bookkeeping on the next call.
