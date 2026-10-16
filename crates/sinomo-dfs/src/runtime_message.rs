@@ -785,6 +785,7 @@ pub(crate) struct DfsRuntimeMessageCacheEntry {
     pub(crate) write_intent_maintenance_scan:
         Arc<crate::metadata_intent_maintenance::DfsWriteIntentMaintenanceScanState>,
 
+    pub(crate) maintenance_progress: Arc<crate::maintenance::DfsMaintenanceProgressState>,
     pub cross_shard_namespace_locks: crate::DfsCrossShardNamespaceLockRegistry,
     pub primary_service: Option<Arc<DfsRuntimeMessageServiceLaneHandle>>,
     pub exact_shard_services: std::collections::BTreeMap<

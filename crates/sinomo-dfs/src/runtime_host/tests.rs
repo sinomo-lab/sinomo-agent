@@ -443,6 +443,24 @@ fn mounted_mutation_classifier_fences_live_work_and_recovery_retains_bounded_pas
 
     let claim = store
         .try_claim_recovery(&marker_id)
+        .expect("reclaim exact marker for retained continuation")
+        .expect("same exact recovery claim");
+    complete_daemon_dfs_mounted_mutation_recovery(
+        DaemonDfsMountedMutationRecoveryBatch::from_claims_for_test(vec![claim], Vec::new(), false),
+        DaemonDfsMaintenanceTickOutcome::Continued,
+    )
+    .expect("retain unfinished checkpoint marker");
+    assert!(matches!(
+        store
+            .marker(&marker_id)
+            .expect("marker")
+            .expect("same marker")
+            .phase,
+        sinomo_dfs::MountedSifsMutationOutboxPhase::Captured { .. }
+    ));
+
+    let claim = store
+        .try_claim_recovery(&marker_id)
         .expect("reclaim exact marker")
         .expect("exact recovery claim");
     complete_daemon_dfs_mounted_mutation_recovery(
@@ -4955,6 +4973,7 @@ fn repair_reconciliation_retains_bounded_pass_and_exact_namespace_compaction_sco
             .unwrap();
     for outcome in [
         DaemonDfsMaintenanceTickOutcome::Deferred,
+        DaemonDfsMaintenanceTickOutcome::Continued,
         DaemonDfsMaintenanceTickOutcome::Completed {
             reached_limit: true,
         },
@@ -17344,4 +17363,55 @@ fn daemon_smoke_revalidates_a_concurrently_advanced_metadata_cache() {
     assert_eq!(report.committed_replica_node_ids, vec![local]);
     assert_eq!(report.attempts.len(), 1);
     assert!(report.attempts[0].committed);
+}
+
+#[test]
+fn actual_runtime_shutdown_cancels_running_maintenance_with_open_component_watch() {
+    let (native, nodes) = crate::test_runtime::DfsTestRuntime::start_cluster(
+        "native-runtime-shutdown-maintenance-owner",
+        1,
+    )
+    .unwrap();
+    let data = native.data_dir(&nodes[0]).clone();
+    let host = registered_dfs_runtime_host(&data).unwrap().unwrap();
+    let scheduler = daemon_dfs_mutation_scheduler(&data).unwrap();
+    let runtime = native.runtime_handle();
+    let held = runtime
+        .block_on(scheduler.admit(&DfsMessageExecutionScope::GlobalExclusive))
+        .unwrap();
+    let (component_stop, component_watch) = tokio::sync::watch::channel(false);
+    let task = runtime.spawn(run_daemon_dfs_maintenance_tick_in_blocking_task(
+        DfsRuntimePaths::new(&data),
+        runtime.clone(),
+        sinomo_device::NodeResourceSnapshot::default(),
+        component_watch,
+    ));
+    runtime.block_on(async {
+        tokio::time::timeout(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT, async {
+            while scheduler.maintenance_interest_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("actual blocking maintenance reached admission while the writer is held");
+    });
+    let outcome = runtime.block_on(host.shutdown_and_wait(
+        tokio::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+    ));
+    // Cleanup also drains the old failing implementation before asserting.
+    component_stop.send_replace(true);
+    drop(held);
+    runtime.block_on(async {
+        let _ = tokio::time::timeout(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT, task).await;
+        host.shutdown_and_wait(
+            tokio::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+        )
+        .await
+        .unwrap();
+    });
+    native.close().unwrap();
+    assert!(
+        outcome.is_ok(),
+        "runtime cancellation must wake its already-running blocking child independently of the component watch: {outcome:?}"
+    );
 }

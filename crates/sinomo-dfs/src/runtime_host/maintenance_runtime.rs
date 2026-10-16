@@ -239,6 +239,7 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_kind_on_runtime(
         Ok(DaemonDfsMaintenanceTickOutcome::Completed {
             reached_limit: true,
         }) => "continuation",
+        Ok(DaemonDfsMaintenanceTickOutcome::Continued) => "retained-continuation",
         Ok(DaemonDfsMaintenanceTickOutcome::Deferred) => "deferred",
         Err(_) => "error",
     });
@@ -385,6 +386,7 @@ async fn run_daemon_dfs_maintenance_tick_kind_inner(
             "dfs-maintenance-owner-state");
         }
         let mut deferred_work = None;
+        let mut turn_progress = None;
         let committed_work_tracker = DfsCommittedWorkTracker::new();
         let maintenance_result = run_daemon_dfs_maintenance_until_foreground_waits(
             &foreground_preemption,
@@ -392,12 +394,14 @@ async fn run_daemon_dfs_maintenance_tick_kind_inner(
                 run_daemon_dfs_maintenance_tick_with_admission(
                     data_dir.clone(),
                     cluster_paths.clone(),
+                    preflight_cluster_state.clone(),
                     runtime,
                     &metadata_authority_preflight,
                     maintenance_kind,
                     node_resources,
                     committed_work_tracker.clone(),
                     &mut deferred_work,
+                    &mut turn_progress,
                     &mut completed_remote_phase,
                     publication_scope
                         .as_ref()
@@ -409,6 +413,10 @@ async fn run_daemon_dfs_maintenance_tick_kind_inner(
         )
         .instrument(maintenance_span.clone())
         .await;
+        let retained_progress = match turn_progress {
+            Some((owner, before)) => owner.unfinished_progress_since(before),
+            None => Ok(false),
+        };
         // The cancellable broad generation has been collapsed or destroyed at
         // this point. Return its freed pages while maintenance still owns message
         // admission: trimming after releasing admission can contend on glibc
@@ -462,6 +470,9 @@ async fn run_daemon_dfs_maintenance_tick_kind_inner(
             committed_work_tracker.take(),
             &[],
         );
+        // A bookkeeping error must not discard already-owned payload work or
+        // committed edges. Propagate it only after their normal handoff.
+        let retained_progress = retained_progress?;
         let outcome = match maintenance_result {
             DaemonDfsMaintenancePreemptionOutcome::Finished(result) => match result? {
                 DaemonDfsMaintenancePreExecution::AuthorityPreflightStale(stale) => {
@@ -513,13 +524,21 @@ async fn run_daemon_dfs_maintenance_tick_kind_inner(
                 DaemonDfsMaintenancePreExecution::Finished(None) => {
                     metrics::counter!("sinomo.dfs.background.deferred", "reason" => "hydration")
                         .increment(1);
-                    DaemonDfsMaintenanceTickOutcome::Deferred
+                    if retained_progress {
+                        DaemonDfsMaintenanceTickOutcome::Continued
+                    } else {
+                        DaemonDfsMaintenanceTickOutcome::Deferred
+                    }
                 }
             },
             DaemonDfsMaintenancePreemptionOutcome::ForegroundWaiting => {
                 metrics::counter!("sinomo.dfs.background.deferred", "reason" => "foreground")
                     .increment(1);
-                DaemonDfsMaintenanceTickOutcome::Deferred
+                if retained_progress {
+                    DaemonDfsMaintenanceTickOutcome::Continued
+                } else {
+                    DaemonDfsMaintenanceTickOutcome::Deferred
+                }
             }
         };
         if let Err(error) = refresh_daemon_dfs_repair_queue_nonempty(&data_dir) {
@@ -539,11 +558,13 @@ async fn run_daemon_dfs_maintenance_tick_kind_inner(
             // keeps capacity evidence current without a periodic filesystem scan.
             notify_daemon_dfs_storage_environment_dirty(&data_dir);
         }
-        return Ok(if namespace_work.complete {
-            outcome
-        } else {
-            DaemonDfsMaintenanceTickOutcome::Deferred
-        });
+        return Ok(
+            if namespace_work.complete || outcome == DaemonDfsMaintenanceTickOutcome::Continued {
+                outcome
+            } else {
+                DaemonDfsMaintenanceTickOutcome::Deferred
+            },
+        );
     }
 }
 
@@ -620,12 +641,14 @@ impl Drop for DaemonDfsMaintenanceServiceReturn<'_> {
 pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
     data_dir: SinomoDataDir,
     cluster_paths: ClusterPaths,
+    cluster_state: sinomo_core::ClusterBootstrapState,
     runtime: &tokio::runtime::Handle,
     metadata_authority_preflight: &DaemonDfsMetadataAuthorityPreflight,
     maintenance_kind: DaemonDfsMaintenanceKind,
     node_resources: sinomo_device::NodeResourceSnapshot,
     committed_work_tracker: DfsCommittedWorkTracker,
     _deferred_work: &mut Option<(Arc<DaemonDfsDetachedSendRuntime>, DfsNodeDetachedSendWorker)>,
+    turn_progress: &mut Option<(Arc<crate::maintenance::DfsMaintenanceProgressState>, u64)>,
     completed_remote_phase: &mut Option<(
         Box<crate::DfsNamespaceRequestRecord>,
         Box<crate::source_adoption::CompletedRemoteNamespacePhase>,
@@ -644,11 +667,12 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
     }
     let (_peer_transport, async_peer_transport) =
         daemon_dfs_peer_transports_on_runtime(&data_dir, runtime);
-    let cluster_state =
-        sinomo_core::cluster::read_cluster_state_without_kv_async(runtime, &cluster_paths).await?;
+    // Identity DATA was read before admission. The live peer projection and
+    // retained authority checks below revalidate that identity before taking
+    // the lane; no file-state wait may retain admission needed by its producer.
     let execution_exclusions =
         daemon_dfs_maintenance_execution_exclusions(&cluster_paths, &cluster_state);
-    // Transfer the mutation lane only after re-reading the admitted cluster
+    // Transfer the mutation lane only after validating the admitted native
     // identity. Topology comes from the retained proof-bearing generation
     // below; maintenance must never refresh or materialize the complete KV
     // store while foreground lanes own the resident Raft node.
@@ -695,6 +719,10 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
     let peer_node_ids = retained.peer_node_ids.clone();
     let detached_send_runtime = Arc::clone(&retained.detached_send_runtime);
     let mut maintenance_service = &mut retained.lane.service;
+    *turn_progress = Some((
+        Arc::clone(&maintenance_service.maintenance_progress),
+        maintenance_service.maintenance_progress.epoch()?,
+    ));
     let publication_provider = publication_owners
         .as_ref()
         .map(|owners| {
@@ -1041,6 +1069,20 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
             request, phase,
         ));
     }
+    // A completed old turn is not completion of a newer authority generation.
+    // Its durable effects and queue checkpoints remain, but the next turn must
+    // acquire the current proof before acknowledging reconciliation readiness.
+    if let Err(error) = daemon_dfs_require_retained_authority(
+        &metadata_authority_generation,
+        authority_generation_before_maintenance,
+    ) {
+        return match error {
+            DaemonDfsAuthorityPreExecutionError::AuthorityPreflightStale(stale) => Ok(
+                DaemonDfsMaintenancePreExecution::AuthorityPreflightStale(stale),
+            ),
+            DaemonDfsAuthorityPreExecutionError::Failed(error) => Err(error.into()),
+        };
+    }
     let report = maintenance_result?;
     let Some(report) = report else {
         // A cancellable hydrate which yields no report did not complete a
@@ -1116,18 +1158,21 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_in_blocking_task(
         detail: "DFS maintenance has no registered runtime task owner".into(),
     })?;
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    let cancellation_owner = Arc::clone(&task_owner);
     let task = tokio::task::spawn_blocking(move || {
         let result = runtime.block_on(async move {
             if *shutdown.borrow() {
                 return Ok(DaemonDfsMaintenanceTickOutcome::Deferred);
             }
             tokio::select! {
+                biased;
+                _ = cancellation_owner.wait_for_shutdown() => Ok(DaemonDfsMaintenanceTickOutcome::Deferred),
+                _ = shutdown.changed() => Ok(DaemonDfsMaintenanceTickOutcome::Deferred),
                 result = run_daemon_dfs_maintenance_tick_on_runtime(
                     &paths,
                     &tick_runtime,
                     node_resources,
                 ) => result,
-                _ = shutdown.changed() => Ok(DaemonDfsMaintenanceTickOutcome::Deferred),
             }
         });
         // Match the prior JoinHandle result boundary only after the actual

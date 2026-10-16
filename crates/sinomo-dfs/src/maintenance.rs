@@ -4,6 +4,9 @@
 //! cluster-aware entrypoints that open DFS services, bind transports, and run a
 //! maintenance tick against configured metadata shards.
 
+mod progress;
+pub(crate) use progress::DfsMaintenanceProgressState;
+
 use serde::{Deserialize, Serialize};
 use sinomo_core::ClusterNodeAvailability;
 use sinomo_core::kv::KvEntry;
@@ -1019,7 +1022,7 @@ where
         async_dfs_metadata_snapshot_install_sender_from_peer_transport(peer_transport),
     );
 
-    let result = run_dfs_maintenance_tick_with_async_host_and_execution_exclusions(
+    let result = run_dfs_maintenance_turn_with_async_host_and_execution_exclusions(
         service,
         &mut maintenance_host,
         &data_dir,
@@ -1031,6 +1034,7 @@ where
         &execution_exclusions,
         Some(authoritative_prefix),
         options,
+        true,
     )
     .await;
     if result.is_err()
@@ -1046,7 +1050,7 @@ where
             "DFS maintenance deferred after its observed repair queue generation changed");
         return Ok(None);
     }
-    result.map(Some)
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2918,111 +2922,258 @@ pub async fn run_dfs_maintenance_tick_with_async_host_and_execution_exclusions<T
 where
     T: AsyncDfsMessageTransport + DfsTransportIdentity + DfsMessageTransport,
 {
-    // Reuse the existing committed-work capture without clearing earlier
-    // owner handoffs. Queue-driven maintenance never snapshots all old jobs.
-    {
-        service.coordinator.ensure_message_repair_job_capture();
-    }
-    let authoritative_topology = authoritative_prefix
-        .map(crate::local_state::DfsClusterTopologyProjection::from_authoritative_prefix)
-        .transpose()?;
-    // Keep the async tick's safety ordering identical to the synchronous tick:
-    // handoff activation/rebind must precede every freeze-sensitive mutation.
-    service.reconcile_pending_metadata_shard_membership_handoffs(
-        &metadata_shards,
-        options.metadata_replication.target_timeout,
-    )?;
-    // The daemon races this globally fenced routine against foreground DFS
-    // admission. End each completed synchronous phase with a cooperative yield
-    // so that race can observe a waiting request instead of making it wait
-    // through the complete maintenance scan.
-    tokio::task::yield_now().await;
-    // Keep the asynchronous production path identical to the synchronous
-    // path: an absent committed topology is retryable startup state, not a
-    // reason to fail durable namespace work.
-    let namespace_job_max_jobs = if metadata_shards.is_empty() {
-        0
-    } else {
-        options.namespace_job_max_jobs
-    };
-    let _namespace_requests = service.recover_pending_namespace_requests_bounded(
-        crate::service_routed_namespace::DFS_NAMESPACE_REQUEST_RECOVERY_BATCH_LIMIT,
-    )?;
-    if service.remote_namespace_phase.is_some() {
-        return Err(DfsError::Metadata {
-            message: "owned namespace recovery requires its asynchronous host continuation".into(),
-        });
-    }
-    tokio::task::yield_now().await;
-    let namespace_jobs = service
-        .posix_resume_namespace_jobs_bounded(
-            namespace_job_max_jobs,
-            options.namespace_job_max_steps_per_job,
-        )
-        .map_err(|error| DfsError::Metadata {
-            message: error.to_string(),
+    run_dfs_maintenance_turn_with_async_host_and_execution_exclusions(
+        service,
+        maintenance_host,
+        data_dir,
+        file_system_id,
+        local_node_id,
+        metadata_shards,
+        metadata_publisher_host,
+        metadata_transport,
+        execution_exclusions,
+        authoritative_prefix,
+        options,
+        false,
+    )
+    .await?
+    .ok_or_else(|| DfsError::Metadata {
+        message: "full maintenance entry unexpectedly yielded a partial turn".into(),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_dfs_maintenance_turn_with_async_host_and_execution_exclusions<T>(
+    service: &mut NetworkedDfsService<T>,
+    maintenance_host: &mut dyn DfsMaintenanceHost,
+    data_dir: &SinomoDataDir,
+    file_system_id: DfsFileSystemId,
+    local_node_id: &NodeId,
+    metadata_shards: Vec<DfsMetadataShardConfig>,
+    metadata_publisher_host: &mut impl DfsMetadataJournalPublisherHost,
+    metadata_transport: &mut dyn AsyncDfsMetadataJournalReplicationTransport,
+    execution_exclusions: &DfsMaintenanceExecutionExclusions,
+    authoritative_prefix: Option<crate::DfsAuthoritativePrefixProjection>,
+    options: DfsMaintenanceTickOptions,
+    fair_resume: bool,
+) -> Result<Option<DfsMaintenanceTickReport>, DfsError>
+where
+    T: AsyncDfsMessageTransport + DfsTransportIdentity + DfsMessageTransport,
+{
+    let progress_owner = Arc::clone(&service.maintenance_progress);
+    let result = async {
+        use progress::Phase;
+        let mut turn = service.maintenance_progress.begin(progress::Scope {
+            file_system_id: file_system_id.clone(),
+            node: local_node_id.clone(),
+            shards: metadata_shards.clone(),
+            options,
+            projection_revision: authoritative_prefix
+                .as_ref()
+                .map(|prefix| prefix.revision()),
         })?;
-    tokio::task::yield_now().await;
-    tokio::task::yield_now().await;
-    let write_intents = service.reconcile_stale_write_intents_bounded(
-        options.write_intent_max_records,
-        options.stale_write_intent_min_age,
-    )?;
-    tokio::task::yield_now().await;
-    // Placement eligibility needs only the current queue cardinality. Its
-    // own durable repair births can advance the queue before enrollment.
+        service.coordinator.ensure_message_repair_job_capture();
+        let progress_owner = Arc::clone(&service.maintenance_progress);
+        // Retry unacknowledged producer data before authoring another phase. The
+        // same queue writer validates/merges these rows; they carry no authority.
+        progress_owner.retry_births(maintenance_host)?;
+        let authoritative_topology = authoritative_prefix
+            .map(crate::local_state::DfsClusterTopologyProjection::from_authoritative_prefix)
+            .transpose()?;
+        if fair_resume && turn.needs_repair_turn() {
+            run_maintenance_repair_phase(
+                service,
+                maintenance_host,
+                execution_exclusions,
+                options,
+                false,
+            )
+            .await?
+            .apply(turn.report());
+            turn.defer_after_repair();
+            return Ok(None);
+        }
+        // Persist phase position before each cooperative yield. Native handoff and
+        // publication checks still run under the current admitted generation.
+        if turn.phase() == Phase::Handoff {
+            service.reconcile_pending_metadata_shard_membership_handoffs(
+                &metadata_shards,
+                options.metadata_replication.target_timeout,
+            )?;
+            turn.advance(Phase::NamespaceRequests);
+            tokio::task::yield_now().await;
+        }
+        if turn.phase() == Phase::NamespaceRequests {
+            service.recover_pending_namespace_requests_bounded(
+                crate::service_routed_namespace::DFS_NAMESPACE_REQUEST_RECOVERY_BATCH_LIMIT,
+            )?;
+            if service.remote_namespace_phase.is_some() {
+                return Err(DfsError::Metadata {
+                    message: "owned namespace recovery requires its asynchronous host continuation"
+                        .into(),
+                });
+            }
+            turn.advance(Phase::NamespaceJobs);
+            tokio::task::yield_now().await;
+        }
+        if turn.phase() == Phase::NamespaceJobs {
+            let max_jobs = if metadata_shards.is_empty() {
+                0
+            } else {
+                options.namespace_job_max_jobs
+            };
+            turn.report().namespace_jobs = service
+                .posix_resume_namespace_jobs_bounded(
+                    max_jobs,
+                    options.namespace_job_max_steps_per_job,
+                )
+                .map_err(|error| DfsError::Metadata {
+                    message: error.to_string(),
+                })?;
+            turn.advance(Phase::WriteIntents);
+            tokio::task::yield_now().await;
+            tokio::task::yield_now().await;
+        }
+        if turn.phase() == Phase::WriteIntents {
+            turn.report().write_intents = service.reconcile_stale_write_intents_bounded(
+                options.write_intent_max_records,
+                options.stale_write_intent_min_age,
+            )?;
+            turn.advance(Phase::Placement);
+            tokio::task::yield_now().await;
+        }
+        if turn.phase() == Phase::Placement {
+            let initial_repair_page = maintenance_host.load_repair_maintenance_page(0)?;
+            tokio::task::yield_now().await;
+            turn.report().placement_reconciliation =
+                if options.placement_reconciliation_max_objects == 0 {
+                    None
+                } else {
+                    service
+                        .run_placement_reconciliation_bounded_async_with_pending_repairs(
+                            options.placement_reconciliation_max_objects,
+                            initial_repair_page.total_record_count,
+                            &metadata_shards,
+                        )
+                        .await?
+                };
+            progress_owner.checkpoint_births(service, maintenance_host)?;
+            turn.advance(Phase::MetadataLifecycle);
+            tokio::task::yield_now().await;
+        }
+        if turn.phase() == Phase::MetadataLifecycle {
+            turn.report().lifecycle_reports = run_dfs_lifecycle_maintenance_with_host(
+                service,
+                maintenance_host,
+                dfs_metadata_lifecycle_options(options.lifecycle),
+            )?;
+            progress_owner.checkpoint_births(service, maintenance_host)?;
+            turn.advance(Phase::ContentLifecycle);
+            tokio::task::yield_now().await;
+        }
+        if turn.phase() == Phase::ContentLifecycle {
+            if dfs_content_gc_requested(options.lifecycle) {
+                let topology = authoritative_topology.as_ref().ok_or_else(|| {
+                    DfsError::Metadata {
+                    message:
+                        "destructive DFS content collection requires authoritative cluster topology"
+                            .into(),
+                }
+                })?;
+                topology.require_destructive_authority()?;
+                let expected_file_systems = topology.all_file_system_configs()?;
+                let expected_shards = topology.all_metadata_shards()?;
+                let pending_handoffs = topology.all_metadata_shard_membership_handoffs()?;
+                let head_watermarks = topology.all_metadata_shard_head_watermarks()?;
+                if let Some(content_gc) = run_dfs_content_gc_with_catalog(
+                    service,
+                    &data_dir.dfs_dir().join("content"),
+                    &expected_file_systems,
+                    &expected_shards,
+                    &pending_handoffs,
+                    &head_watermarks,
+                    options.lifecycle,
+                )? {
+                    turn.report().lifecycle_reports.push(content_gc);
+                }
+            }
+            progress_owner.checkpoint_births(service, maintenance_host)?;
+            turn.advance(Phase::Repair);
+            tokio::task::yield_now().await;
+        }
+        if turn.phase() == Phase::Repair {
+            run_maintenance_repair_phase(
+                service,
+                maintenance_host,
+                execution_exclusions,
+                options,
+                true,
+            )
+            .await?
+            .apply(turn.report());
+            turn.advance(Phase::Publish);
+            tokio::task::yield_now().await;
+        }
+        if turn.phase() == Phase::Publish {
+            turn.report().metadata_replication = if options.publish_metadata {
+                crate::publish_dfs_metadata_journal_with_async_host_and_execution_exclusions(
+                    file_system_id,
+                    local_node_id,
+                    metadata_shards.clone(),
+                    data_dir,
+                    metadata_publisher_host,
+                    metadata_transport,
+                    execution_exclusions,
+                    options.metadata_replication,
+                )
+                .await?
+            } else {
+                DfsMetadataJournalReplicationReport {
+                    outcomes: Vec::new(),
+                }
+            };
+            turn.advance(Phase::Complete);
+        }
+        turn.finish().map(Some)
+    }
+    .await;
+    if result.is_err() {
+        progress_owner.restart_after_error()?;
+    }
+    result
+}
+
+struct RepairPhaseReport {
+    scheduled_repairs: Vec<DistributedRepairJob>,
+    followup_events: Vec<NetworkedDfsServiceEvent>,
+    repair_attempts_before: Vec<DfsRepairAttemptRecord>,
+    repair_attempts_after: Vec<DfsRepairAttemptRecord>,
+    repair_budget_exhausted: bool,
+    repair_page_checkpoint: DfsRepairMaintenancePageCheckpoint,
+}
+impl RepairPhaseReport {
+    fn apply(self, report: &mut DfsMaintenanceTickReport) {
+        report.scheduled_repairs = self.scheduled_repairs;
+        report.followup_events = self.followup_events;
+        report.repair_attempts_before = self.repair_attempts_before;
+        report.repair_attempts_after = self.repair_attempts_after;
+        report.repair_budget_exhausted = self.repair_budget_exhausted;
+        report.repair_page_checkpoint = self.repair_page_checkpoint;
+    }
+}
+async fn run_maintenance_repair_phase<T>(
+    service: &mut NetworkedDfsService<T>,
+    maintenance_host: &mut dyn DfsMaintenanceHost,
+    execution_exclusions: &DfsMaintenanceExecutionExclusions,
+    options: DfsMaintenanceTickOptions,
+    yield_before_followup: bool,
+) -> Result<RepairPhaseReport, DfsError>
+where
+    T: AsyncDfsMessageTransport + DfsTransportIdentity + DfsMessageTransport,
+{
     let repair_page_limit = options
         .repair_max_jobs
         .min(crate::service_repair::DFS_REPAIR_EXAMINED_RECORDS_PER_PAGE);
-    let initial_repair_page = maintenance_host.load_repair_maintenance_page(0)?;
-    tokio::task::yield_now().await;
-    let placement_reconciliation = if options.placement_reconciliation_max_objects == 0 {
-        None
-    } else {
-        service
-            .run_placement_reconciliation_bounded_async_with_pending_repairs(
-                options.placement_reconciliation_max_objects,
-                initial_repair_page.total_record_count,
-                &metadata_shards,
-            )
-            .await?
-    };
-    tokio::task::yield_now().await;
-    let mut lifecycle_reports = run_dfs_lifecycle_maintenance_with_host(
-        service,
-        maintenance_host,
-        dfs_metadata_lifecycle_options(options.lifecycle),
-    )?;
-    tokio::task::yield_now().await;
-    if dfs_content_gc_requested(options.lifecycle) {
-        // Metadata history removal is authoritative and journaled above. Build
-        // the node-wide content-root catalog only after that durable cut, and
-        // cover every filesystem whose manifests share this content store.
-        let topology = authoritative_topology
-            .as_ref()
-            .ok_or_else(|| DfsError::Metadata {
-                message:
-                    "destructive DFS content collection requires authoritative cluster topology"
-                        .to_string(),
-            })?;
-        topology.require_destructive_authority()?;
-        let expected_file_systems = topology.all_file_system_configs()?;
-        let expected_shards = topology.all_metadata_shards()?;
-        let pending_handoffs = topology.all_metadata_shard_membership_handoffs()?;
-        let head_watermarks = topology.all_metadata_shard_head_watermarks()?;
-        if let Some(content_gc) = run_dfs_content_gc_with_catalog(
-            service,
-            &data_dir.dfs_dir().join("content"),
-            &expected_file_systems,
-            &expected_shards,
-            &pending_handoffs,
-            &head_watermarks,
-            options.lifecycle,
-        )? {
-            lifecycle_reports.push(content_gc);
-        }
-        tokio::task::yield_now().await;
-    }
     // Capture work authored by earlier phases even when the observed queue
     // was empty. The same queue observation governs enrollment and retirement.
     let captures = {
@@ -3177,7 +3328,9 @@ where
         if let Some(error) = deferred_repair_error {
             return Err(error);
         }
-        tokio::task::yield_now().await;
+        if yield_before_followup {
+            tokio::task::yield_now().await;
+        }
         let mut followup_keys = scoped_targets.clone();
         followup_keys.retain(|key| !preserved_keys.contains(key));
         followup_keys.extend(
@@ -3283,35 +3436,13 @@ where
             repair_page_checkpoint,
         )
     };
-    let metadata_replication = if options.publish_metadata {
-        crate::publish_dfs_metadata_journal_with_async_host_and_execution_exclusions(
-            file_system_id,
-            local_node_id,
-            metadata_shards.clone(),
-            data_dir,
-            metadata_publisher_host,
-            metadata_transport,
-            execution_exclusions,
-            options.metadata_replication,
-        )
-        .await?
-    } else {
-        DfsMetadataJournalReplicationReport {
-            outcomes: Vec::new(),
-        }
-    };
-    Ok(DfsMaintenanceTickReport {
-        namespace_jobs,
-        write_intents,
-        placement_reconciliation,
-        lifecycle_reports,
+    Ok(RepairPhaseReport {
         scheduled_repairs,
         followup_events,
         repair_attempts_before,
         repair_attempts_after,
         repair_budget_exhausted,
         repair_page_checkpoint,
-        metadata_replication,
     })
 }
 

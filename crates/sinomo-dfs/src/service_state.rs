@@ -526,6 +526,7 @@ pub struct NetworkedDfsService<T> {
     /// preemption or shell destruction cannot repeatedly rewind a settled prefix.
     pub(crate) write_intent_maintenance_scan:
         Arc<crate::metadata_intent_maintenance::DfsWriteIntentMaintenanceScanState>,
+    pub(crate) maintenance_progress: Arc<crate::maintenance::DfsMaintenanceProgressState>,
     pub(crate) routed_namespace_settle_depth: usize,
     pub(crate) cross_shard_namespace_locks: DfsCrossShardNamespaceLockRegistry,
     pub(crate) last_events: Vec<NetworkedDfsServiceEvent>,

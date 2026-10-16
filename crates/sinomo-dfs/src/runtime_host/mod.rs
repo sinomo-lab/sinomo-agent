@@ -356,6 +356,7 @@ pub struct DfsRuntimeHost {
     event_client: Option<ComponentEventClient>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     shutting_down: crate::DfsCancellationFlag,
+    shutdown_notify: tokio::sync::Notify,
 }
 
 impl DfsRuntimeHost {
@@ -373,6 +374,7 @@ impl DfsRuntimeHost {
             event_client: None,
             tasks: Mutex::new(Vec::new()),
             shutting_down: crate::DfsCancellationFlag::new(),
+            shutdown_notify: tokio::sync::Notify::new(),
         }
     }
 
@@ -394,11 +396,24 @@ impl DfsRuntimeHost {
 
     pub(crate) fn shutdown(&self) {
         self.shutting_down.cancel();
+        self.shutdown_notify.notify_waiters();
         self.response_delivery.shutdown();
         if let Ok(tasks) = self.tasks.lock() {
             for task in tasks.iter() {
                 task.abort();
             }
+        }
+    }
+
+    async fn wait_for_shutdown(&self) {
+        // Register before reading the flag so shutdown cannot be lost between
+        // that read and the first poll. The flag also covers children started
+        // after shutdown; notification alone is not retained for those children.
+        let notified = self.shutdown_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if !self.shutting_down.is_cancelled() {
+            notified.await;
         }
     }
 }

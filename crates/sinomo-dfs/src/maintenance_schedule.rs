@@ -12,7 +12,11 @@ pub const DFS_MAINTENANCE_NETWORK_STARTUP_GRACE: Duration = Duration::from_secs(
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DfsMaintenanceTickOutcome {
-    Completed { reached_limit: bool },
+    Completed {
+        reached_limit: bool,
+    },
+    /// Actual retained phase progress; the pass is still incomplete.
+    Continued,
     Deferred,
 }
 
@@ -110,6 +114,13 @@ pub fn dfs_maintenance_completion_decision(
         DfsMaintenanceTickOutcome::Completed { reached_limit } => {
             decision.immediate_continuation = reached_limit && decision.trigger_maintenance;
         }
+        DfsMaintenanceTickOutcome::Continued => {
+            // A transient work probe can be empty while an owned placement
+            // continuation remains. Resume that actual checkpoint, not a new
+            // retry budget or a fabricated completed pass.
+            decision.trigger_maintenance = true;
+            decision.immediate_continuation = true;
+        }
         DfsMaintenanceTickOutcome::Deferred => {
             decision.immediate_continuation = false;
         }
@@ -193,6 +204,40 @@ pub fn dfs_maintenance_should_launch(triggered_due: bool, work_revalidated: bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_incomplete_progress_resumes_even_when_the_queue_probe_is_empty() {
+        let now = Instant::now();
+        for work in [None, Some(DfsPendingMaintenanceWork::default())] {
+            let continuation = dfs_maintenance_completion_decision(
+                DfsMaintenanceTickOutcome::Continued,
+                now,
+                1_000_000_000,
+                work.clone(),
+                false,
+            );
+            assert!(continuation.trigger_maintenance);
+            assert!(continuation.immediate_continuation);
+            assert_eq!(
+                dfs_maintenance_due_in(
+                    now,
+                    now + DFS_MAINTENANCE_NETWORK_STARTUP_GRACE,
+                    now,
+                    continuation.trigger_maintenance,
+                    continuation.immediate_continuation,
+                ),
+                Some(Duration::ZERO),
+            );
+            let deferred = dfs_maintenance_completion_decision(
+                DfsMaintenanceTickOutcome::Deferred,
+                now,
+                1_000_000_000,
+                work,
+                false,
+            );
+            assert!(!deferred.immediate_continuation);
+        }
+    }
 
     #[test]
     fn idle_work_parks_and_actionable_work_is_interval_gated() {
