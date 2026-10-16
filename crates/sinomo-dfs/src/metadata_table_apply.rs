@@ -1611,6 +1611,8 @@ fn run_metadata_table_checkpoint_worker(
             ..MetadataTableCheckpointRun::default()
         });
     }
+    let journal_admission =
+        crate::metadata_journal::admission::capture_owned_checkpoint_admission(root)?;
     staged.install(root)?;
     drop(tables);
     remove_metadata_table_checkpoint_log(root)?;
@@ -1620,6 +1622,9 @@ fn run_metadata_table_checkpoint_worker(
     // leaves a discontinuity that forces lagging replicas through snapshot
     // installation rather than reporting a false empty suffix.
     prune_segmented_journal_before_checkpoint(root, checkpoint_sequence)?;
+    if let Some(admission) = journal_admission {
+        admission.record_installed(&prefix_proof)?;
+    }
     let publish_ms = publish_started.elapsed().as_millis();
     Ok(MetadataTableCheckpointRun {
         checkpointed: true,
@@ -2466,6 +2471,125 @@ mod tests {
             ),
             (physical_eligible, false),
             "physical and crash-resumed work must never wait behind normal logical spacing"
+        );
+    }
+
+    #[test]
+    fn background_checkpoint_preserves_native_journal_admission_certificate() {
+        fn copy_native_tree(from: &Path, to: &Path) {
+            fs::create_dir_all(to).unwrap();
+            for entry in fs::read_dir(from).unwrap() {
+                let entry = entry.unwrap();
+                let kind = entry.file_type().unwrap();
+                assert!(!kind.is_symlink());
+                let target = to.join(entry.file_name());
+                if kind.is_dir() {
+                    copy_native_tree(&entry.path(), &target);
+                } else {
+                    assert!(kind.is_file());
+                    fs::copy(entry.path(), &target).unwrap();
+                    assert_eq!(fs::read(entry.path()).unwrap(), fs::read(target).unwrap());
+                }
+            }
+        }
+        let (mut native, mut service, config) =
+            crate::test_support::current_native_metadata_service(
+                "native-background-checkpoint-certificate",
+                1,
+                "/services",
+            )
+            .unwrap();
+        service
+            .posix_mkdir_all("/services/checkpoint-source")
+            .unwrap();
+        let original_object = service
+            .lookup_sifs_path("/services/checkpoint-source")
+            .unwrap()
+            .unwrap();
+        let original_root =
+            crate::default_dfs_metadata_shards_root(native.data_dir(&config.primary_node_id))
+                .join(&config.shard_id);
+        drop(service);
+        native.stop_node(&config.primary_node_id).unwrap();
+        let copy = sinomo_testdir::TestDir::new("native-checkpoint-certificate-copy");
+        copy_native_tree(&original_root, copy.path());
+        native.close().unwrap();
+        let shard = DfsMetadataShardId::new(config.shard_id);
+        let backend = crate::LocalSobjMetadataBackend::new(shard.clone(), copy.path()).unwrap();
+        let before = backend.metadata_prefix_proof().unwrap();
+        drop(backend);
+        let next =
+            crate::metadata_journal::admission::certify_for_write(copy.path(), &shard).unwrap();
+        let active_bytes = fs::metadata(metadata_table_path(copy.path()))
+            .unwrap()
+            .len();
+        assert!(active_bytes > 0);
+        let now = Instant::now();
+        // Force only this copied native source's existing storage checkpoint.
+        // The production threshold and the original700-file case stay unchanged.
+        let request = MetadataTableCheckpointWorkerRequest {
+            revision: 0,
+            requested_at: now,
+            eligible_at: now,
+            trigger: MetadataTableCheckpointTrigger::Physical,
+            deferral_reason: "native-storage-transition-test",
+            replay_pressure_boundary: None,
+            replay_cost_bytes: active_bytes,
+            max_log_bytes: 1,
+            hard_threshold_bytes: 2,
+            emergency_threshold_bytes: 3,
+            process_spacing_applied: false,
+        };
+        let run = run_metadata_table_checkpoint_worker(copy.path(), 1, request).unwrap();
+        assert!(run.checkpointed);
+        struct ResetCertificationFault;
+        impl Drop for ResetCertificationFault {
+            fn drop(&mut self) {
+                crate::metadata_journal::fail_journal_certifications_for_test(0);
+            }
+        }
+        let _reset = ResetCertificationFault;
+        let _writer = crate::metadata_lock::metadata_write_lock(
+            copy.path().to_path_buf(),
+            journal_write_lock_path(copy.path()),
+        )
+        .unwrap();
+        crate::metadata_journal::fail_journal_certifications_for_test(1);
+        let actual = crate::metadata_journal::admission::certify_for_write(copy.path(), &shard);
+        assert!(
+            actual.is_ok(),
+            "a completed owned checkpoint must retain its certificate without a cold snapshot scan: {actual:?}"
+        );
+        assert_eq!(actual.unwrap(), next);
+        assert_eq!(
+            crate::metadata_journal::admission::current_owned_materialized_prefix(
+                copy.path(),
+                &shard
+            )
+            .unwrap(),
+            Some(before.clone())
+        );
+        // An otherwise identical external replacement has no owned transition.
+        // Stable file identity changes still require actual cold certification.
+        let snapshot = crate::metadata_table_store::metadata_table_snapshot_path(copy.path());
+        let replacement = copy.path().join("external-snapshot-replacement.sobj");
+        fs::copy(&snapshot, &replacement).unwrap();
+        fs::rename(replacement, snapshot).unwrap();
+        assert!(
+            crate::metadata_journal::admission::certify_for_write(copy.path(), &shard).is_err()
+        );
+        crate::metadata_journal::fail_journal_certifications_for_test(0);
+        drop(_writer);
+        crate::metadata_journal::admission::forget_for_test(copy.path());
+        let reopened = crate::LocalSobjMetadataBackend::new(shard.clone(), copy.path()).unwrap();
+        assert_eq!(reopened.metadata_prefix_proof().unwrap(), before);
+        assert_eq!(
+            crate::DfsMetadataBackend::get_object(&reopened, &original_object.object_id).unwrap(),
+            Some(original_object)
+        );
+        assert_eq!(
+            crate::metadata_journal::admission::certify_for_write(copy.path(), &shard).unwrap(),
+            next
         );
     }
 

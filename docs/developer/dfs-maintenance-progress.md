@@ -135,3 +135,13 @@ the full named content-receipt set and the existing intersecting metadata proof.
 
 The existing per-phase record/job/byte limits, caller deadlines, worker policy
 and actual CPU/network quietness requirements are unchanged.
+
+A background table checkpoint captures the existing journal certificate under
+the canonical writer immediately before installing its validated image. After
+installation and journal pruning succeed, it records the same owned-materialization
+transition used by ordinary metadata writers. This preserves the stronger exact
+deferred prefix when present; it does not create author authority. Changed file
+identities, uncertain owners and pruned coverage still receive the existing
+validation. Cancellation before this cache update and process restart retain the
+full cold-certification path. An arbitrary snapshot replacement cannot use the
+checkpoint owner's transition.
