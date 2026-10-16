@@ -4070,6 +4070,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     fn stored_repair_record_for_queue(
         &self,
         records: &[DfsRepairAttemptRecord],
+        orphaned_custody: &mut BTreeSet<String>,
     ) -> Result<Option<(DfsWriteIntentRecord, bool)>, DfsError> {
         let Some(first) = records.first() else {
             return Ok(None);
@@ -4104,6 +4105,37 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 row.next_retry_unix_nanos == u64::MAX && repair_transfer_custody_unresolved(row)
             }) {
                 return Ok(None);
+            }
+            // History GC may remove the executable owner before a cold lane
+            // observes the carrier's parked deadline. Preserve only the SAME
+            // unresolved records actually held by this owner's durable queue.
+            // An incoming tuple or fresh NotSent row cannot establish custody.
+            if records.iter().all(|row| {
+                repair_transfer_custody_unresolved(row)
+                    && row.transfer_kind.is_some()
+                    && row.transfer_request_id.is_some()
+                    && row.completed_transfer_request_id.is_none()
+                    && row.attempts > 0
+                    && row.last_attempt_unix_nanos > 0
+            }) && self
+                .coordinator
+                .intent(&first.intent_id)
+                .is_none_or(|intent| intent.state == DfsWriteIntentState::Committed)
+            {
+                if let Some(store) = self.owned_repair_queue_store()? {
+                    let targets = records
+                        .iter()
+                        .map(|row| row.missing_replica_node_id.clone())
+                        .collect::<Vec<_>>();
+                    let actual = store.records_for_targets(&first.intent_id, &targets)?;
+                    if records
+                        .iter()
+                        .all(|row| actual.iter().any(|stored| stored == row))
+                    {
+                        orphaned_custody.insert(first.intent_id.clone());
+                        return Ok(None);
+                    }
+                }
             }
             return Err(unknown());
         };
@@ -4292,10 +4324,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             let mut pending_records = Vec::with_capacity(intents.len());
             let mut replaced_owners = BTreeSet::new();
             let mut compacted_identities = BTreeSet::new();
+            let mut orphaned_custody = BTreeSet::new();
             for queued in intents.values() {
                 checked_intents += 1;
                 if let Some((record, replaces_compacted_identity)) =
-                    self.stored_repair_record_for_queue(queued)?
+                    self.stored_repair_record_for_queue(queued, &mut orphaned_custody)?
                 {
                     if replaces_compacted_identity {
                         replaced_owners.insert(record.intent_id.clone());
@@ -4312,6 +4345,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             for id in &compacted_identities {
                 self.writes.pending_writes.remove(id);
             }
+            // Only derived execution is withdrawn. Existing retirement retains
+            // uncertain request/delivery evidence and its real transfer owner.
+            self.retire_committed_repairs(&orphaned_custody);
             candidate_records = pending_records.len() as u64;
             // Use the same deferred restoration primitives as startup hydration.
             // Rebuilding the complete repair list after each queued intent and
@@ -4347,6 +4383,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             restore_result?;
             let mut scheduling = records.to_vec();
+            for row in &mut scheduling {
+                if orphaned_custody.contains(&row.intent_id) {
+                    // Preserve kind, request, completion, attempts and delivery.
+                    // The existing observed queue checkpoint performs the CAS.
+                    row.next_retry_unix_nanos = u64::MAX;
+                }
+            }
             for record in &pending_records {
                 if !record.publication.is_current()
                     || record.status != DfsWriteIntentStatus::Committed
