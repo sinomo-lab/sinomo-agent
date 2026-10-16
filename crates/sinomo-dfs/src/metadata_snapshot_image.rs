@@ -54,6 +54,35 @@ impl DfsMetadataSnapshotImage {
             state: Mutex::new(None),
         })))
     }
+    pub(crate) fn capture_existing(root: &Path, source: File) -> Result<Self> {
+        let (staged, state) = crate::metadata_snapshot::copy_verified_snapshot(root, source)?;
+        let descriptor = staged.image_descriptor();
+        Ok(Self(Arc::new(Image {
+            staged: Arc::new(staged),
+            descriptor,
+            state: Mutex::new(Some(Arc::new(state))),
+        })))
+    }
+    /// The caller holds the ordinary exclusive candidate writer. Keep every
+    /// validated native record and its exact framing during hidden installation.
+    pub(crate) fn install_candidate_copy(&self, root: &Path) -> Result<()> {
+        self.validate()?;
+        let destination = crate::metadata_table_store::metadata_table_snapshot_path(root);
+        let parent = destination.parent().ok_or_else(|| {
+            MetadataBackendError::Serde("snapshot candidate has no parent".into())
+        })?;
+        std::fs::create_dir_all(parent).map_err(|source| MetadataBackendError::Io {
+            path: parent.to_owned(),
+            source,
+        })?;
+        let source =
+            File::open(self.0.staged.path()).map_err(|source| MetadataBackendError::Io {
+                path: self.0.staged.path().to_owned(),
+                source,
+            })?;
+        crate::metadata_snapshot::copy_snapshot_stream(root, source, self.descriptor())?
+            .install(root)
+    }
     pub fn attachment_source(
         &self,
     ) -> std::result::Result<

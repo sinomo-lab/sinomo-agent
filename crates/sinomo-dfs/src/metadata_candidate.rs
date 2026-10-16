@@ -269,15 +269,7 @@ pub fn read_metadata_candidate(root: &Path) -> Result<DfsMetadataTableSnapshot> 
 pub fn read_metadata_candidate_image(root: &Path) -> Result<crate::DfsMetadataSnapshotImage> {
     let path = metadata_table_snapshot_path(root);
     let file = File::open(&path).map_err(|source| MetadataBackendError::Io { path, source })?;
-    let state = crate::metadata_snapshot::read_snapshot(root, file)?;
-    let proof = state
-        .prefix_proof
-        .as_ref()
-        .ok_or_else(|| MetadataBackendError::Serde("current candidate has no prefix".into()))?;
-    let sequence = state
-        .materialized_through_sequence
-        .ok_or_else(|| MetadataBackendError::Serde("current candidate has no cut".into()))?;
-    crate::DfsMetadataSnapshotImage::capture(root, &state.tables, sequence, proof)
+    crate::DfsMetadataSnapshotImage::capture_existing(root, file)
 }
 
 /// Stage actual native image DATA with the ordinary candidate lock/parser and
@@ -288,14 +280,8 @@ pub fn write_metadata_candidate_image(
     fs: &crate::DfsFileSystemId,
 ) -> Result<DfsMetadataCandidateIdentity> {
     image.validate_file_system(fs)?;
-    let state = image.state()?;
     let writer = DfsMetadataCandidateWriter::open(root)?;
-    crate::metadata_snapshot::persist_snapshot(
-        &writer.root,
-        &state.tables,
-        Some(image.materialized_through_sequence),
-        Some(&image.prefix_proof),
-    )?;
+    image.install_candidate_copy(&writer.root)?;
     inspect_metadata_candidate(root)
 }
 

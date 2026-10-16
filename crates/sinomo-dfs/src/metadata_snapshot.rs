@@ -324,9 +324,9 @@ pub(crate) fn read_snapshot_with_verified_fingerprint(
     root: &Path,
     file: fs::File,
 ) -> Result<(DfsMetadataTableState, String)> {
-    let (mut state, fingerprint) = decode_snapshot_image_with_verified_fingerprint(file, None)?;
+    let (mut state, descriptor) = decode_snapshot_image_with_descriptor(file, None)?;
     state.snapshot_fingerprint = metadata_table_snapshot_fingerprint(root)?;
-    Ok((state, fingerprint))
+    Ok((state, descriptor.semantic_state_fingerprint))
 }
 
 /// SAME row decoder for native storage and a durably staged incoming image.
@@ -336,13 +336,13 @@ pub(crate) fn decode_snapshot_image(
     file: fs::File,
     expected: Option<&crate::metadata_records::DfsMetadataSnapshotImageDescriptor>,
 ) -> Result<DfsMetadataTableState> {
-    decode_snapshot_image_with_verified_fingerprint(file, expected).map(|(state, _)| state)
+    decode_snapshot_image_with_descriptor(file, expected).map(|(state, _)| state)
 }
 
-fn decode_snapshot_image_with_verified_fingerprint(
+fn decode_snapshot_image_with_descriptor(
     file: fs::File,
     expected: Option<&crate::metadata_records::DfsMetadataSnapshotImageDescriptor>,
-) -> Result<(DfsMetadataTableState, String)> {
+) -> Result<(DfsMetadataTableState, DfsMetadataSnapshotImageDescriptor)> {
     let len = file.metadata().map_err(error)?.len();
     if expected.is_some_and(|expected| expected.total_size_bytes != len) {
         return Err(error(
@@ -391,7 +391,15 @@ fn decode_snapshot_image_with_verified_fingerprint(
             "current snapshot semantic checksum mismatch".into(),
         ));
     }
-    let fingerprint = stored.semantic_state_fingerprint;
+    let descriptor = DfsMetadataSnapshotImageDescriptor {
+        format_version: stored.format_version,
+        materialized_through_sequence: stored.materialized_through_sequence,
+        semantic_state_fingerprint: stored.semantic_state_fingerprint,
+        prefix_proof: stored.prefix_proof.clone(),
+        total_size_bytes: len,
+        stream_record_count: reader.cursor().records,
+        stream_digest: reader.cursor().digest.clone(),
+    };
     Ok((
         DfsMetadataTableState {
             tables,
@@ -401,8 +409,83 @@ fn decode_snapshot_image_with_verified_fingerprint(
             snapshot_fingerprint: None,
             ..Default::default()
         },
-        fingerprint,
+        descriptor,
     ))
+}
+
+/// Compare every physical byte through the native framed stream chain. The
+/// expected descriptor comes from the full row/semantic decoder below, so an
+/// equal stream retains all of those validations without rebuilding the tables.
+fn verify_snapshot_stream_identity(
+    file: fs::File,
+    expected: &DfsMetadataSnapshotImageDescriptor,
+) -> Result<()> {
+    if file.metadata().map_err(error)?.len() != expected.total_size_bytes {
+        return Err(error("copied native image length changed"));
+    }
+    let mut reader = MigrationStreamReader::from_file(file).map_err(error)?;
+    let stored: SnapshotHeader = serde_ext::from_bytes(&reader.header).map_err(error)?;
+    if stored.format_version != expected.format_version
+        || stored.materialized_through_sequence != expected.materialized_through_sequence
+        || stored.semantic_state_fingerprint != expected.semantic_state_fingerprint
+        || stored.prefix_proof != expected.prefix_proof
+    {
+        return Err(error("copied native image header changed"));
+    }
+    while reader
+        .next_record(sinomo_core::storage::migration::stream::MAX_RECORD_BYTES as usize)
+        .map_err(error)?
+        .is_some()
+    {}
+    if reader.cursor().records != expected.stream_record_count
+        || reader.cursor().digest != expected.stream_digest
+    {
+        return Err(error(
+            "copied native image differs from its fully validated source",
+        ));
+    }
+    Ok(())
+}
+
+/// Retain validated DATA across an exact immutable copy. The opened source
+/// handle survives pathname replacement; the copied physical stream must match
+/// the full decoder's header, record chain and terminal EOF before reuse.
+pub(crate) fn copy_verified_snapshot(
+    root: &Path,
+    source: fs::File,
+) -> Result<(StagedSnapshot, DfsMetadataTableState)> {
+    let (state, descriptor) =
+        decode_snapshot_image_with_descriptor(source.try_clone().map_err(error)?, None)?;
+    Ok((copy_snapshot_stream(root, source, &descriptor)?, state))
+}
+
+/// Copy an already validated immutable image, checking its entire physical
+/// output against the same native descriptor before exposing or installing it.
+pub(crate) fn copy_snapshot_stream(
+    root: &Path,
+    mut source: fs::File,
+    descriptor: &DfsMetadataSnapshotImageDescriptor,
+) -> Result<StagedSnapshot> {
+    use std::io::{Read, Seek, SeekFrom};
+    let (stage, mut output) = StagedSnapshot::begin_received(root, &descriptor)?;
+    let copied = (|| {
+        source.seek(SeekFrom::Start(0)).map_err(error)?;
+        let limit = descriptor
+            .total_size_bytes
+            .checked_add(1)
+            .ok_or_else(|| error("native image copy length overflow"))?;
+        if std::io::copy(&mut source.take(limit), &mut output).map_err(error)?
+            != descriptor.total_size_bytes
+        {
+            return Err(error("native source length changed during capture"));
+        }
+        output.sync_all().map_err(error)
+    })();
+    // Close on every result before StagedSnapshot cleanup, including Windows.
+    drop(output);
+    copied?;
+    verify_snapshot_stream_identity(fs::File::open(stage.path()).map_err(error)?, &descriptor)?;
+    Ok(stage)
 }
 #[derive(Debug)]
 pub(crate) struct StagedSnapshot {
@@ -524,4 +607,101 @@ pub(crate) fn persist_snapshot(
         sequence.ok_or_else(|| error("current snapshot has no materialization sequence"))?;
     let proof = proof.ok_or_else(|| error("current snapshot has no certified prefix"))?;
     stage_snapshot(root, tables, sequence, proof)?.install(root)
+}
+
+#[cfg(test)]
+mod verified_copy_tests {
+    use super::*;
+
+    #[test]
+    fn verified_snapshot_copy_keeps_exact_native_bytes_and_rejects_changed_output() {
+        let name = "native-verified-snapshot-copy";
+        let node = crate::test_runtime::DfsTestRuntime::ordered_node_ids(name, 1).remove(0);
+        let (native, client) =
+            crate::test_runtime::DfsTestRuntime::start_single_node(name, node.clone()).unwrap();
+        drop(client);
+        let root = crate::default_dfs_metadata_shards_root(native.data_dir(&node)).join("root");
+        let backend = crate::LocalSobjMetadataBackend::open_for_inspection(
+            crate::DfsMetadataShardId::new("root"),
+            &root,
+        )
+        .unwrap();
+        let snapshot = backend.export_table_snapshot();
+        let sequence = snapshot.materialized_through_sequence;
+        let proof = snapshot.prefix_proof.clone();
+        let tables = crate::metadata_table_store::metadata_tables_from_table_snapshot(
+            snapshot,
+            "actual native copy fixture",
+        )
+        .unwrap();
+        let directory = sinomo_testdir::TestDir::new(name);
+        let original = stage_snapshot(directory.path(), &tables, sequence, &proof).unwrap();
+        let original_bytes = fs::read(original.path()).unwrap();
+        let (copied, state) =
+            copy_verified_snapshot(directory.path(), fs::File::open(original.path()).unwrap())
+                .unwrap();
+        assert_eq!(fs::read(copied.path()).unwrap(), original_bytes);
+        assert_eq!(copied.image_descriptor(), original.image_descriptor());
+        assert_eq!(state.prefix_proof.as_ref(), Some(&proof));
+        assert_eq!(state.materialized_through_sequence, Some(sequence));
+        #[cfg(feature = "storage-conversion")]
+        {
+            let image = crate::DfsMetadataSnapshotImage::capture_existing(
+                directory.path(),
+                fs::File::open(original.path()).unwrap(),
+            )
+            .unwrap();
+            let fresh = directory.join("fresh-candidate");
+            assert!(!fresh.exists());
+            let identity = crate::write_metadata_candidate_image(
+                &fresh,
+                &image,
+                &native.file_system().file_system_id,
+            )
+            .unwrap();
+            assert_eq!(
+                fs::read(metadata_table_snapshot_path(&fresh)).unwrap(),
+                original_bytes
+            );
+            assert_eq!(
+                identity.state_fingerprint,
+                image.descriptor().semantic_state_fingerprint
+            );
+            assert_eq!(identity.prefix_proof, proof);
+        }
+        let expected = copied.image_descriptor();
+        for variant in 0..3 {
+            let mut changed = original_bytes.clone();
+            match variant {
+                0 => {
+                    changed.pop();
+                }
+                1 => {
+                    *changed.last_mut().unwrap() ^= 1;
+                }
+                _ => changed.push(0),
+            }
+            fs::write(copied.path(), changed).unwrap();
+            assert!(
+                verify_snapshot_stream_identity(fs::File::open(copied.path()).unwrap(), &expected)
+                    .is_err()
+            );
+        }
+        fs::write(copied.path(), &original_bytes).unwrap();
+        let mut wrong_count = expected.clone();
+        wrong_count.stream_record_count += 1;
+        assert!(
+            verify_snapshot_stream_identity(fs::File::open(copied.path()).unwrap(), &wrong_count)
+                .is_err()
+        );
+        let mut wrong_digest = expected.clone();
+        wrong_digest.stream_digest = "0".repeat(64);
+        assert!(
+            verify_snapshot_stream_identity(fs::File::open(copied.path()).unwrap(), &wrong_digest)
+                .is_err()
+        );
+        assert_eq!(fs::read(original.path()).unwrap(), original_bytes);
+        drop((copied, original, backend));
+        native.close().unwrap();
+    }
 }

@@ -1784,7 +1784,29 @@ mod tests {
                 &source_fence,
             )
             .unwrap()
-            .expect("actual same source fence must commit");
+            .unwrap_or_else(|| {
+                let keys = [
+                    sinomo_dfs::metadata_shard_key(&fs, &shard.0),
+                    sinomo_dfs::metadata_shard_membership_handoff_key(&fs, &shard.0),
+                    sinomo_dfs::metadata_shard_operation_floor_key(&fs, &shard.0),
+                    sinomo_dfs::metadata_shard_head_watermark_key(&fs, &shard.0),
+                ];
+                let observed = runtime.authority.read_exact(&keys).unwrap();
+                let actual = observed
+                    .0
+                    .iter()
+                    .map(|row| {
+                        (
+                            &row.key,
+                            row.entry
+                                .as_ref()
+                                .map(|entry| entry.decode::<serde_json::Value>().unwrap()),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                eprintln!("NATIVE_FENCE_CAS_MISS expected={source_fence:?} actual={actual:?}");
+                panic!("actual same source fence must commit");
+            });
         assert!(NativeImportAuthority::content_handoff_matches_plan(
             &pending,
             &plan.expected_handoff,
