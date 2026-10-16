@@ -96,5 +96,16 @@ both replica receipts, the original sealed body and single mutation dispatch.
 File-sync, restart, authority and process-cluster tests remain separate required
 checks. A focused pass does not establish cluster acceptance.
 
+A file-sync request can find more than one committed plan for its frozen
+filesystem, object, version and hash. Its repair loop visits one matching current
+plan per turn at the strongest required replica count. A retained placement plan
+whose executor is parked cannot prevent the original committed write plan from
+being visited. The existing per-turn send budget and request deadline still apply;
+each selected owner passes the normal native authority and transfer-custody checks.
+The request-local cursor is scheduling data only. Cancellation or exact request
+replay rediscovers the durable plans, while unresolved requests belonging to an
+older owner keep their identities and delivery evidence. Success still requires
+the full named content-receipt set and the existing intersecting metadata proof.
+
 The existing per-phase record/job/byte limits, caller deadlines, worker policy
 and actual CPU/network quietness requirements are unchanged.

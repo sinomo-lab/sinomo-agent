@@ -354,6 +354,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<DfsPosixFileSyncCertificate> {
         let _namespace_plan = self.namespace_execution.begin_planning();
         let started_at = Instant::now();
+        // This is only a scheduling cursor within the existing request budget.
+        // Every visit reloads exact durable owners; it grants no publication
+        // permission and cannot settle a previous carrier's unknown outcome.
+        let mut repair_owner_after = None;
         let content_evidence = loop {
             self.check_cancelled("file sync content receipts")?;
             match self.posix_validate_file_sync_target_local(target) {
@@ -365,8 +369,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         return Err(validation_error);
                     };
 
+                    let repair_owner = self
+                        .file_sync_repair_owner_after(
+                            target,
+                            required_receipts,
+                            repair_owner_after.as_deref(),
+                        )?
+                        .unwrap_or_else(|| intent_id.clone());
+                    repair_owner_after = Some(repair_owner.clone());
                     self.record_local_pending_write_receipt_if_desired(
-                        &intent_id,
+                        &repair_owner,
                         &target.object_id,
                         &target.version,
                         &target.content_hash,
@@ -381,10 +393,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     // repairs; waiting while holding this lane cannot rely on
                     // a later maintenance pass to hydrate it for us.
                     self.restore_pending_write_for_intent_if_missing(
-                        &intent_id,
+                        &repair_owner,
                         &target.object_id,
                     )?;
-                    let intent_ids = BTreeSet::from([intent_id.clone()]);
+                    let intent_ids = BTreeSet::from([repair_owner]);
                     let (_scheduled, _events) = self.retry_pending_repairs_for_intents_best_effort(
                         &intent_ids,
                         required_receipts,
@@ -501,6 +513,47 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             ));
         }
         Ok(object)
+    }
+
+    /// A durable placement plan can remain as source/custody evidence after
+    /// its repair executor is retired. It must not starve another actual
+    /// committed plan for the same frozen bytes. Visit one strongest current
+    /// owner per existing repair turn; the repair path still revalidates native
+    /// authority and preserves every unresolved transfer identity.
+    fn file_sync_repair_owner_after(
+        &self,
+        target: &DfsPosixFileSyncTarget,
+        required_receipts: usize,
+        after: Option<&str>,
+    ) -> Result<Option<String>> {
+        let Some(backend) = self.metadata_backend.as_ref() else {
+            return Ok(None);
+        };
+        let owners = backend
+            .intents_for_object(&target.object_id)?
+            .into_iter()
+            .filter(|intent| {
+                intent.file_system_id == target.file_system_id
+                    && intent.object_id == target.object_id
+                    && intent.target_version == target.version
+                    && intent.status == DfsWriteIntentStatus::Committed
+                    && intent.publication.is_current()
+                    && intent.policy.desired_replicas.max(1) == required_receipts
+                    && intent.content_hash.as_deref() == Some(target.content_hash.as_str())
+                    && intent.object_metadata.as_ref().is_none_or(|object| {
+                        object.file_system_id == target.file_system_id
+                            && object.object_id == target.object_id
+                            && object.version == target.version
+                            && object.content_hash.as_deref() == Some(target.content_hash.as_str())
+                    })
+            })
+            .map(|intent| intent.intent_id)
+            .collect::<BTreeSet<_>>();
+        Ok(owners
+            .iter()
+            .find(|owner| after.is_none_or(|after| owner.as_str() > after))
+            .or_else(|| owners.first())
+            .cloned())
     }
 
     fn pending_file_sync_receipt_state(
