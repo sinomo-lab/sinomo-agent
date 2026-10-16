@@ -2311,6 +2311,21 @@ mod provider_lifecycle_tests {
     }
 
     #[test]
+    fn native_production_sized_metadata_preparation_keeps_original_browser_deadline() {
+        // An additional production-cardinality fixture, not a replacement for
+        // the existing 256-file test with its original five-second deadline.
+        native_released_namespace_source_reopens_with_browser_budget(
+            false,
+            false,
+            false,
+            false,
+            3072,
+            None,
+            Some(std::time::Duration::from_secs(60)),
+        );
+    }
+
+    #[test]
     fn native_candidate_checkpoint_restarts_with_exact_source_and_real_authority() {
         native_released_namespace_source_reopens_scaled(
             false,
@@ -2358,13 +2373,35 @@ mod provider_lifecycle_tests {
         additional_source_files: usize,
         pause_finalization: Option<&'static str>,
     ) {
+        native_released_namespace_source_reopens_with_browser_budget(
+            omit_source_durability,
+            same_version_placement,
+            interrupt_metadata_confirmation,
+            retained_root_exchange,
+            additional_source_files,
+            pause_finalization,
+            None,
+        );
+    }
+
+    fn native_released_namespace_source_reopens_with_browser_budget(
+        omit_source_durability: bool,
+        same_version_placement: bool,
+        interrupt_metadata_confirmation: bool,
+        retained_root_exchange: bool,
+        additional_source_files: usize,
+        pause_finalization: Option<&'static str>,
+        production_browser_budget: Option<std::time::Duration>,
+    ) {
         use sinomo_core::object::{LengthMode, serde_ext};
         use sinomo_dfs::{
             DfsMetadataShardId, DfsNamespaceObjectVersionExpectation,
             DfsNamespacePathOccupantExpectation, DfsNamespaceTransaction,
             DfsPreparedOperationStatus, test_support::DfsTestRuntime,
         };
-        let name = if pause_finalization == Some("source-cut.json") {
+        let name = if production_browser_budget.is_some() {
+            "native-production-sized-metadata-preparation"
+        } else if pause_finalization == Some("source-cut.json") {
             "native-finalization-candidate-restart"
         } else if pause_finalization.is_some() {
             "native-finalization-proposal-restart"
@@ -3163,6 +3200,14 @@ mod provider_lifecycle_tests {
             pause_completed_install.store(false, std::sync::atomic::Ordering::Release);
         }
         assert!(!crate::metadata::current_root(&root).unwrap() || retained_root_exchange);
+        if production_browser_budget.is_some() {
+            let records = crate::metadata::count_stopped_source_records_for_test(&root).unwrap();
+            assert!(
+                records >= 19_808,
+                "fixture must cover the retained real root's record count: {records}"
+            );
+            eprintln!("PRODUCTION_SHAPE_SOURCE records={records} files={additional_source_files}");
+        }
         let retained_checkpoint = if pause_finalization.is_some() {
             let blocked = native.reopen_node(node.clone());
             assert!(
@@ -3196,9 +3241,27 @@ mod provider_lifecycle_tests {
         } else {
             None
         };
-        native
-            .reopen_node(node.clone())
-            .expect("normal cold Main and real MIG provider must admit the released source");
+        let recovery_started = std::time::Instant::now();
+        let recovered = if let Some(budget) = production_browser_budget {
+            native.reopen_node_with_startup_deadline(
+                node.clone(),
+                tokio::time::Instant::now() + budget,
+            )
+        } else {
+            native.reopen_node(node.clone())
+        };
+        if let Some(budget) = production_browser_budget {
+            eprintln!(
+                "PRODUCTION_SHAPE_RECOVERY elapsed_ms={} budget_ms={} result={recovered:?}",
+                recovery_started.elapsed().as_millis(),
+                budget.as_millis()
+            );
+            assert!(
+                recovery_started.elapsed() < budget,
+                "original browser completion deadline"
+            );
+        }
+        recovered.expect("normal cold Main and real MIG provider must admit the released source");
         if let Some((path, original)) = retained_checkpoint {
             assert_eq!(
                 std::fs::read(path).unwrap(),
@@ -3354,6 +3417,33 @@ mod provider_lifecycle_tests {
         drop(owner);
         let mut client = native.client(&node).unwrap();
         assert_eq!(client.posix_read_file_distributed(path).unwrap(), first);
+        if production_browser_budget.is_some() {
+            // Check every original generated pathname and body after actual
+            // native publication. No sampled subset or count-only acceptance.
+            let mut checkpointed = native.checkpoint_rpc_observation_window().unwrap();
+            for index in 0..additional_source_files {
+                assert_eq!(
+                    client
+                        .posix_read_file_distributed(&format!(
+                            "/preparation-records/file-{index:04}"
+                        ))
+                        .unwrap(),
+                    b"native bounded-preparation source"
+                );
+                if (index + 1) % 64 == 0 {
+                    checkpointed += native.checkpoint_rpc_observation_window().unwrap();
+                }
+            }
+            checkpointed += native.checkpoint_rpc_observation_window().unwrap();
+            assert!(
+                checkpointed > 4096,
+                "full source validation exceeds one observation window"
+            );
+            assert_eq!(native.observation_dropped_count(), 0);
+            eprintln!(
+                "PRODUCTION_SHAPE_EXACT_READS files={additional_source_files} checkpointed_rpc_records={checkpointed} dropped=0"
+            );
+        }
         let after = b"normal native writer after released-source admission";
         let after_options = if same_version_placement {
             let (_, _, policy) = client

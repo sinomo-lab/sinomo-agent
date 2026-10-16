@@ -4047,6 +4047,28 @@ impl DfsTestRuntime {
     pub fn reopen_node(&mut self, node: NodeId) -> Result<(), String> {
         self.reopen_node_with_action(node, None)
     }
+    /// Reopen a production-shape fixture under its actual browser deadline.
+    /// Existing ordinary reopen calls retain DEFAULT_NETWORK_TIMEOUT. This
+    /// explicit caller deadline covers mounting, authority and completion.
+    pub fn reopen_node_with_startup_deadline(
+        &mut self,
+        node: NodeId,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), String> {
+        if tokio::time::Instant::now() >= deadline {
+            return Err("native recovery startup reached the caller deadline".into());
+        }
+        self.prepare_projection(&node)?;
+        self.mount_node(&node)?;
+        self.wait_native_authority_before(
+            &node,
+            deadline
+                .min(tokio::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT),
+        )?;
+        self.ready_node(&node)?;
+        self.wait_startup_completion_with_budget(Some(deadline), Some(&node))
+    }
+
     /// Run an ordinary RPC action once the real mounted host admits it, before
     /// waiting for its current startup generation. Recovery can enable that
     /// generation; action and completion share the original network budget.

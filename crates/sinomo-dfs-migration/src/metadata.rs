@@ -35,6 +35,21 @@ use std::sync::{Arc, Mutex};
 
 type Result<T> = std::result::Result<T, MetadataBackendError>;
 
+#[cfg(test)]
+pub(crate) fn count_stopped_source_records_for_test(root: &Path) -> Result<usize> {
+    // The fixture's real owner is stopped before this read-only census. Verify
+    // the complete inventory again; this observation grants no source custody
+    // or publication authority to the subsequently mounted converter.
+    let inventory = source::discover(root)?;
+    let mut cursor = source::SourceCursor::new(inventory.clone());
+    let mut records = 0;
+    while source::next(root, &mut cursor)?.is_some() {
+        records += 1;
+    }
+    assert_eq!(source::discover(root)?, inventory);
+    Ok(records)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MetadataImportProposalFacts {
     pub source_root: PathBuf,
