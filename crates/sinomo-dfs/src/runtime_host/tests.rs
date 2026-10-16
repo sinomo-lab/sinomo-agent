@@ -11089,21 +11089,6 @@ fn daemon_dfs_resident_mutation_lanes_are_scoped_by_exact_shard() {
         .unwrap();
     assert_eq!(root_shard.primary_node_id, local);
     assert_eq!(services_shard.primary_node_id, local);
-    let peer_snapshot = read_daemon_dfs_message_peer_snapshot(&cluster_paths)
-        .unwrap()
-        .expect("actual native peer projection");
-    let warm = runtime
-        .block_on(warm_daemon_dfs_metadata_authority_for_peer_snapshot_async(
-            &cluster_paths,
-            &peer_snapshot,
-            &runtime,
-        ))
-        .unwrap();
-    let scheduler = daemon_dfs_mutation_scheduler(&data_dir).unwrap();
-    let admission = runtime
-        .block_on(scheduler.admit(&DfsMessageExecutionScope::GlobalExclusive))
-        .expect("normal global generation admission");
-    let preflight = warm.for_admission(&admission);
     let root_key = DaemonDfsMutationLaneKey {
         file_system_id: root_shard.file_system_id.clone(),
         shard_id: DfsMetadataShardId::new(root_shard.shard_id.clone()),
@@ -11112,60 +11097,152 @@ fn daemon_dfs_resident_mutation_lanes_are_scoped_by_exact_shard() {
         file_system_id: services_shard.file_system_id.clone(),
         shard_id: DfsMetadataShardId::new(services_shard.shard_id.clone()),
     };
-    let (had_root, had_services, prior_global, prior_exact_count) = {
-        let cache_slot = daemon_dfs_message_service_cache()
-            .root(&data_dir.root())
-            .expect("actual root cache slot");
-        let cache = cache_slot.lock().unwrap();
-        let entry = cache.as_ref().expect("normal Main resident generation");
-        (
-            entry.exact_shard_services.contains_key(&root_key),
-            entry.exact_shard_services.contains_key(&services_key),
-            entry.primary_service.clone(),
-            entry.exact_shard_services.len(),
-        )
-    };
-    let opens_before = daemon_dfs_test_message_service_lane_open_count(&data_dir);
-    let select = |kind| {
-        let rollover = matches!(&kind, DaemonDfsMessageLaneKind::MutationGlobal);
-        daemon_dfs_message_lane(
-            &data_dir,
-            &cluster_paths,
-            &peer_snapshot,
-            &runtime,
-            kind,
-            rollover,
-            Some(&preflight),
-        )
-        .map(|(lane, _)| lane)
-        .expect("normal admitted resident lane selection")
-    };
-    let root_lane = select(DaemonDfsMessageLaneKind::MutationExact(root_key.clone()));
-    let same_root_lane = select(DaemonDfsMessageLaneKind::MutationExact(root_key.clone()));
-    let services_lane = select(DaemonDfsMessageLaneKind::MutationExact(services_key));
-    let added_exact = usize::from(!had_root) + usize::from(!had_services);
-    {
-        let cache_slot = daemon_dfs_message_service_cache()
-            .root(&data_dir.root())
-            .expect("actual root cache slot");
-        let cache = cache_slot.lock().unwrap();
-        let entry = cache.as_ref().unwrap();
-        assert_eq!(
-            entry.exact_shard_services.len(),
-            prior_exact_count + added_exact
-        );
-        match (&prior_global, &entry.primary_service) {
-            (Some(before), Some(after)) => assert!(Arc::ptr_eq(before, after)),
-            (None, None) => {}
-            _ => panic!("exact selection changed the all-shard service"),
+    let scheduler = daemon_dfs_mutation_scheduler(&data_dir).unwrap();
+    let deadline = tokio::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    let mut replans = 0;
+    let (
+        peer_snapshot,
+        admission,
+        preflight,
+        root_lane,
+        same_root_lane,
+        services_lane,
+        global_lane,
+        prior_global,
+        opens_before,
+        added_exact,
+    ) = loop {
+        let peer_snapshot = read_daemon_dfs_message_peer_snapshot(&cluster_paths)
+            .unwrap()
+            .expect("actual native peer projection");
+        let warm = runtime.block_on(async {
+            tokio::time::timeout_at(
+                deadline,
+                warm_daemon_dfs_metadata_authority_for_peer_snapshot_async(
+                    &cluster_paths,
+                    &peer_snapshot,
+                    &runtime,
+                ),
+            )
+            .await
+            .expect("original native preflight budget")
+            .unwrap()
+        });
+        let admission = runtime.block_on(async {
+            tokio::time::timeout_at(
+                deadline,
+                scheduler.admit(&DfsMessageExecutionScope::GlobalExclusive),
+            )
+            .await
+            .expect("original native admission budget")
+            .unwrap()
+        });
+        let preflight = warm.for_admission(&admission);
+        let selected = (|| -> Result<_, DaemonDfsAuthorityPreExecutionError> {
+            let (had_root, had_services, prior_global, prior_exact_count) = {
+                let cache_slot = daemon_dfs_message_service_cache()
+                    .root(&data_dir.root())
+                    .expect("actual root cache slot");
+                let cache = cache_slot.lock().unwrap();
+                let entry = cache.as_ref().expect("normal Main resident generation");
+                (
+                    entry.exact_shard_services.contains_key(&root_key),
+                    entry.exact_shard_services.contains_key(&services_key),
+                    entry.primary_service.clone(),
+                    entry.exact_shard_services.len(),
+                )
+            };
+            let opens_before = daemon_dfs_test_message_service_lane_open_count(&data_dir);
+            let select = |kind| {
+                let rollover = matches!(&kind, DaemonDfsMessageLaneKind::MutationGlobal);
+                daemon_dfs_message_lane_with_typed_preflight_for_test(
+                    &data_dir,
+                    &cluster_paths,
+                    &peer_snapshot,
+                    &runtime,
+                    kind,
+                    rollover,
+                    &preflight,
+                )
+            };
+            let root_lane = select(DaemonDfsMessageLaneKind::MutationExact(root_key.clone()))?;
+            let same_root_lane = select(DaemonDfsMessageLaneKind::MutationExact(root_key.clone()))?;
+            let services_lane = select(DaemonDfsMessageLaneKind::MutationExact(
+                services_key.clone(),
+            ))?;
+            let added_exact = usize::from(!had_root) + usize::from(!had_services);
+            {
+                let cache_slot = daemon_dfs_message_service_cache()
+                    .root(&data_dir.root())
+                    .expect("actual root cache slot");
+                let cache = cache_slot.lock().unwrap();
+                let entry = cache.as_ref().unwrap();
+                assert_eq!(
+                    entry.exact_shard_services.len(),
+                    prior_exact_count + added_exact
+                );
+                match (&prior_global, &entry.primary_service) {
+                    (Some(before), Some(after)) => assert!(Arc::ptr_eq(before, after)),
+                    (None, None) => {}
+                    _ => panic!("exact selection changed the all-shard service"),
+                }
+            }
+            assert_eq!(
+                daemon_dfs_test_message_service_lane_open_count(&data_dir),
+                opens_before + added_exact,
+                "exact selection opens only absent request shells"
+            );
+            let global_lane = select(DaemonDfsMessageLaneKind::MutationGlobal)?;
+
+            Ok((
+                root_lane,
+                same_root_lane,
+                services_lane,
+                global_lane,
+                prior_global,
+                opens_before,
+                added_exact,
+            ))
+        })();
+        match selected {
+            Ok((
+                root_lane,
+                same_root_lane,
+                services_lane,
+                global_lane,
+                prior_global,
+                opens_before,
+                added_exact,
+            )) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "original lane setup budget"
+                );
+                break (
+                    peer_snapshot,
+                    admission,
+                    preflight,
+                    root_lane,
+                    same_root_lane,
+                    services_lane,
+                    global_lane,
+                    prior_global,
+                    opens_before,
+                    added_exact,
+                );
+            }
+            Err(DaemonDfsAuthorityPreExecutionError::AuthorityPreflightStale(_)) => {
+                // Match the normal pre-execution replan bound. No storage error
+                // is retried and no admission is retained through refresh.
+                drop(admission);
+                replans += 1;
+                assert!(replans <= 2, "normal pre-execution replan limit");
+            }
+            Err(DaemonDfsAuthorityPreExecutionError::Failed(error)) => {
+                panic!("normal admitted resident lane selection: {error}")
+            }
         }
-    }
-    assert_eq!(
-        daemon_dfs_test_message_service_lane_open_count(&data_dir),
-        opens_before + added_exact,
-        "exact selection opens only absent request shells"
-    );
-    let global_lane = select(DaemonDfsMessageLaneKind::MutationGlobal);
+    };
     assert!(Arc::ptr_eq(&root_lane, &same_root_lane));
     assert!(!Arc::ptr_eq(&root_lane, &services_lane));
     assert!(!Arc::ptr_eq(&root_lane, &global_lane) && !Arc::ptr_eq(&services_lane, &global_lane));

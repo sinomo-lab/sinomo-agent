@@ -10411,7 +10411,20 @@ mod tests {
             }
             runtime.start_nodes().unwrap();
             let shard = runtime.root_shard().unwrap();
-            let source = runtime.shared_control_plane().unwrap();
+            // This fixture captures control-plane DATA only. Borrow the real
+            // registered Core client directly; opening a DFS mutation service
+            // would add an unrelated, concurrently refreshing projection gate.
+            let context = runtime.component_context(&nodes[0]).unwrap();
+            assert!(
+                crate::runtime_host::registered_component_cluster(&context)
+                    .unwrap()
+                    .is_some()
+            );
+            let paths = sinomo_core::network::ClusterPaths::new(runtime.data_dir(&nodes[0]));
+            let mut source = crate::runtime_host::DaemonDfsControlPlaneKvClient::new_on_runtime(
+                &paths,
+                &runtime.runtime_handle(),
+            );
             let mut keys = nodes
                 .iter()
                 .flat_map(|node| {
@@ -10422,9 +10435,7 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             keys.push(metadata_shard_key(&shard.file_system_id, &shard.shard_id));
-            let entries = source
-                .with_client(|client| client.get_authoritative_consistent(&keys))
-                .unwrap();
+            let entries = source.get_authoritative_consistent(&keys).unwrap();
             assert_eq!(entries.len(), keys.len());
             let mut data = InProcessKvStore::new();
             for (key, entry) in keys.into_iter().zip(entries) {
@@ -10459,6 +10470,7 @@ mod tests {
                 shard
             );
             drop(source);
+            drop(context);
             runtime.close().unwrap();
             (data, shard)
         })

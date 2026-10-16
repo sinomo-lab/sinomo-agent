@@ -2503,6 +2503,34 @@ pub(crate) fn daemon_dfs_message_lane(
     }
 }
 
+#[cfg(test)]
+pub(super) fn daemon_dfs_message_lane_with_typed_preflight_for_test(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    peer_snapshot: &DaemonDfsMessagePeerSnapshot,
+    runtime: &tokio::runtime::Handle,
+    kind: DaemonDfsMessageLaneKind,
+    allow_generation_rollover: bool,
+    metadata_authority_preflight: &DaemonDfsMetadataAuthorityPreflight,
+) -> Result<Arc<DaemonDfsMessageServiceLaneHandle>, DaemonDfsAuthorityPreExecutionError> {
+    match try_select_daemon_dfs_message_lane(
+        data_dir,
+        cluster_paths,
+        peer_snapshot,
+        runtime,
+        kind,
+        allow_generation_rollover,
+        Some(metadata_authority_preflight),
+        None,
+        None,
+    )? {
+        DaemonDfsMessageLaneSelection::Ready(lane, _) => Ok(lane),
+        DaemonDfsMessageLaneSelection::AuthorityPreflightStale(stale) => {
+            Err(DaemonDfsAuthorityPreExecutionError::AuthorityPreflightStale(stale))
+        }
+    }
+}
+
 fn select_daemon_dfs_message_lane(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
