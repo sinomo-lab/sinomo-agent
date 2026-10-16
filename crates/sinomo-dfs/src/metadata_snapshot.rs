@@ -339,7 +339,7 @@ pub(crate) fn decode_snapshot_image(
     decode_snapshot_image_with_descriptor(file, expected).map(|(state, _)| state)
 }
 
-fn decode_snapshot_image_with_descriptor(
+pub(crate) fn decode_snapshot_image_with_descriptor(
     file: fs::File,
     expected: Option<&crate::metadata_records::DfsMetadataSnapshotImageDescriptor>,
 ) -> Result<(DfsMetadataTableState, DfsMetadataSnapshotImageDescriptor)> {
@@ -416,7 +416,7 @@ fn decode_snapshot_image_with_descriptor(
 /// Compare every physical byte through the native framed stream chain. The
 /// expected descriptor comes from the full row/semantic decoder below, so an
 /// equal stream retains all of those validations without rebuilding the tables.
-fn verify_snapshot_stream_identity(
+pub(crate) fn verify_snapshot_stream_identity(
     file: fs::File,
     expected: &DfsMetadataSnapshotImageDescriptor,
 ) -> Result<()> {
@@ -668,6 +668,44 @@ mod verified_copy_tests {
                 image.descriptor().semantic_state_fingerprint
             );
             assert_eq!(identity.prefix_proof, proof);
+            let retained = crate::DfsMetadataCandidateInspection::capture(&fresh).unwrap();
+            assert_eq!(retained.verify(&fresh).unwrap(), identity);
+            let renamed = directory.join("published-candidate-copy");
+            fs::rename(&fresh, &renamed).unwrap();
+            assert!(
+                retained.verify(&fresh).is_err(),
+                "missing original path is not data custody"
+            );
+            assert_eq!(retained.verify(&renamed).unwrap(), identity);
+            let actual = metadata_table_snapshot_path(&renamed);
+            for variant in 0..4 {
+                let mut changed = original_bytes.clone();
+                match variant {
+                    0 => {
+                        changed.pop();
+                    }
+                    1 => {
+                        let index = changed.len() / 2;
+                        changed[index] ^= 1;
+                    }
+                    2 => {
+                        *changed.last_mut().unwrap() ^= 1;
+                    }
+                    _ => changed.push(0),
+                }
+                fs::write(&actual, &changed).unwrap();
+                assert!(
+                    retained.verify(&renamed).is_err(),
+                    "changed current bytes cannot reuse validation"
+                );
+                assert!(crate::DfsMetadataCandidateInspection::capture(&renamed).is_err());
+            }
+            fs::remove_file(&actual).unwrap();
+            assert!(retained.verify(&renamed).is_err());
+            fs::write(&actual, &original_bytes).unwrap();
+            assert_eq!(retained.verify(&renamed).unwrap(), identity);
+            let restarted = crate::DfsMetadataCandidateInspection::capture(&renamed).unwrap();
+            assert_eq!(restarted.verify(&renamed).unwrap(), identity);
         }
         let expected = copied.image_descriptor();
         for variant in 0..3 {

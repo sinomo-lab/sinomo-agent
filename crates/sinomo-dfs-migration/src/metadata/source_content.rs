@@ -653,9 +653,24 @@ pub(super) fn source_locator(
             error("immutable version has no independently captured raw source membership locator")
         })
 }
-pub(super) fn publish(session: &mut Session, captured: &CapturedSourceCut) -> Result<()> {
+pub(super) fn publish(
+    session: &mut Session,
+    captured: &CapturedSourceCut,
+    remaining: &mut usize,
+) -> Result<bool> {
+    let Some(next) = session.source_hint_next else {
+        return Ok(true);
+    };
     let tables = session.projection.current_tables()?;
-    for version in &tables.versions {
+    if next > tables.versions.len() {
+        return Err(error("source hint cursor exceeds its verified source view"));
+    }
+    for (index, version) in tables.versions.iter().enumerate().skip(next) {
+        if *remaining == 0 {
+            return Ok(false);
+        }
+        *remaining -= 1;
+        session.source_hint_next = Some(index + 1);
         let key = (
             version.file_system_id.clone(),
             version.object_id.clone(),
@@ -722,9 +737,24 @@ pub(super) fn publish(session: &mut Session, captured: &CapturedSourceCut) -> Re
                 .ok_or_else(|| error("source evidence has no parent"))?,
         )
         .map_err(error)?;
-        write_json(&file, &evidence)?;
+        // This unsigned lookup hint cannot supply membership or authority.
+        // The source and event checkpoint are already durable; a fresh owner
+        // replays them and rebuilds these hints before content work resumes.
+        // Keep atomic visibility, while avoiding a durability transaction per
+        // derived row. The reader still validates the actual source bytes,
+        // provenance, current membership and physical writer fence every time.
+        sinomo_core::storage::durable_file::write_file_atomic_hint(
+            &file,
+            &serde_json::to_vec(&evidence).map_err(error)?,
+            sinomo_core::storage::durable_file::DurableAtomicFileOptions::new(
+                "source-evidence",
+                "tmp",
+            ),
+        )
+        .map_err(error)?;
     }
-    Ok(())
+    session.source_hint_next = None;
+    Ok(true)
 }
 fn actual_row(
     root: &Path,

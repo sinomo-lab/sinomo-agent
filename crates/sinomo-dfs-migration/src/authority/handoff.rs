@@ -362,7 +362,7 @@ impl NativeImportAuthority {
     /// A saved-only primary retries the ordinary guarded first CAS. A stage
     /// already present/activated is observed, never resubmitted as a new effect.
     fn recover_stage_commit(&self, plan: &MetadataImportPlan) -> Result<DfsNativeTxnCommit> {
-        Self::validate_plan(plan)?;
+        self.retained_plan_file.validate(plan)?;
         let h = &plan.expected_handoff;
         let keys = vec![
             sinomo_dfs::metadata_shard_key(
@@ -424,7 +424,7 @@ impl NativeImportAuthority {
                 KvAuthorityProof,
             ) = serde_json::from_slice(&std::fs::read(input_path).map_err(error)?)
                 .map_err(error)?;
-            if digest(&input_source)? != digest(source)?
+            if !plan_file::same_source_cut(&input_source, source)
                 || serde_json::to_value(&input_entries).map_err(error)?
                     != serde_json::to_value(&plan.captured_entries).map_err(error)?
                 || input_authority != plan.captured_authority
@@ -520,7 +520,7 @@ impl NativeImportAuthority {
         plan: &MetadataImportPlan,
         request: KvTxnRequest,
     ) -> std::result::Result<DfsNativeTxnCommit, NativeEvaluationError> {
-        Self::validate_plan(plan)?;
+        self.retained_plan_file.validate(plan)?;
         self.evaluate_original_native_commit(
             request,
             &plan.expected_handoff.retiring_shard.primary_node_id,
@@ -677,7 +677,7 @@ impl NativeImportAuthority {
                 Vec<MetadataCapturedKvEntry>,
                 KvAuthorityProof,
             ) = serde_json::from_slice(&std::fs::read(input).map_err(error)?).map_err(error)?;
-            if digest(&captured_source)? != digest(source)? {
+            if !plan_file::same_source_cut(&captured_source, source) {
                 return Err(error("pre-stage source cut changed after restart"));
             }
             let mut recovered = None;
@@ -730,8 +730,8 @@ impl NativeImportAuthority {
             Self::save_blueprint(&source.staged_root, "native-import-plan.json", &plan)?;
             plan
         };
-        Self::validate_plan(&plan)?;
-        if digest(&plan.source_cut)? != digest(source)? {
+        self.retained_plan_file.validate(&plan)?;
+        if !plan_file::same_source_cut(&plan.source_cut, source) {
             return Err(error(
                 "immutable native import blueprint changed after restart",
             ));
@@ -745,7 +745,7 @@ impl NativeImportAuthority {
         &self,
         plan: &MetadataImportPlan,
     ) -> Result<Option<DfsMetadataShardMembershipHandoffProof>> {
-        Self::validate_plan(plan)?;
+        self.retained_plan_file.validate(plan)?;
         let h = &plan.expected_handoff;
         let keys = vec![
             sinomo_dfs::metadata_shard_key(
@@ -846,7 +846,7 @@ impl NativeImportAuthority {
         plan: &MetadataImportPlan,
         proof: &DfsMetadataShardMembershipHandoffProof,
     ) -> Result<()> {
-        Self::validate_plan(plan)?;
+        self.retained_plan_file.validate(plan)?;
         Self::validate_joint_acknowledgements(proof)?;
         let h = &plan.expected_handoff;
         if proof.handoff_id != h.handoff_id

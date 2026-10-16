@@ -101,9 +101,10 @@ pub use native_shard_trace::ObservedNative as NativeObservedFact;
 
 #[cfg(feature = "storage-conversion")]
 pub use metadata_candidate::{
-    DfsMetadataCandidateIdentity, DfsMetadataCandidateState, DfsMetadataCandidateWriter,
-    inspect_metadata_candidate, read_metadata_candidate, read_metadata_candidate_image,
-    receive_metadata_candidate_image, write_metadata_candidate_image,
+    DfsMetadataCandidateIdentity, DfsMetadataCandidateInspection, DfsMetadataCandidateState,
+    DfsMetadataCandidateWriter, inspect_metadata_candidate, read_metadata_candidate,
+    read_metadata_candidate_image, receive_metadata_candidate_image,
+    write_metadata_candidate_image, write_metadata_candidate_image_inspected,
 };
 #[cfg(feature = "storage-conversion")]
 pub use metadata_cursor::read_current_metadata_acknowledgement_floors;

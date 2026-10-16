@@ -337,7 +337,7 @@ impl NativeImportAuthority {
         source: &sinomo_core::node::NodeId,
         envelope: &StageSnapshot,
     ) -> Result<()> {
-        Self::validate_plan(&envelope.plan)?;
+        self.retained_plan_file.validate(&envelope.plan)?;
         let command = &envelope.command;
         if &command.source_node_id != source {
             return Err(error("staged image head differs from authenticated caller"));
@@ -378,7 +378,7 @@ impl NativeImportAuthority {
         source: sinomo_core::node::NodeId,
         envelope: StageSnapshot,
     ) -> Result<DfsMetadataSnapshotInstallResponse> {
-        Self::validate_plan(&envelope.plan)?;
+        self.retained_plan_file.validate(&envelope.plan)?;
         let command = envelope.command;
         if source != command.source_node_id {
             return Err(error(
@@ -436,7 +436,7 @@ impl NativeImportAuthority {
         image.validate_file_system(fs)?;
         let root = self.staged_receiver_root(&pending)?;
         if root.join("records/tables/snapshot.sobj").exists() {
-            let actual = sinomo_dfs::inspect_metadata_candidate(&root)?;
+            let actual = self.retained_plan_file.inspect_candidate(&root)?;
             if actual.prefix_proof != cut.target_prefix
                 || actual.state_fingerprint != cut.converted_image_fingerprint
             {
@@ -445,7 +445,8 @@ impl NativeImportAuthority {
                 ));
             }
         } else {
-            let actual = sinomo_dfs::write_metadata_candidate_image(&root, image, fs)?;
+            let inspection = sinomo_dfs::write_metadata_candidate_image_inspected(&root, image, fs)?;
+            let actual = self.retained_plan_file.retain_candidate(&root, inspection)?;
             if actual.prefix_proof != cut.target_prefix
                 || actual.state_fingerprint != cut.converted_image_fingerprint
             {
@@ -524,7 +525,7 @@ impl NativeImportAuthority {
             &ancestry_request_id,
             None,
         )?;
-        let actual = sinomo_dfs::inspect_metadata_candidate(&root)?;
+        let actual = self.retained_plan_file.inspect_candidate(&root)?;
         if actual.prefix_proof != cut.target_prefix
             || actual.state_fingerprint != cut.converted_image_fingerprint
             || probe.journal_sequence != actual.prefix_proof.journal_sequence
@@ -892,7 +893,7 @@ impl NativeImportAuthority {
         source: sinomo_core::node::NodeId,
         challenge: SourceFloorChallenge,
     ) -> Result<SourceFloorResponse> {
-        Self::validate_plan(&challenge.plan)?;
+        self.retained_plan_file.validate(&challenge.plan)?;
         let h = &challenge.plan.expected_handoff;
         let actual = self.receive_context(
             &h.retiring_shard.file_system_id,
@@ -929,11 +930,9 @@ impl NativeImportAuthority {
         let root = self.source_ancestry_root(&h.handoff_id, &challenge.request_id)?;
         std::fs::create_dir_all(&root).map_err(error)?;
         if root.join("floors.json").is_file() {
-            let recorded: SourceFloorChallenge =
-                serde_json::from_slice(&std::fs::read(root.join("challenge.json")).map_err(error)?)
-                    .map_err(error)?;
+            let recorded = self.retained_plan_file.read_challenge(&root.join("challenge.json"))?;
             if recorded.request_id != challenge.request_id
-                || digest(&recorded.plan)? != digest(&challenge.plan)?
+                || !plan_file::same_plan(&recorded.plan, &challenge.plan)
             {
                 return Err(error(
                     "retained ancestry retry changes its exact immutable plan/request",
@@ -976,9 +975,7 @@ impl NativeImportAuthority {
         // A request ID alone is not a scope or permission. Resolve the saved
         // challenge and require its exact authenticated current native source.
         let root = self.source_ancestry_root(&transfer.handoff_id, &transfer.request_id)?;
-        let challenge: SourceFloorChallenge =
-            serde_json::from_slice(&std::fs::read(root.join("challenge.json")).map_err(error)?)
-                .map_err(error)?;
+        let challenge = self.retained_plan_file.read_challenge(&root.join("challenge.json"))?;
         if challenge.request_id != transfer.request_id
             || challenge.plan.expected_handoff.handoff_id != transfer.handoff_id
         {
@@ -1149,10 +1146,8 @@ impl NativeImportAuthority {
         local_exact_prefix: Option<&sinomo_dfs::DfsMetadataPrefixProof>,
     ) -> Result<Vec<Arc<std::fs::File>>> {
         let root = self.source_ancestry_root(&plan.expected_handoff.handoff_id, request_id)?;
-        let challenge: SourceFloorChallenge =
-            serde_json::from_slice(&std::fs::read(root.join("challenge.json")).map_err(error)?)
-                .map_err(error)?;
-        if digest(&challenge.plan)? != digest(plan)? {
+        let challenge = self.retained_plan_file.read_challenge(&root.join("challenge.json"))?;
+        if !plan_file::same_plan(&challenge.plan, plan) {
             return Err(error("source ancestry belongs to another immutable plan"));
         }
         let (fences, floors, checkpoints) = self.capture_local_source_floors(fs, shard, plan)?;
@@ -1219,10 +1214,8 @@ impl NativeImportAuthority {
         )
         .map_err(error)?;
         let root = self.source_ancestry_root(&plan.expected_handoff.handoff_id, &request_id)?;
-        let challenge: SourceFloorChallenge =
-            serde_json::from_slice(&std::fs::read(root.join("challenge.json")).map_err(error)?)
-                .map_err(error)?;
-        if digest(&challenge.plan)? != digest(plan)? {
+        let challenge = self.retained_plan_file.read_challenge(&root.join("challenge.json"))?;
+        if !plan_file::same_plan(&challenge.plan, plan) {
             return Err(error(
                 "recovered ancestry changes the immutable native plan",
             ));
@@ -1416,7 +1409,7 @@ impl NativeImportAuthority {
         let plan = self
             .retained_plan_file
             .read(&root.join("native-import-plan.json"))?;
-        if digest(&plan.source_cut)? != digest(source)? {
+        if !plan_file::same_source_cut(&plan.source_cut, source) {
             return Err(error("source floor verification changed its original cut"));
         }
         let request_id: String = serde_json::from_slice(
@@ -1430,7 +1423,7 @@ impl NativeImportAuthority {
         source: sinomo_core::node::NodeId,
         envelope: ActivationBlueprint,
     ) -> Result<BlueprintStored> {
-        Self::validate_plan(&envelope.plan)?;
+        self.retained_plan_file.validate(&envelope.plan)?;
         let h = &envelope.plan.expected_handoff;
         let proof = Self::activation_proof(&envelope.request)?
             .ok_or_else(|| error("activation blueprint has no exact joint proof effect"))?;
@@ -1460,12 +1453,12 @@ impl NativeImportAuthority {
         let retained = self
             .retained_plan_file
             .read(&root.join("native-import-plan.json"))?;
-        if digest(retained.as_ref())? != digest(&envelope.plan)? {
+        if !plan_file::same_plan(retained.as_ref(), &envelope.plan) {
             return Err(error(
                 "activation request changes the acknowledged source blueprint",
             ));
         }
-        let actual = sinomo_dfs::inspect_metadata_candidate(&root)?;
+        let actual = self.retained_plan_file.inspect_candidate(&root)?;
         if actual.prefix_proof != envelope.plan.target_exact_prefix
             || actual.state_fingerprint != envelope.plan.current_image_fingerprint
         {

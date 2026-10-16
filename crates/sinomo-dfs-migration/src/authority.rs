@@ -98,6 +98,10 @@ fn digest(value: &impl Serialize) -> Result<String> {
         .to_hex()
         .to_string())
 }
+
+pub(crate) fn same_source_cut(left: &MetadataSourceCut, right: &MetadataSourceCut) -> bool {
+    plan_file::same_source_cut(left, right)
+}
 fn captured_compares(entries: &[MetadataCapturedKvEntry]) -> Vec<KvCompare> {
     entries
         .iter()
@@ -722,7 +726,7 @@ impl MetadataImportAuthority for NativeImportAuthority {
             &plan.source_cut,
             legacy_local.as_ref().map(|(_, prefix)| prefix),
         )?;
-        let candidate = sinomo_dfs::inspect_metadata_candidate(&root)?;
+        let candidate = self.retained_plan_file.inspect_candidate(&root)?;
         if candidate.prefix_proof != plan.target_exact_prefix
             || candidate.state_fingerprint != plan.current_image_fingerprint
         {
@@ -1181,7 +1185,7 @@ impl MetadataImportAuthority for NativeImportAuthority {
         let plan = self
             .retained_plan_file
             .read(&provenance_plan_root.join("native-import-plan.json"))?;
-        if digest(&plan.source_cut)? != digest(&proposal.source_cut)?
+        if !plan_file::same_source_cut(&plan.source_cut, &proposal.source_cut)
             || plan.stage_request != proposal.stage_request
             || plan.expected_handoff != proposal.expected_handoff
             || plan.expected_assignments != proposal.expected_assignments
@@ -1310,7 +1314,7 @@ impl MetadataImportAuthority for NativeImportAuthority {
         )?;
         let path = provenance_plan_root.join("native-import-plan.json");
         let plan = self.retained_plan_file.read(&path)?;
-        if digest(&plan.source_cut)? != digest(&proposal.source_cut)?
+        if !plan_file::same_source_cut(&plan.source_cut, &proposal.source_cut)
             || plan.stage_request != proposal.stage_request
             || plan.expected_handoff != proposal.expected_handoff
             || plan.expected_assignments != proposal.expected_assignments
@@ -2317,6 +2321,21 @@ mod provider_lifecycle_tests {
             3072,
             None,
             Some(std::time::Duration::from_secs(60)),
+            false,
+        );
+    }
+
+    #[test]
+    fn native_source_lookup_hints_rebuild_exactly_after_checkpoint_restart() {
+        native_released_namespace_source_reopens_with_browser_budget(
+            false, false, false, false, 256, Some("source-cut.json"), None, true,
+        );
+    }
+
+    #[test]
+    fn native_source_lookup_hints_rebuild_after_proposal_checkpoint_restart() {
+        native_released_namespace_source_reopens_with_browser_budget(
+            false, false, false, false, 64, Some("import-proposal.json"), None, true,
         );
     }
 
@@ -2376,6 +2395,7 @@ mod provider_lifecycle_tests {
             additional_source_files,
             pause_finalization,
             None,
+            false,
         );
     }
 
@@ -2387,6 +2407,7 @@ mod provider_lifecycle_tests {
         additional_source_files: usize,
         pause_finalization: Option<&'static str>,
         production_browser_budget: Option<std::time::Duration>,
+        lose_lookup_hints: bool,
     ) {
         use sinomo_core::object::{LengthMode, serde_ext};
         use sinomo_dfs::{
@@ -2394,7 +2415,11 @@ mod provider_lifecycle_tests {
             DfsNamespacePathOccupantExpectation, DfsNamespaceTransaction,
             DfsPreparedOperationStatus, test_support::DfsTestRuntime,
         };
-        let name = if production_browser_budget.is_some() {
+        let name = if lose_lookup_hints && pause_finalization == Some("import-proposal.json") {
+            "native-source-hint-loss-proposal-restart"
+        } else if lose_lookup_hints {
+            "native-source-hint-loss-candidate-restart"
+        } else if production_browser_budget.is_some() {
             "native-production-sized-metadata-preparation"
         } else if pause_finalization == Some("source-cut.json") {
             "native-finalization-candidate-restart"
@@ -2452,7 +2477,18 @@ mod provider_lifecycle_tests {
                             processed_records: 0,
                         });
                     }
+                    let hints_before = if lose_lookup_hints {
+                        match scope {
+                            sinomo_dfs::DfsStoragePreparationScope::Metadata(shard) =>
+                                Some((shard, crate::metadata::source_hint_count_for_test(root, shard)?)),
+                            _ => None,
+                        }
+                    } else { None };
                     let result = provider(root, scope, budget)?;
+                    if let Some((shard, before)) = hints_before {
+                        let after = crate::metadata::source_hint_count_for_test(root, shard)?;
+                        assert!(after <= before + budget, "one preparation call exceeded its hint record budget: {before} -> {after}, budget {budget}");
+                    }
                     if matches!(scope, sinomo_dfs::DfsStoragePreparationScope::Metadata(_)) {
                         if let sinomo_dfs::DfsStoragePreparation::Pending { processed_records } =
                             result
@@ -3203,6 +3239,7 @@ mod provider_lifecycle_tests {
             );
             eprintln!("PRODUCTION_SHAPE_SOURCE records={records} files={additional_source_files}");
         }
+        let mut lost_hints = None;
         let retained_checkpoint = if pause_finalization.is_some() {
             let blocked = native.reopen_node(node.clone());
             assert!(
@@ -3231,6 +3268,20 @@ mod provider_lifecycle_tests {
             drop(competing);
             native.stop_node(&node).unwrap();
             assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            if lose_lookup_hints {
+                let hints = path.parent().unwrap().join("source-version-evidence");
+                let saved = path.parent().unwrap().join("source-version-evidence-loss-copy");
+                let original = std::fs::read_dir(&hints).unwrap().map(|entry| {
+                    let entry = entry.unwrap();
+                    (entry.file_name(), std::fs::read(entry.path()).unwrap())
+                }).collect::<Vec<_>>();
+                assert!(original.len() >= additional_source_files, "real producer coverage");
+                // Model loss of derived hints after the actual owner drains.
+                // Keep every original byte in this fresh fixture's loss copy.
+                std::fs::rename(&hints, &saved).unwrap();
+                assert!(!hints.exists());
+                lost_hints = Some((hints, original));
+            }
             hold_checkpoint.store(false, std::sync::atomic::Ordering::SeqCst);
             Some((path, bytes))
         } else {
@@ -3245,6 +3296,10 @@ mod provider_lifecycle_tests {
         } else {
             native.reopen_node(node.clone())
         };
+        eprintln!(
+            "NATIVE_METADATA_RECOVERY files={additional_source_files} elapsed_ms={} result={recovered:?}",
+            recovery_started.elapsed().as_millis()
+        );
         if let Some(budget) = production_browser_budget {
             eprintln!(
                 "PRODUCTION_SHAPE_RECOVERY elapsed_ms={} budget_ms={} result={recovered:?}",
@@ -3257,6 +3312,12 @@ mod provider_lifecycle_tests {
             );
         }
         recovered.expect("normal cold Main and real MIG provider must admit the released source");
+        if let Some((hints, original)) = lost_hints {
+            for (name, bytes) in original {
+                assert_eq!(std::fs::read(hints.join(name)).unwrap(), bytes,
+                    "restart must rebuild exact hints from the fenced source and durable replay");
+            }
+        }
         if let Some((path, original)) = retained_checkpoint {
             assert_eq!(
                 std::fs::read(path).unwrap(),

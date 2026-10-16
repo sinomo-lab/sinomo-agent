@@ -82,6 +82,93 @@ fn entries(service: &NativeService, shard: &DfsMetadataShardId) -> Vec<DfsMetada
         .expect("actual native shard journal")
         .entries
 }
+
+#[cfg(feature = "storage-conversion")]
+#[test]
+fn candidate_journal_recovers_head_hints_but_requires_the_actual_prepare() {
+    let (mut runtime, mut service, config) = native_case("candidate-head-hint-recovery", 1);
+    let shard = DfsMetadataShardId::new(config.shard_id.clone());
+    let current = directory(&mut service, "/services/candidate-head-hint-recovery");
+    let mut changed = current.clone();
+    changed.version = DfsVersion::generate();
+    changed.mode = 0o600;
+    let payload = namespace_payload(&config, &current, changed, "candidate-hint-body");
+    let base = service
+        .metadata_backend()
+        .unwrap()
+        .metadata_prefix_proof(&shard)
+        .unwrap()
+        .unwrap();
+    // These are hidden candidates populated from an actual native producer.
+    // CandidateWriter grants no author guard and does not publish this body.
+    let temporary = sinomo_testdir::TestDir::new("candidate-head-hint-images");
+    for variant in ["missing", "corrupt", "stale"] {
+        let root = temporary.join(variant);
+        let writer = crate::DfsMetadataCandidateWriter::open(&root).unwrap();
+        let (prepared, after_prepare) = writer.prepare(payload.clone(), &base).unwrap();
+        let head = root.join("journal/head.sobj");
+        fs::rename(&head, root.join("retained-head-after-prepare.sobj")).unwrap();
+        match variant {
+            "corrupt" => fs::write(&head, b"torn hint").unwrap(),
+            "stale" => crate::metadata_cursor::write_journal_head_hint(&root, 1).unwrap(),
+            "missing" => {}
+            _ => unreachable!(),
+        }
+        drop(writer);
+        assert_eq!(
+            crate::metadata_journal::recover_next_journal_sequence(&root).unwrap(),
+            after_prepare.journal_sequence + 1
+        );
+        let actual = crate::metadata_journal::segmented_journal_entry_at_sequence(
+            &root,
+            prepared.digest.prepare_sequence,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            matches!(&actual.mutation, DfsMetadataMutation::PrepareOperationV7 { record, .. }
+            if record.digest == prepared.digest && record.payload == prepared.payload)
+        );
+        let writer = crate::DfsMetadataCandidateWriter::open(&root).unwrap();
+        let (committed, after_commit) = writer
+            .commit(prepared, &after_prepare, OffsetDateTime::now_utc())
+            .unwrap();
+        assert_eq!(
+            committed.status,
+            crate::DfsPreparedOperationStatus::Committed
+        );
+        fs::rename(&head, root.join("retained-head-after-commit.sobj")).unwrap();
+        drop(writer);
+        assert_eq!(
+            crate::metadata_journal::recover_next_journal_sequence(&root).unwrap(),
+            after_commit.journal_sequence + 1
+        );
+        assert_eq!(
+            crate::metadata_journal::segmented_journal_entry_at_sequence(&root, actual.sequence)
+                .unwrap()
+                .unwrap(),
+            actual
+        );
+    }
+    let root = temporary.join("missing-prepare");
+    let writer = crate::DfsMetadataCandidateWriter::open(&root).unwrap();
+    let (prepared, after_prepare) = writer.prepare(payload, &base).unwrap();
+    fs::rename(
+        root.join("journal/segments"),
+        root.join("retained-original-segments"),
+    )
+    .unwrap();
+    assert!(
+        writer
+            .commit(prepared, &after_prepare, OffsetDateTime::now_utc())
+            .is_err(),
+        "a head hint cannot stand in for the missing durable prepare"
+    );
+    assert!(!root.join("journal/segments").exists());
+    drop(writer);
+    drop(service);
+    runtime.close().unwrap();
+}
 fn commit_kernel(
     service: &mut NativeService,
     digest: &crate::DfsPreparedOperationDigest,
