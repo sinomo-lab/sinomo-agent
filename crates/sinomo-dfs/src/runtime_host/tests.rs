@@ -15530,9 +15530,21 @@ fn default_cluster_metadata_shard_transfers_after_candidate_replays_current_jour
     let completion_deadline = Instant::now() + Duration::from_secs(5);
     let explicit = source
         .reconcile_pending_metadata_shard_membership_handoffs(&configs, Duration::from_secs(5));
-    let completed = fixture
-        .observe_completed_native_handoff(&control, &handoff, completion_deadline)
-        .expect("observe the original native handoff proof");
+    // This explicit caller can return zero while the normal Main owner is
+    // completing the SAME handoff. Keep observing its full proof and local
+    // freeze boundary within the original shared completion deadline.
+    let completed = loop {
+        let completed = fixture
+            .observe_completed_native_handoff(&control, &handoff, completion_deadline)
+            .expect("observe the original native handoff proof");
+        if completed.is_some() || Instant::now() >= completion_deadline {
+            break completed;
+        }
+        std::thread::sleep(
+            Duration::from_millis(1)
+                .min(completion_deadline.saturating_duration_since(Instant::now())),
+        );
+    };
     assert_eq!(
         completed.as_ref(),
         Some(&desired),

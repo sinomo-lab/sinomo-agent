@@ -1582,6 +1582,34 @@ fn native_served_maintenance_skips_parked_job_for_tail_and_retires_superseded_he
         sinomo_core::Id::generate().to_string(),
     );
     tail.scope = DfsPlacementScope::SelfOnly;
+    // Capture the actual committed rows before publishing Pending. Automatic
+    // Main and explicit bounded turns may both advance this same job; a later
+    // query must not erase evidence that Repairing was durably published first.
+    let observed = std::sync::Arc::new(std::sync::Mutex::new(
+        Vec::<DfsPlacementReconciliationJob>::new(),
+    ));
+    let omitted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let captured = std::sync::Arc::clone(&observed);
+    let overflow = std::sync::Arc::clone(&omitted);
+    let tail_key = crate::control_plane::placement_reconciliation_key(&fs, &tail.job_id);
+    let subscription = sinomo_core::cluster::subscribe_cluster_kv_committed_deltas(
+        &sinomo_core::network::ClusterPaths::new(runtime.data_dir(&nodes[0])),
+        move |delta| {
+            for event in delta.events.iter().filter(|event| event.key == tail_key) {
+                if let sinomo_core::kv::KvEventKind::Put { value } = &event.kind {
+                    let row =
+                        sinomo_core::kv::decode_kv_value::<DfsPlacementReconciliationJob>(value)
+                            .expect("actual typed committed placement row");
+                    let mut rows = captured.lock().unwrap();
+                    if rows.len() < 16 {
+                        rows.push(row);
+                    } else {
+                        overflow.fetch_add(1, std::sync::atomic::Ordering::Release);
+                    }
+                }
+            }
+        },
+    );
     assert!(control.with_client(|kv| {
         DfsControlPlaneStore::new(kv.as_mut())
             .compare_and_put_placement_update(&config, &config, &tail)
@@ -1595,35 +1623,45 @@ fn native_served_maintenance_skips_parked_job_for_tail_and_retires_superseded_he
         DfsPlacementReconciliationState::Repairing,
         DfsPlacementReconciliationState::Completed,
     ] {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        assert!(
-            !remaining.is_zero(),
-            "tail must finish within the original five-second budget"
-        );
-        let result = runtime.maintenance_tick(&nodes[0], remaining).unwrap();
-        assert!(
-            result.outcome.is_ok(),
-            "ordinary served owner: {:?}",
-            result.outcome
-        );
-        assert_eq!(result.omitted_kv_event_count, 0);
-        let (parked, advanced) = control.with_client(|kv| {
-            let store = DfsControlPlaneStore::new(kv.as_mut());
-            (
-                store
+        let advanced = loop {
+            assert_eq!(omitted.load(std::sync::atomic::Ordering::Acquire), 0);
+            let advanced = observed
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|row| row.state == expected && row.revision > previous_revision)
+                .cloned();
+            let parked = control.with_client(|kv| {
+                DfsControlPlaneStore::new(kv.as_mut())
                     .placement_reconciliation(&fs, &head.job_id)
                     .unwrap()
-                    .unwrap(),
-                store
-                    .placement_reconciliation(&fs, &tail.job_id)
                     .unwrap()
-                    .unwrap(),
-            )
-        });
-        assert_eq!(
-            parked, head,
-            "pending durable repair work parks the head's object pass"
-        );
+            });
+            assert_eq!(
+                parked, head,
+                "pending durable repair work parks the head's object pass"
+            );
+            if let Some(advanced) = advanced {
+                break advanced;
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "tail must finish both actual phases within the original five-second budget; observed={:?}",
+                observed.lock().unwrap()
+            );
+            let result = runtime.maintenance_tick(&nodes[0], remaining).unwrap();
+            assert!(
+                result.outcome.is_ok(),
+                "ordinary served owner: {:?}",
+                result.outcome
+            );
+            assert_eq!(result.omitted_kv_event_count, 0);
+            std::thread::sleep(
+                Duration::from_millis(1)
+                    .min(deadline.saturating_duration_since(std::time::Instant::now())),
+            );
+        };
         assert!(advanced.revision > previous_revision);
         previous_revision = advanced.revision;
         assert_eq!(advanced.state, expected);
@@ -1631,6 +1669,18 @@ fn native_served_maintenance_skips_parked_job_for_tail_and_retires_superseded_he
         assert_eq!(advanced.pending_repair_count, 0);
     }
     assert!(std::time::Instant::now() < deadline);
+    assert_eq!(omitted.load(std::sync::atomic::Ordering::Acquire), 0);
+    let completed = control.with_client(|kv| {
+        DfsControlPlaneStore::new(kv.as_mut())
+            .placement_reconciliation(&fs, &tail.job_id)
+            .unwrap()
+            .unwrap()
+    });
+    assert_eq!(completed.state, DfsPlacementReconciliationState::Completed);
+    assert_eq!(completed.revision, previous_revision);
+    assert_eq!(completed.matched_object_count, 0);
+    assert_eq!(completed.pending_repair_count, 0);
+    drop(subscription);
     let mut current = config.clone();
     upsert_placement_rule(
         &mut current.subtree_policies,
