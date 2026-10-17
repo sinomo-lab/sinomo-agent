@@ -3838,8 +3838,15 @@ fn compound_receipt_location_retry_preserves_original_publication() {
 fn compound_receipt_filesystem_retry_preserves_original_publication() {
     check_compound_receipt_publication_retry(true);
 }
-fn check_retained_intent_opening(reconcile_only: bool, restart_owner: bool) {
-    let name = if reconcile_only {
+fn check_retained_intent_opening(
+    reconcile_only: bool,
+    restart_owner: bool,
+    receipt_completion: bool,
+) {
+    assert!(!receipt_completion || (!reconcile_only && !restart_owner));
+    let name = if receipt_completion {
+        "native-retained-opening-receipt-completion"
+    } else if reconcile_only {
         "native-retained-opening-reconcile"
     } else if restart_owner {
         "native-retained-opening-restart-retry"
@@ -4049,11 +4056,70 @@ fn check_retained_intent_opening(reconcile_only: bool, restart_owner: bool) {
             owner = runtime.metadata_primary_service(path).unwrap();
         }
 
-        let written = owner
-            .posix_write_file_with_operation_id(path, bytes, options.clone(), operation)
-            .unwrap();
-        assert_eq!(written.object_id, record.object_id);
-        assert_eq!(written.version, record.target_version);
+        let (written_object_id, written_version) = if receipt_completion {
+            // Resume the ordinary bounded Stage producer and consume its real
+            // native reply. No client write/reconciliation retry recovers the
+            // opening on this path.
+            owner.retry_pending_repairs_bounded(1).unwrap();
+            let pending = owner.write_outcome(&record.intent_id).unwrap();
+            let completion = owner.settle_ready_write_outcome(pending, false);
+            assert_eq!(runtime.observation_dropped_count(), 0);
+            let stage_calls = runtime
+                .rpc_observations()
+                .into_iter()
+                .filter(|event| {
+                    event.source == shard.primary_node_id
+                        && event.target == content_replica
+                        && event.route == crate::DFS_DATA_STAGE_BLOB_ROUTE
+                        && event.phase == crate::test_runtime::RpcPhase::Completed
+                })
+                .map(|event| event.call_id)
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                stage_calls.len(),
+                1,
+                "one actual native Stage call owns the completion; no client write retry or replacement transfer"
+            );
+            let completed = completion.unwrap();
+            let NetworkedDfsWriteOutcome::Committed {
+                intent_id,
+                version,
+                content_hash,
+                ..
+            } = completed
+            else {
+                panic!(
+                    "ordinary receipt completion did not publish the retained original: {completed:?}"
+                );
+            };
+            assert_eq!(intent_id, record.intent_id);
+            assert_eq!(version, record.target_version);
+            assert_eq!(content_hash, crate::content_hash(bytes));
+            // The generic RPC observer does not decode streamed Stage heads.
+            // Bind that actual call to the exact persisted receipt and outcome.
+            let receipt = owner
+                .backend_receipt_for_replica(
+                    &record.object_id,
+                    &record.target_version,
+                    &content_replica,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(receipt.receipt.file_system_id, record.file_system_id);
+            assert_eq!(receipt.receipt.object_id, record.object_id);
+            assert_eq!(receipt.receipt.committed_version, record.target_version);
+            assert_eq!(receipt.replica_node_id, content_replica);
+            assert_eq!(receipt.content_hash.as_deref(), Some(content_hash.as_str()));
+            let actual = owner.posix_stat_distributed(path).unwrap();
+            (actual.object_id, actual.version)
+        } else {
+            let written = owner
+                .posix_write_file_with_operation_id(path, bytes, options.clone(), operation)
+                .unwrap();
+            (written.object_id, written.version)
+        };
+        assert_eq!(written_object_id, record.object_id);
+        assert_eq!(written_version, record.target_version);
         let terminal = owner
             .metadata_backend()
             .unwrap()
@@ -4087,17 +4153,17 @@ fn check_retained_intent_opening(reconcile_only: bool, restart_owner: bool) {
 
 #[test]
 fn prepared_intent_opening_is_not_authoritative_absence() {
-    check_retained_intent_opening(true, false);
+    check_retained_intent_opening(true, false, false);
 }
 
 #[test]
 fn exact_retry_resumes_original_intent_opening_after_ack_failure() {
-    check_retained_intent_opening(false, false);
+    check_retained_intent_opening(false, false, false);
 }
 
 #[test]
 fn exact_retry_resumes_original_intent_opening_after_restart() {
-    check_retained_intent_opening(false, true);
+    check_retained_intent_opening(false, true, false);
 }
 
 #[test]
@@ -4189,4 +4255,9 @@ fn stored_prepare_retry_observes_commit_before_its_execution_admission() {
     );
     drop(source);
     runtime.close().unwrap();
+}
+
+#[test]
+fn ordinary_stage_receipt_resumes_original_opening_without_client_retry() {
+    check_retained_intent_opening(false, false, true);
 }

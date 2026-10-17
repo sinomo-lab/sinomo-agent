@@ -600,11 +600,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if !intent.desired_replica_nodes.contains(&self.node_id) {
             return Ok(());
         }
-        let receipt_recorded = self
-            .coordinator
-            .receipts_for_intent(intent_id)
-            .iter()
-            .any(|receipt| receipt.replica_node_id == self.node_id);
         if self
             .local_object_version_manifest_size_if_matches(object_id, version, content_hash)
             .is_none()
@@ -614,6 +609,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let local_node_id = self.node_id.clone();
         let file_system_id = intent.file_system_id;
         self.with_placement_intent_authority(intent_id, |service| {
+            service.recover_write_publications_before_receipt(intent_id, content_hash)?;
+            let receipt_recorded = service
+                .coordinator
+                .receipts_for_intent(intent_id)
+                .iter()
+                .any(|receipt| receipt.replica_node_id == local_node_id);
             if !receipt_recorded {
                 if !service.ensure_local_repair_manifest(object_id, version, content_hash)? {
                     return Ok(());

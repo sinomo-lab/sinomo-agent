@@ -2030,19 +2030,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(())
     }
 
-    pub(crate) fn recover_prepared_intent_opening_for_retry(
+    fn recover_prepared_intent_opening_publication(
         &mut self,
         intent: &DistributedWriteIntent,
         content_hash: &str,
-        content_size_bytes: u64,
-    ) -> Result<(), DfsError> {
-        if self.transport.delegates_local_namespace_authority()
+    ) -> Result<Option<DfsObjectMetadata>, DfsError> {
+        if self.metadata_backend.is_none()
+            || self.transport.delegates_local_namespace_authority()
             || !self
                 .coordinator
                 .intent(&intent.intent_id)
                 .is_some_and(|resident| resident.state == DfsWriteIntentState::AwaitingReceipts)
         {
-            return Ok(());
+            return Ok(None);
         }
         let object = self.current_object_for_write(&intent.object_id)?;
         let scope = self.metadata_effect_scope_for_object(
@@ -2105,7 +2105,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .get_intent_on_shard(&scope.shard_id, &intent.object_id, &intent.intent_id)?
         else {
             // No successful placeholder or staging authority is invented.
-            return Ok(());
+            return Ok(None);
         };
         let actual = crate::intent::distributed_intent_from_record(&stored);
         let mut expected = intent.clone();
@@ -2121,10 +2121,69 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         self.refresh_committed_write_projection(&intent.intent_id)?;
         if actual.state != DfsWriteIntentState::AwaitingReceipts {
-            return Ok(());
+            return Ok(None);
         }
         self.restore_pending_write_for_intent_if_missing(&intent.intent_id, &intent.object_id)?;
         self.restore_backend_receipt_pages_for_intent(&stored, true)?;
+        if recovered {
+            self.record_durable_write_intent_work(&actual, &[]);
+        }
+        Ok(Some(object))
+    }
+
+    /// Resume only existing publication checkpoints before consuming a real
+    /// receipt. This phase never re-enters staging or commit readiness: those
+    /// remain the caller's normal next steps after its receipt is recorded.
+    pub(crate) fn recover_write_publications_before_receipt(
+        &mut self,
+        intent_id: &str,
+        content_hash: &str,
+    ) -> Result<(), DfsError> {
+        let Some(intent) = self
+            .coordinator
+            .intent(intent_id)
+            .cloned()
+            .filter(|intent| intent.state == DfsWriteIntentState::AwaitingReceipts)
+        else {
+            return Ok(());
+        };
+        let pending = self.writes.pending_writes.get(intent_id).ok_or_else(|| {
+            DfsError::WriteReconciliationRequired {
+                operation_id: intent
+                    .operation_id
+                    .clone()
+                    .unwrap_or_else(|| intent_id.to_owned()),
+                object_id: intent.object_id.clone(),
+                reason: "receipt completion has no original pending transfer descriptor".into(),
+            }
+        })?;
+        if pending.content_hash != content_hash {
+            return Err(DfsError::WriteOperationIdConflict {
+                operation_id: intent
+                    .operation_id
+                    .clone()
+                    .unwrap_or_else(|| intent_id.to_owned()),
+                object_id: intent.object_id.clone(),
+            });
+        }
+        let size = pending.size_bytes;
+        self.refresh_committed_write_projection(intent_id)?;
+        self.recover_prepared_write_for_retry(&intent, content_hash, size)?;
+        self.recover_prepared_intent_opening_publication(&intent, content_hash)?;
+        Ok(())
+    }
+
+    pub(crate) fn recover_prepared_intent_opening_for_retry(
+        &mut self,
+        intent: &DistributedWriteIntent,
+        content_hash: &str,
+        content_size_bytes: u64,
+    ) -> Result<(), DfsError> {
+        let Some(object) =
+            self.recover_prepared_intent_opening_publication(intent, content_hash)?
+        else {
+            return Ok(());
+        };
         let Some(pending) = self.writes.pending_writes.get(&intent.intent_id) else {
             return Err(DfsError::WriteReconciliationRequired {
                 operation_id: intent
@@ -2146,14 +2205,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     .into(),
             });
         }
-        if recovered {
-            self.record_durable_write_intent_work(&actual, &[]);
-        }
         self.try_apply_committed_intent_if_ready(&intent.intent_id)?;
         if self.should_stage_missing_replicas_after_write(&intent.intent_id) {
-            // Resume the same normal stage with its existing targets, inflight
-            // request identities and cooling. This is an explicit original-ID
-            // retry, not a new mutation or an enlarged maintenance budget.
             self.stage_missing_desired_replicas_for_intent(&intent.intent_id, object)?;
         }
         Ok(())
