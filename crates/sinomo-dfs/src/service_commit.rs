@@ -340,6 +340,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         intent_id: &str,
     ) -> Result<(), DfsError> {
         if self.coordinator.is_commit_ready(intent_id)? {
+            if let (Some(intent), Some(pending)) = (
+                self.coordinator.intent(intent_id).cloned(),
+                self.writes.pending_writes.get(intent_id),
+            ) {
+                let hash = pending.content_hash.clone();
+                let size = pending.size_bytes;
+                // Retried receipt completion owns the same input as an
+                // explicit retry. Resume its sealed body before any fresh
+                // planning can change timestamps, read sets or other effects.
+                self.recover_prepared_write_for_retry(&intent, &hash, size)?;
+            }
             if let Err(error) = self.apply_committed_intent(intent_id) {
                 // A failed author attempt may have found a different immutable
                 // prepare with the same ID. It cannot authorize publication of

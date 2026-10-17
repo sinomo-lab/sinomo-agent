@@ -434,6 +434,146 @@ fn explicit_original_write_retry_recovers_its_complete_prepare() {
     check_recovered_original_write(true);
 }
 
+#[test]
+fn replayed_local_receipt_finishes_exact_prepare_after_ack_failure() {
+    let (mut runtime, mut requester, shard) = crate::test_support::current_native_metadata_service(
+        "native-replayed-receipt-publication",
+        3,
+        "/",
+    )
+    .unwrap();
+    let path = "/replayed-receipt-publication";
+    let options = DfsWriteOptions {
+        policy: DfsReplicationPolicy::new(1, 1).unwrap(),
+        replica_candidates: vec![shard.primary_node_id.clone()],
+        wait_for_commit: true,
+        foreground_replica_repair: false,
+    };
+    let initial = requester
+        .posix_write_file(
+            path,
+            b"before interrupted receipt completion",
+            options.clone(),
+        )
+        .unwrap();
+    drop(requester);
+    let mut owner = runtime.metadata_primary_service(path).unwrap();
+    let interrupted = shard.replica_node_ids[0].clone();
+    runtime.stop_node(&interrupted).unwrap();
+    let operation = "replayed-receipt-original-operation";
+    assert!(
+        owner
+            .posix_write_file_with_operation_id(
+                path,
+                b"exact bytes retained across the publication failure",
+                options,
+                operation,
+            )
+            .is_err()
+    );
+    let prepared = owner
+        .metadata_backend()
+        .unwrap()
+        .list_prepared_operations()
+        .unwrap()
+        .into_iter()
+        .find(|record| {
+            record
+                .payload
+                .prepared_intent
+                .as_ref()
+                .is_some_and(|intent| intent.operation_id.as_deref() == Some(operation))
+        })
+        .expect("the ordinary writer retained its exact complete prepare");
+    assert_eq!(prepared.status, DfsPreparedOperationStatus::Prepared);
+    let intent = prepared.payload.prepared_intent.as_ref().unwrap();
+    let hash = intent.content_hash.as_deref().unwrap();
+    assert_eq!(
+        owner
+            .coordinator
+            .receipts_for_intent(&intent.intent_id)
+            .len(),
+        1
+    );
+    assert!(
+        owner
+            .coordinator
+            .is_commit_ready(&intent.intent_id)
+            .unwrap()
+    );
+
+    // Fetch/receipt completion may be retried after the receipt succeeded but
+    // the complete-shard publication failed. Receipt deduplication must not
+    // turn that unfinished work into a successful no-op, nor waive the missing
+    // participant while it remains stopped.
+    assert!(
+        owner
+            .record_local_pending_write_receipt_if_desired(
+                &intent.intent_id,
+                &intent.object_id,
+                &intent.target_version,
+                hash,
+            )
+            .is_err(),
+        "a retained receipt is not a completed or authorized publication"
+    );
+    assert_eq!(
+        owner
+            .metadata_backend()
+            .unwrap()
+            .get_object(&intent.object_id)
+            .unwrap()
+            .unwrap()
+            .version,
+        initial.version
+    );
+    runtime.reopen_node(interrupted).unwrap();
+    owner
+        .record_local_pending_write_receipt_if_desired(
+            &intent.intent_id,
+            &intent.object_id,
+            &intent.target_version,
+            hash,
+        )
+        .unwrap();
+    let committed = owner
+        .metadata_backend()
+        .unwrap()
+        .prepared_operation_record(&prepared.digest.operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(committed.digest, prepared.digest);
+    assert_eq!(committed.payload, prepared.payload);
+    assert_eq!(committed.status, DfsPreparedOperationStatus::Committed);
+    assert!(matches!(owner.write_outcome(&intent.intent_id).unwrap(),
+        NetworkedDfsWriteOutcome::Committed { version, content_hash, .. }
+        if version == intent.target_version && content_hash == hash));
+    let prefix = owner
+        .metadata_backend()
+        .unwrap()
+        .metadata_prefix_proof(&prepared.digest.shard_id)
+        .unwrap();
+    owner
+        .record_local_pending_write_receipt_if_desired(
+            &intent.intent_id,
+            &intent.object_id,
+            &intent.target_version,
+            hash,
+        )
+        .unwrap();
+    assert_eq!(
+        owner
+            .metadata_backend()
+            .unwrap()
+            .metadata_prefix_proof(&prepared.digest.shard_id)
+            .unwrap(),
+        prefix,
+        "an exact completed receipt replay must append no new publication"
+    );
+    drop(owner);
+    runtime.close().unwrap();
+}
+
 fn check_recovered_original_write(explicit_retry: bool) {
     let name = if explicit_retry {
         "native-explicit-original-retry"
@@ -1816,13 +1956,27 @@ fn retry_pending_repairs_skips_sender_that_lost_metadata_primary_authority() {
     // This fixture owns the actual Core producer, rather than the browser
     // client whose same-node write is delegated to Main.
     let mut old = runtime.metadata_primary_service(path).unwrap();
+    let (_, _, replication) = old
+        .managed_replication_policy_for_path(path, DfsObjectPolicy::ReplicatedEventual, 2)
+        .unwrap();
+    assert_eq!(replication.min_commit_replicas, 1);
+    assert_eq!(replication.desired_replicas, 2);
+    assert_eq!(
+        replication
+            .required_node_ids
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        [owner.clone(), replica.clone()].into_iter().collect(),
+        "the native plan must retain this fixture's actual required missing target"
+    );
     let stat = old
         .posix_write_file(
             path,
             b"actual old-primary repair bytes",
             DfsWriteOptions {
                 replica_candidates: vec![owner.clone(), replica.clone()],
-                policy: DfsReplicationPolicy::new(1, 2).unwrap(),
+                policy: replication,
                 wait_for_commit: true,
                 foreground_replica_repair: false,
             },
@@ -3154,5 +3308,168 @@ fn served_requester_completion_does_not_claim_authority_repair_work() {
     drop(authority);
     drop(client);
     runtime.clear_faults();
+    runtime.close().unwrap();
+}
+
+#[test]
+fn metadata_receipt_retry_recovers_original_prepare_and_receipt_identity() {
+    let (mut runtime, mut requester, shard) = crate::test_support::current_native_metadata_service(
+        "native-metadata-receipt-exact-retry",
+        3,
+        "/",
+    )
+    .unwrap();
+    let path = "/receipt-exact-retry";
+    let original = requester
+        .posix_write_file(
+            path,
+            b"visible original",
+            DfsWriteOptions {
+                policy: DfsReplicationPolicy::new(1, 1).unwrap(),
+                replica_candidates: vec![shard.primary_node_id.clone()],
+                wait_for_commit: true,
+                foreground_replica_repair: false,
+            },
+        )
+        .unwrap();
+    drop(requester);
+    let mut owner = runtime.metadata_primary_service(path).unwrap();
+    let version = DfsVersion::generate();
+    // Actual native durable content precedes the producer's receipt. This test
+    // exercises receipt publication alone and never makes this version visible.
+    let manifest = owner
+        .content()
+        .put_object_version(
+            original.object_id.as_str(),
+            version.as_str(),
+            b"native content awaiting receipt publication",
+        )
+        .unwrap();
+    let stopped = shard.replica_node_ids[0].clone();
+    runtime.stop_node(&stopped).unwrap();
+    assert!(
+        owner
+            .put_metadata_receipt(
+                &original.file_system_id,
+                &original.object_id,
+                &version,
+                &shard.primary_node_id,
+                &manifest.content_hash
+            )
+            .is_err()
+    );
+    let prepared = owner.metadata_backend().unwrap().list_prepared_operations().unwrap().into_iter().find(|record| {
+        matches!(record.payload.metadata_effects.as_slice(), [DfsPreparedMetadataEffect::PutReceipt { receipt }]
+            if receipt.receipt.object_id == original.object_id && receipt.receipt.committed_version == version)
+    }).expect("the original native receipt publication is durably prepared");
+    assert_eq!(prepared.status, DfsPreparedOperationStatus::Prepared);
+    assert!(
+        owner
+            .backend_receipt_for_replica(&original.object_id, &version, &shard.primary_node_id)
+            .unwrap()
+            .is_none()
+    );
+    let before = owner
+        .metadata_backend()
+        .unwrap()
+        .metadata_prefix_proof(&prepared.digest.shard_id)
+        .unwrap();
+    assert!(
+        owner
+            .put_metadata_receipt(
+                &original.file_system_id,
+                &original.object_id,
+                &version,
+                &shard.primary_node_id,
+                &crate::content_hash(b"changed receipt input")
+            )
+            .is_err()
+    );
+    assert_eq!(
+        owner
+            .metadata_backend()
+            .unwrap()
+            .metadata_prefix_proof(&prepared.digest.shard_id)
+            .unwrap(),
+        before,
+        "a conflicting retry must publish nothing"
+    );
+    runtime.reopen_node(stopped).unwrap();
+    assert!(
+        owner
+            .put_metadata_receipt(
+                &original.file_system_id,
+                &original.object_id,
+                &version,
+                &shard.primary_node_id,
+                &manifest.content_hash
+            )
+            .unwrap()
+    );
+    let terminal = owner
+        .metadata_backend()
+        .unwrap()
+        .prepared_operation_record(&prepared.digest.operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(terminal.status, DfsPreparedOperationStatus::Committed);
+    assert_eq!(terminal.digest, prepared.digest);
+    assert_eq!(terminal.payload, prepared.payload);
+    let DfsPreparedMetadataEffect::PutReceipt { receipt: expected } =
+        &prepared.payload.metadata_effects[0]
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        owner
+            .backend_receipt_for_replica(&original.object_id, &version, &shard.primary_node_id)
+            .unwrap()
+            .as_ref(),
+        Some(expected),
+        "original event ID and timestamp survive exact replay"
+    );
+    assert_eq!(
+        owner
+            .metadata_backend()
+            .unwrap()
+            .get_object(&original.object_id)
+            .unwrap()
+            .unwrap()
+            .version,
+        original.version
+    );
+    assert_eq!(
+        owner
+            .content()
+            .read_object_version(original.object_id.as_str(), version.as_str())
+            .unwrap()
+            .1,
+        b"native content awaiting receipt publication"
+    );
+    let after = owner
+        .metadata_backend()
+        .unwrap()
+        .metadata_prefix_proof(&prepared.digest.shard_id)
+        .unwrap();
+    assert!(
+        !owner
+            .put_metadata_receipt(
+                &original.file_system_id,
+                &original.object_id,
+                &version,
+                &shard.primary_node_id,
+                &manifest.content_hash
+            )
+            .unwrap()
+    );
+    assert_eq!(
+        owner
+            .metadata_backend()
+            .unwrap()
+            .metadata_prefix_proof(&prepared.digest.shard_id)
+            .unwrap(),
+        after
+    );
+    drop(owner);
     runtime.close().unwrap();
 }

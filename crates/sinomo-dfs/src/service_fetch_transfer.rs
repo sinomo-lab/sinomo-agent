@@ -600,14 +600,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if !intent.desired_replica_nodes.contains(&self.node_id) {
             return Ok(());
         }
-        if self
+        let receipt_recorded = self
             .coordinator
             .receipts_for_intent(intent_id)
             .iter()
-            .any(|receipt| receipt.replica_node_id == self.node_id)
-        {
-            return Ok(());
-        }
+            .any(|receipt| receipt.replica_node_id == self.node_id);
         if self
             .local_object_version_manifest_size_if_matches(object_id, version, content_hash)
             .is_none()
@@ -617,19 +614,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let local_node_id = self.node_id.clone();
         let file_system_id = intent.file_system_id;
         self.with_placement_intent_authority(intent_id, |service| {
-            if !service.ensure_local_repair_manifest(object_id, version, content_hash)? {
-                return Ok(());
+            if !receipt_recorded {
+                if !service.ensure_local_repair_manifest(object_id, version, content_hash)? {
+                    return Ok(());
+                }
+                service.put_metadata_receipt(
+                    &file_system_id,
+                    object_id,
+                    version,
+                    &local_node_id,
+                    content_hash,
+                )?;
+                service
+                    .coordinator
+                    .record_durable_receipt(intent_id, local_node_id)?;
             }
-            service.put_metadata_receipt(
-                &file_system_id,
-                object_id,
-                version,
-                &local_node_id,
-                content_hash,
-            )?;
-            service
-                .coordinator
-                .record_durable_receipt(intent_id, local_node_id)?;
+            // A previous completion can have persisted this receipt and then
+            // failed to authorize its exact prepared publication. Deduplicate
+            // the receipt, but keep that original commit/response obligation.
             service.try_apply_committed_intent_if_ready(intent_id)?;
             service.send_untracked_completed_routed_write_response_if_committed(
                 intent_id, object_id,

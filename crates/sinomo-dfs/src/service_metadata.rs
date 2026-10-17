@@ -813,6 +813,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         payload: DfsPreparedOperationPayload,
     ) -> Result<bool, DfsError> {
+        if self.recover_matching_metadata_receipt_prepare(&payload)? {
+            return Ok(true);
+        }
         let published = self.publish_prepared_operation(payload)?;
         self.refresh_recorded_prepared_rows(&published.payload)?;
         if published.published {
@@ -822,6 +825,74 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             });
         }
         Ok(published.published)
+    }
+
+    /// Receipt producers can retry after their durable prepare but before its
+    /// publication was acknowledged. Only the same receipt-only body/readset
+    /// may resume here. Keep its original event, time and operation identity;
+    /// another receipt, namespace effect or authority round is not equivalent.
+    fn recover_matching_metadata_receipt_prepare(
+        &mut self,
+        proposed: &DfsPreparedOperationPayload,
+    ) -> Result<bool, DfsError> {
+        let [DfsPreparedMetadataEffect::PutReceipt { receipt: incoming }] =
+            proposed.metadata_effects.as_slice()
+        else {
+            return Ok(false);
+        };
+        let backend = self
+            .metadata_backend
+            .as_ref()
+            .ok_or_else(|| DfsError::Metadata {
+                message: "receipt publication requires its native metadata backend".into(),
+            })?;
+        let mut matching = None;
+        for record in backend.prepared_operation_reservations(proposed)? {
+            let original = record.payload.as_ref();
+            let [DfsPreparedMetadataEffect::PutReceipt { receipt: stored }] =
+                original.metadata_effects.as_slice()
+            else {
+                continue;
+            };
+            let mut same_receipt = incoming.clone();
+            same_receipt.receipt.event_id = stored.receipt.event_id.clone();
+            same_receipt.received_at = stored.received_at;
+            if same_receipt != *stored {
+                continue;
+            }
+            // These fields are minted by for_metadata_effects and the receipt
+            // producer on each call. Every other field, including owner epoch,
+            // object/path expectations and the complete effect set, must match.
+            if proposed.transaction.transaction_id != format!("metadata:{}", proposed.operation_id)
+                || original.transaction.transaction_id
+                    != format!("metadata:{}", original.operation_id)
+            {
+                continue;
+            }
+            let mut same_body = proposed.clone();
+            same_body.operation_id = original.operation_id.clone();
+            same_body.transaction.transaction_id = original.transaction.transaction_id.clone();
+            same_body.transaction.created_at = original.transaction.created_at;
+            same_body.metadata_effects = original.metadata_effects.clone();
+            if same_body != *original {
+                continue;
+            }
+            if matching.replace(record).is_some() {
+                return Err(DfsError::Metadata {
+                    message: "multiple prepared publications claim the same exact receipt".into(),
+                });
+            }
+        }
+        let Some(record) = matching else {
+            return Ok(false);
+        };
+        if !self.recover_one_prepared_operation(record)? {
+            return Err(DfsError::Metadata {
+                message: "original receipt prepare requires current native recovery authority"
+                    .into(),
+            });
+        }
+        Ok(true)
     }
 
     pub(crate) fn metadata_effect_scope_for_object(
