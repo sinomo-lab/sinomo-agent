@@ -105,6 +105,7 @@ const MAX_RETAINED_PATH_PREFIX_BYTES: usize = 16 * 1024;
 #[cfg(test)]
 thread_local! {
     pub(crate) static RETAINED_PATH_INDEX_UPDATES: Cell<usize> = const { Cell::new(0) };
+    static INTENT_INDEX_KEY_VISITS: Cell<usize> = const { Cell::new(0) };
 }
 
 fn retained_object_path_is_unchanged(
@@ -1286,6 +1287,8 @@ impl DfsMetadataTables {
     }
 
     fn put_intent_indexed(&mut self, intent: DfsWriteIntentRecord) {
+        #[cfg(test)]
+        INTENT_INDEX_KEY_VISITS.with(|count| count.set(count.get() + 1));
         let key = (intent.object_id.clone(), intent.intent_id.clone());
         if let Some(previous) = self.intents.insert(key.clone(), intent.clone()) {
             self.intent_order.remove(&write_intent_scan_key(&previous));
@@ -1299,23 +1302,13 @@ impl DfsMetadataTables {
     }
 
     fn remove_intent_indexed(&mut self, object_id: &DfsObjectId, intent_id: &str) {
+        #[cfg(test)]
+        INTENT_INDEX_KEY_VISITS.with(|count| count.set(count.get() + 1));
         let key = (object_id.clone(), intent_id.to_string());
         if let Some(previous) = self.intents.remove(&key) {
             self.intent_order.remove(&write_intent_scan_key(&previous));
             self.intent_targets
                 .remove(&write_intent_target_key(&previous));
-        }
-    }
-
-    fn rebuild_intent_indexes(&mut self) {
-        self.intent_order.clear();
-        self.intent_targets.clear();
-        for intent in self.intents.values() {
-            let key = intent_key(intent);
-            self.intent_order
-                .insert(write_intent_scan_key(intent), key.clone());
-            self.intent_targets
-                .insert(write_intent_target_key(intent), key);
         }
     }
 
@@ -2935,12 +2928,19 @@ impl DfsMetadataTableRollback {
             self.cross_shard_pin_transfers,
         );
         rollback_map(&mut tables.receipts, self.receipts);
-        rollback_map(&mut tables.intents, self.intents);
+        // Validation temporarily changes only these recorded keys. Restore
+        // their exact old rows and index keys without rescanning unrelated
+        // owners for every prepared record replayed from the durable log.
+        for ((object_id, intent_id), original) in self.intents {
+            match original {
+                Some(intent) => tables.put_intent_indexed(intent),
+                None => tables.remove_intent_indexed(&object_id, &intent_id),
+            }
+        }
         rollback_map(&mut tables.intent_receipts, self.intent_receipts);
         if let Some(retention) = self.intent_receipt_retention {
             tables.intent_receipt_retention = retention;
         }
-        tables.rebuild_intent_indexes();
         rollback_map(&mut tables.advisory_lock_states, self.advisory_lock_states);
         rollback_map(
             &mut tables.namespace_transaction_receipts,
@@ -3226,6 +3226,154 @@ mod repair_birth_selection_tests {
         for changed in rejected {
             let (tables, rollback) = newly_touched_owner(changed);
             assert!(rollback.new_repair_owners(&tables).is_empty());
+        }
+    }
+}
+
+#[cfg(test)]
+mod intent_index_rollback_tests {
+    use super::*;
+    use crate::{DfsReplicationPolicy, DfsWriteIntentStatus};
+
+    // Table-kernel DATA only. These fixtures supply no native publication or
+    // content authority; the native prepared-operation tests cover that boundary.
+    fn intent(index: i64) -> DfsWriteIntentRecord {
+        let owner = NodeId::from_legacy_named("rollback-index-owner").unwrap();
+        DfsWriteIntentRecord {
+            publication: Default::default(),
+            intent_id: format!("rollback-index-intent-{index}"),
+            file_system_id: crate::sifs_file_system_id(),
+            object_id: DfsObjectId::from_legacy_named(format!("rollback-index-object-{index}"))
+                .unwrap(),
+            base_version: None,
+            target_version: DfsVersion::from_legacy_named(format!(
+                "rollback-index-version-{index}"
+            ))
+            .unwrap(),
+            coordinator_node_id: owner.clone(),
+            operation_id: Some(format!("rollback-index-operation-{index}")),
+            operation_order_token: None,
+            owner_epoch: 1,
+            desired_replica_node_ids: vec![owner],
+            policy: DfsReplicationPolicy::new(1, 1).unwrap(),
+            status: DfsWriteIntentStatus::ReceiptsPending,
+            content_hash: Some(crate::content_hash(b"rollback index fixture")),
+            object_metadata: None,
+            touch_parent_on_create: false,
+            create_predecessor_object_id: None,
+            created_at: OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(index),
+            updated_at: None,
+        }
+    }
+
+    fn fixture() -> DfsMetadataTables {
+        let mut tables = DfsMetadataTables::default();
+        for index in 0..512 {
+            tables.apply(DfsMetadataTableOp::PutIntent {
+                intent: intent(index),
+            });
+        }
+        tables
+    }
+
+    fn terminal_receipt(mut original: DfsWriteIntentRecord) -> DfsWriteIntentReceipt {
+        original.status = DfsWriteIntentStatus::Committed;
+        original.updated_at = Some(OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1));
+        DfsWriteIntentReceipt::from_intent(&original, original.updated_at.unwrap()).unwrap()
+    }
+
+    #[test]
+    fn receipt_validation_rollback_does_not_reindex_unrelated_intents() {
+        let mut tables = fixture();
+        let before = tables.clone();
+        let original = intent(0);
+        let receipt = DfsReplicaReceiptRecord {
+            receipt: sinomo_core::DfsWriteReceipt {
+                file_system_id: original.file_system_id,
+                object_id: original.object_id,
+                committed_version: original.target_version,
+                owner_node_id: original.coordinator_node_id.clone(),
+                event_id: sinomo_core::events::EventId::generate(),
+            },
+            replica_node_id: original.coordinator_node_id,
+            content_hash: original.content_hash,
+            received_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        for _ in 0..3 {
+            let mut undo = DfsMetadataTableRollback::default();
+            tables.apply_with_rollback(
+                DfsMetadataTableOp::PutReceipt {
+                    receipt: receipt.clone(),
+                },
+                &mut undo,
+            );
+            INTENT_INDEX_KEY_VISITS.with(|count| count.set(0));
+            undo.rollback(&mut tables);
+            let visits = INTENT_INDEX_KEY_VISITS.with(Cell::get);
+            assert_eq!(
+                tables, before,
+                "exact rows and every derived index restored"
+            );
+            assert_eq!(
+                visits, 0,
+                "receipt-only validation must not scan512 unrelated intent keys"
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_intent_rollback_restores_exact_indexes_with_bounded_key_work() {
+        let mut tables = fixture();
+        tables.apply(DfsMetadataTableOp::PutIntentReceipt {
+            receipt: terminal_receipt(intent(2)),
+        });
+        let before = tables.clone();
+        for _ in 0..3 {
+            let mut undo = DfsMetadataTableRollback::default();
+            // Repeated updates must restore the FIRST prior value, including
+            // both independent target and creation-order index keys.
+            let mut changed = intent(0);
+            for round in 1..=2 {
+                changed.created_at += time::Duration::hours(round);
+                changed.target_version = DfsVersion::generate();
+                tables.apply_with_rollback(
+                    DfsMetadataTableOp::PutIntent {
+                        intent: changed.clone(),
+                    },
+                    &mut undo,
+                );
+            }
+            tables.apply_with_rollback(
+                DfsMetadataTableOp::PutIntentReceipt {
+                    receipt: terminal_receipt(intent(1)),
+                },
+                &mut undo,
+            );
+            tables.apply_with_rollback(
+                DfsMetadataTableOp::PutIntent {
+                    intent: intent(512),
+                },
+                &mut undo,
+            );
+            // A rejected tentative reopening must restore its compact terminal
+            // outcome, without leaving a full owner or target index behind.
+            tables.apply_with_rollback(
+                DfsMetadataTableOp::PutIntent { intent: intent(2) },
+                &mut undo,
+            );
+            assert_eq!(undo.intents.len(), 4);
+            assert_ne!(tables, before);
+            INTENT_INDEX_KEY_VISITS.with(|count| count.set(0));
+            undo.rollback(&mut tables);
+            let visits = INTENT_INDEX_KEY_VISITS.with(Cell::get);
+            assert_eq!(
+                tables, before,
+                "exact full/compact owners and all indexes restored"
+            );
+            assert_eq!(
+                visits, 4,
+                "rollback visits its4 touched keys, not511 resident intents"
+            );
         }
     }
 }
