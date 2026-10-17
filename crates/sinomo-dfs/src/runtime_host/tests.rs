@@ -3436,6 +3436,10 @@ fn assert_background_repair_batch_continues_after_error(unmatched_peer: bool) {
     let mut worker = service.detach_message_deferred_work();
     drop(service);
     let observed_healthy = Arc::clone(&healthy_replies);
+    let completion_available = Arc::new(AtomicBool::new(false));
+    let handler_available = Arc::clone(&completion_available);
+    let recovered_replies = Arc::new(AtomicUsize::new(0));
+    let observed_recovered = Arc::clone(&recovered_replies);
     worker.set_background_response_handler(move |message, original| {
         assert!(
             original.is_some(),
@@ -3446,9 +3450,13 @@ fn assert_background_repair_batch_continues_after_error(unmatched_peer: bool) {
             if matches!(response.result, DfsBlobTransferResult::Committed { .. }))
         );
         if message.source_node_id == faulty {
-            return Err(sinomo_dfs::DfsError::Network {
-                message: "injected repair response handler failure".into(),
-            });
+            if !handler_available.load(Ordering::SeqCst) {
+                return Err(sinomo_dfs::DfsError::Network {
+                    message: "injected repair response handler failure".into(),
+                });
+            }
+            observed_recovered.fetch_add(1, Ordering::SeqCst);
+            return Ok(());
         }
         assert_eq!(message.source_node_id, healthy);
         observed_healthy.fetch_add(1, Ordering::SeqCst);
@@ -3472,8 +3480,30 @@ fn assert_background_repair_batch_continues_after_error(unmatched_peer: bool) {
         1,
         "ordinary detached work must flush despite a background reply failure"
     );
-    assert!(!worker.has_pending().unwrap());
+    assert_eq!(
+        worker.has_pending().unwrap(),
+        !unmatched_peer,
+        "only the genuine reply with failed local completion remains pending"
+    );
+    assert_eq!(recovered_replies.load(Ordering::SeqCst), 0);
+    completion_available.store(true, Ordering::SeqCst);
+    if !unmatched_peer {
+        let (ready, retry_at, _) = worker.scheduling_snapshot().unwrap();
+        if !ready {
+            std::thread::sleep(
+                retry_at
+                    .expect("existing local-completion cooling deadline")
+                    .saturating_duration_since(Instant::now()),
+            );
+        }
+    }
     worker.drain_exclusive().unwrap();
+    assert!(!worker.has_pending().unwrap());
+    assert_eq!(
+        recovered_replies.load(Ordering::SeqCst),
+        usize::from(!unmatched_peer),
+        "exact genuine reply completes after the local owner recovers"
+    );
     assert_eq!(
         repair_calls.load(Ordering::SeqCst),
         2,

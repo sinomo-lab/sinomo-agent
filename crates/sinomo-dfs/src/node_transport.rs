@@ -639,7 +639,9 @@ fn collect_dfs_direct_read_response_sync(
 }
 #[derive(Clone)]
 struct DeferredDfsPeerSend {
-    sender: DfsMessageSender,
+    // A returned repair completion has consumed its attachment and deliberately
+    // carries no outbound sender. Only its admitted local handler may resume it.
+    sender: Option<DfsMessageSender>,
     options: DfsObjectRpcSendOptions,
     operation_deadline: Option<Instant>,
     target_node_id: NodeId,
@@ -649,7 +651,7 @@ struct DeferredDfsPeerSend {
     // not a receipt or authority capability: the admitted handler revalidates
     // content custody and current authority on every attempt. The shared outbox
     // retains it across worker replacement; durable intent recovery owns restart.
-    pending_fetch_responses: VecDeque<DfsRoutedMessage>,
+    pending_local_responses: VecDeque<DfsRoutedMessage>,
     // Process-local pacing only. Durable intent/receipt hydration reconstructs
     // outstanding promotions at tier zero after restart.
     retry_attempts: u32,
@@ -877,6 +879,37 @@ fn all_commit_version_response_identity_matches(
         && response.object_id == command.object_id
         && response.version == command.version
         && response.replica_node_id == send.target_node_id
+}
+
+fn all_background_replica_response_identity_matches(
+    local_node_id: &NodeId,
+    original: &DfsRoutedMessage,
+    message: &DfsRoutedMessage,
+) -> bool {
+    let (
+        DfsNetworkMessage::RepairReplica(command),
+        DfsNetworkMessage::RepairReplicaResponse(response),
+    ) = (&original.message, &message.message)
+    else {
+        return false;
+    };
+    command.background_repair
+        && original.source_node_id == *local_node_id
+        && message.source_node_id == original.target_node_id
+        && message.target_node_id == *local_node_id
+        && response.replica_node_id == original.target_node_id
+        && response.request_id == command.request_id
+        && response.intent_id == command.intent_id
+        && response.file_system_id == command.file_system_id
+        && response.object_id == command.object_id
+        && response.version == command.version
+        && match &response.result {
+            DfsBlobTransferResult::Durable { content_hash }
+            | DfsBlobTransferResult::Committed { content_hash } => {
+                *content_hash == command.content_hash
+            }
+            DfsBlobTransferResult::Rejected { .. } => true,
+        }
 }
 
 #[cfg(test)]
@@ -1346,34 +1379,31 @@ impl DfsNodeDetachedSendWorker {
             }
         };
         for message in returned {
-            let original = match &message.message {
-                DfsNetworkMessage::RepairReplicaResponse(response) => expected
-                    .iter()
-                    .find(|(target, original, _, _)| {
-                        let DfsNetworkMessage::RepairReplica(command) = &original.message else {
-                            return false;
-                        };
-                        command.background_repair
-                            && message.source_node_id == *target
-                            && message.target_node_id == self.transport.local_node_id
-                            && response.replica_node_id == *target
-                            && response.request_id == command.request_id
-                            && response.intent_id == command.intent_id
-                            && response.file_system_id == command.file_system_id
-                            && response.object_id == command.object_id
-                            && response.version == command.version
-                    })
-                    .map(|(_, original, _, _)| original),
-                _ => None,
-            };
+            let original = expected
+                .iter()
+                .find(|(target, original, _, _)| {
+                    message.source_node_id == *target
+                        && all_background_replica_response_identity_matches(
+                            &self.transport.local_node_id,
+                            original,
+                            &message,
+                        )
+                })
+                .map(|(_, original, _, _)| original);
             let Some(original) = original else {
                 first_error.get_or_insert_with(|| DfsError::Network {
                     message: "background DFS repair returned an unmatched response identity".into(),
                 });
                 continue;
             };
-            if let Err(error) = handler(message, Some(original)) {
+            if let Err(error) = handler(message.clone(), Some(original)) {
                 first_error.get_or_insert(error);
+                if let Err(error) = self
+                    .transport
+                    .retain_background_replica_completion(original.clone(), message)
+                {
+                    first_error.get_or_insert_with(|| DfsError::from_network(error));
+                }
             }
         }
         match send_result {
@@ -2835,13 +2865,13 @@ impl DfsNodeTransport {
             format!("send detached DFS message to {target_node_id}"),
         )?;
         let mut send = DeferredDfsPeerSend {
-            sender,
+            sender: Some(sender),
             options,
             operation_deadline,
             target_node_id: target_node_id.clone(),
             routed_message,
             promotion_sequence: None,
-            pending_fetch_responses: VecDeque::new(),
+            pending_local_responses: VecDeque::new(),
             retry_attempts: 0,
         };
         let promotion_identity = send.commit_version_promotion_identity();
@@ -3088,23 +3118,22 @@ impl DfsNodeTransport {
                 } else {
                     self.operation_deadline
                 };
-                let local_fetch_handler = matches!(
+                let local_response_handler = (matches!(
                     &send.routed_message.message,
                     DfsNetworkMessage::FetchBlob(_)
-                )
+                ) || !send.pending_local_responses.is_empty())
                 .then_some(response_handler)
                 .flatten();
-                let result = if let Some(handler) = local_fetch_handler {
-                    self.deliver_detached_fetch_responses(
+                let result = if let Some(handler) = local_response_handler {
+                    self.deliver_detached_local_responses(
                         &mut send,
                         current_operation_deadline,
                         handler,
                     )
-                } else if !send.pending_fetch_responses.is_empty() {
+                } else if !send.pending_local_responses.is_empty() {
                     Err(NetworkError::Io {
-                        operation: "resume detached DFS fetch response delivery".into(),
-                        detail: "retained Fetch response requires its admitted local handler"
-                            .into(),
+                        operation: "resume detached DFS local response delivery".into(),
+                        detail: "retained response requires its admitted local handler".into(),
                     })
                 } else {
                     Self::send_detached_peer_message(send.clone(), current_operation_deadline)
@@ -3113,7 +3142,7 @@ impl DfsNodeTransport {
                         })
                 };
                 if let Err(error) = result {
-                    if !send.pending_fetch_responses.is_empty() {
+                    if !send.pending_local_responses.is_empty() {
                         // The network call finished. Retry only its exact local
                         // delivery, never a fresh mutation or a fabricated ACK.
                         // Use the existing shared cooling queue and retry tiers.
@@ -3155,7 +3184,10 @@ impl DfsNodeTransport {
             format!("flush detached DFS message send to {}", send.target_node_id),
         )?;
         send_dfs_routed_message_to_peer(
-            send.sender,
+            send.sender.ok_or_else(|| NetworkError::Io {
+                operation: "send detached DFS message".into(),
+                detail: "already-returned repair has no outbound sender or attachment".into(),
+            })?,
             options,
             send.target_node_id,
             send.routed_message,
@@ -3278,7 +3310,40 @@ impl DfsNodeTransport {
         Ok(())
     }
 
-    fn deliver_detached_fetch_responses(
+    fn retain_background_replica_completion(
+        &mut self,
+        original: DfsRoutedMessage,
+        response: DfsRoutedMessage,
+    ) -> Result<(), NetworkError> {
+        if !all_background_replica_response_identity_matches(
+            &self.local_node_id,
+            &original,
+            &response,
+        ) {
+            return Err(NetworkError::Serialization {
+                detail: "retained background repair response changed original identity".into(),
+            });
+        }
+        let completion = DeferredDfsPeerSend {
+            sender: None,
+            options: DfsObjectRpcSendOptions::new(self.connect_timeout),
+            operation_deadline: None,
+            target_node_id: original.target_node_id.clone(),
+            routed_message: original,
+            promotion_sequence: None,
+            pending_local_responses: VecDeque::from([response]),
+            retry_attempts: 0,
+        };
+        // The first local attempt already failed. Reuse the existing shared
+        // backoff, worker exclusion and target policy; no new remote call exists.
+        self.restore_detached_peer_send_work(
+            VecDeque::new(),
+            VecDeque::from([completion]),
+            Instant::now(),
+        )
+    }
+
+    fn deliver_detached_local_responses(
         &self,
         send: &mut DeferredDfsPeerSend,
         operation_deadline: Option<Instant>,
@@ -3288,10 +3353,12 @@ impl DfsNodeTransport {
                  + Sync
          ),
     ) -> Result<(), NetworkError> {
-        let DfsNetworkMessage::FetchBlob(command) = &send.routed_message.message else {
-            unreachable!("captured detached fetch command");
-        };
-        if send.pending_fetch_responses.is_empty() {
+        if send.pending_local_responses.is_empty() {
+            let DfsNetworkMessage::FetchBlob(command) = &send.routed_message.message else {
+                return Err(NetworkError::Serialization {
+                    detail: "retained repair completion has no original returned frame".into(),
+                });
+            };
             let returned = Self::send_detached_peer_message(send.clone(), operation_deadline)?;
             for message in &returned {
                 let original = &send.routed_message;
@@ -3315,17 +3382,36 @@ impl DfsNodeTransport {
                     });
                 }
             }
-            send.pending_fetch_responses = returned.into();
+            send.pending_local_responses = returned.into();
         }
-        while let Some(response) = send.pending_fetch_responses.front() {
+        while let Some(response) = send.pending_local_responses.front() {
+            let original = if matches!(
+                &send.routed_message.message,
+                DfsNetworkMessage::RepairReplica(_)
+            ) {
+                if send.sender.is_some()
+                    || !all_background_replica_response_identity_matches(
+                        &self.local_node_id,
+                        &send.routed_message,
+                        response,
+                    )
+                {
+                    return Err(NetworkError::Serialization {
+                        detail: "retained repair completion changed original call custody".into(),
+                    });
+                }
+                Some(&send.routed_message)
+            } else {
+                None
+            };
             // Remove only after local processing succeeds. A failed handler can
             // already have durable effects; its next call must see the SAME
             // frame and validate the original native intent/content again.
-            handler(response.clone(), None).map_err(|error| NetworkError::Io {
-                operation: "deliver detached DFS fetch response to Main".into(),
+            handler(response.clone(), original).map_err(|error| NetworkError::Io {
+                operation: "deliver detached DFS response to Main".into(),
                 detail: error.to_string(),
             })?;
-            send.pending_fetch_responses.pop_front();
+            send.pending_local_responses.pop_front();
         }
         Ok(())
     }
