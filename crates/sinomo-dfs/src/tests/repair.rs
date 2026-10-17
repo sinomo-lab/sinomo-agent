@@ -4842,7 +4842,24 @@ pub(super) fn native_committed_repair_backlog(
     String,
     Option<impl Send + use<>>,
 ) {
-    let (runtime, owner, replica, service) = native_missing_content_repair(name);
+    native_committed_repair_backlog_with_nodes(name, intercept_background, 2)
+}
+
+pub(super) fn native_committed_repair_backlog_with_nodes(
+    name: &str,
+    intercept_background: bool,
+    node_count: usize,
+) -> (
+    crate::test_runtime::DfsTestRuntime,
+    NodeId,
+    NodeId,
+    NetworkedDfsService<DfsNodeTransport>,
+    DfsStat,
+    String,
+    Option<impl Send + use<>>,
+) {
+    let (runtime, owner, replica, service) =
+        native_missing_content_repair_with_nodes(name, node_count);
     drop(service);
     let background = intercept_background.then(|| {
         runtime
@@ -6838,11 +6855,24 @@ fn native_missing_content_repair(
     NodeId,
     NetworkedDfsService<DfsNodeTransport>,
 ) {
+    native_missing_content_repair_with_nodes(name, 2)
+}
+
+fn native_missing_content_repair_with_nodes(
+    name: &str,
+    node_count: usize,
+) -> (
+    crate::test_support::DfsTestRuntime,
+    NodeId,
+    NodeId,
+    NetworkedDfsService<DfsNodeTransport>,
+) {
     let (runtime, service, config) =
-        crate::test_support::current_native_metadata_service(name, 2, "/services").unwrap();
+        crate::test_support::current_native_metadata_service(name, node_count, "/services")
+            .unwrap();
     let owner = config.primary_node_id;
     drop(service);
-    let peer = crate::test_support::DfsTestRuntime::ordered_node_ids(name, 2)
+    let peer = crate::test_support::DfsTestRuntime::ordered_node_ids(name, node_count)
         .into_iter()
         .find(|node| *node != owner)
         .unwrap();

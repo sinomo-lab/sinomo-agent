@@ -3592,6 +3592,16 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         self.shard_backend(&payload.shard_id)?
             .prepared_operation_reservations(payload)
     }
+    fn write_operation_admission_snapshot(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        file_system_id: &DfsFileSystemId,
+        object_id: &DfsObjectId,
+        intent_id: &str,
+    ) -> Result<crate::DfsWriteOperationAdmissionSnapshot> {
+        self.shard_backend(shard_id)?
+            .write_operation_admission_snapshot(shard_id, file_system_id, object_id, intent_id)
+    }
     fn list_prepared_operations(&self) -> Result<Vec<DfsPreparedOperationRecord>> {
         let mut records = Vec::new();
         for shard in self.shards.keys() {

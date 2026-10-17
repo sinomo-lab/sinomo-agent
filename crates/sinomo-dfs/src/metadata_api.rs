@@ -180,6 +180,17 @@ pub struct DfsNamespaceRequestAdmissionSnapshot {
     pub history_expired: bool,
 }
 
+/// Applied outcomes and hidden reservations from one exact physical table view.
+/// A read must not combine pre-commit absence with post-commit reservation
+/// removal and then incorrectly certify that an operation was never applied.
+#[derive(Clone, Debug)]
+pub struct DfsWriteOperationAdmissionSnapshot {
+    pub intent: Option<DfsWriteIntentRecord>,
+    pub target_size_bytes: Option<u64>,
+    pub prepared: Vec<DfsPreparedOperationRecord>,
+    pub retention: DfsWriteIntentReceiptRetentionState,
+}
+
 impl DfsMetadataReplicaIngestPermit {
     /// Mint evidence only after the caller has validated all four values
     /// against the same exact committed shard assignment.
@@ -1319,6 +1330,16 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         object_id: &DfsObjectId,
         intent_id: &str,
     ) -> Result<Option<DfsWriteIntentRecord>>;
+
+    /// Observe one write identity and its object's indexed reservations without
+    /// opening unrelated shards or granting publication authority.
+    fn write_operation_admission_snapshot(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        file_system_id: &DfsFileSystemId,
+        object_id: &DfsObjectId,
+        intent_id: &str,
+    ) -> Result<DfsWriteOperationAdmissionSnapshot>;
 
     /// Fetch one exact write-intent key from one physical local metadata
     /// shard. Unlike [`Self::get_intent`], this never follows an object index

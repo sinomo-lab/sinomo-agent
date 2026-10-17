@@ -505,6 +505,7 @@ pub use metadata_api::{
     DfsCrossShardPinTransferPlan, DfsForeignShardSourceEvictionPlan, DfsMetadataBackend,
     DfsMetadataHistoryEffectsPlan, DfsMetadataReplicaApplyReport, DfsMetadataReplicaIngestPermit,
     DfsMetadataShardWriteFreeze, DfsNamespaceRequestAdmissionSnapshot,
+    DfsWriteOperationAdmissionSnapshot,
 };
 pub use metadata_backend::{
     DfsSourceAdoptionCapture, DfsSourceAdoptionJobCapture, DfsSourceAdoptionSourceCapture,

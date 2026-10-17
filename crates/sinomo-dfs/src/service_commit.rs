@@ -2030,6 +2030,135 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(())
     }
 
+    pub(crate) fn recover_prepared_intent_opening_for_retry(
+        &mut self,
+        intent: &DistributedWriteIntent,
+        content_hash: &str,
+        content_size_bytes: u64,
+    ) -> Result<(), DfsError> {
+        if self.transport.delegates_local_namespace_authority()
+            || !self
+                .coordinator
+                .intent(&intent.intent_id)
+                .is_some_and(|resident| resident.state == DfsWriteIntentState::AwaitingReceipts)
+        {
+            return Ok(());
+        }
+        let object = self.current_object_for_write(&intent.object_id)?;
+        let scope = self.metadata_effect_scope_for_object(
+            &object,
+            intent
+                .operation_id
+                .clone()
+                .unwrap_or_else(|| intent.intent_id.clone()),
+        )?;
+        let observed = self
+            .metadata_backend
+            .as_ref()
+            .expect("retry backend")
+            .write_operation_admission_snapshot(
+                &scope.shard_id,
+                &intent.file_system_id,
+                &intent.object_id,
+                &intent.intent_id,
+            )?;
+        let mut opening = None;
+        for record in observed.prepared {
+            let Some(original) = crate::service_routed_write::prepared_intent_for_write(
+                &record,
+                &intent.object_id,
+                &intent.intent_id,
+            ) else {
+                continue;
+            };
+            crate::service_routed_write::validate_retained_write_opening(
+                &record,
+                original,
+                intent,
+                content_hash,
+            )?;
+            if opening.replace(record).is_some() {
+                return Err(DfsError::WriteReconciliationRequired {
+                    operation_id: intent
+                        .operation_id
+                        .clone()
+                        .unwrap_or_else(|| intent.intent_id.clone()),
+                    object_id: intent.object_id.clone(),
+                    reason: "write opening has competing prepared effects".into(),
+                });
+            }
+        }
+        let recovered = if let Some(record) = opening {
+            if !self.recover_one_prepared_operation(record)? {
+                return Err(DfsError::Metadata {
+                    message: "original opening still requires its native recovery owner".into(),
+                });
+            }
+            true
+        } else {
+            false
+        };
+        let Some(stored) = self
+            .metadata_backend
+            .as_ref()
+            .expect("retry backend")
+            .get_intent_on_shard(&scope.shard_id, &intent.object_id, &intent.intent_id)?
+        else {
+            // No successful placeholder or staging authority is invented.
+            return Ok(());
+        };
+        let actual = crate::intent::distributed_intent_from_record(&stored);
+        let mut expected = intent.clone();
+        expected.state = actual.state.clone();
+        if expected != actual || stored.content_hash.as_deref() != Some(content_hash) {
+            return Err(DfsError::WriteOperationIdConflict {
+                operation_id: intent
+                    .operation_id
+                    .clone()
+                    .unwrap_or_else(|| intent.intent_id.clone()),
+                object_id: intent.object_id.clone(),
+            });
+        }
+        self.refresh_committed_write_projection(&intent.intent_id)?;
+        if actual.state != DfsWriteIntentState::AwaitingReceipts {
+            return Ok(());
+        }
+        self.restore_pending_write_for_intent_if_missing(&intent.intent_id, &intent.object_id)?;
+        self.restore_backend_receipt_pages_for_intent(&stored, true)?;
+        let Some(pending) = self.writes.pending_writes.get(&intent.intent_id) else {
+            return Err(DfsError::WriteReconciliationRequired {
+                operation_id: intent
+                    .operation_id
+                    .clone()
+                    .unwrap_or_else(|| intent.intent_id.clone()),
+                object_id: intent.object_id.clone(),
+                reason: "original opening has no retained transfer source".into(),
+            });
+        };
+        if pending.content_hash != content_hash || pending.size_bytes != content_size_bytes {
+            return Err(DfsError::WriteReconciliationRequired {
+                operation_id: intent
+                    .operation_id
+                    .clone()
+                    .unwrap_or_else(|| intent.intent_id.clone()),
+                object_id: intent.object_id.clone(),
+                reason: "original transfer descriptor is unavailable or differs from the retry"
+                    .into(),
+            });
+        }
+        if recovered {
+            self.record_durable_write_intent_work(&actual, &[]);
+        }
+        self.try_apply_committed_intent_if_ready(&intent.intent_id)?;
+        if self.should_stage_missing_replicas_after_write(&intent.intent_id) {
+            // Resume the same normal stage with its existing targets, inflight
+            // request identities and cooling. This is an explicit original-ID
+            // retry, not a new mutation or an enlarged maintenance budget.
+            self.stage_missing_desired_replicas_for_intent(&intent.intent_id, object)?;
+        }
+        Ok(())
+    }
+
     /// A base version can belong to transient, not-yet-published metadata.
     /// Existing-object batching therefore keys off durable backend state, while
     /// first publication uses an exact namespace prepare (with the parent touch

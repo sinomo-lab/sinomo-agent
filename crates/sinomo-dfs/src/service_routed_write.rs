@@ -41,6 +41,91 @@ pub fn validate_write_operation_id(operation_id: &str) -> Result<(), DfsError> {
     Ok(())
 }
 
+pub(crate) fn prepared_intent_for_write<'a>(
+    prepared: &'a DfsPreparedOperationRecord,
+    object_id: &DfsObjectId,
+    intent_id: &str,
+) -> Option<&'a DfsWriteIntentRecord> {
+    prepared
+        .payload
+        .prepared_intent
+        .iter()
+        .chain(prepared.payload.terminal_intent.iter())
+        .chain(
+            prepared
+                .payload
+                .metadata_effects
+                .iter()
+                .filter_map(|effect| match effect {
+                    DfsPreparedMetadataEffect::PutIntent { intent } => Some(intent),
+                    _ => None,
+                }),
+        )
+        .find(|intent| intent.object_id == *object_id && intent.intent_id == intent_id)
+}
+
+/// A retry may recover only this exact initial opening, not an unrelated
+/// metadata operation or a new publication body derived from its effects.
+pub(crate) fn validate_retained_write_opening(
+    record: &DfsPreparedOperationRecord,
+    original: &DfsWriteIntentRecord,
+    intent: &DistributedWriteIntent,
+    content_hash: &str,
+) -> Result<(), DfsError> {
+    record.validate()?;
+    if record.payload.prepared_intent.is_some()
+        || record.payload.terminal_intent.is_some()
+        || !record.payload.transaction.objects.is_empty()
+        || !record.payload.transaction.versions.is_empty()
+        || record.payload.completed_request.is_some()
+        || record.payload.completed_request_completion.is_some()
+        || crate::intent::distributed_intent_from_record(original) != *intent
+        || original.content_hash.as_deref() != Some(content_hash)
+        || record.digest.owner_epoch != original.owner_epoch
+    {
+        return Err(DfsError::WriteReconciliationRequired {
+            operation_id: intent.operation_id.clone().unwrap_or_else(|| intent.intent_id.clone()),
+            object_id: intent.object_id.clone(),
+            reason: "retained opening differs from the original write; native reconciliation is required".into(),
+        });
+    }
+    let mut intents = 0;
+    let allowed = record
+        .payload
+        .metadata_effects
+        .iter()
+        .all(|effect| match effect {
+            DfsPreparedMetadataEffect::PutIntent { intent: captured } => {
+                intents += 1;
+                captured == original
+            }
+            DfsPreparedMetadataEffect::PutReceipt { receipt } => {
+                receipt.receipt.file_system_id == intent.file_system_id
+                    && receipt.receipt.object_id == intent.object_id
+                    && receipt.receipt.committed_version == intent.target_version
+                    && receipt.content_hash.as_deref() == Some(content_hash)
+                    && intent
+                        .desired_replica_nodes
+                        .contains(&receipt.replica_node_id)
+            }
+            DfsPreparedMetadataEffect::PutFileSystem { file_system } => {
+                file_system.file_system_id == intent.file_system_id
+            }
+            _ => false,
+        });
+    if !allowed || intents != 1 {
+        return Err(DfsError::WriteReconciliationRequired {
+            operation_id: intent
+                .operation_id
+                .clone()
+                .unwrap_or_else(|| intent.intent_id.clone()),
+            object_id: intent.object_id.clone(),
+            reason: "write opening has unrelated prepared effects".into(),
+        });
+    }
+    Ok(())
+}
+
 /// Compact requester-local identity needed to publish a manifest after an
 /// authoritative routed write commits. The content hash and version arrive in
 /// the terminal outcome; the local content store proves whether this node
@@ -331,34 +416,89 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         requester_node_id: &NodeId,
         expected_content_hash: &str,
         expected_content_size_bytes: u64,
+        shard_id: Option<&DfsMetadataShardId>,
         locally_authoritative: bool,
     ) -> Result<DfsStableWriteOperationReconciliation, DfsError> {
         let file_system_id = sifs_file_system_id();
         let target_version =
             crate::intent::stable_write_target_version(requester_node_id, object_id, operation_id);
         let intent_id = stable_write_intent_id(requester_node_id, object_id, operation_id);
-        let (record, recorded_content_size_bytes, history_expired) =
-            if let Some(backend) = self.metadata_backend.as_ref() {
-                let record = backend.get_intent(object_id, &intent_id)?;
-                let recorded_content_size_bytes = match record.as_ref() {
-                    Some(record) => backend
-                        .get_version(object_id, &record.target_version)?
-                        .and_then(|version| version.size_bytes),
-                    None => None,
-                };
-                let history_expired = record.is_none()
-                    && backend
-                        .intent_receipt_retention_for_object(object_id)?
-                        .operation_history_expired(
-                            object_id,
-                            requester_node_id,
-                            &intent_id,
-                            stable_operation_order_token(operation_id).as_deref(),
-                        );
-                (record, recorded_content_size_bytes, history_expired)
-            } else {
-                (None, None, false)
-            };
+        let (record, recorded_content_size_bytes, history_expired) = if let (
+            Some(backend),
+            Some(shard_id),
+        ) =
+            (self.metadata_backend.as_ref(), shard_id)
+        {
+            let observed = backend.write_operation_admission_snapshot(
+                shard_id,
+                &file_system_id,
+                object_id,
+                &intent_id,
+            )?;
+            let record = observed.intent;
+            if record.is_none() {
+                for prepared in &observed.prepared {
+                    let Some(original) = prepared_intent_for_write(prepared, object_id, &intent_id)
+                    else {
+                        continue;
+                    };
+                    prepared.validate()?;
+                    let size = prepared
+                        .payload
+                        .transaction
+                        .objects
+                        .iter()
+                        .find(|object| {
+                            object.object_id == *object_id
+                                && object.version == original.target_version
+                        })
+                        .and_then(|object| object.content_size_bytes);
+                    let identity = classify_stable_write_operation(
+                        operation_id,
+                        &intent_id,
+                        &file_system_id,
+                        object_id,
+                        &target_version,
+                        requester_node_id,
+                        expected_content_hash,
+                        expected_content_size_bytes,
+                        Some(original),
+                        size,
+                        false,
+                        locally_authoritative,
+                    );
+                    if matches!(
+                        identity,
+                        DfsStableWriteOperationReconciliation::Conflict { .. }
+                    ) {
+                        return Ok(identity);
+                    }
+                    return Ok(DfsStableWriteOperationReconciliation::AmbiguousOrExpired {
+                        reason: format!(
+                            "write operation {operation_id} retains prepared operation {}; no absence or terminal outcome is established",
+                            prepared.digest.operation_id
+                        ),
+                    });
+                }
+                if self.coordinator.intent(&intent_id).is_some() {
+                    return Ok(DfsStableWriteOperationReconciliation::AmbiguousOrExpired {
+                        reason: format!(
+                            "write operation {operation_id} still has live execution without a durable terminal outcome"
+                        ),
+                    });
+                }
+            }
+            let history_expired = record.is_none()
+                && observed.retention.operation_history_expired(
+                    object_id,
+                    requester_node_id,
+                    &intent_id,
+                    stable_operation_order_token(operation_id).as_deref(),
+                );
+            (record, observed.target_size_bytes, history_expired)
+        } else {
+            (None, None, false)
+        };
         Ok(classify_stable_write_operation(
             operation_id,
             &intent_id,
@@ -430,12 +570,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         })?;
         let requester_node_id = self.node_id.clone();
         if self.control_plane.is_none() {
+            let shard_id = self
+                .metadata_backend
+                .as_ref()
+                .map(|_| self.local_prepared_operation_shard())
+                .transpose()?;
             return self.reconcile_stable_write_operation_locally_for_requester(
                 object_id,
                 operation_id,
                 &requester_node_id,
                 expected_content_hash,
                 expected_content_size_bytes,
+                shard_id.as_ref(),
                 self.metadata_backend.is_some(),
             );
         }
@@ -462,6 +608,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 &requester_node_id,
                 expected_content_hash,
                 expected_content_size_bytes,
+                Some(&DfsMetadataShardId::new(authority_shard.shard_id.clone())),
                 true,
             );
         }
@@ -559,6 +706,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     &request.requesting_node_id,
                     &request.expected_content_hash,
                     request.expected_content_size_bytes,
+                    Some(&DfsMetadataShardId::new(
+                        request.authority_shard.shard_id.clone(),
+                    )),
                     true,
                 )?
             }
@@ -785,11 +935,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             );
         }
 
-        let stable_record = if let Some(backend) = self.metadata_backend.as_ref() {
+        let mut stable_record = if let Some(backend) = self.metadata_backend.as_ref() {
             backend.get_intent(&command.request.object_id, &stable_intent_id)?
         } else {
             None
         };
+        if stable_record.is_none() {
+            stable_record = self.recover_retained_routed_write_opening(
+                requester_node_id,
+                command,
+                &stable_intent_id,
+                &expected_content_hash,
+                expected_content_size_bytes,
+            )?;
+        }
         if let Some(record) = stable_record {
             let size_matches = match self.metadata_backend.as_ref() {
                 Some(backend) => backend
@@ -861,6 +1020,120 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(None)
     }
 
+    /// After restart an initial prepare can be durable while neither the
+    /// applied-intent row nor the resident coordinator exists. Its absence
+    /// from those projections must not admit a newly timestamped opening.
+    fn recover_retained_routed_write_opening(
+        &mut self,
+        requester_node_id: &NodeId,
+        command: &DfsDistributedWriteCommand,
+        intent_id: &str,
+        content_hash: &str,
+        content_size_bytes: u64,
+    ) -> Result<Option<DfsWriteIntentRecord>, DfsError> {
+        if self.metadata_backend.is_none() || self.transport.delegates_local_namespace_authority() {
+            return Ok(None);
+        }
+        let object = match self.current_object_for_write(&command.request.object_id) {
+            Ok(object) => object,
+            Err(DfsError::UnknownObject { .. }) => match command.object_metadata.as_ref() {
+                Some(object)
+                    if object.object_id == command.request.object_id
+                        && object.file_system_id == command.request.file_system_id =>
+                {
+                    object.clone()
+                }
+                _ => return Ok(None),
+            },
+            Err(error) => return Err(error),
+        };
+        let scope = match self.metadata_effect_scope_for_object(&object, command.request_id.clone())
+        {
+            Ok(scope) => scope,
+            // Requester-side replay probing does not acquire a remote owner's
+            // recovery authority. The ordinary routed write still owns that hop.
+            Err(DfsError::StaleOwnerEpoch { .. }) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let observed = self
+            .metadata_backend
+            .as_ref()
+            .expect("backend checked above")
+            .write_operation_admission_snapshot(
+                &scope.shard_id,
+                &object.file_system_id,
+                &object.object_id,
+                intent_id,
+            )?;
+        if observed.intent.is_some() {
+            return Ok(observed.intent);
+        }
+        let mut opening = None;
+        for prepared in observed.prepared {
+            let Some(original) = prepared_intent_for_write(&prepared, &object.object_id, intent_id)
+            else {
+                continue;
+            };
+            if !stable_write_intent_record_matches_routed_write_command(
+                original,
+                requester_node_id,
+                command,
+                content_hash,
+            ) {
+                return Err(DfsError::WriteOperationIdConflict {
+                    operation_id: command.request_id.clone(),
+                    object_id: object.object_id.clone(),
+                });
+            }
+            let intent = crate::intent::distributed_intent_from_record(original);
+            validate_retained_write_opening(&prepared, original, &intent, content_hash)?;
+            if self.pending_write_size_hint(
+                &object.object_id,
+                &original.target_version,
+                content_hash,
+            )? != Some(content_size_bytes)
+            {
+                return Err(DfsError::WriteReconciliationRequired {
+                    operation_id: command.request_id.clone(),
+                    object_id: object.object_id.clone(),
+                    reason: "retained opening has no exact transfer size/source for this retry"
+                        .into(),
+                });
+            }
+            if opening.replace(prepared).is_some() {
+                return Err(DfsError::WriteReconciliationRequired {
+                    operation_id: command.request_id.clone(),
+                    object_id: object.object_id.clone(),
+                    reason: "write opening has competing prepared effects".into(),
+                });
+            }
+        }
+        let Some(prepared) = opening else {
+            return Ok(None);
+        };
+        // The native recovery path alone certifies current authority and all
+        // original participants, and publishes the captured immutable body.
+        if !self.recover_one_prepared_operation(prepared)? {
+            return Err(DfsError::WriteReconciliationRequired {
+                operation_id: command.request_id.clone(),
+                object_id: object.object_id.clone(),
+                reason: "retained opening still requires its native recovery owner".into(),
+            });
+        }
+        let record = self
+            .metadata_backend
+            .as_ref()
+            .expect("backend remains installed")
+            .get_intent_on_shard(&scope.shard_id, &object.object_id, intent_id)?;
+        record
+            .map(Some)
+            .ok_or_else(|| DfsError::WriteReconciliationRequired {
+                operation_id: command.request_id.clone(),
+                object_id: object.object_id,
+                reason: "recovered opening has no durable applied intent".into(),
+            })
+    }
+
     /// Proves that an in-memory intent belongs to this exact write payload
     /// before the response-safe transport path treats the command as a replay.
     /// The coordinator intentionally does not own content bytes, so consult the
@@ -912,6 +1185,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<Option<NetworkedDfsWriteOutcome>, DfsError> {
         self.refresh_committed_write_projection(&intent.intent_id)?;
         self.recover_prepared_write_for_retry(intent, content_hash, content_size_bytes)?;
+        // Opening publication and its first transfer are a separate checkpoint
+        // from the final write body. Resume them only on this explicit replay;
+        // receipt-driven commit readiness must not recursively re-enter it.
+        self.recover_prepared_intent_opening_for_retry(intent, content_hash, content_size_bytes)?;
         match self.write_outcome(&intent.intent_id) {
             Ok(outcome) => Ok(Some(outcome)),
             Err(error) if matches!(intent.state, DfsWriteIntentState::AwaitingReceipts) => {

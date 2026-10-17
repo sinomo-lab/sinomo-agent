@@ -984,6 +984,38 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         self.get_intent(object_id, intent_id)
     }
 
+    fn write_operation_admission_snapshot(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        file_system_id: &DfsFileSystemId,
+        object_id: &DfsObjectId,
+        intent_id: &str,
+    ) -> Result<crate::DfsWriteOperationAdmissionSnapshot> {
+        self.require_replication_source_shard(shard_id)?;
+        let tables = self.current_tables_snapshot()?;
+        let intent = tables.intent_record(object_id, intent_id);
+        if intent
+            .as_ref()
+            .is_some_and(|record| record.file_system_id != *file_system_id)
+        {
+            return Err(MetadataBackendError::Serde(
+                "write observation names a foreign filesystem".into(),
+            ));
+        }
+        let target_size_bytes = intent.as_ref().and_then(|record| {
+            tables
+                .versions
+                .get(&(object_id.clone(), record.target_version.clone()))
+                .and_then(|version| version.size_bytes)
+        });
+        Ok(crate::DfsWriteOperationAdmissionSnapshot {
+            intent,
+            target_size_bytes,
+            prepared: tables.prepared_operations_for_object(file_system_id, object_id)?,
+            retention: tables.intent_receipt_retention.for_object(object_id),
+        })
+    }
+
     fn get_receipt_on_shard(
         &self,
         shard_id: &DfsMetadataShardId,

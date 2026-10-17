@@ -725,6 +725,32 @@ fn validate_local_eventual_batch_commit_from_view(
     Ok(prepare_expectations)
 }
 
+/// The ordinary receipt producer may also settle that exact visible version's
+/// location. Other effects are distinct operations, not receipt retries.
+fn metadata_receipt_projection_input(
+    effects: &[DfsPreparedMetadataEffect],
+) -> Option<&DfsReplicaReceiptRecord> {
+    match effects {
+        [DfsPreparedMetadataEffect::PutReceipt { receipt }] => Some(receipt),
+        [
+            DfsPreparedMetadataEffect::PutReceipt { receipt },
+            DfsPreparedMetadataEffect::PutObject { object },
+        ] if object.file_system_id == receipt.receipt.file_system_id
+            && object.object_id == receipt.receipt.object_id
+            && object.version == receipt.receipt.committed_version
+            && object.kind != DfsObjectKind::Tombstone
+            && receipt
+                .content_hash
+                .as_deref()
+                .is_some_and(|hash| object.content_hash.as_deref() == Some(hash))
+            && object.current_locations.contains(&receipt.replica_node_id) =>
+        {
+            Some(receipt)
+        }
+        _ => None,
+    }
+}
+
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub(crate) fn resolve_prepared_operation(
         &mut self,
@@ -828,16 +854,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     /// Receipt producers can retry after their durable prepare but before its
-    /// publication was acknowledged. Only the same receipt-only body/readset
-    /// may resume here. Keep its original event, time and operation identity;
-    /// another receipt, namespace effect or authority round is not equivalent.
+    /// publication was acknowledged. Only the same receipt and exact location
+    /// projection/readset may resume here. Keep its original event, time and
+    /// operation identity; another receipt, object change or authority round
+    /// is not equivalent. A filesystem row appended by the ordinary preparer
+    /// remains part of the ORIGINAL complete body, never a fresh replacement.
     fn recover_matching_metadata_receipt_prepare(
         &mut self,
         proposed: &DfsPreparedOperationPayload,
     ) -> Result<bool, DfsError> {
-        let [DfsPreparedMetadataEffect::PutReceipt { receipt: incoming }] =
-            proposed.metadata_effects.as_slice()
-        else {
+        let Some(incoming) = metadata_receipt_projection_input(&proposed.metadata_effects) else {
             return Ok(false);
         };
         let backend = self
@@ -849,15 +875,33 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let mut matching = None;
         for record in backend.prepared_operation_reservations(proposed)? {
             let original = record.payload.as_ref();
-            let [DfsPreparedMetadataEffect::PutReceipt { receipt: stored }] =
-                original.metadata_effects.as_slice()
-            else {
+            // prepare_payload_for_publication can append this captured row
+            // after the producer's receipt/location payload was constructed.
+            // No explicitly requested filesystem effect is ignored: proposed
+            // is restricted to the receipt-producer shapes above.
+            let original_input = match original.metadata_effects.split_last() {
+                Some((DfsPreparedMetadataEffect::PutFileSystem { file_system }, input))
+                    if file_system.file_system_id == original.file_system_id =>
+                {
+                    input
+                }
+                _ => original.metadata_effects.as_slice(),
+            };
+            let Some(stored) = metadata_receipt_projection_input(original_input) else {
                 continue;
             };
             let mut same_receipt = incoming.clone();
             same_receipt.receipt.event_id = stored.receipt.event_id.clone();
             same_receipt.received_at = stored.received_at;
             if same_receipt != *stored {
+                continue;
+            }
+            let mut same_input = proposed.metadata_effects.clone();
+            let DfsPreparedMetadataEffect::PutReceipt { receipt } = &mut same_input[0] else {
+                unreachable!("validated receipt-producer shape")
+            };
+            *receipt = stored.clone();
+            if same_input.as_slice() != original_input {
                 continue;
             }
             // These fields are minted by for_metadata_effects and the receipt

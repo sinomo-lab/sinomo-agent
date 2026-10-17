@@ -1719,6 +1719,41 @@ impl DfsMetadataTables {
             })
     }
 
+    pub(crate) fn prepared_operations_for_object(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        object_id: &DfsObjectId,
+    ) -> Result<Vec<DfsPreparedOperationRecord>> {
+        let Some(owners) = self
+            .namespace_prepare_object_owners
+            .get(file_system_id)
+            .and_then(|objects| objects.get(object_id))
+        else {
+            return Ok(Vec::new());
+        };
+        owners
+            .iter()
+            .map(|id| {
+                let record = self.prepared_operations_v7.get(id).ok_or_else(|| {
+                    MetadataBackendError::Serde(
+                        "object reservation indexes a missing prepared body".into(),
+                    )
+                })?;
+                if record.status != DfsPreparedOperationStatus::Prepared
+                    || record.file_system_id != *file_system_id
+                    || !namespace_prepare_footprint(record)
+                        .object_ids()
+                        .contains(object_id)
+                {
+                    return Err(MetadataBackendError::Serde(
+                        "object reservation differs from its actual prepared body".into(),
+                    ));
+                }
+                Ok(record.clone())
+            })
+            .collect()
+    }
+
     pub(crate) fn prepared_content_reference_protection(
         &self,
         file_system_id: &DfsFileSystemId,

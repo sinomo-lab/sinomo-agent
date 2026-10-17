@@ -371,7 +371,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(())
     }
 
-    fn record_durable_write_intent_work(
+    pub(crate) fn record_durable_write_intent_work(
         &mut self,
         intent: &DistributedWriteIntent,
         receipt_node_ids: &[NodeId],

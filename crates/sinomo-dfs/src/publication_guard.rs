@@ -12,6 +12,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 #[cfg(test)]
 thread_local! {
+    pub(crate) static BEFORE_STORED_PREPARE_EXECUTION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     /// Pause only after the real author guard and complete participant evidence
     /// exist. Tests may interrupt delivery; they cannot supply acknowledgement claims.
     pub(crate) static AFTER_PREPARED_AUTHORIZATION: std::cell::RefCell<Option<Box<dyn FnOnce(&DfsPreparedOperationDigest, &crate::DfsPreparedOperationPayload)>>> = const { std::cell::RefCell::new(None) };
@@ -1072,12 +1073,52 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
                 published: false,
             });
         }
+        #[cfg(test)]
+        if let Some(before_execution) =
+            BEFORE_STORED_PREPARE_EXECUTION.with(|hook| hook.borrow_mut().take())
+        {
+            before_execution();
+        }
         let _execution = self.acquire_prepared_execution(&crate::DfsPreparedOperationScope {
             file_system_id: digest.file_system_id.clone(),
             shard_id: digest.shard_id.clone(),
             owner_epoch: digest.owner_epoch,
             operation_id: digest.operation_id.clone(),
         })?;
+        // Admission can wait behind another normal recovery owner. A shared
+        // read snapshot may already see its new record while this projection's
+        // resident exact-prefix proof still names the older cut. Refresh only
+        // this shard after acquiring admission, then observe the terminal state
+        // again before attempting any new certification. Do not reopen a writer
+        // already retained by an adoption offer/body witness across yields.
+        let record = if _execution.is_some()
+            && self.source_adoption.offer().is_none()
+            && self.source_adoption.witness().is_none()
+        {
+            let backend = self.metadata_backend.as_mut().expect("prepared backend");
+            backend.refresh_metadata_shard_attestation_view(&digest.shard_id)?;
+            let current = backend
+                .prepared_operation_record(&digest.operation_id)?
+                .ok_or_else(|| crate::DfsError::Metadata {
+                    message: "admitted retry lost its original durable prepare".into(),
+                })?;
+            current.validate()?;
+            if current.digest != *digest || current.payload != payload {
+                return Err(crate::DfsError::Metadata {
+                    message: "admitted retry differs from its original durable prepare".into(),
+                });
+            }
+            if current.status == crate::DfsPreparedOperationStatus::Committed {
+                self.refresh_recorded_prepared_rows(&payload)?;
+                return Ok(DfsPreparedPublication {
+                    payload,
+                    published: false,
+                });
+            }
+            current
+        } else {
+            record
+        };
         let guard = self.authorize_prepared_publication_from_record(digest, record)?;
         #[cfg(test)]
         if let Some(after_authorization) =
