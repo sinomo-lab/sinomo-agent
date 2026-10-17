@@ -2292,12 +2292,20 @@ fn sifs_cluster_posix_routed_namespace_ops_have_read_your_write_semantics() {
         writer.posix_stat_distributed("/users/routed-dir/link"),
         Err(DfsPosixError::NotFound { .. })
     ));
+    let after_alias_unlink = writer
+        .posix_stat_distributed("/users/routed-dir/renamed.txt")
+        .expect("stat after alias unlink");
+    let actual_primary = if after_alias_unlink.link_count != 1 {
+        match _runtime.metadata_primary_service("/users/routed-dir/renamed.txt") {
+            Ok(service) => format!("{:?}", service.posix_stat("/users/routed-dir/renamed.txt")),
+            Err(error) => format!("unavailable: {error}"),
+        }
+    } else {
+        String::new()
+    };
     assert_eq!(
-        writer
-            .posix_stat_distributed("/users/routed-dir/renamed.txt")
-            .expect("stat after alias unlink")
-            .link_count,
-        1
+        after_alias_unlink.link_count, 1,
+        "actual caller={after_alias_unlink:?}; actual primary={actual_primary}"
     );
 
     // POSIX error mapping survives the wire round trip.

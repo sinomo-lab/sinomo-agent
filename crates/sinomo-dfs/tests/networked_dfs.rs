@@ -551,12 +551,32 @@ fn networked_dfs_supports_three_nodes_two_replicas_with_cross_reads() {
     let mut stats = Vec::new();
     for index in 0..2 {
         let mut writer = runtime.client(&nodes[index]).expect("normal writer");
+        let (_, _, policy) = writer
+            .managed_replication_policy_for_path(
+                paths[index],
+                DfsObjectPolicy::ReplicatedConfirmed,
+                2,
+            )
+            .expect("actual applied required-node policy");
+        assert_eq!(policy.min_commit_replicas, 2);
+        assert_eq!(policy.desired_replicas, 2);
+        assert_eq!(
+            policy
+                .required_node_ids
+                .iter()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            [nodes[index].clone(), nodes[2].clone()]
+                .into_iter()
+                .collect(),
+            "each writer and the shared receiver are actual required replicas"
+        );
         let stat = writer
             .posix_write_file(
                 paths[index],
                 bytes[index],
                 sinomo_dfs::DfsWriteOptions {
-                    policy: DfsReplicationPolicy::new(2, 2).unwrap(),
+                    policy,
                     replica_candidates: nodes.clone(),
                     wait_for_commit: true,
                     foreground_replica_repair: true,

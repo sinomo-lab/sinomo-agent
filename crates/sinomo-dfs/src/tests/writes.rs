@@ -2449,8 +2449,22 @@ fn replica_stage_and_commit_do_not_append_authoritative_metadata() {
     let committed_replies = Arc::new(Mutex::new(Vec::new()));
     let bytes = vec![0x63; 2 * 1024 * 1024 + 4096];
     let expected_hash = content_hash(&bytes);
+    let (_, _, replication) = writer
+        .managed_replication_policy_for_path(path, DfsObjectPolicy::ReplicatedConfirmed, 2)
+        .unwrap();
+    assert_eq!(replication.min_commit_replicas, 2);
+    assert_eq!(replication.desired_replicas, 2);
+    assert_eq!(
+        replication
+            .required_node_ids
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        content_nodes.iter().cloned().collect(),
+        "the actual Stage receiver must be required by this fixture's effective policy"
+    );
     let options = DfsWriteOptions {
-        policy: DfsReplicationPolicy::new(2, 2).unwrap(),
+        policy: replication,
         replica_candidates: content_nodes,
         wait_for_commit: true,
         foreground_replica_repair: true,

@@ -13,6 +13,19 @@ use super::{
 use crate::metadata_error::{MetadataBackendError, Result};
 use crate::{DfsFileSystemId, DfsMetadataShardId, DfsReplicaReceiptRecord};
 
+#[cfg(test)]
+thread_local! {
+    static PREPARED_PAYLOAD_DIGEST_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+#[cfg(test)]
+pub(crate) fn reset_prepared_payload_digest_count() {
+    PREPARED_PAYLOAD_DIGEST_COUNT.with(|count| count.set(0));
+}
+#[cfg(test)]
+pub(crate) fn prepared_payload_digest_count() -> usize {
+    PREPARED_PAYLOAD_DIGEST_COUNT.with(|count| count.get())
+}
+
 pub const DFS_PREPARED_OPERATION_PROTOCOL_VERSION: u8 = 7;
 const PREPARED_OPERATION_DIGEST_DOMAIN: &[u8] = b"sinomo.dfs.prepared-operation\0v7\0";
 
@@ -220,6 +233,61 @@ fn deserialize_journal_sequence_precondition<'de, D: serde::Deserializer<'de>>(
     Option::<u64>::deserialize(deserializer)
 }
 
+// A replay owns its decoded table image until it returns. Keep only one
+// successful immutable-body observation in that scope, never an authority,
+// terminal-state result or strong payload reference. Outside replay every
+// public validation still hashes normally and leaves Arc uniqueness unchanged.
+struct PreparedPayloadValidation {
+    last: Option<(std::sync::Weak<DfsPreparedOperationPayload>, String)>,
+}
+thread_local! {
+    static PREPARED_PAYLOAD_VALIDATION: std::cell::RefCell<Option<PreparedPayloadValidation>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) fn with_prepared_payload_validation<R>(read: impl FnOnce() -> R) -> R {
+    struct Restore(Option<PreparedPayloadValidation>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let previous = self.0.take();
+            let _ = PREPARED_PAYLOAD_VALIDATION.try_with(|slot| slot.replace(previous));
+        }
+    }
+    let Ok(previous) = PREPARED_PAYLOAD_VALIDATION
+        .try_with(|slot| slot.replace(Some(PreparedPayloadValidation { last: None })))
+    else {
+        return read();
+    };
+    let _restore = Restore(previous);
+    read()
+}
+
+fn canonical_digest_in_validation_scope(
+    payload: &Arc<DfsPreparedOperationPayload>,
+) -> Result<String> {
+    let cached = PREPARED_PAYLOAD_VALIDATION
+        .try_with(|slot| {
+            let held = slot.borrow();
+            let (owner, digest) = held.as_ref()?.last.as_ref()?;
+            let owner = owner.upgrade()?;
+            Arc::ptr_eq(&owner, payload).then(|| digest.clone())
+        })
+        .ok()
+        .flatten();
+    if let Some(digest) = cached {
+        return Ok(digest);
+    }
+    let digest = payload.canonical_digest()?;
+    let _ = PREPARED_PAYLOAD_VALIDATION.try_with(|slot| {
+        if let Some(scope) = slot.borrow_mut().as_mut() {
+            // Payload fields contain owned immutable values. Safe mutation of
+            // this Arc either clones its body or dissociates Weak observers;
+            // either action requires fresh validation for the new allocation.
+            scope.last = Some((Arc::downgrade(payload), digest.clone()));
+        }
+    });
+    Ok(digest)
+}
+
 impl DfsPreparedOperationPayload {
     #[allow(clippy::too_many_arguments)]
     pub fn for_namespace_transaction(
@@ -360,6 +428,8 @@ impl DfsPreparedOperationPayload {
 
     pub fn canonical_digest(&self) -> Result<String> {
         self.validate()?;
+        #[cfg(test)]
+        PREPARED_PAYLOAD_DIGEST_COUNT.with(|count| count.set(count.get() + 1));
         let mut hasher = blake3::Hasher::new();
         hasher.update(PREPARED_OPERATION_DIGEST_DOMAIN);
         serde_json::to_writer(&mut hasher, self)
@@ -381,15 +451,43 @@ impl DfsPreparedOperationDigest {
                 "prepared operation sequence is zero".into(),
             ));
         }
-        Ok(Self {
+        Ok(Self::bind_canonical_digest(
+            payload,
+            prepare_sequence,
+            payload.canonical_digest()?,
+        ))
+    }
+
+    fn bind_canonical_digest(
+        payload: &DfsPreparedOperationPayload,
+        prepare_sequence: u64,
+        payload_digest: String,
+    ) -> Self {
+        Self {
             protocol_version: payload.protocol_version,
             file_system_id: payload.file_system_id.clone(),
             shard_id: payload.shard_id.clone(),
             owner_epoch: payload.owner_epoch,
             operation_id: payload.operation_id.clone(),
-            payload_digest: payload.canonical_digest()?,
+            payload_digest,
             prepare_sequence,
-        })
+        }
+    }
+
+    fn validate_shared_payload(&self, payload: &Arc<DfsPreparedOperationPayload>) -> Result<()> {
+        if self.prepare_sequence == 0
+            || *self
+                != Self::bind_canonical_digest(
+                    payload,
+                    self.prepare_sequence,
+                    canonical_digest_in_validation_scope(payload)?,
+                )
+        {
+            return Err(MetadataBackendError::Serde(
+                "prepared operation digest or durable scope mismatch".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub fn validate_payload(&self, payload: &DfsPreparedOperationPayload) -> Result<()> {
@@ -405,7 +503,7 @@ impl DfsPreparedOperationDigest {
 
 impl DfsPreparedOperationRecord {
     pub fn validate(&self) -> Result<()> {
-        self.digest.validate_payload(&self.payload)?;
+        self.digest.validate_shared_payload(&self.payload)?;
         if self
             .payload
             .expected_journal_sequence

@@ -21,6 +21,9 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sinomo_core::object::{LengthMode, serde_ext};
 use sinomo_core::storage::durable_file::{self, DurableFileSync, DurableLengthEndian};
 
+#[cfg(unix)]
+mod validation_cache;
+
 use crate::DfsMetadataShardId;
 use crate::metadata_error::{MetadataBackendError, Result};
 use crate::metadata_io::{metadata_durable_file_error, write_sobj_atomic};
@@ -38,6 +41,7 @@ enum FailurePoint {
 #[cfg(test)]
 thread_local! {
     static FAIL_NEXT: std::cell::Cell<Option<FailurePoint>> = const { std::cell::Cell::new(None) };
+    static RECORD_DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 #[cfg(test)]
 fn fail_if_requested(point: FailurePoint) -> Result<()> {
@@ -51,7 +55,7 @@ fn fail_if_requested(point: FailurePoint) -> Result<()> {
     })
 }
 
-pub(crate) trait AckFloor: Clone + Eq + Serialize + DeserializeOwned {
+pub(crate) trait AckFloor: Clone + Eq + Serialize + DeserializeOwned + 'static {
     const KIND: &'static str;
     fn shard(&self) -> &DfsMetadataShardId;
     fn validate(&self) -> Result<()>;
@@ -75,6 +79,7 @@ struct Record {
     checksum: String,
 }
 
+#[derive(Clone)]
 struct Loaded<T> {
     floor: Option<T>,
     initialized: bool,
@@ -129,6 +134,8 @@ fn record_bytes<T: AckFloor>(floor: &T) -> Result<Vec<u8>> {
 }
 
 fn parse_record<T: AckFloor>(bytes: &[u8], shard: &DfsMetadataShardId) -> Result<T> {
+    #[cfg(test)]
+    RECORD_DECODES.with(|count| count.set(count.get() + 1));
     let record: Record = decode(bytes)?;
     if record.format != FORMAT || record.kind != T::KIND || &record.shard_id != shard {
         return Err(invalid(
@@ -183,11 +190,17 @@ fn lock(path: &Path, exclusive: bool) -> Result<Option<File>> {
 
 #[tracing::instrument(target = "sinomo.perf", level = "trace", name = "dfs.metadata.ack_floor.read",
     skip_all, fields(stage = "dfs.metadata.ack_floor.read", kind = T::KIND,
-    records = tracing::field::Empty, log_bytes = tracing::field::Empty, outcome = "error"))]
-fn load<T: AckFloor>(path: &Path, shard: &DfsMetadataShardId) -> Result<Loaded<T>> {
+    records = tracing::field::Empty, decoded_records = tracing::field::Empty,
+    reused_validation = false, log_bytes = tracing::field::Empty, outcome = "error"))]
+fn load<T: AckFloor>(
+    path: &Path,
+    shard: &DfsMetadataShardId,
+    _held_lock: Option<&File>,
+) -> Result<Loaded<T>> {
     let mut initialized = false;
-    if let Some(bytes) = read_optional(path)? {
-        let pointer: FormatPointer = decode(&bytes)?;
+    let pointer_bytes = read_optional(path)?;
+    if let Some(bytes) = pointer_bytes.as_deref() {
+        let pointer: FormatPointer = decode(bytes)?;
         if pointer.ack_floor_log_format != FORMAT
             || pointer.kind != T::KIND
             || &pointer.shard_id != shard
@@ -211,7 +224,41 @@ fn load<T: AckFloor>(path: &Path, shard: &DfsMetadataShardId) -> Result<Loaded<T
         complete_len: 0,
         file_len: 0,
     };
-    if let Some(log) = log {
+    if let Some(mut log) = log {
+        #[cfg(unix)]
+        let before =
+            validation_cache::source::<T>(path, shard, _held_lock, &log, pointer_bytes.as_deref())?;
+        #[cfg(unix)]
+        if let Some(source) = before.as_ref()
+            && let Some(cached) = validation_cache::reuse::<T>(source, &mut log)?
+        {
+            let current_pointer = read_optional(path)?;
+            let after = validation_cache::source::<T>(
+                path,
+                shard,
+                _held_lock,
+                &log,
+                current_pointer.as_deref(),
+            )?;
+            if after.as_ref() != Some(source) {
+                return Err(invalid(
+                    "acknowledgement source changed during locked validation",
+                ));
+            }
+            let span = tracing::Span::current();
+            span.record("records", cached.records);
+            span.record("decoded_records", 0usize);
+            span.record("reused_validation", true);
+            span.record("log_bytes", cached.file_len);
+            span.record("outcome", "ok");
+            return Ok(cached);
+        }
+        #[cfg(unix)]
+        let identity_handle = log
+            .try_clone()
+            .map_err(|error| io_error(&log_path, error))?;
+        #[cfg(unix)]
+        let mut validated_bytes = blake3::Hasher::new();
         let mut records = durable_file::DurableRecordReader::new(
             log,
             &log_path,
@@ -222,6 +269,11 @@ fn load<T: AckFloor>(path: &Path, shard: &DfsMetadataShardId) -> Result<Loaded<T
         loaded.file_len = records.file_len();
         while let Some(record) = records.next_record().map_err(metadata_durable_file_error)? {
             let floor = parse_record::<T>(&record.bytes, shard)?;
+            #[cfg(unix)]
+            {
+                validated_bytes.update(&(record.bytes.len() as u32).to_le_bytes());
+                validated_bytes.update(&record.bytes);
+            }
             if let Some(previous) = loaded.floor.as_ref() {
                 // A complete log entry cannot regress or discard enrichment.
                 if T::merge(previous, &floor)? != floor {
@@ -239,6 +291,18 @@ fn load<T: AckFloor>(path: &Path, shard: &DfsMetadataShardId) -> Result<Loaded<T
                 ));
             }
         }
+        #[cfg(unix)]
+        {
+            let current_pointer = read_optional(path)?;
+            let after = validation_cache::source::<T>(
+                path,
+                shard,
+                _held_lock,
+                &identity_handle,
+                current_pointer.as_deref(),
+            )?;
+            validation_cache::remember::<T>(before, after, validated_bytes.finalize(), &loaded);
+        }
     }
     if initialized && loaded.floor.is_none() {
         return Err(invalid(
@@ -247,6 +311,7 @@ fn load<T: AckFloor>(path: &Path, shard: &DfsMetadataShardId) -> Result<Loaded<T
     }
     let span = tracing::Span::current();
     span.record("records", loaded.records);
+    span.record("decoded_records", loaded.records);
     span.record("log_bytes", loaded.file_len);
     span.record("outcome", "ok");
     Ok(loaded)
@@ -254,7 +319,7 @@ fn load<T: AckFloor>(path: &Path, shard: &DfsMetadataShardId) -> Result<Loaded<T
 
 pub(crate) fn read<T: AckFloor>(path: &Path, shard: &DfsMetadataShardId) -> Result<Option<T>> {
     let _lock = lock(path, false)?;
-    load(path, shard).map(|loaded| loaded.floor)
+    load(path, shard, _lock.as_ref()).map(|loaded| loaded.floor)
 }
 
 /// Persist before ACK. Retried equal/older requests still sync the current
@@ -266,7 +331,11 @@ pub(crate) fn read<T: AckFloor>(path: &Path, shard: &DfsMetadataShardId) -> Resu
 pub(crate) fn put<T: AckFloor>(path: &Path, incoming: &T) -> Result<()> {
     incoming.validate()?;
     let _lock = lock(path, true)?;
-    let loaded = load::<T>(path, incoming.shard())?;
+    let loaded = load::<T>(path, incoming.shard(), _lock.as_ref())?;
+    // Decoded DATA never certifies a write or a barrier. Drop it before any
+    // append, rotation, truncation or equal-value resynchronization can fail.
+    #[cfg(unix)]
+    validation_cache::forget::<T>();
     let floor = match loaded.floor.as_ref() {
         Some(current) => T::merge(current, incoming)?,
         None => incoming.clone(),
@@ -529,7 +598,7 @@ mod tests {
         }
         assert_eq!(current(&path), floor(MAX_LOG_RECORDS as u64 + 5));
         assert_eq!(
-            load::<DfsMetadataAuthorityAckFloor>(&path, &floor(1).shard_id)
+            load::<DfsMetadataAuthorityAckFloor>(&path, &floor(1).shard_id, None)
                 .unwrap()
                 .records,
             5
@@ -578,5 +647,175 @@ mod tests {
         assert!(put(&path, &floor(2)).is_err());
         put(&path, &floor(2)).unwrap();
         assert_eq!(current(&path), floor(2));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn unchanged_authority_log_is_decoded_once_across_prefix_read_and_ack_write() {
+        let root = sinomo_testdir::TestDir::new("ack-floor-same-source-validation");
+        let authority = sidecar(&root);
+        let prefix = root.join("coordination/metadata-prefix-ack-floors/floor-test.sobj");
+        for sequence in 1..=76 {
+            put(&authority, &floor(sequence)).unwrap();
+        }
+        for sequence in 1..=50 {
+            put(
+                &prefix,
+                &DfsMetadataPrefixAckFloor {
+                    shard_id: floor(sequence).shard_id,
+                    journal_sequence: sequence,
+                    state_fingerprint: String::new(),
+                    durable_prefix_proof: floor(sequence).durable_prefix_proof,
+                },
+            )
+            .unwrap();
+        }
+        RECORD_DECODES.with(|count| count.set(0));
+        assert_eq!(
+            read::<DfsMetadataAuthorityAckFloor>(&authority, &floor(76).shard_id).unwrap(),
+            Some(floor(76))
+        );
+        assert_eq!(
+            read::<DfsMetadataPrefixAckFloor>(&prefix, &floor(50).shard_id)
+                .unwrap()
+                .unwrap()
+                .journal_sequence,
+            50
+        );
+        let first = RECORD_DECODES.with(|count| count.get());
+        assert_eq!(
+            first, 126,
+            "the actual initial logs are completely decoded and validated"
+        );
+        put(&authority, &floor(77)).unwrap();
+        assert_eq!(
+            RECORD_DECODES.with(|count| count.get()),
+            first,
+            "the already validated unchanged authority history is not decoded again to publish its next ACK"
+        );
+        assert_eq!(current(&authority), floor(77));
+        // Decoded state cannot substitute for the next durability barrier.
+        FAIL_NEXT.with(|point| point.set(Some(FailurePoint::LogSync)));
+        assert!(put(&authority, &floor(77)).is_err());
+        put(&authority, &floor(77)).unwrap();
+        assert_eq!(current(&authority), floor(77));
+    }
+
+    #[test]
+    fn remembered_validation_rejects_same_length_corruption_with_restored_mtime() {
+        let root = sinomo_testdir::TestDir::new("ack-floor-validation-corruption");
+        let path = sidecar(&root);
+        put(&path, &floor(1)).unwrap();
+        assert_eq!(current(&path), floor(1));
+        let log_path = path.with_extension("slog");
+        let original = fs::read(&log_path).unwrap();
+        let modified = fs::metadata(&log_path).unwrap().modified().unwrap();
+        let mut corrupt = original.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        fs::write(&log_path, &corrupt).unwrap();
+        File::options()
+            .write(true)
+            .open(&log_path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        assert_eq!(
+            fs::metadata(&log_path).unwrap().len(),
+            original.len() as u64
+        );
+        assert_eq!(
+            fs::metadata(&log_path).unwrap().modified().unwrap(),
+            modified
+        );
+        assert!(read::<DfsMetadataAuthorityAckFloor>(&path, &floor(1).shard_id).is_err());
+        assert!(put(&path, &floor(2)).is_err());
+        fs::write(&log_path, original).unwrap();
+        assert_eq!(current(&path), floor(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identical_bytes_under_replaced_physical_custody_are_decoded_again() {
+        use std::os::unix::fs::MetadataExt;
+        let root = sinomo_testdir::TestDir::new("ack-floor-validation-physical-generation");
+        let path = sidecar(&root);
+        put(&path, &floor(1)).unwrap();
+        // Each replacement happens after the prior reader released its lock.
+        // These are owned disposable files, with no concurrent live writer.
+        for replaced in [
+            path.with_extension("slog"),
+            path.clone(),
+            path.with_extension("lock"),
+        ] {
+            assert_eq!(current(&path), floor(1));
+            let before_inode = fs::metadata(&replaced).unwrap().ino();
+            let bytes = fs::read(&replaced).unwrap();
+            let saved = replaced.with_extension(format!(
+                "{}.preserved",
+                replaced.extension().unwrap().to_str().unwrap()
+            ));
+            fs::rename(&replaced, &saved).unwrap();
+            fs::write(&replaced, &bytes).unwrap();
+            assert_ne!(fs::metadata(&replaced).unwrap().ino(), before_inode);
+            RECORD_DECODES.with(|count| count.set(0));
+            assert_eq!(current(&path), floor(1));
+            assert_eq!(
+                RECORD_DECODES.with(|count| count.get()),
+                1,
+                "identical bytes cannot substitute for the current physical source generation"
+            );
+            assert_eq!(fs::read(saved).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn remembered_full_log_rotates_at_the_existing_record_boundary() {
+        let root = sinomo_testdir::TestDir::new("ack-floor-validation-rotation");
+        let path = sidecar(&root);
+        for sequence in 1..=MAX_LOG_RECORDS as u64 {
+            put(&path, &floor(sequence)).unwrap();
+        }
+        assert_eq!(current(&path), floor(MAX_LOG_RECORDS as u64));
+        put(&path, &floor(MAX_LOG_RECORDS as u64 + 1)).unwrap();
+        assert_eq!(current(&path), floor(MAX_LOG_RECORDS as u64 + 1));
+        let held = lock(&path, false).unwrap();
+        let loaded =
+            load::<DfsMetadataAuthorityAckFloor>(&path, &floor(1).shard_id, held.as_ref()).unwrap();
+        assert_eq!(loaded.records, 1);
+        assert_eq!(loaded.complete_len, loaded.file_len);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remembered_generation_alone_cannot_hide_changed_physical_bytes() {
+        let root = sinomo_testdir::TestDir::new("ack-floor-validation-rehash");
+        let path = sidecar(&root);
+        put(&path, &floor(1)).unwrap();
+        assert_eq!(current(&path), floor(1));
+        let held = lock(&path, false).unwrap();
+        let log_path = path.with_extension("slog");
+        let mut opened = File::open(&log_path).unwrap();
+        let pointer = read_optional(&path).unwrap();
+        let before = validation_cache::source::<DfsMetadataAuthorityAckFloor>(
+            &path,
+            &floor(1).shard_id,
+            held.as_ref(),
+            &opened,
+            pointer.as_deref(),
+        )
+        .unwrap()
+        .unwrap();
+        // A negative storage fault in this isolated, owned fixture deliberately
+        // changes bytes after the captured generation. No other writer exists.
+        let mut corrupt = fs::read(&log_path).unwrap();
+        *corrupt.last_mut().unwrap() ^= 1;
+        fs::write(&log_path, corrupt).unwrap();
+        assert!(
+            validation_cache::reuse::<DfsMetadataAuthorityAckFloor>(&before, &mut opened)
+                .unwrap()
+                .is_none(),
+            "the actual opened bytes must be compared even for an equal captured generation"
+        );
+        drop(held);
+        assert!(read::<DfsMetadataAuthorityAckFloor>(&path, &floor(1).shard_id).is_err());
     }
 }

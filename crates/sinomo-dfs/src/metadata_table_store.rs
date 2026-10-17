@@ -719,44 +719,62 @@ fn replay_metadata_table_batches(
     checkpoint_sequence: Option<u64>,
     tables: &mut DfsMetadataTables,
 ) -> Result<MetadataTableReplay> {
-    let mut offset = file
-        .stream_position()
-        .map_err(|source| MetadataBackendError::Io {
-            path: path.to_owned(),
-            source,
-        })?;
-    let mut through = None;
-    let mut prefix = None;
-    while let Some(record) = durable_file::read_length_prefixed_record(
-        file,
-        path,
-        durable_file::DurableRecordReadOptions::new(durable_file::DurableLengthEndian::Little),
-    )
-    .map_err(metadata_durable_file_error)?
-    {
-        let batch = decode_current_metadata_table_batch(&record.bytes, path)?;
-        let proof = batch
-            .prefix_proof
-            .as_ref()
-            .expect("validated current prefix");
-        if through.is_some_and(|old| batch.sequence <= old) {
-            return Err(MetadataBackendError::replica_diverged(
-                "table batch prefix/sequence is inconsistent".into(),
-            ));
+    crate::metadata_records::with_prepared_payload_validation(|| {
+        let mut offset = file
+            .stream_position()
+            .map_err(|source| MetadataBackendError::Io {
+                path: path.to_owned(),
+                source,
+            })?;
+        let mut through = None;
+        let mut prefix = None;
+        let span = tracing::Span::current();
+        span.record("starting_offset", offset);
+        if let Some(sequence) = checkpoint_sequence {
+            span.record("checkpoint_sequence", sequence);
         }
-        through = Some(batch.sequence);
-        prefix = Some(proof.clone());
-        if checkpoint_sequence.is_none_or(|checkpoint| batch.sequence > checkpoint) {
-            for op in batch.ops {
-                tables.apply_checked(op)?;
+        let mut decoded_batches = 0usize;
+        let mut applied_batches = 0usize;
+        while let Some(record) = durable_file::read_length_prefixed_record(
+            file,
+            path,
+            durable_file::DurableRecordReadOptions::new(durable_file::DurableLengthEndian::Little),
+        )
+        .map_err(metadata_durable_file_error)?
+        {
+            let batch = decode_current_metadata_table_batch(&record.bytes, path)?;
+            decoded_batches += 1;
+            let proof = batch
+                .prefix_proof
+                .as_ref()
+                .expect("validated current prefix");
+            if through.is_some_and(|old| batch.sequence <= old) {
+                return Err(MetadataBackendError::replica_diverged(
+                    "table batch prefix/sequence is inconsistent".into(),
+                ));
             }
+            through = Some(batch.sequence);
+            prefix = Some(proof.clone());
+            if checkpoint_sequence.is_none_or(|checkpoint| batch.sequence > checkpoint) {
+                for op in batch.ops {
+                    tables.apply_checked(op)?;
+                }
+                applied_batches += 1;
+            }
+            offset = record.record_end;
         }
-        offset = record.record_end;
-    }
-    Ok(MetadataTableReplay {
-        offset,
-        materialized_through_sequence: through,
-        prefix_proof: prefix,
+        span.record("ending_offset", offset);
+        span.record("decoded_batches", decoded_batches);
+        span.record("applied_batches", applied_batches);
+        if let Some(sequence) = through {
+            span.record("materialized_through_sequence", sequence);
+        }
+        span.record("outcome", "ok");
+        Ok(MetadataTableReplay {
+            offset,
+            materialized_through_sequence: through,
+            prefix_proof: prefix,
+        })
     })
 }
 
