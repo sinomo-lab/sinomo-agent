@@ -3497,6 +3497,10 @@ fn prepare_dfs_metadata_journal_publish_for_primary_shard(
             &shard_id,
             shard.epoch,
         ) {
+            tracing::trace!(target: "sinomo.dfs.perf", node = %local_node_id,
+                target = %target_node_id, shard = %shard_id.0, epoch = shard.epoch,
+                disposition = "topology-suppressed", rejection_code = ?suppression.code,
+                "metadata-publish-target-decision");
             outcomes.push(
                 DfsMetadataJournalReplicationOutcome::TopologyMismatchSuppressed {
                     target_node_id,
@@ -3509,6 +3513,10 @@ fn prepare_dfs_metadata_journal_publish_for_primary_shard(
         }
         let after_sequence = replication_cursor(backend, &target_node_id, &shard_id)?;
         if execution_exclusions.contains(&target_node_id) {
+            tracing::trace!(target: "sinomo.dfs.perf", node = %local_node_id,
+                target = %target_node_id, shard = %shard_id.0, epoch = shard.epoch,
+                after_sequence, disposition = "execution-excluded",
+                "metadata-publish-target-decision");
             outcomes.push(DfsMetadataJournalReplicationOutcome::MissingRoute {
                 target_node_id,
                 shard_id: shard_id.clone(),
@@ -3528,9 +3536,18 @@ fn prepare_dfs_metadata_journal_publish_for_primary_shard(
             &mut payloads_by_after_sequence,
         )? {
             DfsPreparedMetadataJournalTargetPublishResult::NoChanges { outcome } => {
+                tracing::trace!(target: "sinomo.dfs.perf", node = %local_node_id,
+                    shard = %shard_id.0, epoch = shard.epoch, disposition = "no-dispatch",
+                    outcome = ?outcome, "metadata-publish-target-decision");
                 outcomes.push(outcome);
             }
             DfsPreparedMetadataJournalTargetPublishResult::Publish { target } => {
+                tracing::trace!(target: "sinomo.dfs.perf", node = %local_node_id,
+                    target = %target.target_node_id, shard = %shard_id.0, epoch = shard.epoch,
+                    after_sequence = target.after_sequence,
+                    source_head = target.prepared_source_head, caught_up_probe = target.caught_up_probe,
+                    commands = target.commands.len(), disposition = "dispatch",
+                    "metadata-publish-target-decision");
                 targets.push(target);
             }
         }
@@ -8718,6 +8735,148 @@ mod cursor_update_tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn native_identical_snapshot_keeps_certified_journal_for_exact_replay() {
+        let (mut runtime, requester, shard) = crate::test_support::current_native_metadata_service(
+            "native-identical-snapshot-journal",
+            3,
+            "/",
+        )
+        .unwrap();
+        drop(requester);
+        let primary = shard.primary_node_id.clone();
+        let receiver = shard.replica_node_ids[0].clone();
+        let shard_id = DfsMetadataShardId::new(&shard.shard_id);
+        let mut source = runtime.metadata_primary_service("/").unwrap();
+        let scope = crate::DfsPreparedOperationScope {
+            file_system_id: shard.file_system_id.clone(),
+            shard_id: shard_id.clone(),
+            owner_epoch: shard.epoch,
+            operation_id: "metadata:snapshot-journal-original".into(),
+        };
+        let execution = source.acquire_prepared_execution(&scope).unwrap();
+        let before = source
+            .metadata_backend()
+            .unwrap()
+            .journal_last_sequence()
+            .unwrap();
+        let mut file_system = source
+            .metadata_backend()
+            .unwrap()
+            .get_file_system(&shard.file_system_id)
+            .unwrap()
+            .unwrap();
+        file_system.display_name = "snapshot must preserve an identical certified source".into();
+        source
+            .publish_metadata_effects_on_shard(
+                scope,
+                Vec::new(),
+                Vec::new(),
+                vec![crate::DfsPreparedMetadataEffect::PutFileSystem { file_system }],
+            )
+            .unwrap();
+        let batch = source
+            .metadata_backend()
+            .unwrap()
+            .journal_batch_for_shard_since_limited(
+                &shard_id,
+                before,
+                DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
+                DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(batch.entries.len(), 2);
+        let prepared =
+            prepare_dfs_metadata_journal_frame_batch(source.metadata_backend().unwrap(), &batch)
+                .unwrap();
+        let command = dfs_metadata_durable_journal_batch_command(
+            &primary,
+            &receiver,
+            &shard.file_system_id,
+            shard.epoch,
+            prepared,
+            false,
+        );
+        let response = crate::DfsMessageTransport::send_metadata_journal_batch_direct(
+            &mut source.transport,
+            &receiver,
+            &command,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(response.result, DfsMetadataJournalBatchResult::Applied);
+        let root = local_dfs_metadata_shard_path(runtime.data_dir(&receiver), &shard_id);
+        let before_frames = crate::metadata_journal::read_segmented_journal_frames_at_sequences(
+            &root,
+            &[before + 1, before + 2],
+        )
+        .unwrap()
+        .into_iter()
+        .map(|frame| frame.unwrap().exact_bytes().to_vec())
+        .collect::<Vec<_>>();
+        let snapshot = dfs_metadata_snapshot_install_command(
+            source.metadata_backend_mut().unwrap(),
+            &primary,
+            &receiver,
+            &shard.file_system_id,
+            shard.epoch,
+            &shard_id,
+            "actual same-cut snapshot retry".into(),
+        )
+        .unwrap();
+        let reply = runtime
+            .rpc_call(
+                &primary,
+                &receiver,
+                dfs_metadata_snapshot_install_rpc_call(&snapshot).unwrap(),
+                sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+            )
+            .unwrap();
+        let reply = decode_dfs_metadata_snapshot_install_rpc_response(&reply).unwrap();
+        assert!(
+            matches!(
+                reply.result,
+                DfsMetadataSnapshotInstallResult::Installed {
+                    archived_existing: false
+                }
+            ),
+            "an identical certified snapshot must preserve the existing physical journal: {reply:?}"
+        );
+        let after_frames = crate::metadata_journal::read_segmented_journal_frames_at_sequences(
+            &root,
+            &[before + 1, before + 2],
+        )
+        .unwrap()
+        .into_iter()
+        .map(|frame| frame.unwrap().exact_bytes().to_vec())
+        .collect::<Vec<_>>();
+        assert_eq!(after_frames, before_frames);
+        let replay = crate::DfsMessageTransport::send_metadata_journal_batch_direct(
+            &mut source.transport,
+            &receiver,
+            &command,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(replay.result, DfsMetadataJournalBatchResult::Applied);
+        assert_eq!(replay.applied_entries, 0);
+        assert_eq!(
+            replay.next_after_sequence,
+            command.batch.next_after_sequence
+        );
+        assert_eq!(
+            replay.verified_authority_probe_id,
+            command
+                .durable_replication
+                .as_ref()
+                .map(|proof| proof.confirmation_id.clone())
+        );
+        drop(execution);
+        drop(source);
+        runtime.close().unwrap();
     }
 
     #[test]

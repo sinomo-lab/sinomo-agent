@@ -1055,6 +1055,44 @@ impl LocalSobjMetadataBackend {
         }
         let tables = snapshot.state()?.tables.clone();
         require_version_pin_table_invariants(&tables)?;
+        // An identical snapshot is already installed when this held writer
+        // still owns a fully materialized certificate for the exact physical
+        // generation. Replacing it would unnecessarily retire journal bytes
+        // needed by an in-flight exact replay. Equality alone is insufficient:
+        // uncertainty, repair-only state, changed sources or a different cut
+        // retain the existing replacement/recovery path below.
+        if !self.replica_repair_only
+            && self.materialized_through_sequence == replayed_through_sequence
+            && self.next_sequence == replayed_through_sequence.saturating_add(1).max(1)
+            && self.prefix_proof.as_ref() == Some(&replacement_prefix_proof)
+            && self.tables == tables
+            && crate::metadata_journal::admission::current_owned_materialized_prefix(
+                &self.root,
+                &self.shard_id,
+            )?
+            .as_ref()
+                == Some(&replacement_prefix_proof)
+        {
+            // Preserve the snapshot RPC's progress-hint postconditions. These
+            // hints do not replace or advance the already-validated proof.
+            metadata_cursor::write_replay_cursor(
+                &self.root,
+                &DfsMetadataReplayCursor {
+                    shard_id: source_shard_id.clone(),
+                    last_sequence: replayed_through_sequence,
+                },
+            )?;
+            self.observe_resident_metadata_replay_cursor(
+                &source_shard_id,
+                replayed_through_sequence,
+            );
+            self.write_local_materialization_cursor(&DfsMetadataReplayCursor {
+                shard_id: self.shard_id.clone(),
+                last_sequence: replayed_through_sequence,
+            })?;
+            metadata_cursor::write_journal_head(&self.root, self.next_sequence)?;
+            return Ok(false);
+        }
         crate::metadata_journal::admission::invalidate(&self.root)?;
         let archived_existing = archive_metadata_backend_state(&self.root)?;
         create_dir_all(self.root.join("records"))?;

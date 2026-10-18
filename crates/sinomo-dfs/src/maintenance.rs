@@ -329,7 +329,7 @@ pub(crate) fn dfs_offline_node_ids_with_transport_availability(
     .unwrap_or_default()
     .into_iter()
     .filter_map(|row| {
-        (dfs_node_is_offline_for_maintenance(
+        let excluded = dfs_node_is_offline_for_maintenance(
             &row.availability,
             &connectivity,
             &state.local_node_id,
@@ -343,8 +343,16 @@ pub(crate) fn dfs_offline_node_ids_with_transport_availability(
                 &row.availability,
                 &row.member,
                 transport(&row.member.node_id),
-            )))
-        .then_some(row.member.node_id)
+            ));
+        if excluded {
+            // Record the actual advisory exclusion used by this plan. Do not
+            // issue another transport/health read or turn it into authority.
+            tracing::trace!(target: "sinomo.dfs.perf", node = %state.local_node_id,
+                target = %row.member.node_id, availability = ?row.availability,
+                member_state = ?row.member.state,
+                "metadata-maintenance-target-excluded");
+        }
+        excluded.then_some(row.member.node_id)
     })
     .collect()
 }
