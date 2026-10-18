@@ -458,6 +458,151 @@ fn placement_publication_stops_on_live_permit_after_definite_cas_rejection() {
 }
 
 #[test]
+fn native_configuration_update_rechecks_a_released_permit_hint_sync() {
+    assert_native_configuration_update_rechecks_a_released_permit_hint(false);
+}
+
+#[test]
+fn native_configuration_update_rechecks_a_released_permit_hint_async() {
+    assert_native_configuration_update_rechecks_a_released_permit_hint(true);
+}
+
+fn assert_native_configuration_update_rechecks_a_released_permit_hint(asynchronous: bool) {
+    let name = format!("native-released-permit-hint-{asynchronous}");
+    let (runtime, nodes) = crate::test_support::DfsTestRuntime::start_cluster(&name, 2).unwrap();
+    let owner = &nodes[0];
+    let mut policy =
+        crate::DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedConfirmed, 1, 1).unwrap();
+    policy.required_node_ids = vec![owner.clone()];
+    let job = runtime
+        .apply_placement_policy(
+            owner,
+            "/released-permit-hint",
+            DfsPlacementScope::Subtree,
+            policy,
+        )
+        .unwrap();
+    // Open both normal native services before retaining the owner's admission.
+    // An opener can itself need that admission for bounded preparation.
+    let mut producer = runtime.client(owner).unwrap();
+    let mut remote = runtime.client(&nodes[1]).unwrap();
+    let inner = remote.control_plane.take().unwrap();
+    drop(remote);
+    let mut kv = NativePlacementObservationKv {
+        inner,
+        observed: None,
+        publication_attempts: 0,
+        authoritative_refreshes: 0,
+    };
+    let config_key = file_system_config_key(&job.file_system_id);
+    let permit_key = placement_authority_permit_key(&job.file_system_id);
+    let config = kv
+        .inner
+        .get_authoritative_consistent(&[config_key.clone()])
+        .unwrap()[0]
+        .as_ref()
+        .unwrap()
+        .decode::<DfsFileSystemConfig>()
+        .unwrap();
+    let mut desired = config.clone();
+    desired.display_name = "current configuration after real permit release".into();
+    let scheduler =
+        crate::runtime_host::daemon_dfs_mutation_scheduler(runtime.data_dir(owner)).unwrap();
+    let admission = runtime.runtime_handle().block_on(async {
+        tokio::time::timeout(
+            sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+            scheduler.admit(&crate::DfsMessageExecutionScope::GlobalExclusive),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+    });
+    let (_, _, mut permit) = producer
+        .acquire_authoritative_placement_reconciliation(&job.file_system_id, &job.job_id, None)
+        .unwrap()
+        .expect("actual native current job permit");
+    let apply = |kv: &mut NativePlacementObservationKv| {
+        if asynchronous {
+            runtime.runtime_handle().block_on(async {
+                DfsControlPlaneAsyncStore::new(kv)
+                    .compare_and_put_file_system_config(Some(&config), &desired)
+                    .await
+            })
+        } else {
+            DfsControlPlaneStore::new(kv)
+                .compare_and_put_file_system_config(Some(&config), &desired)
+        }
+    };
+    let actual = kv
+        .inner
+        .get_authoritative_consistent(&[permit_key.clone()])
+        .unwrap()[0]
+        .clone()
+        .expect("actual native producer's immutable permit");
+    kv.observed = Some(BTreeMap::from([(permit_key.clone(), Some(actual.clone()))]));
+    assert!(
+        matches!(apply(&mut kv), Err(KvError::Busy { .. })),
+        "a live permit must still reject the configuration mutation"
+    );
+    assert_eq!(kv.publication_attempts, 0);
+    assert_eq!(
+        kv.inner
+            .get_authoritative_consistent(&[permit_key.clone()])
+            .unwrap()[0],
+        Some(actual.clone())
+    );
+    assert_eq!(
+        kv.inner
+            .get_authoritative_consistent(&[config_key.clone()])
+            .unwrap()[0]
+            .as_ref()
+            .unwrap()
+            .decode::<DfsFileSystemConfig>()
+            .unwrap(),
+        config
+    );
+    DfsControlPlaneStore::new(producer.control_plane.as_mut().unwrap().as_mut())
+        .release_placement_authority_permit(&mut permit)
+        .unwrap();
+    assert!(
+        kv.inner
+            .get_authoritative_consistent(&[permit_key.clone()])
+            .unwrap()[0]
+            .is_none()
+    );
+    // Retain only the exact previously observed DATA as a stale client hint.
+    // Authority reads and every transaction still use the real native CP;
+    // this wrapper cannot create, expire or release a holder.
+    kv.observed = Some(BTreeMap::from([(permit_key.clone(), Some(actual))]));
+    assert!(
+        apply(&mut kv).unwrap(),
+        "a released hint is not a live authority fence"
+    );
+    assert_eq!(kv.publication_attempts, 1);
+    assert_eq!(kv.authoritative_refreshes, 2);
+    assert_eq!(
+        kv.inner
+            .get_authoritative_consistent(&[config_key])
+            .unwrap()[0]
+            .as_ref()
+            .unwrap()
+            .decode::<DfsFileSystemConfig>()
+            .unwrap(),
+        desired
+    );
+    assert!(
+        kv.inner
+            .get_authoritative_consistent(&[permit_key])
+            .unwrap()[0]
+            .is_none()
+    );
+    drop(kv);
+    drop(producer);
+    drop(admission);
+    runtime.close().unwrap();
+}
+
+#[test]
 fn placement_publication_never_replays_an_ambiguous_applied_transaction() {
     for asynchronous in [false, true] {
         let (mut kv, desired) = RacingPlacementKv::new(Injection::AppliedThenLostReply);
