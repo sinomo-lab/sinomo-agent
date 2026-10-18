@@ -11261,11 +11261,18 @@ fn daemon_dfs_resident_mutation_lanes_are_scoped_by_exact_shard() {
                     added_exact,
                 );
             }
-            Err(DaemonDfsAuthorityPreExecutionError::AuthorityPreflightStale(_)) => {
+            Err(DaemonDfsAuthorityPreExecutionError::AuthorityPreflightStale(stale)) => {
                 // Match the normal pre-execution replan bound. No storage error
                 // is retried and no admission is retained through refresh.
                 drop(admission);
                 replans += 1;
+                if replans > 2 {
+                    eprintln!(
+                        "native exact-shard lane boundary: root={} replans={replans} stale={stale:?} storage_generation={}",
+                        data_dir.root().display(),
+                        preflight.authority.storage_generation(),
+                    );
+                }
                 assert!(replans <= 2, "normal pre-execution replan limit");
             }
             Err(DaemonDfsAuthorityPreExecutionError::Failed(error)) => {

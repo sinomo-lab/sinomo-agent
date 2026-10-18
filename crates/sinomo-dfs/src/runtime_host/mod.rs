@@ -2745,6 +2745,21 @@ pub(crate) fn register_daemon_dfs_data_owner_lock(
 }
 
 /// Observe the registered weak owner without acquiring or retaining its lease.
+#[cfg(test)]
+pub(crate) fn test_data_owner_weak_reference(
+    paths: &DfsRuntimePaths,
+) -> Option<Weak<DaemonDataOwnerLock>> {
+    // A Weak observation survives registry removal without retaining the OS
+    // owner or granting permission to reopen its DATA.
+    DAEMON_DFS_DATA_OWNER_LOCKS
+        .get()?
+        .lock()
+        .ok()?
+        .get(&paths.root)
+        .cloned()
+}
+
+/// Observe the registered weak owner without acquiring or retaining its lease.
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) fn trace_dfs_data_owner_references(paths: &DfsRuntimePaths, checkpoint: &str) {
     if !tracing::enabled!(target: "sinomo.dfs.reconciliation", tracing::Level::TRACE) {

@@ -444,8 +444,20 @@ fn native_namespace_request_replay_survives_actual_primary_restart() {
         .unwrap();
     assert_eq!(moved.object_id, source.object_id);
     drop(writer);
+    let owner_paths = crate::runtime_host::DfsRuntimePaths::new(runtime.data_dir(&primary));
+    let owner_weak = crate::runtime_host::test_data_owner_weak_reference(&owner_paths);
+    let owner_before_stop = owner_weak.as_ref().map(std::sync::Weak::strong_count);
     runtime.stop_node(&primary).unwrap();
-    runtime.reopen_node(primary).unwrap();
+    let owner_after_stop = owner_weak.as_ref().map(std::sync::Weak::strong_count);
+    let reopened = runtime.reopen_node(primary);
+    if reopened.is_err() {
+        eprintln!(
+            "native namespace reopen boundary: root={} owner_before_stop={owner_before_stop:?} owner_after_stop={owner_after_stop:?} owner_at_failure={:?} result={reopened:?}",
+            owner_paths.root.display(),
+            owner_weak.as_ref().map(std::sync::Weak::strong_count),
+        );
+    }
+    reopened.unwrap();
     let mut reader = runtime.client(&requester).unwrap();
     let replay = reader
         .posix_rename_with_operation_id(from, to, &operation)

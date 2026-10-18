@@ -583,6 +583,19 @@ fn provider_delta_after_first_fence(changed_attempts: usize) {
             result.is_err(),
             "continuous provider churn must exhaust the existing replan bound"
         );
+        if seen.selections.load(Ordering::SeqCst) != 3 {
+            eprintln!(
+                "native provider churn boundary: root={} result={result:?} selections={} refreshes={} executions={} completed={} prefix_reads={} generation={} storage_generation={}",
+                f.data_dir.root().display(),
+                seen.selections.load(Ordering::SeqCst),
+                seen.refreshes.load(Ordering::SeqCst),
+                seen.executions.load(Ordering::SeqCst),
+                seen.completed_executions.load(Ordering::SeqCst),
+                seen.native_prefix_reads.load(Ordering::SeqCst),
+                f._authority.generation(),
+                f._authority.storage_generation(),
+            );
+        }
         assert_eq!(seen.selections.load(Ordering::SeqCst), 3);
         assert_eq!(seen.refreshes.load(Ordering::SeqCst), 2);
         assert_eq!(seen.executions.load(Ordering::SeqCst), 0);

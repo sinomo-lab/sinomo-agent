@@ -2828,12 +2828,6 @@ mod filesystem_preparation_recovery_tests {
             })
             .collect::<Vec<_>>();
         let mut owner = native.metadata_primary_service(path).unwrap();
-        let object = owner
-            .metadata_backend()
-            .unwrap()
-            .get_object(&stat.object_id)
-            .unwrap()
-            .unwrap();
         let intent = crate::DistributedWriteIntent {
             publication: Default::default(),
             intent_id: format!(
@@ -2863,6 +2857,18 @@ mod filesystem_preparation_recovery_tests {
         // Retain the genuine producer's admission while arranging its failed
         // publication and exact retry. The actual native replicas supply ACKs.
         let execution = owner.acquire_prepared_execution(&scope).unwrap();
+        // Ordinary repair can publish a real receipt between the original
+        // write and this producer's admission. Compare against the exact
+        // current cut under admission, not the opener's older cached object.
+        let backend = owner.metadata_backend_mut().unwrap();
+        backend
+            .begin_consistent_read_snapshot_for_path(&stat.file_system_id, path)
+            .unwrap();
+        let object = backend.get_object(&stat.object_id).unwrap().unwrap();
+        backend.end_consistent_read_snapshot_for_path(&stat.file_system_id, path);
+        assert_eq!(object.version, stat.version);
+        assert_eq!(object.content_hash, stat.content_hash);
+        assert_eq!(object.path, stat.path);
         let unavailable = shard.replica_node_ids[0].clone();
         for route in [
             crate::DFS_METADATA_JOURNAL_BATCH_ROUTE,
