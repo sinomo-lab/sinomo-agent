@@ -1473,6 +1473,40 @@ fn metadata_authority_probe_rejects_a_gap_before_the_hidden_prepare() {
         receiver.metadata_replay_cursor(&shard_id).unwrap(),
         base_head
     );
+    // The sender can now know this complete durable cut while the ordinary
+    // materializer is still paused. Confirmation-only replay must validate
+    // the same original body and prefix through the real authenticated route.
+    let mut confirmation = command.clone();
+    confirmation.request_id = "native-current-cut-confirmation-after-deferred-ingest".into();
+    confirmation.batch.journal_frames.clear();
+    confirmation.authority_probe.as_mut().unwrap().probe_id =
+        "native-current-cut-fresh-confirmation".into();
+    let confirmed = call(&confirmation);
+    assert_eq!(
+        confirmed.result,
+        DfsMetadataJournalBatchResult::Applied,
+        "already durable original/cut confirmation: {confirmed:?}; probe={:?}",
+        confirmation.authority_probe,
+    );
+    assert_eq!(
+        confirmed.verified_authority_probe_id,
+        crate::service_replica::metadata_authority_probe_confirmation_id(
+            confirmation.authority_probe.as_ref().unwrap()
+        )
+    );
+    assert_eq!(
+        confirmed.applied_entries, 0,
+        "confirmation appends no journal frame"
+    );
+    assert_eq!(
+        receiver
+            .metadata_authority_ack_floor(&shard_id)
+            .unwrap()
+            .unwrap()
+            .journal_sequence,
+        later.prepare_sequence,
+        "confirmation preserves the exact acknowledged current cut"
+    );
     pause.release();
     drop(pause);
     dispatch.close();

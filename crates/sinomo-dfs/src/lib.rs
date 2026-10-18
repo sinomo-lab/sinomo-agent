@@ -46,6 +46,7 @@ mod identity;
 mod intent;
 mod lifecycle;
 mod repair_deadlines;
+mod stat_projection;
 pub use lifecycle::*;
 mod local_state;
 mod maintenance;
@@ -94,6 +95,8 @@ mod metadata_snapshot_image;
 pub use metadata_snapshot_image::DfsMetadataSnapshotImage;
 #[cfg(any(test, feature = "test-support"))]
 mod native_shard_trace;
+#[cfg(test)]
+mod native_boundary_diagnostics;
 #[cfg(any(test, feature = "test-support"))]
 pub use metadata_backend::prepared_operation::NativeHeldMetadataSnapshotV1;
 #[cfg(any(test, feature = "test-support"))]
@@ -927,6 +930,10 @@ pub use metadata_records::{
     DfsRetainedRevisionDescriptor, DfsRevisionMetadataDescriptor, DfsRevisionMetadataExpectation,
 };
 pub use service_file_restore::VerifiedContentInput;
+pub use stat_projection::{
+    DfsStatPathRequest, DfsStatPathView, DfsStatProjectionCursor, DfsStatProjectionPage,
+    DfsStatProjectionRequest, DfsStatShardPrefix,
+};
 
 pub use service_restore_jobs::{validate_content_copy_job, validate_content_copy_job_receipt};
 pub use sinomo_api::dfs::{DfsRetainedContentPublication, validate_metadata_namespace};

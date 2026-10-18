@@ -460,6 +460,23 @@ impl LocalSobjMetadataBackend {
                 );
                 observation.complete();
             }
+            #[cfg(test)]
+            if crate::native_boundary_diagnostics::selected_operation(
+                &self.root,
+                &digest.operation_id,
+            ) {
+                crate::native_boundary_diagnostics::record(
+                    &self.root,
+                    "kernel-committed-replay",
+                    || {
+                        serde_json::json!({
+                            "digest": digest, "status": record.status, "committed_entry": record.committed_entry,
+                            "instance_epoch": self.instance_authority_epoch, "guard_consumed": true,
+                        })
+                    },
+                    true,
+                );
+            }
             return Ok(crate::metadata_records::DfsPreparedOperationCommitResult {
                 entry: entry.journal_entry(),
                 published: false,
@@ -522,6 +539,21 @@ impl LocalSobjMetadataBackend {
         }
         let mut rollback = Some(rollback);
         let (entry, _) = self.write_journal_frame_unlocked(&frame, &mut rollback)?;
+        #[cfg(test)]
+        if crate::native_boundary_diagnostics::selected_operation(&self.root, &digest.operation_id)
+        {
+            crate::native_boundary_diagnostics::record(
+                &self.root,
+                "kernel-commit-durable",
+                || {
+                    serde_json::json!({
+                        "digest": digest, "entry": entry, "instance_epoch": self.instance_authority_epoch,
+                    })
+                },
+                digest.operation_id == "v7-host-bind"
+                    || digest.operation_id.starts_with("filesystem:"),
+            );
+        }
         #[cfg(any(test, feature = "test-support"))]
         if let (Some(observation), Some(before)) = (&mut native_observation, &native_before) {
             observation.observe(

@@ -232,8 +232,27 @@ pub struct StageExchangeCapture {
     pub dropped_count: usize,
 }
 
+#[derive(Clone, Debug)]
+pub enum StatReplyFault {
+    Unsupported,
+    Incomplete,
+    WrongRequest,
+    WrongEpoch,
+    WrongSource,
+    WrongTarget,
+    MalformedPrefix,
+    StalePrefix,
+    /// Alter only an actual canonical projection page, after its path view.
+    SameVersionHashChanged,
+}
+
 #[derive(Clone)]
 pub enum FaultAction {
+    /// Negative-only mutation of a real completed stat query response.
+    AlterStatReplyAfterDispatch {
+        change: StatReplyFault,
+        captured: Arc<Mutex<Vec<crate::DfsRoutedMessage>>>,
+    },
     PauseBeforeDispatch(Arc<Semaphore>),
     /// Hold the actual receiver's response after its native execution completes.
     PauseAfterDispatch(Arc<Semaphore>),
@@ -386,6 +405,10 @@ impl Fabric {
                     .is_none_or(|origin| origin == observation.origin)
                 && rule.call_id.is_none_or(|id| id == observation.call_id)
                 && match &rule.action {
+                    // The ordinary request value may be streamed. Select this
+                    // negative fault from the real completed typed reply,
+                    // without consuming or reconstructing the request body.
+                    FaultAction::AlterStatReplyAfterDispatch { .. } => false,
                     FaultAction::CaptureTransferReplyAndLoseAfterDispatch { intent_id, .. } => {
                         intent_id.as_ref().is_none_or(|expected| {
                             observation.dfs_intent_id.as_ref() == Some(expected)
@@ -988,6 +1011,170 @@ impl Carrier {
                 }
             }
             drop(records);
+            let mut rewritten =
+                ObjectRpcOutgoingResponse::encode_value(outgoing.response.route.clone(), response)?;
+            rewritten.response.metadata = std::mem::take(&mut outgoing.response.metadata);
+            outgoing = rewritten;
+        }
+        let stat_fault = if observation.route == crate::DFS_DATA_NAMESPACE_ROUTE {
+            self.fabric
+                .faults
+                .lock()
+                .unwrap()
+                .iter()
+                .enumerate()
+                .find(|(_, rule)| {
+                    matches!(rule.action, FaultAction::AlterStatReplyAfterDispatch { .. })
+                        && rule
+                            .source
+                            .as_ref()
+                            .is_none_or(|id| id == &observation.source)
+                        && rule
+                            .target
+                            .as_ref()
+                            .is_none_or(|id| id == &observation.target)
+                        && rule
+                            .route
+                            .as_ref()
+                            .is_none_or(|route| route == &observation.route)
+                        && rule
+                            .origin
+                            .is_none_or(|origin| origin == observation.origin)
+                        && rule.call_id.is_none_or(|id| id == observation.call_id)
+                })
+                .map(|(index, rule)| (index, rule.action.clone()))
+        } else {
+            None
+        };
+        if let Some((rule_index, FaultAction::AlterStatReplyAfterDispatch { change, captured })) =
+            stat_fault
+        {
+            let value = if outgoing.response.body.is_empty() {
+                outgoing.body.collect_to_vec(64 * 1024).await?
+            } else {
+                outgoing.response.body.clone()
+            };
+            let mut response: crate::DfsMessageResponse = sinomo_object_serde::from_bytes(&value)
+                .map_err(|e| {
+                NetworkError::Serialization {
+                    detail: e.to_string(),
+                }
+            })?;
+            for routed in &mut response.outbound_messages {
+                let crate::DfsNetworkMessage::NamespaceResponse(reply) = &mut routed.message else {
+                    continue;
+                };
+                let Some(crate::DfsPosixCoordinationResult::MetadataQuery(query)) =
+                    &mut reply.posix_coordination_result
+                else {
+                    continue;
+                };
+                if !matches!(
+                    query.result,
+                    crate::DfsMetadataQueryResult::StatProjectionV1 { .. }
+                        | crate::DfsMetadataQueryResult::StatAtPathV1 { .. }
+                ) {
+                    continue;
+                }
+                if matches!(change, StatReplyFault::SameVersionHashChanged)
+                    && !matches!(&query.result,
+                        crate::DfsMetadataQueryResult::StatProjectionV1 { page }
+                            if page.object.is_some())
+                {
+                    continue;
+                }
+                {
+                    let mut rules = self.fabric.faults.lock().unwrap();
+                    let rule = &mut rules[rule_index];
+                    // Bind to this actual call. Later collection/fence calls
+                    // must execute normally so their checks, not fault-budget
+                    // exhaustion, establish rejection of stale evidence.
+                    rule.call_id.get_or_insert(observation.call_id);
+                    if rule.remaining_hits == 0 {
+                        self.fabric
+                            .exhausted_budgets
+                            .fetch_add(1, Ordering::Relaxed);
+                        return Err(NetworkError::Io {
+                            operation: "bounded stat negative reply".into(),
+                            detail: "stat negative reply fault budget exhausted".into(),
+                        });
+                    }
+                    rule.remaining_hits -= 1;
+                }
+                // Save the actual receiver-produced response before the negative edit.
+                captured.lock().unwrap().push(crate::DfsRoutedMessage {
+                    source_node_id: routed.source_node_id.clone(),
+                    target_node_id: routed.target_node_id.clone(),
+                    frame_id: routed.frame_id,
+                    message_id: routed.message_id,
+                    message: crate::DfsNetworkMessage::NamespaceResponse(reply.clone()),
+                });
+                let Some(crate::DfsPosixCoordinationResult::MetadataQuery(query)) =
+                    &mut reply.posix_coordination_result
+                else {
+                    unreachable!()
+                };
+                match &change {
+                    StatReplyFault::Unsupported => {
+                        query.result = crate::DfsMetadataQueryResult::CurrentObject { object: None }
+                    }
+                    StatReplyFault::WrongEpoch => query.epoch += 1,
+                    StatReplyFault::WrongSource => {
+                        routed.source_node_id =
+                            NodeId::from_legacy_named("forged-stat-source").unwrap()
+                    }
+                    StatReplyFault::WrongTarget => {
+                        routed.target_node_id =
+                            NodeId::from_legacy_named("forged-stat-target").unwrap()
+                    }
+                    _ => {
+                        if let crate::DfsMetadataQueryResult::StatAtPathV1 { view } =
+                            &mut query.result
+                        {
+                            match &change {
+                                StatReplyFault::Incomplete => view.complete = !view.complete,
+                                StatReplyFault::WrongRequest => {
+                                    view.request.read_id = crate::DfsVersion::generate().to_string()
+                                }
+                                StatReplyFault::MalformedPrefix => {
+                                    view.prefixes[0].prefix.digest = "invalid".into()
+                                }
+                                StatReplyFault::StalePrefix => {
+                                    view.prefixes[0].prefix.journal_sequence += 1
+                                }
+                                _ => unreachable!(),
+                            }
+                            continue;
+                        }
+                        let crate::DfsMetadataQueryResult::StatProjectionV1 { page } =
+                            &mut query.result
+                        else {
+                            unreachable!()
+                        };
+                        match &change {
+                            StatReplyFault::Incomplete => page.complete = !page.complete,
+                            StatReplyFault::WrongRequest => {
+                                page.request.object_version = crate::DfsVersion::generate()
+                            }
+                            StatReplyFault::MalformedPrefix => {
+                                page.prefix.digest = "invalid".into()
+                            }
+                            StatReplyFault::StalePrefix => {
+                                page.prefix.journal_sequence =
+                                    page.prefix.journal_sequence.saturating_add(1)
+                            }
+                            StatReplyFault::SameVersionHashChanged => {
+                                let object = page.object.as_mut().expect("selected canonical page");
+                                object.content_hash = Some(format!(
+                                    "blake3:{}",
+                                    blake3::hash(b"negative stat same-version hash corruption")
+                                ));
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                }
+            }
             let mut rewritten =
                 ObjectRpcOutgoingResponse::encode_value(outgoing.response.route.clone(), response)?;
             rewritten.response.metadata = std::mem::take(&mut outgoing.response.metadata);

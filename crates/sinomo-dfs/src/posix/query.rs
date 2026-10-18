@@ -274,32 +274,31 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_stat_distributed(&mut self, path: &str) -> Result<DfsStat> {
+        self.with_stat_deadline(|service| service.posix_stat_authoritative(path))
+    }
+
+    fn posix_stat_authoritative(&mut self, path: &str) -> Result<DfsStat> {
         let _namespace_plan = self.namespace_execution.begin_planning();
         let path = self.resolve_posix_dot_components_distributed(path)?;
-        self.with_local_primary_metadata_read_snapshot(&path, |service, shard_snapshot| {
-            service.with_metadata_lookup_cache_mut(|service| {
-                service.check_cancelled("distributed stat")?;
-                service.ensure_distributed_read_path_not_in_cross_shard_flight(
-                    &sifs_file_system_id(),
-                    &path,
-                )?;
-                let path = service.resolve_existing_posix_path_distributed(&path, true)?;
-                service.ensure_distributed_read_path_not_in_cross_shard_flight(
-                    &sifs_file_system_id(),
-                    &path,
-                )?;
-                let object = service
-                    .lookup_sifs_path_direct_distributed_synced_from_snapshot(
+        let (path, snapshot) =
+            self.with_local_primary_stat_read_snapshot(&path, |service, shard_snapshot| {
+                service.with_metadata_lookup_cache_mut(|service| {
+                    service.check_cancelled("distributed stat")?;
+                    service.ensure_distributed_read_path_not_in_cross_shard_flight(
+                        &sifs_file_system_id(),
                         &path,
-                        shard_snapshot,
-                    )?
-                    .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
-                if object.kind == DfsObjectKind::Tombstone {
-                    return Err(DfsPosixError::NotFound { path });
-                }
-                service.stat_object_for_path(&object, &path)
-            })
-        })
+                    )?;
+                    let path = service.resolve_existing_posix_path_distributed(&path, true)?;
+                    service.ensure_distributed_read_path_not_in_cross_shard_flight(
+                        &sifs_file_system_id(),
+                        &path,
+                    )?;
+                    Ok((path, shard_snapshot.map(<[_]>::to_vec)))
+                })
+            })?;
+        // Release lookup snapshots before collecting and fencing authority
+        // views, so a local authority revalidation cannot reuse a pinned past.
+        self.stat_path_from_authorities(&path, snapshot.as_deref())
     }
 
     pub(crate) fn file_history_capture_object(
@@ -354,19 +353,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_lstat_distributed(&mut self, path: &str) -> Result<DfsStat> {
+        self.with_stat_deadline(|service| service.posix_lstat_authoritative(path))
+    }
+
+    fn posix_lstat_authoritative(&mut self, path: &str) -> Result<DfsStat> {
         let _namespace_plan = self.namespace_execution.begin_planning();
         let requested = self.resolve_posix_dot_components_distributed(path)?;
         self.ensure_distributed_read_path_not_in_cross_shard_flight(
             &sifs_file_system_id(),
             &requested,
         )?;
-        let (path, object) = self.lookup_sifs_path_distributed_synced(path, false)?;
+        let path = self.resolve_existing_posix_path_distributed(&requested, false)?;
+        let snapshot = self.refresh_sifs_metadata_shards()?;
         self.ensure_distributed_read_path_not_in_cross_shard_flight(&sifs_file_system_id(), &path)?;
-        let object = object.ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
-        if object.kind == DfsObjectKind::Tombstone {
-            return Err(DfsPosixError::NotFound { path });
-        }
-        self.stat_object_for_path(&object, &path)
+        self.stat_path_from_authorities(&path, snapshot.as_deref())
     }
 
     /// Inspect the final DFS namespace record without resolving either a

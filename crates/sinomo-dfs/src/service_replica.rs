@@ -225,6 +225,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             probe_timeout,
         )?;
         let trace_probe_ms = probe_started.elapsed().as_millis();
+        #[cfg(test)]
+        if let Some((root, _)) = self.native_publication_owner_for_observation() {
+            if matches!(operation, DfsMetadataAuthorityOperation::PreparedOperation { operation_id, .. }
+                if crate::native_boundary_diagnostics::selected_operation(&root, operation_id))
+            {
+                crate::native_boundary_diagnostics::record(
+                    &root,
+                    "authorization-participants",
+                    || {
+                        serde_json::json!({
+                            "source": self.node_id, "operation": operation, "expected_shard": shard,
+                            "required": required_node_ids, "acknowledged": acknowledged_node_ids,
+                            "probe_timeout_ms": probe_timeout.as_millis(), "probe_elapsed_ms": trace_probe_ms,
+                        })
+                    },
+                    false,
+                );
+            }
+        }
         let trace_acknowledged = acknowledged_node_ids.len();
         dfs_perf_trace(format_args!(
             "metadata_authority action=probe shard={} epoch={} prepare={} acknowledgements={} required={} timeout_ms={}",
@@ -335,6 +354,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         operation_deadline: Instant,
         timeout: Duration,
     ) -> Result<BTreeSet<NodeId>, DfsError> {
+        #[cfg(test)]
+        let diagnostic_root = self.native_publication_owner_for_observation().map(|(root, _)| root)
+            .filter(|root| crate::native_boundary_diagnostics::enabled(root)
+                && matches!(operation, DfsMetadataAuthorityOperation::PreparedOperation { operation_id, .. }
+                    if crate::native_boundary_diagnostics::selected_operation(root, operation_id)));
+        #[cfg(test)]
+        let mut diagnostic_groups = Vec::new();
+        #[cfg(test)]
+        let mut diagnostic_unavailable = Vec::new();
+        #[cfg(test)]
+        let mut diagnostic_direct = None;
+        #[cfg(test)]
+        let mut diagnostic_routed = Vec::new();
         let mut request_ids = Vec::with_capacity(targets.len());
         let mut request_targets = Vec::with_capacity(targets.len());
         let mut acknowledged_node_ids = BTreeSet::from([self.node_id.clone()]);
@@ -407,6 +439,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     return Ok(acknowledged_node_ids);
                 }
                 let Some(target_batch) = target_batch else {
+                    #[cfg(test)]
+                    if diagnostic_root.is_some() {
+                        diagnostic_unavailable
+                            .push((target_node_ids.clone(), replicated_through_sequence));
+                    }
                     // A member farther behind than one bounded catch-up batch
                     // cannot count toward this operation's full-shard proof.
                     // Background replication can close the gap independently.
@@ -460,12 +497,32 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             // catch-up value. The duration-aware transport keeps that local
             // work under `operation_deadline` and begins this shorter budget
             // only after encoding, immediately before peer fan-out.
-            match self
+            #[cfg(test)]
+            if diagnostic_root.is_some() {
+                diagnostic_groups = authority_groups
+                    .iter()
+                    .map(|group| {
+                        (
+                            group.target_node_ids.clone(),
+                            group.command.request_id.clone(),
+                            group.command.authority_probe.clone(),
+                            group.command.batch.next_after_sequence,
+                            group.command.batch.journal_frames.len(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+            }
+            let direct_result = self
                 .transport
                 .send_grouped_metadata_journal_batches_direct_with_response_timeout(
                     &authority_groups,
                     timeout,
-                ) {
+                );
+            #[cfg(test)]
+            if diagnostic_root.is_some() {
+                diagnostic_direct = Some(direct_result.clone());
+            }
+            match direct_result {
                 Ok(Some(responses)) => {
                     let mut cursors = Vec::new();
                     for group in &authority_groups {
@@ -596,10 +653,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             expected_next_after_sequence: command.batch.next_after_sequence,
                         },
                     );
-                    let sent = match self.send_dfs_message_if_routable(
+                    let sent_result = self.send_dfs_message_if_routable(
                         &target_node_id,
                         DfsNetworkMessage::MetadataJournalBatch(command),
-                    ) {
+                    );
+                    #[cfg(test)]
+                    if diagnostic_root.is_some() {
+                        diagnostic_routed.push((
+                            target_node_id.clone(),
+                            request_id.clone(),
+                            sent_result.clone(),
+                        ));
+                    }
+                    let sent = match sent_result {
                         Ok(sent) => sent,
                         Err(DfsError::Network { .. } | DfsError::NetworkDelivery { .. }) => false,
                         Err(error) => return Err(error),
@@ -660,6 +726,27 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             self.transport.set_operation_deadline(previous_deadline);
             routed_result
         })();
+        #[cfg(test)]
+        if let Some(root) = &diagnostic_root {
+            crate::native_boundary_diagnostics::record(
+                root,
+                "participant-final-result",
+                || {
+                    serde_json::json!({
+                        "operation": operation, "result": format!("{result:?}"),
+                        "original_direct_groups": diagnostic_groups,
+                        "unavailable_batches": diagnostic_unavailable,
+                        "actual_direct_result": format!("{diagnostic_direct:?}"),
+                        "actual_routed_sends": format!("{diagnostic_routed:?}"),
+                        "requests": request_targets.iter().map(|(id, target)| serde_json::json!({
+                            "request_id": id, "target": target, "accepted": self.replication.metadata_authority_probe_results.get(id),
+                        })).collect::<Vec<_>>(),
+                        "remaining_operation_ms": operation_deadline.saturating_duration_since(Instant::now()).as_millis(),
+                    })
+                },
+                false,
+            );
+        }
         self.clear_metadata_authority_probe_requests(&request_ids);
         result
     }

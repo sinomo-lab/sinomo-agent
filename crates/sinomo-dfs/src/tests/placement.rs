@@ -757,6 +757,11 @@ fn mounted_read_policy_does_not_escalate_lookup_failure_to_sync_path() {
             let label = match &namespace.operation {
                 DfsNamespaceOperation::LookupPath { .. } => "lookup-path",
                 DfsNamespaceOperation::SyncPath { .. } => "sync-path",
+                DfsNamespaceOperation::MetadataQuery { query }
+                    if matches!(query.selection, DfsMetadataSelection::StatAtPathV1 { .. }) =>
+                {
+                    "stat-query"
+                }
                 operation => {
                     return Err(DfsPeerTransportError::new(format!(
                         "unexpected mounted-read namespace operation: {operation:?}"
@@ -850,7 +855,7 @@ fn mounted_read_policy_does_not_escalate_lookup_failure_to_sync_path() {
         read_service(&root, "ordinary", &local_node, &primary_node, control_plane);
     assert!(
         ordinary
-            .posix_stat_distributed("/services/missing.txt")
+            .posix_read_file_distributed("/services/missing.txt")
             .is_err()
     );
     assert_eq!(
@@ -870,7 +875,7 @@ fn mounted_read_policy_does_not_escalate_lookup_failure_to_sync_path() {
     mounted.disable_implicit_read_replica_ingest();
     assert!(
         mounted
-            .posix_stat_distributed("/services/missing.txt")
+            .posix_read_file_distributed("/services/missing.txt")
             .is_err()
     );
     assert_eq!(
@@ -879,6 +884,21 @@ fn mounted_read_policy_does_not_escalate_lookup_failure_to_sync_path() {
         "a mounted read must not turn an authority lookup failure into an unowned durable SyncPath apply"
     );
 
+    // Keep both original lookup-policy assertions above. Authoritative stat is
+    // a different approved contract: even the compatibility caller must not
+    // ingest a journal to manufacture a complete stat after authority failure.
+    for (service, calls) in [
+        (&mut ordinary, &ordinary_calls),
+        (&mut mounted, &mounted_calls),
+    ] {
+        calls.lock().unwrap().clear();
+        assert!(
+            service
+                .posix_stat_distributed("/services/missing.txt")
+                .is_err()
+        );
+        assert_eq!(calls.lock().unwrap().as_slice(), ["stat-query"]);
+    }
     drop((ordinary, mounted));
     runtime.close().unwrap();
     std::fs::remove_dir_all(root).ok();

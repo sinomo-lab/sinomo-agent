@@ -3870,6 +3870,39 @@ fn same_node_distinct_shard_hardlink_alias_uses_durable_saga_and_survives_cold_r
             DfsNamespaceOperation::LookupPath { .. }
             | DfsNamespaceOperation::LookupPaths { .. }
             | DfsNamespaceOperation::PollNamespaceChanges { .. } => owner_read = true,
+            DfsNamespaceOperation::MetadataQuery { query }
+                if matches!(query.selection, DfsMetadataSelection::StatAtPathV1 { .. }) =>
+            {
+                let DfsMetadataSelection::StatAtPathV1 { request: stat } = &query.selection else {
+                    unreachable!()
+                };
+                assert_eq!(query.file_system_id, request.file_system_id);
+                assert!(!stat.read_id.is_empty());
+                assert_eq!(
+                    stat.catalog_digest,
+                    crate::stat_projection::stat_catalog_digest(&configs).unwrap()
+                );
+                assert_eq!(request.authority_shards, configs);
+                assert!(
+                    request
+                        .authority_shards
+                        .iter()
+                        .all(|shard| shard.primary_node_id == node)
+                );
+                assert!(!request.include_metadata_journal_batches);
+                assert!(request.metadata_journal_after_sequences.is_empty());
+                let selected =
+                    crate::select_metadata_shard_config_for_path_strict_default_sifs_split(
+                        &query.file_system_id,
+                        &configs,
+                        &stat.path,
+                    )
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(query.shard_id.0, selected.shard_id);
+                assert_eq!(query.epoch, selected.epoch);
+                owner_read = true;
+            }
             DfsNamespaceOperation::Hardlink {
                 existing_path,
                 link_path,

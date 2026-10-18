@@ -23,6 +23,7 @@ mod namespace_ops;
 mod query;
 mod read;
 mod routing;
+mod stat;
 pub(crate) mod sync;
 
 #[cfg(test)]
@@ -229,7 +230,7 @@ const POSIX_REMOTE_READ_IDLE_WAIT_INITIAL: Duration = Duration::from_millis(2);
 const POSIX_BULK_PARENT_RETRY_ATTEMPTS: usize = 3;
 /// Follow-up sync rounds a routed-operation wrapper performs when bounded
 /// response replay has not yet surfaced the mutation locally.
-const POSIX_ROUTED_SYNC_RETRY_ROUNDS: usize = 4;
+pub(crate) const POSIX_ROUTED_SYNC_RETRY_ROUNDS: usize = 4;
 /// Whole-file POSIX writes are blind overwrites, not user-supplied CAS writes.
 /// If another service instance is already committing, wait for that intent to
 /// settle, refresh from the backend, and retry against the new current version.

@@ -423,6 +423,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         link_path: &str,
     ) -> posix_model::Result<()> {
         if self.routed_namespace_settle_depth >= DFS_MAX_NESTED_NAMESPACE_COORDINATION_DEPTH {
+            #[cfg(test)]
+            if let Some((root, _)) = self.native_publication_owner_for_observation() {
+                crate::native_boundary_diagnostics::record(
+                    &root,
+                    "hardlink-coordination-depth",
+                    || {
+                        serde_json::json!({
+                            "node": self.node_id, "existing_path": existing_path, "link_path": link_path,
+                            "depth": self.routed_namespace_settle_depth,
+                        })
+                    },
+                    true,
+                );
+            }
             return Err(posix_model::DfsPosixError::Dfs(DfsError::Busy {
                 path: existing_path.to_string(),
             }));
@@ -549,6 +563,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .cross_shard_namespace_locks
             .blocks(file_system_id, &normalized);
         if blocked {
+            #[cfg(test)]
+            if let Some((root, _)) = self.native_publication_owner_for_observation() {
+                crate::native_boundary_diagnostics::record(
+                    &root,
+                    "namespace-path-blocked",
+                    || {
+                        serde_json::json!({
+                            "node": self.node_id, "file_system_id": file_system_id, "path": path,
+                            "locks": format!("{:?}", self.cross_shard_namespace_locks),
+                        })
+                    },
+                    true,
+                );
+            }
             return Err(DfsError::Busy {
                 path: path.to_string(),
             });

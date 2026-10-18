@@ -2979,8 +2979,24 @@ mod metadata_publish_membership_tests {
                         && fact["response"]["next_after_sequence"].as_u64()
                             == Some(expected_prefix.journal_sequence)
                         && fact["response"]["result"] == "applied"
-                })
-                .expect("the actual source accepted this target's exact final prefix ACK");
+                });
+            if returned.is_none() {
+                let artifact = data_dir.root().join("missing-final-ack-observation.json");
+                std::fs::write(
+                    &artifact,
+                    serde_json::to_vec_pretty(&serde_json::json!({
+                        "expected_prefix": &expected_prefix,
+                        "missing_target": target,
+                        "native_observations": &observed,
+                        "maintenance_outcome": format!("{:?}", tick.outcome),
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+                eprintln!("NATIVE_FINAL_ACK_FAILURE {}", artifact.display());
+            }
+            let returned =
+                returned.expect("the actual source accepted this target's exact final prefix ACK");
             let receiver = observed.get(target).unwrap();
             assert!(
                 receiver["boundary_packets"]
@@ -6476,13 +6492,21 @@ pub fn process_dfs_metadata_journal_batch(
         return response;
     }
     if command.batch.journal_frames.is_empty() {
-        // Confirmation only: no ingest, repair, fabricated frame or cursor ACK.
-        // The authenticated current shard context above is still mandatory.
+        // Confirmation carries no replacement body or journal append. Ordinary
+        // replication can already have ACKed this exact durable cut while its
+        // rebuildable table view is behind. Refresh that SAME resident replica
+        // through the existing writer-fenced replay path before reading the
+        // original preparation and prefix; an old projection cannot prove that
+        // a durable preparation is absent. All authenticated source, body and
+        // exact-prefix checks remain mandatory, including for an empty batch.
         let context = context.expect("validated authority query has a shard context");
         let probe = command
             .authority_probe
             .as_ref()
             .expect("validated authority query purpose");
+        if let Err(error) = backend.materialize_pending_replica_journal() {
+            return dfs_metadata_journal_rejection_response(&command, error.to_string());
+        }
         let confirmation = crate::service_replica::verify_persisted_metadata_authority_probe_inner(
             backend,
             &context.shard,

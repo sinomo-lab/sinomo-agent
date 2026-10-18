@@ -2018,11 +2018,25 @@ fn native_owned_recovery_starts_at_exact_tables_despite_a_lagging_cursor_hint() 
 fn prepared_v7_initial_epoch_requires_the_real_host_provider() {
     let (mut runtime, mut service, config) = native_case("v7-initial-host-bind", 1);
     let shard = DfsMetadataShardId::new(config.shard_id.clone());
+    let diagnostic = crate::native_boundary_diagnostics::capture(
+        runtime.data_dir(&config.primary_node_id).root(),
+    );
     let current = directory(&mut service, "/services/v7-initial-host-bind");
     let mut committed = current.clone();
     committed.version = DfsVersion::generate();
     committed.mode = 0o600;
     let payload = namespace_payload(&config, &current, committed.clone(), "v7-host-bind");
+    // Like production publish_prepared_operation, own the real execution
+    // window before exposing the durable prepare. Otherwise normal Main
+    // recovery may correctly publish it before this test's explicit kernel.
+    let execution = service
+        .acquire_prepared_execution(&crate::DfsPreparedOperationScope {
+            file_system_id: payload.file_system_id.clone(),
+            shard_id: payload.shard_id.clone(),
+            owner_epoch: payload.owner_epoch,
+            operation_id: payload.operation_id.clone(),
+        })
+        .unwrap();
     let digest = service
         .metadata_backend_mut()
         .unwrap()
@@ -2060,7 +2074,67 @@ fn prepared_v7_initial_epoch_requires_the_real_host_provider() {
         Some(current)
     );
     drop(unbound);
-    assert!(commit_kernel(&mut service, &digest).unwrap().published);
+    // Controlled scheduling diagnostic: ask the SAME mounted Main owner to
+    // reconcile its actual durable work. The actual native admission gate
+    // decides whether it can run here; no proof, outcome or journal is supplied.
+    let reconciliation = runtime
+        .request_repair_reconciliation(&config.primary_node_id)
+        .unwrap();
+    let scheduler = crate::runtime_host::daemon_dfs_mutation_scheduler(
+        runtime.data_dir(&config.primary_node_id),
+    )
+    .unwrap();
+    let eligible = scheduler.try_admit_global();
+    let maintenance_admitted = eligible.is_some();
+    drop(eligible);
+    if maintenance_admitted {
+        let tick = runtime
+            .maintenance_tick(
+                &config.primary_node_id,
+                sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+            )
+            .unwrap();
+        diagnostic.dump(
+            "competing-main",
+            serde_json::json!({
+                "digest": digest, "requested_reconciliation": reconciliation,
+                "actual_global_admission_available": maintenance_admitted,
+                "outcome": format!("{:?}", tick.outcome),
+            }),
+        );
+    }
+    let committed_result = commit_kernel(&mut service, &digest);
+    diagnostic.dump(
+        "initial-epoch-kernel",
+        serde_json::json!({
+            "digest": digest, "result": format!("{committed_result:?}"),
+            "rpc": format!("{:?}", runtime.rpc_observations()),
+        }),
+    );
+    let committed_result = committed_result.unwrap();
+    assert!(committed_result.published);
+    assert!(
+        !maintenance_admitted,
+        "the actual provider's retained admission excludes competing Main publication"
+    );
+    drop(execution);
+    runtime
+        .maintenance_tick(
+            &config.primary_node_id,
+            sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+        )
+        .unwrap()
+        .outcome
+        .unwrap();
+    assert_eq!(
+        service
+            .metadata_backend()
+            .unwrap()
+            .committed_prepared_operation(&digest)
+            .unwrap(),
+        Some(committed_result.entry),
+        "Main recovery after release preserves the exact original commit"
+    );
     assert_eq!(
         service
             .metadata_backend()

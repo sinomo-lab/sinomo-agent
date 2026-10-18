@@ -890,6 +890,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     .ok_or_else(|| DfsError::Metadata {
                         message: "history query names a stale or foreign shard authority".into(),
                     })?;
+                if matches!(
+                    query.selection,
+                    crate::DfsMetadataSelection::StatAtPathV1 { .. }
+                ) && shards
+                    .iter()
+                    .all(|s| s.primary_node_id == shard.primary_node_id)
+                {
+                    return Ok(shards.to_vec());
+                }
                 Ok(vec![shard.clone()])
             }
             DfsNamespaceOperation::PollNamespaceChanges { request } => {

@@ -3797,6 +3797,60 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         self.begin_consistent_read_snapshot_for_shards(&shard_ids)
     }
 
+    fn begin_stat_read_snapshot(&mut self) -> Result<()> {
+        let ids = self.shards.keys().cloned().collect::<Vec<_>>();
+        self.begin_stat_read_snapshot_on_shards(&ids)
+    }
+    fn end_stat_read_snapshot(&mut self) {
+        let ids = self.shards.keys().cloned().collect::<Vec<_>>();
+        self.end_stat_read_snapshot_on_shards(&ids);
+    }
+    fn begin_stat_read_snapshot_on_shard(&mut self, id: &DfsMetadataShardId) -> Result<()> {
+        self.shard_backend_mut(id)?.pin_stat_read_snapshot()
+    }
+    fn end_stat_read_snapshot_on_shard(&mut self, id: &DfsMetadataShardId) {
+        self.shards
+            .get_mut(id)
+            .expect("pinned stat shard remains installed")
+            .opened_backend_mut()
+            .expect("pinned stat shard remains open")
+            .unpin_stat_read_snapshot();
+    }
+    fn begin_stat_read_snapshot_for_path(
+        &mut self,
+        fs: &DfsFileSystemId,
+        path: &str,
+    ) -> Result<()> {
+        let ids = self.consistent_read_shard_ids_for_path(fs, path)?;
+        self.begin_stat_read_snapshot_on_shards(&ids)
+    }
+    fn end_stat_read_snapshot_for_path(&mut self, fs: &DfsFileSystemId, path: &str) {
+        let ids = self
+            .consistent_read_shard_ids_for_path(fs, path)
+            .expect("pinned stat path retains its routing");
+        self.end_stat_read_snapshot_on_shards(&ids);
+    }
+
+    fn has_physical_read_scope(&self, shard_id: &DfsMetadataShardId) -> bool {
+        self.shards.contains_key(shard_id)
+    }
+
+    fn begin_consistent_read_snapshot_on_shard(
+        &mut self,
+        shard_id: &DfsMetadataShardId,
+    ) -> Result<()> {
+        if !self.shards.contains_key(shard_id) {
+            return Err(MetadataBackendError::Serde(
+                "read snapshot names an unavailable shard".into(),
+            ));
+        }
+        self.begin_consistent_read_snapshot_for_shards(std::slice::from_ref(shard_id))
+    }
+
+    fn end_consistent_read_snapshot_on_shard(&mut self, shard_id: &DfsMetadataShardId) {
+        self.end_consistent_read_snapshot_for_shards(std::slice::from_ref(shard_id));
+    }
+
     fn end_consistent_read_snapshot(&mut self) {
         let shard_ids = self.shards.keys().cloned().collect::<Vec<_>>();
         self.end_consistent_read_snapshot_for_shards(&shard_ids);

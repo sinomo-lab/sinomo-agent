@@ -2694,6 +2694,145 @@ mod filesystem_preparation_recovery_tests {
     use crate::DfsMetadataBackend;
 
     #[test]
+    fn native_filesystem_recovery_confirms_reopened_durable_replica_before_background_replay() {
+        let (mut native, requester, shard) = crate::test_support::current_native_metadata_service(
+            "native-filesystem-deferred-confirmation",
+            3,
+            "/",
+        )
+        .unwrap();
+        drop(requester);
+        let receiver = shard.replica_node_ids[0].clone();
+        let shard_id = crate::DfsMetadataShardId::new(&shard.shard_id);
+        let diagnostics = std::iter::once(&shard.primary_node_id)
+            .chain(&shard.replica_node_ids)
+            .map(|node| crate::native_boundary_diagnostics::capture(native.data_dir(node).root()))
+            .collect::<Vec<_>>();
+        let mut source = native.metadata_primary_service("/").unwrap();
+        let mut requested = source
+            .metadata_backend()
+            .unwrap()
+            .get_file_system(&shard.file_system_id)
+            .unwrap()
+            .unwrap();
+        requested.display_name = "originals confirmed before background replay".into();
+        let scope = DfsPreparedOperationScope {
+            file_system_id: shard.file_system_id.clone(),
+            shard_id: shard_id.clone(),
+            owner_epoch: shard.epoch,
+            operation_id: "filesystem:deferred-original-0".into(),
+        };
+        // Hold the actual producer admission while arranging the receiver cut;
+        // the normal replica sender and receiver still establish every ACK.
+        let execution = source.acquire_prepared_execution(&scope).unwrap();
+        native.stop_node(&receiver).unwrap();
+        let mut originals = Vec::new();
+        for index in 0..2 {
+            let mut next = scope.clone();
+            next.operation_id = format!("filesystem:deferred-original-{index}");
+            let result = source.publish_metadata_effects_on_shard(
+                next.clone(),
+                Vec::new(),
+                Vec::new(),
+                vec![crate::DfsPreparedMetadataEffect::PutFileSystem {
+                    file_system: requested.clone(),
+                }],
+            );
+            assert!(matches!(
+                result,
+                Err(DfsError::MetadataRecoveryQuorumUnavailable {
+                    required: 3,
+                    verified: 2,
+                    ..
+                })
+            ));
+            originals.push(
+                source
+                    .metadata_backend()
+                    .unwrap()
+                    .prepared_operation_record(&next.operation_id)
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        native.reopen_node(receiver.clone()).unwrap();
+        let pause = native
+            .pause_replica_materialization(&receiver, &shard_id)
+            .unwrap();
+        let (peer, _) = native.peer_transports(&shard.primary_node_id).unwrap();
+        let mut replication = crate::DfsMetadataNodeTransport::new(
+            [receiver.clone()],
+            crate::dfs_metadata_journal_batch_sender_from_peer_transport(
+                native.data_dir(&shard.primary_node_id),
+                std::sync::Arc::clone(&peer),
+            ),
+            crate::dfs_metadata_snapshot_install_sender_from_peer_transport(peer),
+        );
+        let outcomes = crate::replicate_dfs_metadata_shard_to_target(
+            source.metadata_backend_mut().unwrap(),
+            &shard.primary_node_id,
+            &receiver,
+            &shard.file_system_id,
+            shard.epoch,
+            &shard_id,
+            0,
+            &mut replication,
+            crate::DfsMetadataJournalReplicationOptions::default(),
+        )
+        .unwrap();
+        let capture = native
+            .wait_paused_materialization(&pause, sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
+            .unwrap();
+        assert_eq!(capture.unavailable, None, "{capture:?}; {outcomes:?}");
+        let cut = originals.last().unwrap().digest.prepare_sequence;
+        assert_eq!(capture.durable_sequence, Some(cut));
+        assert!(capture.materialized_sequence.unwrap() < originals[0].digest.prepare_sequence);
+        assert_eq!(
+            source
+                .metadata_backend()
+                .unwrap()
+                .metadata_replication_cursor(&receiver, &shard_id)
+                .unwrap(),
+            cut,
+            "the normal sender must record its actual authenticated durable ACK"
+        );
+        let recovered = source.recover_durable_namespace_prepares();
+        for diagnostic in &diagnostics {
+            diagnostic.dump("filesystem-deferred-recovery", serde_json::json!({
+                "shard": shard, "originals": originals, "receiver": receiver,
+                "capture": format!("{capture:?}"), "replication": format!("{outcomes:?}"),
+                "result": format!("{recovered:?}"), "rpc": format!("{:?}", native.rpc_observations()),
+            }));
+        }
+        recovered.unwrap();
+        for original in originals {
+            let actual = source
+                .metadata_backend()
+                .unwrap()
+                .prepared_operation_record(&original.digest.operation_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(actual.digest, original.digest);
+            assert_eq!(actual.payload, original.payload);
+            assert_eq!(actual.status, crate::DfsPreparedOperationStatus::Committed);
+            assert!(actual.committed_entry.is_some());
+        }
+        assert_eq!(
+            source
+                .metadata_backend()
+                .unwrap()
+                .get_file_system(&shard.file_system_id)
+                .unwrap(),
+            Some(requested)
+        );
+        pause.release();
+        drop(pause);
+        drop(execution);
+        drop(source);
+        native.close().unwrap();
+    }
+
+    #[test]
     fn native_filesystem_retry_rejects_ambiguous_bodies_and_recovers_each_original() {
         let (mut native, mut requester, shard) =
             crate::test_support::current_native_metadata_service(
@@ -2703,6 +2842,10 @@ mod filesystem_preparation_recovery_tests {
             )
             .unwrap();
         assert_eq!(shard.replica_node_ids.len(), 2);
+        let diagnostics = std::iter::once(&shard.primary_node_id)
+            .chain(&shard.replica_node_ids)
+            .map(|node| crate::native_boundary_diagnostics::capture(native.data_dir(node).root()))
+            .collect::<Vec<_>>();
         let receiver = shard.replica_node_ids[0].clone();
         let initial = native.metadata_primary_service("/").unwrap();
         let original = initial
@@ -2822,7 +2965,17 @@ mod filesystem_preparation_recovery_tests {
         drop(source);
         native.reopen_node(receiver).unwrap();
         let mut source = native.metadata_primary_service("/").unwrap();
-        source.recover_durable_namespace_prepares().unwrap();
+        let recovered = source.recover_durable_namespace_prepares();
+        for diagnostic in &diagnostics {
+            diagnostic.dump(
+                "filesystem-recovery",
+                serde_json::json!({
+                    "shard": shard, "originals": originals, "result": format!("{recovered:?}"),
+                    "rpc": format!("{:?}", native.rpc_observations()),
+                }),
+            );
+        }
+        recovered.unwrap();
         for original in originals {
             let actual = source
                 .metadata_backend()

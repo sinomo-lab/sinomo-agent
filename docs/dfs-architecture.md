@@ -1541,6 +1541,10 @@ records each slice's exact scope.
 
 ## Reads and Caches
 
+Distributed POSIX stat derives current inode fields through bounded authenticated
+metadata projections; see [the authoritative stat contract](dfs-authoritative-stat.md)
+for generation, cross-shard completeness, compatibility and outage behavior.
+
 Reads prefer the closest valid copy:
 
 1. local content for the requested current version;

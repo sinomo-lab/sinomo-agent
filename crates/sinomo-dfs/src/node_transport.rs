@@ -4704,6 +4704,44 @@ impl DfsNodeTransport {
 }
 
 impl DfsMessageTransport for DfsNodeTransport {
+    fn send_local_metadata_query_to_main(
+        &mut self,
+        message: DfsRoutedMessage,
+    ) -> Result<(), NetworkError> {
+        if message.source_node_id != self.local_node_id
+            || message.target_node_id != self.local_node_id
+            || !matches!(&message.message,
+                DfsNetworkMessage::NamespaceRequest(command)
+                if command.requesting_node_id == self.local_node_id
+                    && !command.include_metadata_journal_batches
+                    && command.metadata_journal_after_sequences.is_empty()
+                    && matches!(command.operation, crate::DfsNamespaceOperation::MetadataQuery { .. }))
+        {
+            return Err(NetworkError::Io {
+                operation: "local metadata query to Main".into(),
+                detail: "only an exact local read-only metadata query may use Main dispatch".into(),
+            });
+        }
+        let sender = self
+            .sender
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| NetworkError::Io {
+                operation: "local metadata query to Main".into(),
+                detail: "registered Main query has no authenticated sender".into(),
+            })?;
+        // The explicit self-source/self-target checks above select registered
+        // Main. A remote-peer membership check cannot validate this route:
+        // known_remote_nodes deliberately excludes the local endpoint.
+        let options = self.current_send_options("local metadata query to Main")?;
+        let replies =
+            send_dfs_routed_message_to_peer(sender, options, self.local_node_id.clone(), message)?;
+        // Preserve original frame/source custody. The query waiter checks the
+        // exact request/source/destination and current authority as usual.
+        self.incoming_messages.extend(replies);
+        Ok(())
+    }
+
     fn delegates_local_namespace_authority(&self) -> bool {
         self.served_message.is_none()
             && self.local_namespace_dispatch == LocalNamespaceDispatch::RegisteredMain

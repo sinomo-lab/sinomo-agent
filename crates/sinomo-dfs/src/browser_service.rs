@@ -2890,10 +2890,17 @@ pub(crate) fn prepare_sifs_browser_write_parent<T: DfsMessageTransport>(
     // A cached directory must never replace those authority-side predicates.
     // Avoid routing a no-op MkdirAll (and replaying its journal response) for
     // every write to an already observed directory.
-    if service
-        .posix_object_metadata_hint(&parent)
-        .is_ok_and(|object| object.kind == DfsObjectKind::Directory)
+    let hint = service.posix_object_metadata_hint(&parent);
+    #[cfg(test)]
+    if let Err(error) = &hint
+        && service
+            .metadata()
+            .object_by_normalized_posix_path(&crate::sifs_file_system_id(), &parent)
+            .is_some_and(|object| object.kind == DfsObjectKind::Directory)
     {
+        eprintln!("NATIVE_CACHED_PARENT_HINT_FAILURE path={parent:?} error={error:?}");
+    }
+    if hint.is_ok_and(|object| object.kind == DfsObjectKind::Directory) {
         return Ok(());
     }
     service.posix_mkdir_all(&parent)

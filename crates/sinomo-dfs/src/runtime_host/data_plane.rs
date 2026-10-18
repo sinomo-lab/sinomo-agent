@@ -880,6 +880,27 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
         Box::pin(async move {
             let _data_owner = data_owner?;
             validation?;
+            #[cfg(test)]
+            let diagnostic = command.authority_probe.as_ref().filter(|probe| {
+                matches!(&probe.operation, crate::DfsMetadataAuthorityOperation::PreparedOperation { operation_id, .. }
+                    if crate::native_boundary_diagnostics::selected_operation(&data_dir.root(), operation_id))
+            }).filter(|_| crate::native_boundary_diagnostics::enabled(&data_dir.root()))
+                .map(|probe| (data_dir.root(), probe.clone(), std::time::Instant::now()));
+            #[cfg(test)]
+            if let Some((root, probe, _)) = &diagnostic {
+                crate::native_boundary_diagnostics::record(
+                    root,
+                    "replica-authority-ingress",
+                    || {
+                        serde_json::json!({
+                            "authenticated_source": authenticated_source_node_id, "request_id": command.request_id,
+                            "probe": probe, "context": format!("{context:?}"), "next_after_sequence": command.batch.next_after_sequence,
+                            "journal_frame_count": command.batch.journal_frames.len(),
+                        })
+                    },
+                    false,
+                );
+            }
             if command.source_node_id.as_ref() != Some(&authenticated_source_node_id) {
                 return Ok(daemon_dfs_metadata_journal_rejection(
                     &command,
@@ -936,6 +957,8 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
             let rejection_shard_id = command.batch.shard_id.clone();
             let rejection_next_after_sequence = command.batch.next_after_sequence;
             let admitted_context = context.clone();
+            #[cfg(test)]
+            let diagnostic_apply = diagnostic.clone();
             let operation = handle_daemon_dfs_resident_replica_operation(
                 &paths,
                 data_dir.clone(),
@@ -956,6 +979,13 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
                             Some(context),
                             command,
                         );
+                        #[cfg(test)]
+                        if let Some((root, probe, started)) = &diagnostic_apply {
+                            crate::native_boundary_diagnostics::record(root, "replica-authority-applied", || serde_json::json!({
+                                "probe": probe, "context": format!("{context:?}"), "response": response,
+                                "ingress_elapsed_us": started.elapsed().as_micros(),
+                            }), false);
+                        }
                         let namespace_paths = logical
                             .map_err(crate::DfsError::from)
                             .and_then(|batch| {
@@ -977,8 +1007,29 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
                     })
                 },
             )
-            .await
-            .map_err(daemon_dfs_data_plane_error)?;
+            .await;
+            #[cfg(test)]
+            if let Some((root, probe, started)) = &diagnostic {
+                crate::native_boundary_diagnostics::record(
+                    root,
+                    "replica-authority-operation-return",
+                    || {
+                        let result = match &operation {
+                            Ok(DaemonDfsResidentReplicaOperation::Completed {
+                                result: (response, _),
+                            }) => serde_json::json!({"completed": response}),
+                            Ok(DaemonDfsResidentReplicaOperation::Rejected { reason }) => {
+                                serde_json::json!({"rejected": format!("{reason:?}")})
+                            }
+                            Err(error) => serde_json::json!({"error": format!("{error:?}")}),
+                        };
+                        serde_json::json!({"probe": probe, "request_id": rejection_request_id,
+                        "result": result, "ingress_elapsed_us": started.elapsed().as_micros()})
+                    },
+                    false,
+                );
+            }
+            let operation = operation.map_err(daemon_dfs_data_plane_error)?;
             let (response, namespace_paths) = match operation {
                 DaemonDfsResidentReplicaOperation::Completed { result } => result,
                 DaemonDfsResidentReplicaOperation::Rejected { reason } => {

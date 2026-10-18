@@ -429,6 +429,7 @@ pub struct LocalSobjMetadataBackend {
     content_root_catalog_snapshot_cache: Option<Arc<DfsContentRootCatalogSnapshotCache>>,
     content_root_catalog_previous_snapshot_cache: Option<Arc<DfsContentRootCatalogSnapshotCache>>,
     consistent_read_snapshot_depth: usize,
+    stat_read_snapshots: Vec<stat_snapshot::StatReadSnapshot>,
     /// This non-primary handle intentionally ignored an unreadable rebuildable
     /// table-log suffix. It may serve only its last self-contained snapshot
     /// until authenticated replica repair installs a new authoritative image.
@@ -537,6 +538,7 @@ impl LocalSobjMetadataBackend {
             content_root_catalog_snapshot_cache: None,
             content_root_catalog_previous_snapshot_cache: None,
             consistent_read_snapshot_depth: 0,
+            stat_read_snapshots: Vec::new(),
             replica_repair_only: false,
             resident_cursor_status_projection: Arc::new(Mutex::new(
                 ResidentMetadataCursorStatusProjection::default(),
@@ -646,6 +648,7 @@ impl LocalSobjMetadataBackend {
             content_root_catalog_snapshot_cache: None,
             content_root_catalog_previous_snapshot_cache: None,
             consistent_read_snapshot_depth: 0,
+            stat_read_snapshots: Vec::new(),
             replica_repair_only: false,
             resident_cursor_status_projection: Arc::new(Mutex::new(
                 ResidentMetadataCursorStatusProjection::default(),
@@ -759,6 +762,7 @@ impl LocalSobjMetadataBackend {
             content_root_catalog_snapshot_cache: None,
             content_root_catalog_previous_snapshot_cache: None,
             consistent_read_snapshot_depth: 0,
+            stat_read_snapshots: Vec::new(),
             replica_repair_only: true,
             resident_cursor_status_projection: Arc::new(Mutex::new(
                 ResidentMetadataCursorStatusProjection::default(),
@@ -950,6 +954,7 @@ impl LocalSobjMetadataBackend {
             content_root_catalog_snapshot_cache: None,
             content_root_catalog_previous_snapshot_cache: None,
             consistent_read_snapshot_depth: 0,
+            stat_read_snapshots: Vec::new(),
             replica_repair_only: false,
             resident_cursor_status_projection: Arc::new(Mutex::new(
                 ResidentMetadataCursorStatusProjection::default(),
@@ -1498,6 +1503,9 @@ impl LocalSobjMetadataBackend {
     }
 
     pub(crate) fn metadata_prefix_proof(&self) -> Result<DfsMetadataPrefixProof> {
+        if let Some(view) = self.stat_read_snapshots.last() {
+            return Ok(view.prefix.clone());
+        }
         let proof = self.prefix_proof.clone().ok_or_else(|| {
             MetadataBackendError::Serde(format!(
                 "metadata shard {} has no exact durable prefix proof",
@@ -1811,6 +1819,11 @@ impl LocalSobjMetadataBackend {
     }
 
     fn metadata_write_lock(&self) -> Result<MetadataWriteLock> {
+        if !self.stat_read_snapshots.is_empty() {
+            return Err(MetadataBackendError::Serde(
+                "a stat read view grants no writer custody".into(),
+            ));
+        }
         metadata_write_lock(self.root.clone(), self.journal_write_lock_path())
     }
 
@@ -2319,6 +2332,12 @@ impl LocalSobjMetadataBackend {
                 .get()
                 .saturating_add(1),
         );
+        if let Some(view) = self.stat_read_snapshots.last() {
+            return Ok(match &view.tables {
+                Some(tables) => DfsMetadataTablesSnapshot::Shared(Arc::clone(tables)),
+                None => DfsMetadataTablesSnapshot::Borrowed(&self.tables),
+            });
+        }
         if self.consistent_read_snapshot_depth > 0 || self.replica_repair_only {
             return Ok(DfsMetadataTablesSnapshot::Borrowed(&self.tables));
         }
@@ -3151,3 +3170,4 @@ use snapshot_validation::*;
 
 mod api;
 mod reference_outcomes;
+mod stat_snapshot;
