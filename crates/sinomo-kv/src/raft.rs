@@ -13164,11 +13164,8 @@ mod resident_checkout_tests {
 
     #[test]
     fn shadow_role_denial_drops_cached_owner_before_a_fresh_main_open() {
-        let raft_root = std::env::temp_dir().join(format!(
-            "sinomo-kv-shadow-denial-{}-{}",
-            std::process::id(),
-            RESIDENT_RAFT_NODE_ACCESS_CLOCK.fetch_add(1, Ordering::Relaxed)
-        ));
+        let fixture = sinomo_testdir::TestDir::new("sinomo-kv-shadow-denial");
+        let raft_root = fixture.to_path_buf();
         let node_id = NodeId::from_legacy_named("node_shadow_denial_fresh_main").expect("node id");
         let wal_paths = KvWalPaths::new(raft_root.join(node_id.as_str()));
 
@@ -13203,11 +13200,8 @@ mod resident_checkout_tests {
 
     #[test]
     fn shadow_role_denial_evicts_and_rejects_preseeded_immutable_raft_view() {
-        let raft_root = std::env::temp_dir().join(format!(
-            "sinomo-kv-shadow-view-denial-{}-{}",
-            std::process::id(),
-            RESIDENT_RAFT_NODE_ACCESS_CLOCK.fetch_add(1, Ordering::Relaxed)
-        ));
+        let fixture = sinomo_testdir::TestDir::new("sinomo-kv-shadow-view-denial");
+        let raft_root = fixture.to_path_buf();
         let node_id =
             NodeId::from_legacy_named("node_shadow_denial_immutable_view").expect("node id");
         let wal_paths = KvWalPaths::new(raft_root.join(node_id.as_str()));

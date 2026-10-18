@@ -46,9 +46,24 @@ Use unit tests for pure parsing, validation, state machines, ordering, and
 selection. Prefer integration tests for cross-crate network, KV, cluster, DFS,
 daemon, persistence, sandbox, and restart behavior.
 
-Filesystem tests should use `sinomo-testdir::TestDir` when possible. Set
-`SINOMO_TEST_KEEP_TMP=1` only while investigating a failure, and preserve the
-reported path before another run.
+Filesystem tests should use `sinomo-testdir::TestDir` when possible. Successful
+owned roots are cleaned on drop; panic evidence and explicitly retained roots
+remain available. Constructors never sweep other tests' roots by age.
+
+For bounded Linux runs, use `scripts/ci/run-with-test-fixtures.py --artifacts ABSOLUTE_NEW_DIR
+-- COMMAND...` inside the normal shared build/resource guard. It gives the
+invocation a private TMPDIR and retains fixtures until the outcome is known.
+After processes drain, success reclaims that private directory; failure first
+creates, flushes and compares a durable tar archive, then reclaims the originals.
+Logs, exit status, archive digest and recovery instructions stay in the artifact
+directory. Failed verification or a live user of the fixture blocks reclamation.
+The wrapper never sweeps shared or previous-run directories. Use
+`--retention failures` for the testdir crate's own Drop-behavior tests.
+
+Do not globally export `SINOMO_TEST_KEEP_TMP=1` for routine development. Bare
+test runs killed before cleanup still require an explicit ownership/evidence
+audit; age alone is not permission to remove their fixtures. Keep permanent
+receipts and unique failure evidence on a durable filesystem, not in `/tmp`.
 
 ## Trust-Ring Gate
 

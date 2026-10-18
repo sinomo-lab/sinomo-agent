@@ -151,6 +151,21 @@ exact activated epochs within its unchanged convergence deadline. Retained
 a committed assignment automatically.
 
 
+Each of the six development nodes has a hard 2 GiB cgroup memory limit and no
+swap (12 GiB aggregate node allocation). The verifier checks resolved Compose,
+Docker HostConfig and actual cgroup limits. Runtime admission requires 12 GiB of
+host MemAvailable; the current driver/host use is already reflected there. A
+driver cgroup ceiling is not an additional fixed allocation. Compiler admission
+and compiler caps remain separate. Temporary and Docker data filesystems retain
+their existing free-byte and reported-inode reserves.
+
+The runtime resource watcher preserves per-node counters and Docker lifecycle
+events in `runtime-resources/`. OOM, kernel memory.max boundary events, automatic
+restarts and unplanned container exits fail the run immediately. Deliberate
+recovery exits require a recorded, node-specific, single-use intent; OOM is
+never excused by such an intent. Failed resource evidence must be debugged at
+the existing limits, not retried with larger containers.
+
 This resets and removes the selected disposable project's volumes. `KEEP=1`
 is spelled `SINOMO_TEST_KEEP=1` and retains it at teardown only;
 `SINOMO_TEST_REUSE=1` skips initial reset and retains existing state. The lane

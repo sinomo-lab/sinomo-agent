@@ -3,34 +3,30 @@
 //! Tests used to build roots with `env::temp_dir().join(format!("name-{nanos}"))`
 //! and remove them with a trailing `remove_dir_all` — which never runs when the
 //! test panics earlier or the test process is killed, leaking roots until the
-//! tmpfs fills. [`TestDir`] fixes both failure modes:
+//! tmpfs fills. [`TestDir`] cleans successful disposable roots on drop:
 //!
-//! - the directory is removed on `Drop`, so panicking tests clean up during
-//!   unwind;
-//! - all roots live under one `sinomo-tests` parent, and the first `TestDir`
-//!   of a process sweeps siblings that have been around longer than
-//!   [`STALE_ROOT_MAX_AGE`] — reclaiming what killed processes left behind.
+//! - panic unwind retains evidence and reports its path;
+//! - no process sweeps another test's roots based only on their age;
+//! - `scripts/ci/run-with-test-fixtures.py` bounds retention to one invocation,
+//!   archives failed runs durably, and reclaims completed unused fixtures.
 //!
-//! Set `SINOMO_TEST_KEEP_TMP=1` to keep every root (and skip the sweep) when a
-//! failing test's on-disk state is needed for debugging.
+//! Set `SINOMO_TEST_KEEP_TMP=1` to retain roots until that runner drains, or for
+//! an explicitly managed investigation. Do not retain successful runs forever.
 
 use std::path::{Path, PathBuf};
-use std::sync::Once;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// Roots older than this are reclaimed by the once-per-process sweep. Long
-/// enough that no live test run is at risk (whole suites finish in minutes),
-/// short enough that leaked roots never accumulate across a workday.
+/// Historical sweep interval, retained for source compatibility. Age alone
+/// never authorizes reclamation; there is no automatic shared-parent sweep.
 pub const STALE_ROOT_MAX_AGE: Duration = Duration::from_secs(2 * 60 * 60);
 
 const KEEP_ENV: &str = "SINOMO_TEST_KEEP_TMP";
 
-static SWEEP: Once = Once::new();
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// A uniquely named directory under `$TMPDIR/sinomo-tests` that is removed
-/// when dropped (including during panic unwind).
+/// when dropped successfully. Panic evidence is retained for verified archival.
 ///
 /// Dereferences to [`Path`], so existing `root.join(..)`, `&root`, and
 /// `root.display()` call sites keep working unchanged.
@@ -43,11 +39,10 @@ pub struct TestDir {
 impl TestDir {
     /// Creates `$TMPDIR/sinomo-tests/<name>-<pid>-<nanos>-<seq>`.
     ///
-    /// The first call in a process also sweeps stale sibling roots left
-    /// behind by killed test processes.
+    /// Existing sibling roots belong to their original invocations and are
+    /// never reclaimed by this constructor.
     pub fn new(name: &str) -> Self {
         let parent = std::env::temp_dir().join("sinomo-tests");
-        SWEEP.call_once(|| sweep_stale_roots(&parent));
         let sanitized: String = name
             .chars()
             .map(|c| if c == '/' || c == '\\' { '-' } else { c })
@@ -70,7 +65,7 @@ impl TestDir {
     }
 
     /// Disarms cleanup and returns the path; the directory then outlives the
-    /// test (until the stale sweep reclaims it).
+    /// test until its owner explicitly archives or reclaims it.
     pub fn keep(mut self) -> PathBuf {
         self.keep = true;
         self.path.clone()
@@ -105,36 +100,19 @@ impl Drop for TestDir {
         if self.keep || keep_requested() {
             return;
         }
+        if std::thread::panicking() {
+            eprintln!(
+                "retained failed Sinomo test fixture: {}",
+                self.path.display()
+            );
+            return;
+        }
         let _ = std::fs::remove_dir_all(&self.path);
     }
 }
 
 fn keep_requested() -> bool {
     std::env::var(KEEP_ENV).is_ok_and(|value| !value.is_empty() && value != "0")
-}
-
-/// Best-effort removal of `sinomo-tests` entries that look abandoned. Races
-/// between concurrent test processes are benign: each entry is unique to its
-/// creator, age keeps live runs out of scope, and removal errors are ignored.
-fn sweep_stale_roots(parent: &Path) {
-    if keep_requested() {
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(parent) else {
-        return;
-    };
-    let now = SystemTime::now();
-    for entry in entries.flatten() {
-        let stale = entry
-            .metadata()
-            .and_then(|metadata| metadata.modified())
-            .ok()
-            .and_then(|modified| now.duration_since(modified).ok())
-            .is_some_and(|age| age > STALE_ROOT_MAX_AGE);
-        if stale {
-            let _ = std::fs::remove_dir_all(entry.path());
-        }
-    }
 }
 
 #[cfg(test)]
@@ -164,18 +142,23 @@ mod tests {
     }
 
     #[test]
-    fn drop_removes_directory_during_panic_unwind() {
+    fn drop_retains_failure_evidence_during_panic_unwind() {
         let observed = std::sync::Arc::new(std::sync::Mutex::new(PathBuf::new()));
         let observed_in_test = observed.clone();
         let result = std::panic::catch_unwind(move || {
             let dir = TestDir::new("sinomo-testdir-panic");
             *observed_in_test.lock().expect("path slot") = dir.to_path_buf();
+            std::fs::write(dir.join("evidence"), b"failed operation").unwrap();
             panic!("test body fails after creating its root");
         });
         assert!(result.is_err());
         let path = observed.lock().expect("path slot").clone();
         assert!(!path.as_os_str().is_empty());
-        assert!(!path.exists(), "unwind must remove the root");
+        assert_eq!(
+            std::fs::read(path.join("evidence")).unwrap(),
+            b"failed operation"
+        );
+        std::fs::remove_dir_all(path).expect("reclaim this test's inspected evidence");
     }
 
     #[test]
@@ -187,22 +170,15 @@ mod tests {
     }
 
     #[test]
-    fn sweep_reclaims_old_roots_and_spares_fresh_ones() {
-        let parent = TestDir::new("sinomo-testdir-sweep");
-        let stale = parent.join("stale-root");
-        let fresh = parent.join("fresh-root");
-        std::fs::create_dir_all(&stale).expect("stale root");
-        std::fs::create_dir_all(&fresh).expect("fresh root");
-        // `sweep_stale_roots` keys off mtime; fake an old root by backdating
-        // through filetime-free means: set the clock window instead — not
-        // portable — so exercise the age predicate directly.
-        let now = SystemTime::now();
-        let old_enough = now - (STALE_ROOT_MAX_AGE + Duration::from_secs(1));
-        assert!(
-            now.duration_since(old_enough)
-                .is_ok_and(|age| age > STALE_ROOT_MAX_AGE)
+    fn creating_a_fixture_never_reclaims_retained_siblings() {
+        let retained = TestDir::new("sinomo-testdir-retained").keep();
+        std::fs::write(retained.join("evidence"), b"owned by another invocation").unwrap();
+        let fresh = TestDir::new("sinomo-testdir-fresh");
+        assert_ne!(retained, fresh.path());
+        assert_eq!(
+            std::fs::read(retained.join("evidence")).unwrap(),
+            b"owned by another invocation"
         );
-        sweep_stale_roots(parent.path());
-        assert!(fresh.exists(), "a just-created root must survive the sweep");
+        std::fs::remove_dir_all(retained).expect("reclaim this test's retained sibling");
     }
 }
