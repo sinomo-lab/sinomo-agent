@@ -195,6 +195,20 @@ impl Service for HostedFeatureService {
                 DAEMON_DFS_BROWSER_FILE_HISTORY_RESTORE_ROUTE => {
                     let payload: DfsFileHistoryRestoreRequest =
                         ctx.decode_request_body(&request).await?;
+                    // Join the core owner's real configuration rebuild before
+                    // borrowing its browser/FIFO or mutation service. Preserve
+                    // the original restore identity and expectations; this is
+                    // one pre-execution wait, never a retry of a possible effect.
+                    tokio::time::timeout(
+                        sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+                        backend_host.ensure_write_configuration_ready(&data_dir, &runtime),
+                    )
+                    .await
+                    .map_err(|_| {
+                        dfs_browser_service_error(
+                            "DFS write configuration readiness deadline elapsed",
+                        )
+                    })??;
                     let backend_data_dir = Arc::clone(&data_dir);
                     let backend_runtime = runtime.clone();
                     let result = run_blocking_browser_task(

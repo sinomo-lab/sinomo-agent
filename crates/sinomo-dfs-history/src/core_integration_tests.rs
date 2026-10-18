@@ -4780,6 +4780,129 @@ fn file_history_service_capture_and_unpin_preserve_the_current_namespace() {
 }
 
 #[test]
+fn native_history_restore_joins_real_configuration_rebuild_before_browser_admission() {
+    let name = "history-restore-native-configuration-gap";
+    let nodes = core_test::DfsTestRuntime::ordered_node_ids(name, 2);
+    let mut runtime = core_test::DfsTestRuntime::new(name, nodes[0].clone()).unwrap();
+    runtime.define_node(nodes[1].clone()).unwrap();
+    runtime
+        .configure_component_factories(vec![Arc::new(crate::component_factory().unwrap())])
+        .unwrap();
+    runtime.start_nodes().unwrap();
+    let mut writer = runtime.client(&nodes[0]).unwrap();
+    let path = "/services/configuration-gap-restore.txt";
+    let options = DfsWriteOptions::replicated_eventual(nodes.clone());
+    let saved = writer
+        .posix_write_file(path, b"saved", options.clone())
+        .unwrap();
+    capture_history(&mut writer, &saved);
+    let current = writer.posix_write_file(path, b"current", options).unwrap();
+    let request = DfsFileHistoryRestoreRequest {
+        source: history_identity(&saved),
+        destination_path: path.into(),
+        expected_destination: Some(history_identity(&saved)),
+        operation_id: sinomo_core::Id::generate().to_string(),
+    };
+    let data_dir = Arc::new(runtime.data_dir(&nodes[1]).clone());
+    let handle = runtime.runtime_handle();
+    let host = sinomo_dfs::dfs_browser_component_host(&data_dir).unwrap();
+    let control = host
+        .control_plane_client(&sinomo_core::network::ClusterPaths::new(&data_dir), &handle)
+        .unwrap();
+    assert!(matches!(
+        control.write_configuration_readiness().unwrap(),
+        sinomo_dfs::DfsWriteConfigurationReadiness::Ready(Some(_))
+    ));
+    // Withhold a real committed delta and pause the existing owner's rebuild.
+    // The other real node publishes both settings through the normal API.
+    let gap = runtime
+        .lose_configuration_delta_and_pause_rebuild(
+            &nodes[1],
+            sinomo_dfs::file_system_config_key(&saved.file_system_id),
+        )
+        .unwrap();
+    let mut policy = writer.file_history_policy(&saved.file_system_id).unwrap();
+    for keep_last in [1, 2] {
+        let next = DfsFileHistoryPolicy {
+            rules: vec![DfsFileHistoryRule {
+                path: "/services/unrelated-gap-policy".into(),
+                retention: DfsFileHistoryRetention {
+                    keep_last,
+                    keep_for_seconds: 0,
+                },
+            }],
+        };
+        writer
+            .update_file_history_policy(DfsFileHistoryPolicyUpdateRequest {
+                file_system_id: saved.file_system_id.clone(),
+                expected: policy,
+                policy: next.clone(),
+            })
+            .unwrap();
+        policy = next;
+    }
+    gap.wait_rebuild(Duration::from_secs(5)).unwrap();
+    assert!(gap.dropped_delta().is_some());
+    assert!(matches!(
+        control.write_configuration_readiness().unwrap(),
+        sinomo_dfs::DfsWriteConfigurationReadiness::Pending
+    ));
+    let call = sinomo_core::network::ObjectRpcCall::value(
+        sinomo_core::network::ObjectRpcRequest::encode_body(
+            sinomo_api::dfs::DAEMON_DFS_BROWSER_FILE_HISTORY_RESTORE_ROUTE,
+            "daemon",
+            &request,
+        )
+        .unwrap(),
+    );
+    let mut response =
+        Box::pin(runtime.rpc_result_future(&nodes[0], &nodes[1], call, Duration::from_secs(5)));
+    handle.block_on(async {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        match tokio::time::timeout(Duration::from_millis(100), response.as_mut()).await {
+            Err(_) => {}
+            Ok(Err(error)) => {
+                panic!("restore failed before its real configuration owner completed: {error}")
+            }
+            Ok(Ok(_)) => panic!("restore replied while the real configuration was incomplete"),
+        }
+        // Readiness must not retain the browser FIFO needed by other work.
+        tokio::time::timeout_at(
+            deadline,
+            sinomo_dfs::run_blocking_browser_task(
+                Arc::clone(&data_dir),
+                "history-configuration-admission-witness",
+                "history configuration admission witness",
+                || Ok(()),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        gap.release();
+        let result = tokio::time::timeout_at(deadline, response).await.unwrap();
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("stale destination expectation was accepted"),
+        };
+        assert!(
+            error.contains("changed"),
+            "the unchanged destination check must run after readiness: {error}"
+        );
+    });
+    let after = writer.posix_stat_distributed(path).unwrap();
+    assert_eq!(history_identity(&after), history_identity(&current));
+    assert_eq!(
+        writer.posix_read_file_distributed(path).unwrap(),
+        b"current"
+    );
+    drop(control);
+    drop(host);
+    drop(writer);
+    runtime.close().unwrap();
+}
+
+#[test]
 fn native_history_registered_provider_replays_exact_capture_and_release() {
     let nodes = sinomo_dfs::test_support::DfsTestRuntime::ordered_node_ids(
         "history-registered-pin-replay",
