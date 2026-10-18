@@ -1256,6 +1256,116 @@ fn file_history_capture_after_chmod_preserves_the_content_replication_plan() {
 }
 
 #[test]
+fn native_history_failure_observation_requires_settled_live_attempts() {
+    let (mut runtime, owner, remotes, mut dfs) =
+        native_history_repair_services("native-history-failure-observation-cut", 3);
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    struct CloseGate(Arc<tokio::sync::Semaphore>);
+    impl Drop for CloseGate {
+        fn drop(&mut self) {
+            self.0.close();
+        }
+    }
+    let _close_gate = CloseGate(Arc::clone(&gate));
+    for (index, target) in remotes.iter().enumerate() {
+        for route in [
+            sinomo_dfs::DFS_DATA_STAGE_BLOB_ROUTE,
+            sinomo_dfs::DFS_DATA_REPAIR_REPLICA_ROUTE,
+        ] {
+            runtime.install_fault(core_test::DfsTestFaultRule {
+                source: Some(owner.clone()),
+                target: Some(target.clone()),
+                route: Some(route.into()),
+                call_id: None,
+                origin: Some(core_test::DfsTestRpcOrigin::RegisteredHost),
+                remaining_hits: 32,
+                action: if index == 1 && route == sinomo_dfs::DFS_DATA_REPAIR_REPLICA_ROUTE {
+                    core_test::DfsTestFaultAction::PauseBeforeDispatch(Arc::clone(&gate))
+                } else {
+                    core_test::DfsTestFaultAction::BudgetExhausted
+                },
+            });
+        }
+    }
+    let stat = dfs
+        .posix_write_file(
+            "/services/failure-observation-cut",
+            b"actual native repair payload",
+            DfsWriteOptions {
+                replica_candidates: std::iter::once(owner.clone())
+                    .chain(remotes.clone())
+                    .collect(),
+                policy: DfsReplicationPolicy::new(1, 3).unwrap(),
+                wait_for_commit: true,
+                foreground_replica_repair: false,
+            },
+        )
+        .unwrap();
+    let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    runtime.request_repair_reconciliation(&owner).unwrap();
+    let pass = runtime
+        .maintenance_tick(&owner, deadline.saturating_duration_since(Instant::now()))
+        .unwrap();
+    pass.outcome.unwrap();
+    assert_eq!(pass.omitted_kv_event_count, 0);
+    loop {
+        let events = runtime.rpc_observations();
+        let exact = |event: &&core_test::DfsTestRpcObservation| {
+            event.source == owner
+                && event.origin == core_test::DfsTestRpcOrigin::RegisteredHost
+                && event.route == sinomo_dfs::DFS_DATA_REPAIR_REPLICA_ROUTE
+                && event.dfs_object_id.as_ref() == Some(&stat.object_id)
+                && event.dfs_version.as_ref() == Some(&stat.version)
+        };
+        if events.iter().filter(exact).any(|e| {
+            e.target == remotes[0] && e.phase == core_test::DfsTestRpcPhase::EndedWithoutResponse
+        }) && events.iter().filter(exact).any(|e| {
+            e.target == remotes[1] && e.phase == core_test::DfsTestRpcPhase::BeforeDispatch
+        }) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "actual failed and paused repair boundaries must fit the original budget"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let cut = native_history_queue(&runtime, &owner);
+    assert!(cut.iter().any(|r| r.object_id == stat.object_id
+        && r.missing_replica_node_id == remotes[1]
+        && r.in_flight
+        && r.transfer_request_id.is_some()));
+    let premature = native_history_failure_observation_complete(&runtime, &owner);
+    std::fs::write(
+        runtime
+            .data_dir(&owner)
+            .root()
+            .join("failure-observation-cut.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({"premature":premature,"queue":cut,
+            "object_id":stat.object_id,"version":stat.version,"paused_target":remotes[1]}))
+        .unwrap(),
+    )
+    .unwrap();
+    // Closing this fixture-owned gate returns a genuine DefinitelyNotSent
+    // result; it neither supplies a receipt nor alters the queued identity.
+    gate.close();
+    while !native_history_failure_observation_complete(&runtime, &owner) {
+        assert!(
+            Instant::now() < deadline,
+            "native failure settlement must fit the original observation budget"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    runtime.clear_faults();
+    drop(dfs);
+    runtime.close().unwrap();
+    assert!(
+        !premature,
+        "one failed RPC is not settlement of the other live attempt"
+    );
+}
+
+#[test]
 fn file_history_capture_after_rename_and_write_history_gc_preserves_durability() {
     capture_after_metadata_change_preserves_durability(true);
 }
@@ -1284,7 +1394,7 @@ fn capture_after_metadata_change_preserves_durability(collect_before_capture: bo
         .unwrap();
     let original_intent_id = native_history_repairs(&dfs)[0].intent_id.clone();
     if collect_before_capture {
-        fail_native_history_repairs(&runtime, &owner, &mut dfs);
+        fail_native_history_live_repairs(&runtime, &owner, &mut dfs);
         runtime.clear_faults();
         let (repairs, _settled) = drain_native_history_repairs(&runtime, &owner, &mut dfs);
         assert!(repairs.is_empty(), "the original write must first reach N");
@@ -1513,7 +1623,7 @@ fn file_history_compacted_queue_requires_actual_matching_target_records() {
         .unwrap();
     // Establish the real failed dispatch while the original carrier denial is
     // still active, before malformed queue DATA can block ordinary restoration.
-    fail_native_history_repairs(&runtime, &owner, &mut dfs);
+    fail_native_history_live_repairs(&runtime, &owner, &mut dfs);
     let store = LocalDfsRepairQueueStore::new(
         sinomo_dfs::default_dfs_repair_attempt_snapshot_path(runtime.data_dir(&owner)),
     );
@@ -2156,7 +2266,7 @@ fn file_history_repin_reactivates_only_the_retained_versions_repair() {
     let negative_guard = runtime
         .deny_repair_claims_after_failed_rpc(&owner, &actual_owner)
         .unwrap();
-    fail_native_history_repairs(&runtime, &owner, &mut dfs);
+    fail_native_history_live_repairs(&runtime, &owner, &mut dfs);
     assert!(
         runtime
             .rpc_observations()
@@ -3340,7 +3450,18 @@ fn file_history_pending_preservation_does_not_block_current_writes_and_publishes
     let current = primary
         .test_current_read_object_metadata(&stat.object_id)
         .unwrap();
-    fail_native_history_repairs(&runtime, &owner, &mut primary);
+    // This is pending staging before W, not a published LIVE repair plan.
+    // Observe its real failed carrier as before; the unchanged checks below
+    // still require exact retained publication and both actual receipts.
+    observe_native_history_content_failure(&runtime, &owner, &mut primary, || {
+        runtime.rpc_observations().iter().any(|event| {
+            event.source == owner
+                && event.target == remote
+                && event.origin == core_test::DfsTestRpcOrigin::RegisteredHost
+                && event.phase == core_test::DfsTestRpcPhase::EndedWithoutResponse
+                && event.route == sinomo_dfs::DFS_DATA_STAGE_BLOB_ROUTE
+        })
+    });
     let peer_head_before = native_history_settled_peer_head(&runtime, &owner, &remote, &current);
     runtime.clear_faults();
     // The old fixture advanced a private retry tick by 100. Use only the
@@ -3482,7 +3603,7 @@ fn file_history_repairs_retained_bytes_without_rewinding_the_replica() {
     let current = primary
         .test_current_read_object_metadata(&first.object_id)
         .unwrap();
-    fail_native_history_repairs(&runtime, &owner, &mut primary);
+    fail_native_history_live_repairs(&runtime, &owner, &mut primary);
     let before = native_history_settled_peer_head(&runtime, &owner, &remotes[0], &current);
     let peer = runtime.client(&remotes[0]).unwrap();
     assert!(
@@ -5902,10 +6023,21 @@ fn native_history_settled_peer_head(
     actual
 }
 
-fn fail_native_history_repairs(
+fn fail_native_history_live_repairs(
     runtime: &sinomo_dfs::test_support::DfsTestRuntime,
     owner: &NodeId,
     service: &mut NetworkedDfsService<sinomo_dfs::DfsNodeTransport>,
+) {
+    observe_native_history_content_failure(runtime, owner, service, || {
+        native_history_failure_observation_complete(runtime, owner)
+    });
+}
+
+fn observe_native_history_content_failure(
+    runtime: &sinomo_dfs::test_support::DfsTestRuntime,
+    owner: &NodeId,
+    service: &mut NetworkedDfsService<sinomo_dfs::DfsNodeTransport>,
+    complete: impl Fn() -> bool,
 ) {
     // Ask the actual Main to reconstruct/dispatch its own persisted work
     // while the original native denial is still active.
@@ -5924,16 +6056,7 @@ fn fail_native_history_repairs(
     // Observe that child's outcome within the SAME deadline; do not infer an
     // RPC failure from scheduling or issue another maintenance invocation.
     loop {
-        if runtime.rpc_observations().iter().any(|event| {
-            &event.source == owner
-                && event.origin == sinomo_dfs::test_support::DfsTestRpcOrigin::RegisteredHost
-                && event.phase == sinomo_dfs::test_support::DfsTestRpcPhase::EndedWithoutResponse
-                && [
-                    sinomo_dfs::DFS_DATA_STAGE_BLOB_ROUTE,
-                    sinomo_dfs::DFS_DATA_REPAIR_REPLICA_ROUTE,
-                ]
-                .contains(&event.route.as_str())
-        }) {
+        if complete() {
             break;
         }
         assert!(
@@ -5942,6 +6065,51 @@ fn fail_native_history_repairs(
         );
         std::thread::sleep(Duration::from_millis(1));
     }
+}
+
+fn native_history_failure_observation_complete(
+    runtime: &sinomo_dfs::test_support::DfsTestRuntime,
+    owner: &NodeId,
+) -> bool {
+    // A carrier's terminal event precedes its owner's durable queue update.
+    // One failed RPC also says nothing about another live target still in
+    // flight. Observe the exact LIVE plan and its settled failure records
+    // before healing the fixture or sampling the existing retry eligibility.
+    let current = runtime.metadata_primary_service("/services").unwrap();
+    let repairs = native_history_repairs(&current);
+    let queue = native_history_queue(runtime, owner);
+    let events = runtime.rpc_observations();
+    !repairs.is_empty()
+        && repairs.iter().all(|repair| {
+            queue.iter().any(|record| {
+                record.intent_id == repair.intent_id
+                    && record.object_id == repair.object_id
+                    && record.version == repair.version
+                    && Some(record.content_hash.as_str()) == repair.content_hash.as_deref()
+                    && record.missing_replica_node_id == repair.missing_replica_node_id
+                    && record.transfer_kind
+                        == Some(sinomo_api::dfs::maintenance::DfsRepairTransferKind::Repair)
+                    && !record.in_flight
+                    && record.transfer_request_id.is_none()
+                    && record.completed_transfer_request_id.is_none()
+                    && record.transfer_delivery_state
+                        == Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent)
+                    && record.attempts > 0
+                    && record.last_attempt_unix_nanos > 0
+                    && record.next_retry_unix_nanos >= record.last_attempt_unix_nanos
+                    && record.next_retry_unix_nanos != u64::MAX
+            }) && events.iter().any(|event| {
+                &event.source == owner
+                    && event.target == repair.missing_replica_node_id
+                    && event.origin == core_test::DfsTestRpcOrigin::RegisteredHost
+                    && event.phase == core_test::DfsTestRpcPhase::EndedWithoutResponse
+                    && event.route == sinomo_dfs::DFS_DATA_REPAIR_REPLICA_ROUTE
+                    && event.dfs_intent_id.as_deref() == Some(repair.intent_id.as_str())
+                    && event.dfs_file_system_id.as_ref() == Some(&repair.file_system_id)
+                    && event.dfs_object_id.as_ref() == Some(&repair.object_id)
+                    && event.dfs_version.as_ref() == Some(&repair.version)
+            })
+        })
 }
 
 fn drain_native_history_repairs(
