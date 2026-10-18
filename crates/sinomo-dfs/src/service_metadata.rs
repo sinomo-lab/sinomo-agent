@@ -839,7 +839,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         payload: DfsPreparedOperationPayload,
     ) -> Result<bool, DfsError> {
-        if self.recover_matching_metadata_receipt_prepare(&payload)? {
+        if self.recover_matching_metadata_receipt_prepare(&payload)?
+            || self.recover_matching_placement_intent_prepare(&payload)?
+        {
             return Ok(true);
         }
         let published = self.publish_prepared_operation(payload)?;
@@ -934,6 +936,97 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Err(DfsError::Metadata {
                 message: "original receipt prepare requires current native recovery authority"
                     .into(),
+            });
+        }
+        Ok(true)
+    }
+
+    /// A same-version placement producer retains a deterministic intent ID,
+    /// although its metadata envelope and observation timestamps are minted on
+    /// each attempt. Resume only its exact original intent-only preparation.
+    /// All other body fields, including captured object, read set, policy and
+    /// authority epoch, must agree. This is not a substitute for native recovery
+    /// of a different plan or authority round.
+    fn recover_matching_placement_intent_prepare(
+        &mut self,
+        proposed: &DfsPreparedOperationPayload,
+    ) -> Result<bool, DfsError> {
+        let [DfsPreparedMetadataEffect::PutIntent { intent: incoming }] =
+            proposed.metadata_effects.as_slice()
+        else {
+            return Ok(false);
+        };
+        if !incoming.intent_id.starts_with("placement:")
+            || incoming.status != crate::DfsWriteIntentStatus::Committed
+            || !incoming.publication.is_current()
+            || incoming.base_version.as_ref() != Some(&incoming.target_version)
+            || incoming.owner_epoch != proposed.owner_epoch
+            || !proposed.operation_id.starts_with("metadata:")
+            || proposed.transaction.transaction_id != format!("metadata:{}", proposed.operation_id)
+        {
+            return Ok(false);
+        }
+        let backend = self
+            .metadata_backend
+            .as_ref()
+            .ok_or_else(|| DfsError::Metadata {
+                message: "placement intent publication requires its native metadata backend".into(),
+            })?;
+        let mut matching = None;
+        for record in backend.prepared_operation_reservations(proposed)? {
+            if record.status != crate::DfsPreparedOperationStatus::Prepared {
+                continue;
+            }
+            record.validate()?;
+            let original = record.payload.as_ref();
+            if !original.operation_id.starts_with("metadata:")
+                || original.transaction.transaction_id
+                    != format!("metadata:{}", original.operation_id)
+            {
+                continue;
+            }
+            // The ordinary preparer may have captured this filesystem row.
+            // It remains in the ORIGINAL body that native recovery certifies.
+            let original_input = match original.metadata_effects.split_last() {
+                Some((DfsPreparedMetadataEffect::PutFileSystem { file_system }, input))
+                    if file_system.file_system_id == original.file_system_id =>
+                {
+                    input
+                }
+                _ => original.metadata_effects.as_slice(),
+            };
+            let [DfsPreparedMetadataEffect::PutIntent { intent: stored }] = original_input else {
+                continue;
+            };
+            let mut same_intent = incoming.clone();
+            same_intent.created_at = stored.created_at;
+            same_intent.updated_at = stored.updated_at;
+            if same_intent != *stored {
+                continue;
+            }
+            let mut same_body = proposed.clone();
+            same_body.operation_id = original.operation_id.clone();
+            same_body.transaction.transaction_id = original.transaction.transaction_id.clone();
+            same_body.transaction.created_at = original.transaction.created_at;
+            same_body.metadata_effects = original.metadata_effects.clone();
+            if same_body != *original {
+                continue;
+            }
+            if matching.replace(record).is_some() {
+                return Err(DfsError::Metadata {
+                    message: "multiple prepared publications claim the same exact placement intent"
+                        .into(),
+                });
+            }
+        }
+        let Some(record) = matching else {
+            return Ok(false);
+        };
+        if !self.recover_one_prepared_operation(record)? {
+            return Err(DfsError::Metadata {
+                message:
+                    "original placement intent prepare requires current native recovery authority"
+                        .into(),
             });
         }
         Ok(true)
@@ -2692,6 +2785,239 @@ fn original_filesystem_preparation_for_request(
 mod filesystem_preparation_recovery_tests {
     use super::*;
     use crate::DfsMetadataBackend;
+
+    #[test]
+    fn native_placement_intent_retry_recovers_the_original_prepared_body() {
+        let path = "/services/native-placement-intent-retry";
+        let (mut native, mut requester, shard) =
+            crate::test_support::current_native_metadata_service(
+                "native-placement-intent-retry",
+                3,
+                path,
+            )
+            .unwrap();
+        let participants = std::iter::once(shard.primary_node_id.clone())
+            .chain(shard.replica_node_ids.iter().cloned())
+            .collect::<Vec<_>>();
+        let stat = requester
+            .posix_write_file(
+                path,
+                b"original durable content",
+                crate::DfsWriteOptions::replicated_eventual(participants.clone()),
+            )
+            .unwrap();
+        drop(requester);
+        let shard = native
+            .metadata_shards()
+            .unwrap()
+            .into_iter()
+            .find(|current| {
+                current.file_system_id == shard.file_system_id && current.shard_id == shard.shard_id
+            })
+            .unwrap();
+        let participants = std::iter::once(shard.primary_node_id.clone())
+            .chain(shard.replica_node_ids.iter().cloned())
+            .collect::<Vec<_>>();
+        assert_eq!(participants.len(), 3);
+        let diagnostics = participants
+            .iter()
+            .map(|node| {
+                crate::native_boundary_diagnostics::capture_all_operations(
+                    native.data_dir(node).root(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut owner = native.metadata_primary_service(path).unwrap();
+        let object = owner
+            .metadata_backend()
+            .unwrap()
+            .get_object(&stat.object_id)
+            .unwrap()
+            .unwrap();
+        let intent = crate::DistributedWriteIntent {
+            publication: Default::default(),
+            intent_id: format!(
+                "placement:native-original:{}:{}",
+                stat.object_id, stat.version
+            ),
+            file_system_id: stat.file_system_id.clone(),
+            object_id: stat.object_id.clone(),
+            base_version: Some(stat.version.clone()),
+            target_version: stat.version.clone(),
+            requesting_node_id: shard.primary_node_id.clone(),
+            operation_id: None,
+            operation_order_token: None,
+            owner_epoch: shard.epoch,
+            desired_replica_nodes: participants[..2].to_vec(),
+            policy: crate::DfsReplicationPolicy::new(1, 2).unwrap(),
+            touch_parent_on_create: false,
+            create_predecessor_object_id: None,
+            state: crate::DfsWriteIntentState::Committed,
+        };
+        let scope = crate::DfsPreparedOperationScope {
+            file_system_id: shard.file_system_id.clone(),
+            shard_id: crate::DfsMetadataShardId::new(&shard.shard_id),
+            owner_epoch: shard.epoch,
+            operation_id: "placement-producer-admission".into(),
+        };
+        // Retain the genuine producer's admission while arranging its failed
+        // publication and exact retry. The actual native replicas supply ACKs.
+        let execution = owner.acquire_prepared_execution(&scope).unwrap();
+        let unavailable = shard.replica_node_ids[0].clone();
+        for route in [
+            crate::DFS_METADATA_JOURNAL_BATCH_ROUTE,
+            crate::DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE,
+        ] {
+            native.install_fault(crate::test_runtime::FaultRule {
+                source: Some(shard.primary_node_id.clone()),
+                target: Some(unavailable.clone()),
+                route: Some(route.into()),
+                call_id: None,
+                origin: None,
+                remaining_hits: 32,
+                action: crate::test_runtime::FaultAction::BudgetExhausted,
+            });
+        }
+        let error = owner
+            .put_metadata_intent_and_receipts(&intent, stat.content_hash.as_deref().unwrap(), &[])
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                crate::DfsError::MetadataRecoveryQuorumUnavailable {
+                    required: 3,
+                    verified: 2,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        let originals = owner
+            .metadata_backend()
+            .unwrap()
+            .list_prepared_operations()
+            .unwrap()
+            .into_iter()
+            .filter(|record| {
+                record.status == crate::DfsPreparedOperationStatus::Prepared
+                    && record.metadata_effects.iter().any(|effect| {
+                        matches!(effect,
+                    crate::DfsPreparedMetadataEffect::PutIntent { intent: row }
+                    if row.intent_id == intent.intent_id)
+                    })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(originals.len(), 1);
+        let original = originals[0].clone();
+        original.validate().unwrap();
+        assert!(
+            owner
+                .metadata_backend()
+                .unwrap()
+                .get_intent(&stat.object_id, &intent.intent_id)
+                .unwrap()
+                .is_none()
+        );
+        let sequence = owner
+            .metadata_backend()
+            .unwrap()
+            .journal_last_sequence()
+            .unwrap();
+        let mut conflicting = intent.clone();
+        conflicting.desired_replica_nodes.reverse();
+        let mut foreign_epoch = intent.clone();
+        foreign_epoch.owner_epoch += 1;
+        let mut foreign_coordinator = intent.clone();
+        foreign_coordinator.requesting_node_id = unavailable.clone();
+        for conflicting in [conflicting, foreign_epoch, foreign_coordinator] {
+            assert!(
+                owner
+                    .put_metadata_intent_and_receipts(
+                        &conflicting,
+                        stat.content_hash.as_deref().unwrap(),
+                        &[],
+                    )
+                    .is_err()
+            );
+            assert_eq!(
+                owner
+                    .metadata_backend()
+                    .unwrap()
+                    .journal_last_sequence()
+                    .unwrap(),
+                sequence
+            );
+            assert_eq!(
+                owner
+                    .metadata_backend()
+                    .unwrap()
+                    .prepared_operation_record(&original.operation_id)
+                    .unwrap(),
+                Some(original.clone())
+            );
+        }
+        assert_eq!(
+            native.remove_faults_matching(|rule| rule.source.as_ref()
+                == Some(&shard.primary_node_id)
+                && rule.target.as_ref() == Some(&unavailable)
+                && matches!(
+                    rule.route.as_deref(),
+                    Some(
+                        crate::DFS_METADATA_JOURNAL_BATCH_ROUTE
+                            | crate::DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE
+                    )
+                )
+                && matches!(
+                    rule.action,
+                    crate::test_runtime::FaultAction::BudgetExhausted
+                )),
+            2
+        );
+        native.assert_fault_budgets().unwrap();
+        owner
+            .put_metadata_intent_and_receipts(&intent, stat.content_hash.as_deref().unwrap(), &[])
+            .expect("the same placement producer must recover its original hidden body");
+        let committed = owner
+            .metadata_backend()
+            .unwrap()
+            .prepared_operation_record(&original.operation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            committed.status,
+            crate::DfsPreparedOperationStatus::Committed
+        );
+        assert_eq!(committed.digest, original.digest);
+        assert_eq!(committed.payload, original.payload);
+        assert_eq!(
+            owner
+                .metadata_backend()
+                .unwrap()
+                .get_object(&stat.object_id)
+                .unwrap(),
+            Some(object)
+        );
+        let committed_sequence = owner
+            .metadata_backend()
+            .unwrap()
+            .journal_last_sequence()
+            .unwrap();
+        owner
+            .put_metadata_intent_and_receipts(&intent, stat.content_hash.as_deref().unwrap(), &[])
+            .unwrap();
+        assert_eq!(
+            owner
+                .metadata_backend()
+                .unwrap()
+                .journal_last_sequence()
+                .unwrap(),
+            committed_sequence
+        );
+        drop(execution);
+        drop(owner);
+        drop(diagnostics);
+        native.close().unwrap();
+    }
 
     #[test]
     fn native_filesystem_recovery_confirms_reopened_durable_replica_before_background_replay() {
