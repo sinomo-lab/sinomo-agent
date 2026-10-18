@@ -665,11 +665,22 @@ impl FrameAppender {
         let mut frame_digest = blake3::Hasher::new_derive_key(FRAME_HASH_CONTEXT);
         frame_digest.update(&encoded_prefix);
         frame_digest.update(&header);
-        crate::io_trace::write_all(&mut self.file, &encoded_prefix)
-            .and_then(|()| crate::io_trace::write_all(&mut self.file, &header))
-            .map_err(|error| io_error(&self.path, error))?;
-        let mut remaining = payload_bytes;
         let mut buffer = [0; COPY_BUFFER_BYTES];
+        // Emit adjacent framing bytes together when they fit the existing
+        // streaming scratch space. Keep the exact format and bounded memory;
+        // large headers retain their ordinary streaming-file write path.
+        let header_end = encoded_prefix.len() + header.len();
+        if header_end <= buffer.len() {
+            buffer[..PREFIX_BYTES].copy_from_slice(&encoded_prefix);
+            buffer[PREFIX_BYTES..header_end].copy_from_slice(&header);
+            crate::io_trace::write_all(&mut self.file, &buffer[..header_end])
+                .map_err(|error| io_error(&self.path, error))?;
+        } else {
+            crate::io_trace::write_all(&mut self.file, &encoded_prefix)
+                .and_then(|()| crate::io_trace::write_all(&mut self.file, &header))
+                .map_err(|error| io_error(&self.path, error))?;
+        }
+        let mut remaining = payload_bytes;
         let mut payload_digest = blake3::Hasher::new();
         while remaining > 0 {
             let chunk = remaining.min(buffer.len() as u64) as usize;
@@ -689,8 +700,9 @@ impl FrameAppender {
             remaining -= received as u64;
         }
         let checksum = *frame_digest.finalize().as_bytes();
-        crate::io_trace::write_all(&mut self.file, &checksum)
-            .and_then(|()| crate::io_trace::write_all(&mut self.file, TRAILER_MAGIC))
+        buffer[..checksum.len()].copy_from_slice(&checksum);
+        buffer[checksum.len()..TRAILER_BYTES].copy_from_slice(TRAILER_MAGIC);
+        crate::io_trace::write_all(&mut self.file, &buffer[..TRAILER_BYTES])
             .map_err(|error| io_error(&self.path, error))?;
         let observed = self
             .file
