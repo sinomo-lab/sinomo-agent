@@ -94,9 +94,9 @@ mod metadata_snapshot;
 mod metadata_snapshot_image;
 pub use metadata_snapshot_image::DfsMetadataSnapshotImage;
 #[cfg(any(test, feature = "test-support"))]
-mod native_shard_trace;
-#[cfg(test)]
 mod native_boundary_diagnostics;
+#[cfg(any(test, feature = "test-support"))]
+mod native_shard_trace;
 #[cfg(any(test, feature = "test-support"))]
 pub use metadata_backend::prepared_operation::NativeHeldMetadataSnapshotV1;
 #[cfg(any(test, feature = "test-support"))]

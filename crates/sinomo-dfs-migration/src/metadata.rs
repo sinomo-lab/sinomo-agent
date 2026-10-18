@@ -757,6 +757,12 @@ impl MetadataConverter {
         // active owner. Yield without waiting, advancing or replacing its slot.
         // The same owner retains physical source custody and the exact cursor.
         let Some(mut session) = slot.try_lock_session() else {
+            #[cfg(test)]
+            sinomo_dfs::test_support::record_metadata_operation_boundary(
+                &destination,
+                "migration-prepare-slot-contended",
+                || serde_json::json!({"slot":format!("{:p}", Arc::as_ptr(&slot)),"shard":shard,"source":source,"budget":budget}),
+            );
             return Ok(DfsStoragePreparation::Pending {
                 processed_records: 0,
             });
@@ -826,6 +832,12 @@ impl MetadataConverter {
             phase = ?session.as_ref().map(|state| &state.progress.phase),
             "migration bounded metadata prepare started"
         );
+        #[cfg(test)]
+        sinomo_dfs::test_support::record_metadata_operation_boundary(
+            &destination,
+            "migration-prepare-turn-start",
+            || serde_json::json!({"slot":format!("{:p}", Arc::as_ptr(&slot)),"shard":shard,"source":source,"budget":budget,"phase":format!("{:?}",session.as_ref().map(|state| &state.progress.phase))}),
+        );
         let mut completion = None;
         let result = self.prepare_with_source_inner(
             &destination,
@@ -855,6 +867,12 @@ impl MetadataConverter {
             outcome = ?result,
             reset_session = result.is_err() || matches!(&result, Ok(DfsStoragePreparation::Ready)),
             "migration bounded metadata prepare returned"
+        );
+        #[cfg(test)]
+        sinomo_dfs::test_support::record_metadata_operation_boundary(
+            &destination,
+            "migration-prepare-turn-result",
+            || serde_json::json!({"slot":format!("{:p}", Arc::as_ptr(&slot)),"shard":shard,"source":source,"result":format!("{result:?}"),"phase":format!("{:?}",session.as_ref().map(|state| &state.progress.phase))}),
         );
         if result.is_err() || matches!(&result, Ok(DfsStoragePreparation::Ready)) {
             // Reset under the SAME per-root lock. Queued aliases can only
@@ -1948,6 +1966,12 @@ pub(crate) fn retain_source_fence(root: &Path) -> Result<Arc<File>> {
     match file.try_lock_exclusive() {
         Ok(()) => {}
         Err(source) if source.kind() == std::io::ErrorKind::WouldBlock => {
+            #[cfg(test)]
+            sinomo_dfs::test_support::record_metadata_operation_boundary(
+                root,
+                "migration-source-fence-contended",
+                || serde_json::json!({"path":path,"canonical_root":key,"error":source.to_string()}),
+            );
             return Err(MetadataBackendError::StoragePreparationPending {
                 root: key,
                 processed_records: 0,

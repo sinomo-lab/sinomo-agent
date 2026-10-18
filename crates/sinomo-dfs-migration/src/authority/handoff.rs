@@ -1099,7 +1099,22 @@ impl NativeImportAuthority {
                 image: Some(image.clone()),
                 reason: "current storage import".into(),
             };
-            match self.confirm_stage_node(&node, command, plan) {
+            let result = self.confirm_stage_node(&node, command, plan);
+            #[cfg(test)]
+            sinomo_dfs::test_support::record_metadata_operation_boundary(
+                &self.data_root,
+                "migration-stage-participant-result",
+                || {
+                    serde_json::json!({
+                        "node":node,"local":local,"handoff_id":h.handoff_id,
+                        "retiring":h.retiring_shard,"desired":h.desired_shard,
+                        "source_prefix":plan.source_cut.source_exact_prefix,
+                        "target_prefix":plan.target_exact_prefix,
+                        "result":format!("{result:?}"),
+                    })
+                },
+            );
+            match result {
                 Ok(()) => {
                     acknowledged.insert(node);
                 }

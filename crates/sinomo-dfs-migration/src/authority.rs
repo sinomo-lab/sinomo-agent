@@ -2328,14 +2328,28 @@ mod provider_lifecycle_tests {
     #[test]
     fn native_source_lookup_hints_rebuild_exactly_after_checkpoint_restart() {
         native_released_namespace_source_reopens_with_browser_budget(
-            false, false, false, false, 256, Some("source-cut.json"), None, true,
+            false,
+            false,
+            false,
+            false,
+            256,
+            Some("source-cut.json"),
+            None,
+            true,
         );
     }
 
     #[test]
     fn native_source_lookup_hints_rebuild_after_proposal_checkpoint_restart() {
         native_released_namespace_source_reopens_with_browser_budget(
-            false, false, false, false, 64, Some("import-proposal.json"), None, true,
+            false,
+            false,
+            false,
+            false,
+            64,
+            Some("import-proposal.json"),
+            None,
+            true,
         );
     }
 
@@ -2457,8 +2471,8 @@ mod provider_lifecycle_tests {
             Arc::new(Mutex::new(None));
         let provider_hold = Arc::clone(&hold_checkpoint);
         let provider_checkpoint = Arc::clone(&checkpoint);
-        let builder: sinomo_dfs::DfsStoragePreparationProviderBuilder =
-            Arc::new(move |context, lifecycle| {
+        let builder: sinomo_dfs::DfsStoragePreparationProviderBuilder = Arc::new(
+            move |context, lifecycle| {
                 let provider = storage_preparation_provider(context, lifecycle)?;
                 let pending = Arc::clone(&observe_pending);
                 let hold = Arc::clone(&provider_hold);
@@ -2479,15 +2493,22 @@ mod provider_lifecycle_tests {
                     }
                     let hints_before = if lose_lookup_hints {
                         match scope {
-                            sinomo_dfs::DfsStoragePreparationScope::Metadata(shard) =>
-                                Some((shard, crate::metadata::source_hint_count_for_test(root, shard)?)),
+                            sinomo_dfs::DfsStoragePreparationScope::Metadata(shard) => Some((
+                                shard,
+                                crate::metadata::source_hint_count_for_test(root, shard)?,
+                            )),
                             _ => None,
                         }
-                    } else { None };
+                    } else {
+                        None
+                    };
                     let result = provider(root, scope, budget)?;
                     if let Some((shard, before)) = hints_before {
                         let after = crate::metadata::source_hint_count_for_test(root, shard)?;
-                        assert!(after <= before + budget, "one preparation call exceeded its hint record budget: {before} -> {after}, budget {budget}");
+                        assert!(
+                            after <= before + budget,
+                            "one preparation call exceeded its hint record budget: {before} -> {after}, budget {budget}"
+                        );
                     }
                     if matches!(scope, sinomo_dfs::DfsStoragePreparationScope::Metadata(_)) {
                         if let sinomo_dfs::DfsStoragePreparation::Pending { processed_records } =
@@ -2515,7 +2536,8 @@ mod provider_lifecycle_tests {
                     }
                     Ok(result)
                 }))
-            });
+            },
+        );
         native
             .configure_component_factories(vec![
                 Arc::new(sinomo_dfs::component_factory_with_storage_preparation(builder).unwrap()),
@@ -3270,12 +3292,21 @@ mod provider_lifecycle_tests {
             assert_eq!(std::fs::read(&path).unwrap(), bytes);
             if lose_lookup_hints {
                 let hints = path.parent().unwrap().join("source-version-evidence");
-                let saved = path.parent().unwrap().join("source-version-evidence-loss-copy");
-                let original = std::fs::read_dir(&hints).unwrap().map(|entry| {
-                    let entry = entry.unwrap();
-                    (entry.file_name(), std::fs::read(entry.path()).unwrap())
-                }).collect::<Vec<_>>();
-                assert!(original.len() >= additional_source_files, "real producer coverage");
+                let saved = path
+                    .parent()
+                    .unwrap()
+                    .join("source-version-evidence-loss-copy");
+                let original = std::fs::read_dir(&hints)
+                    .unwrap()
+                    .map(|entry| {
+                        let entry = entry.unwrap();
+                        (entry.file_name(), std::fs::read(entry.path()).unwrap())
+                    })
+                    .collect::<Vec<_>>();
+                assert!(
+                    original.len() >= additional_source_files,
+                    "real producer coverage"
+                );
                 // Model loss of derived hints after the actual owner drains.
                 // Keep every original byte in this fresh fixture's loss copy.
                 std::fs::rename(&hints, &saved).unwrap();
@@ -3314,8 +3345,11 @@ mod provider_lifecycle_tests {
         recovered.expect("normal cold Main and real MIG provider must admit the released source");
         if let Some((hints, original)) = lost_hints {
             for (name, bytes) in original {
-                assert_eq!(std::fs::read(hints.join(name)).unwrap(), bytes,
-                    "restart must rebuild exact hints from the fenced source and durable replay");
+                assert_eq!(
+                    std::fs::read(hints.join(name)).unwrap(),
+                    bytes,
+                    "restart must rebuild exact hints from the fenced source and durable replay"
+                );
             }
         }
         if let Some((path, original)) = retained_checkpoint {
@@ -3619,6 +3653,15 @@ mod provider_lifecycle_tests {
 
     #[test]
     fn native_legacy3_users_receiver_checkpoint_excludes_independent_retained_root_clock() {
+        native_legacy3_users_receiver_checkpoint_case(false);
+    }
+
+    #[test]
+    fn native_legacy3_users_receiver_checkpoint_after_missed_peer_stage() {
+        native_legacy3_users_receiver_checkpoint_case(true);
+    }
+
+    fn native_legacy3_users_receiver_checkpoint_case(miss_peer_stage: bool) {
         use sinomo_core::object::{LengthMode, serde_ext};
         use sinomo_core::storage::migration::stream::{
             MigrationStreamReader, MigrationStreamWriter, StreamCursor,
@@ -3653,7 +3696,11 @@ mod provider_lifecycle_tests {
             generation: String,
         }
 
-        let name = "native-legacy3-users-receiver-checkpoint-root-clock";
+        let name = if miss_peer_stage {
+            "native-legacy3-users-receiver-checkpoint-root-clock-missed-peer"
+        } else {
+            "native-legacy3-users-receiver-checkpoint-root-clock"
+        };
         let (mut native, nodes) = placement_work::native_tests::native_migration_cluster(name, 3);
         let fs = sinomo_dfs::sifs_file_system_id();
         let scope = "users";
@@ -4089,9 +4136,52 @@ mod provider_lifecycle_tests {
                 snapshot.prefix_proof,
             ));
         }
+        let boundary_captures = nodes
+            .iter()
+            .map(|node| {
+                (
+                    node.clone(),
+                    sinomo_dfs::test_support::capture_metadata_operation_boundaries(
+                        native.data_dir(node).root(),
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+        if miss_peer_stage {
+            // Model the retained two-member activation proof using only a
+            // negative fault in the actual third participant's stage RPC.
+            native.install_fault(sinomo_dfs::test_support::DfsTestFaultRule {
+                source: Some(source_primary.clone()),
+                target: Some(nodes[2].clone()),
+                route: Some(staged_service::SNAPSHOT_ROUTE.into()),
+                call_id: None,
+                origin: None,
+                remaining_hits: 32,
+                action: sinomo_dfs::test_support::DfsTestFaultAction::BudgetExhausted,
+            });
+        }
         // The existing public whole-roster start mounts every stopped component
         // before normal preparation; its KV bootstrap is already complete.
         native.start_nodes().unwrap();
+        if miss_peer_stage {
+            native.clear_faults();
+            let context = native.component_context(&source_primary).unwrap();
+            let actual = placement_work::native_tests::canonical_migration_runtime(&context);
+            let key = sinomo_dfs::metadata_shard_membership_handoff_proof_key(&fs, scope);
+            let (entries, _) = actual.authority.read_exact(&[key]).unwrap();
+            let proof: sinomo_dfs::DfsMetadataShardMembershipHandoffProof =
+                entries[0].entry.as_ref().unwrap().decode().unwrap();
+            assert_eq!(proof.acknowledged_node_ids.len(), 2);
+            assert!(!proof.acknowledged_node_ids.contains(&nodes[2]));
+            sinomo_dfs::test_support::record_metadata_operation_boundary(
+                &native.data_dir(&source_primary).root(),
+                "controlled-missed-stage-activation",
+                || serde_json::json!({"proof":proof}),
+            );
+        }
+        for (_, capture) in &boundary_captures {
+            capture.checkpoint("users-after-import-start");
+        }
         assert_eq!(
             observe_stage(&native),
             original_record,
@@ -4175,8 +4265,62 @@ mod provider_lifecycle_tests {
         drop(owner);
         let mut client = native.client(&source_primary).unwrap();
         assert_eq!(client.posix_read_file_distributed(path).unwrap(), before);
+        // Import activation certifies both assignment majorities; it does not
+        // promise every configured participant has the converted clock yet.
+        // Require the real ordinary barrier before asserting full-shard write
+        // readiness. Its existing deadline and every original write/assertion
+        // remain unchanged; no new write identity repairs an uncertain result.
+        let synced = client.posix_sync_file(path, sinomo_dfs::DfsPosixSyncKind::File);
+        if synced.is_err() {
+            let rpc = native.rpc_observations();
+            for (_, capture) in &boundary_captures {
+                capture.dump_replication_failure(
+                    "users-post-import-sync",
+                    &current_users,
+                    &format!("{synced:?}"),
+                    &rpc,
+                );
+            }
+        }
+        let synced = synced.unwrap();
+        assert_eq!(synced.target.object_id, written.object_id);
+        assert_eq!(synced.target.version, written.version);
+        assert_eq!(
+            synced.metadata_certificate.quorum_size,
+            sinomo_dfs::dfs_metadata_replica_quorum_size(current_users.replica_node_ids.len())
+        );
+        assert_eq!(
+            synced.metadata_certificate.target.expected_shard.as_ref(),
+            Some(&current_users)
+        );
+        assert_eq!(
+            synced
+                .metadata_certificate
+                .acknowledged_node_ids
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            nodes.iter().cloned().collect::<BTreeSet<_>>()
+        );
+        sinomo_dfs::test_support::record_metadata_operation_boundary(
+            &native.data_dir(&source_primary).root(),
+            "users-post-import-sync-certificate",
+            || serde_json::json!({"certificate":synced}),
+        );
         let after = b"normal USERS body after original receiver checkpoint admission";
-        client.posix_write_file(path, after, options).unwrap();
+        let written_after = client.posix_write_file(path, after, options);
+        if written_after.is_err() {
+            let rpc = native.rpc_observations();
+            for (_, capture) in &boundary_captures {
+                capture.dump_replication_failure(
+                    "users-post-import-write",
+                    &current_users,
+                    &format!("{written_after:?}"),
+                    &rpc,
+                );
+            }
+        }
+        written_after.unwrap();
         assert_eq!(client.posix_read_file_distributed(path).unwrap(), after);
         drop(client);
         for node in &nodes {

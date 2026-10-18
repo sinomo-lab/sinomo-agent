@@ -880,13 +880,13 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
         Box::pin(async move {
             let _data_owner = data_owner?;
             validation?;
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             let diagnostic = command.authority_probe.as_ref().filter(|probe| {
                 matches!(&probe.operation, crate::DfsMetadataAuthorityOperation::PreparedOperation { operation_id, .. }
                     if crate::native_boundary_diagnostics::selected_operation(&data_dir.root(), operation_id))
             }).filter(|_| crate::native_boundary_diagnostics::enabled(&data_dir.root()))
                 .map(|probe| (data_dir.root(), probe.clone(), std::time::Instant::now()));
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             if let Some((root, probe, _)) = &diagnostic {
                 crate::native_boundary_diagnostics::record(
                     root,
@@ -957,7 +957,7 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
             let rejection_shard_id = command.batch.shard_id.clone();
             let rejection_next_after_sequence = command.batch.next_after_sequence;
             let admitted_context = context.clone();
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             let diagnostic_apply = diagnostic.clone();
             let operation = handle_daemon_dfs_resident_replica_operation(
                 &paths,
@@ -979,7 +979,7 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
                             Some(context),
                             command,
                         );
-                        #[cfg(test)]
+                        #[cfg(any(test, feature = "test-support"))]
                         if let Some((root, probe, started)) = &diagnostic_apply {
                             crate::native_boundary_diagnostics::record(root, "replica-authority-applied", || serde_json::json!({
                                 "probe": probe, "context": format!("{context:?}"), "response": response,
@@ -1008,7 +1008,7 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
                 },
             )
             .await;
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             if let Some((root, probe, started)) = &diagnostic {
                 crate::native_boundary_diagnostics::record(
                     root,

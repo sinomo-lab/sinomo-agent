@@ -225,7 +225,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             probe_timeout,
         )?;
         let trace_probe_ms = probe_started.elapsed().as_millis();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if let Some((root, _)) = self.native_publication_owner_for_observation() {
             if matches!(operation, DfsMetadataAuthorityOperation::PreparedOperation { operation_id, .. }
                 if crate::native_boundary_diagnostics::selected_operation(&root, operation_id))
@@ -354,18 +354,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         operation_deadline: Instant,
         timeout: Duration,
     ) -> Result<BTreeSet<NodeId>, DfsError> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let diagnostic_root = self.native_publication_owner_for_observation().map(|(root, _)| root)
             .filter(|root| crate::native_boundary_diagnostics::enabled(root)
                 && matches!(operation, DfsMetadataAuthorityOperation::PreparedOperation { operation_id, .. }
                     if crate::native_boundary_diagnostics::selected_operation(root, operation_id)));
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let mut diagnostic_groups = Vec::new();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let mut diagnostic_unavailable = Vec::new();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let mut diagnostic_direct = None;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let mut diagnostic_routed = Vec::new();
         let mut request_ids = Vec::with_capacity(targets.len());
         let mut request_targets = Vec::with_capacity(targets.len());
@@ -439,7 +439,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     return Ok(acknowledged_node_ids);
                 }
                 let Some(target_batch) = target_batch else {
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "test-support"))]
                     if diagnostic_root.is_some() {
                         diagnostic_unavailable
                             .push((target_node_ids.clone(), replicated_through_sequence));
@@ -497,7 +497,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             // catch-up value. The duration-aware transport keeps that local
             // work under `operation_deadline` and begins this shorter budget
             // only after encoding, immediately before peer fan-out.
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             if diagnostic_root.is_some() {
                 diagnostic_groups = authority_groups
                     .iter()
@@ -518,7 +518,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     &authority_groups,
                     timeout,
                 );
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             if diagnostic_root.is_some() {
                 diagnostic_direct = Some(direct_result.clone());
             }
@@ -657,7 +657,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         &target_node_id,
                         DfsNetworkMessage::MetadataJournalBatch(command),
                     );
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "test-support"))]
                     if diagnostic_root.is_some() {
                         diagnostic_routed.push((
                             target_node_id.clone(),
@@ -726,7 +726,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             self.transport.set_operation_deadline(previous_deadline);
             routed_result
         })();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(root) = &diagnostic_root {
             crate::native_boundary_diagnostics::record(
                 root,
