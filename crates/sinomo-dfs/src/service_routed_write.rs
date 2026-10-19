@@ -1189,6 +1189,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // from the final write body. Resume them only on this explicit replay;
         // receipt-driven commit readiness must not recursively re-enter it.
         self.recover_prepared_intent_opening_for_retry(intent, content_hash, content_size_bytes)?;
+        if self.metadata_backend.is_some() && !self.transport.delegates_local_namespace_authority()
+        {
+            // The first native prepare can be rejected by another reservation
+            // after the resident owner has retained its input and real receipt.
+            // There is then no durable body for the recovery helpers above to
+            // resume. An explicit exact replay must also revisit ordinary
+            // commit readiness; returning the resident Pending outcome alone
+            // cannot make progress once that other reservation has settled.
+            // This keeps the same intent/transfer and all native author,
+            // namespace, content and participant checks. Proxy callers never
+            // acquire author authority through this path.
+            self.try_apply_committed_intent_if_ready(&intent.intent_id)?;
+        }
         match self.write_outcome(&intent.intent_id) {
             Ok(outcome) => Ok(Some(outcome)),
             Err(error) if matches!(intent.state, DfsWriteIntentState::AwaitingReceipts) => {

@@ -668,6 +668,143 @@ fn check_recovered_original_write(explicit_retry: bool) {
 }
 
 #[test]
+fn native_explicit_retry_resumes_ready_intent_after_overlapping_prepare() {
+    let (mut runtime, mut requester, shard) = crate::test_support::current_native_metadata_service(
+        "native-ready-retry-after-overlap",
+        3,
+        "/services",
+    )
+    .unwrap();
+    let path = "/services/ready-retry-after-overlap";
+    let options = DfsWriteOptions {
+        policy: DfsReplicationPolicy::new(1, 2).unwrap(),
+        replica_candidates: vec![
+            shard.primary_node_id.clone(),
+            shard.replica_node_ids[0].clone(),
+        ],
+        wait_for_commit: true,
+        foreground_replica_repair: false,
+    };
+    let initial = requester
+        .posix_write_file(path, b"original", options.clone())
+        .unwrap();
+    requester
+        .posix_sync_file(path, DfsPosixSyncKind::File)
+        .unwrap();
+    drop(requester);
+    let mut owner = runtime.metadata_primary_service(path).unwrap();
+    let interrupted = shard.replica_node_ids[1].clone();
+    runtime.stop_node(&interrupted).unwrap();
+
+    // A genuine different metadata publication owns this object's reservation.
+    // Keep its original durable body while an assigned participant is absent.
+    let mut changed = owner
+        .metadata_backend()
+        .unwrap()
+        .get_object(&initial.object_id)
+        .unwrap()
+        .unwrap();
+    changed.accessed_at_unix_nanos += 1;
+    assert!(owner.add_object_metadata(changed.clone()).is_err());
+    let other = owner
+        .metadata_backend()
+        .unwrap()
+        .list_prepared_operations()
+        .unwrap()
+        .into_iter()
+        .find(|record| {
+            record.payload.metadata_effects.iter().any(|effect| {
+                matches!(effect, DfsPreparedMetadataEffect::PutObject { object }
+                    if object.object_id == initial.object_id
+                    && object.accessed_at_unix_nanos == changed.accessed_at_unix_nanos)
+            })
+        })
+        .unwrap();
+    other.validate().unwrap();
+    assert_eq!(other.status, DfsPreparedOperationStatus::Prepared);
+
+    let operation = "native-original-before-prepare-overlap";
+    let error = owner
+        .posix_write_file_with_operation_id(path, b"recovered", options.clone(), operation)
+        .unwrap_err();
+    assert!(error.to_string().contains(&format!(
+        "overlaps active prepare {}",
+        other.digest.operation_id
+    )));
+    let intent_id =
+        crate::intent::stable_write_intent_id(&owner.node_id, &initial.object_id, operation);
+    let intent = owner.coordinator.intent(&intent_id).unwrap().clone();
+    assert_eq!(intent.state, DfsWriteIntentState::AwaitingReceipts);
+    assert_eq!(owner.coordinator.durable_receipt_count(&intent_id), 1);
+    assert!(owner.coordinator.is_commit_ready(&intent_id).unwrap());
+    assert!(
+        owner
+            .metadata_backend()
+            .unwrap()
+            .prepared_operation_record(&format!("write:{intent_id}"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        owner
+            .metadata_backend()
+            .unwrap()
+            .get_intent(&initial.object_id, &intent_id)
+            .unwrap()
+            .is_none()
+    );
+    let pending = owner.writes.pending_writes.get(&intent_id).unwrap();
+    let original_hash = pending.content_hash.clone();
+    let original_size = pending.size_bytes;
+
+    // An exact retry cannot be replaced with another payload, even before its
+    // first native prepare exists. Preserve the actual retained transfer.
+    assert!(matches!(
+        owner.posix_write_file_with_operation_id(path, b"different", options.clone(), operation),
+        Err(DfsPosixError::Dfs(
+            DfsError::WriteOperationIdConflict { .. }
+        ))
+    ));
+    let pending = owner.writes.pending_writes.get(&intent_id).unwrap();
+    assert_eq!(pending.content_hash, original_hash);
+    assert_eq!(pending.size_bytes, original_size);
+
+    runtime.reopen_node(interrupted).unwrap();
+    owner.recover_one_prepared_operation(other.clone()).unwrap();
+    let settled = owner
+        .metadata_backend()
+        .unwrap()
+        .prepared_operation_record(&other.digest.operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(settled.digest, other.digest);
+    assert_eq!(settled.payload, other.payload);
+    assert_eq!(settled.status, DfsPreparedOperationStatus::Committed);
+
+    let result = owner
+        .posix_write_file_with_operation_id(path, b"recovered", options, operation)
+        .expect("the exact receipt-ready write must resume after the other prepare commits");
+    assert_eq!(result.version, intent.target_version);
+    assert_eq!(result.content_hash.as_deref(), Some(original_hash.as_str()));
+    assert_eq!(
+        owner.posix_read_file_distributed(path).unwrap(),
+        b"recovered"
+    );
+    let committed = owner
+        .metadata_backend()
+        .unwrap()
+        .prepared_operation_record(&format!("write:{intent_id}"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(committed.status, DfsPreparedOperationStatus::Committed);
+    assert!(matches!(owner.write_outcome(&intent_id).unwrap(),
+        NetworkedDfsWriteOutcome::Committed { version, content_hash, .. }
+        if version == intent.target_version && content_hash == original_hash));
+    drop(owner);
+    runtime.close().unwrap();
+}
+
+#[test]
 fn posix_create_cleans_transient_metadata_when_publication_authorization_is_unavailable() {
     use crate::test_runtime::{DfsTestRuntime, FaultAction, FaultRule, RpcPhase};
     let nodes = DfsTestRuntime::ordered_node_ids("native-create-publication-unavailable", 3);
