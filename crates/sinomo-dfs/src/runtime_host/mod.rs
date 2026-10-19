@@ -3163,7 +3163,7 @@ pub fn owned_storage_import_control_plane_client(
 pub use maintenance_host::{queue_namespace_reconciliation_work, wake_namespace_reconciliation};
 
 #[cfg(test)]
-mod native_request_outcome_test;
+pub(crate) mod native_request_outcome_test;
 
 #[cfg(test)]
 mod storage_preparation_error_tests {

@@ -22,6 +22,44 @@ struct Gate {
 }
 static GATES: OnceLock<Mutex<BTreeMap<PathBuf, Arc<Gate>>>> = OnceLock::new();
 
+/// Observe only the already-installed native slot. A caller shell's cached
+/// replay cursor is not the resident materializer's completion boundary.
+#[cfg(test)]
+pub(crate) fn observe_existing_materialization(
+    data_dir: &SinomoDataDir,
+    file_system_id: &crate::DfsFileSystemId,
+    shard_id: &crate::DfsMetadataShardId,
+    runtime: &tokio::runtime::Handle,
+) -> Result<Option<DfsTestMaterializationCapture>, String> {
+    let paths = ClusterPaths::new(data_dir);
+    let peer = read_daemon_dfs_message_peer_snapshot(&paths)
+        .map_err(|error| error.to_string())?
+        .ok_or("native peer identity is unavailable")?;
+    let key = DaemonDfsMutationLaneKey {
+        file_system_id: file_system_id.clone(),
+        shard_id: shard_id.clone(),
+    };
+    let shard =
+        daemon_dfs_message_cache_exact_admission_handle(data_dir, &paths, &peer, &key, runtime)
+            .map_err(|error| error.to_string())?
+            .ok_or(
+                "the exact current resident shard is unavailable; observation cannot open another",
+            )?;
+    let Some(backend) = shard.try_checkout().map_err(|error| error.to_string())? else {
+        return Ok(None);
+    };
+    let (durable, materialized, prefix) = backend.replica_materialization_boundary_state();
+    Ok(Some(DfsTestMaterializationCapture {
+        physical_root: crate::default_dfs_metadata_shards_root(data_dir).join(&shard_id.0),
+        file_system_id: file_system_id.clone(),
+        shard_id: shard_id.clone(),
+        durable_sequence: Some(durable),
+        materialized_sequence: Some(materialized),
+        prefix,
+        unavailable: None,
+    }))
+}
+
 pub struct DfsTestMaterializationPause {
     root: PathBuf,
     gate: Arc<Gate>,

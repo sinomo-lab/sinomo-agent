@@ -5009,6 +5009,81 @@ mod normal_native_kv_admission_tests {
     use super::*;
     use sinomo_core::kv::{KvOp, KvTxn, KvTxnRequest};
 
+    async fn observe_mounted_native_outcome(
+        cluster: &dyn sinomo_core::service::ClusterAccess,
+        request_id: &sinomo_core::kv::KvRequestId,
+        on_busy: impl FnMut(),
+    ) -> Result<sinomo_core::kv::ClusterKvRequestOutcomeRead, sinomo_core::service::ServiceError>
+    {
+        crate::runtime_host::native_request_outcome_test::admitted_native_request_outcome_observing(
+            cluster, request_id, on_busy,
+        )
+        .await
+    }
+
+    #[test]
+    fn mounted_native_outcome_observation_keeps_original_identity_across_real_busy_admission() {
+        let (mut native, nodes) =
+            DfsTestRuntime::start_cluster("native-original-outcome-busy", 1).unwrap();
+        let context = native.component_context(&nodes[0]).unwrap();
+        let cluster = context.cluster_access().unwrap();
+        let request = KvTxnRequest::generated(KvTxn {
+            compares: Vec::new(),
+            success: vec![KvOp::Put {
+                key: "/test/native-original-outcome-busy".into(),
+                value: b"original body".to_vec(),
+                lease_id: None,
+            }],
+            failure: Vec::new(),
+        });
+        let committed = executor()
+            .block_on(cluster.kv_commit_compact_async(request.clone()))
+            .unwrap();
+        assert!(committed.txn_response.as_ref().unwrap().succeeded);
+        let paths = ClusterPaths::new(native.data_dir(&nodes[0]));
+        let held =
+            sinomo_core::kv::lock_cluster_kv_raft_operation_for_paths(&paths.kv_paths()).unwrap();
+        let (release, released) = std::sync::mpsc::channel();
+        let budget = sinomo_core::cluster::ClusterControlPlaneTimeouts::default_daemon_transport()
+            .kv_txn_quorum_options(true)
+            .raft_append_timeout;
+        let holder = std::thread::spawn(move || {
+            let observed_busy = released.recv_timeout(budget);
+            drop(held);
+            observed_busy.expect("the real native read must encounter the owned admission");
+        });
+        let mut observed_busy = 0;
+        let result = executor().block_on(observe_mounted_native_outcome(
+            cluster.as_ref(),
+            &request.request_id,
+            || {
+                observed_busy += 1;
+                if observed_busy == 1 {
+                    release.send(()).unwrap();
+                }
+            },
+        ));
+        // Release and join even if an unexpected error precedes the busy branch.
+        let _ = release.send(());
+        holder.join().unwrap();
+        assert!(
+            observed_busy > 0,
+            "negative control must observe actual native contention"
+        );
+        let outcome =
+            result.expect("the same original observation must finish after admission is released");
+        sinomo_core::kv::validate_cluster_kv_request_outcome_read(&outcome).unwrap();
+        let sinomo_core::kv::KvRequestOutcome::Committed(record) = outcome.outcome else {
+            panic!("the original native committed receipt must remain available");
+        };
+        assert_eq!(record.request_id, request.request_id);
+        assert_eq!(record.command_digest, committed.command_digest);
+        assert_eq!(record.txn_response, committed.txn_response);
+        drop(cluster);
+        drop(context);
+        native.close().unwrap();
+    }
+
     #[test]
     fn mounted_native_kv_routes_work_before_dfs_preparation_and_stop_removes_admission() {
         let name = "native-core-kv-before-dfs-prepared";
@@ -5061,11 +5136,11 @@ mod normal_native_kv_admission_tests {
         let response: sinomo_core::kv::ClusterKvTxnRpcResponse = response.decode_body().unwrap();
         assert!(response.txn_response.as_ref().unwrap().succeeded);
         let outcome = executor()
-            .block_on(
-                endpoint
-                    .cluster
-                    .kv_request_outcome_authoritative_async(request.request_id.clone()),
-            )
+            .block_on(observe_mounted_native_outcome(
+                endpoint.cluster.as_ref(),
+                &request.request_id,
+                || {},
+            ))
             .unwrap();
         sinomo_core::kv::validate_cluster_kv_request_outcome_read(&outcome).unwrap();
         let sinomo_core::kv::KvRequestOutcome::Committed(record) = outcome.outcome else {

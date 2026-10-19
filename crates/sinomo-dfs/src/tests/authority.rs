@@ -3140,11 +3140,27 @@ fn sifs_cluster_authority_local_follower_bootstrap_stays_on_incremental_stream()
                 DfsWriteOptions::replicated_eventual(vec![primary_node.clone()]),
             )
             .unwrap();
+        let shard_id = DfsMetadataShardId::new(config.shard_id.clone());
+        let publication_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+        let published_sequence =
+            captured_native_publication_prefix(&runtime, &primary_node, &shard_id, &stat);
         let publication = runtime
-            .maintenance_tick(&primary_node, sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
+            .maintenance_tick(
+                &primary_node,
+                publication_deadline.saturating_duration_since(Instant::now()),
+            )
             .unwrap();
         assert!(publication.outcome.is_ok(), "{:?}", publication.outcome);
         assert_eq!(publication.omitted_kv_event_count, 0);
+        observe_native_follower_prefix(
+            &runtime,
+            &follower_node,
+            &shard_id,
+            published_sequence,
+            publication_deadline,
+            |_| {},
+        )
+        .unwrap();
         assert_eq!(follower.posix_stat(&file).unwrap().version, stat.version);
         assert_eq!(follower.posix_read_file_distributed(&file).unwrap(), bytes);
     }
@@ -3170,6 +3186,145 @@ fn sifs_cluster_authority_local_follower_bootstrap_stays_on_incremental_stream()
             && event.phase == crate::test_support::DfsTestRpcPhase::BeforeDispatch),
         "actual authority-local bootstrap keeps normal follow-up writes on incremental publication"
     );
+    drop(follower);
+    drop(primary);
+    runtime.close().unwrap();
+}
+
+fn observe_native_follower_prefix(
+    runtime: &crate::test_runtime::DfsTestRuntime,
+    follower_node: &NodeId,
+    shard: &DfsMetadataShardId,
+    published_sequence: u64,
+    deadline: Instant,
+    mut on_lag: impl FnMut(u64),
+) -> std::result::Result<(), String> {
+    // Ingress ACK proves durable journal custody, not completion of its
+    // separate materializer. Observe that real owner under the SAME deadline
+    // captured before maintenance; never pull/apply a replacement journal here.
+    loop {
+        if Instant::now() >= deadline {
+            return Err(
+                "native follower observation exhausted the original publication deadline".into(),
+            );
+        }
+        if let Some(observed) =
+            crate::runtime_host::materialization_test::observe_existing_materialization(
+                runtime.data_dir(follower_node),
+                &sifs_file_system_id(),
+                shard,
+                &runtime.runtime_handle(),
+            )?
+        {
+            let materialized = observed.materialized_sequence.unwrap();
+            let durable = observed.durable_sequence.unwrap();
+            assert!(materialized <= durable, "{observed:?}");
+            if materialized >= published_sequence {
+                let prefix = observed
+                    .prefix
+                    .as_ref()
+                    .expect("materialized prefix evidence");
+                assert!(prefix.is_well_formed());
+                assert_eq!(prefix.journal_sequence, materialized);
+                return Ok(());
+            }
+            on_lag(materialized);
+        }
+        std::thread::sleep(
+            SIFS_CLUSTER_PUMP_IDLE_SLEEP.min(deadline.saturating_duration_since(Instant::now())),
+        );
+    }
+}
+
+fn captured_native_publication_prefix(
+    runtime: &crate::test_runtime::DfsTestRuntime,
+    primary: &NodeId,
+    shard: &DfsMetadataShardId,
+    published: &DfsStat,
+) -> u64 {
+    // The caller shell's cached prefix is not the served Main's publication
+    // cut. Inspect the actual source store without obtaining author authority.
+    let source = LocalSobjMetadataBackend::open_for_inspection(
+        shard.clone(),
+        default_dfs_metadata_shards_root(runtime.data_dir(primary)).join(&shard.0),
+    )
+    .unwrap();
+    let object = source.get_object(&published.object_id).unwrap().unwrap();
+    assert_eq!(object.version, published.version);
+    assert_eq!(object.content_hash, published.content_hash);
+    let snapshot = source.export_table_snapshot();
+    assert!(snapshot.prefix_proof.is_well_formed());
+    assert_eq!(
+        snapshot.prefix_proof.journal_sequence,
+        snapshot.materialized_through_sequence
+    );
+    snapshot.materialized_through_sequence
+}
+
+#[test]
+fn native_follower_observation_waits_for_actual_published_prefix_materialization() {
+    let name = "native-follower-observed-prefix-gap";
+    let (runtime, mut primary, config) =
+        crate::test_support::current_native_metadata_service(name, 2, "/users").unwrap();
+    let follower_node = config.replica_node_ids[0].clone();
+    let mut follower = runtime.client(&follower_node).unwrap();
+    let shard = DfsMetadataShardId::new(config.shard_id.clone());
+    let pause = runtime
+        .pause_replica_materialization(&follower_node, &shard)
+        .unwrap();
+    let path = "/users/native-follower-observed-prefix-gap";
+    let original = primary.posix_mkdir(path).unwrap();
+    let capture = runtime
+        .wait_paused_materialization(&pause, Duration::from_secs(2))
+        .unwrap();
+    assert!(capture.unavailable.is_none(), "{capture:?}");
+    assert!(capture.durable_sequence.unwrap() > capture.materialized_sequence.unwrap());
+    assert!(matches!(
+        follower.posix_stat(path),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+    let published =
+        captured_native_publication_prefix(&runtime, &config.primary_node_id, &shard, &original);
+    assert!(published > capture.materialized_sequence.unwrap());
+    assert!(
+        observe_native_follower_prefix(
+            &runtime,
+            &follower_node,
+            &shard,
+            published,
+            Instant::now(),
+            |_| panic!("an expired observer must not request more work"),
+        )
+        .is_err()
+    );
+    let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    let mut saw_gap = false;
+    let observed = observe_native_follower_prefix(
+        &runtime,
+        &follower_node,
+        &shard,
+        published,
+        deadline,
+        |cursor| {
+            assert!(cursor < published);
+            saw_gap = true;
+            pause.release();
+        },
+    );
+    pause.release();
+    assert!(
+        saw_gap,
+        "the actual materialization owner must expose its pending cut"
+    );
+    observed.expect("durable ingress must be observed as materialized before local stat");
+    let actual = follower.posix_stat(path).unwrap();
+    assert_eq!(actual.object_id, original.object_id);
+    assert_eq!(actual.version, original.version);
+    assert_eq!(
+        follower.posix_stat_distributed(path).unwrap().object_id,
+        original.object_id
+    );
+    drop(pause);
     drop(follower);
     drop(primary);
     runtime.close().unwrap();

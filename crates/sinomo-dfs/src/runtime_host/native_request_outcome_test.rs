@@ -5,9 +5,19 @@ use super::*;
 // about a concurrent local Raft lock. Retry only the explicit fail-closed busy
 // result under the SAME original daemon read deadline. Never execute or replay
 // transaction DATA to obtain an outcome, and never retry other authority errors.
-async fn admitted_native_request_outcome(
+pub(crate) async fn admitted_native_request_outcome(
     cluster: &dyn sinomo_core::service::ClusterAccess,
     request_id: &sinomo_core::kv::KvRequestId,
+) -> Result<sinomo_core::kv::ClusterKvRequestOutcomeRead, sinomo_core::service::ServiceError> {
+    admitted_native_request_outcome_observing(cluster, request_id, || {}).await
+}
+
+/// Observe only a real native busy rejection; this supplies no authority or
+/// receipt and changes neither the original deadline nor production admission.
+pub(crate) async fn admitted_native_request_outcome_observing(
+    cluster: &dyn sinomo_core::service::ClusterAccess,
+    request_id: &sinomo_core::kv::KvRequestId,
+    mut on_busy: impl FnMut(),
 ) -> Result<sinomo_core::kv::ClusterKvRequestOutcomeRead, sinomo_core::service::ServiceError> {
     let budget = sinomo_core::cluster::ClusterControlPlaneTimeouts::default_daemon_transport()
         .kv_txn_quorum_options(true)
@@ -30,6 +40,7 @@ async fn admitted_native_request_outcome(
             )) if detail
                 == "local Raft admission is busy and no authority accepted the forwarded request-outcome read; local election was skipped" =>
             {
+                on_busy();
                 tokio::task::yield_now().await;
             }
             result => return result,
