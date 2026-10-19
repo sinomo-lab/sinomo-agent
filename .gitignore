@@ -9,6 +9,7 @@
 /benchmark-results
 /crates/sinomo-agent/tests/scenarios/*.recorded.json
 /.codegraph/
+/.archify/
 /_apalache-out/
 
 /.claude/settings.local.json
