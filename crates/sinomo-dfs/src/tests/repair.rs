@@ -355,6 +355,37 @@ fn native_routed_manifest_write(
     ContentManifest,
     NetworkedDfsWriteOutcome,
 ) {
+    native_routed_manifest_write_with_response_pause(
+        name,
+        min_commit,
+        desired,
+        primary_is_desired,
+        foreground,
+        deny_third_target,
+        deny_primary_fetch,
+        None,
+    )
+}
+
+fn native_routed_manifest_write_with_response_pause(
+    name: &str,
+    min_commit: usize,
+    desired: usize,
+    primary_is_desired: bool,
+    foreground: bool,
+    deny_third_target: bool,
+    deny_primary_fetch: bool,
+    response_pause: Option<std::sync::Arc<tokio::sync::Semaphore>>,
+) -> (
+    crate::test_support::DfsTestRuntime,
+    NodeId,
+    NodeId,
+    NodeId,
+    NetworkedDfsService<DfsNodeTransport>,
+    DfsWriteRequest,
+    ContentManifest,
+    NetworkedDfsWriteOutcome,
+) {
     let (runtime, service, config) =
         crate::test_support::current_native_metadata_service(name, 3, "/services").unwrap();
     let primary = config.primary_node_id;
@@ -426,6 +457,17 @@ fn native_routed_manifest_write(
     };
     let mut policy = DfsReplicationPolicy::new(min_commit, desired).unwrap();
     policy.required_node_ids = candidates.clone();
+    if let Some(gate) = response_pause {
+        runtime.install_fault(crate::test_support::DfsTestFaultRule {
+            source: Some(primary.clone()),
+            target: Some(requester.clone()),
+            route: Some(DFS_DATA_DISTRIBUTED_WRITE_RESPONSE_ROUTE.into()),
+            call_id: None,
+            origin: None,
+            remaining_hits: 1,
+            action: crate::test_support::DfsTestFaultAction::PauseAfterDispatch(gate),
+        });
+    }
     let outcome = writer
         .write_distributed_manifest_with_candidates(
             request.clone(),
@@ -3049,6 +3091,180 @@ fn foreground_w1_postcommit_targets_use_repair_not_stage() {
     runtime.close().unwrap();
 }
 
+fn native_completed_write_observations(
+    runtime: &crate::test_support::DfsTestRuntime,
+    primary: &NodeId,
+    requester: &NodeId,
+    write: &DfsWriteRequest,
+    request_id: &str,
+    deadline: Instant,
+    mut on_pending: impl FnMut(),
+) -> Vec<crate::test_runtime::RpcObservation> {
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "actual response RPC completion exhausted the original write-response deadline for {request_id}"
+        );
+        assert_eq!(
+            runtime.observation_dropped_count(),
+            0,
+            "missing observations cannot prove response completion"
+        );
+        let calls = runtime.rpc_observations();
+        let decoded = calls.iter().find(|row| {
+            row.source == *primary
+                && row.target == *requester
+                && row.route == DFS_DATA_DISTRIBUTED_WRITE_RESPONSE_ROUTE
+                && row.phase == crate::test_runtime::RpcPhase::Decoded
+                && row.dfs_request_id.as_deref() == Some(request_id)
+                && row.dfs_object_id.as_ref() == Some(&write.object_id)
+                && row.dfs_version.as_ref() == Some(&write.target_version)
+        });
+        if let Some(decoded) = decoded {
+            assert!(
+                !calls.iter().any(|row| row.call_id == decoded.call_id
+                    && row.phase == crate::test_runtime::RpcPhase::EndedWithoutResponse),
+                "actual response RPC ended without completion for {request_id}: {calls:?}"
+            );
+            if calls.iter().any(|row| {
+                row.call_id == decoded.call_id
+                    && row.phase == crate::test_runtime::RpcPhase::Completed
+            }) {
+                assert!(
+                    Instant::now() < deadline,
+                    "response observation crossed the original absolute deadline"
+                );
+                return calls;
+            }
+        }
+        on_pending();
+        std::thread::sleep(
+            Duration::from_millis(1).min(deadline.saturating_duration_since(Instant::now())),
+        );
+    }
+}
+
+#[test]
+fn native_write_completion_observation_waits_for_actual_response_rpc() {
+    let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let (runtime, primary, requester, replica, mut writer, request, _, outcome) =
+        native_routed_manifest_write_with_response_pause(
+            "native-response-completion-boundary",
+            2,
+            3,
+            true,
+            false,
+            true,
+            false,
+            Some(gate.clone()),
+        );
+    assert!(matches!(outcome, NetworkedDfsWriteOutcome::Pending { .. }));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let events = writer
+        .process_incoming_until_pending_routed_writes_ready(
+            deadline.saturating_duration_since(Instant::now()),
+        )
+        .unwrap();
+    let response_id = events
+        .iter()
+        .find_map(|event| match event {
+            NetworkedDfsServiceEvent::RemoteWriteCompleted {
+                request_id,
+                object_id,
+                primary_node_id,
+                result:
+                    DfsDistributedWriteResult::Outcome {
+                        outcome:
+                            NetworkedDfsWriteOutcome::Committed {
+                                version,
+                                repair_jobs,
+                                ..
+                            },
+                    },
+            } if object_id == &request.object_id
+                && primary_node_id == &primary
+                && version == &request.target_version
+                && repair_jobs
+                    .iter()
+                    .any(|job| job.missing_replica_node_id == replica) =>
+            {
+                Some(request_id.clone())
+            }
+            _ => None,
+        })
+        .expect("actual matching deferred committed response");
+    let before = runtime.rpc_observations();
+    let decoded = before
+        .iter()
+        .find(|row| {
+            row.phase == crate::test_runtime::RpcPhase::Decoded
+                && row.dfs_request_id.as_deref() == Some(&response_id)
+                && row.dfs_object_id.as_ref() == Some(&request.object_id)
+                && row.dfs_version.as_ref() == Some(&request.target_version)
+        })
+        .unwrap();
+    let call_id = decoded.call_id;
+    assert!(
+        !before
+            .iter()
+            .any(|row| row.call_id == call_id
+                && row.phase == crate::test_runtime::RpcPhase::Completed)
+    );
+    let mut released = false;
+    let observed = native_completed_write_observations(
+        &runtime,
+        &primary,
+        &requester,
+        &request,
+        &response_id,
+        deadline,
+        || {
+            if !released {
+                released = true;
+                gate.add_permits(1);
+            }
+        },
+    );
+    eprintln!(
+        "actual response-boundary request={request:?} response={response_id} call={call_id} events={events:?} before={:?} observed={:?}",
+        before
+            .iter()
+            .filter(|row| row.call_id == call_id)
+            .collect::<Vec<_>>(),
+        observed
+            .iter()
+            .filter(|row| row.call_id == call_id)
+            .collect::<Vec<_>>()
+    );
+    // Drain the controlled old failure before asserting, without replacing the
+    // actual response or acknowledging anything on its behalf.
+    if !released {
+        gate.add_permits(1);
+    }
+    let complete = observed.iter().position(|row| {
+        row.call_id == call_id && row.phase == crate::test_runtime::RpcPhase::Completed
+    });
+    let no_early_repair = complete.is_some_and(|end| {
+        !observed.iter().take(end + 1).any(|row| {
+            row.source == primary
+                && row.target == replica
+                && row.phase == crate::test_runtime::RpcPhase::BeforeDispatch
+                && [DFS_DATA_STAGE_BLOB_ROUTE, DFS_DATA_REPAIR_REPLICA_ROUTE]
+                    .contains(&row.route.as_str())
+        })
+    });
+    drop(writer);
+    runtime.close().unwrap();
+    assert!(
+        complete.is_some(),
+        "the real RPC completion must be observed within the original deadline"
+    );
+    assert!(
+        no_early_repair,
+        "deferred repair cannot precede actual response completion"
+    );
+}
+
 #[test]
 fn background_local_fetch_crossing_w_preserves_deferred_repair_mode() {
     let (runtime, primary, requester, replica, mut writer, request, _, outcome) =
@@ -3062,21 +3278,61 @@ fn background_local_fetch_crossing_w_preserves_deferred_repair_mode() {
             false,
         );
     assert!(matches!(outcome, NetworkedDfsWriteOutcome::Pending { .. }));
+    let completion_deadline = Instant::now() + Duration::from_secs(5);
     let events = writer
-        .process_incoming_until_pending_routed_writes_ready(Duration::from_secs(5))
+        .process_incoming_until_pending_routed_writes_ready(
+            completion_deadline.saturating_duration_since(Instant::now()),
+        )
         .unwrap();
     assert!(events.iter().any(|event| matches!(event, NetworkedDfsServiceEvent::RemoteWriteCompleted {
         result: DfsDistributedWriteResult::Outcome { outcome: NetworkedDfsWriteOutcome::Committed { version, repair_jobs, .. } }, ..
     } if version == &request.target_version && repair_jobs.iter().any(|job| job.missing_replica_node_id == replica))));
-    let calls = runtime.rpc_observations();
+    let completed_request = events
+        .iter()
+        .find_map(|event| match event {
+            NetworkedDfsServiceEvent::RemoteWriteCompleted {
+                request_id,
+                object_id,
+                result:
+                    DfsDistributedWriteResult::Outcome {
+                        outcome: NetworkedDfsWriteOutcome::Committed { version, .. },
+                    },
+                ..
+            } if object_id == &request.object_id && version == &request.target_version => {
+                Some(request_id.clone())
+            }
+            _ => None,
+        })
+        .unwrap();
+    let calls = native_completed_write_observations(
+        &runtime,
+        &primary,
+        &requester,
+        &request,
+        &completed_request,
+        completion_deadline,
+        || {},
+    );
+
     assert!(calls.iter().any(|event| event.source == primary
         && event.target == requester
         && event.route == DFS_DATA_FETCH_BLOB_ROUTE
         && event.phase == crate::test_support::DfsTestRpcPhase::Completed));
+    let response_call_id = calls
+        .iter()
+        .find(|event| {
+            event.phase == crate::test_runtime::RpcPhase::Decoded
+                && event.dfs_request_id.as_deref() == Some(&completed_request)
+                && event.dfs_object_id.as_ref() == Some(&request.object_id)
+                && event.dfs_version.as_ref() == Some(&request.target_version)
+        })
+        .unwrap()
+        .call_id;
     let completion = calls
         .iter()
         .position(|event| {
-            event.source == primary
+            event.call_id == response_call_id
+                && event.source == primary
                 && event.target == requester
                 && event.route == DFS_DATA_DISTRIBUTED_WRITE_RESPONSE_ROUTE
                 && event.phase == crate::test_support::DfsTestRpcPhase::Completed

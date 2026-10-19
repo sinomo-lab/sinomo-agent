@@ -143,18 +143,13 @@ tokio::task_local! {
     static NATIVE_RPC_CALL_CONTEXT: NativeRpcCallContext;
 }
 
-/// Observe the command returned by the normal decoder after signer validation.
+/// Observe actual namespace/write-response identities after normal decoding and signer validation.
 /// Streamed value bodies have already been consumed by that ordinary decoder;
 /// this observer copies only existing scalar identity fields.
 pub(crate) fn observe_decoded_namespace_call(command: &crate::DfsMessageCommand) {
-    let crate::DfsNetworkMessage::NamespaceRequest(request) = &command.routed_message.message
-    else {
-        return;
-    };
+    let head = &command.routed_message;
     let _ = NATIVE_RPC_CALL_CONTEXT.try_with(|context| {
-        let head = &command.routed_message;
-        if context.observation.route != crate::DFS_DATA_NAMESPACE_ROUTE
-            || context.observation.source != head.source_node_id
+        if context.observation.source != head.source_node_id
             || context.observation.target != head.target_node_id
         {
             return;
@@ -163,10 +158,33 @@ pub(crate) fn observe_decoded_namespace_call(command: &crate::DfsMessageCommand)
             return;
         };
         let mut observation = context.observation.clone();
+        match &head.message {
+            crate::DfsNetworkMessage::NamespaceRequest(request)
+                if observation.route == crate::DFS_DATA_NAMESPACE_ROUTE =>
+            {
+                observation.dfs_request_id = Some(request.request_id.clone());
+                observation.dfs_file_system_id = Some(request.file_system_id.clone());
+            }
+            crate::DfsNetworkMessage::DistributedWriteResponse(response)
+                if observation.route == crate::DFS_DATA_DISTRIBUTED_WRITE_RESPONSE_ROUTE =>
+            {
+                observation.dfs_request_id = Some(response.request_id.clone());
+                observation.dfs_object_id = Some(response.object_id.clone());
+                if let crate::DfsDistributedWriteResult::Outcome {
+                    outcome:
+                        crate::NetworkedDfsWriteOutcome::Committed {
+                            intent_id, version, ..
+                        },
+                } = &response.result
+                {
+                    observation.dfs_intent_id = Some(intent_id.clone());
+                    observation.dfs_version = Some(version.clone());
+                }
+            }
+            _ => return,
+        }
         observation.phase = RpcPhase::Decoded;
         observation.dfs_frame_id = Some(head.frame_id);
-        observation.dfs_request_id = Some(request.request_id.clone());
-        observation.dfs_file_system_id = Some(request.file_system_id.clone());
         fabric.record(observation);
     });
 }
