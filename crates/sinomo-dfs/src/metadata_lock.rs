@@ -28,6 +28,15 @@ pub(crate) struct MetadataWriteLock {
     _file: fs::File,
 }
 
+impl Drop for MetadataWriteLock {
+    fn drop(&mut self) {
+        // The guard owns custody, not incidental duplicates/inherited copies
+        // of its open file description. End the physical fence BEFORE the path
+        // registration is released; close alone can leave that fence alive.
+        let _ = FileExt::unlock(&self._file);
+    }
+}
+
 /// Pin an existing writer generation for observational reads only. A busy or
 /// absent root/file owner is unavailable: inspection must not create storage or
 /// wait for that writer's lifetime. Brief registry bookkeeping is synchronized
@@ -308,6 +317,61 @@ mod tests {
     use super::*;
     use std::sync::{Arc, mpsc};
     use std::time::Duration;
+
+    #[cfg(unix)]
+    #[test]
+    fn resident_snapshot_recovers_after_owner_release_with_inherited_description() {
+        use crate::DfsMetadataBackend;
+        use std::os::unix::fs::MetadataExt;
+        let root = sinomo_testdir::TestDir::new("resident-local-source-fence-description");
+        let mut backend = crate::LocalSobjMetadataBackend::new(
+            crate::DfsMetadataShardId::new("root"),
+            root.path(),
+        )
+        .unwrap();
+        let prefix = backend.metadata_prefix_proof().unwrap();
+        let lock_path = root.path().join("journal/write.lock");
+        let owner = metadata_write_lock(root.path().to_owned(), lock_path.clone()).unwrap();
+        // A duplicate retains the real open file description, as fork does;
+        // it is not a second metadata writer or an invented readiness result.
+        let inherited = owner._file.try_clone().unwrap();
+        let identity = inherited.metadata().unwrap();
+        assert!(!backend.try_begin_resident_read_snapshot().unwrap());
+        drop(owner);
+        assert!(
+            backend.try_begin_resident_read_snapshot().unwrap(),
+            "the ended writer must not leave its physical fence owned by an incidental descriptor"
+        );
+        assert_eq!(backend.metadata_prefix_proof().unwrap(), prefix);
+        backend.end_consistent_read_snapshot();
+        let successor = try_metadata_write_lock(root.path().to_owned(), lock_path.clone())
+            .unwrap()
+            .expect("successor acquires the released source");
+        let current = successor._file.metadata().unwrap();
+        assert_eq!(
+            (identity.dev(), identity.ino()),
+            (current.dev(), current.ino())
+        );
+        let contender = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(lock_path)
+            .unwrap();
+        assert!(
+            FileExt::try_lock_exclusive(&contender)
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::WouldBlock)
+        );
+        drop(inherited);
+        assert!(
+            FileExt::try_lock_exclusive(&contender)
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::WouldBlock)
+        );
+        assert!(!backend.try_begin_resident_read_snapshot().unwrap());
+        drop(successor);
+        assert!(backend.try_begin_resident_read_snapshot().unwrap());
+        assert_eq!(backend.metadata_prefix_proof().unwrap(), prefix);
+        backend.end_consistent_read_snapshot();
+    }
 
     #[test]
     fn independent_root_registration_survives_registry_bookkeeping_contention() {
