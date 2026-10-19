@@ -124,13 +124,21 @@ fn sifs_clustered_daemon_client_until(
     }
     let state = cluster::read_cluster_state_without_kv(cluster_paths)
         .map_err(|error| format!("cannot read local cluster state: {error}"))?;
+    sifs_main_client_for_state_until(data_dir, &state, operation_deadline)
+}
+
+fn sifs_main_client_for_state_until(
+    data_dir: &SinomoDataDir,
+    state: &sinomo_runtime::core::ClusterBootstrapState,
+    operation_deadline: Option<Instant>,
+) -> Result<Option<sinomo_runtime::daemon::DaemonApiClient>, String> {
     let daemon_paths = sinomo_runtime::daemon::DaemonPaths::new(data_dir);
     let probe_timeout =
         sifs_operation_remaining(operation_deadline, "probing the resident daemon")?
             .map(|remaining| remaining.min(sinomo_runtime::daemon::DAEMON_API_PROBE_TIMEOUT))
             .unwrap_or(sinomo_runtime::daemon::DAEMON_API_PROBE_TIMEOUT);
     let probe = sinomo_runtime::daemon::probe_daemon_status(&daemon_paths, probe_timeout);
-    sifs_clustered_daemon_client_from_probe(&state, data_dir, probe)
+    sifs_clustered_daemon_client_from_probe(state, data_dir, probe)
 }
 
 fn sifs_clustered_daemon_client_from_probe(
@@ -232,6 +240,11 @@ pub(crate) struct SifsFileManagerBackend {
     /// Clustered ordinary operations borrow the daemon's resident owner rather
     /// than decoding a second local metadata image in every caller process.
     resident: Option<crate::app_api::RemoteSifsBrowser>,
+    /// Configured caller identity only. Main is resolved at each operation;
+    /// construction neither owns storage nor certifies a current DFS view.
+    deferred_main_identity: Option<(sinomo_runtime::core::Id, NodeId)>,
+    #[cfg(test)]
+    native_test_main: Option<crate::app_api::RemoteSifsBrowser>,
     resident_node_id: Option<NodeId>,
     service: OnceLock<Mutex<NetworkedDfsService<DfsNodeTransport>>>,
     service_initialization: Mutex<()>,
@@ -536,6 +549,9 @@ impl SifsFileManagerBackend {
             data_dir: data_dir.clone(),
             rpc_runtime,
             resident: None,
+            deferred_main_identity: None,
+            #[cfg(test)]
+            native_test_main: None,
             resident_node_id: None,
             service: OnceLock::from(Mutex::new(service)),
             service_initialization: Mutex::new(()),
@@ -553,28 +569,29 @@ impl SifsFileManagerBackend {
         operation_deadline: Option<Instant>,
     ) -> Result<Option<Self>, String> {
         let cluster_paths = ClusterPaths::new(data_dir);
-        let Some(client) =
-            sifs_clustered_daemon_client_until(data_dir, &cluster_paths, operation_deadline)?
-        else {
+        if !cluster_paths.state.exists() {
             return Ok(None);
-        };
+        }
+        sifs_operation_remaining(operation_deadline, "reading local cluster identity")?;
         let state = cluster::read_cluster_state_without_kv(&cluster_paths)
             .map_err(|error| format!("cannot read local cluster identity: {error}"))?;
-        let resident = crate::app_api::RemoteSifsBrowser::for_main_owner(
-            data_dir.clone(),
-            client.address().to_string(),
-            state.local_node_id.clone(),
-            rpc_runtime.runtime.handle(),
-        );
-        Self::from_resident_owner(
-            data_dir,
+        sifs_operation_remaining(operation_deadline, "reading local cluster identity")?;
+        let node_id = state.local_node_id;
+        Ok(Some(Self {
+            data_dir: data_dir.clone(),
             rpc_runtime,
-            writable,
-            operation_deadline,
-            resident,
-            state.local_node_id,
-        )
-        .map(Some)
+            resident: None,
+            deferred_main_identity: Some((state.cluster_id, node_id.clone())),
+            #[cfg(test)]
+            native_test_main: None,
+            resident_node_id: Some(node_id.clone()),
+            service: OnceLock::new(),
+            service_initialization: Mutex::new(()),
+            local_catalog_authoritative: AtomicBool::new(false),
+            mutation_bootstrapped: Mutex::new(writable.then_some(false)),
+            peer_targets_refreshed_at: Mutex::new(None),
+            replica_candidates: sifs_replica_candidates(data_dir, &node_id),
+        }))
     }
 
     fn from_resident_owner(
@@ -600,6 +617,9 @@ impl SifsFileManagerBackend {
             data_dir: data_dir.clone(),
             rpc_runtime,
             resident: Some(resident),
+            deferred_main_identity: None,
+            #[cfg(test)]
+            native_test_main: None,
             resident_node_id: Some(node_id.clone()),
             service: OnceLock::new(),
             service_initialization: Mutex::new(()),
@@ -625,6 +645,58 @@ impl SifsFileManagerBackend {
             return Err("this SIFS backend is read-only".into());
         }
         sifs_operation_remaining(operation_deadline, "resident SIFS request")?;
+        if let Some((cluster_id, node_id)) = &self.deferred_main_identity {
+            let resolve = || -> Result<crate::app_api::RemoteSifsBrowser, String> {
+                let state =
+                    cluster::read_cluster_state_without_kv(&ClusterPaths::new(&self.data_dir))
+                        .map_err(|error| {
+                            format!("cannot read configured SIFS identity: {error}")
+                        })?;
+                if &state.cluster_id != cluster_id || &state.local_node_id != node_id {
+                    return Err(
+                        "configured SIFS caller node/cluster identity changed; reopen the backend"
+                            .into(),
+                    );
+                }
+                #[cfg(test)]
+                if let Some(client) = &self.native_test_main {
+                    // This hook only adapts an actual isolated native registry.
+                    // The stopped owner rejects the request; no healthy reply,
+                    // identity or authority is supplied by the fixture.
+                    let client = client.with_operation_deadline(operation_deadline);
+                    let status: sinomo_runtime::api::DaemonDfsBrowserStatusResponse = client
+                        .read_rpc(
+                            sinomo_runtime::api::DAEMON_DFS_BROWSER_STATUS_ROUTE,
+                            &sinomo_runtime::api::DaemonDfsBrowserStatusRequest::node_only(),
+                        )?;
+                    if status.node_id != node_id.to_string() {
+                        return Err("native Main returned another node identity".into());
+                    }
+                    return Ok(client);
+                }
+                let client =
+                    sifs_main_client_for_state_until(&self.data_dir, &state, operation_deadline)?
+                        .ok_or_else(|| {
+                        "daemon is not running; authoritative SIFS operations require Main"
+                            .to_string()
+                    })?;
+                sifs_operation_remaining(operation_deadline, "resolving resident Main")?;
+                Ok(crate::app_api::RemoteSifsBrowser::for_main_owner(
+                    self.data_dir.clone(),
+                    client.address().to_string(),
+                    node_id.clone(),
+                    self.rpc_runtime.runtime.handle(),
+                )
+                .with_operation_deadline(operation_deadline))
+            };
+            return resolve().map(Some).map_err(|error| {
+                if mutation {
+                    format!("cannot prepare SIFS mutation authority: {error}")
+                } else {
+                    error
+                }
+            });
+        }
         Ok(self
             .resident
             .as_ref()
@@ -857,7 +929,9 @@ impl SifsFileManagerBackend {
         &self,
         operation_deadline: Option<Instant>,
     ) -> Result<(), String> {
-        if self.resident.is_some() && self.service.get().is_none() {
+        if (self.resident.is_some() || self.deferred_main_identity.is_some())
+            && self.service.get().is_none()
+        {
             // The resident owner captured committed follow-up work before its
             // reply; a client must not reopen local stores to repeat it.
             return Ok(());
@@ -2541,7 +2615,7 @@ impl FileManagerBackend for SifsFileManagerBackend {
     }
 
     fn stat(&self, path: &str) -> Result<FileManagerMetadata, String> {
-        if self.resident.is_some() {
+        if self.resident.is_some() || self.deferred_main_identity.is_some() {
             let stat = self.dfs_stat(path)?;
             return Ok(FileManagerMetadata {
                 kind: sifs_entry_kind(&stat.kind),
@@ -3312,7 +3386,7 @@ fn sifs_main_caller_transport(
     local_node_id: NodeId,
     peer_node_ids: Vec<NodeId>,
 ) -> Result<DfsNodeTransport, String> {
-    let peer = sinomo_runtime::dfs::DaemonDfsPeerTransport::connect(data_dir.clone()).map_err(
+    let peer = sinomo_runtime::dfs::DaemonDfsPeerTransport::deferred(data_dir.clone()).map_err(
         |error| format!("SIFS caller requires the resident Main DFS transport: {error}"),
     )?;
     let (sync_peer, async_peer) = shared_sifs_peer_transports(peer);
@@ -5511,6 +5585,7 @@ fn parent_sifs_path(path: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    mod cold_open_contract;
     use super::*;
     use sinomo_runtime::api::{
         DAEMON_DFS_BROWSER_CREATE_DIR_ALL_ROUTE, DAEMON_DFS_BROWSER_DELETE_ROUTE,
