@@ -1729,6 +1729,26 @@ impl SifsFileManagerBackend {
         sifs_write_options(&mut service, &path, &self.replica_candidates)
     }
 
+    /// Settle a genuinely seeded file before a probe interrupts its assignment.
+    /// This uses the normal Main barrier and shares the probe's existing budget.
+    pub(crate) fn sync_file_until(
+        &self,
+        path: &str,
+        deadline: Instant,
+    ) -> Result<sinomo_runtime::dfs::DfsPosixFileSyncCertificate, String> {
+        let path = normalize_sifs_path(path)?;
+        sifs_operation_remaining(Some(deadline), "syncing the seeded file")?;
+        let mut service = self.lock_service_for_mutation(Some(deadline))?;
+        self.refresh_service_peer_targets_with_deadline(&mut service, Some(deadline));
+        let previous = service.set_transport_operation_deadline(Some(deadline));
+        if let Some(previous) = previous {
+            service.set_transport_operation_deadline(Some(previous.min(deadline)));
+        }
+        let result = service.posix_sync_file(&path, sinomo_runtime::dfs::DfsPosixSyncKind::File);
+        service.set_transport_operation_deadline(previous);
+        result.map_err(|error| format!("cannot sync seeded file {path}: {error}"))
+    }
+
     /// Keep the typed result and caller-owned ID on the existing normal Main
     /// route. Setup failures remain separate from the actual write result.
     pub(crate) fn write_file_with_original_operation_until(

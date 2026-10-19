@@ -252,6 +252,46 @@ fn run_partition_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     ctx.record("caller_node_id", &caller);
     ctx.record("target_root", root.display().to_string());
     if phase == "baseline" {
+        // The fault must interrupt the new original write, not a late receipt
+        // publication for the seed. Prove setup through the real Main barrier
+        // within this same deadline; the tested write keeps ordinary W/N options.
+        let seed_sync = backend.sync_file_until(&path, deadline).map_err(fail)?;
+        ctx.record("seed_sync", &seed_sync);
+        let acknowledged = seed_sync
+            .metadata_certificate
+            .acknowledged_node_ids
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if seed_sync.target.file_system_id != current.file_system_id
+            || seed_sync.target.object_id != current.object_id
+            || seed_sync.target.version != current.version
+            || Some(seed_sync.target.content_hash.as_str()) != current.content_hash.as_deref()
+            || seed_sync
+                .metadata_certificate
+                .target
+                .expected_shard
+                .as_ref()
+                != Some(&assignment)
+            || acknowledged != participants
+        {
+            return Err(fail(
+                "seed barrier did not certify the original file and complete actual assignment",
+            ));
+        }
+        let settled = capture()?;
+        let settled_current = settled
+            .tables
+            .objects
+            .iter()
+            .find(|row| row.object_id == current.object_id)
+            .ok_or_else(|| fail("seed barrier lost the original canonical object"))?;
+        if settled_current.version != current.version
+            || settled_current.content_hash != current.content_hash
+            || settled_current.content_size_bytes != current.content_size_bytes
+        {
+            return Err(fail("seed barrier changed the original file content"));
+        }
         let options = backend
             .ordinary_write_options_until(&path, deadline)
             .map_err(fail)?;
@@ -260,9 +300,9 @@ fn run_partition_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
                 "baseline must retain ordinary committed write options",
             ));
         }
-        ctx.record("original", &current);
+        ctx.record("original", settled_current);
         ctx.record("write_options", &options);
-        ctx.record("prefix", &before.prefix_proof);
+        ctx.record("prefix", &settled.prefix_proof);
         ctx.record("new_content_hash", &hash);
         ctx.record("new_size_bytes", payload.len());
         return Ok(SinomoTestOutcome::passed(
