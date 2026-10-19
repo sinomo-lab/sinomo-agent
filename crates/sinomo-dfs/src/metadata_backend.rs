@@ -2256,9 +2256,10 @@ impl LocalSobjMetadataBackend {
             &current_storage_generation,
             self.table_log_offset,
         )?;
-        // A read-only lookup may already have decoded a newer durable table
-        // image. Under the writer fence, adopt that exact storage generation
-        // instead of replaying the same checkpoint and suffix a second time.
+        // A read-only lookup may already have decoded this durable generation.
+        // Under the writer fence, adopt the fully validated physical image. An
+        // equal sequence also requires the same exact prefix: checkpoint
+        // rotation alone must not force a second decode of that same cut.
         // Incremental-only reader overlays lack complete replay accounting and
         // remain ineligible. Journal certification/recovery still runs below.
         let cached = if let Ok(mut cache) = self.read_snapshot_cache.lock() {
@@ -2266,7 +2267,9 @@ impl LocalSobjMetadataBackend {
                 cache.storage_generation.as_ref() == Some(&current_storage_generation)
                     && cache.snapshot_format_version.is_some()
                     && cache.materialized_through_sequence.is_some_and(|sequence| {
-                        sequence > self.materialized_through_sequence
+                        (sequence > self.materialized_through_sequence
+                            || (sequence == self.materialized_through_sequence
+                                && cache.prefix_proof == self.prefix_proof))
                             && cache.prefix_proof.as_ref().is_some_and(|proof| {
                                 proof.is_well_formed() && proof.journal_sequence == sequence
                             })

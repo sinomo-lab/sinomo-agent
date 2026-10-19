@@ -125,3 +125,103 @@ fn resident_snapshot_preserves_external_fence_nested_cut_and_corruption_errors()
     assert!(backend.try_begin_resident_read_snapshot().is_err());
     assert_eq!(backend.consistent_read_snapshot_depth, 0);
 }
+
+fn resident_checkpoint_read_image(
+    name: &str,
+) -> (sinomo_testdir::TestDir, LocalSobjMetadataBackend) {
+    let root = sinomo_testdir::TestDir::new(name);
+    let backend =
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.path()).unwrap();
+    let path = metadata_table_snapshot_path(root.path());
+    let replacement = path.with_extension("validated-replacement");
+    std::fs::copy(&path, &replacement).unwrap();
+    std::fs::rename(&replacement, &path).unwrap();
+    assert_ne!(
+        backend.table_storage_generation.as_ref(),
+        Some(&metadata_table_storage_generation(root.path()).unwrap())
+    );
+    let view = backend.current_tables_snapshot().unwrap();
+    assert_eq!(&*view, &backend.tables);
+    drop(view);
+    {
+        let cache = backend.read_snapshot_cache.lock().unwrap();
+        let cache = cache
+            .as_ref()
+            .expect("actual full decode of the replaced checkpoint");
+        assert!(cache.snapshot_format_version.is_some());
+        assert_eq!(
+            cache.materialized_through_sequence,
+            Some(backend.materialized_through_sequence)
+        );
+        assert_eq!(cache.prefix_proof, backend.prefix_proof);
+        assert_eq!(
+            cache.storage_generation.as_ref(),
+            Some(&metadata_table_storage_generation(root.path()).unwrap())
+        );
+    }
+    (root, backend)
+}
+
+#[test]
+fn resident_replay_reuses_verified_same_prefix_checkpoint_image() {
+    let (_root, mut backend) = resident_checkpoint_read_image("resident-same-prefix-read-image");
+    let prefix = backend.prefix_proof.clone();
+    reset_metadata_durable_table_reloads();
+    assert_eq!(backend.try_materialize_resident_journal().unwrap(), Some(0));
+    assert_eq!(backend.prefix_proof, prefix);
+    assert_eq!(
+        metadata_durable_table_reloads(),
+        0,
+        "an already validated exact physical checkpoint must not be decoded again just because its sequence is equal"
+    );
+}
+
+#[test]
+fn resident_read_image_cannot_cover_changed_physical_checkpoint() {
+    use std::io::Write;
+    let (root, mut backend) = resident_checkpoint_read_image("resident-read-image-physical-change");
+    let path = metadata_table_snapshot_path(root.path());
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[0] ^= 0xff;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(&path)
+        .unwrap()
+        .write_all(&bytes)
+        .unwrap();
+    assert!(
+        backend.try_materialize_resident_journal().is_err(),
+        "a cached image from before source corruption cannot certify the changed generation"
+    );
+}
+
+#[test]
+fn resident_read_image_different_prefix_requires_fresh_source_reload() {
+    let (root, mut backend) = resident_checkpoint_read_image("resident-read-image-foreign-prefix");
+    let foreign = sinomo_testdir::TestDir::new("resident-read-image-foreign-source");
+    let other =
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("foreign-shard"), foreign.path())
+            .unwrap();
+    assert_ne!(backend.prefix_proof, other.prefix_proof);
+    let replacement = root.path().join("foreign-checkpoint.sobj");
+    std::fs::copy(metadata_table_snapshot_path(foreign.path()), &replacement).unwrap();
+    std::fs::rename(replacement, metadata_table_snapshot_path(root.path())).unwrap();
+    // This is a raw storage reload, not an authenticated replica install.
+    // The valid changed checkpoint must take the original full source path;
+    // equality of the sequence alone cannot select the new cache fast path.
+    drop(backend.current_tables_snapshot().unwrap());
+    {
+        let cache = backend.read_snapshot_cache.lock().unwrap();
+        let cache = cache.as_ref().unwrap();
+        assert_eq!(
+            cache.materialized_through_sequence,
+            Some(backend.materialized_through_sequence)
+        );
+        assert_ne!(cache.prefix_proof, backend.prefix_proof);
+    }
+    reset_metadata_durable_table_reloads();
+    assert_eq!(backend.try_materialize_resident_journal().unwrap(), Some(0));
+    assert_eq!(metadata_durable_table_reloads(), 1);
+    assert_eq!(backend.prefix_proof, other.prefix_proof);
+}
