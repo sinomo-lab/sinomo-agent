@@ -3,6 +3,64 @@
 use super::*;
 
 #[test]
+fn routed_mkdir_all_uses_applied_result_without_a_discarded_stat_projection() {
+    use crate::test_runtime::{FaultAction, FaultRule, StatReplyFault};
+    let mut cluster = sifs_outsider_cluster("mkdir-applied-without-stat");
+    let path = "/users/mkdir-applied/child";
+    assert!(
+        cluster
+            .observer
+            .transport
+            .delegates_local_namespace_authority()
+    );
+    let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    cluster._runtime.install_fault(FaultRule {
+        source: Some(cluster.observer_node.clone()),
+        target: Some(cluster.primary_node.clone()),
+        route: None,
+        call_id: None,
+        origin: None,
+        remaining_hits: 1,
+        action: FaultAction::AlterStatReplyAfterDispatch {
+            change: StatReplyFault::Unsupported,
+            captured: captured.clone(),
+        },
+    });
+    let result = cluster.observer.posix_mkdir_all(path);
+    {
+        let owner = cluster._runtime.metadata_primary_service(path).unwrap();
+        let object = owner
+            .metadata_backend()
+            .unwrap()
+            .get_object_by_path(&sifs_file_system_id(), path)
+            .unwrap()
+            .expect("the real namespace owner committed the directory");
+        assert_eq!(object.kind, DfsObjectKind::Directory);
+    }
+    assert!(
+        result.is_ok(),
+        "the applied unit mutation failed: {result:?}"
+    );
+    assert!(
+        captured.lock().unwrap().is_empty(),
+        "mkdir must not request discarded stat fields"
+    );
+    assert!(
+        cluster.observer.posix_stat_distributed(path).is_err(),
+        "a separately requested stat must still reject an unsupported reply"
+    );
+    assert_eq!(captured.lock().unwrap().len(), 1);
+    cluster._runtime.assert_fault_budgets().unwrap();
+    cluster._runtime.clear_faults();
+    assert_eq!(
+        cluster.observer.posix_stat_distributed(path).unwrap().kind,
+        DfsObjectKind::Directory
+    );
+    drop((cluster.primary, cluster.writer, cluster.observer));
+    cluster._runtime.close().unwrap();
+}
+
+#[test]
 fn browser_parent_exact_hint_does_not_require_cached_ancestors_or_recreate_deleted_parent() {
     let mut cluster = sifs_outsider_cluster("browser-parent-data-only-hint");
     let fs = sifs_file_system_id();

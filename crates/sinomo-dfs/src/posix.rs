@@ -984,8 +984,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 },
             ) {
                 Ok(()) => {
-                    self.stat_routed_namespace_result(&normalized, false)
-                        .map(drop)?;
+                    // Main has already authenticated and applied this unit
+                    // mutation. A projection-only caller has no returned stat
+                    // fields to validate: a subsequent, discarded stat can
+                    // fail on an unrelated publication after mkdir committed.
+                    // Keep bounded catch-up for legacy local replay clients;
+                    // explicit stat calls retain their full current-cut checks.
+                    if !self.transport.delegates_local_namespace_authority() {
+                        self.stat_routed_namespace_result(&normalized, false)
+                            .map(drop)?;
+                    }
                     return Ok(());
                 }
                 Err(error)
