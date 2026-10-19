@@ -6,6 +6,12 @@ private TMPDIR, never a shared sinomo-tests directory or an older run. Successfu
 runs are reclaimed after their processes drain. Failed runs are archived and
 compared against the originals before reclamation. An archival/use-check error
 retains the originals and fails the wrapper. No age-based sweep is performed.
+
+For separate resource measurements, --defer-cleanup checkpoints a completed
+invocation without reclaiming it. Run --finalize ARTIFACTS under the same ordinary
+guard in a subsequent scope. Its exit status describes cleanup only; the original
+test status stays in pending-cleanup.json and result.json. Do not abandon pending
+roots or count successful finalization as a test pass.
 """
 import argparse
 import hashlib
@@ -125,7 +131,52 @@ def archive_verified(root, artifacts):
     return receipt
 
 
-def run(command, artifacts, temp_base, retention="all"):
+def finalize(artifacts):
+    """Finalize only the exact private root checkpointed by this launcher.
+
+    The explicit split lets execution and evidence processing run in separate
+    capped scopes. An interrupted or rejected finalization retains the root.
+    The caller must hold the ordinary shared build/test guard in both phases.
+    """
+    if (artifacts / "result.json").exists():
+        raise RuntimeError("finalization already recorded; preserve the receipt and remaining state")
+    pending = json.loads((artifacts / "pending-cleanup.json").read_text())
+    root, temp_base = Path(pending["temporary_root"]), Path(pending["temp_base"])
+    code = pending["command_exit_code"]
+    result = {"command_exit_code": code, "elapsed_seconds": pending["elapsed_seconds"],
+              "temporary_root": str(root), "reclaimed": False}
+    try:
+        require_durable_artifacts(artifacts)
+        invocation = json.loads((artifacts / "invocation.json").read_text())
+        current = root.lstat()
+        identity = (pending["device"], pending["inode"])
+        if (invocation["temporary_root"] != str(root) or root.parent != temp_base
+                or not root.name.startswith("sinomo-run-") or root.is_symlink()
+                or not root.is_dir() or root.resolve() != root
+                or current.st_uid != os.getuid()
+                or (current.st_dev, current.st_ino) != identity):
+            raise RuntimeError("fixture ownership changed before finalization")
+        uses = active_uses(root, pending["process_group"])
+        if uses:
+            raise RuntimeError(f"owned fixture still in use: {uses}")
+        if code:
+            require_storage(artifacts)
+            result["archive"] = archive_verified(root, artifacts)
+        uses = active_uses(root, pending["process_group"])
+        current = root.stat()
+        if uses or (current.st_dev, current.st_ino) != identity:
+            raise RuntimeError(f"fixture ownership changed or still active: {uses}")
+        shutil.rmtree(root)
+        result["reclaimed"] = True
+    except Exception as error:
+        result["preservation_error"] = str(error)
+    result["after"] = {"temporary": storage(temp_base), "artifacts": storage(artifacts)}
+    write_json(artifacts / "result.json", result)
+    print(json.dumps(result), flush=True)
+    return result
+
+
+def run(command, artifacts, temp_base, retention="all", defer_cleanup=False):
     artifacts = artifacts.resolve()
     artifacts.mkdir(parents=True, exist_ok=False)
     filesystem = require_durable_artifacts(artifacts)
@@ -143,37 +194,38 @@ def run(command, artifacts, temp_base, retention="all"):
         child = subprocess.Popen(command, env=env, stdout=log, stderr=subprocess.STDOUT,
                                  start_new_session=True)
         code = child.wait()
-    result = {"command_exit_code": code, "elapsed_seconds": time.monotonic() - start,
-              "temporary_root": str(root), "reclaimed": False}
+    write_json(artifacts / "pending-cleanup.json", {
+        "command_exit_code": code, "elapsed_seconds": time.monotonic() - start,
+        "temporary_root": str(root), "temp_base": str(root.parent),
+        "device": identity.st_dev, "inode": identity.st_ino, "process_group": child.pid})
+    fd = os.open(artifacts, os.O_RDONLY | os.O_DIRECTORY)
     try:
-        uses = active_uses(root, child.pid)
-        if uses:
-            raise RuntimeError(f"owned fixture still in use: {uses}")
-        if code:
-            require_storage(artifacts)
-            result["archive"] = archive_verified(root, artifacts)
-        uses = active_uses(root, child.pid)
-        current = root.stat()
-        if uses or (current.st_dev, current.st_ino) != (identity.st_dev, identity.st_ino):
-            raise RuntimeError(f"fixture ownership changed or still active: {uses}")
-        shutil.rmtree(root)
-        result["reclaimed"] = True
-    except Exception as error:
-        result["preservation_error"] = str(error)
-    result["after"] = {"temporary": storage(temp_base), "artifacts": storage(artifacts)}
-    write_json(artifacts / "result.json", result)
-    print(json.dumps(result), flush=True)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    if defer_cleanup:
+        print(json.dumps({"finalization_required": str(artifacts), "command_exit_code": code}), flush=True)
+        return code
+    result = finalize(artifacts)
     return (code or 1) if not result["reclaimed"] else code
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--artifacts", type=Path, required=True)
+    parser.add_argument("--artifacts", type=Path)
+    parser.add_argument("--defer-cleanup", action="store_true",
+                        help="checkpoint the owned root; require a subsequent guarded --finalize")
+    parser.add_argument("--finalize", type=Path,
+                        help="archive/reclaim a checkpointed root in a separate scope; exit status describes cleanup only")
     parser.add_argument("--temp-base", type=Path, default=Path(tempfile.gettempdir()))
     parser.add_argument("--retention", choices=["all", "failures"], default="all")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
+    if args.finalize:
+        if args.command or args.artifacts or args.defer_cleanup:
+            parser.error("--finalize cannot start another invocation")
+        raise SystemExit(0 if finalize(args.finalize.resolve())["reclaimed"] else 1)
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
-    if not command:
-        parser.error("a command is required")
-    raise SystemExit(run(command, args.artifacts, args.temp_base, args.retention))
+    if not command or args.artifacts is None:
+        parser.error("a command and --artifacts are required")
+    raise SystemExit(run(command, args.artifacts, args.temp_base, args.retention, args.defer_cleanup))

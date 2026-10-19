@@ -58,6 +58,50 @@ class FixtureLifecycle(unittest.TestCase):
         self.assertTrue(Path(receipt["temporary_root"]).is_dir())
         self.assertIn("verification failed", receipt["preservation_error"])
 
+    def test_deferred_failure_keeps_original_until_separate_verified_finalization(self):
+        out = self.artifact_root / "deferred"
+        script = "import os,pathlib; pathlib.Path(os.environ['TMPDIR'],'evidence').write_bytes(b'keep-me'); raise SystemExit(37)"
+        self.assertEqual(fixtures.run([sys.executable, "-c", script], out, self.root,
+                                      defer_cleanup=True), 37)
+        pending = json.loads((out / "pending-cleanup.json").read_text())
+        root = Path(pending["temporary_root"])
+        self.assertEqual((root / "evidence").read_bytes(), b"keep-me")
+        self.assertFalse((out / "result.json").exists())
+        receipt = fixtures.finalize(out)
+        self.assertEqual(receipt["command_exit_code"], 37)
+        self.assertTrue(receipt["reclaimed"])
+        with tarfile.open(receipt["archive"]["archive"]) as archive:
+            self.assertEqual(archive.extractfile(root.name + "/evidence").read(), b"keep-me")
+        original_receipt = (out / "result.json").read_bytes()
+        with self.assertRaisesRegex(RuntimeError, "finalization already recorded"):
+            fixtures.finalize(out)
+        self.assertEqual((out / "result.json").read_bytes(), original_receipt)
+
+    def test_deferred_finalization_rejects_replacement_root_and_preserves_both(self):
+        out = self.artifact_root / "replacement"
+        self.assertEqual(fixtures.run([sys.executable, "-c", "pass"], out, self.root,
+                                      defer_cleanup=True), 0)
+        pending = json.loads((out / "pending-cleanup.json").read_text())
+        root = Path(pending["temporary_root"])
+        retained = root.with_name(root.name + "-original")
+        root.rename(retained)
+        root.mkdir()
+        (root / "unrelated").write_bytes(b"preserve")
+        receipt = fixtures.finalize(out)
+        self.assertFalse(receipt["reclaimed"])
+        self.assertIn("ownership changed", receipt["preservation_error"])
+        self.assertTrue(retained.is_dir())
+        self.assertEqual((root / "unrelated").read_bytes(), b"preserve")
+
+    def test_deferred_finalization_checks_live_use_again(self):
+        out = self.artifact_root / "live"
+        self.assertEqual(fixtures.run([sys.executable, "-c", "pass"], out, self.root,
+                                      defer_cleanup=True), 0)
+        with patch.object(fixtures, "active_uses", return_value=[{"pid": 42}]):
+            receipt = fixtures.finalize(out)
+        self.assertFalse(receipt["reclaimed"])
+        self.assertTrue(Path(receipt["temporary_root"]).is_dir())
+
     def test_active_process_reference_prevents_cleanup(self):
         proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(1)"], cwd=self.root)
         try:

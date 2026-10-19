@@ -40,6 +40,13 @@ def snapshot(rss, pss, *, missing=0, scan_errors=0, count=2, available=1000):
 
 
 class ProcessAccountingTests(unittest.TestCase):
+    def test_event_deltas_do_not_invent_zero_for_missing_or_reset_counters(self):
+        self.assertIsNone(measure.counter_delta(None, "max 0\n"))
+        self.assertIsNone(measure.counter_delta("", ""))
+        self.assertIsNone(measure.counter_delta("max 1\n", "max 0\n"))
+        self.assertIsNone(measure.counter_delta("max 0\n", "max 0\noom 0\n"))
+        self.assertEqual(measure.counter_delta("max 4\noom 1\n", "max 7\noom 1\n"),
+                         {"max": 3, "oom": 0})
     def test_gnu_time_hours_and_minutes_preserve_workload_values(self):
         for elapsed, seconds in (("1:02:03.45", 3723.45), ("2:03.45", 123.45), ("0:00.07", 0.07)):
             with self.subTest(elapsed=elapsed):
@@ -522,6 +529,9 @@ class FakeCommandTests(unittest.TestCase):
         leaf.mkdir(parents=True)
         (leaf / "memory.current").write_text("123\n")
         (leaf / "memory.peak").write_text("987654\n")
+        (leaf / "memory.events").write_text("max 2\noom 0\n")
+        (leaf / "memory.swap.current").write_text("0\n")
+        (leaf / "memory.swap.peak").write_text("0\n")
         (ancestor / "memory.current").write_text("9000000\n")
         with mock.patch.object(measure, "cgroup_paths", return_value=[leaf, ancestor]):
             self.assertEqual(self.invoke([sys.executable, "-c", "pass"], extra=("--dedicated-cgroup",)), 0)
@@ -530,9 +540,12 @@ class FakeCommandTests(unittest.TestCase):
         self.assertEqual(result["cgroups_after"][1]["classification"], "shared")
         self.assertEqual(result["dedicated_cgroup_measurement"]["peak_bytes"], 987654)
         self.assertTrue(result["dedicated_cgroup_measurement"]["includes_observer_page_cache_and_kernel"])
+        self.assertEqual(result["dedicated_cgroup_measurement"]["memory_events_delta"], {"max": 0, "oom": 0})
+        self.assertEqual(result["dedicated_cgroup_measurement"]["swap_peak_bytes"], 0)
         samples = [json.loads(line) for line in (self.output / "process-samples.jsonl").read_text().splitlines()]
         self.assertEqual(samples[0]["cgroup_current_bytes"], ["123", "9000000"])
         self.assertNotIn("shared_cgroup_current_bytes", samples[0])
+        self.assertEqual(samples[0]["dedicated_leaf"][0]["memory.events"], "max 2\noom 0")
         self.assertEqual((leaf / "memory.peak").read_text(), "987654\n")
 
 
