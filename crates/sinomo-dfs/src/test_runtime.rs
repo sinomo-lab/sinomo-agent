@@ -124,6 +124,8 @@ pub struct RpcObservation {
     /// Actual returned transport error, attached only to a retained terminal
     /// observation. Cancellation without a returned error leaves this absent.
     pub outcome_error: Option<String>,
+    /// Actual receiver context, recorded only after source custody is validated.
+    pub signer: Option<ServiceSigner>,
     pub origin: RpcOrigin,
     pub options: ClusterObjectRpcOptions,
     pub observe_connectivity: bool,
@@ -303,6 +305,8 @@ pub struct FaultRule {
     pub action: FaultAction,
 }
 struct Endpoint {
+    // One actual mounted host lifetime; component-only reloads keep this fence.
+    host_generation: Arc<()>,
     data_dir: Arc<SinomoDataDir>,
     cluster: Arc<dyn ClusterAccess>,
     registry: ServiceRegistry,
@@ -473,7 +477,15 @@ impl Drop for Invocation {
     }
 }
 #[derive(Clone)]
+struct NativeHostIdentity {
+    generation: Arc<()>,
+    cluster_id: ClusterId,
+}
+
+#[derive(Clone)]
 struct Carrier {
+    // Only mount_node grants a host binding. Raw fixture RPCs remain remote.
+    host_identity: Option<NativeHostIdentity>,
     source: NodeId,
     fabric: Arc<Fabric>,
     origin: RpcOrigin,
@@ -544,6 +556,7 @@ impl Carrier {
             route: call.request.route.clone(),
             phase: RpcPhase::Constructed,
             outcome_error: None,
+            signer: None,
             origin: self.origin,
             options,
             observe_connectivity,
@@ -569,6 +582,15 @@ impl Carrier {
                 .ok_or_else(|| NetworkError::UnknownNode {
                     node_id: self.source.clone(),
                 })?;
+            if self.host_identity.as_ref().is_some_and(|host| {
+                !Arc::ptr_eq(&host.generation, &source.host_generation)
+            }) {
+                return Err(NetworkError::delivery_failed(
+                    "native host generation admission",
+                    NetworkDeliveryState::DefinitelyNotSent,
+                    "retired native host generation cannot borrow its successor's authority",
+                ));
+            }
             if !source.admits_route(&call.request.route) {
                 return Err(NetworkError::UnknownNode {
                     node_id: self.source.clone(),
@@ -700,25 +722,37 @@ impl Carrier {
             .lock()
             .expect("DFS test source identity")
             .get(&self.source)
-            .filter(|source| source.admits_route(&incoming.request.route))
+            .filter(|source| source.admits_route(&incoming.request.route)
+                && self.host_identity.as_ref().is_none_or(|host|
+                    Arc::ptr_eq(&host.generation, &source.host_generation)))
             .map(|source| source.data_dir.clone());
         let source_data = source_state.ok_or_else(|| NetworkError::UnknownNode {
             node_id: self.source.clone(),
         })?;
         let source_state =
             sinomo_core::cluster::read_cluster_state_without_kv(&ClusterPaths::new(&source_data))?;
-        let signer = ServiceSigner::Remote {
-            node_id: self.source.to_string(),
-            public_key: source_state
-                .members
-                .iter()
-                .find(|member| member.node_id == self.source)
-                .ok_or_else(|| NetworkError::UnknownNode {
-                    node_id: self.source.clone(),
-                })?
-                .node_public_key
-                .clone(),
+        let public_key = source_state.members.iter()
+            .find(|member| member.node_id == self.source)
+            .ok_or_else(|| NetworkError::UnknownNode { node_id: self.source.clone() })?
+            .node_public_key.clone();
+        if let Some(host) = &self.host_identity {
+            if source_state.local_node_id != self.source || source_state.cluster_id != host.cluster_id {
+                return Err(NetworkError::delivery_failed(
+                    "native host identity admission", NetworkDeliveryState::DefinitelyNotSent,
+                    "configured node/cluster identity changed under the mounted native host",
+                ));
+            }
+        }
+        // Mirror authenticated local Main ingress only for the SAME actual
+        // registered host generation. Equal node IDs alone do not establish
+        // locality: raw protocol frames and calls across nodes stay Remote.
+        let signer = if self.source == *target && self.host_identity.is_some() {
+            ServiceSigner::LocalNode { node_id: self.source.to_string(), public_key }
+        } else {
+            ServiceSigner::Remote { node_id: self.source.to_string(), public_key }
         };
+        observation.signer = Some(signer.clone());
+        _invocation.observation.signer = Some(signer.clone());
         let context = ServiceContext::new(
             endpoint.data_dir.clone(),
             Some(endpoint.cluster.clone()),
@@ -2656,6 +2690,7 @@ impl DfsTestRuntime {
             .reconcile_staged_with_base_registry(ServiceRegistry::default(), &factories)
             .map_err(|error| error.to_string())?;
         let next_endpoint = Arc::new(Endpoint {
+            host_generation: Arc::clone(&endpoint.host_generation),
             data_dir: Arc::clone(&endpoint.data_dir),
             cluster: Arc::clone(&endpoint.cluster),
             registry: reconciler
@@ -2727,7 +2762,12 @@ impl DfsTestRuntime {
             return Err("duplicate live DFS test node".into());
         }
         let data_dir = self.nodes[node].data_dir.clone();
+        let host_generation = Arc::new(());
         let carrier = Arc::new(Carrier {
+            host_identity: Some(NativeHostIdentity {
+                generation: Arc::clone(&host_generation),
+                cluster_id: self.state.cluster_id.clone(),
+            }),
             source: node.clone(),
             fabric: self.fabric.clone(),
             origin: RpcOrigin::RegisteredHost,
@@ -2754,6 +2794,7 @@ impl DfsTestRuntime {
             return Err("embedded DFS component did not activate".into());
         }
         let endpoint = Arc::new(Endpoint {
+            host_generation,
             data_dir,
             cluster,
             registry: reconciler
@@ -3686,6 +3727,7 @@ impl DfsTestRuntime {
         timeout: Duration,
     ) -> Result<ObjectRpcResult, String> {
         let carrier = Carrier {
+            host_identity: None,
             source: source.clone(),
             fabric: self.fabric.clone(),
             origin: RpcOrigin::ExplicitFixtureRpc,
@@ -3711,6 +3753,7 @@ impl DfsTestRuntime {
         timeout: Duration,
     ) -> impl std::future::Future<Output = Result<ObjectRpcResult, String>> + Send + use<> {
         let carrier = Carrier {
+            host_identity: None,
             source: source.clone(),
             fabric: Arc::clone(&self.fabric),
             origin: RpcOrigin::ExplicitFixtureRpc,
@@ -5107,6 +5150,7 @@ mod normal_native_kv_admission_tests {
         native.bootstrap_planned_cluster().unwrap();
         native.prepare_projection(&node).unwrap();
         let carrier = Carrier {
+            host_identity: None,
             source: node.clone(),
             fabric: Arc::clone(&native.fabric),
             origin: RpcOrigin::RegisteredHost,
@@ -5278,6 +5322,7 @@ mod owned_fault_cleanup_tests {
         let endpoint = Arc::clone(&native.fabric.nodes.lock().unwrap()[&node]);
         assert!(endpoint.registry.owns(crate::DFS_STATUS_ROUTE));
         let carrier = Carrier {
+            host_identity: None,
             source: node.clone(),
             fabric: Arc::clone(&native.fabric),
             origin: RpcOrigin::RegisteredHost,

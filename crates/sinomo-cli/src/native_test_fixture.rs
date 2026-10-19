@@ -224,3 +224,180 @@ fn explicit_native_fixture_preserves_path_isolation_and_drains_with_live_fronten
             .is_none()
     );
 }
+
+#[test]
+fn registered_native_control_read_keeps_local_provenance_and_remote_contention_fails_closed() {
+    use sinomo_runtime::{
+        cluster::ClusterKvPathsExt,
+        dfs::DfsObjectRpcSendOptions,
+        network::{ClusterPaths, ObjectRpcCall, ObjectRpcRequest},
+    };
+    let root = sinomo_testdir::TestDir::new("cli-native-local-read-provenance");
+    let data = SinomoDataDir::new(&root);
+    let owner = NativeCliFixture::start(&data);
+    let paths = ClusterPaths::new(&data);
+    let state = sinomo_runtime::cluster::read_cluster_state_without_kv(&paths).unwrap();
+    let node = state.local_node_id.clone();
+    let budget = sinomo_runtime::network::DEFAULT_NETWORK_TIMEOUT;
+    let prefix = "/dfs/filesystems/";
+    let request = || {
+        let payload =
+            sinomo_runtime::kv::cluster_kv_authoritative_range_prefix_rpc_payload(prefix).unwrap();
+        ObjectRpcRequest::from_encoded_body(payload.route, payload.category, payload.body)
+    };
+    let (peer, _) = peer_transports(&data).unwrap();
+    let response = peer
+        .call_object_rpc(
+            &node,
+            ObjectRpcCall::value(request()),
+            DfsObjectRpcSendOptions::default().with_overall_timeout(budget),
+        )
+        .unwrap();
+    let native = owner.native.as_ref().unwrap().lock().unwrap();
+    let response = native
+        .runtime_handle()
+        .block_on(response.into_materialized_value_response(16 * 1024 * 1024))
+        .unwrap();
+    let read =
+        sinomo_runtime::kv::decode_cluster_kv_authoritative_range_prefix_rpc_body(&response.body)
+            .unwrap();
+    assert!(
+        !read.value.is_empty(),
+        "actual committed native configuration"
+    );
+    let completed = native
+        .rpc_observations()
+        .into_iter()
+        .rev()
+        .find(|r| {
+            r.source == node
+                && r.target == node
+                && r.route == sinomo_runtime::kv::CLUSTER_KV_AUTHORITATIVE_RANGE_PREFIX_ROUTE
+                && r.phase == sinomo_runtime::dfs::test_support::DfsTestRpcPhase::Completed
+        })
+        .unwrap();
+    drop(native);
+    let signer = completed.signer.expect("actual receiver signer recorded");
+    assert!(
+        signer.is_local(),
+        "registered same-host request was mislabeled: {signer:?}"
+    );
+    let (signer_node, signer_key) = signer.cluster_identity().unwrap();
+    let member = state.members.iter().find(|m| m.node_id == node).unwrap();
+    assert_eq!(signer_node, node.as_str());
+    assert_eq!(signer_key, member.node_public_key);
+    // A raw protocol frame remains a remote/forwarded call even when its
+    // source ID equals its destination. It cannot borrow local-origin policy.
+    let held =
+        sinomo_runtime::kv::lock_cluster_kv_raft_operation_for_paths(&paths.kv_paths()).unwrap();
+    let started = std::time::Instant::now();
+    let (rejected, ended) = {
+        let native = owner.native.as_ref().unwrap().lock().unwrap();
+        let rejected = native
+            .rpc_request(&node, &node, request(), budget)
+            .unwrap_err();
+        let ended = native
+            .rpc_observations()
+            .into_iter()
+            .rev()
+            .find(|r| {
+                r.route == sinomo_runtime::kv::CLUSTER_KV_AUTHORITATIVE_RANGE_PREFIX_ROUTE
+                    && r.phase
+                        == sinomo_runtime::dfs::test_support::DfsTestRpcPhase::EndedWithoutResponse
+            })
+            .unwrap();
+        (rejected, ended)
+    };
+    assert!(
+        rejected.contains("local Raft admission is busy"),
+        "{rejected}"
+    );
+    assert!(started.elapsed() < budget);
+    assert!(!ended.signer.unwrap().is_local());
+    drop(held);
+    owner
+        .native
+        .as_ref()
+        .unwrap()
+        .lock()
+        .unwrap()
+        .checkpoint_rpc_observation_window()
+        .unwrap();
+    drop(owner);
+}
+
+#[test]
+fn registered_native_transport_cannot_borrow_restarted_host_generation() {
+    use sinomo_runtime::network::{
+        ClusterObjectRpcOptions, ClusterPaths, NetworkDeliveryState, ObjectRpcCall,
+        ObjectRpcRequest,
+    };
+    let root = sinomo_testdir::TestDir::new("cli-native-host-generation");
+    let data = SinomoDataDir::new(&root);
+    let owner = NativeCliFixture::start(&data);
+    let node = sinomo_runtime::cluster::read_cluster_state_without_kv(&ClusterPaths::new(&data))
+        .unwrap()
+        .local_node_id;
+    let host = owner
+        .native
+        .as_ref()
+        .unwrap()
+        .lock()
+        .unwrap()
+        .component_context(&node)
+        .unwrap()
+        .object_rpc_transport()
+        .unwrap();
+    let request = || {
+        ObjectRpcCall::value(
+            ObjectRpcRequest::encode_body(
+                sinomo_runtime::api::DAEMON_DFS_BROWSER_STATUS_ROUTE,
+                sinomo_runtime::api::DAEMON_RPC_CATEGORY,
+                &sinomo_runtime::api::DaemonDfsBrowserStatusRequest::node_only(),
+            )
+            .unwrap(),
+        )
+    };
+    let options = ClusterObjectRpcOptions::default()
+        .with_overall_timeout(sinomo_runtime::network::DEFAULT_NETWORK_TIMEOUT);
+    host.call(&node, request(), options, true).unwrap();
+    {
+        let mut native = owner.native.as_ref().unwrap().lock().unwrap();
+        native.stop_node(&node).unwrap();
+        assert!(host.call(&node, request(), options, true).is_err());
+        native.reopen_node(node.clone()).unwrap();
+    }
+    let rejected = host.call(&node, request(), options, true).unwrap_err();
+    assert!(
+        rejected
+            .to_string()
+            .contains("retired native host generation"),
+        "{rejected}"
+    );
+    assert_eq!(
+        rejected.delivery_state(),
+        Some(NetworkDeliveryState::DefinitelyNotSent)
+    );
+    let current = owner
+        .native
+        .as_ref()
+        .unwrap()
+        .lock()
+        .unwrap()
+        .component_context(&node)
+        .unwrap()
+        .object_rpc_transport()
+        .unwrap();
+    current.call(&node, request(), options, true).unwrap();
+    owner
+        .native
+        .as_ref()
+        .unwrap()
+        .lock()
+        .unwrap()
+        .checkpoint_rpc_observation_window()
+        .unwrap();
+    drop(current);
+    drop(host);
+    drop(owner);
+}
