@@ -171,6 +171,47 @@ pub(crate) fn observe_decoded_namespace_call(command: &crate::DfsMessageCommand)
     });
 }
 
+/// Observe the normal decoded command after source authentication. No stream
+/// is consumed twice, no body is reconstructed, and no reply is substituted.
+pub(crate) async fn pause_decoded_write_commit_publication(
+    command: &crate::DfsMetadataJournalBatchCommand,
+) -> Result<(), ServiceError> {
+    let selected = NATIVE_RPC_CALL_CONTEXT.try_with(|context| {
+        let Some(fabric) = context.fabric.upgrade() else { return Ok(None); };
+        let observation = &context.observation;
+        let mut rules = fabric.faults.lock().unwrap();
+        let Some(rule) = rules.iter_mut().find(|rule| {
+            matches!(rule.action, FaultAction::PauseWriteCommitPublication { .. })
+                && rule.source.as_ref().is_none_or(|id| id == &observation.source)
+                && rule.target.as_ref().is_none_or(|id| id == &observation.target)
+                && rule.route.as_ref().is_none_or(|route| route == &observation.route)
+                && rule.origin.is_none_or(|origin| origin == observation.origin)
+                && rule.call_id.is_none_or(|id| id == observation.call_id)
+        }) else { return Ok(None); };
+        if !command.durable_replication.as_ref().is_some_and(|purpose| purpose.background_publication)
+            || !command.batch.decoded().is_ok_and(|batch| batch.entries.iter().any(|entry| {
+                matches!(&entry.mutation, crate::DfsMetadataMutation::CommitPreparedOperationV7 { digest, .. }
+                    if digest.operation_id.starts_with("write:"))
+            })) { return Ok(None); }
+        if rule.remaining_hits == 0 {
+            fabric.exhausted_budgets.fetch_add(1, Ordering::Relaxed);
+            return Err(ServiceError::Service("bounded native publication pause exhausted".into()));
+        }
+        rule.remaining_hits -= 1;
+        let FaultAction::PauseWriteCommitPublication { gate, captured } = &rule.action else { unreachable!() };
+        captured.lock().unwrap().push(command.clone());
+        Ok(Some(Arc::clone(gate)))
+    }).unwrap_or(Ok(None))?;
+    if let Some(gate) = selected {
+        let permit = gate
+            .acquire()
+            .await
+            .map_err(|_| ServiceError::Service("native publication pause closed".into()))?;
+        permit.forget();
+    }
+    Ok(())
+}
+
 /// Bounded negative changes to replies already produced by native read RPC.
 #[derive(Clone, Copy)]
 pub enum ReadReplyFault {
@@ -256,6 +297,12 @@ pub enum FaultAction {
         captured: Arc<Mutex<Vec<crate::DfsRoutedMessage>>>,
     },
     PauseBeforeDispatch(Arc<Semaphore>),
+    /// Hold a real committed-write journal publication before receiver ingress.
+    /// Prepare/authority RPCs remain untouched; no successful reply is supplied.
+    PauseWriteCommitPublication {
+        gate: Arc<Semaphore>,
+        captured: Arc<Mutex<Vec<crate::DfsMetadataJournalBatchCommand>>>,
+    },
     /// Hold the actual receiver's response after its native execution completes.
     PauseAfterDispatch(Arc<Semaphore>),
     /// Retain the actual native read head while pausing its original body source.
@@ -413,6 +460,9 @@ impl Fabric {
                     // negative fault from the real completed typed reply,
                     // without consuming or reconstructing the request body.
                     FaultAction::AlterStatReplyAfterDispatch { .. } => false,
+                    // Metadata journal values may be streamed. Select only
+                    // after the ordinary authenticated receiver decodes them.
+                    FaultAction::PauseWriteCommitPublication { .. } => false,
                     FaultAction::CaptureTransferReplyAndLoseAfterDispatch { intent_id, .. } => {
                         intent_id.as_ref().is_none_or(|expected| {
                             observation.dfs_intent_id.as_ref() == Some(expected)
@@ -4226,6 +4276,7 @@ impl DfsTestRuntime {
                 || rule.source.as_ref().is_none_or(|id| id == node)
             {
                 if let FaultAction::PauseBeforeDispatch(gate)
+                | FaultAction::PauseWriteCommitPublication { gate, .. }
                 | FaultAction::PauseAfterDispatch(gate)
                 | FaultAction::PauseNativeReadBody { gate, .. } = &rule.action
                 {
