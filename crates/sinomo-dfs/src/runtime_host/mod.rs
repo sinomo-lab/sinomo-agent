@@ -3010,6 +3010,10 @@ mod data_plane;
 pub(crate) mod materialization_test;
 #[cfg(any(test, feature = "test-support"))]
 pub use materialization_test::{DfsTestMaterializationCapture, DfsTestMaterializationPause};
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) mod deferred_work_test;
+#[cfg(any(test, feature = "test-support"))]
+pub use deferred_work_test::{DfsTestDeferredResponseCapture, DfsTestDeferredResponsePause};
 #[cfg(feature = "storage-conversion")]
 mod storage_import;
 use data_plane::with_daemon_dfs_control_plane_seeded_on_runtime;

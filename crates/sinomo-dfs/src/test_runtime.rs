@@ -3225,6 +3225,21 @@ impl DfsTestRuntime {
             &crate::default_dfs_metadata_shards_root(&owned.data_dir).join(&shard.0),
         )
     }
+    /// Pause only the first real received deferred reply while its native
+    /// completion still retains the original data owner. No reply is supplied.
+    pub fn pause_deferred_response(
+        &self,
+        node: &NodeId,
+    ) -> Result<crate::runtime_host::DfsTestDeferredResponsePause, String> {
+        if self
+            .nodes
+            .get(node)
+            .is_none_or(|owned| owned.reconciler.is_none())
+        {
+            return Err("native deferred-response owner is not mounted".into());
+        }
+        crate::runtime_host::deferred_work_test::install(self.data_dir(node))
+    }
     pub fn wait_paused_materialization(
         &self,
         pause: &crate::runtime_host::DfsTestMaterializationPause,
