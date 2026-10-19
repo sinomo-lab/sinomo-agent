@@ -67,8 +67,58 @@ impl DfsMetadataCandidateInspection {
 /// metadata root: a durable candidate stamp must precede every image write.
 pub struct DfsMetadataCandidateWriter {
     root: PathBuf,
-    _lock: File,
+    _lock: CandidateWriteLock,
 }
+
+struct CandidateWriteLock(File);
+
+impl Drop for CandidateWriteLock {
+    fn drop(&mut self) {
+        // Closing one descriptor need not release its lock while an incidental
+        // inherited/duplicated descriptor keeps the open file description alive.
+        // The staging writer, not that descriptor, owns this custody lifetime.
+        let _ = FileExt::unlock(&self.0);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod lock_lifetime_tests {
+    use super::*;
+    use std::os::unix::fs::MetadataExt;
+
+    fn assert_busy(root: &Path) {
+        assert!(matches!(
+            DfsMetadataCandidateWriter::open(root),
+            Err(MetadataBackendError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::WouldBlock
+        ));
+    }
+
+    #[test]
+    fn candidate_writer_releases_its_lock_despite_an_inherited_description() {
+        let root = sinomo_testdir::TestDir::new("candidate-lock-retirement");
+        let writer = DfsMetadataCandidateWriter::open(root.path()).unwrap();
+        // try_clone retains the same open file description, as an unrelated
+        // fork child does before exec. It does not create a second writer.
+        let inherited = writer._lock.0.try_clone().unwrap();
+        let physical = inherited.metadata().unwrap();
+        assert_busy(root.path());
+        drop(writer);
+        let successor = DfsMetadataCandidateWriter::open(root.path())
+            .expect("writer drop ends custody even while an inherited descriptor lives");
+        let current = successor._lock.0.metadata().unwrap();
+        assert_eq!(
+            (physical.dev(), physical.ino()),
+            (current.dev(), current.ino())
+        );
+        assert_busy(root.path());
+        drop(inherited);
+        assert_busy(root.path());
+        drop(successor);
+        DfsMetadataCandidateWriter::open(root.path()).expect("successor released its own custody");
+    }
+}
+
 impl DfsMetadataCandidateWriter {
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
@@ -93,6 +143,9 @@ impl DfsMetadataCandidateWriter {
                 path: lock_path.clone(),
                 source,
             })?;
+        // Install the guard immediately after acquisition so a rejected stamp
+        // or failed initialization also ends the acquired custody explicitly.
+        let lock = CandidateWriteLock(lock);
         if stamp.exists() {
             let bytes = fs::read(&stamp).map_err(|source| MetadataBackendError::Io {
                 path: stamp.clone(),
