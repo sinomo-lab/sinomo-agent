@@ -124,6 +124,8 @@ pub struct RpcObservation {
     /// Actual returned transport error, attached only to a retained terminal
     /// observation. Cancellation without a returned error leaves this absent.
     pub outcome_error: Option<String>,
+    /// Actual receiver context, recorded only after source custody is validated.
+    pub signer: Option<ServiceSigner>,
     pub origin: RpcOrigin,
     pub options: ClusterObjectRpcOptions,
     pub observe_connectivity: bool,
@@ -141,18 +143,13 @@ tokio::task_local! {
     static NATIVE_RPC_CALL_CONTEXT: NativeRpcCallContext;
 }
 
-/// Observe the command returned by the normal decoder after signer validation.
+/// Observe actual namespace/write-response identities after normal decoding and signer validation.
 /// Streamed value bodies have already been consumed by that ordinary decoder;
 /// this observer copies only existing scalar identity fields.
 pub(crate) fn observe_decoded_namespace_call(command: &crate::DfsMessageCommand) {
-    let crate::DfsNetworkMessage::NamespaceRequest(request) = &command.routed_message.message
-    else {
-        return;
-    };
+    let head = &command.routed_message;
     let _ = NATIVE_RPC_CALL_CONTEXT.try_with(|context| {
-        let head = &command.routed_message;
-        if context.observation.route != crate::DFS_DATA_NAMESPACE_ROUTE
-            || context.observation.source != head.source_node_id
+        if context.observation.source != head.source_node_id
             || context.observation.target != head.target_node_id
         {
             return;
@@ -161,12 +158,76 @@ pub(crate) fn observe_decoded_namespace_call(command: &crate::DfsMessageCommand)
             return;
         };
         let mut observation = context.observation.clone();
+        match &head.message {
+            crate::DfsNetworkMessage::NamespaceRequest(request)
+                if observation.route == crate::DFS_DATA_NAMESPACE_ROUTE =>
+            {
+                observation.dfs_request_id = Some(request.request_id.clone());
+                observation.dfs_file_system_id = Some(request.file_system_id.clone());
+            }
+            crate::DfsNetworkMessage::DistributedWriteResponse(response)
+                if observation.route == crate::DFS_DATA_DISTRIBUTED_WRITE_RESPONSE_ROUTE =>
+            {
+                observation.dfs_request_id = Some(response.request_id.clone());
+                observation.dfs_object_id = Some(response.object_id.clone());
+                if let crate::DfsDistributedWriteResult::Outcome {
+                    outcome:
+                        crate::NetworkedDfsWriteOutcome::Committed {
+                            intent_id, version, ..
+                        },
+                } = &response.result
+                {
+                    observation.dfs_intent_id = Some(intent_id.clone());
+                    observation.dfs_version = Some(version.clone());
+                }
+            }
+            _ => return,
+        }
         observation.phase = RpcPhase::Decoded;
         observation.dfs_frame_id = Some(head.frame_id);
-        observation.dfs_request_id = Some(request.request_id.clone());
-        observation.dfs_file_system_id = Some(request.file_system_id.clone());
         fabric.record(observation);
     });
+}
+
+/// Observe the normal decoded command after source authentication. No stream
+/// is consumed twice, no body is reconstructed, and no reply is substituted.
+pub(crate) async fn pause_decoded_write_commit_publication(
+    command: &crate::DfsMetadataJournalBatchCommand,
+) -> Result<(), ServiceError> {
+    let selected = NATIVE_RPC_CALL_CONTEXT.try_with(|context| {
+        let Some(fabric) = context.fabric.upgrade() else { return Ok(None); };
+        let observation = &context.observation;
+        let mut rules = fabric.faults.lock().unwrap();
+        let Some(rule) = rules.iter_mut().find(|rule| {
+            matches!(rule.action, FaultAction::PauseWriteCommitPublication { .. })
+                && rule.source.as_ref().is_none_or(|id| id == &observation.source)
+                && rule.target.as_ref().is_none_or(|id| id == &observation.target)
+                && rule.route.as_ref().is_none_or(|route| route == &observation.route)
+                && rule.origin.is_none_or(|origin| origin == observation.origin)
+                && rule.call_id.is_none_or(|id| id == observation.call_id)
+        }) else { return Ok(None); };
+        if !command.durable_replication.as_ref().is_some_and(|purpose| purpose.background_publication)
+            || !command.batch.decoded().is_ok_and(|batch| batch.entries.iter().any(|entry| {
+                matches!(&entry.mutation, crate::DfsMetadataMutation::CommitPreparedOperationV7 { digest, .. }
+                    if digest.operation_id.starts_with("write:"))
+            })) { return Ok(None); }
+        if rule.remaining_hits == 0 {
+            fabric.exhausted_budgets.fetch_add(1, Ordering::Relaxed);
+            return Err(ServiceError::Service("bounded native publication pause exhausted".into()));
+        }
+        rule.remaining_hits -= 1;
+        let FaultAction::PauseWriteCommitPublication { gate, captured } = &rule.action else { unreachable!() };
+        captured.lock().unwrap().push(command.clone());
+        Ok(Some(Arc::clone(gate)))
+    }).unwrap_or(Ok(None))?;
+    if let Some(gate) = selected {
+        let permit = gate
+            .acquire()
+            .await
+            .map_err(|_| ServiceError::Service("native publication pause closed".into()))?;
+        permit.forget();
+    }
+    Ok(())
 }
 
 /// Bounded negative changes to replies already produced by native read RPC.
@@ -232,9 +293,34 @@ pub struct StageExchangeCapture {
     pub dropped_count: usize,
 }
 
+#[derive(Clone, Debug)]
+pub enum StatReplyFault {
+    Unsupported,
+    Incomplete,
+    WrongRequest,
+    WrongEpoch,
+    WrongSource,
+    WrongTarget,
+    MalformedPrefix,
+    StalePrefix,
+    /// Alter only an actual canonical projection page, after its path view.
+    SameVersionHashChanged,
+}
+
 #[derive(Clone)]
 pub enum FaultAction {
+    /// Negative-only mutation of a real completed stat query response.
+    AlterStatReplyAfterDispatch {
+        change: StatReplyFault,
+        captured: Arc<Mutex<Vec<crate::DfsRoutedMessage>>>,
+    },
     PauseBeforeDispatch(Arc<Semaphore>),
+    /// Hold a real committed-write journal publication before receiver ingress.
+    /// Prepare/authority RPCs remain untouched; no successful reply is supplied.
+    PauseWriteCommitPublication {
+        gate: Arc<Semaphore>,
+        captured: Arc<Mutex<Vec<crate::DfsMetadataJournalBatchCommand>>>,
+    },
     /// Hold the actual receiver's response after its native execution completes.
     PauseAfterDispatch(Arc<Semaphore>),
     /// Retain the actual native read head while pausing its original body source.
@@ -284,6 +370,8 @@ pub struct FaultRule {
     pub action: FaultAction,
 }
 struct Endpoint {
+    // One actual mounted host lifetime; component-only reloads keep this fence.
+    host_generation: Arc<()>,
     data_dir: Arc<SinomoDataDir>,
     cluster: Arc<dyn ClusterAccess>,
     registry: ServiceRegistry,
@@ -386,6 +474,13 @@ impl Fabric {
                     .is_none_or(|origin| origin == observation.origin)
                 && rule.call_id.is_none_or(|id| id == observation.call_id)
                 && match &rule.action {
+                    // The ordinary request value may be streamed. Select this
+                    // negative fault from the real completed typed reply,
+                    // without consuming or reconstructing the request body.
+                    FaultAction::AlterStatReplyAfterDispatch { .. } => false,
+                    // Metadata journal values may be streamed. Select only
+                    // after the ordinary authenticated receiver decodes them.
+                    FaultAction::PauseWriteCommitPublication { .. } => false,
                     FaultAction::CaptureTransferReplyAndLoseAfterDispatch { intent_id, .. } => {
                         intent_id.as_ref().is_none_or(|expected| {
                             observation.dfs_intent_id.as_ref() == Some(expected)
@@ -450,7 +545,15 @@ impl Drop for Invocation {
     }
 }
 #[derive(Clone)]
+struct NativeHostIdentity {
+    generation: Arc<()>,
+    cluster_id: ClusterId,
+}
+
+#[derive(Clone)]
 struct Carrier {
+    // Only mount_node grants a host binding. Raw fixture RPCs remain remote.
+    host_identity: Option<NativeHostIdentity>,
     source: NodeId,
     fabric: Arc<Fabric>,
     origin: RpcOrigin,
@@ -521,6 +624,7 @@ impl Carrier {
             route: call.request.route.clone(),
             phase: RpcPhase::Constructed,
             outcome_error: None,
+            signer: None,
             origin: self.origin,
             options,
             observe_connectivity,
@@ -546,6 +650,15 @@ impl Carrier {
                 .ok_or_else(|| NetworkError::UnknownNode {
                     node_id: self.source.clone(),
                 })?;
+            if self.host_identity.as_ref().is_some_and(|host| {
+                !Arc::ptr_eq(&host.generation, &source.host_generation)
+            }) {
+                return Err(NetworkError::delivery_failed(
+                    "native host generation admission",
+                    NetworkDeliveryState::DefinitelyNotSent,
+                    "retired native host generation cannot borrow its successor's authority",
+                ));
+            }
             if !source.admits_route(&call.request.route) {
                 return Err(NetworkError::UnknownNode {
                     node_id: self.source.clone(),
@@ -677,25 +790,37 @@ impl Carrier {
             .lock()
             .expect("DFS test source identity")
             .get(&self.source)
-            .filter(|source| source.admits_route(&incoming.request.route))
+            .filter(|source| source.admits_route(&incoming.request.route)
+                && self.host_identity.as_ref().is_none_or(|host|
+                    Arc::ptr_eq(&host.generation, &source.host_generation)))
             .map(|source| source.data_dir.clone());
         let source_data = source_state.ok_or_else(|| NetworkError::UnknownNode {
             node_id: self.source.clone(),
         })?;
         let source_state =
             sinomo_core::cluster::read_cluster_state_without_kv(&ClusterPaths::new(&source_data))?;
-        let signer = ServiceSigner::Remote {
-            node_id: self.source.to_string(),
-            public_key: source_state
-                .members
-                .iter()
-                .find(|member| member.node_id == self.source)
-                .ok_or_else(|| NetworkError::UnknownNode {
-                    node_id: self.source.clone(),
-                })?
-                .node_public_key
-                .clone(),
+        let public_key = source_state.members.iter()
+            .find(|member| member.node_id == self.source)
+            .ok_or_else(|| NetworkError::UnknownNode { node_id: self.source.clone() })?
+            .node_public_key.clone();
+        if let Some(host) = &self.host_identity {
+            if source_state.local_node_id != self.source || source_state.cluster_id != host.cluster_id {
+                return Err(NetworkError::delivery_failed(
+                    "native host identity admission", NetworkDeliveryState::DefinitelyNotSent,
+                    "configured node/cluster identity changed under the mounted native host",
+                ));
+            }
+        }
+        // Mirror authenticated local Main ingress only for the SAME actual
+        // registered host generation. Equal node IDs alone do not establish
+        // locality: raw protocol frames and calls across nodes stay Remote.
+        let signer = if self.source == *target && self.host_identity.is_some() {
+            ServiceSigner::LocalNode { node_id: self.source.to_string(), public_key }
+        } else {
+            ServiceSigner::Remote { node_id: self.source.to_string(), public_key }
         };
+        observation.signer = Some(signer.clone());
+        _invocation.observation.signer = Some(signer.clone());
         let context = ServiceContext::new(
             endpoint.data_dir.clone(),
             Some(endpoint.cluster.clone()),
@@ -988,6 +1113,170 @@ impl Carrier {
                 }
             }
             drop(records);
+            let mut rewritten =
+                ObjectRpcOutgoingResponse::encode_value(outgoing.response.route.clone(), response)?;
+            rewritten.response.metadata = std::mem::take(&mut outgoing.response.metadata);
+            outgoing = rewritten;
+        }
+        let stat_fault = if observation.route == crate::DFS_DATA_NAMESPACE_ROUTE {
+            self.fabric
+                .faults
+                .lock()
+                .unwrap()
+                .iter()
+                .enumerate()
+                .find(|(_, rule)| {
+                    matches!(rule.action, FaultAction::AlterStatReplyAfterDispatch { .. })
+                        && rule
+                            .source
+                            .as_ref()
+                            .is_none_or(|id| id == &observation.source)
+                        && rule
+                            .target
+                            .as_ref()
+                            .is_none_or(|id| id == &observation.target)
+                        && rule
+                            .route
+                            .as_ref()
+                            .is_none_or(|route| route == &observation.route)
+                        && rule
+                            .origin
+                            .is_none_or(|origin| origin == observation.origin)
+                        && rule.call_id.is_none_or(|id| id == observation.call_id)
+                })
+                .map(|(index, rule)| (index, rule.action.clone()))
+        } else {
+            None
+        };
+        if let Some((rule_index, FaultAction::AlterStatReplyAfterDispatch { change, captured })) =
+            stat_fault
+        {
+            let value = if outgoing.response.body.is_empty() {
+                outgoing.body.collect_to_vec(64 * 1024).await?
+            } else {
+                outgoing.response.body.clone()
+            };
+            let mut response: crate::DfsMessageResponse = sinomo_object_serde::from_bytes(&value)
+                .map_err(|e| {
+                NetworkError::Serialization {
+                    detail: e.to_string(),
+                }
+            })?;
+            for routed in &mut response.outbound_messages {
+                let crate::DfsNetworkMessage::NamespaceResponse(reply) = &mut routed.message else {
+                    continue;
+                };
+                let Some(crate::DfsPosixCoordinationResult::MetadataQuery(query)) =
+                    &mut reply.posix_coordination_result
+                else {
+                    continue;
+                };
+                if !matches!(
+                    query.result,
+                    crate::DfsMetadataQueryResult::StatProjectionV1 { .. }
+                        | crate::DfsMetadataQueryResult::StatAtPathV1 { .. }
+                ) {
+                    continue;
+                }
+                if matches!(change, StatReplyFault::SameVersionHashChanged)
+                    && !matches!(&query.result,
+                        crate::DfsMetadataQueryResult::StatProjectionV1 { page }
+                            if page.object.is_some())
+                {
+                    continue;
+                }
+                {
+                    let mut rules = self.fabric.faults.lock().unwrap();
+                    let rule = &mut rules[rule_index];
+                    // Bind to this actual call. Later collection/fence calls
+                    // must execute normally so their checks, not fault-budget
+                    // exhaustion, establish rejection of stale evidence.
+                    rule.call_id.get_or_insert(observation.call_id);
+                    if rule.remaining_hits == 0 {
+                        self.fabric
+                            .exhausted_budgets
+                            .fetch_add(1, Ordering::Relaxed);
+                        return Err(NetworkError::Io {
+                            operation: "bounded stat negative reply".into(),
+                            detail: "stat negative reply fault budget exhausted".into(),
+                        });
+                    }
+                    rule.remaining_hits -= 1;
+                }
+                // Save the actual receiver-produced response before the negative edit.
+                captured.lock().unwrap().push(crate::DfsRoutedMessage {
+                    source_node_id: routed.source_node_id.clone(),
+                    target_node_id: routed.target_node_id.clone(),
+                    frame_id: routed.frame_id,
+                    message_id: routed.message_id,
+                    message: crate::DfsNetworkMessage::NamespaceResponse(reply.clone()),
+                });
+                let Some(crate::DfsPosixCoordinationResult::MetadataQuery(query)) =
+                    &mut reply.posix_coordination_result
+                else {
+                    unreachable!()
+                };
+                match &change {
+                    StatReplyFault::Unsupported => {
+                        query.result = crate::DfsMetadataQueryResult::CurrentObject { object: None }
+                    }
+                    StatReplyFault::WrongEpoch => query.epoch += 1,
+                    StatReplyFault::WrongSource => {
+                        routed.source_node_id =
+                            NodeId::from_legacy_named("forged-stat-source").unwrap()
+                    }
+                    StatReplyFault::WrongTarget => {
+                        routed.target_node_id =
+                            NodeId::from_legacy_named("forged-stat-target").unwrap()
+                    }
+                    _ => {
+                        if let crate::DfsMetadataQueryResult::StatAtPathV1 { view } =
+                            &mut query.result
+                        {
+                            match &change {
+                                StatReplyFault::Incomplete => view.complete = !view.complete,
+                                StatReplyFault::WrongRequest => {
+                                    view.request.read_id = crate::DfsVersion::generate().to_string()
+                                }
+                                StatReplyFault::MalformedPrefix => {
+                                    view.prefixes[0].prefix.digest = "invalid".into()
+                                }
+                                StatReplyFault::StalePrefix => {
+                                    view.prefixes[0].prefix.journal_sequence += 1
+                                }
+                                _ => unreachable!(),
+                            }
+                            continue;
+                        }
+                        let crate::DfsMetadataQueryResult::StatProjectionV1 { page } =
+                            &mut query.result
+                        else {
+                            unreachable!()
+                        };
+                        match &change {
+                            StatReplyFault::Incomplete => page.complete = !page.complete,
+                            StatReplyFault::WrongRequest => {
+                                page.request.object_version = crate::DfsVersion::generate()
+                            }
+                            StatReplyFault::MalformedPrefix => {
+                                page.prefix.digest = "invalid".into()
+                            }
+                            StatReplyFault::StalePrefix => {
+                                page.prefix.journal_sequence =
+                                    page.prefix.journal_sequence.saturating_add(1)
+                            }
+                            StatReplyFault::SameVersionHashChanged => {
+                                let object = page.object.as_mut().expect("selected canonical page");
+                                object.content_hash = Some(format!(
+                                    "blake3:{}",
+                                    blake3::hash(b"negative stat same-version hash corruption")
+                                ));
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                }
+            }
             let mut rewritten =
                 ObjectRpcOutgoingResponse::encode_value(outgoing.response.route.clone(), response)?;
             rewritten.response.metadata = std::mem::take(&mut outgoing.response.metadata);
@@ -2469,6 +2758,7 @@ impl DfsTestRuntime {
             .reconcile_staged_with_base_registry(ServiceRegistry::default(), &factories)
             .map_err(|error| error.to_string())?;
         let next_endpoint = Arc::new(Endpoint {
+            host_generation: Arc::clone(&endpoint.host_generation),
             data_dir: Arc::clone(&endpoint.data_dir),
             cluster: Arc::clone(&endpoint.cluster),
             registry: reconciler
@@ -2540,7 +2830,12 @@ impl DfsTestRuntime {
             return Err("duplicate live DFS test node".into());
         }
         let data_dir = self.nodes[node].data_dir.clone();
+        let host_generation = Arc::new(());
         let carrier = Arc::new(Carrier {
+            host_identity: Some(NativeHostIdentity {
+                generation: Arc::clone(&host_generation),
+                cluster_id: self.state.cluster_id.clone(),
+            }),
             source: node.clone(),
             fabric: self.fabric.clone(),
             origin: RpcOrigin::RegisteredHost,
@@ -2567,6 +2862,7 @@ impl DfsTestRuntime {
             return Err("embedded DFS component did not activate".into());
         }
         let endpoint = Arc::new(Endpoint {
+            host_generation,
             data_dir,
             cluster,
             registry: reconciler
@@ -3038,6 +3334,21 @@ impl DfsTestRuntime {
             &crate::default_dfs_metadata_shards_root(&owned.data_dir).join(&shard.0),
         )
     }
+    /// Pause only the first real received deferred reply while its native
+    /// completion still retains the original data owner. No reply is supplied.
+    pub fn pause_deferred_response(
+        &self,
+        node: &NodeId,
+    ) -> Result<crate::runtime_host::DfsTestDeferredResponsePause, String> {
+        if self
+            .nodes
+            .get(node)
+            .is_none_or(|owned| owned.reconciler.is_none())
+        {
+            return Err("native deferred-response owner is not mounted".into());
+        }
+        crate::runtime_host::deferred_work_test::install(self.data_dir(node))
+    }
     pub fn wait_paused_materialization(
         &self,
         pause: &crate::runtime_host::DfsTestMaterializationPause,
@@ -3484,6 +3795,7 @@ impl DfsTestRuntime {
         timeout: Duration,
     ) -> Result<ObjectRpcResult, String> {
         let carrier = Carrier {
+            host_identity: None,
             source: source.clone(),
             fabric: self.fabric.clone(),
             origin: RpcOrigin::ExplicitFixtureRpc,
@@ -3509,6 +3821,7 @@ impl DfsTestRuntime {
         timeout: Duration,
     ) -> impl std::future::Future<Output = Result<ObjectRpcResult, String>> + Send + use<> {
         let carrier = Carrier {
+            host_identity: None,
             source: source.clone(),
             fabric: Arc::clone(&self.fabric),
             origin: RpcOrigin::ExplicitFixtureRpc,
@@ -3981,6 +4294,7 @@ impl DfsTestRuntime {
                 || rule.source.as_ref().is_none_or(|id| id == node)
             {
                 if let FaultAction::PauseBeforeDispatch(gate)
+                | FaultAction::PauseWriteCommitPublication { gate, .. }
                 | FaultAction::PauseAfterDispatch(gate)
                 | FaultAction::PauseNativeReadBody { gate, .. } = &rule.action
                 {
@@ -4822,6 +5136,81 @@ mod normal_native_kv_admission_tests {
     use super::*;
     use sinomo_core::kv::{KvOp, KvTxn, KvTxnRequest};
 
+    async fn observe_mounted_native_outcome(
+        cluster: &dyn sinomo_core::service::ClusterAccess,
+        request_id: &sinomo_core::kv::KvRequestId,
+        on_busy: impl FnMut(),
+    ) -> Result<sinomo_core::kv::ClusterKvRequestOutcomeRead, sinomo_core::service::ServiceError>
+    {
+        crate::runtime_host::native_request_outcome_test::admitted_native_request_outcome_observing(
+            cluster, request_id, on_busy,
+        )
+        .await
+    }
+
+    #[test]
+    fn mounted_native_outcome_observation_keeps_original_identity_across_real_busy_admission() {
+        let (mut native, nodes) =
+            DfsTestRuntime::start_cluster("native-original-outcome-busy", 1).unwrap();
+        let context = native.component_context(&nodes[0]).unwrap();
+        let cluster = context.cluster_access().unwrap();
+        let request = KvTxnRequest::generated(KvTxn {
+            compares: Vec::new(),
+            success: vec![KvOp::Put {
+                key: "/test/native-original-outcome-busy".into(),
+                value: b"original body".to_vec(),
+                lease_id: None,
+            }],
+            failure: Vec::new(),
+        });
+        let committed = executor()
+            .block_on(cluster.kv_commit_compact_async(request.clone()))
+            .unwrap();
+        assert!(committed.txn_response.as_ref().unwrap().succeeded);
+        let paths = ClusterPaths::new(native.data_dir(&nodes[0]));
+        let held =
+            sinomo_core::kv::lock_cluster_kv_raft_operation_for_paths(&paths.kv_paths()).unwrap();
+        let (release, released) = std::sync::mpsc::channel();
+        let budget = sinomo_core::cluster::ClusterControlPlaneTimeouts::default_daemon_transport()
+            .kv_txn_quorum_options(true)
+            .raft_append_timeout;
+        let holder = std::thread::spawn(move || {
+            let observed_busy = released.recv_timeout(budget);
+            drop(held);
+            observed_busy.expect("the real native read must encounter the owned admission");
+        });
+        let mut observed_busy = 0;
+        let result = executor().block_on(observe_mounted_native_outcome(
+            cluster.as_ref(),
+            &request.request_id,
+            || {
+                observed_busy += 1;
+                if observed_busy == 1 {
+                    release.send(()).unwrap();
+                }
+            },
+        ));
+        // Release and join even if an unexpected error precedes the busy branch.
+        let _ = release.send(());
+        holder.join().unwrap();
+        assert!(
+            observed_busy > 0,
+            "negative control must observe actual native contention"
+        );
+        let outcome =
+            result.expect("the same original observation must finish after admission is released");
+        sinomo_core::kv::validate_cluster_kv_request_outcome_read(&outcome).unwrap();
+        let sinomo_core::kv::KvRequestOutcome::Committed(record) = outcome.outcome else {
+            panic!("the original native committed receipt must remain available");
+        };
+        assert_eq!(record.request_id, request.request_id);
+        assert_eq!(record.command_digest, committed.command_digest);
+        assert_eq!(record.txn_response, committed.txn_response);
+        drop(cluster);
+        drop(context);
+        native.close().unwrap();
+    }
+
     #[test]
     fn mounted_native_kv_routes_work_before_dfs_preparation_and_stop_removes_admission() {
         let name = "native-core-kv-before-dfs-prepared";
@@ -4830,6 +5219,7 @@ mod normal_native_kv_admission_tests {
         native.bootstrap_planned_cluster().unwrap();
         native.prepare_projection(&node).unwrap();
         let carrier = Carrier {
+            host_identity: None,
             source: node.clone(),
             fabric: Arc::clone(&native.fabric),
             origin: RpcOrigin::RegisteredHost,
@@ -4874,11 +5264,11 @@ mod normal_native_kv_admission_tests {
         let response: sinomo_core::kv::ClusterKvTxnRpcResponse = response.decode_body().unwrap();
         assert!(response.txn_response.as_ref().unwrap().succeeded);
         let outcome = executor()
-            .block_on(
-                endpoint
-                    .cluster
-                    .kv_request_outcome_authoritative_async(request.request_id.clone()),
-            )
+            .block_on(observe_mounted_native_outcome(
+                endpoint.cluster.as_ref(),
+                &request.request_id,
+                || {},
+            ))
             .unwrap();
         sinomo_core::kv::validate_cluster_kv_request_outcome_read(&outcome).unwrap();
         let sinomo_core::kv::KvRequestOutcome::Committed(record) = outcome.outcome else {
@@ -5001,6 +5391,7 @@ mod owned_fault_cleanup_tests {
         let endpoint = Arc::clone(&native.fabric.nodes.lock().unwrap()[&node]);
         assert!(endpoint.registry.owns(crate::DFS_STATUS_ROUTE));
         let carrier = Carrier {
+            host_identity: None,
             source: node.clone(),
             fabric: Arc::clone(&native.fabric),
             origin: RpcOrigin::RegisteredHost,

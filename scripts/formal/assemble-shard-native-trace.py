@@ -589,6 +589,118 @@ def verify_replica_freeze_gate(raw, owners, scope, blobs, context, revision):
         raise Rejected('replica freeze gate changes its whole normal marker')
 
 
+def validate_retained_configuration_cut(cut, header, scope, *, guard_id=None,
+                                        expected=None):
+    """Validate DATA from the SAME already-qualified retained configuration view.
+
+    Its original three quorum proofs remain unchanged even when replay advances
+    the accepted projection revision. This is not a fresh per-operation KV read.
+    The source-bound Rust observation is emitted only after normal readiness.
+    """
+    fields = {'owner_label', 'owner_ordinal', 'requested_scope_prefixes', 'revision', 'accepted_authority_generation', 'scopes', 'authority', 'retained_projection_floor', 'guard_context_id'}
+    if not isinstance(cut, dict) or 'guard_context_id' not in cut:
+        raise Unavailable('retained configuration observation lacks current guard-context contract')
+    if set(cut) != fields:
+        raise Rejected('retained configuration observation has unknown or missing native fields')
+    if cut.get('owner_label') != header.get('actual_mount_label'):
+        raise Rejected('retained configuration cut borrows another mounted owner')
+    ordinal = SUBTREE.PROJECTOR.u64(cut.get('owner_ordinal'), 'retained cut ordinal')
+    if guard_id is not None and cut['guard_context_id'] != guard_id:
+        raise Rejected('retained configuration cut borrows another guard context')
+    prefixes = ['/dfs/filesystems/', '/dfs/services/content/', '/cluster/services/']
+    if cut.get('requested_scope_prefixes') != prefixes:
+        raise Rejected('retained configuration cut omits its exact three projection scopes')
+    scopes, proofs = cut.get('scopes'), cut.get('authority')
+    if not isinstance(scopes, list) or not isinstance(proofs, list) or len(scopes) != 3 or len(proofs) != 3:
+        raise Rejected('retained configuration cut lacks complete scope/proof coverage')
+    revision = SUBTREE.PROJECTOR.u64(cut.get('revision'), 'accepted projection revision')
+    SUBTREE.PROJECTOR.u64(cut.get('accepted_authority_generation'), 'accepted authority generation')
+    floor = cut.get('retained_projection_floor')
+    if not isinstance(floor, dict) or not isinstance(floor.get('value'), dict):
+        raise Unavailable('retained configuration cut has no actual native configuration floor')
+    entry = floor['value']
+    if entry.get('key') != '/cluster/raft/config' or not byte_vector(entry.get('value'), 'retained Raft config bytes'):
+        raise Rejected('retained configuration floor changes its native configuration identity')
+    created = SUBTREE.PROJECTOR.u64(entry.get('create_revision'), 'floor created')
+    modified = SUBTREE.PROJECTOR.u64(entry.get('modify_revision'), 'floor modified')
+    if not created <= modified <= SUBTREE.PROJECTOR.u64(floor.get('revision'), 'local floor revision') <= revision:
+        raise Rejected('retained configuration floor crosses accepted projection revision')
+    floor_term = SUBTREE.PROJECTOR.u64(floor.get('observed_term'), 'local floor term')
+    SUBTREE.PROJECTOR.u64(floor.get('applied_index'), 'local floor applied index')
+    voters = {row['node_id'] for row in header['normal_mounted_identity']['configured_members']
+              if row['role'] == 'voter' and row['state'] == 'voter'}
+    if not voters:
+        raise Unavailable('native retained cut has no actual configured voter basis')
+    terms = set()
+    for prefix, rows, proof in zip(prefixes, scopes, proofs):
+        if not isinstance(rows, list) or not isinstance(proof, dict) or set(proof) != {'term', 'commit_index', 'revision', 'basis'}:
+            raise Rejected('retained scope/proof has an invalid native shape')
+        term = SUBTREE.PROJECTOR.u64(proof.get('term'), 'original projection term')
+        proof_revision = SUBTREE.PROJECTOR.u64(proof.get('revision'), 'original projection revision')
+        if term == 0 or term < floor_term or not modified <= proof_revision <= revision:
+            raise Rejected('retained projection authority contradicts its native floor/cut')
+        if SUBTREE.PROJECTOR.u64(proof.get('commit_index'), 'original commit index') == 0:
+            raise Rejected('retained projection proof has no current-term committed index')
+        basis = proof.get('basis')
+        if not isinstance(basis, dict) or set(basis) != {'current-term-quorum'}:
+            raise Unavailable('retained projection proof is not current-term quorum evidence')
+        quorum = basis['current-term-quorum']
+        if not isinstance(quorum, dict) or set(quorum) != {'required_quorum', 'voter_acks'}:
+            raise Rejected('retained quorum proof has malformed native fields')
+        required = SUBTREE.PROJECTOR.u64(quorum.get('required_quorum'), 'projection quorum')
+        acknowledged = SUBTREE.PROJECTOR.u64(quorum.get('voter_acks'), 'projection voter ACKs')
+        if required != len(voters)//2+1 or not required <= acknowledged <= len(voters):
+            raise Rejected('retained projection proof differs from actual native voter membership')
+        terms.add(term)
+        keys = []
+        for row in rows:
+            key = row.get('key')
+            if not isinstance(key, str) or not key.startswith(prefix):
+                raise Rejected('retained projection row is outside its complete scope')
+            created = SUBTREE.PROJECTOR.u64(row.get('create_revision'), 'scope created')
+            modified_row = SUBTREE.PROJECTOR.u64(row.get('modify_revision'), 'scope modified')
+            if not created <= modified_row <= revision:
+                raise Rejected('retained projection row is beyond its accepted cut')
+            byte_vector(row.get('value'), 'retained scope entry bytes')
+            keys.append(key)
+        if keys != sorted(set(keys)):
+            raise Rejected('retained projection has duplicate or unordered rows')
+    if len(terms) != 1:
+        raise Rejected('retained projection proofs cross native authority terms')
+    prefix = '/dfs/filesystems/' + scope['file_system_id'] + '/'
+    segment = scope['shard_id'].strip('/').replace('/', '_')
+    kinds = [('metadata-shards/', 'DfsMetadataShardConfig'),
+             ('metadata-membership-handoffs/', 'DfsMetadataShardMembershipHandoff')]
+    keys = [prefix + family + segment for family, _ in kinds]
+    entries = {row['key']: row for row in scopes[0]}
+    decoded = []
+    decodes = []
+    for key, (_, kind) in zip(keys, kinds):
+        row = entries.get(key)
+        if row is None:
+            decoded.append(None)
+            continue
+        found = [value for value in header['actual_control_decodes']
+                 if SUBTREE.PROJECTOR.u64(value['source_owner_ordinal'], 'decoder ordinal') == ordinal
+                 and value['exact_entry'] == row and value['native_type'] == kind]
+        if len(found) != 1:
+            raise Unavailable('retained configuration lacks its SAME ordinal/bytes typed decoder')
+        decoded.append(found[0]['decoded_value']); decodes.append(found[0])
+    config = decoded[0]
+    if config is None:
+        raise Unavailable('retained configuration cut has no active shard assignment')
+    if any(config.get(key) != scope[key] for key in ('file_system_id', 'shard_id')):
+        raise Rejected('retained configuration decoder describes another physical shard')
+    members = config.get('replica_node_ids', []) + [config['primary_node_id']]
+    if len(members) != len(set(members)):
+        raise Rejected('retained configuration has duplicate assigned participants')
+    if expected is not None and (config != expected or decoded[1] is not None):
+        raise Rejected('guard retained configuration or missing handoff differs from actual mint')
+    return dict(entries=scopes[0], cached_revision=str(revision), scope_prefix=prefixes[0],
+                selected_keys=keys, decoded=decoded, typed_decodes=decodes,
+                original_authority=proofs, retained_projection_floor=floor)
+
+
 def validate_metadata_cache_cut(cut):
     """Independently fold actual accepted delta facts over the ORIGINAL read.
 
@@ -693,7 +805,7 @@ def validate_metadata_cache_consumer_scope(cut, file_system_id, shard_id,
         segment = shard_id.strip('/').replace('/', '_')
         selected = {prefix + file_system_id + '/' + family + segment for family in (
             'metadata-shards/', 'metadata-membership-handoffs/',
-            'metadata-operation-floors/', 'metadata-head-watermarks/')}
+            )}
         if not selected.intersection(keys):
             raise Rejected('native retained key return is scoped elsewhere')
         entries = {entry['key']: entry for entry in cut['entries']}
@@ -1237,6 +1349,22 @@ def validate_initial_sources(header, raw, raw_headers, blobs):
         facts=native_json(blobs.values[context['native_operational_facts_blob']]['data'].encode(),'initial operational facts')
         if facts.get('native_control_cut_blob'):initial_control_refs.add(facts['native_control_cut_blob'])
     for reference,value in list(blobs.values.items()):
+        if value['native_type'] == 'DfsNativeRetainedConfigurationCutEvidenceV1':
+            fact = native_json(value['data'].encode(), 'retained configuration evidence')
+            cut = fact['actual_configuration_cut']; key = (cut['owner_label'], CHECK.decimal_u64(cut['owner_ordinal']))
+            if key not in raw or raw[key]['kind'] != 'configuration-cut' or raw[key]['record'] != cut:
+                raise Rejected('retained certificate differs from actual raw owner/ordinal/cut')
+            headers = [item for item in raw_headers if item['actual_mount_label'] == key[0]]
+            if len(headers) != 1:
+                raise Unavailable('retained certificate has no exact actual source header')
+            qualified = validate_retained_configuration_cut(cut, headers[0], header['scope'])
+            entries = {row['key']: row for row in qualified['entries']}
+            if (fact['selected_control_keys'] != qualified['selected_keys']
+                    or fact['selected_entries'] != [entries.get(k) for k in qualified['selected_keys']]
+                    or fact['actual_typed_decodes'] != qualified['typed_decodes']):
+                raise Rejected('retained certificate changes its exact selected keys/bytes/typed rows')
+            if reference in initial_control_refs: control_keys.add(key)
+            continue
         if value['native_type']!='DfsNativeCacheControlCutEvidenceV1':continue
         fact=native_json(value['data'].encode(),'native cache evidence');cut=fact['actual_cache_cut']
         key=(cut['owner_label'],CHECK.decimal_u64(cut['owner_ordinal']))
@@ -1245,7 +1373,7 @@ def validate_initial_sources(header, raw, raw_headers, blobs):
         if not raw_headers:raise Unavailable('actual typed decoder source header is required')
         scope=header['scope'];segment=scope['shard_id'].strip('/').replace('/','_')
         expected_keys=[f"/dfs/filesystems/{scope['file_system_id']}/{family}/{segment}" for family in
-                       ('metadata-shards','metadata-membership-handoffs','metadata-operation-floors','metadata-head-watermarks')]
+                       ('metadata-shards','metadata-membership-handoffs')]
         if fact['selected_control_keys']!=expected_keys:
             raise Rejected('initial control certificate changes the exact selected scope/key set')
         expected_decodes=[item for item in actual_decodes.get(key,[]) if item['exact_entry']['key'] in expected_keys]
@@ -1297,10 +1425,13 @@ def validate_initial_sources(header, raw, raw_headers, blobs):
             if not stored or record['digest']!=stored['digest']:raise Rejected('initial guard belongs to another terminal baseline')
             if record['phase']=='admitted' and (not record['matches_actual_mounted_owner'] or record['held'] is None):
                 raise Unavailable('initial baseline guard lacks actual mounted custody')
-        elif kind=='authoritative-read':
-            guards=[v['record'] for v in raw.values() if v['kind']=='guard' and v['record']['phase']=='admitted' and v['record']['guard_id']==record['guard_context_id']]
-            if len(guards)!=1 or guards[0]['digest']['operation_id'] not in baseline:
-                raise Rejected('initial authority read lacks exact baseline guard correlation')
+        elif kind == 'authoritative-read':
+            if record.get('guard_context_id') is not None:
+                raise Rejected('retired per-operation authoritative guard read is incompatible')
+            if key not in boundary_sources:
+                raise Unavailable('initial global authoritative read needs exact configuration/handoff source evidence')
+        elif kind == 'configuration-cut':
+            validate_retained_configuration_cut(record, header_map[key[0]], header['scope'])
         elif kind=='content-receipt':
             references=[]
             for value in blobs.values.values():
@@ -1497,7 +1628,7 @@ def assemble(header: dict[str, Any], captures: list[dict[str, Any]], raw_headers
             if key in used:raise Rejected('raw native effect represented more than once')
             used.add(key);records.append(raw[key])
         action=copy.deepcopy(source['action'])
-        if action['kind']!='fallback-permit' and any(item['kind']=='original-control-commit' for item in records):
+        if action['kind'] not in ('handoff-begin','activate','kv-observation') and any(item['kind']=='original-control-commit' for item in records):
             raise Rejected('original KV proof cannot be consumed by another semantic group')
         owner=source['owner_id']
         if owner not in owners:raise Rejected('timeline owner is not native-bound')
@@ -1616,33 +1747,34 @@ def assemble(header: dict[str, Any], captures: list[dict[str, Any]], raw_headers
                     raise Rejected('guard authorization blob has wrong native type')
                 guard_fact=native_json(guard_blob['data'].encode(),'guard fact')
                 actual_mode=native_authority['mode']
-                if guard_fact['digest']!=observed['digest'] or guard_fact['authorization_mode']!=('full-shard' if actual_mode=='full-shard' else 'recovery'):
+                if guard_fact['digest']!=observed['digest'] or guard_fact['authorization_mode']!=actual_mode:
                     raise Rejected('guard envelope authority differs from actual guard')
                 if set(guard_fact['authenticated_prepare_ack_node_ids'])!=set(native_authority['authenticated_acknowledged_node_ids']):
                     raise Rejected('guard envelope invents or drops authenticated native ACKs')
-                if actual_mode=='recovery':
-                    permit_ref=guard_fact.get('native_permit_observation_blob')
-                    if permit_ref is None:raise Unavailable('actual recovery guard native receipt absent')
-                    permit_fact=native_json(blobs.values[permit_ref]['data'].encode(),'native permit fact')
-                    native_permit_ref=permit_fact['native_permit_blob']
-                    if native_json(blobs.values[native_permit_ref]['data'].encode(),'native permit')!=native_authority['native_permit']:
-                        raise Rejected('recovery envelope differs from actual operation-bound native permit')
-                correlated=[item['record'] for item in records if item['kind']=='authoritative-read' and item['record'].get('guard_context_id')==observed['guard_id']]
-                if len(correlated)!=1:
-                    raise Unavailable('guard lacks its same-call native authoritative read')
-                actual_read=correlated[0]
-                exact=action['authoritative_exact_read']
-                authority=actual_read['read']['authority']
-                if exact['requested_keys']!=actual_read['requested_keys'] or CHECK.decimal_u64(exact['revision'])!=authority['revision']:
-                    raise Rejected('guard exact read differs from returned native receipt')
-                raw_values=actual_read['read']['value']
-                if len(raw_values)!=len(exact['rows']):
-                    raise Rejected('guard exact read omits native rows')
-                for actual,row in zip(raw_values,exact['rows']):
-                    if actual is None:
-                        if row['entry_blob'] is not None:raise Rejected('native observed absence changed to a row')
-                    elif native_json(blobs.values[row['entry_blob']]['data'].encode(),'native KV entry')!=actual:
-                        raise Rejected('guard KV row differs from actual same read')
+                if actual_mode != 'full-shard':
+                    raise Unavailable('clustered native guard rejects retired fallback/local authority')
+                correlated = [item['record'] for item in records if item['kind'] == 'configuration-cut'
+                              and item['record'].get('guard_context_id') == observed['guard_id']]
+                if len(correlated) != 1:
+                    raise Unavailable('guard lacks its SAME consumed retained configuration cut')
+                actual_cut = correlated[0]
+                header_for_owner = next(value for value in raw_headers if value['actual_mount_label'] == owner)
+                qualified = validate_retained_configuration_cut(actual_cut, header_for_owner,
+                    header['scope'], guard_id=observed['guard_id'], expected=expected_config)
+                exact = action['retained_configuration_cut']
+                if exact['requested_keys'] != qualified['selected_keys'] or CHECK.decimal_u64(exact['revision']) != CHECK.decimal_u64(qualified['cached_revision']):
+                    raise Rejected('guard cut differs from actual accepted retained projection')
+                evidence = native_json(blobs.values[exact['native_authority_evidence_blob']]['data'].encode(), 'retained cut evidence')
+                if evidence != actual_cut or len(exact['rows']) != 2:
+                    raise Rejected('guard cut substitutes actual retained evidence/row coverage')
+                entries = {row['key']: row for row in qualified['entries']}
+                for key, row in zip(qualified['selected_keys'], exact['rows']):
+                    if row['key'] != key:
+                        raise Rejected('guard retained row key changes actual requested scope')
+                    actual = entries.get(key)
+                    value = native_json(blobs.values[row['entry_blob']]['data'].encode(), 'retained KV row') if row['entry_blob'] else None
+                    if value != actual:
+                        raise Rejected('guard retained row differs from SAME consumed cut')
                 snapshot(source['before_snapshot'])
                 if observed['held'] is None:raise Unavailable('guard admission lacks actual held native cut')
                 snapshot(source['after_snapshot'],json.dumps(observed['held'],separators=(',',':')).encode())
@@ -1651,48 +1783,7 @@ def assemble(header: dict[str, Any], captures: list[dict[str, Any]], raw_headers
                     raise Rejected('guard release names another actual operation')
                 snapshot(source['before_snapshot']);snapshot(source['after_snapshot'])
         elif action['kind'] == 'fallback-permit':
-            issued = [item['record'] for item in records if item['kind'] == 'boundary'
-                      and item['record']['facts']['phase'] == 'recovery-permit-issued']
-            if len(issued) != 1:
-                raise Unavailable('fallback requires its actual normal permit-return packet')
-            fact = issued[0]['facts']; permit = fact['permit']
-            if (permit['operation_digest'] != action['operation']['native_digest']
-                    or permit['permit_id'] != action['permit_id']
-                    or permit['file_system_id'] != header['scope']['file_system_id']
-                    or permit['shard_id'] != header['scope']['shard_id']):
-                raise Rejected('fallback action changes its actual operation-bound native permit')
-            native = permit.get('native_commit')
-            observed = [item for item in records if item['kind'] == 'control-commit']
-            if native is None or len(observed) != 1 or observed[0]['record']['commit'] != native:
-                raise Unavailable('fallback lacks its exact same-call actual native commit')
-            if observed[0]['record']['owner_label'] != owners[owner]['component_incarnation']:
-                raise Rejected('operation permit borrows another actual native call owner')
-            reference = action['native_quorum_result_blob']
-            permit_fact = native_json(blobs.values[reference]['data'].encode(), 'operation permit observation')
-            if (native_json(blobs.values[permit_fact['native_permit_blob']]['data'].encode(), 'actual operation permit') != permit
-                    or set(permit_fact['authenticated_recovery_prefix_ack_node_ids']) != set(fact['authenticated_recovery_node_ids'])):
-                raise Rejected('operation permit changes its actual native receipt or metadata recovery ACKs')
-            expected_call = dict(scope=header['scope'], implementation_revision=header['envelope_binding']['implementation_revision'],
-                owner_bindings=header['owners'], complete=True, continuous=True,
-                owner_id=owner, actual_owner_ordinal=str(observed[0]['ordinal']), commit=native,
-                refinement_boundary='verified-r0-atomic-kv')
-            module,_=initial_native_verifiers(header['scope'],header['owners'],raw)
-            raw_header=next(h for h in raw_headers if h['actual_mount_label']==owner)
-            voters={member['node_id'] for member in raw_header['normal_mounted_identity']['configured_members']
-                if member['role']=='voter' and member['state']=='voter'}
-            original=module.original_for_replay(header['scope'],owners[owner],raw_header,raw,
-                (owner,observed[0]['ordinal']),observed[0]['record'],voters,required=False)
-            original_refs=[item for item in records if item['kind']=='original-control-commit']
-            if ([item['ordinal'] for item in original_refs] != ([original[1]] if original is not None else [])):
-                raise Rejected('fallback group omits/changes its actual original effect boundary')
-            if original is not None:
-                expected_call['original_native_commit_source']=dict(owner_id=owner,owner_ordinal=str(original[1]))
-            call_ref = permit_fact.get('native_same_call_commit_observation_blob')
-            if call_ref and native_json(blobs.values[call_ref]['data'].encode(), 'same-call native commit') != expected_call:
-                raise Rejected('operation permit certificate changes the actual native call owner/ordinal/receipt')
-            permit_fact['native_same_call_commit_observation_blob'] = blobs.json('DfsNativeControlCommitObservationV1', expected_call)
-            action['native_quorum_result_blob'] = blobs.json('DfsNativeOperationPermitObservationV1', permit_fact)
-            snapshot(source['before_snapshot']);snapshot(source['after_snapshot'])
+            raise Rejected('retired per-operation KV fallback is incompatible with current pipeline')
         elif action['kind'] == 'replay':
             matches = [item['record'] for item in records if item['kind'] == 'kernel'
                        and item['record']['phase'] == 'exact-committed-replay']
@@ -1703,6 +1794,36 @@ def assemble(header: dict[str, Any], captures: list[dict[str, Any]], raw_headers
                 raise Rejected('replay borrows another actual immutable operation')
             snapshot(source['before_snapshot'],byte_vector(observed['before_held_json'],'replay prior'))
             snapshot(source['after_snapshot'],byte_vector(observed['after_held_json'],'replay next'))
+        elif action['kind'] == 'handoff-begin':
+            calls = [item for item in records if item['kind'] == 'control-commit']
+            if len(calls) != 1:
+                raise Unavailable('finite pending decision requires its exact global transaction receipt')
+            call = calls[0]; key = (owner, call['ordinal'])
+            native_header = next(value for value in raw_headers if value['actual_mount_label'] == owner)
+            voters = {member['node_id'] for member in native_header['normal_mounted_identity']['configured_members']
+                      if member['role'] == 'voter' and member['state'] == 'voter'}
+            module, _ = initial_native_verifiers(header['scope'], header['owners'], raw)
+            txn = module.native_receipt(call['record'], voters, scope=header['scope'], owner=owners[owner],
+                header=native_header, raw=raw, key=key)
+            decoded = module.request_decodes(native_header, call['record'])
+            pending = native_json(blobs.values[action['handoff_blob']]['data'].encode(), 'actual pending handoff')
+            retiring = native_json(blobs.values[action['retiring']['native_config_blob']]['data'].encode(), 'retiring config')
+            desired = native_json(blobs.values[action['desired']['native_config_blob']]['data'].encode(), 'desired config')
+            pending_key = '/dfs/filesystems/' + header['scope']['file_system_id'] + '/metadata-membership-handoffs/' + header['scope']['shard_id'].strip('/').replace('/', '_')
+            effects = [value for (section, _), value in decoded.items() if section == 'success' and value[0] == pending_key]
+            if len(effects) != 1 or effects[0][1] != 'DfsMetadataShardMembershipHandoff' or effects[0][2] != pending:
+                raise Rejected('finite handoff decision does not publish the exact observed pending body')
+            if pending['handoff_id'] != action['handoff_id'] or pending['retiring_shard'] != retiring or pending['desired_shard'] != desired:
+                raise Rejected('finite handoff action changes its original tuple/body')
+            # These are genuine global configuration CAS constraints, not
+            # ordinary metadata effect authority or model permit state.
+            module.exact_scope_guards(txn, decoded, header['scope'], retiring, pending_key,
+                None, pending.get('required_head_watermark'))
+            before = snapshots[snapshot(source['before_snapshot'])]
+            snapshot(source['after_snapshot'])
+            prefix = action['pending_begin_local_prefix']
+            if before['owner_id'] != owner or before['local_certified_prefix'] != prefix or CHECK.decimal_u64(action['pending_begin_local_head']) != CHECK.decimal_u64(prefix['journal_sequence']):
+                raise Rejected('pending decision substitutes a freeze/height for its actual original local prefix')
         elif action['kind'] in ('freeze', 'activate', 'rebind'):
             phase = {'freeze':'retiring-freeze-persisted', 'activate':'handoff-activation-completed',
                      'rebind':'successor-rebound'}[action['kind']]
@@ -1749,6 +1870,14 @@ def assemble(header: dict[str, Any], captures: list[dict[str, Any]], raw_headers
             module,_=initial_native_verifiers(header['scope'],header['owners'],raw)
             module.verify_original_observation(header['scope'],header['owners'],
                 {row['actual_mount_label']:row for row in raw_headers},raw,key)
+        elif raw[key]['kind'] == 'authoritative-read':
+            if raw[key]['record'].get('guard_context_id') is not None:
+                raise Rejected('retired per-operation authoritative read cannot be auxiliary')
+        elif raw[key]['kind'] == 'configuration-cut':
+            if 'guard_context_id' not in raw[key]['record']:
+                raise Unavailable('archived retained cut lacks current context contract')
+            if raw[key]['record']['guard_context_id'] is not None:
+                raise Unavailable('guard-bound retained cut cannot disappear into auxiliary observations')
         elif raw[key]['kind'] not in ('authoritative-read','configuration-cut'):
             raise Rejected('durable kernel/control effects and guards cannot be labeled auxiliary')
         used.add(key)

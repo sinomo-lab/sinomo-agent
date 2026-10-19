@@ -292,6 +292,32 @@ pub(crate) fn current_tables_snapshot<'a>(
 ) -> Result<DfsMetadataTablesSnapshot<'a>> {
     #[cfg(test)]
     METADATA_DURABLE_TABLE_PROBES.set(METADATA_DURABLE_TABLE_PROBES.get().saturating_add(1));
+    pin_current_tables_snapshot(
+        root,
+        live_tables,
+        table_log_offset,
+        materialized_through_sequence,
+        table_snapshot_fingerprint,
+        loaded_storage_generation,
+        prefix_proof,
+        read_snapshot_cache,
+    )
+}
+
+/// The same validated lock-free read, used once at an operation's pin boundary.
+/// Getter-level probe counters stay in current_tables_snapshot, as with the
+/// existing consistent-read scope; this pin remains visible in read_snapshot
+/// tracing and actual filesystem I/O measurements.
+pub(crate) fn pin_current_tables_snapshot<'a>(
+    root: &Path,
+    live_tables: &'a DfsMetadataTables,
+    table_log_offset: u64,
+    materialized_through_sequence: u64,
+    table_snapshot_fingerprint: &Option<MetadataTableSnapshotFingerprint>,
+    loaded_storage_generation: &Option<MetadataTableStorageGeneration>,
+    prefix_proof: &Option<DfsMetadataPrefixProof>,
+    read_snapshot_cache: &Arc<Mutex<Option<MetadataTableReadSnapshotCache>>>,
+) -> Result<DfsMetadataTablesSnapshot<'a>> {
     const MAX_GENERATION_TRANSITION_ATTEMPTS: usize = 4;
     for _ in 0..MAX_GENERATION_TRANSITION_ATTEMPTS {
         let generation_before = metadata_table_storage_generation(root)?;

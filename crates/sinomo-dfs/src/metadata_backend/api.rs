@@ -21,6 +21,25 @@ pub(super) fn initial_namespace_batch_before_materialize_for_test(action: impl F
 }
 
 impl DfsMetadataBackend for LocalSobjMetadataBackend {
+    fn begin_stat_read_snapshot(&mut self) -> Result<()> {
+        self.pin_stat_read_snapshot()
+    }
+    fn end_stat_read_snapshot(&mut self) {
+        self.unpin_stat_read_snapshot();
+    }
+    fn begin_stat_read_snapshot_on_shard(&mut self, id: &DfsMetadataShardId) -> Result<()> {
+        if id != &self.shard_id {
+            return Err(MetadataBackendError::Serde(
+                "stat view names a foreign shard".into(),
+            ));
+        }
+        self.pin_stat_read_snapshot()
+    }
+    fn end_stat_read_snapshot_on_shard(&mut self, id: &DfsMetadataShardId) {
+        if id == &self.shard_id {
+            self.unpin_stat_read_snapshot();
+        }
+    }
     #[cfg(test)]
     fn test_receipt_scan_counts_by_shard(&self) -> BTreeMap<DfsMetadataShardId, (usize, usize)> {
         BTreeMap::from([(self.shard_id.clone(), self.test_receipt_scan_counts())])
@@ -290,6 +309,28 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
 
     fn end_consistent_read_snapshot(&mut self) {
         self.consistent_read_snapshot_depth = self.consistent_read_snapshot_depth.saturating_sub(1);
+    }
+
+    fn has_physical_read_scope(&self, shard_id: &DfsMetadataShardId) -> bool {
+        shard_id == &self.shard_id
+    }
+
+    fn begin_consistent_read_snapshot_on_shard(
+        &mut self,
+        shard_id: &DfsMetadataShardId,
+    ) -> Result<()> {
+        if shard_id != &self.shard_id {
+            return Err(MetadataBackendError::Serde(
+                "read snapshot names a foreign shard".into(),
+            ));
+        }
+        self.begin_consistent_read_snapshot()
+    }
+
+    fn end_consistent_read_snapshot_on_shard(&mut self, shard_id: &DfsMetadataShardId) {
+        if shard_id == &self.shard_id {
+            self.end_consistent_read_snapshot();
+        }
     }
 
     fn get_file_system(&self, file_system_id: &DfsFileSystemId) -> Result<Option<DfsFileSystem>> {
@@ -982,6 +1023,38 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             return Ok(None);
         }
         self.get_intent(object_id, intent_id)
+    }
+
+    fn write_operation_admission_snapshot(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        file_system_id: &DfsFileSystemId,
+        object_id: &DfsObjectId,
+        intent_id: &str,
+    ) -> Result<crate::DfsWriteOperationAdmissionSnapshot> {
+        self.require_replication_source_shard(shard_id)?;
+        let tables = self.current_tables_snapshot()?;
+        let intent = tables.intent_record(object_id, intent_id);
+        if intent
+            .as_ref()
+            .is_some_and(|record| record.file_system_id != *file_system_id)
+        {
+            return Err(MetadataBackendError::Serde(
+                "write observation names a foreign filesystem".into(),
+            ));
+        }
+        let target_size_bytes = intent.as_ref().and_then(|record| {
+            tables
+                .versions
+                .get(&(object_id.clone(), record.target_version.clone()))
+                .and_then(|version| version.size_bytes)
+        });
+        Ok(crate::DfsWriteOperationAdmissionSnapshot {
+            intent,
+            target_size_bytes,
+            prepared: tables.prepared_operations_for_object(file_system_id, object_id)?,
+            retention: tables.intent_receipt_retention.for_object(object_id),
+        })
     }
 
     fn get_receipt_on_shard(

@@ -62,6 +62,23 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         path: &str,
         operation: impl FnOnce(&mut Self, Option<&[DfsMetadataShardConfig]>) -> Result<R>,
     ) -> Result<R> {
+        self.with_local_primary_read_snapshot(path, false, operation)
+    }
+
+    pub(super) fn with_local_primary_stat_read_snapshot<R>(
+        &mut self,
+        path: &str,
+        operation: impl FnOnce(&mut Self, Option<&[DfsMetadataShardConfig]>) -> Result<R>,
+    ) -> Result<R> {
+        self.with_local_primary_read_snapshot(path, true, operation)
+    }
+
+    fn with_local_primary_read_snapshot<R>(
+        &mut self,
+        path: &str,
+        stat: bool,
+        operation: impl FnOnce(&mut Self, Option<&[DfsMetadataShardConfig]>) -> Result<R>,
+    ) -> Result<R> {
         let path = normalize_posix_path(path)?;
         let shard_snapshot = self.refresh_sifs_metadata_shards()?;
         let local_primary = match shard_snapshot.as_deref() {
@@ -72,19 +89,29 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         };
         let pinned = local_primary && self.metadata_backend.is_some();
         if pinned {
-            self.metadata_backend
+            let backend = self
+                .metadata_backend
                 .as_mut()
-                .expect("metadata backend presence checked before read snapshot")
-                .begin_consistent_read_snapshot_for_path(&sifs_file_system_id(), &path)
-                .map_err(DfsPosixError::from)?;
+                .expect("metadata backend presence checked before read snapshot");
+            if stat {
+                backend.begin_stat_read_snapshot_for_path(&sifs_file_system_id(), &path)
+            } else {
+                backend.begin_consistent_read_snapshot_for_path(&sifs_file_system_id(), &path)
+            }
+            .map_err(DfsPosixError::from)?;
         }
 
         let result = operation(self, shard_snapshot.as_deref());
         if pinned {
-            self.metadata_backend
+            let backend = self
+                .metadata_backend
                 .as_mut()
-                .expect("pinned metadata backend remains installed")
-                .end_consistent_read_snapshot_for_path(&sifs_file_system_id(), &path);
+                .expect("pinned metadata backend remains installed");
+            if stat {
+                backend.end_stat_read_snapshot_for_path(&sifs_file_system_id(), &path);
+            } else {
+                backend.end_consistent_read_snapshot_for_path(&sifs_file_system_id(), &path);
+            }
         }
         result
     }

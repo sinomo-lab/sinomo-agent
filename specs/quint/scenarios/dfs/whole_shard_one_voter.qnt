@@ -4,7 +4,7 @@ module dfs_whole_shard_one_voter_scenario {
   import dfs_whole_shard_safety from "../../checks/dfs/whole_shard_safety"
   var phase: int
   action init = all {
-    dfs_whole_shard::initFromProfile({ nodes: Set(1, 2, 3, 4), voters: Set(1),
+    dfs_whole_shard::initFromProfile({ standalone: false, nodes: Set(1, 2, 3, 4), voters: Set(1),
       initialMembers: Set(1, 2, 3), replacementMembers: Set(1, 2, 4),
       contentReplicas: Set(1, 2, 3, 4), requiredW: 1, metadataOnlyOperations: Set() }),
     phase' = 0,
@@ -33,17 +33,11 @@ module dfs_whole_shard_one_voter_scenario {
     } else if (phase == 10) {
       all { dfs_whole_shard::acknowledgePrepare(2, 2), phase' = phase + 1 }
     } else if (phase == 11) {
-      all { dfs_whole_shard::issuePermit(2), phase' = phase + 1 }
-    } else if (phase == 12) {
-      all { dfs_whole_shard::admitCommit(2), phase' = phase + 1 }
-    } else if (phase == 13) {
-      all { dfs_whole_shard::commit(2, dfs_whole_shard::digest(2, 1), false), phase' = phase + 1 }
-    } else if (phase == 14) {
-      all { dfs_whole_shard::releasePublicationGuard(2), phase' = phase + 1 }
+      all { dfs_whole_shard::rejectPartial(2), phase' = phase + 1 }
     } else { all { dfs_whole_shard::stutter, phase' = phase } }
   def safety: bool = dfs_whole_shard_safety::safety
-  def terminalWitness: bool = phase == 15 and all {
+  def terminalWitness: bool = phase == 12 and all {
     dfs_whole_shard::s.profile.voters == Set(1),
-    dfs_whole_shard_safety::witnessHealthy, dfs_whole_shard_safety::witnessFallback,
+    dfs_whole_shard_safety::witnessHealthy, dfs_whole_shard_safety::witnessPartialRejected,
   }
 }

@@ -1547,9 +1547,25 @@ impl DfsMetadataAuthorityState {
                 .map_err(|_| sinomo_core::kv::KvError::AuthorityUnavailable {
                     detail: "DFS metadata authority projection lock poisoned".into(),
                 })?;
+        let current_projection_generation = self.projection_generation();
         if projection.revision.is_none()
-            || self.projection_generation() != expected_projection_generation
+            || current_projection_generation != expected_projection_generation
         {
+            #[cfg(test)]
+            eprintln!(
+                "NATIVE_PUBLICATION_CONFIGURATION_NOT_CURRENT branch={} filesystem={} expected_generation={} current_generation={} revision={:?} required_revision={:?} thread={:?}",
+                if projection.revision.is_none() {
+                    "projection_unavailable"
+                } else {
+                    "generation_changed"
+                },
+                file_system_id,
+                expected_projection_generation,
+                current_projection_generation,
+                projection.revision,
+                projection.required_revision,
+                std::thread::current().name(),
+            );
             return Ok(None);
         }
         let shards = match projection

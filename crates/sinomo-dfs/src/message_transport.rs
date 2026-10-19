@@ -213,6 +213,19 @@ pub trait DfsMessageTransport: DfsTransportIdentity {
         false
     }
 
+    /// A shard-bound Core may read another physical scope on the same node
+    /// only through its authenticated registered Main. This is one read-only
+    /// command, not a role change or permission to drain incoming mutations.
+    fn send_local_metadata_query_to_main(
+        &mut self,
+        _message: crate::DfsRoutedMessage,
+    ) -> Result<(), sinomo_core::network::NetworkError> {
+        Err(sinomo_core::network::NetworkError::Io {
+            operation: "local metadata query to Main".into(),
+            detail: "transport has no authenticated Main query sender".into(),
+        })
+    }
+
     /// Runtime-local response custody only. The service retains authority checks.
     fn register_routed_write_response_owner(
         &mut self,

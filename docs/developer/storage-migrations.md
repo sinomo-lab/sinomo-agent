@@ -132,6 +132,57 @@ only: source custody, current assignment, native receipts, participant proof and
 installed-image checks still run at their original boundaries. A new component
 owner starts with no retained plan, and no parsed plan is an authority token.
 
+Within that component, pure plan validation can reuse this same single entry
+when every typed field matches. Opaque JSON numbers and original path spelling
+are compared exactly, including distinctions that ordinary numeric or path
+equality normalizes. This avoids repeatedly serializing an unchanged plan during
+one bounded publication turn. Changed data earns full validation again. Reads
+of retained files still check their entire current contents, and every native
+scope, source, receipt, floor and publication check remains independent of this
+data reuse.
+
+During preparation and installation, a current candidate's complete native row
+decoder supplies a private inspection value. The component retains at most one
+candidate inspection and one decoded ancestry challenge alongside its existing
+single decoded plan entry. Challenge reuse reads and compares all current file
+bytes; its source custody, floors and authority are checked afresh by the caller.
+Each subsequent candidate check reads
+the entire physical stream again, including the header, every framed record,
+record count, stream chain and terminal EOF, then compares the raw file hash.
+Only identical bytes reuse the decoded semantic result. This value grants no
+writer permission, survives no process restart, and does not replace source or
+target fences. The same checks apply after the candidate's root is renamed.
+
+Retained raw journal copies are checkpointed within the existing bounded source
+turn. New copies stay in uniquely named private files until every file has been
+synced. No-clobber installation then publishes their canonical names and syncs
+the directories before a projection reader or the saved source cursor can use
+them. A failure may leave a prefix of individually synced canonical copies, but
+never an acknowledged batch. Restart independently replays the source/events,
+compares exact bytes, and syncs reused names before acknowledging progress.
+Unpublished abandoned files are not source evidence. Conflicting canonical or
+pending copies remain errors, and the original source writer fence stays held.
+
+Hidden native candidate frames retain their ordinary journal durability barrier.
+A commit still requires its exact durable prepare frame. The separately written
+journal head uses the existing derived-hint API; lost, stale or corrupt hints
+are recovered from the actual durable tail rather than authorizing a sequence.
+
+Source-version lookup hints are derived from the verified source projection.
+Their publication consumes the existing preparation record budget, retaining a
+cursor in the same fenced session between calls. Each hint is atomically
+replaced using the normal hint writer. The source event ledger, progress,
+captured cuts, proposals and installation records retain their durability
+barriers; hint files never supply those guarantees or native authority.
+
+A fresh owner first validates source custody and replays the durable event
+checkpoint under the same record budget, then reconstructs the hints. No saved
+hint cursor or hint file can replace this replay. Missing hints remain
+unavailable until reconstructed; malformed or foreign hints still fail source
+validation. Every lookup checks current membership, original source bytes and
+row provenance. Losing these derived files across cancellation or restart cannot
+make incomplete preparation Ready or change the native publication checks.
+
 Cancellation between calls preserves this pending state. A process restart
 reconstructs the source projection under the original record budget, verifies
 the staged candidate and reuses the retained native plan and request identities.

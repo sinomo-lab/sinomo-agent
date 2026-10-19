@@ -4,6 +4,71 @@
 mod native_trace_artifact;
 pub use native_trace_artifact::NativeShardTraceArtifactSession;
 
+/// Bounded observations of actual metadata publication and replica responses.
+/// This handle grants no authority and uses the existing packet/byte limits.
+pub struct DfsTestMetadataBoundaryCapture {
+    root: std::path::PathBuf,
+    capture: crate::native_boundary_diagnostics::Capture,
+}
+
+impl DfsTestMetadataBoundaryCapture {
+    pub fn checkpoint(&self, label: &str) {
+        self.capture.checkpoint(label);
+    }
+
+    pub fn dump_replication_failure(
+        &self,
+        label: &str,
+        assignment: &crate::DfsMetadataShardConfig,
+        error: &str,
+        observations: &[DfsTestRpcObservation],
+    ) {
+        crate::native_boundary_diagnostics::record(
+            &self.root,
+            "replication-failure-context",
+            || serde_json::json!({"assignment":assignment,"error":error}),
+            false,
+        );
+        for (ordinal, call) in observations.iter().enumerate() {
+            crate::native_boundary_diagnostics::record(
+                &self.root,
+                "rpc-observation-at-failure",
+                || {
+                    serde_json::json!({
+                        "ordinal":ordinal,"source":call.source,"target":call.target,
+                        "route":call.route,"call_id":call.call_id,
+                        "phase":format!("{:?}",call.phase),"origin":format!("{:?}",call.origin),
+                        "error":call.outcome_error,"frame_id":call.dfs_frame_id,
+                        "intent_id":call.dfs_intent_id,"file_system_id":call.dfs_file_system_id,
+                        "object_id":call.dfs_object_id,"version":call.dfs_version,
+                        "time_qualification":"dumped at failure; original RPC timestamps unavailable",
+                    })
+                },
+                false,
+            );
+        }
+        self.capture.dump(label, serde_json::Value::Null);
+    }
+}
+
+/// Record actual test-observed migration decisions within the same bounded capture.
+pub fn record_metadata_operation_boundary(
+    root: &std::path::Path,
+    kind: &str,
+    facts: impl FnOnce() -> serde_json::Value,
+) {
+    crate::native_boundary_diagnostics::record(root, kind, facts, false);
+}
+
+pub fn capture_metadata_operation_boundaries(
+    root: std::path::PathBuf,
+) -> DfsTestMetadataBoundaryCapture {
+    DfsTestMetadataBoundaryCapture {
+        capture: crate::native_boundary_diagnostics::capture_all_operations(root.clone()),
+        root,
+    }
+}
+
 pub use crate::native_shard_trace::{
     NativeShardTraceCapture, NativeShardTraceRequest, NativeTraceArtifactBindingV1,
     capture_native_shard_trace, request_native_shard_trace,

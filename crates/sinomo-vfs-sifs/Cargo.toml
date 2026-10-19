@@ -19,3 +19,7 @@ sinomo-core = { path = "../sinomo-core" }
 sinomo-dfs = { path = "../sinomo-dfs" }
 sinomo-vfs = { path = "../sinomo-vfs" }
 tokio = { workspace = true, features = ["io-util", "net", "rt", "rt-multi-thread", "time"] }
+
+[features]
+# Explicit native fixture transport only; never enabled by normal host builds.
+test-support = ["sinomo-dfs/test-support"]

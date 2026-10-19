@@ -22,6 +22,87 @@ struct Gate {
 }
 static GATES: OnceLock<Mutex<BTreeMap<PathBuf, Arc<Gate>>>> = OnceLock::new();
 
+/// Observe only the already-installed native slot. A caller shell's cached
+/// replay cursor is not the resident materializer's completion boundary.
+/// None means checkout is busy or the current generation is not installed yet;
+/// it never authorizes opening a substitute or declares replay complete.
+#[cfg(test)]
+pub(crate) fn observe_existing_materialization(
+    data_dir: &SinomoDataDir,
+    file_system_id: &crate::DfsFileSystemId,
+    shard_id: &crate::DfsMetadataShardId,
+    runtime: &tokio::runtime::Handle,
+) -> Result<Option<DfsTestMaterializationCapture>, String> {
+    let paths = ClusterPaths::new(data_dir);
+    let peer = read_daemon_dfs_message_peer_snapshot(&paths)
+        .map_err(|error| error.to_string())?
+        .ok_or("native peer identity is unavailable")?;
+    let key = DaemonDfsMutationLaneKey {
+        file_system_id: file_system_id.clone(),
+        shard_id: shard_id.clone(),
+    };
+    let Some(shard) =
+        daemon_dfs_message_cache_exact_admission_handle(data_dir, &paths, &peer, &key, runtime)
+            .map_err(|error| error.to_string())?
+    else {
+        return Ok(None);
+    };
+    let Some(backend) = shard.try_checkout().map_err(|error| error.to_string())? else {
+        return Ok(None);
+    };
+    let (durable, materialized, prefix) = backend.replica_materialization_boundary_state();
+    Ok(Some(DfsTestMaterializationCapture {
+        physical_root: crate::default_dfs_metadata_shards_root(data_dir).join(&shard_id.0),
+        file_system_id: file_system_id.clone(),
+        shard_id: shard_id.clone(),
+        durable_sequence: Some(durable),
+        materialized_sequence: Some(materialized),
+        prefix,
+        unavailable: None,
+    }))
+}
+
+/// Observe accepted replay under the caller's original absolute deadline.
+/// This neither ingests a journal nor opens a replacement resident generation.
+#[cfg(test)]
+pub(crate) fn wait_for_existing_materialization(
+    data_dir: &SinomoDataDir,
+    file_system_id: &crate::DfsFileSystemId,
+    shard_id: &crate::DfsMetadataShardId,
+    runtime: &tokio::runtime::Handle,
+    target_sequence: u64,
+    deadline: Instant,
+    mut on_lag: impl FnMut(&DfsTestMaterializationCapture),
+) -> Result<DfsTestMaterializationCapture, String> {
+    loop {
+        if Instant::now() >= deadline {
+            return Err("replica materialization did not reach the published prefix before the original deadline".into());
+        }
+        if let Some(observed) =
+            observe_existing_materialization(data_dir, file_system_id, shard_id, runtime)?
+        {
+            if Instant::now() >= deadline {
+                return Err("replica observation exhausted the original deadline".into());
+            }
+            let materialized = observed.materialized_sequence.unwrap();
+            assert!(
+                materialized <= observed.durable_sequence.unwrap(),
+                "{observed:?}"
+            );
+            if materialized >= target_sequence {
+                let prefix = observed.prefix.as_ref().expect("materialized prefix proof");
+                assert!(prefix.is_well_formed());
+                assert_eq!(prefix.journal_sequence, materialized);
+                return Ok(observed);
+            }
+            on_lag(&observed);
+        }
+        std::thread::sleep(
+            Duration::from_millis(2).min(deadline.saturating_duration_since(Instant::now())),
+        );
+    }
+}
+
 pub struct DfsTestMaterializationPause {
     root: PathBuf,
     gate: Arc<Gate>,

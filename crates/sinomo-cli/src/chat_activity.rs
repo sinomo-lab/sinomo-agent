@@ -711,6 +711,7 @@ mod tests {
     fn stable_projection_records_chat_messages_idempotently() {
         let root = sinomo_testdir::TestDir::new("sinomo-cli-chat-projection");
         let data_dir = SinomoDataDir::new(root.to_path_buf());
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let session = session();
         let projection = StableChatProjection::open(&data_dir, &session).expect("projection");
         let user_id = TaskId::from_legacy_named("cli_projection_user").expect("user id");
@@ -762,6 +763,7 @@ mod tests {
     fn stable_projection_keeps_text_and_sanitized_background_handoff_request() {
         let root = sinomo_testdir::TestDir::new("sinomo-cli-chat-projection-handoff");
         let data_dir = SinomoDataDir::new(root.to_path_buf());
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let session = session();
         let projection = StableChatProjection::open(&data_dir, &session).expect("projection");
         let event = AgentRuntimeEvent::new(
@@ -830,6 +832,7 @@ mod tests {
     fn stable_projection_rejects_conflicting_message_identity() {
         let root = sinomo_testdir::TestDir::new("sinomo-cli-chat-projection-conflict");
         let data_dir = SinomoDataDir::new(root.to_path_buf());
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let session = session();
         let projection = StableChatProjection::open(&data_dir, &session).expect("projection");
         let message_id = TaskId::from_legacy_named("cli_projection_conflict").expect("message id");
@@ -848,6 +851,7 @@ mod tests {
     fn delayed_cli_projection_cannot_reenable_revoked_agent() {
         let root = sinomo_testdir::TestDir::new("sinomo-cli-chat-projection-revoked-agent");
         let data_dir = SinomoDataDir::new(root.to_path_buf());
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let session = session();
         let projection = StableChatProjection::open(&data_dir, &session).expect("projection");
         projection
@@ -908,6 +912,7 @@ mod tests {
     fn stable_projection_rejects_replayed_id_from_different_provenance() {
         let root = sinomo_testdir::TestDir::new("sinomo-cli-chat-projection-provenance");
         let data_dir = SinomoDataDir::new(root.to_path_buf());
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let first_session = session();
         let message_id =
             TaskId::from_legacy_named("cli_projection_provenance").expect("message id");

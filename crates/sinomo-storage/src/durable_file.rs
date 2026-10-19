@@ -1387,6 +1387,58 @@ pub fn install_synced_private_staged_file(
     }
 }
 
+/// Publish an owned batch of already-synced private files without clobbering.
+/// Every file retains the single-file installer's identity checks. On Unix,
+/// directory barriers cover the whole batch before success; an error may leave
+/// a prefix of individually synced files visible, never a successful batch.
+/// Callers must not acknowledge their checkpoint until this function succeeds.
+/// Other platforms retain the single-file installer's durability policy.
+pub fn install_synced_private_staged_files(
+    files: &[(SyncedPrivateStagedFile, PathBuf)],
+) -> Result<(), DurableFileError> {
+    #[cfg(not(unix))]
+    {
+        for (staged, destination) in files {
+            install_synced_private_staged_file(staged, destination)?;
+        }
+        Ok(())
+    }
+    #[cfg(unix)]
+    {
+        install_synced_private_staged_files_with(files, sync_directory)
+    }
+}
+
+#[cfg(unix)]
+fn install_synced_private_staged_files_with(
+    files: &[(SyncedPrivateStagedFile, PathBuf)],
+    mut sync: impl FnMut(&Path) -> Result<(), DurableFileError>,
+) -> Result<(), DurableFileError> {
+    let mut parents = std::collections::BTreeSet::new();
+    // Reject a changed stage before any batch effect, then recheck it at its
+    // own publication boundary as the single-file installer does.
+    for (staged, destination) in files {
+        let (source_parent, destination_parent) =
+            validate_staged_install_paths(&staged.path, destination)?;
+        validate_synced_private_stage(staged)?;
+        parents.insert(source_parent);
+        parents.insert(destination_parent);
+    }
+    for (staged, destination) in files {
+        validate_synced_private_stage(staged)?;
+        let publication = publish_staged_no_replace(&staged.path, destination)
+            .map_err(|source| io_error(destination.display(), source))?;
+        if publication == NoReplacePublication::Linked {
+            fs::remove_file(&staged.path)
+                .map_err(|source| io_error(staged.path.display(), source))?;
+        }
+    }
+    for parent in parents {
+        sync(&parent)?;
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn validate_synced_private_stage(staged: &SyncedPrivateStagedFile) -> Result<(), DurableFileError> {
     let metadata = staged
@@ -2646,6 +2698,96 @@ mod tests {
         .expect_err("failed file sync cannot create publication capability");
         assert!(error.to_string().contains("injected file sync failure"));
         assert_eq!(fs::read(&path).unwrap(), b"not certified durable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn synced_private_batch_requires_all_directory_barriers_and_preserves_conflicts() {
+        let root = sinomo_testdir::TestDir::new("storage-synced-private-batch");
+        let staging = root.join("staging");
+        let target = root.join("target");
+        fs::create_dir(&staging).unwrap();
+        fs::create_dir(&target).unwrap();
+        let files = [
+            (
+                synced_private_stage(&staging.join("a"), b"first"),
+                target.join("a"),
+            ),
+            (
+                synced_private_stage(&staging.join("b"), b"second"),
+                target.join("b"),
+            ),
+        ];
+        let mut synced = Vec::new();
+        let error = install_synced_private_staged_files_with(&files, |parent| {
+            synced.push(parent.to_owned());
+            // Publication happened, but a failed final directory barrier is
+            // still failure. Recovery owns these exact individually synced bytes.
+            if parent == target {
+                Err(io_error(
+                    parent.display(),
+                    io::Error::other("injected directory sync"),
+                ))
+            } else {
+                sync_directory(parent)
+            }
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("injected directory sync"));
+        assert_eq!(synced, vec![staging.clone(), target.clone()]);
+        assert_eq!(fs::read(target.join("a")).unwrap(), b"first");
+        assert_eq!(fs::read(target.join("b")).unwrap(), b"second");
+        let conflict = [(
+            synced_private_stage(&staging.join("conflict"), b"replacement"),
+            target.join("a"),
+        )];
+        assert_eq!(
+            install_synced_private_staged_files(&conflict)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(fs::read(target.join("a")).unwrap(), b"first");
+        assert_eq!(fs::read(conflict[0].0.path()).unwrap(), b"replacement");
+        let retry = [(
+            synced_private_stage(&staging.join("c"), b"third"),
+            target.join("c"),
+        )];
+        let mut synced = Vec::new();
+        install_synced_private_staged_files_with(&retry, |parent| {
+            synced.push(parent.to_owned());
+            sync_directory(parent)
+        })
+        .unwrap();
+        assert_eq!(synced, vec![staging, target.clone()]);
+        assert_eq!(fs::read(target.join("c")).unwrap(), b"third");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn synced_private_batch_rejects_changed_later_inode_before_publication() {
+        let root = sinomo_testdir::TestDir::new("storage-synced-private-batch-mutation");
+        let files = [
+            (
+                synced_private_stage(&root.join("first-stage"), b"first"),
+                root.join("first"),
+            ),
+            (
+                synced_private_stage(&root.join("second-stage"), b"second"),
+                root.join("second"),
+            ),
+        ];
+        fs::rename(files[1].0.path(), root.join("retained-original")).unwrap();
+        write_private_stage(files[1].0.path(), b"second");
+        assert_eq!(
+            install_synced_private_staged_files(&files)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert!(!files[0].1.exists());
+        assert!(!files[1].1.exists());
+        assert_eq!(fs::read(files[0].0.path()).unwrap(), b"first");
     }
 
     #[cfg(unix)]

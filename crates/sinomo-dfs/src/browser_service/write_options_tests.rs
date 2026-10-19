@@ -828,7 +828,24 @@ fn write_configuration_browser_pending_preserves_payload_without_parent_intent_o
     let mut second = first;
     second.required_node_ids = vec![nodes[0].clone()];
     native_browser_policy(&control, "/documents", second);
-    gap.wait_rebuild(std::time::Duration::from_secs(5)).unwrap();
+    let rebuilt = gap.wait_rebuild(std::time::Duration::from_secs(5));
+    if rebuilt.is_err() {
+        eprintln!(
+            "native browser gap boundary: root={} key={key} result={rebuilt:?} lost_delta={:?}",
+            runtime.data_dir(&nodes[0]).root().display(),
+            gap.dropped_delta().map(|delta| (
+                delta.revision,
+                delta.compacted_revision,
+                delta
+                    .events
+                    .iter()
+                    .map(|event| event.key.clone())
+                    .collect::<Vec<_>>(),
+                delta.final_key_states.len(),
+            )),
+        );
+    }
+    rebuilt.unwrap();
     let actual_lost = gap
         .dropped_delta()
         .expect("one real committed delta was withheld");

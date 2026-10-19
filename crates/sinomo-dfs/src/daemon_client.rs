@@ -337,7 +337,8 @@ fn validate_daemon_dfs_mounted_mutation_handoff_response(
 #[derive(Clone, Debug)]
 pub struct DaemonDfsPeerTransport {
     data_dir: SinomoDataDir,
-    address: String,
+    address: Option<String>,
+    deferred_cluster_id: Option<sinomo_core::node::ClusterId>,
     local_node_id: NodeId,
     connected_process_affinity: sinomo_api::DaemonObjectRpcDestinationProcessAffinity,
     runtime: std::sync::Arc<tokio::runtime::Runtime>,
@@ -356,12 +357,61 @@ impl DaemonDfsPeerTransport {
         let runtime = daemon_dfs_peer_runtime()?;
         Ok(Self {
             data_dir,
-            address: client.address().to_owned(),
+            address: Some(client.address().to_owned()),
+            deferred_cluster_id: None,
             local_node_id,
             connected_process_affinity:
                 sinomo_api::DaemonObjectRpcDestinationProcessAffinity::MainDaemon,
             runtime,
         })
+    }
+
+    /// Observational caller construction. The saved node/cluster identify the
+    /// caller, not an available or authorized Main. Resolve and verify Main at
+    /// each invocation, including after an initially unavailable daemon starts.
+    pub fn deferred(data_dir: SinomoDataDir) -> Result<Self, DaemonApiError> {
+        let state = sinomo_core::cluster::read_cluster_state_without_kv(
+            &sinomo_core::network::ClusterPaths::new(&data_dir),
+        )?;
+        Ok(Self {
+            data_dir,
+            address: None,
+            deferred_cluster_id: Some(state.cluster_id),
+            local_node_id: state.local_node_id,
+            connected_process_affinity:
+                sinomo_api::DaemonObjectRpcDestinationProcessAffinity::MainDaemon,
+            runtime: daemon_dfs_peer_runtime()?,
+        })
+    }
+
+    async fn resolve_main(
+        &self,
+        timeout: Duration,
+        runtime: &tokio::runtime::Handle,
+    ) -> Result<String, DaemonApiError> {
+        let state = sinomo_core::cluster::read_cluster_state_without_kv(
+            &sinomo_core::network::ClusterPaths::new(&self.data_dir),
+        )?;
+        if Some(&state.cluster_id) != self.deferred_cluster_id.as_ref()
+            || state.local_node_id != self.local_node_id
+        {
+            return Err(DaemonApiError::NetworkDelivery {
+                detail: "deferred DFS caller node/cluster identity changed before dispatch".into(),
+                delivery_state: sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent,
+            });
+        }
+        match probe_daemon_status_async(&DaemonPaths::new(&self.data_dir), timeout.min(DAEMON_API_PROBE_TIMEOUT), runtime).await {
+            DaemonProbeStatus::Running(status) if status.cluster.as_ref().is_some_and(|cluster|
+                cluster.cluster_id == state.cluster_id && cluster.node_id == self.local_node_id
+                    && cluster.process == sinomo_core::node::DAEMON_MAIN_CLUSTER_ROLE) => Ok(status.address),
+            DaemonProbeStatus::Running(_) => Err(DaemonApiError::NetworkDelivery {
+                detail: "deferred DFS transport discovered another node, cluster or process instead of its Main".into(),
+                delivery_state: sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent,
+            }),
+            _ => Err(DaemonApiError::NotRunning {
+                detail: format!("authenticated Main is unavailable for {}", self.data_dir.root().display()),
+            }),
+        }
     }
 
     #[cfg(test)]
@@ -387,7 +437,8 @@ impl DaemonDfsPeerTransport {
     ) -> Self {
         Self {
             data_dir,
-            address: address.into(),
+            address: Some(address.into()),
+            deferred_cluster_id: None,
             local_node_id,
             connected_process_affinity,
             runtime: daemon_dfs_peer_runtime().expect("daemon DFS peer runtime"),
@@ -398,12 +449,54 @@ impl DaemonDfsPeerTransport {
         &self,
         target_node_id: &NodeId,
         call: ObjectRpcCall,
-        options: crate::DfsObjectRpcSendOptions,
+        mut options: crate::DfsObjectRpcSendOptions,
         runtime: &tokio::runtime::Handle,
     ) -> Result<ObjectRpcResult, DaemonApiError> {
-        send_daemon_object_rpc_call_with_affinity_async(
+        let deadline = daemon_api_overall_deadline(options.overall_timeout);
+        if deadline.is_some_and(|(at, _)| tokio::time::Instant::now() >= at) {
+            return Err(DaemonApiError::NetworkDelivery {
+                detail: "DFS operation deadline expired before Main discovery".into(),
+                delivery_state: sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent,
+            });
+        }
+        let address = match &self.address {
+            Some(address) => address.clone(),
+            None => {
+                let resolve = async {
+                    self.resolve_main(options.connect_timeout, runtime)
+                        .await
+                        .map_err(|error| DaemonApiError::NetworkDelivery {
+                            detail: error.to_string(),
+                            delivery_state:
+                                sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent,
+                        })
+                };
+                if let Some((deadline, _)) = deadline {
+                    tokio::time::timeout_at(deadline, resolve)
+                        .await.map_err(|_| DaemonApiError::NetworkDelivery {
+                            detail: "DFS operation deadline expired during Main discovery before dispatch".into(),
+                            delivery_state: sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent,
+                        })??
+                } else {
+                    resolve.await?
+                }
+            }
+        };
+        if let Some((deadline, _)) = deadline {
+            options.overall_timeout = Some(
+                deadline
+                    .checked_duration_since(tokio::time::Instant::now())
+                    .filter(|remaining| !remaining.is_zero())
+                    .ok_or_else(|| DaemonApiError::NetworkDelivery {
+                        detail: "DFS operation deadline expired before Main dispatch".into(),
+                        delivery_state:
+                            sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent,
+                    })?,
+            );
+        }
+        let send = send_daemon_object_rpc_call_with_affinity_async(
             self.data_dir.clone(),
-            &self.address,
+            &address,
             DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE,
             target_node_id,
             call,
@@ -416,8 +509,8 @@ impl DaemonDfsPeerTransport {
             Some(&self.local_node_id),
             Some(self.connected_process_affinity),
             runtime,
-        )
-        .await
+        );
+        run_daemon_api_with_overall_deadline("DFS Main call", deadline, Box::pin(send)).await
     }
 }
 
@@ -582,6 +675,80 @@ impl DaemonDfsApiClientExt for DaemonApiClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deferred_main_transport_constructs_offline_and_never_dispatches_expired_or_rebound_calls() {
+        let root = sinomo_testdir::TestDir::new("deferred-main-transport");
+        let data = SinomoDataDir::new(&root);
+        let (mut native, node) =
+            crate::test_support::DfsTestRuntime::start_single_node_in_data_dir(
+                "deferred-main-transport",
+                data.clone(),
+            )
+            .unwrap();
+        native.stop_node(&node).unwrap();
+        let peer = DaemonDfsPeerTransport::deferred(data.clone()).unwrap();
+        assert!(
+            peer.address.is_none(),
+            "no endpoint was proved at construction"
+        );
+        let request = || {
+            ObjectRpcCall::value(
+                ObjectRpcRequest::encode_body(
+                    DAEMON_DFS_BROWSER_CREATE_DIR_ALL_ROUTE,
+                    "dfs",
+                    &DaemonDfsBrowserCreateDirAllRequest {
+                        path: "/services/never-dispatched".into(),
+                    },
+                )
+                .unwrap(),
+            )
+        };
+        let options =
+            crate::DfsObjectRpcSendOptions::default().with_overall_timeout(Duration::from_secs(1));
+        let error = peer.call_object_rpc(&node, request(), options).unwrap_err();
+        assert_eq!(
+            error.delivery_state(),
+            Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent)
+        );
+        assert!(error.to_string().contains("not running"), "{error}");
+        let expired = peer
+            .call_object_rpc(
+                &node,
+                request(),
+                crate::DfsObjectRpcSendOptions::default().with_overall_timeout(Duration::ZERO),
+            )
+            .unwrap_err();
+        assert!(
+            expired
+                .to_string()
+                .contains("deadline expired before Main discovery")
+        );
+        assert_eq!(
+            expired.delivery_state(),
+            Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent)
+        );
+        let paths = sinomo_core::network::ClusterPaths::new(&data);
+        let original = std::fs::read(&paths.state).unwrap();
+        let mut state = sinomo_core::cluster::read_cluster_state_without_kv(&paths).unwrap();
+        state.cluster_id = sinomo_core::Id::generate(); // negative DATA, never authority
+        sinomo_core::cluster::write_cluster_state(&paths, &state).unwrap();
+        let changed = peer.call_object_rpc(&node, request(), options).unwrap_err();
+        assert!(changed.to_string().contains("identity changed"));
+        assert_eq!(
+            changed.delivery_state(),
+            Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent)
+        );
+        std::fs::write(&paths.state, original).unwrap();
+        native.reopen_node(node.clone()).unwrap();
+        let mut service = native.client(&node).unwrap();
+        assert!(matches!(
+            service.posix_stat_distributed("/services/never-dispatched"),
+            Err(crate::DfsPosixError::NotFound { .. })
+        ));
+        drop(service);
+        native.close().unwrap();
+    }
 
     fn mounted_mutation_test_ids() -> (
         crate::MountedSifsMutationMarkerId,

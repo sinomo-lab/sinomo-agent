@@ -725,6 +725,32 @@ fn validate_local_eventual_batch_commit_from_view(
     Ok(prepare_expectations)
 }
 
+/// The ordinary receipt producer may also settle that exact visible version's
+/// location. Other effects are distinct operations, not receipt retries.
+fn metadata_receipt_projection_input(
+    effects: &[DfsPreparedMetadataEffect],
+) -> Option<&DfsReplicaReceiptRecord> {
+    match effects {
+        [DfsPreparedMetadataEffect::PutReceipt { receipt }] => Some(receipt),
+        [
+            DfsPreparedMetadataEffect::PutReceipt { receipt },
+            DfsPreparedMetadataEffect::PutObject { object },
+        ] if object.file_system_id == receipt.receipt.file_system_id
+            && object.object_id == receipt.receipt.object_id
+            && object.version == receipt.receipt.committed_version
+            && object.kind != DfsObjectKind::Tombstone
+            && receipt
+                .content_hash
+                .as_deref()
+                .is_some_and(|hash| object.content_hash.as_deref() == Some(hash))
+            && object.current_locations.contains(&receipt.replica_node_id) =>
+        {
+            Some(receipt)
+        }
+        _ => None,
+    }
+}
+
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub(crate) fn resolve_prepared_operation(
         &mut self,
@@ -813,6 +839,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         payload: DfsPreparedOperationPayload,
     ) -> Result<bool, DfsError> {
+        if self.recover_matching_metadata_receipt_prepare(&payload)?
+            || self.recover_matching_placement_intent_prepare(&payload)?
+        {
+            return Ok(true);
+        }
         let published = self.publish_prepared_operation(payload)?;
         self.refresh_recorded_prepared_rows(&published.payload)?;
         if published.published {
@@ -822,6 +853,183 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             });
         }
         Ok(published.published)
+    }
+
+    /// Receipt producers can retry after their durable prepare but before its
+    /// publication was acknowledged. Only the same receipt and exact location
+    /// projection/readset may resume here. Keep its original event, time and
+    /// operation identity; another receipt, object change or authority round
+    /// is not equivalent. A filesystem row appended by the ordinary preparer
+    /// remains part of the ORIGINAL complete body, never a fresh replacement.
+    fn recover_matching_metadata_receipt_prepare(
+        &mut self,
+        proposed: &DfsPreparedOperationPayload,
+    ) -> Result<bool, DfsError> {
+        let Some(incoming) = metadata_receipt_projection_input(&proposed.metadata_effects) else {
+            return Ok(false);
+        };
+        let backend = self
+            .metadata_backend
+            .as_ref()
+            .ok_or_else(|| DfsError::Metadata {
+                message: "receipt publication requires its native metadata backend".into(),
+            })?;
+        let mut matching = None;
+        for record in backend.prepared_operation_reservations(proposed)? {
+            let original = record.payload.as_ref();
+            // prepare_payload_for_publication can append this captured row
+            // after the producer's receipt/location payload was constructed.
+            // No explicitly requested filesystem effect is ignored: proposed
+            // is restricted to the receipt-producer shapes above.
+            let original_input = match original.metadata_effects.split_last() {
+                Some((DfsPreparedMetadataEffect::PutFileSystem { file_system }, input))
+                    if file_system.file_system_id == original.file_system_id =>
+                {
+                    input
+                }
+                _ => original.metadata_effects.as_slice(),
+            };
+            let Some(stored) = metadata_receipt_projection_input(original_input) else {
+                continue;
+            };
+            let mut same_receipt = incoming.clone();
+            same_receipt.receipt.event_id = stored.receipt.event_id.clone();
+            same_receipt.received_at = stored.received_at;
+            if same_receipt != *stored {
+                continue;
+            }
+            let mut same_input = proposed.metadata_effects.clone();
+            let DfsPreparedMetadataEffect::PutReceipt { receipt } = &mut same_input[0] else {
+                unreachable!("validated receipt-producer shape")
+            };
+            *receipt = stored.clone();
+            if same_input.as_slice() != original_input {
+                continue;
+            }
+            // These fields are minted by for_metadata_effects and the receipt
+            // producer on each call. Every other field, including owner epoch,
+            // object/path expectations and the complete effect set, must match.
+            if proposed.transaction.transaction_id != format!("metadata:{}", proposed.operation_id)
+                || original.transaction.transaction_id
+                    != format!("metadata:{}", original.operation_id)
+            {
+                continue;
+            }
+            let mut same_body = proposed.clone();
+            same_body.operation_id = original.operation_id.clone();
+            same_body.transaction.transaction_id = original.transaction.transaction_id.clone();
+            same_body.transaction.created_at = original.transaction.created_at;
+            same_body.metadata_effects = original.metadata_effects.clone();
+            if same_body != *original {
+                continue;
+            }
+            if matching.replace(record).is_some() {
+                return Err(DfsError::Metadata {
+                    message: "multiple prepared publications claim the same exact receipt".into(),
+                });
+            }
+        }
+        let Some(record) = matching else {
+            return Ok(false);
+        };
+        if !self.recover_one_prepared_operation(record)? {
+            return Err(DfsError::Metadata {
+                message: "original receipt prepare requires current native recovery authority"
+                    .into(),
+            });
+        }
+        Ok(true)
+    }
+
+    /// A same-version placement producer retains a deterministic intent ID,
+    /// although its metadata envelope and observation timestamps are minted on
+    /// each attempt. Resume only its exact original intent-only preparation.
+    /// All other body fields, including captured object, read set, policy and
+    /// authority epoch, must agree. This is not a substitute for native recovery
+    /// of a different plan or authority round.
+    fn recover_matching_placement_intent_prepare(
+        &mut self,
+        proposed: &DfsPreparedOperationPayload,
+    ) -> Result<bool, DfsError> {
+        let [DfsPreparedMetadataEffect::PutIntent { intent: incoming }] =
+            proposed.metadata_effects.as_slice()
+        else {
+            return Ok(false);
+        };
+        if !incoming.intent_id.starts_with("placement:")
+            || incoming.status != crate::DfsWriteIntentStatus::Committed
+            || !incoming.publication.is_current()
+            || incoming.base_version.as_ref() != Some(&incoming.target_version)
+            || incoming.owner_epoch != proposed.owner_epoch
+            || !proposed.operation_id.starts_with("metadata:")
+            || proposed.transaction.transaction_id != format!("metadata:{}", proposed.operation_id)
+        {
+            return Ok(false);
+        }
+        let backend = self
+            .metadata_backend
+            .as_ref()
+            .ok_or_else(|| DfsError::Metadata {
+                message: "placement intent publication requires its native metadata backend".into(),
+            })?;
+        let mut matching = None;
+        for record in backend.prepared_operation_reservations(proposed)? {
+            if record.status != crate::DfsPreparedOperationStatus::Prepared {
+                continue;
+            }
+            record.validate()?;
+            let original = record.payload.as_ref();
+            if !original.operation_id.starts_with("metadata:")
+                || original.transaction.transaction_id
+                    != format!("metadata:{}", original.operation_id)
+            {
+                continue;
+            }
+            // The ordinary preparer may have captured this filesystem row.
+            // It remains in the ORIGINAL body that native recovery certifies.
+            let original_input = match original.metadata_effects.split_last() {
+                Some((DfsPreparedMetadataEffect::PutFileSystem { file_system }, input))
+                    if file_system.file_system_id == original.file_system_id =>
+                {
+                    input
+                }
+                _ => original.metadata_effects.as_slice(),
+            };
+            let [DfsPreparedMetadataEffect::PutIntent { intent: stored }] = original_input else {
+                continue;
+            };
+            let mut same_intent = incoming.clone();
+            same_intent.created_at = stored.created_at;
+            same_intent.updated_at = stored.updated_at;
+            if same_intent != *stored {
+                continue;
+            }
+            let mut same_body = proposed.clone();
+            same_body.operation_id = original.operation_id.clone();
+            same_body.transaction.transaction_id = original.transaction.transaction_id.clone();
+            same_body.transaction.created_at = original.transaction.created_at;
+            same_body.metadata_effects = original.metadata_effects.clone();
+            if same_body != *original {
+                continue;
+            }
+            if matching.replace(record).is_some() {
+                return Err(DfsError::Metadata {
+                    message: "multiple prepared publications claim the same exact placement intent"
+                        .into(),
+                });
+            }
+        }
+        let Some(record) = matching else {
+            return Ok(false);
+        };
+        if !self.recover_one_prepared_operation(record)? {
+            return Err(DfsError::Metadata {
+                message:
+                    "original placement intent prepare requires current native recovery authority"
+                        .into(),
+            });
+        }
+        Ok(true)
     }
 
     pub(crate) fn metadata_effect_scope_for_object(
@@ -2579,6 +2787,384 @@ mod filesystem_preparation_recovery_tests {
     use crate::DfsMetadataBackend;
 
     #[test]
+    fn native_placement_intent_retry_recovers_the_original_prepared_body() {
+        let path = "/services/native-placement-intent-retry";
+        let (mut native, mut requester, shard) =
+            crate::test_support::current_native_metadata_service(
+                "native-placement-intent-retry",
+                3,
+                path,
+            )
+            .unwrap();
+        let participants = std::iter::once(shard.primary_node_id.clone())
+            .chain(shard.replica_node_ids.iter().cloned())
+            .collect::<Vec<_>>();
+        let stat = requester
+            .posix_write_file(
+                path,
+                b"original durable content",
+                crate::DfsWriteOptions::replicated_eventual(participants.clone()),
+            )
+            .unwrap();
+        drop(requester);
+        let shard = native
+            .metadata_shards()
+            .unwrap()
+            .into_iter()
+            .find(|current| {
+                current.file_system_id == shard.file_system_id && current.shard_id == shard.shard_id
+            })
+            .unwrap();
+        let participants = std::iter::once(shard.primary_node_id.clone())
+            .chain(shard.replica_node_ids.iter().cloned())
+            .collect::<Vec<_>>();
+        assert_eq!(participants.len(), 3);
+        let diagnostics = participants
+            .iter()
+            .map(|node| {
+                crate::native_boundary_diagnostics::capture_all_operations(
+                    native.data_dir(node).root(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut owner = native.metadata_primary_service(path).unwrap();
+        let intent = crate::DistributedWriteIntent {
+            publication: Default::default(),
+            intent_id: format!(
+                "placement:native-original:{}:{}",
+                stat.object_id, stat.version
+            ),
+            file_system_id: stat.file_system_id.clone(),
+            object_id: stat.object_id.clone(),
+            base_version: Some(stat.version.clone()),
+            target_version: stat.version.clone(),
+            requesting_node_id: shard.primary_node_id.clone(),
+            operation_id: None,
+            operation_order_token: None,
+            owner_epoch: shard.epoch,
+            desired_replica_nodes: participants[..2].to_vec(),
+            policy: crate::DfsReplicationPolicy::new(1, 2).unwrap(),
+            touch_parent_on_create: false,
+            create_predecessor_object_id: None,
+            state: crate::DfsWriteIntentState::Committed,
+        };
+        let scope = crate::DfsPreparedOperationScope {
+            file_system_id: shard.file_system_id.clone(),
+            shard_id: crate::DfsMetadataShardId::new(&shard.shard_id),
+            owner_epoch: shard.epoch,
+            operation_id: "placement-producer-admission".into(),
+        };
+        // Retain the genuine producer's admission while arranging its failed
+        // publication and exact retry. The actual native replicas supply ACKs.
+        let execution = owner.acquire_prepared_execution(&scope).unwrap();
+        // Ordinary repair can publish a real receipt between the original
+        // write and this producer's admission. Compare against the exact
+        // current cut under admission, not the opener's older cached object.
+        let backend = owner.metadata_backend_mut().unwrap();
+        backend
+            .begin_consistent_read_snapshot_for_path(&stat.file_system_id, path)
+            .unwrap();
+        let object = backend.get_object(&stat.object_id).unwrap().unwrap();
+        backend.end_consistent_read_snapshot_for_path(&stat.file_system_id, path);
+        assert_eq!(object.version, stat.version);
+        assert_eq!(object.content_hash, stat.content_hash);
+        assert_eq!(object.path, stat.path);
+        let unavailable = shard.replica_node_ids[0].clone();
+        for route in [
+            crate::DFS_METADATA_JOURNAL_BATCH_ROUTE,
+            crate::DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE,
+        ] {
+            native.install_fault(crate::test_runtime::FaultRule {
+                source: Some(shard.primary_node_id.clone()),
+                target: Some(unavailable.clone()),
+                route: Some(route.into()),
+                call_id: None,
+                origin: None,
+                remaining_hits: 32,
+                action: crate::test_runtime::FaultAction::BudgetExhausted,
+            });
+        }
+        let error = owner
+            .put_metadata_intent_and_receipts(&intent, stat.content_hash.as_deref().unwrap(), &[])
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                crate::DfsError::MetadataRecoveryQuorumUnavailable {
+                    required: 3,
+                    verified: 2,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        let originals = owner
+            .metadata_backend()
+            .unwrap()
+            .list_prepared_operations()
+            .unwrap()
+            .into_iter()
+            .filter(|record| {
+                record.status == crate::DfsPreparedOperationStatus::Prepared
+                    && record.metadata_effects.iter().any(|effect| {
+                        matches!(effect,
+                    crate::DfsPreparedMetadataEffect::PutIntent { intent: row }
+                    if row.intent_id == intent.intent_id)
+                    })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(originals.len(), 1);
+        let original = originals[0].clone();
+        original.validate().unwrap();
+        assert!(
+            owner
+                .metadata_backend()
+                .unwrap()
+                .get_intent(&stat.object_id, &intent.intent_id)
+                .unwrap()
+                .is_none()
+        );
+        let sequence = owner
+            .metadata_backend()
+            .unwrap()
+            .journal_last_sequence()
+            .unwrap();
+        let mut conflicting = intent.clone();
+        conflicting.desired_replica_nodes.reverse();
+        let mut foreign_epoch = intent.clone();
+        foreign_epoch.owner_epoch += 1;
+        let mut foreign_coordinator = intent.clone();
+        foreign_coordinator.requesting_node_id = unavailable.clone();
+        for conflicting in [conflicting, foreign_epoch, foreign_coordinator] {
+            assert!(
+                owner
+                    .put_metadata_intent_and_receipts(
+                        &conflicting,
+                        stat.content_hash.as_deref().unwrap(),
+                        &[],
+                    )
+                    .is_err()
+            );
+            assert_eq!(
+                owner
+                    .metadata_backend()
+                    .unwrap()
+                    .journal_last_sequence()
+                    .unwrap(),
+                sequence
+            );
+            assert_eq!(
+                owner
+                    .metadata_backend()
+                    .unwrap()
+                    .prepared_operation_record(&original.operation_id)
+                    .unwrap(),
+                Some(original.clone())
+            );
+        }
+        assert_eq!(
+            native.remove_faults_matching(|rule| rule.source.as_ref()
+                == Some(&shard.primary_node_id)
+                && rule.target.as_ref() == Some(&unavailable)
+                && matches!(
+                    rule.route.as_deref(),
+                    Some(
+                        crate::DFS_METADATA_JOURNAL_BATCH_ROUTE
+                            | crate::DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE
+                    )
+                )
+                && matches!(
+                    rule.action,
+                    crate::test_runtime::FaultAction::BudgetExhausted
+                )),
+            2
+        );
+        native.assert_fault_budgets().unwrap();
+        owner
+            .put_metadata_intent_and_receipts(&intent, stat.content_hash.as_deref().unwrap(), &[])
+            .expect("the same placement producer must recover its original hidden body");
+        let committed = owner
+            .metadata_backend()
+            .unwrap()
+            .prepared_operation_record(&original.operation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            committed.status,
+            crate::DfsPreparedOperationStatus::Committed
+        );
+        assert_eq!(committed.digest, original.digest);
+        assert_eq!(committed.payload, original.payload);
+        assert_eq!(
+            owner
+                .metadata_backend()
+                .unwrap()
+                .get_object(&stat.object_id)
+                .unwrap(),
+            Some(object)
+        );
+        let committed_sequence = owner
+            .metadata_backend()
+            .unwrap()
+            .journal_last_sequence()
+            .unwrap();
+        owner
+            .put_metadata_intent_and_receipts(&intent, stat.content_hash.as_deref().unwrap(), &[])
+            .unwrap();
+        assert_eq!(
+            owner
+                .metadata_backend()
+                .unwrap()
+                .journal_last_sequence()
+                .unwrap(),
+            committed_sequence
+        );
+        drop(execution);
+        drop(owner);
+        drop(diagnostics);
+        native.close().unwrap();
+    }
+
+    #[test]
+    fn native_filesystem_recovery_confirms_reopened_durable_replica_before_background_replay() {
+        let (mut native, requester, shard) = crate::test_support::current_native_metadata_service(
+            "native-filesystem-deferred-confirmation",
+            3,
+            "/",
+        )
+        .unwrap();
+        drop(requester);
+        let receiver = shard.replica_node_ids[0].clone();
+        let shard_id = crate::DfsMetadataShardId::new(&shard.shard_id);
+        let diagnostics = std::iter::once(&shard.primary_node_id)
+            .chain(&shard.replica_node_ids)
+            .map(|node| crate::native_boundary_diagnostics::capture(native.data_dir(node).root()))
+            .collect::<Vec<_>>();
+        let mut source = native.metadata_primary_service("/").unwrap();
+        let mut requested = source
+            .metadata_backend()
+            .unwrap()
+            .get_file_system(&shard.file_system_id)
+            .unwrap()
+            .unwrap();
+        requested.display_name = "originals confirmed before background replay".into();
+        let scope = DfsPreparedOperationScope {
+            file_system_id: shard.file_system_id.clone(),
+            shard_id: shard_id.clone(),
+            owner_epoch: shard.epoch,
+            operation_id: "filesystem:deferred-original-0".into(),
+        };
+        // Hold the actual producer admission while arranging the receiver cut;
+        // the normal replica sender and receiver still establish every ACK.
+        let execution = source.acquire_prepared_execution(&scope).unwrap();
+        native.stop_node(&receiver).unwrap();
+        let mut originals = Vec::new();
+        for index in 0..2 {
+            let mut next = scope.clone();
+            next.operation_id = format!("filesystem:deferred-original-{index}");
+            let result = source.publish_metadata_effects_on_shard(
+                next.clone(),
+                Vec::new(),
+                Vec::new(),
+                vec![crate::DfsPreparedMetadataEffect::PutFileSystem {
+                    file_system: requested.clone(),
+                }],
+            );
+            assert!(matches!(
+                result,
+                Err(DfsError::MetadataRecoveryQuorumUnavailable {
+                    required: 3,
+                    verified: 2,
+                    ..
+                })
+            ));
+            originals.push(
+                source
+                    .metadata_backend()
+                    .unwrap()
+                    .prepared_operation_record(&next.operation_id)
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        native.reopen_node(receiver.clone()).unwrap();
+        let pause = native
+            .pause_replica_materialization(&receiver, &shard_id)
+            .unwrap();
+        let (peer, _) = native.peer_transports(&shard.primary_node_id).unwrap();
+        let mut replication = crate::DfsMetadataNodeTransport::new(
+            [receiver.clone()],
+            crate::dfs_metadata_journal_batch_sender_from_peer_transport(
+                native.data_dir(&shard.primary_node_id),
+                std::sync::Arc::clone(&peer),
+            ),
+            crate::dfs_metadata_snapshot_install_sender_from_peer_transport(peer),
+        );
+        let outcomes = crate::replicate_dfs_metadata_shard_to_target(
+            source.metadata_backend_mut().unwrap(),
+            &shard.primary_node_id,
+            &receiver,
+            &shard.file_system_id,
+            shard.epoch,
+            &shard_id,
+            0,
+            &mut replication,
+            crate::DfsMetadataJournalReplicationOptions::default(),
+        )
+        .unwrap();
+        let capture = native
+            .wait_paused_materialization(&pause, sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
+            .unwrap();
+        assert_eq!(capture.unavailable, None, "{capture:?}; {outcomes:?}");
+        let cut = originals.last().unwrap().digest.prepare_sequence;
+        assert_eq!(capture.durable_sequence, Some(cut));
+        assert!(capture.materialized_sequence.unwrap() < originals[0].digest.prepare_sequence);
+        assert_eq!(
+            source
+                .metadata_backend()
+                .unwrap()
+                .metadata_replication_cursor(&receiver, &shard_id)
+                .unwrap(),
+            cut,
+            "the normal sender must record its actual authenticated durable ACK"
+        );
+        let recovered = source.recover_durable_namespace_prepares();
+        for diagnostic in &diagnostics {
+            diagnostic.dump("filesystem-deferred-recovery", serde_json::json!({
+                "shard": shard, "originals": originals, "receiver": receiver,
+                "capture": format!("{capture:?}"), "replication": format!("{outcomes:?}"),
+                "result": format!("{recovered:?}"), "rpc": format!("{:?}", native.rpc_observations()),
+            }));
+        }
+        recovered.unwrap();
+        for original in originals {
+            let actual = source
+                .metadata_backend()
+                .unwrap()
+                .prepared_operation_record(&original.digest.operation_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(actual.digest, original.digest);
+            assert_eq!(actual.payload, original.payload);
+            assert_eq!(actual.status, crate::DfsPreparedOperationStatus::Committed);
+            assert!(actual.committed_entry.is_some());
+        }
+        assert_eq!(
+            source
+                .metadata_backend()
+                .unwrap()
+                .get_file_system(&shard.file_system_id)
+                .unwrap(),
+            Some(requested)
+        );
+        pause.release();
+        drop(pause);
+        drop(execution);
+        drop(source);
+        native.close().unwrap();
+    }
+
+    #[test]
     fn native_filesystem_retry_rejects_ambiguous_bodies_and_recovers_each_original() {
         let (mut native, mut requester, shard) =
             crate::test_support::current_native_metadata_service(
@@ -2588,6 +3174,10 @@ mod filesystem_preparation_recovery_tests {
             )
             .unwrap();
         assert_eq!(shard.replica_node_ids.len(), 2);
+        let diagnostics = std::iter::once(&shard.primary_node_id)
+            .chain(&shard.replica_node_ids)
+            .map(|node| crate::native_boundary_diagnostics::capture(native.data_dir(node).root()))
+            .collect::<Vec<_>>();
         let receiver = shard.replica_node_ids[0].clone();
         let initial = native.metadata_primary_service("/").unwrap();
         let original = initial
@@ -2707,7 +3297,17 @@ mod filesystem_preparation_recovery_tests {
         drop(source);
         native.reopen_node(receiver).unwrap();
         let mut source = native.metadata_primary_service("/").unwrap();
-        source.recover_durable_namespace_prepares().unwrap();
+        let recovered = source.recover_durable_namespace_prepares();
+        for diagnostic in &diagnostics {
+            diagnostic.dump(
+                "filesystem-recovery",
+                serde_json::json!({
+                    "shard": shard, "originals": originals, "result": format!("{recovered:?}"),
+                    "rpc": format!("{:?}", native.rpc_observations()),
+                }),
+            );
+        }
+        recovered.unwrap();
         for original in originals {
             let actual = source
                 .metadata_backend()

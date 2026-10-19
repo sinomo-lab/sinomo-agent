@@ -20,12 +20,105 @@ pub struct DfsMetadataCandidateIdentity {
     pub prefix_proof: DfsMetadataPrefixProof,
 }
 
+/// Fully decoded candidate DATA retained for one publication turn. This has no
+/// writer or authority capability and cannot be restored from an untrusted
+/// descriptor. Every reuse checks the entire actual framed stream and raw hash.
+pub struct DfsMetadataCandidateInspection {
+    descriptor: crate::DfsMetadataSnapshotImageDescriptor,
+    identity: DfsMetadataCandidateIdentity,
+}
+impl DfsMetadataCandidateInspection {
+    pub fn capture(root: &Path) -> Result<Self> {
+        let path = metadata_table_snapshot_path(root);
+        let file = File::open(&path).map_err(|source| MetadataBackendError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        let (_, descriptor) =
+            crate::metadata_snapshot::decode_snapshot_image_with_descriptor(file, None)?;
+        let identity = DfsMetadataCandidateIdentity {
+            state_fingerprint: descriptor.semantic_state_fingerprint.clone(),
+            prefix_proof: descriptor.prefix_proof.clone(),
+            file_fingerprint: candidate_file_fingerprint(root)?,
+        };
+        Ok(Self {
+            descriptor,
+            identity,
+        })
+    }
+
+    pub fn verify(&self, root: &Path) -> Result<DfsMetadataCandidateIdentity> {
+        let path = metadata_table_snapshot_path(root);
+        let file = File::open(&path).map_err(|source| MetadataBackendError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        crate::metadata_snapshot::verify_snapshot_stream_identity(file, &self.descriptor)?;
+        if candidate_file_fingerprint(root)? != self.identity.file_fingerprint {
+            return Err(MetadataBackendError::Serde(
+                "candidate physical bytes changed after full validation".into(),
+            ));
+        }
+        Ok(self.identity.clone())
+    }
+}
+
 /// An exclusively owned staging directory. It cannot overwrite a populated
 /// metadata root: a durable candidate stamp must precede every image write.
 pub struct DfsMetadataCandidateWriter {
     root: PathBuf,
-    _lock: File,
+    _lock: CandidateWriteLock,
 }
+
+struct CandidateWriteLock(File);
+
+impl Drop for CandidateWriteLock {
+    fn drop(&mut self) {
+        // Closing one descriptor need not release its lock while an incidental
+        // inherited/duplicated descriptor keeps the open file description alive.
+        // The staging writer, not that descriptor, owns this custody lifetime.
+        let _ = FileExt::unlock(&self.0);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod lock_lifetime_tests {
+    use super::*;
+    use std::os::unix::fs::MetadataExt;
+
+    fn assert_busy(root: &Path) {
+        assert!(matches!(
+            DfsMetadataCandidateWriter::open(root),
+            Err(MetadataBackendError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::WouldBlock
+        ));
+    }
+
+    #[test]
+    fn candidate_writer_releases_its_lock_despite_an_inherited_description() {
+        let root = sinomo_testdir::TestDir::new("candidate-lock-retirement");
+        let writer = DfsMetadataCandidateWriter::open(root.path()).unwrap();
+        // try_clone retains the same open file description, as an unrelated
+        // fork child does before exec. It does not create a second writer.
+        let inherited = writer._lock.0.try_clone().unwrap();
+        let physical = inherited.metadata().unwrap();
+        assert_busy(root.path());
+        drop(writer);
+        let successor = DfsMetadataCandidateWriter::open(root.path())
+            .expect("writer drop ends custody even while an inherited descriptor lives");
+        let current = successor._lock.0.metadata().unwrap();
+        assert_eq!(
+            (physical.dev(), physical.ino()),
+            (current.dev(), current.ino())
+        );
+        assert_busy(root.path());
+        drop(inherited);
+        assert_busy(root.path());
+        drop(successor);
+        DfsMetadataCandidateWriter::open(root.path()).expect("successor released its own custody");
+    }
+}
+
 impl DfsMetadataCandidateWriter {
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
@@ -50,6 +143,9 @@ impl DfsMetadataCandidateWriter {
                 path: lock_path.clone(),
                 source,
             })?;
+        // Install the guard immediately after acquisition so a rejected stamp
+        // or failed initialization also ends the acquired custody explicitly.
+        let lock = CandidateWriteLock(lock);
         if stamp.exists() {
             let bytes = fs::read(&stamp).map_err(|source| MetadataBackendError::Io {
                 path: stamp.clone(),
@@ -173,7 +269,13 @@ impl DfsMetadataCandidateWriter {
             entry,
             frame.exact_bytes(),
         )?;
-        crate::metadata_cursor::write_journal_head(&self.root, entry.sequence.saturating_add(1))?;
+        // The exact frame is already durable, including a new segment's name.
+        // Use the ordinary journal's reconstructible head hint: recovery checks
+        // the actual tail, and commit above still requires its durable prepare.
+        crate::metadata_cursor::write_journal_head_hint(
+            &self.root,
+            entry.sequence.saturating_add(1),
+        )?;
         Ok(proof)
     }
     pub fn prepare(
@@ -279,10 +381,21 @@ pub fn write_metadata_candidate_image(
     image: &crate::DfsMetadataSnapshotImage,
     fs: &crate::DfsFileSystemId,
 ) -> Result<DfsMetadataCandidateIdentity> {
+    Ok(write_metadata_candidate_image_inspected(root, image, fs)?.identity)
+}
+
+/// Return the full decoder's private inspection of the completed copy. A
+/// receiver may retain this immutable DATA result, but every reuse must verify
+/// the entire actual candidate stream and bytes through `verify`.
+pub fn write_metadata_candidate_image_inspected(
+    root: &Path,
+    image: &crate::DfsMetadataSnapshotImage,
+    fs: &crate::DfsFileSystemId,
+) -> Result<DfsMetadataCandidateInspection> {
     image.validate_file_system(fs)?;
     let writer = DfsMetadataCandidateWriter::open(root)?;
     image.install_candidate_copy(&writer.root)?;
-    inspect_metadata_candidate(root)
+    DfsMetadataCandidateInspection::capture(root)
 }
 
 /// Reuse the normal owned chunk worker for a hidden import candidate. Its real
@@ -309,22 +422,12 @@ pub async fn receive_metadata_candidate_image(
     })
 }
 pub fn inspect_metadata_candidate(root: &Path) -> Result<DfsMetadataCandidateIdentity> {
+    Ok(DfsMetadataCandidateInspection::capture(root)?.identity)
+}
+
+fn candidate_file_fingerprint(root: &Path) -> Result<String> {
     use std::io::Read;
-    // Inspect the actual native rows once and retain that verified result. An
-    // identity query needs no second table projection or semantic serialization.
     let path = metadata_table_snapshot_path(root);
-    let file = File::open(&path).map_err(|source| MetadataBackendError::Io {
-        path: path.clone(),
-        source,
-    })?;
-    let (state, fingerprint) =
-        crate::metadata_snapshot::read_snapshot_with_verified_fingerprint(root, file)?;
-    let proof = state
-        .prefix_proof
-        .ok_or_else(|| MetadataBackendError::Serde("current image has no prefix".into()))?;
-    state
-        .materialized_through_sequence
-        .ok_or_else(|| MetadataBackendError::Serde("current image has no cut".into()))?;
     let mut file = File::open(&path).map_err(|source| MetadataBackendError::Io {
         path: path.clone(),
         source,
@@ -343,11 +446,7 @@ pub fn inspect_metadata_candidate(root: &Path) -> Result<DfsMetadataCandidateIde
         }
         hasher.update(&buffer[..count]);
     }
-    Ok(DfsMetadataCandidateIdentity {
-        state_fingerprint: fingerprint,
-        file_fingerprint: format!("blake3:{}", hasher.finalize().to_hex()),
-        prefix_proof: proof,
-    })
+    Ok(format!("blake3:{}", hasher.finalize().to_hex()))
 }
 
 /// Current table projection used while assembling an unmounted candidate.

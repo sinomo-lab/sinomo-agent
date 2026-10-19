@@ -1,6 +1,7 @@
 /// Safety and witnesses for the bounded whole-shard target contract.
 module dfs_whole_shard_safety {
   import dfs_whole_shard.* from "../../models/dfs/whole_shard"
+  import dfs_whole_shard_authority.* from "../../contracts/dfs/whole_shard_authority"
   def commitSafety: bool = Operations.forall(op => {
     val c = s.commits.get(op)
     val p = s.prepares.get(op)
@@ -10,18 +11,12 @@ module dfs_whole_shard_safety {
       contentReceiptsValid(op, c.receipts),
       c.epoch == p.epoch, c.revision == p.revision, c.primary == p.primary,
       c.epoch == c.admittedEpoch, c.revision == c.admittedRevision,
-      c.primary == c.admittedPrimary, not(c.admittedFrozen), not(c.admittedPending),
-      (c.epoch == 1 and c.primary == 1 and c.members == s.profile.initialMembers)
+      c.primary == c.admittedPrimary, not(c.admittedFrozen),
+      (s.profile.standalone and c.epoch == 0 and c.revision == 0 and c.members == Set(c.primary))
+        or (c.epoch == 1 and c.primary == 1 and c.members == s.profile.initialMembers)
         or (c.epoch == 2 and c.primary == s.desiredPrimary and c.members == s.desiredMembers),
-      if (c.path == 1) all { c.acks == c.members, c.voters == Set(), c.recovery == Set() }
-      else all {
-        c.path == 2, c.acks == Set(), c.voters.subseteq(s.profile.voters),
-        c.voters.size() >= quorum(s.profile.voters), c.recovery.subseteq(c.members),
-        c.recovery.size() >= quorum(c.members), c.recovery.contains(c.primary),
-        s.permits.get(op).digest == c.digest, s.permits.get(op).seq == c.seq,
-        s.permits.get(op).epoch == c.epoch, s.permits.get(op).revision == c.revision,
-        s.permits.get(op).primary == c.primary, s.permits.get(op).op == c.op,
-      },
+      c.path == (if (s.profile.standalone) 0 else 1),
+      publicationProofAllowed(s.profile.standalone, c.primary, c.members, c.acks),
     }
   })
   def denseUniqueHistory: bool = all {
@@ -31,9 +26,9 @@ module dfs_whole_shard_safety {
         == (if (version <= s.visible) 1 else 0)),
   }
   def activationSafety: bool = s.activated implies all {
-    s.frozen, jointProof, s.frozenHead >= s.capturedFloor, s.epoch == 2,
+    s.frozen, jointProof, s.epoch == 2,
     s.primary == s.desiredPrimary, s.members == s.desiredMembers,
-    s.frozenHead >= s.capturedHead, samePrefix(s.frozenPrefix, s.capturedWatermarkPrefix, s.capturedHead),
+    s.frozenHead >= s.capturedHead, samePrefix(s.frozenPrefix, s.capturedPrefix, s.capturedHead),
     s.frozenHead <= s.head, samePrefix(s.journal, s.frozenPrefix, s.frozenHead),
     s.primary == 1 or s.promotionMarker,
   }
@@ -58,24 +53,26 @@ module dfs_whole_shard_safety {
     profileValid(s.profile), s.members.subseteq(s.profile.nodes), s.online.subseteq(s.profile.nodes),
     commitSafety, denseUniqueHistory, activationSafety, payloadHiddenUntilCommit, journalCommitsExactlyOnce, journalCommitDigestMatchesPayload, replicaReadSafety,
     s.head >= 0, s.head <= 6, s.visible >= 0, s.visible <= 3,
-    s.permitFloor <= s.head, s.raftWatermarkHead >= s.permitFloor, s.raftWatermarkHead <= s.head,
-    samePrefix(s.journal, s.raftWatermarkPrefix, s.raftWatermarkHead), s.guardOp == 0 or Operations.contains(s.guardOp),
+    s.capturedHead <= s.head, s.guardOp == 0 or Operations.contains(s.guardOp),
     s.frozen and not(s.activated) implies s.guardOp == 0,
     s.frozen and not(s.activated) implies not(writable),
   }
-  def witnessHealthy: bool = Operations.exists(op => s.commits.get(op).present and s.commits.get(op).path == 1 and not(s.permits.get(op).present))
-  def witnessFallback: bool = Operations.exists(op => s.commits.get(op).present and s.commits.get(op).path == 2)
+  def witnessHealthy: bool = Operations.exists(op => s.commits.get(op).present and s.commits.get(op).path == 1)
+  def witnessStandalone: bool = s.profile.standalone and Operations.exists(op => s.commits.get(op).present and s.commits.get(op).path == 0)
+  def witnessPartialRejected: bool = s.partialRejected and Operations.exists(op =>
+    s.prepares.get(op).present and not(s.commits.get(op).present)
+      and s.acks.get(op).size() >= quorum(s.members) and s.acks.get(op) != s.members)
   def witnessMinorityRejected: bool = s.minorityRejected
   def witnessChangedRetryRejected: bool = s.changedRetryRejected
   def witnessUnknownReplay: bool = s.lostReply.intersect(s.replayed).size() > 0
   def witnessJointOfflineActivation: bool = s.activated and s.handoffAcks != s.profile.initialMembers.union(s.desiredMembers)
   def witnessPromotion: bool = s.activated and s.primary == 2 and s.bound.get(2) == 2
   def witnessStaleEpochRejected: bool = s.staleEpochRejected
-  def witnessCachedPermitHandoffRejected: bool = s.cachedPermitHandoffRejected
+  def witnessFrozenWriterRejected: bool = s.frozenWriterRejected
   def witnessWrongDigestRejected: bool = s.wrongDigestRejected
   def witnessDivergentPrefixRejected: bool = s.divergentPrefixRejected
   def witnessLateAdmittedWriteCaptured: bool = s.activated and s.lateWriteCaptured
-  def witnessWatermarkCarried: bool = s.activated and s.capturedHead > 0
-    and samePrefix(s.frozenPrefix, s.capturedWatermarkPrefix, s.capturedHead)
+  def witnessCapturedPrefixCarried: bool = s.activated and s.capturedHead > 0
+    and samePrefix(s.frozenPrefix, s.capturedPrefix, s.capturedHead)
   def witnessPartialActivationRejected: bool = s.partialActivationRejected
 }

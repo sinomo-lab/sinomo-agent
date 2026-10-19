@@ -82,6 +82,93 @@ fn entries(service: &NativeService, shard: &DfsMetadataShardId) -> Vec<DfsMetada
         .expect("actual native shard journal")
         .entries
 }
+
+#[cfg(feature = "storage-conversion")]
+#[test]
+fn candidate_journal_recovers_head_hints_but_requires_the_actual_prepare() {
+    let (mut runtime, mut service, config) = native_case("candidate-head-hint-recovery", 1);
+    let shard = DfsMetadataShardId::new(config.shard_id.clone());
+    let current = directory(&mut service, "/services/candidate-head-hint-recovery");
+    let mut changed = current.clone();
+    changed.version = DfsVersion::generate();
+    changed.mode = 0o600;
+    let payload = namespace_payload(&config, &current, changed, "candidate-hint-body");
+    let base = service
+        .metadata_backend()
+        .unwrap()
+        .metadata_prefix_proof(&shard)
+        .unwrap()
+        .unwrap();
+    // These are hidden candidates populated from an actual native producer.
+    // CandidateWriter grants no author guard and does not publish this body.
+    let temporary = sinomo_testdir::TestDir::new("candidate-head-hint-images");
+    for variant in ["missing", "corrupt", "stale"] {
+        let root = temporary.join(variant);
+        let writer = crate::DfsMetadataCandidateWriter::open(&root).unwrap();
+        let (prepared, after_prepare) = writer.prepare(payload.clone(), &base).unwrap();
+        let head = root.join("journal/head.sobj");
+        fs::rename(&head, root.join("retained-head-after-prepare.sobj")).unwrap();
+        match variant {
+            "corrupt" => fs::write(&head, b"torn hint").unwrap(),
+            "stale" => crate::metadata_cursor::write_journal_head_hint(&root, 1).unwrap(),
+            "missing" => {}
+            _ => unreachable!(),
+        }
+        drop(writer);
+        assert_eq!(
+            crate::metadata_journal::recover_next_journal_sequence(&root).unwrap(),
+            after_prepare.journal_sequence + 1
+        );
+        let actual = crate::metadata_journal::segmented_journal_entry_at_sequence(
+            &root,
+            prepared.digest.prepare_sequence,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            matches!(&actual.mutation, DfsMetadataMutation::PrepareOperationV7 { record, .. }
+            if record.digest == prepared.digest && record.payload == prepared.payload)
+        );
+        let writer = crate::DfsMetadataCandidateWriter::open(&root).unwrap();
+        let (committed, after_commit) = writer
+            .commit(prepared, &after_prepare, OffsetDateTime::now_utc())
+            .unwrap();
+        assert_eq!(
+            committed.status,
+            crate::DfsPreparedOperationStatus::Committed
+        );
+        fs::rename(&head, root.join("retained-head-after-commit.sobj")).unwrap();
+        drop(writer);
+        assert_eq!(
+            crate::metadata_journal::recover_next_journal_sequence(&root).unwrap(),
+            after_commit.journal_sequence + 1
+        );
+        assert_eq!(
+            crate::metadata_journal::segmented_journal_entry_at_sequence(&root, actual.sequence)
+                .unwrap()
+                .unwrap(),
+            actual
+        );
+    }
+    let root = temporary.join("missing-prepare");
+    let writer = crate::DfsMetadataCandidateWriter::open(&root).unwrap();
+    let (prepared, after_prepare) = writer.prepare(payload, &base).unwrap();
+    fs::rename(
+        root.join("journal/segments"),
+        root.join("retained-original-segments"),
+    )
+    .unwrap();
+    assert!(
+        writer
+            .commit(prepared, &after_prepare, OffsetDateTime::now_utc())
+            .is_err(),
+        "a head hint cannot stand in for the missing durable prepare"
+    );
+    assert!(!root.join("journal/segments").exists());
+    drop(writer);
+    drop(service);
+    runtime.close().unwrap();
+}
 fn commit_kernel(
     service: &mut NativeService,
     digest: &crate::DfsPreparedOperationDigest,
@@ -1931,11 +2018,25 @@ fn native_owned_recovery_starts_at_exact_tables_despite_a_lagging_cursor_hint() 
 fn prepared_v7_initial_epoch_requires_the_real_host_provider() {
     let (mut runtime, mut service, config) = native_case("v7-initial-host-bind", 1);
     let shard = DfsMetadataShardId::new(config.shard_id.clone());
+    let diagnostic = crate::native_boundary_diagnostics::capture(
+        runtime.data_dir(&config.primary_node_id).root(),
+    );
     let current = directory(&mut service, "/services/v7-initial-host-bind");
     let mut committed = current.clone();
     committed.version = DfsVersion::generate();
     committed.mode = 0o600;
     let payload = namespace_payload(&config, &current, committed.clone(), "v7-host-bind");
+    // Like production publish_prepared_operation, own the real execution
+    // window before exposing the durable prepare. Otherwise normal Main
+    // recovery may correctly publish it before this test's explicit kernel.
+    let execution = service
+        .acquire_prepared_execution(&crate::DfsPreparedOperationScope {
+            file_system_id: payload.file_system_id.clone(),
+            shard_id: payload.shard_id.clone(),
+            owner_epoch: payload.owner_epoch,
+            operation_id: payload.operation_id.clone(),
+        })
+        .unwrap();
     let digest = service
         .metadata_backend_mut()
         .unwrap()
@@ -1973,7 +2074,67 @@ fn prepared_v7_initial_epoch_requires_the_real_host_provider() {
         Some(current)
     );
     drop(unbound);
-    assert!(commit_kernel(&mut service, &digest).unwrap().published);
+    // Controlled scheduling diagnostic: ask the SAME mounted Main owner to
+    // reconcile its actual durable work. The actual native admission gate
+    // decides whether it can run here; no proof, outcome or journal is supplied.
+    let reconciliation = runtime
+        .request_repair_reconciliation(&config.primary_node_id)
+        .unwrap();
+    let scheduler = crate::runtime_host::daemon_dfs_mutation_scheduler(
+        runtime.data_dir(&config.primary_node_id),
+    )
+    .unwrap();
+    let eligible = scheduler.try_admit_global();
+    let maintenance_admitted = eligible.is_some();
+    drop(eligible);
+    if maintenance_admitted {
+        let tick = runtime
+            .maintenance_tick(
+                &config.primary_node_id,
+                sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+            )
+            .unwrap();
+        diagnostic.dump(
+            "competing-main",
+            serde_json::json!({
+                "digest": digest, "requested_reconciliation": reconciliation,
+                "actual_global_admission_available": maintenance_admitted,
+                "outcome": format!("{:?}", tick.outcome),
+            }),
+        );
+    }
+    let committed_result = commit_kernel(&mut service, &digest);
+    diagnostic.dump(
+        "initial-epoch-kernel",
+        serde_json::json!({
+            "digest": digest, "result": format!("{committed_result:?}"),
+            "rpc": format!("{:?}", runtime.rpc_observations()),
+        }),
+    );
+    let committed_result = committed_result.unwrap();
+    assert!(committed_result.published);
+    assert!(
+        !maintenance_admitted,
+        "the actual provider's retained admission excludes competing Main publication"
+    );
+    drop(execution);
+    runtime
+        .maintenance_tick(
+            &config.primary_node_id,
+            sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+        )
+        .unwrap()
+        .outcome
+        .unwrap();
+    assert_eq!(
+        service
+            .metadata_backend()
+            .unwrap()
+            .committed_prepared_operation(&digest)
+            .unwrap(),
+        Some(committed_result.entry),
+        "Main recovery after release preserves the exact original commit"
+    );
     assert_eq!(
         service
             .metadata_backend()
@@ -1984,4 +2145,174 @@ fn prepared_v7_initial_epoch_requires_the_real_host_provider() {
     );
     drop(service);
     runtime.close().unwrap();
+}
+
+#[test]
+fn native_table_replay_validates_each_unchanged_owned_prepared_body_once() {
+    let (mut runtime, mut service, config) = native_case("native-replay-owned-body-validation", 1);
+    let expected = directory(&mut service, "/services/owned-body-validation");
+    let source = runtime
+        .data_dir(&config.primary_node_id)
+        .dfs_dir()
+        .join("metadata")
+        .join(&config.shard_id);
+    drop(service);
+    runtime.stop_node(&config.primary_node_id).unwrap();
+    let copy = sinomo_testdir::TestDir::new("native-replay-owned-body-copy");
+    let source_snapshot = crate::metadata_table_store::metadata_table_snapshot_path(&source);
+    let source_log = crate::metadata_table_store::metadata_table_path(&source);
+    let copied_snapshot = crate::metadata_table_store::metadata_table_snapshot_path(&copy);
+    let copied_log = crate::metadata_table_store::metadata_table_path(&copy);
+    std::fs::create_dir_all(copied_log.parent().unwrap()).unwrap();
+    let mut originals = Vec::new();
+    for (from, to) in [(source_snapshot, copied_snapshot), (source_log, copied_log)] {
+        let before = std::fs::read(&from).unwrap();
+        assert!(
+            before.len() <= 8 * 1024 * 1024,
+            "bounded native fixture source"
+        );
+        std::fs::copy(&from, &to).unwrap();
+        assert_eq!(std::fs::read(&to).unwrap(), before);
+        originals.push((from, to, before));
+    }
+    // The ordinary reader replays copies of ACTUAL native table frames. No
+    // synthetic authority, expected records, successful marker or altered body
+    // is supplied to the projector. The stopped original remains untouched.
+    crate::metadata_records::reset_prepared_payload_digest_count();
+    let replayed = crate::metadata_table_store::read_metadata_table_state_lenient(&copy).unwrap();
+    let prepared_count = replayed.tables.prepared_operations_v7.len();
+    assert!(prepared_count > 0);
+    assert_eq!(
+        crate::metadata_records::prepared_payload_digest_count(),
+        prepared_count,
+        "prepare and commit replay retain the same immutable body and must not serialize/hash it repeatedly"
+    );
+    assert_eq!(
+        replayed.tables.objects.get(&expected.object_id),
+        Some(&expected)
+    );
+    for record in replayed.tables.prepared_operations_v7.values() {
+        assert_eq!(record.status, crate::DfsPreparedOperationStatus::Committed);
+        record
+            .committed_entry
+            .as_ref()
+            .unwrap()
+            .validate(&record.digest)
+            .unwrap();
+    }
+    for (from, to, before) in originals {
+        assert_eq!(std::fs::read(from).unwrap(), before);
+        assert_eq!(std::fs::read(to).unwrap(), before);
+    }
+    runtime.close().unwrap();
+}
+
+#[test]
+fn native_replay_validation_keeps_mutable_record_checks_and_releases_body_custody() {
+    let (runtime, mut service, config) = native_case("native-replay-body-custody", 1);
+    directory(&mut service, "/services/replay-body-custody");
+    let shard = DfsMetadataShardId::new(config.shard_id.clone());
+    let operation = entries(&service, &shard)
+        .into_iter()
+        .find_map(|entry| {
+            if let DfsMetadataMutation::PrepareOperationV7 { record, .. } = entry.mutation {
+                Some(record.digest.operation_id)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    let actual = service
+        .metadata_backend()
+        .unwrap()
+        .prepared_operation_record(&operation)
+        .unwrap()
+        .unwrap();
+    assert_eq!(actual.status, crate::DfsPreparedOperationStatus::Committed);
+    drop(service);
+    runtime.close().unwrap();
+    use crate::metadata_records::{
+        prepared_payload_digest_count, reset_prepared_payload_digest_count,
+        with_prepared_payload_validation,
+    };
+    with_prepared_payload_validation(|| {
+        reset_prepared_payload_digest_count();
+        actual.validate().unwrap();
+        actual.validate().unwrap();
+        assert_eq!(prepared_payload_digest_count(), 1);
+        let mut changed_scope = actual.clone();
+        changed_scope.digest.owner_epoch += 1;
+        assert!(changed_scope.validate().is_err());
+        let mut changed_slot = actual.clone();
+        changed_slot.digest.prepare_sequence = 0;
+        assert!(changed_slot.validate().is_err());
+        let mut changed_terminal = actual.clone();
+        changed_terminal.status = crate::DfsPreparedOperationStatus::Prepared;
+        assert!(changed_terminal.validate().is_err());
+        let mut changed_reference = actual.clone();
+        changed_reference.committed_entry.as_mut().unwrap().sequence =
+            actual.digest.prepare_sequence;
+        assert!(changed_reference.validate().is_err());
+        assert_eq!(
+            prepared_payload_digest_count(),
+            1,
+            "only immutable-body work is reused; record checks still reject changes"
+        );
+        let mut changed_body = actual.clone();
+        Arc::make_mut(&mut changed_body.payload)
+            .transaction
+            .created_at += time::Duration::nanoseconds(1);
+        assert!(changed_body.validate().is_err());
+        assert_eq!(
+            prepared_payload_digest_count(),
+            2,
+            "a changed allocation is validated anew"
+        );
+    });
+    let mut unique = actual.clone();
+    unique.payload = Arc::new(actual.payload.as_ref().clone());
+    with_prepared_payload_validation(|| {
+        unique.validate().unwrap();
+        assert_eq!(
+            Arc::strong_count(&unique.payload),
+            1,
+            "validation must not retain the body"
+        );
+        Arc::make_mut(&mut unique.payload).transaction.created_at += time::Duration::nanoseconds(1);
+        assert!(
+            unique.validate().is_err(),
+            "unique-owner mutation dissociates the old weak generation"
+        );
+    });
+    let mut outside = actual.clone();
+    outside.payload = Arc::new(actual.payload.as_ref().clone());
+    reset_prepared_payload_digest_count();
+    outside.validate().unwrap();
+    outside.validate().unwrap();
+    assert_eq!(
+        prepared_payload_digest_count(),
+        2,
+        "ordinary public validation retains no replay observation"
+    );
+    assert!(Arc::get_mut(&mut outside.payload).is_some());
+    let aborted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        with_prepared_payload_validation(|| {
+            outside.validate().unwrap();
+            panic!("injected owned replay unwind");
+        });
+    }));
+    assert!(aborted.is_err());
+    assert!(
+        Arc::get_mut(&mut outside.payload).is_some(),
+        "unwind releases the replay's weak custody before handback"
+    );
+    with_prepared_payload_validation(|| {
+        outside.validate().unwrap();
+        let witness = Arc::downgrade(&outside.payload);
+        drop(outside);
+        assert!(
+            witness.upgrade().is_none(),
+            "a decoded-body observation cannot keep an evicted body alive"
+        );
+    });
 }

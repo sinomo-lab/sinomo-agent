@@ -21,6 +21,75 @@ fn failed_sync(path: &Path) -> DurableFileError {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn individual_small_frames_keep_the_unchanged_bulk_write_syscall_budget() {
+    fn thread_writes() -> u64 {
+        fs::read_to_string("/proc/thread-self/io")
+            .unwrap()
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("syscw: ")
+                    .map(|count| count.parse().unwrap())
+            })
+            .expect("Linux thread write-syscall counter")
+    }
+    let root = root("individual-frame-write-budget");
+    let path = root.join("frames.log");
+    let mut writer = FrameAppender::open(&path, FrameLimits::default()).unwrap();
+    let before = thread_writes();
+    for index in 0_u64..64 {
+        let payload = [index as u8; 4096];
+        let frame = writer.append_bytes(&index.to_le_bytes(), &payload).unwrap();
+        assert_eq!(frame.prefix().frames(), index + 1);
+    }
+    let writes = thread_writes() - before;
+    assert!(
+        writes <= 4 * 64 + 16,
+        "64 individual frames used {writes} write syscalls; budget272"
+    );
+    let end = writer.durable_prefix().end();
+    drop(writer);
+    let reopened = FrameAppender::open(&path, FrameLimits::default()).unwrap();
+    assert_eq!(reopened.durable_prefix().frames(), 64);
+    assert_eq!(reopened.durable_prefix().end(), end);
+    let mut reader = File::open(&path).unwrap();
+    for index in 0_u64..64 {
+        let frame = complete(&mut reader, &path);
+        assert_eq!(frame.header(), index.to_le_bytes());
+        assert_eq!(frame.payload_bytes(), 4096);
+        assert_eq!(
+            frame.payload_checksum(),
+            blake3::hash(&[index as u8; 4096]).as_bytes()
+        );
+    }
+}
+
+#[test]
+fn framing_at_scratch_buffer_boundaries_keeps_exact_streamed_content() {
+    let root = root("frame-scratch-boundaries");
+    for header_len in [
+        0,
+        COPY_BUFFER_BYTES - PREFIX_BYTES,
+        COPY_BUFFER_BYTES - PREFIX_BYTES + 1,
+        MAX_HEADER_BYTES as usize,
+    ] {
+        let path = root.join(format!("frames-{header_len}.log"));
+        let mut writer = FrameAppender::open(&path, FrameLimits::default()).unwrap();
+        let header = vec![37; header_len];
+        let payload = vec![91; COPY_BUFFER_BYTES + 7];
+        let first = writer.append_bytes(&header, &payload).unwrap();
+        let second = writer.append_bytes(&header, &[]).unwrap();
+        drop(writer);
+        let mut reader = File::open(&path).unwrap();
+        assert_eq!(complete(&mut reader, &path), *first.frame());
+        assert_eq!(complete(&mut reader, &path), *second.frame());
+        let reopened = FrameAppender::open(&path, FrameLimits::default()).unwrap();
+        assert_eq!(reopened.durable_prefix().frames(), 2);
+        assert_eq!(reopened.durable_prefix().digest(), second.prefix().digest());
+    }
+}
+
 #[test]
 fn batch_append_has_identical_frames_and_one_final_sync() {
     let root = root("checksummed-frame-batch");

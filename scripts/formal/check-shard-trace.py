@@ -43,8 +43,10 @@ def digest_bytes(data: bytes) -> str:
 
 
 def formal_source_hash(model: Path, checks: Path) -> str:
-    """Bind both the transition relation and its invariant suite."""
-    return digest_bytes(model.read_bytes() + b"\x00" + checks.read_bytes())
+    """Bind the complete bounded transition/check/authority-contract source."""
+    contract = model.parents[2] / "contracts/dfs/whole_shard_authority.qnt"
+    return digest_bytes(model.read_bytes() + b"\x00" + checks.read_bytes()
+                        + b"\x00" + contract.read_bytes())
 
 
 def decimal_u64(value: Any, where: str = "u64") -> int:

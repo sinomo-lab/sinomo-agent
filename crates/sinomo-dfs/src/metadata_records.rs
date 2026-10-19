@@ -947,12 +947,18 @@ pub struct DfsNamespacePathOccupantExpectation {
 mod prepared_effects;
 pub use prepared_effects::DfsPreparedMetadataEffect;
 mod prepared_operation;
-pub(crate) use prepared_operation::compound_prepared_operation_id;
 pub use prepared_operation::{
     DFS_PREPARED_OPERATION_PROTOCOL_VERSION, DfsPreparedOperationCommitReference,
     DfsPreparedOperationCommitResult, DfsPreparedOperationDigest, DfsPreparedOperationEviction,
     DfsPreparedOperationPayload, DfsPreparedOperationRecord, DfsPreparedOperationScope,
     DfsPreparedOperationStatus,
+};
+pub(crate) use prepared_operation::{
+    compound_prepared_operation_id, with_prepared_payload_validation,
+};
+#[cfg(test)]
+pub(crate) use prepared_operation::{
+    prepared_payload_digest_count, reset_prepared_payload_digest_count,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]

@@ -2150,8 +2150,28 @@ struct ClusterKvRaftOperationLockState {
 }
 
 struct ClusterKvRaftOperationLock {
+    root: PathBuf,
     state: Mutex<ClusterKvRaftOperationLockState>,
     ready: Condvar,
+}
+
+impl Drop for ClusterKvRaftOperationLock {
+    fn drop(&mut self) {
+        // Guard cleanup can overlap: both retiring guards may observe another
+        // strong reference before either finishes dropping its fields. Reclaim
+        // the weak registry entry at the actual last-reference boundary too.
+        let mut locks = CLUSTER_KV_RAFT_OPERATION_LOCKS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if locks
+            .get(&self.root)
+            .is_some_and(|registered| std::ptr::eq(registered.as_ptr(), self))
+        {
+            // A new owner can replace an expired Weak before this destructor
+            // obtains the registry mutex. Never remove that successor's slot.
+            locks.remove(&self.root);
+        }
+    }
 }
 
 struct ClusterKvRaftOperationWaiter {
@@ -2257,21 +2277,6 @@ pub struct ClusterKvRaftOperationGuard {
     acquired_at: Instant,
 }
 
-fn remove_cluster_kv_raft_operation_lock_if_unused(
-    root: &Path,
-    lock: &Arc<ClusterKvRaftOperationLock>,
-) {
-    let mut locks = CLUSTER_KV_RAFT_OPERATION_LOCKS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let is_registered_lock = locks
-        .get(root)
-        .is_some_and(|registered| registered.as_ptr() == Arc::as_ptr(lock));
-    if is_registered_lock && Arc::strong_count(lock) == 1 {
-        locks.remove(root);
-    }
-}
-
 impl Drop for ClusterKvRaftOperationGuard {
     fn drop(&mut self) {
         metrics::gauge!("sinomo.kv.raft.operation.inflight").decrement(1.0);
@@ -2288,7 +2293,8 @@ impl Drop for ClusterKvRaftOperationGuard {
             self.acquired_at.elapsed().as_micros() as f64
         };
         metrics::histogram!("sinomo.kv.raft.operation.hold.us").record(held_us);
-        remove_cluster_kv_raft_operation_lock_if_unused(&self.root, &self.lock);
+        #[cfg(test)]
+        operation_lock_tests::pause_after_guard_cleanup_for_test(&self.root);
     }
 }
 
@@ -2314,6 +2320,7 @@ fn lock_cluster_kv_raft_operation_for_root_with_wait(
             Some(lock) => lock,
             None => {
                 let lock = Arc::new(ClusterKvRaftOperationLock {
+                    root: root.clone(),
                     state: Mutex::new(ClusterKvRaftOperationLockState::default()),
                     ready: Condvar::new(),
                 });
@@ -2337,7 +2344,6 @@ fn lock_cluster_kv_raft_operation_for_root_with_wait(
             let detail = format!("cluster kv raft operation lock poisoned: {error}");
             drop(error);
             waiter.cancel("error");
-            remove_cluster_kv_raft_operation_lock_if_unused(&root, &lock);
             return Err(KvError::Io {
                 path: root.display().to_string(),
                 detail,
@@ -2350,7 +2356,6 @@ fn lock_cluster_kv_raft_operation_for_root_with_wait(
             if remaining.is_zero() {
                 drop(state);
                 waiter.cancel("timeout");
-                remove_cluster_kv_raft_operation_lock_if_unused(&root, &lock);
                 return Err(KvError::Busy {
                     path: root.display().to_string(),
                 });
@@ -2362,7 +2367,6 @@ fn lock_cluster_kv_raft_operation_for_root_with_wait(
                         format!("cluster kv raft operation lock poisoned while waiting: {error}");
                     drop(error);
                     waiter.cancel("error");
-                    remove_cluster_kv_raft_operation_lock_if_unused(&root, &lock);
                     return Err(KvError::Io {
                         path: root.display().to_string(),
                         detail,
@@ -2375,7 +2379,6 @@ fn lock_cluster_kv_raft_operation_for_root_with_wait(
             {
                 drop(state);
                 waiter.cancel("timeout");
-                remove_cluster_kv_raft_operation_lock_if_unused(&root, &lock);
                 return Err(KvError::Busy {
                     path: root.display().to_string(),
                 });
@@ -2388,7 +2391,6 @@ fn lock_cluster_kv_raft_operation_for_root_with_wait(
                         format!("cluster kv raft operation lock poisoned while waiting: {error}");
                     drop(error);
                     waiter.cancel("error");
-                    remove_cluster_kv_raft_operation_lock_if_unused(&root, &lock);
                     return Err(KvError::Io {
                         path: root.display().to_string(),
                         detail,
@@ -2423,6 +2425,25 @@ fn cluster_kv_raft_operation_lock_is_registered_for_test(root: &Path) -> bool {
 mod operation_lock_tests {
     use super::*;
     use std::sync::mpsc;
+
+    type RetiringGuardPause = (PathBuf, mpsc::Sender<()>, mpsc::Receiver<()>);
+    thread_local! {
+        static RETIRING_GUARD_PAUSE: std::cell::RefCell<Option<RetiringGuardPause>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn pause_after_guard_cleanup_for_test(root: &Path) {
+        let pause = RETIRING_GUARD_PAUSE.with(|slot| slot.borrow_mut().take());
+        if let Some((expected, reached, resume)) = pause {
+            assert_eq!(root, expected);
+            reached
+                .send(())
+                .expect("retiring guard reached cleanup boundary");
+            resume
+                .recv_timeout(Duration::from_secs(1))
+                .expect("release retiring guard's final reference");
+        }
+    }
 
     fn operation_lock_for_test(root: &Path) -> Arc<ClusterKvRaftOperationLock> {
         CLUSTER_KV_RAFT_OPERATION_LOCKS
@@ -2575,6 +2596,60 @@ mod operation_lock_tests {
         assert!(!cluster_kv_raft_operation_lock_is_registered_for_test(
             &root
         ));
+    }
+
+    #[test]
+    fn operation_lock_registry_releases_overlapping_retiring_guards() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-kv-operation-lock-overlapping-retirement-{}",
+            std::process::id()
+        ));
+        let first = lock_cluster_kv_raft_operation_for_root(&root).unwrap();
+        let observed = operation_lock_for_test(&root);
+        let slot_identity = Arc::as_ptr(&observed) as usize;
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let (drop_second_tx, drop_second_rx) = mpsc::channel();
+        let waiter_root = root.clone();
+        let second = thread::spawn(move || {
+            let guard = lock_cluster_kv_raft_operation_for_root(&waiter_root).unwrap();
+            assert_eq!(Arc::as_ptr(&guard.lock) as usize, slot_identity);
+            acquired_tx.send(()).unwrap();
+            drop_second_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            drop(guard);
+        });
+        wait_for_operation_queue_depth(&observed, 1);
+        drop(observed);
+        let (retired_tx, retired_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let retiring_root = root.clone();
+        let retiring = thread::spawn(move || {
+            RETIRING_GUARD_PAUSE.with(|slot| {
+                *slot.borrow_mut() = Some((retiring_root, retired_tx, resume_rx));
+            });
+            drop(first);
+        });
+        retired_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        acquired_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        drop_second_tx.send(()).unwrap();
+        second.join().unwrap();
+        // Both actual guards have released admission while the retiring
+        // predecessor's Arc is still alive. Only the final field drop can
+        // establish that no owner remains; no fabricated permit is involved.
+        {
+            let registry = CLUSTER_KV_RAFT_OPERATION_LOCKS.lock().unwrap();
+            let weak = registry.get(&root).expect("retiring slot still present");
+            assert_eq!(weak.as_ptr() as usize, slot_identity);
+            assert_eq!(weak.strong_count(), 1);
+            eprintln!(
+                "retirement boundary: exact_slot={slot_identity:x} strong=1; second guard joined"
+            );
+        }
+        resume_tx.send(()).unwrap();
+        retiring.join().unwrap();
+        assert!(
+            !cluster_kv_raft_operation_lock_is_registered_for_test(&root),
+            "last retiring reference left a dead registry entry"
+        );
     }
 
     #[test]
@@ -13164,11 +13239,8 @@ mod resident_checkout_tests {
 
     #[test]
     fn shadow_role_denial_drops_cached_owner_before_a_fresh_main_open() {
-        let raft_root = std::env::temp_dir().join(format!(
-            "sinomo-kv-shadow-denial-{}-{}",
-            std::process::id(),
-            RESIDENT_RAFT_NODE_ACCESS_CLOCK.fetch_add(1, Ordering::Relaxed)
-        ));
+        let fixture = sinomo_testdir::TestDir::new("sinomo-kv-shadow-denial");
+        let raft_root = fixture.to_path_buf();
         let node_id = NodeId::from_legacy_named("node_shadow_denial_fresh_main").expect("node id");
         let wal_paths = KvWalPaths::new(raft_root.join(node_id.as_str()));
 
@@ -13203,11 +13275,8 @@ mod resident_checkout_tests {
 
     #[test]
     fn shadow_role_denial_evicts_and_rejects_preseeded_immutable_raft_view() {
-        let raft_root = std::env::temp_dir().join(format!(
-            "sinomo-kv-shadow-view-denial-{}-{}",
-            std::process::id(),
-            RESIDENT_RAFT_NODE_ACCESS_CLOCK.fetch_add(1, Ordering::Relaxed)
-        ));
+        let fixture = sinomo_testdir::TestDir::new("sinomo-kv-shadow-view-denial");
+        let raft_root = fixture.to_path_buf();
         let node_id =
             NodeId::from_legacy_named("node_shadow_denial_immutable_view").expect("node id");
         let wal_paths = KvWalPaths::new(raft_root.join(node_id.as_str()));

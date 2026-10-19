@@ -65,6 +65,9 @@ class Acceptance:
             self.binary_hash = hashlib.file_digest(binary, "sha256").hexdigest()
 
     def run(self, label, argv, *, expected_success=True, expected_error=None, timeout=120):
+        if argv[:len(self.compose)] == self.compose and argv[len(self.compose)] in ("kill", "restart"):
+            from runtime_resources import NODES, expect_exit
+            expect_exit([arg for arg in argv[len(self.compose) + 1:] if arg in NODES] or sorted(NODES), label)
         self.index += 1
         stem = self.artifacts / f"{self.index:03d}-{label}"
         stem.with_suffix(".command.json").write_text(json.dumps(argv, indent=2) + "\n")

@@ -180,6 +180,17 @@ pub struct DfsNamespaceRequestAdmissionSnapshot {
     pub history_expired: bool,
 }
 
+/// Applied outcomes and hidden reservations from one exact physical table view.
+/// A read must not combine pre-commit absence with post-commit reservation
+/// removal and then incorrectly certify that an operation was never applied.
+#[derive(Clone, Debug)]
+pub struct DfsWriteOperationAdmissionSnapshot {
+    pub intent: Option<DfsWriteIntentRecord>,
+    pub target_size_bytes: Option<u64>,
+    pub prepared: Vec<DfsPreparedOperationRecord>,
+    pub retention: DfsWriteIntentReceiptRetentionState,
+}
+
 impl DfsMetadataReplicaIngestPermit {
     /// Mint evidence only after the caller has validated all four values
     /// against the same exact committed shard assignment.
@@ -523,6 +534,64 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
 
     /// End one bounded coherent-read scope opened above.
     fn end_consistent_read_snapshot(&mut self) {}
+
+    /// Pin exactly one physical authority scope. Unlike a path lookup, this
+    /// must not refresh ancestor fallbacks or unrelated shard backlogs.
+    fn has_physical_read_scope(&self, _shard_id: &DfsMetadataShardId) -> bool {
+        false
+    }
+
+    fn begin_consistent_read_snapshot_on_shard(
+        &mut self,
+        _shard_id: &DfsMetadataShardId,
+    ) -> Result<()> {
+        Err(MetadataBackendError::Serde(
+            "metadata backend does not support exact-shard read snapshots".into(),
+        ))
+    }
+
+    fn end_consistent_read_snapshot_on_shard(&mut self, _shard_id: &DfsMetadataShardId) {}
+
+    /// Pin an existing materialized read view without acquiring a writer or
+    /// running journal recovery. Unsupported backends remain unavailable.
+    fn begin_stat_read_snapshot(&mut self) -> Result<()> {
+        Err(MetadataBackendError::Serde(
+            "backend has no stat read-view capability".into(),
+        ))
+    }
+    fn end_stat_read_snapshot(&mut self) {}
+    fn begin_stat_read_snapshot_on_shard(&mut self, _id: &DfsMetadataShardId) -> Result<()> {
+        Err(MetadataBackendError::Serde(
+            "backend has no exact stat read-view capability".into(),
+        ))
+    }
+    fn end_stat_read_snapshot_on_shard(&mut self, _id: &DfsMetadataShardId) {}
+    fn begin_stat_read_snapshot_on_shards(&mut self, ids: &[DfsMetadataShardId]) -> Result<()> {
+        for (index, id) in ids.iter().enumerate() {
+            if let Err(error) = self.begin_stat_read_snapshot_on_shard(id) {
+                for pinned in ids[..index].iter().rev() {
+                    self.end_stat_read_snapshot_on_shard(pinned);
+                }
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+    fn end_stat_read_snapshot_on_shards(&mut self, ids: &[DfsMetadataShardId]) {
+        for id in ids.iter().rev() {
+            self.end_stat_read_snapshot_on_shard(id);
+        }
+    }
+    fn begin_stat_read_snapshot_for_path(
+        &mut self,
+        _fs: &DfsFileSystemId,
+        _path: &str,
+    ) -> Result<()> {
+        self.begin_stat_read_snapshot()
+    }
+    fn end_stat_read_snapshot_for_path(&mut self, _fs: &DfsFileSystemId, _path: &str) {
+        self.end_stat_read_snapshot();
+    }
 
     /// Pin the metadata generation needed to serve one exact namespace path.
     ///
@@ -1319,6 +1388,16 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         object_id: &DfsObjectId,
         intent_id: &str,
     ) -> Result<Option<DfsWriteIntentRecord>>;
+
+    /// Observe one write identity and its object's indexed reservations without
+    /// opening unrelated shards or granting publication authority.
+    fn write_operation_admission_snapshot(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        file_system_id: &DfsFileSystemId,
+        object_id: &DfsObjectId,
+        intent_id: &str,
+    ) -> Result<DfsWriteOperationAdmissionSnapshot>;
 
     /// Fetch one exact write-intent key from one physical local metadata
     /// shard. Unlike [`Self::get_intent`], this never follows an object index

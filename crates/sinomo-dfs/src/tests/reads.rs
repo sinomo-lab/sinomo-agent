@@ -1173,6 +1173,122 @@ fn process_incoming_accepts_queued_remote_read_response_before_expiry_prune() {
 }
 
 #[test]
+fn native_read_fixture_observes_actual_publication_before_queued_read_setup() {
+    use std::cell::Cell;
+    use std::sync::{Arc, Mutex};
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let captured = Arc::new(Mutex::new(
+        Vec::<crate::DfsMetadataJournalBatchCommand>::new(),
+    ));
+    let saw_gap = Cell::new(false);
+    let wait_for_publication = || {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while captured.lock().unwrap().is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            !captured.lock().unwrap().is_empty(),
+            "actual committed-write publication must reach the carrier"
+        );
+    };
+    let (runtime, owner, _, reader_node, stat, bytes) =
+        native_read_fixture_observing_materialization(
+            "native-read-controlled-publication",
+            1,
+            false,
+            vec![0x61; 4096],
+            |runtime, reader, _| {
+                runtime.install_fault(crate::test_runtime::FaultRule {
+                    source: None,
+                    target: Some(reader.clone()),
+                    route: Some(crate::DFS_METADATA_JOURNAL_BATCH_ROUTE.into()),
+                    call_id: None,
+                    origin: None,
+                    remaining_hits: 1,
+                    action: crate::test_runtime::FaultAction::PauseWriteCommitPublication {
+                        gate: Arc::clone(&gate),
+                        captured: Arc::clone(&captured),
+                    },
+                });
+            },
+            |runtime, reader_node, published, observed| {
+                if saw_gap.get() {
+                    return;
+                }
+                wait_for_publication();
+                let mut reader = runtime.client(reader_node).unwrap();
+                assert!(
+                    matches!(reader.request_remote_object_read(&published.object_id),
+                Err(DfsError::UnknownObject { object_id }) if object_id == published.object_id)
+                );
+                assert!(reader.reads.pending_reads.is_empty());
+                let command = captured.lock().unwrap()[0].clone();
+                assert!(
+                    observed.materialized_sequence.unwrap() < command.batch.next_after_sequence
+                );
+                assert_eq!(
+                    command.file_system_id.as_ref(),
+                    Some(&published.file_system_id)
+                );
+                assert!(
+                    crate::runtime_host::materialization_test::wait_for_existing_materialization(
+                        runtime.data_dir(reader_node),
+                        &published.file_system_id,
+                        &command.batch.shard_id,
+                        &runtime.runtime_handle(),
+                        command.batch.next_after_sequence,
+                        Instant::now(),
+                        |_| panic!("an expired readiness observation must not request work"),
+                    )
+                    .is_err()
+                );
+                eprintln!(
+                    "QUEUED-READ controlled gap: expected={published:?} actual={observed:?} held={:?}",
+                    command.batch.decoded().unwrap()
+                );
+                saw_gap.set(true);
+                runtime.clear_faults();
+                gate.add_permits(1);
+            },
+        );
+    wait_for_publication();
+    let mut reader = runtime.client(&reader_node).unwrap();
+    let request = reader.request_remote_object_read(&stat.object_id);
+    // Always release actual paused ingress before asserting the old failure.
+    runtime.clear_faults();
+    if !saw_gap.get() {
+        gate.add_permits(1);
+    }
+    if request.is_err() {
+        eprintln!(
+            "QUEUED-READ controlled premature fixture: stat={stat:?} result={request:?} held={:#?}",
+            captured.lock().unwrap()[0].batch.decoded()
+        );
+        drop(reader);
+        runtime.close().unwrap();
+        panic!("fixture returned before its exact reader view was published: {request:?}");
+    }
+    assert_eq!(request.unwrap(), vec![owner.clone()]);
+    assert!(
+        saw_gap.get(),
+        "the actual reader view must be missing before releasing publication"
+    );
+    let request_id = reader.reads.pending_reads.keys().next().unwrap().clone();
+    runtime.expire_queued_native_read(&mut reader, &request_id);
+    let events = reader.process_incoming().unwrap();
+    assert!(events.iter().any(|event| matches!(event,
+        NetworkedDfsServiceEvent::RemoteReadCompleted {
+            request_id: actual, object_id, source_node_id,
+            result: DfsReadResult::Found(DfsReadData { version, bytes: actual_bytes, .. }),
+        } if actual == &request_id && object_id == &stat.object_id && source_node_id == &owner
+            && version == &stat.version && actual_bytes == &bytes)));
+    assert!(!reader.reads.pending_reads.contains_key(&request_id));
+    runtime.assert_fault_budgets().unwrap();
+    drop(reader);
+    runtime.close().unwrap();
+}
+
+#[test]
 fn remote_read_planning_deduplicates_duplicate_locations() {
     let (runtime, owner, _, reader_node, stat, bytes) = native_read_fixture(
         "native-read-duplicate-location-hint",

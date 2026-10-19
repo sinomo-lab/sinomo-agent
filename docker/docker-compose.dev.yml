@@ -38,6 +38,10 @@
 x-node-defaults: &node-defaults
   image: sinomo-dev-runtime
   restart: unless-stopped
+  # Hard per-node limit, including main, shadow, helpers and charged page cache.
+  # Equal memory+swap and memory limits prohibit container swap.
+  mem_limit: 2g
+  memswap_limit: 2g
 
 services:
   node1:

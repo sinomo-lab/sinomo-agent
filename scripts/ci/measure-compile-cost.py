@@ -216,8 +216,20 @@ def cgroup_snapshot(paths, dedicated_leaf=False):
     return [{"path": str(path), "classification": "dedicated-observer-and-workload"
              if dedicated_leaf and index == 0 else "shared", **{name: read_optional(path / name) for name in
             ("memory.current", "memory.peak", "memory.max", "memory.high",
-             "memory.swap.max", "memory.events", "memory.stat", "memory.pressure")}}
+             "memory.swap.max", "memory.swap.current", "memory.swap.peak",
+             "memory.events", "memory.stat", "memory.pressure")}}
             for index, path in enumerate(paths)]
+
+
+def counter_delta(before, after):
+    """Missing counters are unavailable, never an observed zero."""
+    if not before or not after:
+        return None
+    first = {key: int(value) for key, value in (line.split() for line in before.splitlines())}
+    last = {key: int(value) for key, value in (line.split() for line in after.splitlines())}
+    if first.keys() != last.keys() or any(last[key] < first[key] for key in first):
+        return None
+    return {key: last[key] - first[key] for key in first}
 
 
 def process_sample(root_pid, elapsed, cgroups, proc_root=Path("/proc")):
@@ -402,6 +414,7 @@ def run_measurement(args, repo, target, output, cgroups, metadata, env, measured
                     sample = process_sample(process.pid, time.monotonic() - begin, cgroups)
                     if args.dedicated_cgroup:
                         sample["cgroup_current_bytes"] = sample.pop("shared_cgroup_current_bytes")
+                        sample["dedicated_leaf"] = cgroup_snapshot(cgroups[:1], True)
                     samples.append(sample)
                     sample_log.write(json.dumps(sample) + "\n")
                     sample_log.flush()
@@ -482,9 +495,15 @@ def run_measurement(args, repo, target, output, cgroups, metadata, env, measured
             leaf = summary["cgroups_after"][0] if cgroups else None
             summary["dedicated_cgroup_measurement"] = None if leaf is None else {
                 "path": leaf["path"],
-                "peak_bytes": int(leaf["memory.peak"]) if (leaf["memory.peak"] or "").isdigit() else None,
-                "current_bytes_after": int(leaf["memory.current"]) if (leaf["memory.current"] or "").isdigit() else None,
+                "peak_bytes": int(leaf["memory.peak"]) if (leaf["memory.peak"] or "").strip().isdigit() else None,
+                "current_bytes_after": int(leaf["memory.current"]) if (leaf["memory.current"] or "").strip().isdigit() else None,
                 "includes_observer_page_cache_and_kernel": True,
+                "memory_events_delta": counter_delta(
+                    metadata["cgroups_before"][0]["memory.events"], leaf["memory.events"]),
+                "swap_current_bytes_after": int(leaf["memory.swap.current"])
+                    if (leaf["memory.swap.current"] or "").strip().isdigit() else None,
+                "swap_peak_bytes": int(leaf["memory.swap.peak"])
+                    if (leaf["memory.swap.peak"] or "").strip().isdigit() else None,
             }
         (output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
         print(json.dumps({"output": str(output), "exit_code": workload_exit,

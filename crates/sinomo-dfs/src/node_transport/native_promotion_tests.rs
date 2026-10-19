@@ -2,6 +2,7 @@
 use super::*;
 use crate::test_runtime::{DfsTestRuntime, FaultAction, FaultRule, RpcPhase};
 use crate::{DfsWriteIntentStatus, DfsWriteOptions};
+use std::sync::Mutex;
 
 // Count only attempts made by this fixture's real promotion outbox. The
 // adapter forwards the original owned SOBJ call and response untouched to the
@@ -430,5 +431,348 @@ fn native_shared_drains_limit_inflight_promotions_and_yield_to_readers() {
     case.transport.flush_detached_sends().unwrap();
     assert_eq!(case.transport.settled_commit_promotion_count(), 3);
     assert_eq!(case.transport.pending_commit_promotion_count(), 0);
+    case.finish();
+}
+
+// The failure is after a genuine native Fetch has returned, at the admitted
+// local completion boundary. The observer never supplies a receipt or authority.
+#[test]
+fn native_detached_fetch_reply_survives_local_completion_failure() {
+    let mut case = NativePromotions::new("native-fetch-local-completion", 2, 1);
+    let (sync, asynchronous) = case.runtime.peer_transports(&case.source).unwrap();
+    case.transport = DfsNodeTransport::with_peer_transports_for_nodes_and_detached_state(
+        case.source.clone(),
+        case.targets.clone(),
+        sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+        sync,
+        asynchronous,
+        DfsNodeDetachedSendState::new(),
+    );
+    let actual = &case.commands[0];
+    let command = crate::DfsFetchBlobCommand {
+        request_id: sinomo_core::Id::generate().to_string(),
+        intent_id: actual.intent_id.clone(),
+        object_id: actual.object_id.clone(),
+        version: actual.version.clone(),
+        content_hash: actual.content_hash.clone(),
+        authority_shard: actual.authority_shard.clone(),
+    };
+    let request = crate::routes::build_dfs_routed_message(
+        &case.source,
+        &case.targets[0],
+        1,
+        1,
+        DfsNetworkMessage::FetchBlob(command.clone()),
+    );
+    case.transport
+        .send_detached_routed_message(&case.targets[0], request)
+        .unwrap();
+    let delivered = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&delivered);
+    let expected_source = case.targets[0].clone();
+    let handler = move |response: DfsRoutedMessage, original: Option<&DfsRoutedMessage>| {
+        assert!(
+            original.is_none(),
+            "a received Fetch is not an outbound repair capability"
+        );
+        assert_eq!(response.source_node_id, expected_source);
+        let DfsNetworkMessage::FetchBlobResponse(body) = &response.message else {
+            panic!("actual Fetch response")
+        };
+        assert_eq!(body.request_id, command.request_id);
+        assert_eq!(body.intent_id, command.intent_id);
+        assert_eq!(body.object_id, command.object_id);
+        assert_eq!(body.version, command.version);
+        assert!(
+            matches!(&body.result, crate::DfsFetchBlobResult::Found { content_hash, .. } if *content_hash == command.content_hash)
+        );
+        let bytes = serde_json::to_vec(&response).unwrap();
+        let mut seen = seen.lock().unwrap();
+        if let Some(first) = seen.first() {
+            assert_eq!(first, &bytes, "exact received frame survives retries");
+        }
+        seen.push(bytes);
+        if seen.len() < 3 {
+            Err(DfsError::Network {
+                message: "injected local completion failure after actual Fetch".into(),
+            })
+        } else {
+            Ok(())
+        }
+    };
+    let before = case.runtime.rpc_observations().len();
+    let start = Instant::now();
+    assert!(
+        case.transport
+            .flush_detached_peer_sends_with_now_mode(
+                &|| start,
+                false,
+                &BTreeSet::new(),
+                Some(&handler)
+            )
+            .is_err()
+    );
+    assert_eq!(delivered.lock().unwrap().len(), 1);
+    assert_eq!(
+        case.transport.detached_send_count(),
+        1,
+        "failed local completion retains the original received reply"
+    );
+    case.transport
+        .flush_detached_peer_sends_with_now_mode(&|| start, false, &BTreeSet::new(), Some(&handler))
+        .unwrap();
+    assert_eq!(
+        delivered.lock().unwrap().len(),
+        1,
+        "unchanged retry cooling"
+    );
+    // Dropping the worker does not cancel the shared outbox's exact delivery.
+    let worker = case.transport.fork_detached_send_worker();
+    drop(worker);
+    let mut replacement = case.transport.fork_detached_send_worker();
+    // A clone without the admitted delivery callback cannot silently resend or
+    // consume this already-returned work.
+    assert!(
+        replacement
+            .transport
+            .flush_detached_peer_sends_with_now(&|| start + DFS_DETACHED_SEND_RETRY_DELAY)
+            .is_err()
+    );
+    assert_eq!(delivered.lock().unwrap().len(), 1);
+    assert_eq!(case.transport.detached_send_count(), 1);
+    let retry = start + DFS_DETACHED_SEND_RETRY_DELAY + dfs_detached_send_retry_delay(2);
+    assert!(
+        replacement
+            .transport
+            .flush_detached_peer_sends_with_now_mode(
+                &|| retry,
+                false,
+                &BTreeSet::new(),
+                Some(&handler)
+            )
+            .is_err()
+    );
+    assert_eq!(delivered.lock().unwrap().len(), 2);
+    let next = retry + dfs_detached_send_retry_delay(3);
+    replacement
+        .transport
+        .flush_detached_peer_sends_with_now_mode(&|| next, false, &BTreeSet::new(), Some(&handler))
+        .unwrap();
+    assert_eq!(delivered.lock().unwrap().len(), 3);
+    assert_eq!(case.transport.detached_send_count(), 0);
+    assert_eq!(
+        case.runtime.rpc_observations()[before..]
+            .iter()
+            .filter(|event| event.route == crate::DFS_DATA_FETCH_BLOB_ROUTE
+                && event.phase == RpcPhase::BeforeDispatch)
+            .count(),
+        1,
+        "local completion replays the actual received frame without a new remote request"
+    );
+    drop(replacement);
+    case.finish();
+}
+
+#[test]
+fn native_background_repair_reply_survives_local_completion_failure() {
+    let mut case = NativePromotions::new("native-repair-local-completion", 2, 1);
+    let (sync, asynchronous) = case.runtime.peer_transports(&case.source).unwrap();
+    case.transport = DfsNodeTransport::with_peer_transports_for_nodes_and_detached_state(
+        case.source.clone(),
+        case.targets.clone(),
+        sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+        sync,
+        asynchronous,
+        DfsNodeDetachedSendState::new(),
+    );
+    let actual = &case.commands[0];
+    let source = case.runtime.client(&case.source).unwrap();
+    let (_, bytes) = source
+        .content
+        .read_object_version(actual.object_id.as_str(), actual.version.as_str())
+        .unwrap();
+    assert_eq!(crate::content_hash(&bytes), actual.content_hash);
+    drop(source);
+    let command = crate::DfsRepairReplicaCommand {
+        background_repair: true,
+        request_id: sinomo_core::Id::generate().to_string(),
+        intent_id: actual.intent_id.clone(),
+        file_system_id: actual.file_system_id.clone(),
+        object_id: actual.object_id.clone(),
+        expected_base_version: actual.expected_base_version.clone(),
+        version: actual.version.clone(),
+        content_hash: actual.content_hash.clone(),
+        bytes: Vec::new(),
+        object_metadata: actual.object_metadata.clone(),
+        authority_shard: actual.authority_shard.clone(),
+    };
+    let original = crate::routes::build_dfs_routed_message(
+        &case.source,
+        &case.targets[0],
+        1,
+        1,
+        DfsNetworkMessage::RepairReplica(command.clone()),
+    );
+    let mut worker = case.transport.fork_detached_send_worker();
+    // Actual native content and publication identity supply this owned reader.
+    // No response, receipt, authority or delivery outcome is fabricated here.
+    worker
+        .prepared_replica_calls
+        .lock()
+        .unwrap()
+        .push(DfsCheckpointedReplicaCall {
+            request: DfsRoutedSend::new(
+                case.targets[0].clone(),
+                DfsRoutedCall::with_attachment(
+                    original.clone(),
+                    DfsOutboundAttachment::from_bytes(bytes, actual.content_hash.clone()),
+                ),
+            ),
+            producer_delivery: std::sync::OnceLock::new(),
+        });
+    let delivered = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&delivered);
+    let expected = original.clone();
+    let handler = move |response: DfsRoutedMessage, original: Option<&DfsRoutedMessage>| {
+        assert_eq!(original, Some(&expected), "exact original local call DATA");
+        assert_eq!(response.source_node_id, expected.target_node_id);
+        assert_eq!(response.target_node_id, expected.source_node_id);
+        let DfsNetworkMessage::RepairReplicaResponse(body) = &response.message else {
+            panic!("actual native RepairReplica response")
+        };
+        assert_eq!(body.request_id, command.request_id);
+        assert_eq!(body.intent_id, command.intent_id);
+        assert_eq!(body.file_system_id, command.file_system_id);
+        assert_eq!(body.object_id, command.object_id);
+        assert_eq!(body.version, command.version);
+        assert_eq!(body.replica_node_id, expected.target_node_id);
+        assert!(
+            matches!(&body.result, DfsBlobTransferResult::Committed { content_hash }
+            if *content_hash == command.content_hash)
+        );
+        let frame = serde_json::to_vec(&response).unwrap();
+        let mut seen = seen.lock().unwrap();
+        if let Some(first) = seen.first() {
+            assert_eq!(first, &frame, "same received frame, not another RPC result");
+        }
+        seen.push(frame);
+        if seen.len() < 3 {
+            Err(DfsError::Network {
+                message: "injected local publication failure after genuine repair reply".into(),
+            })
+        } else {
+            Ok(())
+        }
+    };
+    let handler: Arc<
+        dyn Fn(DfsRoutedMessage, Option<&DfsRoutedMessage>) -> Result<(), DfsError> + Send + Sync,
+    > = Arc::new(handler);
+    worker.background_response_handler = Some(Arc::clone(&handler));
+    let before = case.runtime.rpc_observations().len();
+    assert!(worker.drain().is_err());
+    assert_eq!(delivered.lock().unwrap().len(), 1);
+    assert_eq!(
+        case.transport.detached_send_count(),
+        1,
+        "local publication failure must retain the genuine repair reply"
+    );
+    {
+        let outbox = case.transport.detached_send_state.inner.lock().unwrap();
+        let retained = outbox.cooling_retries.values().flatten().next().unwrap();
+        assert!(
+            retained.sender.is_none(),
+            "consumed attachment has no resend path"
+        );
+        assert_eq!(retained.routed_message, original);
+    }
+    // Negative controls change copies of this ACTUAL receiver frame only. None
+    // may replace the original completion or become evidence for another call.
+    let actual_response: DfsRoutedMessage =
+        serde_json::from_slice(&delivered.lock().unwrap()[0]).unwrap();
+    for field in [
+        "source",
+        "target",
+        "request",
+        "intent",
+        "filesystem",
+        "object",
+        "version",
+        "replica",
+        "hash",
+    ] {
+        let mut changed = actual_response.clone();
+        if field == "source" {
+            changed.source_node_id = case.source.clone();
+        } else if field == "target" {
+            changed.target_node_id = case.targets[0].clone();
+        } else {
+            let DfsNetworkMessage::RepairReplicaResponse(body) = &mut changed.message else {
+                unreachable!("copied actual repair response")
+            };
+            match field {
+                "request" => body.request_id.push_str("-changed"),
+                "intent" => body.intent_id.push_str("-changed"),
+                "filesystem" => body.file_system_id = crate::DfsFileSystemId::generate(),
+                "object" => body.object_id = crate::DfsObjectId::generate(),
+                "version" => body.version = crate::DfsVersion::generate(),
+                "replica" => body.replica_node_id = case.source.clone(),
+                "hash" => {
+                    body.result = DfsBlobTransferResult::Committed {
+                        content_hash: crate::content_hash(b"different actual bytes"),
+                    };
+                }
+                _ => unreachable!(),
+            }
+        }
+        assert!(
+            case.transport
+                .retain_background_replica_completion(original.clone(), changed)
+                .is_err(),
+            "reject changed {field} without replacing original receipt DATA"
+        );
+        assert_eq!(case.transport.detached_send_count(), 1);
+    }
+    let mut changed_call = original.clone();
+    let DfsNetworkMessage::RepairReplica(body) = &mut changed_call.message else {
+        unreachable!()
+    };
+    body.background_repair = false;
+    assert!(
+        case.transport
+            .retain_background_replica_completion(changed_call, actual_response)
+            .is_err()
+    );
+    assert_eq!(case.transport.detached_send_count(), 1);
+    assert!(worker.prepared_replica_calls.lock().unwrap().is_empty());
+    let (ready, deadline, _) = worker.scheduling_snapshot().unwrap();
+    assert!(!ready, "the existing retry cooling remains in force");
+    let deadline = deadline.expect("retained completion cooling deadline");
+    worker.drain_at(deadline - Duration::from_nanos(1)).unwrap();
+    assert_eq!(delivered.lock().unwrap().len(), 1);
+    drop(worker);
+    let mut replacement = case.transport.fork_detached_send_worker();
+    assert!(replacement.drain_at(deadline).is_err());
+    assert_eq!(delivered.lock().unwrap().len(), 1);
+    assert_eq!(case.transport.detached_send_count(), 1);
+    replacement.background_response_handler = Some(handler);
+    let retry = deadline + dfs_detached_send_retry_delay(2);
+    assert!(replacement.drain_at(retry).is_err());
+    assert_eq!(delivered.lock().unwrap().len(), 2);
+    replacement
+        .drain_at(retry + dfs_detached_send_retry_delay(3))
+        .unwrap();
+    assert_eq!(delivered.lock().unwrap().len(), 3);
+    assert_eq!(case.transport.detached_send_count(), 0);
+    let events = case.runtime.rpc_observations();
+    assert_eq!(
+        events[before..]
+            .iter()
+            .filter(|event| event.route == crate::DFS_DATA_REPAIR_REPLICA_ROUTE
+                && event.phase == RpcPhase::BeforeDispatch)
+            .count(),
+        1,
+        "retry only local completion; never resend the consumed repair attachment"
+    );
+    drop(replacement);
     case.finish();
 }

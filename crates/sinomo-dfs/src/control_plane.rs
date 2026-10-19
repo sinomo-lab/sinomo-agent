@@ -381,6 +381,35 @@ pub fn placement_authority_permit_key(file_system_id: &DfsFileSystemId) -> Strin
     format!("{DFS_KV_PREFIX}/filesystems/{file_system_id}/placement-authority-permit-v1")
 }
 
+fn authoritative_placement_permit_entry(
+    key: &str,
+    observed_revision: KvRevision,
+    mut entries: Vec<Option<KvEntry>>,
+) -> Result<Option<(KvEntry, DfsPlacementAuthorityPermitRecord)>, KvError> {
+    if entries.len() != 1 {
+        return Err(KvError::Serialization {
+            detail: "placement permit authority did not return exactly one requested key".into(),
+        });
+    }
+    let Some(entry) = entries.pop().flatten() else {
+        tracing::trace!(target: "sinomo.dfs.perf", key,
+            observed_revision = observed_revision.0, disposition = "absent",
+            "placement-permit-authoritative-recheck");
+        return Ok(None);
+    };
+    if entry.key != key {
+        return Err(KvError::Serialization {
+            detail: "placement permit authority returned another key".into(),
+        });
+    }
+    let record: DfsPlacementAuthorityPermitRecord = entry.decode()?;
+    tracing::trace!(target: "sinomo.dfs.perf", key,
+        observed_revision = observed_revision.0, current_revision = entry.modify_revision.0,
+        holder_node = %record.holder_node_id, job_id = %record.job_id, disposition = "present",
+        "placement-permit-authoritative-recheck");
+    Ok(Some((entry, record)))
+}
+
 pub(crate) fn placement_authority_permit_value_requires_local_process_recovery(
     value: &[u8],
     local_node_id: &NodeId,
@@ -2338,20 +2367,38 @@ impl<'a> DfsControlPlaneStore<'a> {
             .succeeded)
     }
 
+    /// sinomo:kv-consistency: Verify a suspected live placement holder with an exact-key authority read; a cached released holder cannot fence current configuration forever.
     fn placement_authority_permit_missing_compare(
         &mut self,
         file_system_id: &DfsFileSystemId,
     ) -> Result<KvCompare, KvError> {
         let key = placement_authority_permit_key(file_system_id);
+        let deadline = metadata_shard_authority_read_deadline(None);
         for _ in 0..PLACEMENT_AUTHORITY_RECOVERY_CAS_RETRIES {
-            let Some(entry) = self.kv.get(&key)? else {
+            let Some(mut entry) = self.kv.get(&key)? else {
                 return Ok(KvCompare::Missing { key });
             };
-            let record = entry.decode::<DfsPlacementAuthorityPermitRecord>()?;
+            let mut record = entry.decode::<DfsPlacementAuthorityPermitRecord>()?;
             if !placement_authority_release_is_pending(file_system_id, &record) {
-                return Err(KvError::Busy {
-                    path: placement_authority_busy_path(file_system_id, &record),
-                });
+                // A normal client's immutable projection may retain a holder
+                // whose exact release already committed elsewhere. Recheck
+                // only this key, within one existing authority-read budget.
+                // Missing still becomes a Missing compare in the real CAS;
+                // no timeout, hint, or read result releases a live holder.
+                let entries = self
+                    .kv
+                    .get_authoritative_consistent_before(&[key.clone()], deadline)?;
+                let Some(current) =
+                    authoritative_placement_permit_entry(&key, entry.modify_revision, entries)?
+                else {
+                    return Ok(KvCompare::Missing { key });
+                };
+                (entry, record) = current;
+                if !placement_authority_release_is_pending(file_system_id, &record) {
+                    return Err(KvError::Busy {
+                        path: placement_authority_busy_path(file_system_id, &record),
+                    });
+                }
             }
             let response = self.kv.txn(KvTxn {
                 compares: vec![KvCompare::ValueEquals {
@@ -4685,20 +4732,34 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
         Ok(false)
     }
 
+    /// sinomo:kv-consistency: Async exact-key recheck of a suspected live placement holder, preserving the same CAS and recovery bounds.
     async fn placement_authority_permit_missing_compare(
         &mut self,
         file_system_id: &DfsFileSystemId,
     ) -> Result<KvCompare, KvError> {
         let key = placement_authority_permit_key(file_system_id);
+        let deadline = metadata_shard_authority_read_deadline(None);
         for _ in 0..PLACEMENT_AUTHORITY_RECOVERY_CAS_RETRIES {
-            let Some(entry) = self.kv.get_async(&key).await? else {
+            let Some(mut entry) = self.kv.get_async(&key).await? else {
                 return Ok(KvCompare::Missing { key });
             };
-            let record = entry.decode::<DfsPlacementAuthorityPermitRecord>()?;
+            let mut record = entry.decode::<DfsPlacementAuthorityPermitRecord>()?;
             if !placement_authority_release_is_pending(file_system_id, &record) {
-                return Err(KvError::Busy {
-                    path: placement_authority_busy_path(file_system_id, &record),
-                });
+                let entries = self
+                    .kv
+                    .get_authoritative_consistent_before_async(vec![key.clone()], deadline)
+                    .await?;
+                let Some(current) =
+                    authoritative_placement_permit_entry(&key, entry.modify_revision, entries)?
+                else {
+                    return Ok(KvCompare::Missing { key });
+                };
+                (entry, record) = current;
+                if !placement_authority_release_is_pending(file_system_id, &record) {
+                    return Err(KvError::Busy {
+                        path: placement_authority_busy_path(file_system_id, &record),
+                    });
+                }
             }
             let response = self
                 .kv

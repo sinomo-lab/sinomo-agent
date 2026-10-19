@@ -182,6 +182,46 @@ fn sharded_point_lookup_snapshot_refreshes_only_the_routed_path_shard() {
 }
 
 #[test]
+fn stat_projection_snapshot_pins_only_exact_shard_with_retained_ancestor() {
+    let root = temp_root("stat-exact-shard-snapshot");
+    let node = NodeId::from_legacy_named("stat_exact_shard_snapshot").unwrap();
+    let shards = sifs_two_primary_shard_configs(&node, &node, 1, Vec::new(), Vec::new());
+    let original = shards
+        .iter()
+        .find(|shard| shard.shard_id == "root")
+        .unwrap()
+        .clone();
+    drop(open_local_sharded_metadata_backend(&root, vec![original]).unwrap());
+    let mut backend = open_local_sharded_metadata_backend(&root, shards).unwrap();
+    let selected = DfsMetadataShardId::new("services");
+    crate::metadata_sharded_backend::reset_sharded_consistent_read_snapshot_shards();
+    backend
+        .begin_consistent_read_snapshot_on_shard(&selected)
+        .unwrap();
+    assert!(
+        backend
+            .metadata_prefix_proof(&selected)
+            .unwrap()
+            .unwrap()
+            .is_well_formed()
+    );
+    backend.end_consistent_read_snapshot_on_shard(&selected);
+    assert_eq!(
+        crate::metadata_sharded_backend::sharded_consistent_read_snapshot_shards(),
+        vec![selected]
+    );
+    crate::metadata_sharded_backend::reset_sharded_consistent_read_snapshot_shards();
+    assert!(
+        backend
+            .begin_consistent_read_snapshot_on_shard(&DfsMetadataShardId::new(
+                "missing-stat-authority"
+            ))
+            .is_err()
+    );
+    assert!(crate::metadata_sharded_backend::sharded_consistent_read_snapshot_shards().is_empty());
+}
+
+#[test]
 fn sifs_cluster_posix_replica_catches_up_after_journal_publish() {
     let mut cluster = sifs_posix_cluster("sifs-cluster-catchup", "/users");
     let path = "/users/replicated.txt";
@@ -755,6 +795,14 @@ fn sifs_cluster_posix_routed_op_replays_deep_catch_up_across_batches() {
         mut replica,
         ..
     } = cluster;
+    let diagnostics = [&users_primary_node, &services_primary_node, &replica_node]
+        .into_iter()
+        .map(|node| {
+            crate::native_boundary_diagnostics::capture_all_operations(
+                _runtime.data_dir(node).root(),
+            )
+        })
+        .collect::<Vec<_>>();
     drop(users_primary);
     let mut users_primary = _runtime.metadata_primary_service("/users").unwrap();
     let anchor = native_backlog_anchor(&_runtime, &users_primary, &replica_node);
@@ -769,16 +817,29 @@ fn sifs_cluster_posix_routed_op_replays_deep_catch_up_across_batches() {
     let mut checkpointed = 0;
     let mut files = Vec::with_capacity(700);
     for index in 0..700 {
-        let stat = users_primary
-            .posix_write_file(
-                &format!("/users/bulk-{index:03}.txt"),
-                format!("bulk payload {index}").as_bytes(),
-                local_options.clone(),
-            )
-            .expect("bulk create");
+        let created = users_primary.posix_write_file(
+            &format!("/users/bulk-{index:03}.txt"),
+            format!("bulk payload {index}").as_bytes(),
+            local_options.clone(),
+        );
+        if created.is_err() {
+            for diagnostic in &diagnostics {
+                diagnostic.dump(
+                    "deep-catchup-bulk-failure",
+                    serde_json::json!({
+                        "index": index, "result": format!("{created:?}"),
+                        "rpc": format!("{:?}", _runtime.rpc_observations()),
+                    }),
+                );
+            }
+        }
+        let stat = created.expect("bulk create");
         files.push(stat);
         if (index + 1) % 100 == 0 {
             checkpointed += _runtime.checkpoint_rpc_observation_window().unwrap();
+            for diagnostic in &diagnostics {
+                diagnostic.checkpoint(&format!("deep-catchup-window-{}", index + 1));
+            }
         }
     }
     assert!(
@@ -881,13 +942,29 @@ fn sifs_cluster_posix_mkdir_all_replays_deep_catch_up_across_batches() {
     let mut checkpointed = 0;
     let mut files = Vec::with_capacity(700);
     for index in 0..700 {
-        let stat = users_primary
-            .posix_write_file(
-                &format!("/users/mkdir-all-backlog-{index:03}.txt"),
-                format!("bulk payload {index}").as_bytes(),
-                local_options.clone(),
+        let path = format!("/users/mkdir-all-backlog-{index:03}.txt");
+        let payload = format!("bulk payload {index}");
+        let result =
+            users_primary.posix_write_file(&path, payload.as_bytes(), local_options.clone());
+        if let Err(error) = &result {
+            let checkpoint = _runtime.checkpoint_rpc_observation_window();
+            let artifact = root.join("bulk-create-failure.json");
+            std::fs::write(
+                &artifact,
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "index": index,
+                    "path": path,
+                    "payload": payload,
+                    "error": format!("{error:?}"),
+                    "checkpoint": format!("{checkpoint:?}"),
+                    "observation_omissions": _runtime.observation_dropped_count(),
+                }))
+                .unwrap(),
             )
-            .expect("bulk create");
+            .unwrap();
+            eprintln!("NATIVE_BULK_CREATE_FAILURE {}", artifact.display());
+        }
+        let stat = result.expect("bulk create");
         files.push(stat);
         if (index + 1) % 100 == 0 {
             checkpointed += _runtime.checkpoint_rpc_observation_window().unwrap();

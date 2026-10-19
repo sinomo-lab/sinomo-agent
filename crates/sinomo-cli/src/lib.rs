@@ -311,6 +311,8 @@ pub mod module_commands;
 mod providers;
 mod sandbox_host;
 #[cfg(test)]
+mod native_test_fixture;
+#[cfg(test)]
 mod tests;
 mod tui;
 mod voice;

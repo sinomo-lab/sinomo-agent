@@ -126,6 +126,7 @@ mod tests {
     fn tool_output_preview_preserves_call_identity_and_isolates_file_errors() {
         let root = sinomo_testdir::TestDir::new("tool-output-preview");
         let data_dir = SinomoDataDir::new(root.join("data"));
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let evidence = data_dir.root().join("events/agent/evidence");
         fs::create_dir_all(&evidence).unwrap();
         let store = SifsAgentChannelStore::open(&data_dir).unwrap();

@@ -606,6 +606,10 @@ validate_pjdfstest_config() {
 }
 
 compose() {
+  if [ "${1:-}" = restart ] && [ -n "${RESOURCE_WATCH_PID:-}" ]; then
+    python3 "$SINOMO_DOCKER_DIR/runtime_resources.py" expect-exit \
+      --nodes "${@:2}" --reason "compose restart" || return 1
+  fi
   docker compose -p "$PROJECT" "${COMPOSE_FILES[@]}" "$@"
 }
 
@@ -4550,6 +4554,14 @@ capture_failure_context() {
 
 TEARDOWN_DONE=0
 PROJECT_OWNED=0
+RESOURCE_WATCH_PID=
+resource_watch_stop() {
+  if [ -n "$RESOURCE_WATCH_PID" ]; then
+    kill -TERM "$RESOURCE_WATCH_PID" 2>/dev/null || true
+    wait "$RESOURCE_WATCH_PID" || return 1
+    RESOURCE_WATCH_PID=
+  fi
+}
 teardown_cluster() {
   local original_exit="$1"
   [ "$TEARDOWN_DONE" = 1 ] && return
@@ -4595,6 +4607,10 @@ teardown_cluster() {
 
 teardown() {
   local original_exit=$? report_exit=0
+  if ! resource_watch_stop || [ -f "$ARTIFACTS/runtime-resources/HARD-FAILURE.json" ]; then
+    FAILED_SCENARIOS="${FAILED_SCENARIOS:+$FAILED_SCENARIOS }runtime-resources"
+    original_exit=1
+  fi
   teardown_cluster "$original_exit" || log "cluster teardown did not complete"
   python3 "$SINOMO_DOCKER_DIR/verification_report.py" "$ARTIFACTS" \
     --project "$PROJECT" --binary "$BINARY" --exit-code "$original_exit" \
@@ -4666,10 +4682,26 @@ if [ "${SINOMO_TEST_BUILD:-1}" = 1 ]; then
   (cd "$SINOMO_ROOT" && env -u CARGO_BUILD_JOBS cargo build -p sinomo -p sinomo-observe --features sinomo-observe/cpu-profiler) || { log "host build failed"; exit 1; }
 fi
 
+compose config --format json > "$ARTIFACTS/compose-effective.json" || exit 1
+python3 "$SINOMO_DOCKER_DIR/runtime_resources.py" preflight \
+  --config "$ARTIFACTS/compose-effective.json" --artifacts "$ARTIFACTS" || exit 1
+export SINOMO_TEST_RESOURCE_INTENTS="$ARTIFACTS/runtime-resource-intents.jsonl"
+trap 'FAILED_SCENARIOS="${FAILED_SCENARIOS:+$FAILED_SCENARIOS }runtime-resources"; exit 1' USR1
+
 if [ "${SINOMO_TEST_REUSE:-0}" != 1 ]; then
   PROJECT_OWNED=1
   log "resetting compose project $PROJECT"
   compose down -v --remove-orphans >/dev/null 2>&1 || true
+fi
+python3 "$SINOMO_DOCKER_DIR/runtime_resources.py" watch --project "$PROJECT" \
+  --artifacts "$ARTIFACTS/runtime-resources" --parent-pid "$$" \
+  > "$ARTIFACTS/runtime-resources-watch.log" 2>&1 &
+RESOURCE_WATCH_PID=$!
+while [ ! -f "$ARTIFACTS/runtime-resources/watch-ready.json" ]; do
+  kill -0 "$RESOURCE_WATCH_PID" 2>/dev/null || exit 1
+  sleep 0.1
+done
+if [ "${SINOMO_TEST_REUSE:-0}" != 1 ]; then
   log "starting 6-node cluster (project $PROJECT)"
   if ! compose up --build -d; then
     log "compose up failed"
@@ -4679,6 +4711,8 @@ if [ "${SINOMO_TEST_REUSE:-0}" != 1 ]; then
 else
   PROJECT_OWNED=1
 fi
+python3 "$SINOMO_DOCKER_DIR/runtime_resources.py" verify --project "$PROJECT" \
+  --artifacts "$ARTIFACTS/runtime-resources" || { FAILED_SCENARIOS=runtime-resources; exit 1; }
 
 if [ -n "$NETWORK_CASES" ] && [ "${SINOMO_TEST_REUSE:-0}" = 1 ]; then
   network_check preflight "$ARTIFACTS/network-preflight" || { FAILED_SCENARIOS=network-preflight; exit 1; }

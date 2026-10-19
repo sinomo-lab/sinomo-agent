@@ -4,12 +4,24 @@ use crate::*;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-const HISTORY_PAGE_LIMIT: usize = 128;
+pub(crate) const HISTORY_PAGE_LIMIT: usize = 128;
 pub const DFS_FILE_HISTORY_RANGE_LIMIT: u32 = 64 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum DfsMetadataSelection {
+    StatAtPathV1 {
+        request: Box<DfsStatPathRequest>,
+    },
+    /// Resolve an inode identity without opening unrelated physical scopes.
+    StatObjectV1 {
+        object_id: DfsObjectId,
+    },
+    /// Explicit capability/version: older peers reject this selection. It may
+    /// never fall back to caller-local derived stat or journal ingestion.
+    StatProjectionV1 {
+        request: Box<DfsStatProjectionRequest>,
+    },
     /// One current owner's durable direct-child page and exact local cursors.
     DirectoryPage {
         path: String,
@@ -76,6 +88,22 @@ pub struct DfsMetadataShardQuery {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum DfsMetadataQueryResult {
+    StatAtPathV1 {
+        view: Box<DfsStatPathView>,
+    },
+    StatObjectV1 {
+        object: Option<Box<DfsObjectMetadata>>,
+        prefix: DfsMetadataPrefixProof,
+    },
+    StatProjectionV1 {
+        page: Box<DfsStatProjectionPage>,
+    },
+    /// The requested cut is no longer current. This is a typed refusal, not
+    /// an empty page or permission to publish a partially collected stat.
+    StatProjectionChangedV1 {
+        request: Box<DfsStatProjectionRequest>,
+        current_prefix: DfsMetadataPrefixProof,
+    },
     DirectoryPage {
         entries: Vec<(DfsObjectMetadata, DfsDirectoryPageCursor)>,
         after: Option<DfsDirectoryPageCursor>,
@@ -128,6 +156,27 @@ pub(crate) fn query_backend_metadata<B: DfsMetadataBackend + ?Sized>(
     query: &DfsMetadataShardQuery,
 ) -> Result<DfsMetadataQueryResult, MetadataBackendError> {
     match &query.selection {
+        DfsMetadataSelection::StatAtPathV1 { .. } => Err(MetadataBackendError::Serde(
+            "stat path requires its authenticated owning service and complete catalog".into(),
+        )),
+        DfsMetadataSelection::StatObjectV1 { object_id } => {
+            let prefix = backend
+                .metadata_prefix_proof(&query.shard_id)?
+                .filter(DfsMetadataPrefixProof::is_well_formed)
+                .ok_or_else(|| {
+                    MetadataBackendError::Serde("stat object has no exact prefix".into())
+                })?;
+            let object = backend.get_object(object_id)?.filter(|row| {
+                row.file_system_id == query.file_system_id && row.tombstone_provenance.is_none()
+            });
+            Ok(DfsMetadataQueryResult::StatObjectV1 {
+                object: object.map(Box::new),
+                prefix,
+            })
+        }
+        DfsMetadataSelection::StatProjectionV1 { request } => {
+            crate::stat_projection::query_stat_projection(backend, query, request)
+        }
         DfsMetadataSelection::DirectoryPage { path, after, limit }
         | DfsMetadataSelection::DirectoryPageForNamespaceJob {
             path, after, limit, ..
@@ -497,6 +546,71 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if let DfsMetadataSelection::DirectoryPage { path, .. } = &query.selection {
             self.ensure_path_not_in_cross_shard_flight(&query.file_system_id, path)?;
         }
+        if let DfsMetadataSelection::StatProjectionV1 { request } = &query.selection {
+            // This physical scope may own only aliases/children of a canonical
+            // object in another shard. A lagging replica guard for that foreign
+            // path is not this authority's read reservation. The canonical
+            // authority checks its path, and the unchanged result checks below
+            // still fence every actual object/alias returned by this scope.
+            let owns_object_path = match self.namespace_execution.context() {
+                Some(context) => {
+                    crate::select_metadata_shard_config_for_path_strict_default_sifs_split(
+                        &query.file_system_id,
+                        &context.shards,
+                        &request.object_path,
+                    )?
+                    .ok_or_else(|| {
+                        error("stat projection has no current canonical path authority")
+                    })?
+                    .shard_id
+                        == query.shard_id.0
+                }
+                // Without a certified routing context, retain the original
+                // conservative guard; do not infer a foreign-scope exemption.
+                None => true,
+            };
+            if owns_object_path {
+                self.ensure_path_not_in_cross_shard_flight(
+                    &query.file_system_id,
+                    &request.object_path,
+                )?;
+            }
+        }
+        let (complete_stat_scope, stat_catalog) =
+            if let DfsMetadataSelection::StatAtPathV1 { request } = &query.selection {
+                self.ensure_path_not_in_cross_shard_flight(&query.file_system_id, &request.path)?;
+                let context = self
+                    .namespace_execution
+                    .context()
+                    .ok_or_else(|| error("stat path requires current authority context"))?;
+                let mut current = context.shards.clone();
+                current.sort_by(|a, b| a.shard_id.cmp(&b.shard_id));
+                if request.read_id.is_empty()
+                    || request.catalog_digest
+                        != crate::stat_projection::stat_catalog_digest(&current)?
+                    || crate::posix_path::normalize_posix_path(&request.path)
+                        .ok()
+                        .as_ref()
+                        != Some(&request.path)
+                    || !crate::select_metadata_shard_config_for_path_strict_default_sifs_split(
+                        &query.file_system_id,
+                        &current,
+                        &request.path,
+                    )?
+                    .is_some_and(|s| s.shard_id == query.shard_id.0 && s.epoch == query.epoch)
+                {
+                    return Err(error("stat path names a stale catalog or invalid request"));
+                }
+                let complete = current.iter().all(|s| {
+                    s.primary_node_id == self.node_id
+                        && self.metadata_backend.as_ref().is_some_and(|b| {
+                            b.has_physical_read_scope(&DfsMetadataShardId::new(s.shard_id.clone()))
+                        })
+                });
+                (complete, current)
+            } else {
+                (false, Vec::new())
+            };
         let coordinated_job = match &query.selection {
             DfsMetadataSelection::CurrentObjectForNamespaceJob {
                 job,
@@ -601,7 +715,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         } else {
             None
         };
+        let query_deadline = self.transport.operation_deadline();
+        let query_cancellation = self.cancellation.clone();
+        #[cfg(test)]
+        let diagnostic_root = self
+            .native_publication_owner_for_observation()
+            .map(|(root, _)| root);
         let ensure_read = |file_system_id: &DfsFileSystemId, path: &str| {
+            if query_cancellation
+                .as_ref()
+                .is_some_and(DfsCancellationFlag::is_cancelled)
+            {
+                return Err(DfsError::Cancelled {
+                    operation: "metadata query",
+                });
+            }
+            if query_deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                return Err(error("metadata query reached its existing deadline"));
+            }
             let Some(path_key) = crate::posix_path::normalized_posix_path_key(path) else {
                 return Ok(());
             };
@@ -613,6 +744,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 &path_key,
                 exemption,
             ) {
+                #[cfg(test)]
+                if let Some(root) = &diagnostic_root {
+                    crate::native_boundary_diagnostics::record(
+                        &root,
+                        "metadata-query-path-blocked",
+                        || {
+                            serde_json::json!({
+                                "node": self.node_id, "file_system_id": file_system_id, "path": path,
+                                "locks": format!("{:?}", self.cross_shard_namespace_locks),
+                                "coordinated_exemption": format!("{exemption:?}"),
+                            })
+                        },
+                        true,
+                    );
+                }
                 return Err(DfsError::Busy {
                     path: path.to_owned(),
                 });
@@ -626,11 +772,117 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .metadata_backend
             .as_mut()
             .ok_or_else(|| error("history query requires durable metadata"))?;
-        backend.begin_consistent_read_snapshot()?;
-        let result = backend.query_file_history_on_shard(query);
-        backend.end_consistent_read_snapshot();
+        let exact_stat_scope =
+            matches!(
+                query.selection,
+                DfsMetadataSelection::StatProjectionV1 { .. }
+                    | DfsMetadataSelection::StatObjectV1 { .. }
+            ) || matches!(query.selection, DfsMetadataSelection::StatAtPathV1 { .. })
+                && !complete_stat_scope;
+        let stat_scope_ids = stat_catalog
+            .iter()
+            .map(|s| DfsMetadataShardId::new(s.shard_id.clone()))
+            .collect::<Vec<_>>();
+        let result = if let DfsMetadataSelection::StatAtPathV1 { request } = &query.selection {
+            let mut remaining = HISTORY_PAGE_LIMIT;
+            let mut accepted = None;
+            for _ in 0..crate::posix::POSIX_ROUTED_SYNC_RETRY_ROUNDS {
+                ensure_read(&query.file_system_id, &request.path)?;
+                if exact_stat_scope {
+                    backend.begin_stat_read_snapshot_on_shard(&query.shard_id)?;
+                } else {
+                    backend.begin_stat_read_snapshot_on_shards(&stat_scope_ids)?;
+                }
+                let view = crate::stat_projection::query_stat_path(
+                    backend.as_ref(),
+                    query,
+                    request,
+                    complete_stat_scope,
+                    &stat_catalog,
+                    &ensure_read,
+                    &mut remaining,
+                );
+                if exact_stat_scope {
+                    backend.end_stat_read_snapshot_on_shard(&query.shard_id);
+                } else {
+                    backend.end_stat_read_snapshot_on_shards(&stat_scope_ids);
+                }
+                let view = view?;
+                if view.complete {
+                    // Reopen after releasing the captured snapshots. Equal
+                    // exact prefixes prove overlapping stable read intervals;
+                    // an unchanged borrowed snapshot is not this validation.
+                    backend.begin_stat_read_snapshot_on_shards(&stat_scope_ids)?;
+                    let validation = (|| {
+                        for cut in &view.prefixes {
+                            ensure_read(&query.file_system_id, &request.path)
+                                .map_err(|e| MetadataBackendError::Serde(e.to_string()))?;
+                            if backend.metadata_prefix_proof(&cut.shard_id)?.as_ref()
+                                != Some(&cut.prefix)
+                            {
+                                return Ok(false);
+                            }
+                        }
+                        Ok::<_, MetadataBackendError>(true)
+                    })();
+                    backend.end_stat_read_snapshot_on_shards(&stat_scope_ids);
+                    if !validation? {
+                        continue;
+                    }
+                }
+                // Detect catalog additions as well as changes to an existing
+                // member. The native Main reuses its current retained catalog
+                // certificate; exact-key checks alone cannot prove no new shard.
+                let mut current_catalog = DfsControlPlaneStore::new(
+                    self.control_plane
+                        .as_mut()
+                        .ok_or_else(|| error("stat path lost its configuration owner"))?
+                        .as_mut(),
+                )
+                .list_metadata_shards(&query.file_system_id)?;
+                current_catalog.sort_by(|a, b| a.shard_id.cmp(&b.shard_id));
+                if crate::stat_projection::stat_catalog_digest(&current_catalog)?
+                    != request.catalog_digest
+                {
+                    return Err(error("stat path authority catalog changed during capture"));
+                }
+                accepted = Some(DfsMetadataQueryResult::StatAtPathV1 {
+                    view: Box::new(view),
+                });
+                break;
+            }
+            accepted.ok_or_else(|| {
+                MetadataBackendError::Serde(
+                    "stat path could not validate a stable view within the existing read rounds"
+                        .into(),
+                )
+            })
+        } else {
+            if exact_stat_scope {
+                backend.begin_stat_read_snapshot_on_shard(&query.shard_id)?;
+            } else {
+                backend.begin_consistent_read_snapshot()?;
+            }
+            let result = backend.query_file_history_on_shard(query);
+            if exact_stat_scope {
+                backend.end_stat_read_snapshot_on_shard(&query.shard_id);
+            } else {
+                backend.end_consistent_read_snapshot();
+            }
+            result
+        };
         let result = result?;
         match &result {
+            DfsMetadataQueryResult::StatAtPathV1 { view } => {
+                if let Some(object) = view.object.as_deref() {
+                    ensure_read(&object.file_system_id, &object.path)?;
+                }
+            }
+            DfsMetadataQueryResult::StatProjectionV1 { page } => {
+                for object in page.entries.iter().chain(page.object.as_deref()) {
+                    ensure_read(&object.file_system_id, &object.path)?;
+                }
+            }
             DfsMetadataQueryResult::DirectoryPage { entries, .. } => {
                 for (object, _) in entries {
                     ensure_read(&object.file_system_id, &object.path)?;
@@ -638,6 +890,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             DfsMetadataQueryResult::CurrentObject {
                 object: Some(object),
+            }
+            | DfsMetadataQueryResult::StatObjectV1 {
+                object: Some(object),
+                ..
             }
             | DfsMetadataQueryResult::ObjectLifecycle {
                 object: Some(object),
@@ -680,6 +936,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         shard: &DfsMetadataShardConfig,
         selection: DfsMetadataSelection,
     ) -> Result<DfsMetadataQueryResult, DfsError> {
+        self.query_metadata_authority_from_snapshot(shard, selection, None)
+    }
+
+    pub(crate) fn query_metadata_authority_from_snapshot(
+        &mut self,
+        shard: &DfsMetadataShardConfig,
+        selection: DfsMetadataSelection,
+        snapshot: Option<&[DfsMetadataShardConfig]>,
+    ) -> Result<DfsMetadataQueryResult, DfsError> {
         let query = DfsMetadataShardQuery {
             file_system_id: shard.file_system_id.clone(),
             shard_id: DfsMetadataShardId::new(shard.shard_id.clone()),
@@ -689,7 +954,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let response = if self.control_plane.is_none() {
             self.serve_metadata_query(&query)?
         } else {
-            let outcome = self.route_metadata_query(shard, &query)?;
+            let outcome = self.route_metadata_query(shard, &query, snapshot)?;
             match (outcome.result, outcome.posix_coordination_result) {
                 (
                     DfsNamespaceResult::Applied,
@@ -707,6 +972,28 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 "history response does not match the requested authority",
             ));
         }
+        if let DfsMetadataQueryResult::StatProjectionChangedV1 {
+            request: refused,
+            current_prefix,
+        } = &response.result
+        {
+            let DfsMetadataSelection::StatProjectionV1 { request } = &query.selection else {
+                return Err(error("unexpected stat generation refusal"));
+            };
+            if refused != request
+                || !current_prefix.is_well_formed()
+                || request.expected_prefix.as_ref().is_none_or(|expected| {
+                    !expected.is_well_formed()
+                        || current_prefix.journal_sequence <= expected.journal_sequence
+                })
+            {
+                return Err(error("invalid or non-forward stat generation refusal"));
+            }
+            return Err(DfsError::MetadataRejection {
+                code: DfsMetadataRejectionCode::PrefixMismatch,
+                message: "authoritative stat generation advanced during collection".into(),
+            });
+        }
         Ok(response.result)
     }
 
@@ -716,11 +1003,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         expected: &DfsMetadataShardConfig,
         query: &DfsMetadataShardQuery,
+        snapshot: Option<&[DfsMetadataShardConfig]>,
     ) -> Result<PendingRoutedNamespaceResult, DfsError> {
         self.check_cancelled("metadata query")?;
-        let snapshot = self
-            .metadata_shard_config_snapshot(&query.file_system_id)?
-            .unwrap_or_default();
+        let snapshot = match snapshot {
+            Some(snapshot) => snapshot.to_vec(),
+            None => self
+                .metadata_shard_config_snapshot(&query.file_system_id)?
+                .unwrap_or_default(),
+        };
         let current = snapshot
             .iter()
             .find(|shard| {
@@ -732,6 +1023,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if current != expected {
             return Err(error("history query authority changed before dispatch"));
         }
+        // Declare the complete co-owned read footprint so the existing scope
+        // classifier borrows Main's Global backend rather than a single shard.
+        // Cross-owner projections remain exact-shard reads and page explicitly.
+        let authority_shards =
+            if matches!(query.selection, DfsMetadataSelection::StatAtPathV1 { .. })
+                && snapshot
+                    .iter()
+                    .all(|s| s.primary_node_id == current.primary_node_id)
+            {
+                snapshot.clone()
+            } else {
+                vec![current.clone()]
+            };
         let request_id = self.next_request_id();
         let command = DfsNamespaceCommand {
             request_id: request_id.clone(),
@@ -739,7 +1043,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             requesting_node_id: self.node_id.clone(),
             include_metadata_journal_batches: false,
             metadata_journal_after_sequences: Vec::new(),
-            authority_shards: vec![current.clone()],
+            authority_shards,
             operation: DfsNamespaceOperation::MetadataQuery {
                 query: query.clone(),
             },
@@ -748,6 +1052,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // continue to delegate to that primary through their ordinary transport.
         if current.primary_node_id == self.node_id
             && !self.transport.delegates_local_namespace_authority()
+            && self
+                .metadata_backend
+                .as_ref()
+                .is_some_and(|backend| backend.has_physical_read_scope(&query.shard_id))
+            && !matches!(&query.selection, DfsMetadataSelection::StatAtPathV1 { .. }
+                if command.authority_shards.iter().any(|s| !self.metadata_backend.as_ref().is_some_and(|b|
+                    b.has_physical_read_scope(&DfsMetadataShardId::new(s.shard_id.clone())))))
         {
             let _planning = self.namespace_execution.begin_independent_planning();
             let previous =
@@ -787,7 +1098,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             },
         );
         let result = (|| {
-            if !self.send_dfs_message_if_routable(
+            if expected.primary_node_id == self.node_id {
+                let message = self.next_dfs_routed_message(
+                    &expected.primary_node_id,
+                    DfsNetworkMessage::NamespaceRequest(command.clone()),
+                );
+                self.transport
+                    .send_local_metadata_query_to_main(message)
+                    .map_err(DfsError::from_network)?;
+            } else if !self.send_dfs_message_if_routable(
                 &expected.primary_node_id,
                 DfsNetworkMessage::NamespaceRequest(command.clone()),
             )? {

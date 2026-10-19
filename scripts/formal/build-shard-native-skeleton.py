@@ -178,20 +178,24 @@ class FiniteCaptureBuilder:
                 or not all(execution.get(k) for k in ('execution_owner_handle','admission_scheduler_handle','execution_scope_debug'))
                 or execution['admission_scheduler_handle']!=owner['lane_incarnation']):
             raise Unavailable('selected guard lacks matching actual owner/physical/admission custody')
-        if authority['mode'] not in ('full-shard','recovery'):raise Unavailable('finite clustered builder needs full-shard or recovery native authority')
-        if authority['mode']=='recovery':
-            expected=authority['expected'];members=set(expected['replica_node_ids']+[expected['primary_node_id']]);acks=set(authority['authenticated_acknowledged_node_ids'])
-            if (authority['required_metadata_quorum']!=len(members)//2+1 or not acks<=members
-                    or expected['primary_node_id'] not in acks or len(acks)<authority['required_metadata_quorum']):
-                raise Rejected('actual recovery guard lacks exact configured metadata majority')
-        reads=[e for (owner,n),e in self.events.items() if owner==oid and n<event['owner_ordinal'] and e['collection']=='authoritative_reads' and e['record'].get('guard_context_id')==raw['guard_id']]
-        if len(reads)!=1:raise Unavailable('finite author guard lacks unique SAME normal final read')
-        read_event=reads[0];read=read_event['record'];key=f"/dfs/filesystems/{self.scope['file_system_id']}/metadata-shards/{self.scope['shard_id'].strip('/').replace('/','_')}";handoff=key.replace('/metadata-shards/','/metadata-membership-handoffs/')
-        if read['requested_keys']!=[key,handoff] or len(read['read']['value'])!=2 or read['read']['value'][1] is not None:raise Unavailable('guard lacks exact configuration/missing handoff read')
-        entry=read['read']['value'][0];cfg=authority['expected']
-        decodes=[r for r in self.headers[oid]['actual_control_decodes'] if r['exact_entry']==entry and r['native_type']=='DfsMetadataShardConfig' and r['decoded_value']==cfg]
-        if not decodes or cfg['primary_node_id']!=self.owner_map[oid]['node_id']:raise Rejected('native guard config lacks normal decoder/source-primary match')
-        config=self.config(cfg,entry);read_ref=self.blobs.json('KvAuthoritativeRead',read['read'])
+        if authority['mode'] != 'full-shard':
+            raise Unavailable('clustered builder accepts only ALL-assigned FullShard authority')
+        reads = [e for (owner, number), e in self.events.items() if owner == oid
+                 and number < event['owner_ordinal'] and e['collection'] == 'configuration_cuts'
+                 and e['record'].get('guard_context_id') == raw['guard_id']]
+        if len(reads) != 1:
+            raise Unavailable('guard lacks its unique SAME final retained configuration cut')
+        read_event = reads[0]; read = read_event['record']; cfg = authority['expected']
+        qualified = A.validate_retained_configuration_cut(read, self.headers[oid], self.scope,
+            guard_id=raw['guard_id'], expected=cfg)
+        entries = {row['key']: row for row in qualified['entries']}
+        entry = entries[qualified['selected_keys'][0]]
+        if cfg['primary_node_id'] != owner['node_id']:
+            raise Rejected('retained guard configuration differs from actual source primary')
+        if set(authority['authenticated_acknowledged_node_ids']) != set(cfg.get('replica_node_ids', []) + [cfg['primary_node_id']]):
+            raise Rejected('FullShard guard lacks ALL actual assigned participant ACKs')
+        config = self.config(cfg, entry)
+        read_ref = self.blobs.json('NativeConfigurationCutObservationV1', read)
         freeze=raw['held']['write_freeze']
         if freeze!={'observation':'absent'}:
             marker=freeze.get('value')
@@ -207,8 +211,11 @@ class FiniteCaptureBuilder:
             and not any(r['owner_id']==oid and r['collection']=='guard_events' and r['record']['phase']=='released'
                         and r['record']['guard_id']==e['record']['guard_id'] and r['owner_ordinal']<event['owner_ordinal'] for r in self.events.values())]
         if prior_guards:raise Unavailable('nested actual publication leases need their explicit source interval')
-        witness=self.cert(digest=raw['digest'],guard_id=raw['guard_id'],authorization_mode=authority['mode'],expected_config=config,authenticated_prepare_ack_node_ids=authority['authenticated_acknowledged_node_ids'],actual_writer_lock_retained=True,raw_scoped_fence_retained=True,execution_and_data_owner_retained=True,exact_config_and_missing_handoff_read=True,admission_pending_handoff=False,admission_write_frozen=False,prior_writer_bound_epoch=None,actual_prior_storage_epoch_view=raw['held']['writer_bound_epoch'],actual_native_guard_blob=self.blobs.json('NativeGuardEventV1',raw),actual_physical_scope=facts['physical_scope'],actual_execution=facts['execution'],same_call_native_read_blob=read_ref)
-        exact=dict(requested_keys=read['requested_keys'],rows=[dict(key=k,entry_blob=self.blobs.json('KvEntry',e) if e else None) for k,e in zip(read['requested_keys'],read['read']['value'])],revision=str(read['read']['authority']['revision']),applied_index=read['read']['authority'].get('applied_index'),native_authority_evidence_blob=read_ref,complete=True,continuous=True)
+        witness=self.cert(digest=raw['digest'],guard_id=raw['guard_id'],authorization_mode=authority['mode'],expected_config=config,authenticated_prepare_ack_node_ids=authority['authenticated_acknowledged_node_ids'],actual_writer_lock_retained=True,raw_scoped_fence_retained=True,execution_and_data_owner_retained=True,retained_config_and_missing_handoff_qualified=True,admission_pending_handoff=False,admission_write_frozen=False,actual_prior_storage_epoch_view=raw['held']['writer_bound_epoch'],actual_native_guard_blob=self.blobs.json('NativeGuardEventV1',raw),actual_physical_scope=facts['physical_scope'],actual_execution=facts['execution'],same_call_retained_configuration_blob=read_ref)
+        exact = dict(requested_keys=qualified['selected_keys'], rows=[dict(key=key,
+            entry_blob=self.blobs.json('KvEntry', entries[key]) if key in entries else None)
+            for key in qualified['selected_keys']], revision=qualified['cached_revision'],
+            applied_index=None, native_authority_evidence_blob=read_ref, complete=True, continuous=True)
         return self.blobs.json('DfsNativePublicationGuardObservationV1',witness),config,exact,read_event
 
     def action(self,event,before,after,action,refs,dependencies=()):
@@ -262,39 +269,7 @@ class FiniteCaptureBuilder:
             if len(records)!=1 or records[0]['status']!='committed':raise Rejected('finite body has no actual terminal commit')
             prepare_id=self.action(pm,before,prepared,dict(kind='prepare-payload',operation=operation,outcome='applied',prepare_record_blob=self.blobs.json('DfsPreparedOperationRecord',record)),[pd,pm])
             authority=gd['record']['facts']['authority'];guard_dependencies=[prepare_id];guard_before=prepared
-            if authority['mode']=='recovery':
-                issued=[e for e in self.events.values() if e['owner_id']==oid and e['collection']=='boundary_packets'
-                    and e['record']['facts']['phase']=='recovery-permit-issued'
-                    and pm['owner_ordinal']<e['owner_ordinal']<gd['owner_ordinal']
-                    and e['record']['facts']['permit']==authority['native_permit']]
-                if len(issued)!=1:raise Unavailable('recovery guard lacks one SAME actual returned operation permit')
-                permit_event=issued[0];fact=permit_event['record']['facts'];native=fact['permit'].get('native_commit')
-                if fact['expected']!=authority['expected'] or set(fact['authenticated_recovery_node_ids'])!=set(authority['authenticated_acknowledged_node_ids']):raise Rejected('recovery guard changes its actual permit-return scope/ACKs')
-                calls=[e for e in self.events.values() if e['owner_id']==oid and e['collection']=='control_commits'
-                    and pm['owner_ordinal']<e['owner_ordinal']<permit_event['owner_ordinal'] and e['record']['commit']==native]
-                if native is None or len(calls)!=1:raise Unavailable('fallback lacks SAME actual native transaction request/result observation')
-                module,_=A.initial_native_verifiers(self.scope,self.owners,
-                    {(owner,n):dict(kind=KINDS[event['collection']],ordinal=n,record=event['record']) for (owner,n),event in self.events.items()})
-                voters={member['node_id'] for member in self.headers[oid]['normal_mounted_identity']['configured_members']
-                    if member['role']=='voter' and member['state']=='voter'}
-                original=module.original_for_replay(self.scope,self.owner_map[oid],self.headers[oid],
-                    {(owner,n):dict(kind=KINDS[event['collection']],ordinal=n,record=event['record']) for (owner,n),event in self.events.items()},
-                    (oid,calls[0]['owner_ordinal']),calls[0]['record'],voters,required=False)
-                effect_ordinal=original[1] if original is not None else calls[0]['owner_ordinal']
-                refs=([self.events[original]] if original is not None else [])+[calls[0],permit_event]
-                earlier=[e for e in self.events.values() if e['owner_id']==oid and pm['owner_ordinal']<=e['owner_ordinal']<effect_ordinal]
-                if not earlier:raise Unavailable('fallback native transaction lacks actual pre-original source cut')
-                prior_event=max(earlier,key=lambda e:e['owner_ordinal'])
-                before_permit=self.cut(pm,'after',asof=prior_event,last=prior_guard);after_permit=self.cut(permit_event,'after',last=prior_guard)
-                for cut_name in (before_permit,after_permit):
-                    if not A.native_metadata_memory_equal(self.cuts[prepared][4],self.cuts[cut_name][4]):raise Unavailable('fallback metadata cut changes outside grouped exact preparation')
-                for cut_name in (before_permit,after_permit,admitted,preappend_cut,committed,released):
-                    self.blueprints[cut_name]['operation_floor_prefix_attribution']=dict(snapshot_id=prepared)
-                permit_id=self.action(permit_event,before_permit,after_permit,dict(kind='fallback-permit',operation=operation,
-                    permit_id=fact['permit']['permit_id'],expected_config=config,native_quorum_result_blob=None,outcome='applied'),refs,[prepare_id])
-                guard_dependencies.append(permit_id);guard_before=after_permit
-                self.blueprints[admitted]['recovery_guard_prepare_source']=dict(owner_id=oid,snapshot_id=prepared)
-            guard_id=self.action(gd,guard_before,admitted,dict(kind='publication-guard-admitted',operation=operation,guard_id=gd['record']['guard_id'],authorization_blob=guard_ref,expected_config=config,authoritative_exact_read=exact,outcome='applied'),[read,gd],guard_dependencies)
+            guard_id=self.action(gd,guard_before,admitted,dict(kind='publication-guard-admitted',operation=operation,guard_id=gd['record']['guard_id'],authorization_blob=guard_ref,expected_config=config,retained_configuration_cut=exact,outcome='applied'),[read,gd],guard_dependencies)
             commit_id=self.action(cm,preappend_cut,committed,dict(kind='commit-digest',operation=operation,guard_id=gd['record']['guard_id'],supplied_digest=digest['payload_digest'],commit_record_blob=self.blobs.json('DfsPreparedOperationCommitReference',records[0]['committed_entry']),outcome='applied'),[cd,cm],[guard_id])
             self.action(gr,committed,released,dict(kind='publication-guard-released',operation_id=op,guard_id=gd['record']['guard_id'],outcome='applied'),[gr],[commit_id])
             self.operations[op]=dict(source_owner_id=oid,digest=digest,payload_blob=body,operation=operation,prepared_source=pm,initial_source=pd,prior_guard=prior_guard,prepare_event_id=prepare_id,guard_event_id=guard_id,commit_event_id=commit_id,committed_source=cm,config=config)
@@ -481,8 +456,6 @@ class FiniteCaptureBuilder:
             refs=[call,returned[0],source]+([response_return] if response_return else [])+([receiver] if ingest_id is None else [])
             ack_id=self.action(source,before_source,after_source,dict(kind='replica-progress',ingest_permit_blob=self.blobs.json('DfsMetadataReplicaIngestPermitObservedTuple',fact['permit']) if fact.get('permit') else self.blobs.json('DfsMetadataAuthorityProbe',fact['command']['authority_probe']),verified_prefix=prefix,replacement=False,outcome='journal-durable-materialization-pending' if fact.get('materialization_pending') else 'applied',native_prepare_ack_blob=self.blobs.json('DfsNativePreparePrefixAckObservationV1',ack)),refs,[ingest_id or actual['prepare_event_id']])
             self.graph[actual['guard_event_id']].add(ack_id)
-            for permit_action in self.timeline:
-                if permit_action['action']['kind']=='fallback-permit' and permit_action['action']['operation']['operation_id']==op:self.graph[permit_action['event_id']].add(ack_id)
             self.links.append(dict(edge=edge,op=op,ingest_event_id=ingest_id,ack_event_id=ack_id,source=source,receiver=receiver,request_source=call,peer_after=peer_after))
         for op,actual in self.operations.items():
             guard=A.native_json(self.blobs.values[self.guards[op]]['data'].encode(),'actual guard');needed=set(guard['authenticated_prepare_ack_node_ids'])-{self.owner_map[actual['source_owner_id']]['node_id']}

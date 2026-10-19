@@ -2,6 +2,1141 @@
 
 use super::*;
 
+#[test]
+fn routed_mkdir_all_uses_applied_result_without_a_discarded_stat_projection() {
+    use crate::test_runtime::{FaultAction, FaultRule, StatReplyFault};
+    let mut cluster = sifs_outsider_cluster("mkdir-applied-without-stat");
+    let path = "/users/mkdir-applied/child";
+    assert!(
+        cluster
+            .observer
+            .transport
+            .delegates_local_namespace_authority()
+    );
+    let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    cluster._runtime.install_fault(FaultRule {
+        source: Some(cluster.observer_node.clone()),
+        target: Some(cluster.primary_node.clone()),
+        route: None,
+        call_id: None,
+        origin: None,
+        remaining_hits: 1,
+        action: FaultAction::AlterStatReplyAfterDispatch {
+            change: StatReplyFault::Unsupported,
+            captured: captured.clone(),
+        },
+    });
+    let result = cluster.observer.posix_mkdir_all(path);
+    {
+        let owner = cluster._runtime.metadata_primary_service(path).unwrap();
+        let object = owner
+            .metadata_backend()
+            .unwrap()
+            .get_object_by_path(&sifs_file_system_id(), path)
+            .unwrap()
+            .expect("the real namespace owner committed the directory");
+        assert_eq!(object.kind, DfsObjectKind::Directory);
+    }
+    assert!(
+        result.is_ok(),
+        "the applied unit mutation failed: {result:?}"
+    );
+    assert!(
+        captured.lock().unwrap().is_empty(),
+        "mkdir must not request discarded stat fields"
+    );
+    assert!(
+        cluster.observer.posix_stat_distributed(path).is_err(),
+        "a separately requested stat must still reject an unsupported reply"
+    );
+    assert_eq!(captured.lock().unwrap().len(), 1);
+    cluster._runtime.assert_fault_budgets().unwrap();
+    cluster._runtime.clear_faults();
+    assert_eq!(
+        cluster.observer.posix_stat_distributed(path).unwrap().kind,
+        DfsObjectKind::Directory
+    );
+    drop((cluster.primary, cluster.writer, cluster.observer));
+    cluster._runtime.close().unwrap();
+}
+
+#[test]
+fn browser_parent_exact_hint_does_not_require_cached_ancestors_or_recreate_deleted_parent() {
+    let mut cluster = sifs_outsider_cluster("browser-parent-data-only-hint");
+    let fs = sifs_file_system_id();
+    let ancestor = "/users/hint-without-local-ancestors";
+    let parent = "/users/hint-without-local-ancestors/parent";
+    let child = "/users/hint-without-local-ancestors/parent/child";
+    cluster.writer.posix_mkdir_all(parent).unwrap();
+    let old = {
+        let owner = cluster._runtime.metadata_primary_service(parent).unwrap();
+        owner
+            .metadata_backend()
+            .unwrap()
+            .get_object_by_path(&fs, parent)
+            .unwrap()
+            .unwrap()
+    };
+    assert_eq!(old.kind, DfsObjectKind::Directory);
+    cluster.writer.posix_rmdir(parent).unwrap();
+    cluster
+        .observer
+        .add_transient_object_metadata(old.clone())
+        .unwrap();
+    assert_eq!(
+        cluster.observer.metadata().object(&old.object_id),
+        Some(&old)
+    );
+    assert!(
+        cluster
+            .observer
+            .metadata()
+            .object_by_normalized_posix_path(&fs, ancestor)
+            .is_none()
+    );
+    assert_eq!(
+        cluster
+            .observer
+            .posix_object_metadata_hint(parent)
+            .unwrap()
+            .kind,
+        DfsObjectKind::Directory,
+        "a missing ancestor projection alone does not invalidate the exact DATA hint"
+    );
+    let capture = cluster
+        ._runtime
+        .capture_served_work(&cluster.primary_node, 32)
+        .unwrap();
+    crate::browser_service::prepare_sifs_browser_write_parent(&mut cluster.observer, child)
+        .unwrap();
+    assert!(!capture.records().iter().any(|row|
+        matches!(&row.command.routed_message.message,
+            DfsNetworkMessage::NamespaceRequest(command)
+                if command.requesting_node_id == cluster.observer_node &&
+                    matches!(&command.operation, DfsNamespaceOperation::MkdirAll { path } if path == parent))),
+        "an exact directory hint must not recreate the deleted parent when ancestors are uncached");
+    let result = cluster.observer.posix_write_file(
+        child,
+        b"must not publish",
+        DfsWriteOptions {
+            policy: DfsReplicationPolicy::new(1, 1).unwrap(),
+            replica_candidates: vec![cluster.primary_node.clone()],
+            wait_for_commit: true,
+            foreground_replica_repair: false,
+        },
+    );
+    assert!(
+        result.is_err(),
+        "the DATA hint grants no parent or write authority: {result:?}"
+    );
+    let owner = cluster._runtime.metadata_primary_service(parent).unwrap();
+    let backend = owner.metadata_backend().unwrap();
+    let tombstone = backend.get_object(&old.object_id).unwrap().unwrap();
+    assert_eq!(tombstone.kind, DfsObjectKind::Tombstone);
+    assert!(backend.get_object_by_path(&fs, child).unwrap().is_none());
+    drop(owner);
+    assert!(matches!(
+        cluster.observer.posix_stat_distributed(parent),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+    drop(capture);
+    drop((cluster.primary, cluster.writer, cluster.observer));
+    cluster._runtime.close().unwrap();
+}
+
+#[test]
+fn authoritative_stat_partial_catalog_keeps_its_existing_exact_physical_scope() {
+    let cluster = sifs_two_primary_cluster("stat-exact-partial-catalog");
+    let path = "/users/stat-existing-source";
+    let alias = "/services/stat-other-owner-alias";
+    let mut client = cluster._runtime.client(&cluster.replica_node).unwrap();
+    let original = client
+        .posix_write_file(
+            path,
+            b"exact source custody",
+            DfsWriteOptions {
+                policy: DfsReplicationPolicy::new(1, 1).unwrap(),
+                replica_candidates: vec![cluster.users_primary_node.clone()],
+                wait_for_commit: true,
+                foreground_replica_repair: true,
+            },
+        )
+        .unwrap();
+    client.posix_hardlink(path, alias).unwrap();
+    drop(client);
+    let mut core = cluster._runtime.metadata_primary_service(path).unwrap();
+    assert!(!core.transport.delegates_local_namespace_authority());
+    let users = DfsMetadataShardId::new("users");
+    let root = DfsMetadataShardId::new("root");
+    assert!(
+        core.metadata_backend()
+            .unwrap()
+            .has_physical_read_scope(&users)
+    );
+    assert!(
+        !core
+            .metadata_backend()
+            .unwrap()
+            .has_physical_read_scope(&root)
+    );
+    let catalog = cluster._runtime.metadata_shards().unwrap();
+    assert_eq!(
+        catalog
+            .iter()
+            .find(|s| s.shard_id == "root")
+            .unwrap()
+            .primary_node_id,
+        cluster.users_primary_node
+    );
+    assert_ne!(cluster.services_primary_node, cluster.users_primary_node);
+    let capture = cluster
+        ._runtime
+        .capture_served_work(&cluster.users_primary_node, 32)
+        .unwrap();
+    let stat = core.posix_stat_distributed(path).unwrap();
+    assert_eq!(stat.object_id, original.object_id);
+    assert_eq!(stat.content_hash, original.content_hash);
+    assert_eq!(stat.link_count, 2);
+    let mut exact_scope_reentries = 0;
+    let mut foreign_scope_reads = 0;
+    for row in capture.records() {
+        let DfsNetworkMessage::NamespaceRequest(command) = row.command.routed_message.message
+        else {
+            continue;
+        };
+        if command.requesting_node_id != cluster.users_primary_node {
+            continue;
+        }
+        let DfsNamespaceOperation::MetadataQuery { query } = command.operation else {
+            continue;
+        };
+        assert!(!command.include_metadata_journal_batches);
+        assert!(command.metadata_journal_after_sequences.is_empty());
+        match query.selection {
+            DfsMetadataSelection::StatAtPathV1 { request } if request.path == path => {
+                assert_eq!(query.shard_id, users);
+                exact_scope_reentries += 1;
+            }
+            DfsMetadataSelection::StatProjectionV1 { .. } if query.shard_id == root => {
+                foreign_scope_reads += 1;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        exact_scope_reentries, 0,
+        "a partial catalog must not force an existing exact-shard source back through Main"
+    );
+    assert!(
+        foreign_scope_reads > 0,
+        "the same node's different physical root must still use registered Main dispatch"
+    );
+    assert!(core.pending_routed_namespace_ops.is_empty());
+    assert!(core.transport.operation_deadline().is_none());
+    drop(capture);
+    drop(core);
+    cluster.close();
+}
+
+#[test]
+fn authoritative_stat_restarts_changed_cross_owner_view_within_existing_read_budget() {
+    assert_stat_generation_race("canonical-generation", StatGenerationChange::Link, 1, true);
+}
+
+#[test]
+fn authoritative_stat_restarts_only_after_typed_forward_prefix_refusal() {
+    assert_stat_generation_race(
+        "prefix-generation",
+        StatGenerationChange::UnrelatedFile,
+        1,
+        true,
+    );
+}
+
+#[test]
+fn authoritative_stat_continuous_generation_changes_exhaust_original_read_rounds() {
+    assert_stat_generation_race(
+        "generation-round-limit",
+        StatGenerationChange::Mode,
+        crate::posix::POSIX_ROUTED_SYNC_RETRY_ROUNDS,
+        false,
+    );
+}
+
+#[derive(Clone, Copy)]
+enum StatGenerationChange {
+    Link,
+    UnrelatedFile,
+    Mode,
+}
+
+fn assert_stat_generation_race(
+    name: &str,
+    change: StatGenerationChange,
+    changes: usize,
+    ready: bool,
+) {
+    use crate::test_runtime::{FaultAction, FaultRule};
+    use std::sync::Arc;
+
+    let mut cluster = sifs_two_primary_cluster(name);
+    let path = "/users/stat-generation-target";
+    let original = cluster
+        .replica
+        .posix_write_file(
+            path,
+            b"generation-bound stat",
+            DfsWriteOptions::replicated_eventual(vec![cluster.replica_node.clone()]),
+        )
+        .unwrap();
+    assert_eq!(original.link_count, 1);
+    let capture = cluster
+        ._runtime
+        .capture_served_work(&cluster.services_primary_node, 32)
+        .unwrap();
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let rounds = crate::posix::POSIX_ROUTED_SYNC_RETRY_ROUNDS;
+    struct Release(Arc<tokio::sync::Semaphore>, usize);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.0.add_permits(self.1);
+        }
+    }
+    cluster._runtime.install_fault(FaultRule {
+        source: Some(cluster.replica_node.clone()),
+        target: Some(cluster.services_primary_node.clone()),
+        route: Some(DFS_DATA_NAMESPACE_ROUTE.into()),
+        call_id: None,
+        origin: None,
+        remaining_hits: rounds * 2,
+        action: FaultAction::PauseAfterDispatch(Arc::clone(&gate)),
+    });
+    let requester = cluster.replica_node.clone();
+    let mut pages = 0;
+    let mut publications = 0;
+    let result = std::thread::scope(|scope| {
+        // Release on unwind before joining the real blocked read. All fixture
+        // changes use another authenticated client; no reply data is fabricated.
+        let release = Release(Arc::clone(&gate), rounds * 2);
+        let reader = &mut cluster.replica;
+        let read = scope.spawn(move || reader.posix_stat_distributed(path));
+        let mut writer = cluster
+            ._runtime
+            .client(&cluster.users_primary_node)
+            .unwrap();
+        let deadline = Instant::now() + SIFS_CLUSTER_PUMP_DEADLINE;
+        let mut seen = BTreeSet::new();
+        loop {
+            for record in capture.records() {
+                let DfsNetworkMessage::NamespaceRequest(command) =
+                    record.command.routed_message.message
+                else {
+                    continue;
+                };
+                if command.requesting_node_id != requester
+                    || !seen.insert(command.request_id.clone())
+                {
+                    continue;
+                }
+                assert!(record.succeeded);
+                let DfsNamespaceOperation::MetadataQuery { query } = command.operation else {
+                    panic!("the paused operation must be an actual stat page or fence")
+                };
+                let DfsMetadataSelection::StatProjectionV1 { request } = query.selection else {
+                    panic!("only services-shard projection responses may be paused")
+                };
+                assert_eq!(request.object_id, original.object_id);
+                assert_eq!(request.limit, crate::file_history_query::HISTORY_PAGE_LIMIT);
+                if !request.fence_only {
+                    assert!(request.expected_prefix.is_none() && request.after.is_none());
+                    pages += 1;
+                    assert!(
+                        pages <= rounds,
+                        "stat increased its existing read-round budget"
+                    );
+                    if publications < changes {
+                        let changed_path =
+                            format!("/services/stat-generation-change-{publications}");
+                        match change {
+                            StatGenerationChange::Link => {
+                                writer.posix_hardlink(path, &changed_path).unwrap();
+                            }
+                            StatGenerationChange::Mode => {
+                                // Real canonical publications, with the original
+                                // 32-report observation cap across all four rounds.
+                                writer
+                                    .posix_set_mode(
+                                        path,
+                                        if publications % 2 == 0 { 0o600 } else { 0o640 },
+                                    )
+                                    .unwrap();
+                            }
+                            StatGenerationChange::UnrelatedFile => {
+                                writer
+                                    .posix_write_file(
+                                        &changed_path,
+                                        b"independent publication advances this physical prefix",
+                                        DfsWriteOptions::replicated_eventual(vec![
+                                            cluster.users_primary_node.clone(),
+                                        ]),
+                                    )
+                                    .unwrap();
+                            }
+                        }
+                        publications += 1;
+                    }
+                } else {
+                    assert!(request.expected_prefix.is_some() && request.after.is_none());
+                }
+                gate.add_permits(1);
+            }
+            if read.is_finished() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "native stat collection did not finish"
+            );
+            std::thread::sleep(SIFS_CLUSTER_PUMP_IDLE_SLEEP);
+        }
+        drop(writer);
+        drop(release);
+        read.join().unwrap()
+    });
+    cluster._runtime.assert_fault_budgets().unwrap();
+    cluster._runtime.clear_faults();
+    assert_eq!(publications, changes);
+    assert!(cluster.replica.transport.operation_deadline().is_none());
+    assert!(cluster.replica.pending_routed_namespace_ops.is_empty());
+    assert_eq!(cluster.replica.routed_namespace_settle_depth, 0);
+    let expected_links = 1 + if matches!(change, StatGenerationChange::Link) {
+        changes as u64
+    } else {
+        0
+    };
+    if ready {
+        let stat = result.expect("fresh collection after the native generation changed");
+        assert_eq!(stat.object_id, original.object_id);
+        assert_eq!(stat.content_hash, original.content_hash);
+        assert_eq!(
+            stat.link_count, expected_links,
+            "stale pages never supply the count"
+        );
+        assert!(pages >= 2, "the old collection must be discarded");
+    } else {
+        assert!(
+            matches!(
+                result,
+                Err(DfsPosixError::Dfs(DfsError::MetadataRejection {
+                    code: DfsMetadataRejectionCode::PrefixMismatch,
+                    ..
+                }))
+            ),
+            "continuous changes must fail closed, without a partial stat: {result:?}"
+        );
+        assert_eq!(
+            pages, rounds,
+            "the original four-round bound must be observable"
+        );
+    }
+    assert_eq!(
+        cluster
+            .replica
+            .posix_stat_distributed(path)
+            .unwrap()
+            .link_count,
+        expected_links
+    );
+    if matches!(change, StatGenerationChange::Mode) {
+        cluster.replica.posix_set_mode(path, original.mode).unwrap();
+    } else {
+        for index in 0..changes {
+            cluster
+                .replica
+                .posix_unlink(&format!("/services/stat-generation-change-{index}"))
+                .unwrap();
+        }
+    }
+    assert_eq!(
+        cluster
+            .replica
+            .posix_stat_distributed(path)
+            .unwrap()
+            .link_count,
+        1
+    );
+    cluster.close();
+}
+
+#[test]
+fn authoritative_stat_rejects_same_version_hash_change_on_actual_canonical_page() {
+    use crate::test_runtime::{FaultAction, FaultRule, StatReplyFault};
+    let mut cluster = sifs_two_primary_cluster("stat-same-version-hash");
+    let path = "/users/stat-immutable-content";
+    let original = cluster
+        .replica
+        .posix_write_file(
+            path,
+            b"immutable version bytes",
+            DfsWriteOptions::replicated_eventual(vec![cluster.replica_node.clone()]),
+        )
+        .unwrap();
+    let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    cluster._runtime.install_fault(FaultRule {
+        source: Some(cluster.replica_node.clone()),
+        target: Some(cluster.users_primary_node.clone()),
+        route: Some(DFS_DATA_NAMESPACE_ROUTE.into()),
+        call_id: None,
+        origin: None,
+        remaining_hits: 1,
+        action: FaultAction::AlterStatReplyAfterDispatch {
+            change: StatReplyFault::SameVersionHashChanged,
+            captured: captured.clone(),
+        },
+    });
+    let result = cluster.replica.posix_stat_distributed(path);
+    let Err(DfsPosixError::Dfs(error)) = result else {
+        panic!("same-version hash corruption must not become a fresh-read retry: {result:?}")
+    };
+    assert_ne!(
+        error.metadata_rejection_code(),
+        DfsMetadataRejectionCode::PrefixMismatch
+    );
+    let records = captured.lock().unwrap();
+    assert_eq!(
+        records.len(),
+        1,
+        "must exercise an actual native canonical page"
+    );
+    let DfsNetworkMessage::NamespaceResponse(response) = &records[0].message else {
+        panic!("wrong captured response")
+    };
+    let Some(DfsPosixCoordinationResult::MetadataQuery(response)) =
+        &response.posix_coordination_result
+    else {
+        panic!("missing captured native query")
+    };
+    let DfsMetadataQueryResult::StatProjectionV1 { page } = &response.result else {
+        panic!("fault must leave the initial path view intact")
+    };
+    let object = page.object.as_ref().unwrap();
+    assert_eq!(object.object_id, original.object_id);
+    assert_eq!(object.version, original.version);
+    assert_eq!(object.content_hash, original.content_hash);
+    drop(records);
+    cluster._runtime.assert_fault_budgets().unwrap();
+    cluster._runtime.clear_faults();
+    assert!(cluster.replica.pending_routed_namespace_ops.is_empty());
+    assert!(cluster.replica.transport.operation_deadline().is_none());
+    let healthy = cluster.replica.posix_stat_distributed(path).unwrap();
+    assert_eq!(healthy.version, original.version);
+    assert_eq!(healthy.content_hash, original.content_hash);
+    cluster.close();
+}
+
+#[test]
+fn authoritative_lstat_preserves_alias_absence_and_original_canonical_read_predicates() {
+    let mut cluster = sifs_outsider_cluster("stat-original-read-predicates");
+    let canonical = "/users/stat-predicate-target";
+    let alias = "/services/stat-predicate-alias";
+    let absent = "/services/stat-predicate-absent";
+    cluster
+        .writer
+        .posix_write_file(
+            canonical,
+            b"first",
+            DfsWriteOptions::replicated_eventual(vec![cluster.writer_node.clone()]),
+        )
+        .unwrap();
+    cluster.writer.posix_hardlink(canonical, alias).unwrap();
+    let alias_row = {
+        let owner = cluster._runtime.metadata_primary_service(alias).unwrap();
+        owner
+            .metadata_backend()
+            .unwrap()
+            .get_object_by_path(&sifs_file_system_id(), alias)
+            .unwrap()
+            .unwrap()
+    };
+    let planning = cluster.observer.namespace_execution.begin_planning();
+    let first = cluster.observer.posix_lstat_distributed(alias).unwrap();
+    assert!(matches!(
+        cluster.observer.posix_lstat_distributed(absent),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+    let fs = sifs_file_system_id();
+    let reads = cluster
+        .observer
+        .namespace_execution
+        .captured_reads()
+        .unwrap();
+    assert_eq!(
+        reads
+            .paths
+            .get(&(fs.clone(), crate::namespace::metadata_path(alias)))
+            .cloned(),
+        Some(Some(alias_row.object_id.clone())),
+        "record the alias dentry, not its canonical inode, at the requested path"
+    );
+    assert_eq!(
+        reads
+            .objects
+            .get(&(fs.clone(), alias_row.object_id.clone()))
+            .cloned(),
+        Some(Some(alias_row.version))
+    );
+    assert_eq!(
+        reads
+            .paths
+            .get(&(fs.clone(), crate::namespace::metadata_path(absent)))
+            .cloned(),
+        Some(None),
+        "authoritative absence is an observation, not a missing predicate"
+    );
+    assert_eq!(
+        reads
+            .objects
+            .get(&(fs.clone(), first.object_id.clone()))
+            .cloned(),
+        Some(Some(first.version.clone()))
+    );
+    cluster
+        .writer
+        .posix_write_file(
+            canonical,
+            b"later",
+            DfsWriteOptions::replicated_eventual(vec![cluster.writer_node.clone()]),
+        )
+        .unwrap();
+    let later = cluster.observer.posix_lstat_distributed(alias).unwrap();
+    assert_ne!(first.version, later.version);
+    let reads = cluster
+        .observer
+        .namespace_execution
+        .captured_reads()
+        .unwrap();
+    let mut expectations = vec![DfsNamespaceObjectVersionExpectation {
+        object_id: first.object_id.clone(),
+        expected_version: Some(later.version),
+    }];
+    reads
+        .bind_recorded_expectations(&fs, &mut expectations, &mut [])
+        .unwrap();
+    assert_eq!(
+        expectations[0].expected_version,
+        Some(first.version),
+        "a later stat must not rebase the original comparison"
+    );
+    drop(planning);
+}
+
+#[test]
+fn authoritative_stat_rejects_actual_corrupted_replies_and_restores_deadline() {
+    use crate::test_runtime::{FaultAction, FaultRule, StatReplyFault};
+    let mut cluster = sifs_outsider_cluster("stat-negative-replies");
+    let path = "/users/stat-negative";
+    cluster
+        .writer
+        .posix_write_file(
+            path,
+            b"negative stat",
+            DfsWriteOptions::replicated_eventual(vec![cluster.writer_node.clone()]),
+        )
+        .unwrap();
+    cluster
+        .writer
+        .posix_hardlink(path, "/services/stat-negative-alias")
+        .unwrap();
+    for change in [
+        StatReplyFault::Unsupported,
+        StatReplyFault::Incomplete,
+        StatReplyFault::WrongRequest,
+        StatReplyFault::WrongEpoch,
+        StatReplyFault::WrongSource,
+        StatReplyFault::WrongTarget,
+        StatReplyFault::MalformedPrefix,
+        StatReplyFault::StalePrefix,
+    ] {
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        cluster._runtime.install_fault(FaultRule {
+            source: Some(cluster.observer_node.clone()),
+            target: Some(cluster.primary_node.clone()),
+            route: None,
+            call_id: None,
+            origin: None,
+            remaining_hits: 1,
+            action: FaultAction::AlterStatReplyAfterDispatch {
+                change: change.clone(),
+                captured: captured.clone(),
+            },
+        });
+        let before = cluster
+            .observer
+            .metadata_backend()
+            .unwrap()
+            .metadata_shard_statuses()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        cluster
+            .observer
+            .set_transport_operation_deadline(Some(deadline));
+        assert!(
+            cluster.observer.posix_stat_distributed(path).is_err(),
+            "accepted {change:?} reply"
+        );
+        assert_eq!(
+            captured.lock().unwrap().len(),
+            1,
+            "must exercise a real native reply"
+        );
+        cluster._runtime.assert_fault_budgets().unwrap();
+        assert_eq!(
+            cluster.observer.transport.operation_deadline(),
+            Some(deadline)
+        );
+        assert!(cluster.observer.pending_routed_namespace_ops.is_empty());
+        assert_eq!(cluster.observer.routed_namespace_settle_depth, 0);
+        assert_eq!(
+            before,
+            cluster
+                .observer
+                .metadata_backend()
+                .unwrap()
+                .metadata_shard_statuses()
+                .unwrap()
+        );
+        cluster._runtime.clear_faults();
+        cluster.observer.set_transport_operation_deadline(None);
+        assert_eq!(
+            cluster
+                .observer
+                .posix_stat_distributed(path)
+                .unwrap()
+                .link_count,
+            2
+        );
+    }
+    let flag = DfsCancellationFlag::default();
+    cluster.observer.set_cancellation(Some(flag.clone()));
+    let deadline = Instant::now() + Duration::from_secs(1);
+    cluster
+        .observer
+        .set_transport_operation_deadline(Some(deadline));
+    flag.cancel();
+    assert!(cluster.observer.posix_stat_distributed(path).is_err());
+    assert_eq!(
+        cluster.observer.transport.operation_deadline(),
+        Some(deadline)
+    );
+    assert!(cluster.observer.pending_routed_namespace_ops.is_empty());
+    cluster.observer.set_cancellation(None);
+    cluster.observer.set_transport_operation_deadline(None);
+    assert_eq!(
+        cluster
+            .observer
+            .posix_stat_distributed(path)
+            .unwrap()
+            .link_count,
+        2
+    );
+}
+
+#[test]
+fn authoritative_stat_alias_projection_keeps_guards_in_the_owning_physical_scope() {
+    let mut cluster = sifs_two_primary_cluster("stat-physical-guard-scope");
+    let path = "/users/stat-guard-source";
+    let alias = "/services/stat-guard-alias";
+    cluster
+        .replica
+        .posix_write_file(
+            path,
+            b"guard scope",
+            DfsWriteOptions::replicated_eventual(vec![cluster.replica_node.clone()]),
+        )
+        .unwrap();
+    cluster.replica.posix_hardlink(path, alias).unwrap();
+    let object = cluster.replica.file_history_capture_object(path).unwrap();
+    let shards = cluster._runtime.metadata_shards().unwrap();
+    let users = shards.iter().find(|s| s.shard_id == "users").unwrap();
+    let services = shards.iter().find(|s| s.shard_id == "services").unwrap();
+    let mut user_owner = cluster._runtime.metadata_primary_service(path).unwrap();
+    let mut alias_owner = cluster._runtime.metadata_primary_service(alias).unwrap();
+    let job = user_owner
+        .metadata_backend()
+        .unwrap()
+        .list_namespace_jobs_page(None, crate::file_history_query::HISTORY_PAGE_LIMIT)
+        .unwrap()
+        .jobs
+        .into_iter()
+        .find(|j| j.root_path == path && j.target_path.as_deref() == Some(alias))
+        .unwrap();
+    assert_eq!(job.status, DfsNamespaceJobStatus::Completed);
+    // Reproduce only the restrictive foreign-replica guard observed in the
+    // failing native run. This lends no authority or DATA: both query services
+    // retain their real registered provider and exact physical backend.
+    alias_owner.cross_shard_namespace_locks.upsert_job(
+        Some(DfsMetadataShardId::new("users")),
+        job.job_id.clone(),
+        job.file_system_id.clone(),
+        vec![job.root_path.clone()],
+    );
+    let request = DfsStatProjectionRequest {
+        object_id: object.object_id.clone(),
+        object_path: path.into(),
+        object_kind: object.kind.clone(),
+        object_version: object.version.clone(),
+        limit: crate::file_history_query::HISTORY_PAGE_LIMIT,
+        after: None,
+        expected_prefix: None,
+        fence_only: false,
+    };
+    let query = |owner: &mut NetworkedDfsService<DfsNodeTransport>,
+                 shard: &DfsMetadataShardConfig| {
+        owner.query_metadata_authority_impl(
+            shard,
+            DfsMetadataSelection::StatProjectionV1 {
+                request: Box::new(request.clone()),
+            },
+        )
+    };
+    let DfsMetadataQueryResult::StatProjectionV1 { page } =
+        query(&mut alias_owner, services).unwrap()
+    else {
+        panic!("current native alias projection");
+    };
+    assert!(
+        page.object.is_none(),
+        "services cannot supply the users object body"
+    );
+    assert_eq!(
+        page.entries
+            .iter()
+            .map(|o| o.path.as_str())
+            .collect::<Vec<_>>(),
+        vec![alias]
+    );
+    assert!(page.after.is_none());
+    assert!(page.complete);
+    assert!(
+        alias_owner
+            .cross_shard_namespace_locks
+            .blocks(&job.file_system_id, path),
+        "a foreign guard must be preserved, not deleted to pass the read"
+    );
+    user_owner.cross_shard_namespace_locks.upsert_job(
+        Some(DfsMetadataShardId::new("users")),
+        job.job_id.clone(),
+        job.file_system_id.clone(),
+        vec![job.root_path.clone()],
+    );
+    assert!(
+        matches!(query(&mut user_owner, users), Err(DfsError::Busy { path: blocked }) if blocked == path),
+        "the canonical authority still enforces its own namespace reservation"
+    );
+    alias_owner.cross_shard_namespace_locks.upsert_job(
+        Some(DfsMetadataShardId::new("services")),
+        format!("{}:local-negative", job.job_id),
+        job.file_system_id.clone(),
+        vec![alias.to_owned()],
+    );
+    assert!(
+        matches!(query(&mut alias_owner, services), Err(DfsError::Busy { path: blocked }) if blocked == alias),
+        "every returned alias remains protected by its own physical authority's guard"
+    );
+    drop((user_owner, alias_owner));
+    cluster.close();
+}
+
+#[test]
+fn authoritative_stat_cross_shard_pages_are_complete_and_rollover_rejects_old_scope() {
+    let mut cluster = sifs_two_primary_cluster("stat-pages-rollover");
+    let diagnostics = [
+        &cluster.users_primary_node,
+        &cluster.services_primary_node,
+        &cluster.replica_node,
+    ]
+    .into_iter()
+    .map(|node| crate::native_boundary_diagnostics::capture(cluster._runtime.data_dir(node).root()))
+    .collect::<Vec<_>>();
+    cluster
+        ._runtime
+        .checkpoint_rpc_observation_window()
+        .unwrap();
+    let path = "/users/stat-many-aliases";
+    cluster
+        .replica
+        .posix_write_file(
+            path,
+            b"paged stat",
+            DfsWriteOptions::replicated_eventual(vec![cluster.replica_node.clone()]),
+        )
+        .unwrap();
+    for index in 0..130 {
+        let result = cluster
+            .replica
+            .posix_hardlink(path, &format!("/services/stat-page-{index:03}"));
+        if result.is_err() {
+            for diagnostic in &diagnostics {
+                diagnostic.dump(
+                    "stat-alias-failure",
+                    serde_json::json!({
+                        "index": index, "result": format!("{result:?}"),
+                        "rpc": format!("{:?}", cluster._runtime.rpc_observations()),
+                    }),
+                );
+            }
+        }
+        result.unwrap();
+        if (index + 1) % 4 == 0 {
+            cluster
+                ._runtime
+                .checkpoint_rpc_observation_window()
+                .unwrap();
+            for diagnostic in &diagnostics {
+                diagnostic.checkpoint(&format!("stat-alias-window-{}", index + 1));
+            }
+        }
+    }
+    cluster
+        ._runtime
+        .checkpoint_rpc_observation_window()
+        .unwrap();
+    cluster
+        .replica
+        .posix_hardlink(path, "/users/stat-local-alias")
+        .unwrap();
+    let object = cluster.replica.file_history_capture_object(path).unwrap();
+    let shards = cluster._runtime.metadata_shards().unwrap();
+    let old = shards
+        .iter()
+        .find(|shard| shard.shard_id == "services")
+        .unwrap()
+        .clone();
+    let mut request = DfsStatProjectionRequest {
+        object_id: object.object_id.clone(),
+        object_path: path.into(),
+        object_kind: object.kind.clone(),
+        object_version: object.version.clone(),
+        limit: crate::file_history_query::HISTORY_PAGE_LIMIT,
+        after: None,
+        expected_prefix: None,
+        fence_only: false,
+    };
+    let query = |caller: &mut NetworkedDfsService<DfsNodeTransport>,
+                 request: &DfsStatProjectionRequest| {
+        caller.query_metadata_authority_impl(
+            &old,
+            DfsMetadataSelection::StatProjectionV1 {
+                request: Box::new(request.clone()),
+            },
+        )
+    };
+    let DfsMetadataQueryResult::StatProjectionV1 { page: first } =
+        query(&mut cluster.replica, &request).unwrap()
+    else {
+        panic!("wrong projection")
+    };
+    assert_eq!(first.entries.len(), 128);
+    assert!(!first.complete && first.after.is_some());
+    request.after = first.after.clone();
+    request.expected_prefix = Some(first.prefix.clone());
+    let DfsMetadataQueryResult::StatProjectionV1 { page: second } =
+        query(&mut cluster.replica, &request).unwrap()
+    else {
+        panic!("wrong continuation")
+    };
+    assert_eq!(second.entries.len(), 2);
+    assert!(second.complete && second.after.is_none());
+    assert_eq!(first.prefix, second.prefix);
+    let ids = first
+        .entries
+        .iter()
+        .chain(&second.entries)
+        .map(|row| row.object_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(ids.len(), 130);
+    assert_eq!(
+        cluster
+            .replica
+            .posix_stat_distributed(path)
+            .unwrap()
+            .link_count,
+        132
+    );
+    assert_eq!(
+        cluster
+            .replica
+            .posix_lstat_distributed("/services/stat-page-129")
+            .unwrap()
+            .link_count,
+        132
+    );
+    cluster
+        .replica
+        .posix_unlink("/services/stat-page-129")
+        .unwrap();
+    assert!(
+        query(&mut cluster.replica, &request).is_err(),
+        "old page prefix cannot span unlink"
+    );
+    assert_eq!(
+        cluster
+            .replica
+            .posix_stat_distributed(path)
+            .unwrap()
+            .link_count,
+        131
+    );
+    let new = cluster
+        ._runtime
+        .reassign_metadata_shard(
+            &old.file_system_id,
+            &old.shard_id,
+            cluster.users_primary_node.clone(),
+            vec![
+                cluster.services_primary_node.clone(),
+                cluster.replica_node.clone(),
+            ],
+        )
+        .unwrap();
+    assert!(new.epoch > old.epoch);
+    request.after = None;
+    request.expected_prefix = None;
+    assert!(
+        query(&mut cluster.replica, &request).is_err(),
+        "old authority epoch cannot supply stat evidence"
+    );
+    assert_eq!(
+        cluster
+            .replica
+            .posix_stat_distributed(path)
+            .unwrap()
+            .link_count,
+        131
+    );
+    cluster.close();
+}
+
+#[test]
+fn authoritative_stat_outsider_counts_link_and_unlink_without_local_replay() {
+    let mut cluster = sifs_outsider_cluster("stat-outsider-ryw");
+    let path = "/users/stat-outsider-target";
+    let alias = "/users/stat-outsider-alias";
+    cluster
+        .writer
+        .posix_write_file(
+            path,
+            b"outsider stat",
+            DfsWriteOptions::replicated_eventual(vec![cluster.writer_node.clone()]),
+        )
+        .unwrap();
+    cluster.writer.posix_hardlink(path, alias).unwrap();
+    for expected in [2, 1] {
+        let before = cluster
+            .observer
+            .metadata_backend()
+            .unwrap()
+            .metadata_shard_statuses()
+            .unwrap();
+        assert!(
+            cluster
+                ._runtime
+                .metadata_shards()
+                .unwrap()
+                .iter()
+                .all(|shard| {
+                    shard.primary_node_id != cluster.observer_node
+                        && !shard.replica_node_ids.contains(&cluster.observer_node)
+                })
+        );
+        let stat = cluster.observer.posix_stat_distributed(path).unwrap();
+        assert_eq!(stat.link_count, expected);
+        assert_eq!(stat.size_bytes, Some(13));
+        if expected == 2 {
+            let alias_stat = cluster.observer.posix_lstat_distributed(alias).unwrap();
+            assert_eq!(alias_stat.object_id, stat.object_id);
+            assert_eq!(alias_stat.link_count, 2);
+        }
+        assert_eq!(
+            before,
+            cluster
+                .observer
+                .metadata_backend()
+                .unwrap()
+                .metadata_shard_statuses()
+                .unwrap(),
+            "stat cannot ingest caller journals or manufacture a local replica"
+        );
+        if expected == 2 {
+            cluster.writer.posix_unlink(alias).unwrap();
+        }
+    }
+    assert_sifs_cluster_no_posix_leaks(&cluster, "authoritative stat outsider");
+}
+
+#[test]
+fn authoritative_stat_counts_cross_shard_alias_and_fails_closed_on_outage() {
+    let mut cluster = sifs_two_primary_cluster("stat-cross-shard-outage");
+    let path = "/users/stat-cross-target";
+    let alias = "/services/stat-cross-alias";
+    cluster
+        .replica
+        .posix_write_file(
+            path,
+            b"cross stat",
+            DfsWriteOptions::replicated_eventual(vec![cluster.replica_node.clone()]),
+        )
+        .unwrap();
+    cluster.replica.posix_hardlink(path, alias).unwrap();
+    let before = cluster
+        .replica
+        .metadata_backend()
+        .unwrap()
+        .metadata_shard_statuses()
+        .unwrap();
+    let canonical = cluster.replica.posix_stat_distributed(path).unwrap();
+    assert_eq!(canonical.link_count, 2);
+    let link = cluster.replica.posix_lstat_distributed(alias).unwrap();
+    assert_eq!(link.object_id, canonical.object_id);
+    assert_eq!(link.link_count, 2);
+    assert_eq!(
+        before,
+        cluster
+            .replica
+            .metadata_backend()
+            .unwrap()
+            .metadata_shard_statuses()
+            .unwrap()
+    );
+    cluster.replica.posix_unlink(alias).unwrap();
+    assert_eq!(
+        cluster
+            .replica
+            .posix_stat_distributed(path)
+            .unwrap()
+            .link_count,
+        1
+    );
+    cluster
+        ._runtime
+        .stop_node(&cluster.services_primary_node)
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    cluster
+        .replica
+        .set_transport_operation_deadline(Some(deadline));
+    assert!(
+        cluster.replica.posix_stat_distributed(path).is_err(),
+        "missing alias authority must not be treated as an empty shard or stale local count"
+    );
+    assert_eq!(
+        cluster.replica.transport.operation_deadline(),
+        Some(deadline)
+    );
+    assert!(cluster.replica.pending_routed_namespace_ops.is_empty());
+    cluster.close();
+}
+
 fn native_pending_routed_write(
     name: &str,
 ) -> (
@@ -303,13 +1438,14 @@ fn routed_write_stale_pending_response_does_not_downgrade_completion() {
 
 #[test]
 fn local_write_outcome_wins_over_stale_routed_alias_shadow() {
+    let deadline = Instant::now() + SIFS_CLUSTER_PUMP_DEADLINE;
     let (runtime, mut client, request, base, bytes, nodes, operation, pending_response) =
         native_pending_routed_write("native-local-committed-before-routed-reply");
     let primary = client.writes.pending_routed_writes[&operation]
         .primary_node_id
         .clone();
     client
-        .handle_distributed_write_response(primary, pending_response)
+        .handle_distributed_write_response(primary.clone(), pending_response)
         .unwrap();
     let (_, terminal) = complete_native_routed_write(
         &runtime,
@@ -344,6 +1480,49 @@ fn local_write_outcome_wins_over_stale_routed_alias_shadow() {
     );
     // Reconstruct local committed custody from the actual replicated native
     // record while the genuine terminal response stays unconsumed.
+    // Owner commit proves publication, not that this replica has already
+    // applied its detached commit notification. Establish this test's local
+    // custody premise through normal bounded maintenance before hydrating.
+    let mut observed = Vec::new();
+    loop {
+        let record = client
+            .metadata_backend()
+            .unwrap()
+            .get_intent(&request.object_id, intent_id)
+            .unwrap()
+            .expect("actual local native intent");
+        observed.push(record.status.clone());
+        if record.status == DfsWriteIntentStatus::Committed {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "local committed custody unavailable within the original fixture deadline: {observed:?}"
+        );
+        let tick = runtime
+            .maintenance_tick(
+                &primary,
+                remaining.min(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT),
+            )
+            .unwrap();
+        assert!(tick.outcome.is_ok(), "{:?}", tick.outcome);
+        assert_eq!(tick.omitted_kv_event_count, 0);
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "replica catch-up exceeded the original fixture deadline"
+        );
+        let tick = runtime
+            .maintenance_tick(
+                client.node_id(),
+                remaining.min(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT),
+            )
+            .unwrap();
+        assert!(tick.outcome.is_ok(), "{:?}", tick.outcome);
+        assert_eq!(tick.omitted_kv_event_count, 0);
+    }
+    eprintln!("NATIVE_LOCAL_COMMITTED_CUSTODY {observed:?}");
     client.hydrate_from_metadata_backend().unwrap();
     let recorded = client
         .metadata_backend()
@@ -2292,12 +3471,20 @@ fn sifs_cluster_posix_routed_namespace_ops_have_read_your_write_semantics() {
         writer.posix_stat_distributed("/users/routed-dir/link"),
         Err(DfsPosixError::NotFound { .. })
     ));
+    let after_alias_unlink = writer
+        .posix_stat_distributed("/users/routed-dir/renamed.txt")
+        .expect("stat after alias unlink");
+    let actual_primary = if after_alias_unlink.link_count != 1 {
+        match _runtime.metadata_primary_service("/users/routed-dir/renamed.txt") {
+            Ok(service) => format!("{:?}", service.posix_stat("/users/routed-dir/renamed.txt")),
+            Err(error) => format!("unavailable: {error}"),
+        }
+    } else {
+        String::new()
+    };
     assert_eq!(
-        writer
-            .posix_stat_distributed("/users/routed-dir/renamed.txt")
-            .expect("stat after alias unlink")
-            .link_count,
-        1
+        after_alias_unlink.link_count, 1,
+        "actual caller={after_alias_unlink:?}; actual primary={actual_primary}"
     );
 
     // POSIX error mapping survives the wire round trip.

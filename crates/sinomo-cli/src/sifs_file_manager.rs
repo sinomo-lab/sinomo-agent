@@ -124,13 +124,21 @@ fn sifs_clustered_daemon_client_until(
     }
     let state = cluster::read_cluster_state_without_kv(cluster_paths)
         .map_err(|error| format!("cannot read local cluster state: {error}"))?;
+    sifs_main_client_for_state_until(data_dir, &state, operation_deadline)
+}
+
+fn sifs_main_client_for_state_until(
+    data_dir: &SinomoDataDir,
+    state: &sinomo_runtime::core::ClusterBootstrapState,
+    operation_deadline: Option<Instant>,
+) -> Result<Option<sinomo_runtime::daemon::DaemonApiClient>, String> {
     let daemon_paths = sinomo_runtime::daemon::DaemonPaths::new(data_dir);
     let probe_timeout =
         sifs_operation_remaining(operation_deadline, "probing the resident daemon")?
             .map(|remaining| remaining.min(sinomo_runtime::daemon::DAEMON_API_PROBE_TIMEOUT))
             .unwrap_or(sinomo_runtime::daemon::DAEMON_API_PROBE_TIMEOUT);
     let probe = sinomo_runtime::daemon::probe_daemon_status(&daemon_paths, probe_timeout);
-    sifs_clustered_daemon_client_from_probe(&state, data_dir, probe)
+    sifs_clustered_daemon_client_from_probe(state, data_dir, probe)
 }
 
 fn sifs_clustered_daemon_client_from_probe(
@@ -232,6 +240,11 @@ pub(crate) struct SifsFileManagerBackend {
     /// Clustered ordinary operations borrow the daemon's resident owner rather
     /// than decoding a second local metadata image in every caller process.
     resident: Option<crate::app_api::RemoteSifsBrowser>,
+    /// Configured caller identity only. Main is resolved at each operation;
+    /// construction neither owns storage nor certifies a current DFS view.
+    deferred_main_identity: Option<(sinomo_runtime::core::Id, NodeId)>,
+    #[cfg(test)]
+    native_test_main: Option<crate::app_api::RemoteSifsBrowser>,
     resident_node_id: Option<NodeId>,
     service: OnceLock<Mutex<NetworkedDfsService<DfsNodeTransport>>>,
     service_initialization: Mutex<()>,
@@ -536,6 +549,9 @@ impl SifsFileManagerBackend {
             data_dir: data_dir.clone(),
             rpc_runtime,
             resident: None,
+            deferred_main_identity: None,
+            #[cfg(test)]
+            native_test_main: None,
             resident_node_id: None,
             service: OnceLock::from(Mutex::new(service)),
             service_initialization: Mutex::new(()),
@@ -553,28 +569,29 @@ impl SifsFileManagerBackend {
         operation_deadline: Option<Instant>,
     ) -> Result<Option<Self>, String> {
         let cluster_paths = ClusterPaths::new(data_dir);
-        let Some(client) =
-            sifs_clustered_daemon_client_until(data_dir, &cluster_paths, operation_deadline)?
-        else {
+        if !cluster_paths.state.exists() {
             return Ok(None);
-        };
+        }
+        sifs_operation_remaining(operation_deadline, "reading local cluster identity")?;
         let state = cluster::read_cluster_state_without_kv(&cluster_paths)
             .map_err(|error| format!("cannot read local cluster identity: {error}"))?;
-        let resident = crate::app_api::RemoteSifsBrowser::for_main_owner(
-            data_dir.clone(),
-            client.address().to_string(),
-            state.local_node_id.clone(),
-            rpc_runtime.runtime.handle(),
-        );
-        Self::from_resident_owner(
-            data_dir,
+        sifs_operation_remaining(operation_deadline, "reading local cluster identity")?;
+        let node_id = state.local_node_id;
+        Ok(Some(Self {
+            data_dir: data_dir.clone(),
             rpc_runtime,
-            writable,
-            operation_deadline,
-            resident,
-            state.local_node_id,
-        )
-        .map(Some)
+            resident: None,
+            deferred_main_identity: Some((state.cluster_id, node_id.clone())),
+            #[cfg(test)]
+            native_test_main: None,
+            resident_node_id: Some(node_id.clone()),
+            service: OnceLock::new(),
+            service_initialization: Mutex::new(()),
+            local_catalog_authoritative: AtomicBool::new(false),
+            mutation_bootstrapped: Mutex::new(writable.then_some(false)),
+            peer_targets_refreshed_at: Mutex::new(None),
+            replica_candidates: sifs_replica_candidates(data_dir, &node_id),
+        }))
     }
 
     fn from_resident_owner(
@@ -600,6 +617,9 @@ impl SifsFileManagerBackend {
             data_dir: data_dir.clone(),
             rpc_runtime,
             resident: Some(resident),
+            deferred_main_identity: None,
+            #[cfg(test)]
+            native_test_main: None,
             resident_node_id: Some(node_id.clone()),
             service: OnceLock::new(),
             service_initialization: Mutex::new(()),
@@ -625,6 +645,62 @@ impl SifsFileManagerBackend {
             return Err("this SIFS backend is read-only".into());
         }
         sifs_operation_remaining(operation_deadline, "resident SIFS request")?;
+        if let Some((cluster_id, node_id)) = &self.deferred_main_identity {
+            let resolve = || -> Result<crate::app_api::RemoteSifsBrowser, String> {
+                let state =
+                    cluster::read_cluster_state_without_kv(&ClusterPaths::new(&self.data_dir))
+                        .map_err(|error| {
+                            format!("cannot read configured SIFS identity: {error}")
+                        })?;
+                if &state.cluster_id != cluster_id || &state.local_node_id != node_id {
+                    return Err(
+                        "configured SIFS caller node/cluster identity changed; reopen the backend"
+                            .into(),
+                    );
+                }
+                #[cfg(test)]
+                let native_test_main = self.native_test_main.clone().or_else(|| {
+                    crate::native_test_fixture::browser(&self.data_dir, self.rpc_runtime.runtime.handle())
+                });
+                #[cfg(test)]
+                if let Some(client) = &native_test_main {
+                    // This hook only adapts an actual isolated native registry.
+                    // The stopped owner rejects the request; no healthy reply,
+                    // identity or authority is supplied by the fixture.
+                    let client = client.with_operation_deadline(operation_deadline);
+                    let status: sinomo_runtime::api::DaemonDfsBrowserStatusResponse = client
+                        .read_rpc(
+                            sinomo_runtime::api::DAEMON_DFS_BROWSER_STATUS_ROUTE,
+                            &sinomo_runtime::api::DaemonDfsBrowserStatusRequest::node_only(),
+                        )?;
+                    if status.node_id != node_id.to_string() {
+                        return Err("native Main returned another node identity".into());
+                    }
+                    return Ok(client);
+                }
+                let client =
+                    sifs_main_client_for_state_until(&self.data_dir, &state, operation_deadline)?
+                        .ok_or_else(|| {
+                        "daemon is not running; authoritative SIFS operations require Main"
+                            .to_string()
+                    })?;
+                sifs_operation_remaining(operation_deadline, "resolving resident Main")?;
+                Ok(crate::app_api::RemoteSifsBrowser::for_main_owner(
+                    self.data_dir.clone(),
+                    client.address().to_string(),
+                    node_id.clone(),
+                    self.rpc_runtime.runtime.handle(),
+                )
+                .with_operation_deadline(operation_deadline))
+            };
+            return resolve().map(Some).map_err(|error| {
+                if mutation {
+                    format!("cannot prepare SIFS mutation authority: {error}")
+                } else {
+                    error
+                }
+            });
+        }
         Ok(self
             .resident
             .as_ref()
@@ -857,7 +933,9 @@ impl SifsFileManagerBackend {
         &self,
         operation_deadline: Option<Instant>,
     ) -> Result<(), String> {
-        if self.resident.is_some() && self.service.get().is_none() {
+        if (self.resident.is_some() || self.deferred_main_identity.is_some())
+            && self.service.get().is_none()
+        {
             // The resident owner captured committed follow-up work before its
             // reply; a client must not reopen local stores to repeat it.
             return Ok(());
@@ -1649,6 +1727,26 @@ impl SifsFileManagerBackend {
         self.refresh_service_peer_targets_with_deadline(&mut service, Some(deadline));
         sifs_operation_remaining(Some(deadline), "capturing ordinary write options")?;
         sifs_write_options(&mut service, &path, &self.replica_candidates)
+    }
+
+    /// Settle a genuinely seeded file before a probe interrupts its assignment.
+    /// This uses the normal Main barrier and shares the probe's existing budget.
+    pub(crate) fn sync_file_until(
+        &self,
+        path: &str,
+        deadline: Instant,
+    ) -> Result<sinomo_runtime::dfs::DfsPosixFileSyncCertificate, String> {
+        let path = normalize_sifs_path(path)?;
+        sifs_operation_remaining(Some(deadline), "syncing the seeded file")?;
+        let mut service = self.lock_service_for_mutation(Some(deadline))?;
+        self.refresh_service_peer_targets_with_deadline(&mut service, Some(deadline));
+        let previous = service.set_transport_operation_deadline(Some(deadline));
+        if let Some(previous) = previous {
+            service.set_transport_operation_deadline(Some(previous.min(deadline)));
+        }
+        let result = service.posix_sync_file(&path, sinomo_runtime::dfs::DfsPosixSyncKind::File);
+        service.set_transport_operation_deadline(previous);
+        result.map_err(|error| format!("cannot sync seeded file {path}: {error}"))
     }
 
     /// Keep the typed result and caller-owned ID on the existing normal Main
@@ -2541,7 +2639,7 @@ impl FileManagerBackend for SifsFileManagerBackend {
     }
 
     fn stat(&self, path: &str) -> Result<FileManagerMetadata, String> {
-        if self.resident.is_some() {
+        if self.resident.is_some() || self.deferred_main_identity.is_some() {
             let stat = self.dfs_stat(path)?;
             return Ok(FileManagerMetadata {
                 kind: sifs_entry_kind(&stat.kind),
@@ -3312,10 +3410,13 @@ fn sifs_main_caller_transport(
     local_node_id: NodeId,
     peer_node_ids: Vec<NodeId>,
 ) -> Result<DfsNodeTransport, String> {
-    let peer = sinomo_runtime::dfs::DaemonDfsPeerTransport::connect(data_dir.clone()).map_err(
+    let peer = sinomo_runtime::dfs::DaemonDfsPeerTransport::deferred(data_dir.clone()).map_err(
         |error| format!("SIFS caller requires the resident Main DFS transport: {error}"),
     )?;
     let (sync_peer, async_peer) = shared_sifs_peer_transports(peer);
+    #[cfg(test)]
+    let (sync_peer, async_peer) = crate::native_test_fixture::peer_transports(data_dir)
+        .unwrap_or((sync_peer, async_peer));
     Ok(DfsNodeTransport::with_peer_transports_for_nodes(
         local_node_id,
         peer_node_ids,
@@ -3642,7 +3743,7 @@ impl SifsControlPlaneKvClient {
             cluster_paths: cluster_paths.clone(),
             snapshot: Arc::new(Mutex::new(SifsKvSnapshotCache::default())),
             #[cfg(test)]
-            peer_transport: None,
+            peer_transport: crate::native_test_fixture::peer_transports(data_dir).map(|peers| peers.0),
         }
     }
 
@@ -5511,6 +5612,7 @@ fn parent_sifs_path(path: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    mod cold_open_contract;
     use super::*;
     use sinomo_runtime::api::{
         DAEMON_DFS_BROWSER_CREATE_DIR_ALL_ROUTE, DAEMON_DFS_BROWSER_DELETE_ROUTE,
@@ -6063,6 +6165,7 @@ mod tests {
     fn stable_namespace_preflight_reuses_the_fallback_without_renaming_or_retaining_deadlines() {
         let root = temp_sifs_data_dir("stable-namespace-preflight-cache");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let mut backend = SifsFileManagerBackend::open(&data_dir).unwrap();
         let from = "/services/stable-preflight-source.txt";
         let to = "/services/stable-preflight-target.txt";
@@ -6112,6 +6215,7 @@ mod tests {
     fn expired_stable_namespace_preflight_does_not_initialize_or_submit_a_mutation() {
         let root = temp_sifs_data_dir("stable-namespace-preflight-expired");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let mut backend = SifsFileManagerBackend::open(&data_dir).unwrap();
         backend
             .write_file("/services/preflight-expired-source.txt", b"original")
@@ -6247,6 +6351,7 @@ mod tests {
     fn file_manager_deferred_publication_keeps_the_local_contract_with_a_resident_client() {
         let root = temp_sifs_data_dir("resident-file-manager-deferred-publication");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let mut backend = SifsFileManagerBackend::open(&data_dir).unwrap();
         let node_id = backend.lock_service().unwrap().node_id().clone();
         let calls = Arc::new(Mutex::new(Vec::new()));
@@ -6908,6 +7013,7 @@ mod tests {
     fn ordinary_sifs_backend_open_always_attaches_metadata() {
         let root = temp_sifs_data_dir("ordinary-open-metadata");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let backend = SifsFileManagerBackend::open(&data_dir).expect("ordinary SIFS backend");
         assert!(
             backend
@@ -8364,6 +8470,7 @@ mod tests {
     fn wait_for_commit_write_rejects_an_already_expired_deadline() {
         let root = temp_sifs_data_dir("expired-wait-for-commit");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let backend = SifsFileManagerBackend::open(&data_dir).expect("backend");
         let path = "/services/expired-wait-for-commit.txt";
 
@@ -8386,6 +8493,7 @@ mod tests {
     fn existing_parent_wait_for_commit_write_does_not_recreate_a_removed_parent() {
         let root = temp_sifs_data_dir("wait-for-commit-removed-parent");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let backend = SifsFileManagerBackend::open(&data_dir).expect("backend");
         let parent = "/services/wait-for-commit-removed-parent";
         let child = "/services/wait-for-commit-removed-parent/child.txt";
@@ -8420,6 +8528,7 @@ mod tests {
     fn wait_for_commit_write_bounds_service_lock_contention() {
         let root = temp_sifs_data_dir("contended-wait-for-commit");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let backend = Arc::new(SifsFileManagerBackend::open(&data_dir).expect("backend"));
         let contended = Arc::clone(&backend);
         let service_guard = backend.lock_service().expect("service lock");
@@ -8453,6 +8562,7 @@ mod tests {
 
         let root = temp_sifs_data_dir("contended-deadline-helpers");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let backend = Arc::new(SifsFileManagerBackend::open(&data_dir).expect("backend"));
         let service_guard = backend.lock_service().expect("service lock");
         let run_contended = |label: &str, operation: ContendedOperation| {
@@ -8539,6 +8649,7 @@ mod tests {
     fn sifs_backend_manages_local_sifs_without_cluster() {
         let root = temp_sifs_data_dir("local");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let backend = SifsFileManagerBackend::open(&data_dir).expect("backend");
         let mut manager = FileManagerState::open(Arc::new(backend), "/services").expect("manager");
 
@@ -8557,6 +8668,7 @@ mod tests {
     fn private_posix_directory_bootstrap_is_idempotent_and_never_steals_owner() {
         let root = temp_sifs_data_dir("private-posix-directory");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let backend = SifsFileManagerBackend::open(&data_dir).expect("backend");
         let path = "/sinomo/agents/test-session/home";
 
@@ -8616,6 +8728,7 @@ mod tests {
     fn sifs_remove_with_deadline_handles_files_and_empty_directories() {
         let root = temp_sifs_data_dir("remove-with-deadline");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let backend = SifsFileManagerBackend::open(&data_dir).expect("backend");
         let file = "/services/remove-with-deadline.txt";
         let directory = "/services/remove-with-deadline-dir";
@@ -8641,6 +8754,7 @@ mod tests {
     fn sifs_read_only_backend_refreshes_visible_overwrite() {
         let root = temp_sifs_data_dir("current-read-refresh");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let writer = SifsFileManagerBackend::open(&data_dir).expect("writer");
         let path = "/services/current-read-refresh.txt";
         let old = b"old visible payload";
@@ -8659,6 +8773,7 @@ mod tests {
     fn bulk_write_mode_preserves_create_exclusivity_and_can_overwrite_existing_files() {
         let root = temp_sifs_data_dir("bulk-write-overwrite-existing");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let backend = SifsFileManagerBackend::open(&data_dir).expect("backend");
         let parent = "/services/bulk-write-overwrite-existing";
         let path = format!("{parent}/payload.bin");
@@ -8707,6 +8822,7 @@ mod tests {
     fn sifs_write_parent_preflight_accepts_local_directory() {
         let root = temp_sifs_data_dir("local-parent-preflight");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let backend = SifsFileManagerBackend::open(&data_dir).expect("backend");
         backend
             .create_dir_all("/services/local-parent-preflight")
@@ -8721,6 +8837,7 @@ mod tests {
     fn sifs_write_parent_preflight_rejects_local_file_parent() {
         let root = temp_sifs_data_dir("local-file-parent-preflight");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let backend = SifsFileManagerBackend::open(&data_dir).expect("backend");
         backend
             .write_file(
@@ -8875,6 +8992,7 @@ mod tests {
     fn placement_activity_rejects_an_empty_cursor_before_cluster_access() {
         let root = temp_sifs_data_dir("placement-activity-empty-cursor");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let backend = SifsFileManagerBackend::open(&data_dir).expect("backend");
         let error = backend
             .placement_activity(
@@ -8894,6 +9012,7 @@ mod tests {
     fn placement_activity_local_browser_reads_compact_filtered_state() {
         let root = temp_sifs_data_dir("placement-activity-local-browser");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         // Open before installing the synthetic cluster snapshot so the test
         // remains an isolated local browser and never probes a daemon.
         let backend = SifsFileManagerBackend::open(&data_dir).expect("backend");
@@ -9165,6 +9284,7 @@ mod tests {
         for overwrite in [false, true] {
             let root = temp_sifs_data_dir("write-missing-required-replica");
             let data_dir = SinomoDataDir::new(&root);
+            let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
             let backend = SifsFileManagerBackend::open(&data_dir).unwrap();
             let path = "/services/needs-two-receipts";
             if overwrite {
@@ -9248,6 +9368,7 @@ mod tests {
     fn expired_detached_send_budget_does_not_misreport_committed_mutation() {
         let root = temp_sifs_data_dir("committed-mutation-detached-send-deadline");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let backend = SifsFileManagerBackend::open(&data_dir).expect("SIFS backend");
 
         backend

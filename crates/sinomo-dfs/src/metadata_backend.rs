@@ -429,6 +429,7 @@ pub struct LocalSobjMetadataBackend {
     content_root_catalog_snapshot_cache: Option<Arc<DfsContentRootCatalogSnapshotCache>>,
     content_root_catalog_previous_snapshot_cache: Option<Arc<DfsContentRootCatalogSnapshotCache>>,
     consistent_read_snapshot_depth: usize,
+    stat_read_snapshots: Vec<stat_snapshot::StatReadSnapshot>,
     /// This non-primary handle intentionally ignored an unreadable rebuildable
     /// table-log suffix. It may serve only its last self-contained snapshot
     /// until authenticated replica repair installs a new authoritative image.
@@ -537,6 +538,7 @@ impl LocalSobjMetadataBackend {
             content_root_catalog_snapshot_cache: None,
             content_root_catalog_previous_snapshot_cache: None,
             consistent_read_snapshot_depth: 0,
+            stat_read_snapshots: Vec::new(),
             replica_repair_only: false,
             resident_cursor_status_projection: Arc::new(Mutex::new(
                 ResidentMetadataCursorStatusProjection::default(),
@@ -646,6 +648,7 @@ impl LocalSobjMetadataBackend {
             content_root_catalog_snapshot_cache: None,
             content_root_catalog_previous_snapshot_cache: None,
             consistent_read_snapshot_depth: 0,
+            stat_read_snapshots: Vec::new(),
             replica_repair_only: false,
             resident_cursor_status_projection: Arc::new(Mutex::new(
                 ResidentMetadataCursorStatusProjection::default(),
@@ -759,6 +762,7 @@ impl LocalSobjMetadataBackend {
             content_root_catalog_snapshot_cache: None,
             content_root_catalog_previous_snapshot_cache: None,
             consistent_read_snapshot_depth: 0,
+            stat_read_snapshots: Vec::new(),
             replica_repair_only: true,
             resident_cursor_status_projection: Arc::new(Mutex::new(
                 ResidentMetadataCursorStatusProjection::default(),
@@ -950,6 +954,7 @@ impl LocalSobjMetadataBackend {
             content_root_catalog_snapshot_cache: None,
             content_root_catalog_previous_snapshot_cache: None,
             consistent_read_snapshot_depth: 0,
+            stat_read_snapshots: Vec::new(),
             replica_repair_only: false,
             resident_cursor_status_projection: Arc::new(Mutex::new(
                 ResidentMetadataCursorStatusProjection::default(),
@@ -1050,6 +1055,44 @@ impl LocalSobjMetadataBackend {
         }
         let tables = snapshot.state()?.tables.clone();
         require_version_pin_table_invariants(&tables)?;
+        // An identical snapshot is already installed when this held writer
+        // still owns a fully materialized certificate for the exact physical
+        // generation. Replacing it would unnecessarily retire journal bytes
+        // needed by an in-flight exact replay. Equality alone is insufficient:
+        // uncertainty, repair-only state, changed sources or a different cut
+        // retain the existing replacement/recovery path below.
+        if !self.replica_repair_only
+            && self.materialized_through_sequence == replayed_through_sequence
+            && self.next_sequence == replayed_through_sequence.saturating_add(1).max(1)
+            && self.prefix_proof.as_ref() == Some(&replacement_prefix_proof)
+            && self.tables == tables
+            && crate::metadata_journal::admission::current_owned_materialized_prefix(
+                &self.root,
+                &self.shard_id,
+            )?
+            .as_ref()
+                == Some(&replacement_prefix_proof)
+        {
+            // Preserve the snapshot RPC's progress-hint postconditions. These
+            // hints do not replace or advance the already-validated proof.
+            metadata_cursor::write_replay_cursor(
+                &self.root,
+                &DfsMetadataReplayCursor {
+                    shard_id: source_shard_id.clone(),
+                    last_sequence: replayed_through_sequence,
+                },
+            )?;
+            self.observe_resident_metadata_replay_cursor(
+                &source_shard_id,
+                replayed_through_sequence,
+            );
+            self.write_local_materialization_cursor(&DfsMetadataReplayCursor {
+                shard_id: self.shard_id.clone(),
+                last_sequence: replayed_through_sequence,
+            })?;
+            metadata_cursor::write_journal_head(&self.root, self.next_sequence)?;
+            return Ok(false);
+        }
         crate::metadata_journal::admission::invalidate(&self.root)?;
         let archived_existing = archive_metadata_backend_state(&self.root)?;
         create_dir_all(self.root.join("records"))?;
@@ -1498,6 +1541,9 @@ impl LocalSobjMetadataBackend {
     }
 
     pub(crate) fn metadata_prefix_proof(&self) -> Result<DfsMetadataPrefixProof> {
+        if let Some(view) = self.stat_read_snapshots.last() {
+            return Ok(view.prefix.clone());
+        }
         let proof = self.prefix_proof.clone().ok_or_else(|| {
             MetadataBackendError::Serde(format!(
                 "metadata shard {} has no exact durable prefix proof",
@@ -1811,6 +1857,11 @@ impl LocalSobjMetadataBackend {
     }
 
     fn metadata_write_lock(&self) -> Result<MetadataWriteLock> {
+        if !self.stat_read_snapshots.is_empty() {
+            return Err(MetadataBackendError::Serde(
+                "a stat read view grants no writer custody".into(),
+            ));
+        }
         metadata_write_lock(self.root.clone(), self.journal_write_lock_path())
     }
 
@@ -2205,9 +2256,10 @@ impl LocalSobjMetadataBackend {
             &current_storage_generation,
             self.table_log_offset,
         )?;
-        // A read-only lookup may already have decoded a newer durable table
-        // image. Under the writer fence, adopt that exact storage generation
-        // instead of replaying the same checkpoint and suffix a second time.
+        // A read-only lookup may already have decoded this durable generation.
+        // Under the writer fence, adopt the fully validated physical image. An
+        // equal sequence also requires the same exact prefix: checkpoint
+        // rotation alone must not force a second decode of that same cut.
         // Incremental-only reader overlays lack complete replay accounting and
         // remain ineligible. Journal certification/recovery still runs below.
         let cached = if let Ok(mut cache) = self.read_snapshot_cache.lock() {
@@ -2215,7 +2267,9 @@ impl LocalSobjMetadataBackend {
                 cache.storage_generation.as_ref() == Some(&current_storage_generation)
                     && cache.snapshot_format_version.is_some()
                     && cache.materialized_through_sequence.is_some_and(|sequence| {
-                        sequence > self.materialized_through_sequence
+                        (sequence > self.materialized_through_sequence
+                            || (sequence == self.materialized_through_sequence
+                                && cache.prefix_proof == self.prefix_proof))
                             && cache.prefix_proof.as_ref().is_some_and(|proof| {
                                 proof.is_well_formed() && proof.journal_sequence == sequence
                             })
@@ -2319,6 +2373,12 @@ impl LocalSobjMetadataBackend {
                 .get()
                 .saturating_add(1),
         );
+        if let Some(view) = self.stat_read_snapshots.last() {
+            return Ok(match &view.tables {
+                Some(tables) => DfsMetadataTablesSnapshot::Shared(Arc::clone(tables)),
+                None => DfsMetadataTablesSnapshot::Borrowed(&self.tables),
+            });
+        }
         if self.consistent_read_snapshot_depth > 0 || self.replica_repair_only {
             return Ok(DfsMetadataTablesSnapshot::Borrowed(&self.tables));
         }
@@ -3151,3 +3211,4 @@ use snapshot_validation::*;
 
 mod api;
 mod reference_outcomes;
+mod stat_snapshot;

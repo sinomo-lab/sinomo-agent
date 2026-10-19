@@ -444,8 +444,20 @@ fn native_namespace_request_replay_survives_actual_primary_restart() {
         .unwrap();
     assert_eq!(moved.object_id, source.object_id);
     drop(writer);
+    let owner_paths = crate::runtime_host::DfsRuntimePaths::new(runtime.data_dir(&primary));
+    let owner_weak = crate::runtime_host::test_data_owner_weak_reference(&owner_paths);
+    let owner_before_stop = owner_weak.as_ref().map(std::sync::Weak::strong_count);
     runtime.stop_node(&primary).unwrap();
-    runtime.reopen_node(primary).unwrap();
+    let owner_after_stop = owner_weak.as_ref().map(std::sync::Weak::strong_count);
+    let reopened = runtime.reopen_node(primary);
+    if reopened.is_err() {
+        eprintln!(
+            "native namespace reopen boundary: root={} owner_before_stop={owner_before_stop:?} owner_after_stop={owner_after_stop:?} owner_at_failure={:?} result={reopened:?}",
+            owner_paths.root.display(),
+            owner_weak.as_ref().map(std::sync::Weak::strong_count),
+        );
+    }
+    reopened.unwrap();
     let mut reader = runtime.client(&requester).unwrap();
     let replay = reader
         .posix_rename_with_operation_id(from, to, &operation)
@@ -461,4 +473,123 @@ fn native_namespace_request_replay_survives_actual_primary_restart() {
     ));
     drop(reader);
     runtime.close().unwrap();
+}
+
+#[test]
+fn native_stop_joins_real_deferred_response_before_reopen() {
+    use crate::test_runtime::DfsTestRuntime;
+    use std::time::{Duration, Instant};
+    let nodes = DfsTestRuntime::ordered_node_ids("native-deferred-stop-control", 3);
+    let mut runtime =
+        DfsTestRuntime::new("native-deferred-stop-control", nodes[0].clone()).unwrap();
+    for node in &nodes[1..] {
+        runtime.define_node(node.clone()).unwrap();
+    }
+    runtime.start_nodes().unwrap();
+    let primary = runtime
+        .metadata_shards()
+        .unwrap()
+        .into_iter()
+        .find(|s| s.shard_id == "services")
+        .unwrap()
+        .primary_node_id;
+    let mut writer = runtime.client(&primary).unwrap();
+    let pause = runtime.pause_deferred_response(&primary).unwrap();
+    let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    let written = writer
+        .posix_write_file(
+            "/services/deferred-stop-control",
+            b"same native owner",
+            DfsWriteOptions::replicated_eventual(nodes.clone()),
+        )
+        .unwrap();
+    drop(writer);
+    let capture = pause
+        .wait(deadline.saturating_duration_since(Instant::now()))
+        .unwrap();
+    eprintln!("ACTUAL-DEFERRED-CAPTURE {capture:?}");
+    assert!(capture.owner_still_held());
+    let original = capture
+        .original
+        .as_ref()
+        .expect("native repair retains its exact original request");
+    let DfsNetworkMessage::RepairReplica(request) = &original.message else {
+        panic!("actual repair request")
+    };
+    let DfsNetworkMessage::RepairReplicaResponse(response) =
+        &capture.command.routed_message.message
+    else {
+        panic!("actual repair response")
+    };
+    assert_eq!(request.request_id, response.request_id);
+    assert_eq!(request.intent_id, response.intent_id);
+    assert!(request.background_repair);
+    assert_eq!(request.file_system_id, written.file_system_id);
+    assert_eq!(response.file_system_id, request.file_system_id);
+    assert_eq!(original.source_node_id, primary);
+    assert_eq!(
+        original.target_node_id,
+        capture.command.routed_message.source_node_id
+    );
+    assert_eq!(capture.command.routed_message.target_node_id, primary);
+    assert_eq!(request.object_id, written.object_id);
+    assert_eq!(request.version, written.version);
+    assert_eq!(response.object_id, request.object_id);
+    assert_eq!(response.version, request.version);
+    let stop_primary = primary.clone();
+    let (sent, received) = std::sync::mpsc::channel();
+    let stopping = std::thread::spawn(move || {
+        let result = runtime.stop_node(&stop_primary);
+        let _ = sent.send(result.clone());
+        (runtime, result)
+    });
+    let early = received.recv_timeout(Duration::from_millis(50));
+    let held_at_boundary = capture.owner_still_held();
+    eprintln!("STOP-BOUNDARY early={early:?} owner_held={held_at_boundary}");
+    pause.release();
+    let (mut runtime, result) = stopping.join().unwrap();
+    result.unwrap();
+    let owner_after_stop = capture.owner_still_held();
+    // Drain/recover before reporting the negative control, retaining its original result.
+    let reopening = runtime.reopen_node(primary.clone());
+    eprintln!("REOPEN-BOUNDARY owner_after_stop={owner_after_stop} result={reopening:?}");
+    if reopening.is_ok() {
+        let context = runtime.component_context(&primary).unwrap();
+        let replacement = crate::runtime_host::retain_component_data_owner(&context).unwrap();
+        assert_eq!(
+            replacement.storage_owner_file_identity().unwrap(),
+            capture.owner_file_identity
+        );
+        assert!(
+            !capture.owner_still_held(),
+            "remount must own a new capability on the same physical lock"
+        );
+        drop(replacement);
+        drop(context);
+        let mut reader = runtime.client(&primary).unwrap();
+        let stat = reader
+            .posix_stat_distributed("/services/deferred-stop-control")
+            .unwrap();
+        assert_eq!(stat.object_id, written.object_id);
+        assert_eq!(stat.version, written.version);
+        assert_eq!(
+            reader
+                .posix_read_file_distributed("/services/deferred-stop-control")
+                .unwrap(),
+            b"same native owner"
+        );
+        drop(reader);
+    }
+    runtime.close().unwrap();
+    assert!(
+        matches!(early, Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
+        "stop returned while actual deferred response held its OS owner: {early:?}"
+    );
+    assert!(held_at_boundary);
+    assert!(!owner_after_stop);
+    reopening.unwrap();
+    assert!(
+        Instant::now() < deadline,
+        "unchanged network deadline covers the controlled stop/reopen"
+    );
 }

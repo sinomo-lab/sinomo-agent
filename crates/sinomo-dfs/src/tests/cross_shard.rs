@@ -3108,7 +3108,14 @@ fn sifs_cluster_posix_cross_shard_move_fences_open_write_intents() {
             remaining_hits: 32,
             action: crate::test_runtime::FaultAction::BudgetExhausted,
         });
+    let before_transfer = cluster._runtime.rpc_observations().len();
     let target = DfsVersion::generate();
+    let content_nodes = vec![
+        cluster.users_primary_node.clone(),
+        cluster.services_primary_node.clone(),
+    ];
+    let mut policy = DfsReplicationPolicy::new(2, 2).unwrap();
+    policy.required_node_ids = content_nodes.clone();
     let outcome = cluster
         .users_primary
         .write_distributed_eventual(
@@ -3119,18 +3126,50 @@ fn sifs_cluster_posix_cross_shard_move_fences_open_write_intents() {
                 requesting_node_id: cluster.users_primary_node.clone(),
             },
             b"pending actual W2 replacement".to_vec(),
-            vec![
-                cluster.users_primary_node.clone(),
-                cluster.services_primary_node.clone(),
-            ],
-            DfsReplicationPolicy::new(2, 2).unwrap(),
+            content_nodes,
+            policy,
         )
         .unwrap();
     assert!(matches!(outcome, NetworkedDfsWriteOutcome::Pending { .. }));
-    assert!(matches!(
-        cluster.users_primary.posix_rename(from, to),
-        Err(DfsPosixError::Dfs(DfsError::Busy { .. }))
-    ));
+    assert!(
+        cluster._runtime.rpc_observations()[before_transfer..]
+            .iter()
+            .any(|event| event.source == cluster.users_primary_node
+                && event.target == cluster.services_primary_node
+                && event.route == DFS_DATA_STAGE_BLOB_ROUTE
+                && event.phase == crate::test_runtime::RpcPhase::BeforeDispatch),
+        "the original pending write must reach the actual faulted required target"
+    );
+    assert_eq!(
+        cluster.users_primary.posix_stat(from).unwrap().version,
+        original.version,
+        "the genuinely incomplete W2 write cannot advance the visible head"
+    );
+    let rename = cluster.users_primary.posix_rename(from, to);
+    assert!(
+        matches!(&rename, Err(DfsPosixError::Dfs(DfsError::Busy { .. }))),
+        "users={}, services={}, replica={}; actual rename={rename:?}; actual transfers={:?}",
+        cluster.users_primary_node,
+        cluster.services_primary_node,
+        cluster.replica_node,
+        cluster._runtime.rpc_observations()[before_transfer..]
+            .iter()
+            .filter(|event| [
+                DFS_DATA_STAGE_BLOB_ROUTE,
+                DFS_DATA_REPAIR_REPLICA_ROUTE,
+                DFS_DATA_FETCH_BLOB_ROUTE
+            ]
+            .contains(&event.route.as_str()))
+            .map(|event| (
+                &event.source,
+                &event.target,
+                &event.route,
+                event.phase,
+                &event.dfs_intent_id,
+                &event.dfs_request_id
+            ))
+            .collect::<Vec<_>>()
+    );
     assert!(
         !cluster
             .users_primary
@@ -3831,6 +3870,39 @@ fn same_node_distinct_shard_hardlink_alias_uses_durable_saga_and_survives_cold_r
             DfsNamespaceOperation::LookupPath { .. }
             | DfsNamespaceOperation::LookupPaths { .. }
             | DfsNamespaceOperation::PollNamespaceChanges { .. } => owner_read = true,
+            DfsNamespaceOperation::MetadataQuery { query }
+                if matches!(query.selection, DfsMetadataSelection::StatAtPathV1 { .. }) =>
+            {
+                let DfsMetadataSelection::StatAtPathV1 { request: stat } = &query.selection else {
+                    unreachable!()
+                };
+                assert_eq!(query.file_system_id, request.file_system_id);
+                assert!(!stat.read_id.is_empty());
+                assert_eq!(
+                    stat.catalog_digest,
+                    crate::stat_projection::stat_catalog_digest(&configs).unwrap()
+                );
+                assert_eq!(request.authority_shards, configs);
+                assert!(
+                    request
+                        .authority_shards
+                        .iter()
+                        .all(|shard| shard.primary_node_id == node)
+                );
+                assert!(!request.include_metadata_journal_batches);
+                assert!(request.metadata_journal_after_sequences.is_empty());
+                let selected =
+                    crate::select_metadata_shard_config_for_path_strict_default_sifs_split(
+                        &query.file_system_id,
+                        &configs,
+                        &stat.path,
+                    )
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(query.shard_id.0, selected.shard_id);
+                assert_eq!(query.epoch, selected.epoch);
+                owner_read = true;
+            }
             DfsNamespaceOperation::Hardlink {
                 existing_path,
                 link_path,

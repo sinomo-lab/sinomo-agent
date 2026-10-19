@@ -103,7 +103,7 @@ The model inventory is split by subsystem:
 
   Each model has a matching `checks/dfs/<stem>_safety.qnt` invariant suite.
   `scenarios/dfs/` holds deterministic canonical-write handoff and
-  quorum-fallback traces, the nine registered whole-shard scenarios,
+  historical canonical-write traces, the ten registered whole-shard scenarios,
   pending-read identity, advisory-lock fencing, file-sync and
   directory-generation recovery, complete-holder/quorum-repair partitions,
   cross-shard retry exhaustion, local-first file/namespace reconciliation,
@@ -485,113 +485,100 @@ unchanged and outside this slice.
 
 ### Whole-shard prepare, publication and handoff
 
-The `dfs-whole-shard` case composes `prepare(payload)`, digest-bound commit,
-ordinary full-shard authority, degraded recovery, handoff and exact replay in
-one logical transition system. State and actions live in
-`models/dfs/whole_shard.qnt`; predicates and witnesses live in
-`checks/dfs/whole_shard_safety.qnt`. This is a **bounded abstract target
-contract**. Conformance is established only for the exact Rust build, source,
-schema and model bound to a successfully replayed native capture. Its degraded
-path requires the actual metadata recovery majority and operation-bound native
-KV permit; content receipts and Raft votes cannot substitute for that evidence.
+The `dfs-whole-shard` case composes hidden `prepare(payload)`, digest-bound
+publication, durable writer fencing, handoff and exact replay. Ordinary
+publication has two authority classes: positively established local standalone
+ownership, or exact prepare acknowledgements from **every assigned metadata
+participant**. A metadata majority, content `W`, or KV voter quorum cannot
+substitute for the full assigned set. A partial set leaves the prepared body
+hidden and publication unavailable. There is no per-operation KV permit,
+metadata operation floor or KV head watermark in this current boundary.
 
-The whole-shard refinement assumes the independently verified R0 atomic-KV
-contract. A permit must retain the same ordinary call's exact request and result,
-matching submitted and committed digests, a current-term quorum receipt with
-nonzero term/index and matching revision, and the exact scoped compares/effects
-decoded from their original SOBJ bytes. The adapter does not serialize another
-digest input or infer voter identities from an ACK count. Detailed multi-voter
-identity scenarios remain unavailable when the native receipt lacks those IDs.
+State and actions live in `models/dfs/whole_shard.qnt`, with the authority
+predicate in `contracts/dfs/whole_shard_authority.qnt` and invariants/witnesses
+in `checks/dfs/whole_shard_safety.qnt`. These are a **bounded abstract contract**;
+passing a model check does not prove native execution. Current Rust conformance
+requires the exact build, complete captured observations and enabled-action
+replay. The local-standalone scenario is an explicit abstract owner profile;
+a one-voter cluster remains clustered and still needs every assigned metadata
+participant. It is never inferred from missing cluster evidence.
 
-The bound is at most four eligible nodes, an immutable exact native voter
-configuration, one observed writer lane per node, one object, two operations, four semantic journal events,
-two epochs and one handoff. Exploration defaults to content `W=1`; native replay
-uses the exact supported captured W and target set. Full canonical current V7
-configuration identity is represented by an equality token; different policies
-or assignments,
-multiple lanes on one node and cluster-voter reconfiguration are outside this
-finite exploration. Native replay initializes a validated immutable profile
-with the exact node, voter, metadata, content-target and required-W sets.
-The default exploration uses three voters; the one-voter scenario retains
-one KV voter with distinct metadata members and does not relabel learners. A native trace with unsupported identities or additional
-effects must be reported unavailable, never coerced into this bound.
+The bound is four eligible nodes, three operations, six semantic journal
+positions, two clustered configuration epochs and one handoff. Each captured
+native operation retains its own content target set and required `W`;
+metadata-only bodies require no content receipts but still require full
+metadata authority. Configuration and payload equality use injective finite
+aliases. Multiple writer lanes on one node, more effects and voter-set changes
+remain outside this bound. Unsupported inputs are unavailable, never coerced
+into a smaller identity set or a literal genesis state.
 
-Healthy publication needs exact prepare acknowledgements from every configured
-metadata member. The complete transaction remains hidden until its matching
-commit. Content `W` alone cannot publish. Both typed authorization paths acquire
-the same publication guard and revalidate the exact shard configuration plus
-absence of a pending handoff. Admission and durable commit are separate model
-actions: an already admitted writer may finish after the pending Raft decision,
-but freeze waits for guard release and a cached permit cannot admit another
-writer after that decision.
+Publication consumes actual participant proof and the retained coherent
+configuration while the native writer, bound instance epoch and durable freeze
+protect the kernel. Global handoff intent is separate from this ordinary
+participant protocol: it does not introduce an ordinary per-operation KV read.
+The retiring freeze waits for any admitted writer, captures the complete native
+prefix and then prevents new retiring-epoch publication. A write that finishes
+before that freeze must be included in its captured prefix. Activation alone
+does not bind an old or unbound backend; the successor verifies the completion
+generation and exact prefix before rebind. The instance binding survives release
+of an ordinary publication guard and is lost only at the modeled restart.
 
-Handoff captures a native prepared-operation floor and an exact native Raft
-watermark, separately from the local journal height at the pending decision.
-The retiring freeze captures the complete immutable prefix. Activation needs
-majorities of both assignments, both primary acknowledgements, an exact frozen
-prefix and the captured floor/watermark. A promoted primary persists its marker
-before its acknowledgement counts. A typed StorageImport cause may advance the
-epoch with the same primary and members through these same freeze and activation
-gates; its exact source cut, current image and pending mapping remain bound.
-Activation does not bind a process-local
-writer; binding additionally verifies the completion generation and a matching
-or certified contiguous local extension. Lost replies and restart do not undo
-durable commit, and exact retry cannot append a second logical commit.
+Native KV retains its genuine global role. The model assumes its existing
+quorum-backed decision and activation contract, without modeling Raft election
+or adding another consensus mechanism. Handoff activation additionally needs
+majorities of both metadata assignments, acknowledgements from both primaries,
+and the exact retiring frozen prefix. Promotion requires its durable marker.
+StorageImport may preserve primary and member sets while advancing the epoch;
+its source cut, converted image and current target prefix remain independently
+validated native inputs. Historical source ACK constraints are separate migration
+obligations and are not ordinary publication grants.
 
-Run the registered simulation, required deterministic witnesses and deliberately
-broken gates with:
+Run the bounded simulations, deterministic witnesses and sensitivity controls
+with:
 
 ```bash
 QUINT_RUN_SEED=0x51a020261006 bash scripts/formal/check-quint.sh whole-shard
 ```
 
-This uses Quint 0.32.0, the TypeScript simulator, 1,000 random traces of 40 steps
-and nine deterministic scenarios. The scenarios require healthy
-authority, degraded permit/minority rejection, a late admitted write carried
-through joint activation with an offline member, promotion/rebind/stale epoch,
-cached-permit rejection after pending, digest/divergent-prefix rejection and
-watermark carry, and healthy/degraded paths with one actual model voter. Four negative controls remove the metadata authority, joint
-certificate, pending-handoff admission or digest gate and must produce an actual
-invariant violation. A disabled or truncated trace is not an expected
-counterexample. Override simulation bounds with
-`QUINT_WHOLE_SHARD_MAX_SAMPLES` and `QUINT_WHOLE_SHARD_MAX_STEPS`.
+The harness pins Quint 0.32.0 and uses 1,000 random traces of 40 steps, plus ten
+deterministic scenarios. They cover healthy all-assigned publication, explicit
+standalone ownership, majority/minority denial with sufficient content `W`,
+late-write capture, joint activation with an offline member, promotion/rebind,
+stale epoch, frozen-writer denial, changed digest, divergent prefix and exact
+lost-reply replay. The one-voter case proves that a KV quorum still cannot grant
+partial metadata publication. Negative controls deliberately remove the full
+assignment, joint certificate, freeze or digest gates and must reach invariant
+violations; disabled/truncated exploration is not a counterexample.
 
-The registered symbolic case is deep-tier, with default depth eight and the
-repository's Apalache 0.56.1 pin. Simulation, deterministic reachability,
-symbolic bounded checking and native implementation conformance are separate
-evidence classes. The model hides native Raft elections, storage-byte barriers,
-wire validation, scheduling and unbounded liveness.
+The symbolic case remains deep-tier at depth eight with the repository's
+Apalache 0.56.1 pin. Simulation, reachability, bounded symbolic proof and native
+conformance are separate evidence classes. This model omits scheduling,
+storage-byte barriers, wire validation, election and unbounded liveness.
 
-Native conformance requires versioned events from the actual runtime owners,
-independent observed state projection and replay through enabled Quint actions
-to the complete terminal cursor. It must retain exact u64 values, certified
-initial cuts, complete native journal intervals, owner/root/lane incarnation,
-whole configuration, operation/payload identities and native quorum/prefix
-proofs. A bootstrap cut cannot be replaced by literal genesis or arithmetic
-sequence subtraction. Complete transaction visibility must be checked from
-actual rows, not inferred from a commit label. Missing, dropped, discontinuous,
-truncated, unsupported or unresolved observations fail availability; only
-observed transitions proven irrelevant to every modeled field may stutter.
-The shared verifier `scripts/formal/check-shard-trace.py` validates the
-versioned `scripts/formal/shard-trace-v1.schema.json` envelope and checks a
-complete finite boundary with actual enabled Quint actions and `.expect` on
-independently observed post-state. It requires the complete terminal cursor,
-so a safe but disabled prefix fails. Both the transition model and its
-invariant suite are included in the `model_sha256` binding. Native u64 values
-use checked canonical decimal strings. The verifier requires artifact and
-source manifests (checked by `native-artifact-binding.py`) and derives every
-state through `shard-native-projector.py` from held native tables, certified
-cuts and retained observations; it rejects externally supplied finite states.
-The capture side (`collect-shard-native-inputs.py`,
-`build-shard-native-skeleton.py`, `assemble-shard-native-trace.py`, and the
-`shard-native-*.py` and `native-json-subtree.py` adapters) packages output
-of the Rust `native_shard_trace` hooks and never constructs model state.
-Missing held-table, initial-cut or atomic-footprint evidence is reported
-unavailable. `scripts/formal/test-shard-trace.py` exercises this boundary and
-explicitly labels its generated inputs as synthetic sensitivity tests.
+Native conformance must join the actual admitted guard to the **same consumed
+retained immutable configuration projection**, its native authority provenance
+and current accepted generation. It does not require or manufacture a fresh
+per-operation authoritative KV read. Exact operation/payload identity, actual
+writer/data-owner custody, bound epoch/freeze, complete transaction footprint,
+all authenticated participant responses, source prefix, incarnation and capture
+coverage remain mandatory. Replica-ingest permits are separate receiver
+capabilities and do not authorize ordinary authorship.
 
-Model-generated traces establish checker sensitivity only. Until a complete
-native Rust trace passes that replay boundary, this remains a target contract.
+`scripts/formal/check-shard-trace.py` validates the versioned native envelope and
+replays enabled Quint actions with independently observed post-state. Its model
+binding covers the model, invariant suite and authority contract together.
+Missing, dropped, discontinuous, truncated or unsupported observations fail
+availability; a safe but disabled prefix is not success. Native integer values
+stay lossless. The verifier requires executable/source manifests and a complete
+terminal cursor. The collector, skeleton, assembler and projector package genuine
+Rust observations, not external finite states. Synthetic checker-sensitivity
+inputs and standalone model witnesses establish no native authority. No current
+capture is accepted until the complete updated conformance boundary passes.
+
+The older canonical-write and union-sync slices described adjacent to this
+section retain historical target assumptions, including degraded KV coupling.
+They are not current ordinary-publication conformance evidence. This bounded
+correction does not silently relabel those older models as implemented behavior.
 
 The `dfs_metadata_handoff_union_sync_safety.safety` invariant isolates the
 older, stronger exact-union sync primitive after the retiring-primary fence.

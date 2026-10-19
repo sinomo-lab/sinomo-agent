@@ -368,28 +368,6 @@
             }
           ]
         },
-        "operation_floor_blob": {
-          "anyOf": [
-            {
-              "type": "string",
-              "minLength": 1
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "raft_head_watermark_blob": {
-          "anyOf": [
-            {
-              "type": "string",
-              "minLength": 1
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
         "retiring_fence_blob": {
           "anyOf": [
             {
@@ -442,8 +420,6 @@
         "commit_record_blobs",
         "complete_visible_rows_blob",
         "pending_handoff_blob",
-        "operation_floor_blob",
-        "raft_head_watermark_blob",
         "retiring_fence_blob",
         "local_marker_blob",
         "local_writer_binding_blob",
@@ -742,9 +718,6 @@
             "expected_config": {
               "$ref": "#/$defs/ConfigTuple"
             },
-            "authoritative_exact_read": {
-              "$ref": "#/$defs/ExactKvRead"
-            },
             "outcome": {
               "type": "string",
               "enum": [
@@ -754,6 +727,9 @@
                 "failed-after-effect",
                 "ambiguous"
               ]
+            },
+            "retained_configuration_cut": {
+              "$ref": "#/$defs/RetainedConfigurationRead"
             }
           },
           "required": [
@@ -762,7 +738,7 @@
             "operation",
             "authorization_blob",
             "expected_config",
-            "authoritative_exact_read",
+            "retained_configuration_cut",
             "outcome"
           ]
         },
@@ -853,70 +829,6 @@
           "additionalProperties": false,
           "properties": {
             "kind": {
-              "const": "fallback-permit"
-            },
-            "operation": {
-              "$ref": "#/$defs/OperationKey"
-            },
-            "prepared_sequence": {
-              "$ref": "#/$defs/DecimalU64"
-            },
-            "permit_id": {
-              "anyOf": [
-                {
-                  "type": "string",
-                  "minLength": 1
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "native_quorum_result_blob": {
-              "type": "string",
-              "minLength": 1
-            },
-            "recovery_prefix_evidence_blobs": {
-              "type": "array",
-              "items": {
-                "type": "string",
-                "minLength": 1
-              }
-            },
-            "voter_evidence_mode": {
-              "type": "string",
-              "enum": [
-                "observed-voter-set",
-                "native-quorum-certificate"
-              ]
-            },
-            "outcome": {
-              "type": "string",
-              "enum": [
-                "applied",
-                "journal-durable-materialization-pending",
-                "rejected-before-effect",
-                "failed-after-effect",
-                "ambiguous"
-              ]
-            }
-          },
-          "required": [
-            "kind",
-            "operation",
-            "prepared_sequence",
-            "permit_id",
-            "native_quorum_result_blob",
-            "recovery_prefix_evidence_blobs",
-            "voter_evidence_mode",
-            "outcome"
-          ]
-        },
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "kind": {
               "const": "handoff-begin"
             },
             "handoff_id": {
@@ -936,28 +848,6 @@
             "pending_begin_local_head": {
               "$ref": "#/$defs/DecimalU64"
             },
-            "native_operation_floor_blob": {
-              "anyOf": [
-                {
-                  "type": "string",
-                  "minLength": 1
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "native_raft_watermark_blob": {
-              "anyOf": [
-                {
-                  "type": "string",
-                  "minLength": 1
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
             "kv_result_blob": {
               "type": "string",
               "minLength": 1
@@ -971,6 +861,9 @@
                 "failed-after-effect",
                 "ambiguous"
               ]
+            },
+            "pending_begin_local_prefix": {
+              "$ref": "#/$defs/PrefixProof"
             }
           },
           "required": [
@@ -980,10 +873,9 @@
             "desired",
             "handoff_blob",
             "pending_begin_local_head",
-            "native_operation_floor_blob",
-            "native_raft_watermark_blob",
             "kv_result_blob",
-            "outcome"
+            "outcome",
+            "pending_begin_local_prefix"
           ]
         },
         {
@@ -1136,9 +1028,6 @@
               "type": "string",
               "minLength": 1
             },
-            "authoritative_exact_read": {
-              "$ref": "#/$defs/ExactKvRead"
-            },
             "outcome": {
               "type": "string",
               "enum": [
@@ -1148,6 +1037,9 @@
                 "failed-after-effect",
                 "ambiguous"
               ]
+            },
+            "authoritative_exact_read": {
+              "$ref": "#/$defs/ExactKvRead"
             }
           },
           "required": [
@@ -1805,6 +1697,58 @@
         "semantic_intervals",
         "operation_payload_aliases"
       ]
+    },
+    "RetainedConfigurationRead": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "requested_keys": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "rows": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ExactKvRow"
+          }
+        },
+        "revision": {
+          "$ref": "#/$defs/DecimalU64"
+        },
+        "applied_index": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DecimalU64"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "native_authority_evidence_blob": {
+          "type": "string",
+          "minLength": 1
+        },
+        "complete": {
+          "type": "boolean"
+        },
+        "continuous": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "requested_keys",
+        "rows",
+        "revision",
+        "applied_index",
+        "native_authority_evidence_blob",
+        "complete",
+        "continuous"
+      ],
+      "description": "Exact config/handoff selection from the SAME already-qualified retained projection. Original three quorum receipts stay in the raw cut; revision is accepted replay position, not a fresh ReadIndex."
     }
   }
 }

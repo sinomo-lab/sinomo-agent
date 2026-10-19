@@ -68,7 +68,7 @@ cluster-test-support = ["client", "sinomo-core/cluster-test-support"]
 # Forwards bounded incoming-body tests through the normal runtime boundary.
 network-test-support = ["client", "sinomo-core/network-test-support"]
 # Expose the existing mounted DFS test facility through the runtime ring boundary.
-dfs-test-support = ["host", "sinomo-dfs/test-support"]
+dfs-test-support = ["host", "sinomo-dfs/test-support", "sinomo-vfs-sifs/test-support"]
 
 [dependencies]
 sinomo-api = { path = "../sinomo-api", default-features = false, optional = true }

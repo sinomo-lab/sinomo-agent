@@ -5294,6 +5294,7 @@ mod tui_tests {
 
         let root = sinomo_testdir::TestDir::new("sinomo-line-chat-projection");
         let data_dir = SinomoDataDir::new(root.to_path_buf());
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let mut output = Vec::new();
         run_tui_with_handler_io_and_daemon_and_projection(
             std::io::Cursor::new("question\n/quit\n"),
@@ -7182,7 +7183,7 @@ mod tui_tests {
             "memory_write",
             serde_json::json!({ "path": path, "markdown": "main authority" }),
         );
-        assert_eq!(main_write.status, sinomo_agent::AgentToolStatus::Succeeded);
+        assert_eq!(main_write.status, sinomo_agent::AgentToolStatus::Succeeded, "actual memory tool reply: {main_write:?}");
 
         handler
             .switch_tui_agent(&data_dir, false, AgentDefinition::coding())
@@ -7257,7 +7258,7 @@ mod tui_tests {
                 "markdown": "main session authority",
             }),
         );
-        assert_eq!(main_write.status, sinomo_agent::AgentToolStatus::Succeeded);
+        assert_eq!(main_write.status, sinomo_agent::AgentToolStatus::Succeeded, "actual memory tool reply: {main_write:?}");
 
         let info = handler
             .switch_tui_agent_for_session(
@@ -7402,10 +7403,7 @@ mod tui_tests {
                 "markdown": "main session memory",
             }),
         );
-        assert_eq!(
-            main_recall_write.status,
-            sinomo_agent::AgentToolStatus::Succeeded
-        );
+        assert_eq!(main_recall_write.status, sinomo_agent::AgentToolStatus::Succeeded, "actual memory tool reply: {main_recall_write:?}");
         let mut runtime =
             new_tui_interaction_runtime(handler, None, &session_store).expect("runtime");
         let mut state = TuiState::new(
@@ -7524,10 +7522,7 @@ mod tui_tests {
                 "markdown": "main authority remains attached",
             }),
         );
-        assert_eq!(
-            previous_memory.status,
-            sinomo_agent::AgentToolStatus::Succeeded
-        );
+        assert_eq!(previous_memory.status, sinomo_agent::AgentToolStatus::Succeeded, "actual memory tool reply: {previous_memory:?}");
         let mut runtime =
             new_tui_interaction_runtime(handler, None, &session_store).expect("runtime");
         let previous_interaction_session = runtime.session().clone();

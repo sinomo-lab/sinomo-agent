@@ -36,6 +36,17 @@ no DFS routes or background work. Component-scope teardown is the sole
 process-lifetime boundary for resident DFS workers and the exclusive data-root
 lease.
 
+File-manager construction is observational: a configured node can create a
+backend while Main is stopped. Construction validates local cluster identity
+but supplies neither authority nor a current-data guarantee, opens no private
+metadata replica, and never starts a daemon. Ordinary authoritative reads and
+mutations resolve the authenticated Main owner when invoked and fail closed if
+that owner is unavailable or has another node, cluster or process identity.
+The same backend can operate after genuine Main becomes available; changing
+its configured node or cluster requires reopening it. Discovery consumes the
+caller's existing absolute deadline. Inspection-only caller transports also
+defer Main discovery until invocation and cannot become local writers.
+
 File-history and attachment behavior lives in separate default-enabled R1
 components assembled by the same product catalog:
 
@@ -1540,6 +1551,10 @@ partition recovery or the Rust journal. The
 records each slice's exact scope.
 
 ## Reads and Caches
+
+Distributed POSIX stat derives current inode fields through bounded authenticated
+metadata projections; see [the authoritative stat contract](dfs-authoritative-stat.md)
+for generation, cross-shard completeness, compatibility and outage behavior.
 
 Reads prefer the closest valid copy:
 

@@ -298,6 +298,23 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if should_cancel() {
             return Ok(false);
         }
+        #[cfg(test)]
+        if let Some((root, _)) = self.native_publication_owner_for_observation()
+            && crate::native_boundary_diagnostics::enabled(&root)
+            && (!locks.is_empty() || !self.cross_shard_namespace_locks.is_empty())
+        {
+            crate::native_boundary_diagnostics::record(
+                &root,
+                "namespace-guard-rebuild",
+                || {
+                    serde_json::json!({
+                        "node": self.node_id, "exact_shard": exact_shard_id, "incoming": locks,
+                        "previous": format!("{:?}", self.cross_shard_namespace_locks),
+                    })
+                },
+                true,
+            );
+        }
         if let Some(exact_shard_id) = exact_shard_id {
             // A snapshot install can remove a previously running job. Replace
             // this shard's complete job-owned projection so that obsolete
@@ -327,6 +344,22 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 | DfsNamespaceJobKind::RenameDirectoryAcrossShardPrimaries
         ) {
             return Ok(());
+        }
+        #[cfg(test)]
+        if let Some((root, _)) = self.native_publication_owner_for_observation()
+            && crate::native_boundary_diagnostics::enabled(&root)
+        {
+            crate::native_boundary_diagnostics::record(
+                &root,
+                "namespace-guard-apply",
+                || {
+                    serde_json::json!({
+                        "node": self.node_id, "incoming_job": job,
+                        "previous": format!("{:?}", self.cross_shard_namespace_locks),
+                    })
+                },
+                true,
+            );
         }
         if job.status == DfsNamespaceJobStatus::Running {
             let shard_id = self

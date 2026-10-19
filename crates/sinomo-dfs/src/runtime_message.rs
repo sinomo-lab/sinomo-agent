@@ -364,9 +364,28 @@ impl DfsDetachedSendRuntime {
 
     pub fn schedule_deferred_work<F>(
         self: &Arc<Self>,
+        worker: crate::DfsNodeDetachedSendWorker,
+        deferred_target_node_ids: BTreeSet<NodeId>,
+        retry_delay: Duration,
+        spawn: F,
+    ) where
+        F: FnOnce(DfsRuntimeTask),
+    {
+        self.schedule_deferred_work_owned(
+            worker,
+            deferred_target_node_ids,
+            retry_delay,
+            None,
+            spawn,
+        );
+    }
+
+    pub(crate) fn schedule_deferred_work_owned<F>(
+        self: &Arc<Self>,
         mut worker: crate::DfsNodeDetachedSendWorker,
         deferred_target_node_ids: BTreeSet<NodeId>,
         retry_delay: Duration,
+        task_owner: Option<Arc<crate::runtime_host::DfsRuntimeHost>>,
         spawn: F,
     ) where
         F: FnOnce(DfsRuntimeTask),
@@ -403,7 +422,9 @@ impl DfsDetachedSendRuntime {
                 worker: None,
             };
             spawn(Box::pin(async move {
-                runtime.run_deferred_worker(retry_delay, owner).await;
+                runtime
+                    .run_deferred_worker(retry_delay, owner, task_owner)
+                    .await;
             }));
         }
     }
@@ -412,6 +433,7 @@ impl DfsDetachedSendRuntime {
         self: Arc<Self>,
         retry_delay: Duration,
         mut owner: DfsDeferredWorkerOwner,
+        task_owner: Option<Arc<crate::runtime_host::DfsRuntimeHost>>,
     ) {
         loop {
             let observed_generation = match self.worker_schedule.lock() {
@@ -433,11 +455,28 @@ impl DfsDetachedSendRuntime {
                 break;
             };
             let mut attempt_worker = active_worker.clone();
-            let (result, background_retry) = match tokio::task::spawn_blocking(move || {
-                attempt_worker.drain_exclusive_with_retry_observation()
-            })
-            .await
-            {
+            let attempt = if let Some(task_owner) = task_owner.as_ref() {
+                let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+                let task = tokio::task::spawn_blocking(move || {
+                    let result = attempt_worker.drain_exclusive_with_retry_observation();
+                    drop(attempt_worker);
+                    let _ = result_tx.send(result);
+                });
+                // Aborting this outer scheduler cannot stop an already-running
+                // blocking drain. Its synchronous native response handler can
+                // still own admission and the OS data lock. Register that SAME
+                // child before awaiting, so component shutdown joins it under
+                // the existing deadline before exposing storage to remount.
+                task_owner.own_task(task);
+                result_rx.await.map_err(|error| error.to_string())
+            } else {
+                tokio::task::spawn_blocking(move || {
+                    attempt_worker.drain_exclusive_with_retry_observation()
+                })
+                .await
+                .map_err(|error| error.to_string())
+            };
+            let (result, background_retry) = match attempt {
                 Ok(result) => result,
                 Err(error) => {
                     tracing::warn!("DFS deferred worker task failed: {error}");

@@ -1432,10 +1432,11 @@ fn schedule_daemon_dfs_message_deferred_work_with_policy_and_owner(
     deferred_target_node_ids: BTreeSet<NodeId>,
     task_owner: Option<Arc<DfsRuntimeHost>>,
 ) {
-    runtime.schedule_deferred_work(
+    runtime.schedule_deferred_work_owned(
         worker,
         deferred_target_node_ids,
         DAEMON_DFS_PROMOTION_RETRY_DELAY,
+        task_owner.clone(),
         move |task| {
             let task = tokio_runtime.spawn(task);
             if let Some(owner) = task_owner.as_ref() {
@@ -4224,6 +4225,8 @@ fn handle_daemon_dfs_message_on_runtime_with_background_response(
     original: Option<&sinomo_dfs::DfsRoutedMessage>,
 ) -> Result<sinomo_dfs::DfsMessageResponse, DaemonError> {
     let _data_owner_lock = require_daemon_dfs_data_owner_lock(paths)?;
+    #[cfg(any(test, feature = "test-support"))]
+    deferred_work_test::before_response(&_data_owner_lock, &command, original)?;
     handle_daemon_dfs_message_on_runtime_with_priority(paths, command, runtime, true, original)
 }
 

@@ -434,6 +434,146 @@ fn explicit_original_write_retry_recovers_its_complete_prepare() {
     check_recovered_original_write(true);
 }
 
+#[test]
+fn replayed_local_receipt_finishes_exact_prepare_after_ack_failure() {
+    let (mut runtime, mut requester, shard) = crate::test_support::current_native_metadata_service(
+        "native-replayed-receipt-publication",
+        3,
+        "/",
+    )
+    .unwrap();
+    let path = "/replayed-receipt-publication";
+    let options = DfsWriteOptions {
+        policy: DfsReplicationPolicy::new(1, 1).unwrap(),
+        replica_candidates: vec![shard.primary_node_id.clone()],
+        wait_for_commit: true,
+        foreground_replica_repair: false,
+    };
+    let initial = requester
+        .posix_write_file(
+            path,
+            b"before interrupted receipt completion",
+            options.clone(),
+        )
+        .unwrap();
+    drop(requester);
+    let mut owner = runtime.metadata_primary_service(path).unwrap();
+    let interrupted = shard.replica_node_ids[0].clone();
+    runtime.stop_node(&interrupted).unwrap();
+    let operation = "replayed-receipt-original-operation";
+    assert!(
+        owner
+            .posix_write_file_with_operation_id(
+                path,
+                b"exact bytes retained across the publication failure",
+                options,
+                operation,
+            )
+            .is_err()
+    );
+    let prepared = owner
+        .metadata_backend()
+        .unwrap()
+        .list_prepared_operations()
+        .unwrap()
+        .into_iter()
+        .find(|record| {
+            record
+                .payload
+                .prepared_intent
+                .as_ref()
+                .is_some_and(|intent| intent.operation_id.as_deref() == Some(operation))
+        })
+        .expect("the ordinary writer retained its exact complete prepare");
+    assert_eq!(prepared.status, DfsPreparedOperationStatus::Prepared);
+    let intent = prepared.payload.prepared_intent.as_ref().unwrap();
+    let hash = intent.content_hash.as_deref().unwrap();
+    assert_eq!(
+        owner
+            .coordinator
+            .receipts_for_intent(&intent.intent_id)
+            .len(),
+        1
+    );
+    assert!(
+        owner
+            .coordinator
+            .is_commit_ready(&intent.intent_id)
+            .unwrap()
+    );
+
+    // Fetch/receipt completion may be retried after the receipt succeeded but
+    // the complete-shard publication failed. Receipt deduplication must not
+    // turn that unfinished work into a successful no-op, nor waive the missing
+    // participant while it remains stopped.
+    assert!(
+        owner
+            .record_local_pending_write_receipt_if_desired(
+                &intent.intent_id,
+                &intent.object_id,
+                &intent.target_version,
+                hash,
+            )
+            .is_err(),
+        "a retained receipt is not a completed or authorized publication"
+    );
+    assert_eq!(
+        owner
+            .metadata_backend()
+            .unwrap()
+            .get_object(&intent.object_id)
+            .unwrap()
+            .unwrap()
+            .version,
+        initial.version
+    );
+    runtime.reopen_node(interrupted).unwrap();
+    owner
+        .record_local_pending_write_receipt_if_desired(
+            &intent.intent_id,
+            &intent.object_id,
+            &intent.target_version,
+            hash,
+        )
+        .unwrap();
+    let committed = owner
+        .metadata_backend()
+        .unwrap()
+        .prepared_operation_record(&prepared.digest.operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(committed.digest, prepared.digest);
+    assert_eq!(committed.payload, prepared.payload);
+    assert_eq!(committed.status, DfsPreparedOperationStatus::Committed);
+    assert!(matches!(owner.write_outcome(&intent.intent_id).unwrap(),
+        NetworkedDfsWriteOutcome::Committed { version, content_hash, .. }
+        if version == intent.target_version && content_hash == hash));
+    let prefix = owner
+        .metadata_backend()
+        .unwrap()
+        .metadata_prefix_proof(&prepared.digest.shard_id)
+        .unwrap();
+    owner
+        .record_local_pending_write_receipt_if_desired(
+            &intent.intent_id,
+            &intent.object_id,
+            &intent.target_version,
+            hash,
+        )
+        .unwrap();
+    assert_eq!(
+        owner
+            .metadata_backend()
+            .unwrap()
+            .metadata_prefix_proof(&prepared.digest.shard_id)
+            .unwrap(),
+        prefix,
+        "an exact completed receipt replay must append no new publication"
+    );
+    drop(owner);
+    runtime.close().unwrap();
+}
+
 fn check_recovered_original_write(explicit_retry: bool) {
     let name = if explicit_retry {
         "native-explicit-original-retry"
@@ -523,6 +663,143 @@ fn check_recovered_original_write(explicit_retry: bool) {
         if version == intent.target_version && Some(content_hash.as_str()) == intent.content_hash.as_deref()),
         "durable recovery must also finish the original resident outcome"
     );
+    drop(owner);
+    runtime.close().unwrap();
+}
+
+#[test]
+fn native_explicit_retry_resumes_ready_intent_after_overlapping_prepare() {
+    let (mut runtime, mut requester, shard) = crate::test_support::current_native_metadata_service(
+        "native-ready-retry-after-overlap",
+        3,
+        "/services",
+    )
+    .unwrap();
+    let path = "/services/ready-retry-after-overlap";
+    let options = DfsWriteOptions {
+        policy: DfsReplicationPolicy::new(1, 2).unwrap(),
+        replica_candidates: vec![
+            shard.primary_node_id.clone(),
+            shard.replica_node_ids[0].clone(),
+        ],
+        wait_for_commit: true,
+        foreground_replica_repair: false,
+    };
+    let initial = requester
+        .posix_write_file(path, b"original", options.clone())
+        .unwrap();
+    requester
+        .posix_sync_file(path, DfsPosixSyncKind::File)
+        .unwrap();
+    drop(requester);
+    let mut owner = runtime.metadata_primary_service(path).unwrap();
+    let interrupted = shard.replica_node_ids[1].clone();
+    runtime.stop_node(&interrupted).unwrap();
+
+    // A genuine different metadata publication owns this object's reservation.
+    // Keep its original durable body while an assigned participant is absent.
+    let mut changed = owner
+        .metadata_backend()
+        .unwrap()
+        .get_object(&initial.object_id)
+        .unwrap()
+        .unwrap();
+    changed.accessed_at_unix_nanos += 1;
+    assert!(owner.add_object_metadata(changed.clone()).is_err());
+    let other = owner
+        .metadata_backend()
+        .unwrap()
+        .list_prepared_operations()
+        .unwrap()
+        .into_iter()
+        .find(|record| {
+            record.payload.metadata_effects.iter().any(|effect| {
+                matches!(effect, DfsPreparedMetadataEffect::PutObject { object }
+                    if object.object_id == initial.object_id
+                    && object.accessed_at_unix_nanos == changed.accessed_at_unix_nanos)
+            })
+        })
+        .unwrap();
+    other.validate().unwrap();
+    assert_eq!(other.status, DfsPreparedOperationStatus::Prepared);
+
+    let operation = "native-original-before-prepare-overlap";
+    let error = owner
+        .posix_write_file_with_operation_id(path, b"recovered", options.clone(), operation)
+        .unwrap_err();
+    assert!(error.to_string().contains(&format!(
+        "overlaps active prepare {}",
+        other.digest.operation_id
+    )));
+    let intent_id =
+        crate::intent::stable_write_intent_id(&owner.node_id, &initial.object_id, operation);
+    let intent = owner.coordinator.intent(&intent_id).unwrap().clone();
+    assert_eq!(intent.state, DfsWriteIntentState::AwaitingReceipts);
+    assert_eq!(owner.coordinator.durable_receipt_count(&intent_id), 1);
+    assert!(owner.coordinator.is_commit_ready(&intent_id).unwrap());
+    assert!(
+        owner
+            .metadata_backend()
+            .unwrap()
+            .prepared_operation_record(&format!("write:{intent_id}"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        owner
+            .metadata_backend()
+            .unwrap()
+            .get_intent(&initial.object_id, &intent_id)
+            .unwrap()
+            .is_none()
+    );
+    let pending = owner.writes.pending_writes.get(&intent_id).unwrap();
+    let original_hash = pending.content_hash.clone();
+    let original_size = pending.size_bytes;
+
+    // An exact retry cannot be replaced with another payload, even before its
+    // first native prepare exists. Preserve the actual retained transfer.
+    assert!(matches!(
+        owner.posix_write_file_with_operation_id(path, b"different", options.clone(), operation),
+        Err(DfsPosixError::Dfs(
+            DfsError::WriteOperationIdConflict { .. }
+        ))
+    ));
+    let pending = owner.writes.pending_writes.get(&intent_id).unwrap();
+    assert_eq!(pending.content_hash, original_hash);
+    assert_eq!(pending.size_bytes, original_size);
+
+    runtime.reopen_node(interrupted).unwrap();
+    owner.recover_one_prepared_operation(other.clone()).unwrap();
+    let settled = owner
+        .metadata_backend()
+        .unwrap()
+        .prepared_operation_record(&other.digest.operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(settled.digest, other.digest);
+    assert_eq!(settled.payload, other.payload);
+    assert_eq!(settled.status, DfsPreparedOperationStatus::Committed);
+
+    let result = owner
+        .posix_write_file_with_operation_id(path, b"recovered", options, operation)
+        .expect("the exact receipt-ready write must resume after the other prepare commits");
+    assert_eq!(result.version, intent.target_version);
+    assert_eq!(result.content_hash.as_deref(), Some(original_hash.as_str()));
+    assert_eq!(
+        owner.posix_read_file_distributed(path).unwrap(),
+        b"recovered"
+    );
+    let committed = owner
+        .metadata_backend()
+        .unwrap()
+        .prepared_operation_record(&format!("write:{intent_id}"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(committed.status, DfsPreparedOperationStatus::Committed);
+    assert!(matches!(owner.write_outcome(&intent_id).unwrap(),
+        NetworkedDfsWriteOutcome::Committed { version, content_hash, .. }
+        if version == intent.target_version && content_hash == original_hash));
     drop(owner);
     runtime.close().unwrap();
 }
@@ -1333,6 +1610,40 @@ fn metadata_authority_probe_rejects_a_gap_before_the_hidden_prepare() {
         receiver.metadata_replay_cursor(&shard_id).unwrap(),
         base_head
     );
+    // The sender can now know this complete durable cut while the ordinary
+    // materializer is still paused. Confirmation-only replay must validate
+    // the same original body and prefix through the real authenticated route.
+    let mut confirmation = command.clone();
+    confirmation.request_id = "native-current-cut-confirmation-after-deferred-ingest".into();
+    confirmation.batch.journal_frames.clear();
+    confirmation.authority_probe.as_mut().unwrap().probe_id =
+        "native-current-cut-fresh-confirmation".into();
+    let confirmed = call(&confirmation);
+    assert_eq!(
+        confirmed.result,
+        DfsMetadataJournalBatchResult::Applied,
+        "already durable original/cut confirmation: {confirmed:?}; probe={:?}",
+        confirmation.authority_probe,
+    );
+    assert_eq!(
+        confirmed.verified_authority_probe_id,
+        crate::service_replica::metadata_authority_probe_confirmation_id(
+            confirmation.authority_probe.as_ref().unwrap()
+        )
+    );
+    assert_eq!(
+        confirmed.applied_entries, 0,
+        "confirmation appends no journal frame"
+    );
+    assert_eq!(
+        receiver
+            .metadata_authority_ack_floor(&shard_id)
+            .unwrap()
+            .unwrap()
+            .journal_sequence,
+        later.prepare_sequence,
+        "confirmation preserves the exact acknowledged current cut"
+    );
     pause.release();
     drop(pause);
     dispatch.close();
@@ -1816,13 +2127,27 @@ fn retry_pending_repairs_skips_sender_that_lost_metadata_primary_authority() {
     // This fixture owns the actual Core producer, rather than the browser
     // client whose same-node write is delegated to Main.
     let mut old = runtime.metadata_primary_service(path).unwrap();
+    let (_, _, replication) = old
+        .managed_replication_policy_for_path(path, DfsObjectPolicy::ReplicatedEventual, 2)
+        .unwrap();
+    assert_eq!(replication.min_commit_replicas, 1);
+    assert_eq!(replication.desired_replicas, 2);
+    assert_eq!(
+        replication
+            .required_node_ids
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        [owner.clone(), replica.clone()].into_iter().collect(),
+        "the native plan must retain this fixture's actual required missing target"
+    );
     let stat = old
         .posix_write_file(
             path,
             b"actual old-primary repair bytes",
             DfsWriteOptions {
                 replica_candidates: vec![owner.clone(), replica.clone()],
-                policy: DfsReplicationPolicy::new(1, 2).unwrap(),
+                policy: replication,
                 wait_for_commit: true,
                 foreground_replica_repair: false,
             },
@@ -2815,11 +3140,27 @@ fn sifs_cluster_authority_local_follower_bootstrap_stays_on_incremental_stream()
                 DfsWriteOptions::replicated_eventual(vec![primary_node.clone()]),
             )
             .unwrap();
+        let shard_id = DfsMetadataShardId::new(config.shard_id.clone());
+        let publication_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+        let published_sequence =
+            captured_native_publication_prefix(&runtime, &primary_node, &shard_id, &stat);
         let publication = runtime
-            .maintenance_tick(&primary_node, sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
+            .maintenance_tick(
+                &primary_node,
+                publication_deadline.saturating_duration_since(Instant::now()),
+            )
             .unwrap();
         assert!(publication.outcome.is_ok(), "{:?}", publication.outcome);
         assert_eq!(publication.omitted_kv_event_count, 0);
+        observe_native_follower_prefix(
+            &runtime,
+            &follower_node,
+            &shard_id,
+            published_sequence,
+            publication_deadline,
+            |_| {},
+        )
+        .unwrap();
         assert_eq!(follower.posix_stat(&file).unwrap().version, stat.version);
         assert_eq!(follower.posix_read_file_distributed(&file).unwrap(), bytes);
     }
@@ -2845,6 +3186,145 @@ fn sifs_cluster_authority_local_follower_bootstrap_stays_on_incremental_stream()
             && event.phase == crate::test_support::DfsTestRpcPhase::BeforeDispatch),
         "actual authority-local bootstrap keeps normal follow-up writes on incremental publication"
     );
+    drop(follower);
+    drop(primary);
+    runtime.close().unwrap();
+}
+
+fn observe_native_follower_prefix(
+    runtime: &crate::test_runtime::DfsTestRuntime,
+    follower_node: &NodeId,
+    shard: &DfsMetadataShardId,
+    published_sequence: u64,
+    deadline: Instant,
+    mut on_lag: impl FnMut(u64),
+) -> std::result::Result<(), String> {
+    // Ingress ACK proves durable journal custody, not completion of its
+    // separate materializer. Observe that real owner under the SAME deadline
+    // captured before maintenance; never pull/apply a replacement journal here.
+    loop {
+        if Instant::now() >= deadline {
+            return Err(
+                "native follower observation exhausted the original publication deadline".into(),
+            );
+        }
+        if let Some(observed) =
+            crate::runtime_host::materialization_test::observe_existing_materialization(
+                runtime.data_dir(follower_node),
+                &sifs_file_system_id(),
+                shard,
+                &runtime.runtime_handle(),
+            )?
+        {
+            let materialized = observed.materialized_sequence.unwrap();
+            let durable = observed.durable_sequence.unwrap();
+            assert!(materialized <= durable, "{observed:?}");
+            if materialized >= published_sequence {
+                let prefix = observed
+                    .prefix
+                    .as_ref()
+                    .expect("materialized prefix evidence");
+                assert!(prefix.is_well_formed());
+                assert_eq!(prefix.journal_sequence, materialized);
+                return Ok(());
+            }
+            on_lag(materialized);
+        }
+        std::thread::sleep(
+            SIFS_CLUSTER_PUMP_IDLE_SLEEP.min(deadline.saturating_duration_since(Instant::now())),
+        );
+    }
+}
+
+fn captured_native_publication_prefix(
+    runtime: &crate::test_runtime::DfsTestRuntime,
+    primary: &NodeId,
+    shard: &DfsMetadataShardId,
+    published: &DfsStat,
+) -> u64 {
+    // The caller shell's cached prefix is not the served Main's publication
+    // cut. Inspect the actual source store without obtaining author authority.
+    let source = LocalSobjMetadataBackend::open_for_inspection(
+        shard.clone(),
+        default_dfs_metadata_shards_root(runtime.data_dir(primary)).join(&shard.0),
+    )
+    .unwrap();
+    let object = source.get_object(&published.object_id).unwrap().unwrap();
+    assert_eq!(object.version, published.version);
+    assert_eq!(object.content_hash, published.content_hash);
+    let snapshot = source.export_table_snapshot();
+    assert!(snapshot.prefix_proof.is_well_formed());
+    assert_eq!(
+        snapshot.prefix_proof.journal_sequence,
+        snapshot.materialized_through_sequence
+    );
+    snapshot.materialized_through_sequence
+}
+
+#[test]
+fn native_follower_observation_waits_for_actual_published_prefix_materialization() {
+    let name = "native-follower-observed-prefix-gap";
+    let (runtime, mut primary, config) =
+        crate::test_support::current_native_metadata_service(name, 2, "/users").unwrap();
+    let follower_node = config.replica_node_ids[0].clone();
+    let mut follower = runtime.client(&follower_node).unwrap();
+    let shard = DfsMetadataShardId::new(config.shard_id.clone());
+    let pause = runtime
+        .pause_replica_materialization(&follower_node, &shard)
+        .unwrap();
+    let path = "/users/native-follower-observed-prefix-gap";
+    let original = primary.posix_mkdir(path).unwrap();
+    let capture = runtime
+        .wait_paused_materialization(&pause, Duration::from_secs(2))
+        .unwrap();
+    assert!(capture.unavailable.is_none(), "{capture:?}");
+    assert!(capture.durable_sequence.unwrap() > capture.materialized_sequence.unwrap());
+    assert!(matches!(
+        follower.posix_stat(path),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+    let published =
+        captured_native_publication_prefix(&runtime, &config.primary_node_id, &shard, &original);
+    assert!(published > capture.materialized_sequence.unwrap());
+    assert!(
+        observe_native_follower_prefix(
+            &runtime,
+            &follower_node,
+            &shard,
+            published,
+            Instant::now(),
+            |_| panic!("an expired observer must not request more work"),
+        )
+        .is_err()
+    );
+    let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    let mut saw_gap = false;
+    let observed = observe_native_follower_prefix(
+        &runtime,
+        &follower_node,
+        &shard,
+        published,
+        deadline,
+        |cursor| {
+            assert!(cursor < published);
+            saw_gap = true;
+            pause.release();
+        },
+    );
+    pause.release();
+    assert!(
+        saw_gap,
+        "the actual materialization owner must expose its pending cut"
+    );
+    observed.expect("durable ingress must be observed as materialized before local stat");
+    let actual = follower.posix_stat(path).unwrap();
+    assert_eq!(actual.object_id, original.object_id);
+    assert_eq!(actual.version, original.version);
+    assert_eq!(
+        follower.posix_stat_distributed(path).unwrap().object_id,
+        original.object_id
+    );
+    drop(pause);
     drop(follower);
     drop(primary);
     runtime.close().unwrap();
@@ -3155,4 +3635,955 @@ fn served_requester_completion_does_not_claim_authority_repair_work() {
     drop(client);
     runtime.clear_faults();
     runtime.close().unwrap();
+}
+
+#[test]
+fn metadata_receipt_retry_recovers_original_prepare_and_receipt_identity() {
+    let (mut runtime, mut requester, shard) = crate::test_support::current_native_metadata_service(
+        "native-metadata-receipt-exact-retry",
+        3,
+        "/",
+    )
+    .unwrap();
+    let path = "/receipt-exact-retry";
+    let original = requester
+        .posix_write_file(
+            path,
+            b"visible original",
+            DfsWriteOptions {
+                policy: DfsReplicationPolicy::new(1, 1).unwrap(),
+                replica_candidates: vec![shard.primary_node_id.clone()],
+                wait_for_commit: true,
+                foreground_replica_repair: false,
+            },
+        )
+        .unwrap();
+    drop(requester);
+    let mut owner = runtime.metadata_primary_service(path).unwrap();
+    let version = DfsVersion::generate();
+    // Actual native durable content precedes the producer's receipt. This test
+    // exercises receipt publication alone and never makes this version visible.
+    let manifest = owner
+        .content()
+        .put_object_version(
+            original.object_id.as_str(),
+            version.as_str(),
+            b"native content awaiting receipt publication",
+        )
+        .unwrap();
+    let stopped = shard.replica_node_ids[0].clone();
+    runtime.stop_node(&stopped).unwrap();
+    assert!(
+        owner
+            .put_metadata_receipt(
+                &original.file_system_id,
+                &original.object_id,
+                &version,
+                &shard.primary_node_id,
+                &manifest.content_hash
+            )
+            .is_err()
+    );
+    let prepared = owner.metadata_backend().unwrap().list_prepared_operations().unwrap().into_iter().find(|record| {
+        matches!(record.payload.metadata_effects.as_slice(), [DfsPreparedMetadataEffect::PutReceipt { receipt }]
+            if receipt.receipt.object_id == original.object_id && receipt.receipt.committed_version == version)
+    }).expect("the original native receipt publication is durably prepared");
+    assert_eq!(prepared.status, DfsPreparedOperationStatus::Prepared);
+    assert!(
+        owner
+            .backend_receipt_for_replica(&original.object_id, &version, &shard.primary_node_id)
+            .unwrap()
+            .is_none()
+    );
+    let before = owner
+        .metadata_backend()
+        .unwrap()
+        .metadata_prefix_proof(&prepared.digest.shard_id)
+        .unwrap();
+    assert!(
+        owner
+            .put_metadata_receipt(
+                &original.file_system_id,
+                &original.object_id,
+                &version,
+                &shard.primary_node_id,
+                &crate::content_hash(b"changed receipt input")
+            )
+            .is_err()
+    );
+    assert_eq!(
+        owner
+            .metadata_backend()
+            .unwrap()
+            .metadata_prefix_proof(&prepared.digest.shard_id)
+            .unwrap(),
+        before,
+        "a conflicting retry must publish nothing"
+    );
+    runtime.reopen_node(stopped).unwrap();
+    assert!(
+        owner
+            .put_metadata_receipt(
+                &original.file_system_id,
+                &original.object_id,
+                &version,
+                &shard.primary_node_id,
+                &manifest.content_hash
+            )
+            .unwrap()
+    );
+    let terminal = owner
+        .metadata_backend()
+        .unwrap()
+        .prepared_operation_record(&prepared.digest.operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(terminal.status, DfsPreparedOperationStatus::Committed);
+    assert_eq!(terminal.digest, prepared.digest);
+    assert_eq!(terminal.payload, prepared.payload);
+    let DfsPreparedMetadataEffect::PutReceipt { receipt: expected } =
+        &prepared.payload.metadata_effects[0]
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        owner
+            .backend_receipt_for_replica(&original.object_id, &version, &shard.primary_node_id)
+            .unwrap()
+            .as_ref(),
+        Some(expected),
+        "original event ID and timestamp survive exact replay"
+    );
+    assert_eq!(
+        owner
+            .metadata_backend()
+            .unwrap()
+            .get_object(&original.object_id)
+            .unwrap()
+            .unwrap()
+            .version,
+        original.version
+    );
+    assert_eq!(
+        owner
+            .content()
+            .read_object_version(original.object_id.as_str(), version.as_str())
+            .unwrap()
+            .1,
+        b"native content awaiting receipt publication"
+    );
+    let after = owner
+        .metadata_backend()
+        .unwrap()
+        .metadata_prefix_proof(&prepared.digest.shard_id)
+        .unwrap();
+    assert!(
+        !owner
+            .put_metadata_receipt(
+                &original.file_system_id,
+                &original.object_id,
+                &version,
+                &shard.primary_node_id,
+                &manifest.content_hash
+            )
+            .unwrap()
+    );
+    assert_eq!(
+        owner
+            .metadata_backend()
+            .unwrap()
+            .metadata_prefix_proof(&prepared.digest.shard_id)
+            .unwrap(),
+        after
+    );
+    drop(owner);
+    runtime.close().unwrap();
+}
+
+fn check_compound_receipt_publication_retry(capture_filesystem: bool) {
+    let name = if capture_filesystem {
+        "native-receipt-location-filesystem-retry"
+    } else {
+        "native-receipt-location-retry"
+    };
+    let (mut runtime, owner, replica, service, stat, intent_id, seed_interception) =
+        super::repair::native_committed_repair_backlog_with_nodes(name, true, 3);
+    drop(service);
+    runtime.clear_faults();
+    let captured = Arc::new(Mutex::new(Vec::<DfsRoutedMessage>::new()));
+    runtime.install_fault(crate::test_runtime::FaultRule {
+        source: Some(owner.clone()),
+        target: Some(replica.clone()),
+        route: Some(DFS_DATA_REPAIR_REPLICA_ROUTE.into()),
+        call_id: None,
+        origin: Some(crate::test_runtime::RpcOrigin::RegisteredHost),
+        remaining_hits: 1,
+        action: crate::test_runtime::FaultAction::CaptureTransferReplyAndLoseAfterDispatch {
+            intent_id: Some(intent_id.clone()),
+            captured: Arc::clone(&captured),
+        },
+    });
+    drop(seed_interception);
+    let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    let tick = runtime
+        .maintenance_tick(&owner, deadline.saturating_duration_since(Instant::now()))
+        .unwrap();
+    assert!(
+        tick.outcome.is_ok(),
+        "actual native repair producer: {:?}",
+        tick.outcome
+    );
+    let original = crate::test_runtime::executor().block_on(async {
+        tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), async {
+            loop {
+                if let Some(reply) = captured.lock().unwrap().iter().find(|routed| {
+                    matches!(&routed.message, DfsNetworkMessage::RepairReplicaResponse(r)
+                        if r.intent_id == intent_id && r.object_id == stat.object_id && r.version == stat.version)
+                }).cloned() { break reply; }
+                tokio::task::yield_now().await;
+            }
+        }).await
+    }).expect("genuine repair reply within the unchanged native window");
+    let background = runtime
+        .deny_background_replica_before_claim(&owner)
+        .unwrap();
+    runtime.clear_faults();
+    assert_eq!(original.source_node_id, replica);
+    assert_eq!(original.target_node_id, owner);
+    let DfsNetworkMessage::RepairReplicaResponse(response) = &original.message else {
+        unreachable!()
+    };
+    assert_eq!(response.replica_node_id, replica);
+    assert_eq!(response.file_system_id, stat.file_system_id);
+    let hash = match &response.result {
+        DfsBlobTransferResult::Durable { content_hash }
+        | DfsBlobTransferResult::Committed { content_hash } => content_hash.clone(),
+        other => panic!("actual receiver did not retain durable bytes: {other:?}"),
+    };
+    assert_eq!(Some(hash.as_str()), stat.content_hash.as_deref());
+    let queue = LocalDfsRepairQueueStore::new(default_dfs_repair_attempt_snapshot_path(
+        runtime.data_dir(&owner),
+    ));
+    let records = queue
+        .records_for_targets(&intent_id, std::slice::from_ref(&replica))
+        .unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].transfer_request_id.as_deref(),
+        Some(response.request_id.as_str())
+    );
+    assert_eq!(records[0].object_id, stat.object_id);
+    assert_eq!(records[0].version, stat.version);
+    assert_eq!(records[0].content_hash, hash);
+    if capture_filesystem {
+        runtime
+            .apply_placement_policy(
+                &owner,
+                &format!("/services/{name}-unrelated"),
+                DfsPlacementScope::Subtree,
+                DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 1).unwrap(),
+            )
+            .unwrap();
+    }
+    let current_configuration = runtime
+        .shared_control_plane()
+        .unwrap()
+        .with_client(|kv| {
+            DfsControlPlaneStore::new(kv.as_mut()).get_file_system_config(&stat.file_system_id)
+        })
+        .unwrap()
+        .unwrap();
+    let mut source = runtime.metadata_primary_service(&stat.path).unwrap();
+    source
+        .retry_pending_repairs_bounded_with_attempts(0, &records)
+        .unwrap();
+    let current = source
+        .current_read_object_metadata(&stat.object_id)
+        .unwrap();
+    let shard = source
+        .local_metadata_owner_shard_hint_for_object(&current)
+        .unwrap()
+        .unwrap();
+    let mut projection_execution = if capture_filesystem {
+        let execution = source
+            .acquire_prepared_execution(&DfsPreparedOperationScope {
+                file_system_id: stat.file_system_id.clone(),
+                shard_id: DfsMetadataShardId::new(shard.shard_id.clone()),
+                owner_epoch: shard.epoch,
+                operation_id: intent_id.clone(),
+            })
+            .unwrap()
+            .expect("actual scoped Core owner");
+        // The ordinary bootstrap's projection step uses this SAME actual
+        // native configuration. Do not bootstrap foreign roots through this
+        // services-only backend, or manufacture an authority/receipt.
+        source.clear_metadata_lookup_cache();
+        source
+            .metadata
+            .add_file_system(DfsFileSystem::from(current_configuration.clone()));
+        source.clear_metadata_lookup_cache();
+        Some(execution)
+    } else {
+        None
+    };
+    let missing = shard
+        .replica_node_ids
+        .iter()
+        .find(|node| **node != replica)
+        .unwrap()
+        .clone();
+    assert_ne!(missing, owner);
+    assert_ne!(missing, replica);
+    runtime.stop_node(&missing).unwrap();
+    assert!(
+        source
+            .put_metadata_receipt(
+                &stat.file_system_id,
+                &stat.object_id,
+                &stat.version,
+                &replica,
+                &hash
+            )
+            .is_err()
+    );
+    // Yield the fixture's actual admission at the producer-call boundary.
+    // The durable prepare and genuine reply retain recovery custody.
+    drop(projection_execution.take());
+    let prepared = source.metadata_backend().unwrap().list_prepared_operations().unwrap().into_iter().find(|record|
+        record.metadata_effects.iter().any(|effect| matches!(effect,
+            DfsPreparedMetadataEffect::PutReceipt { receipt } if receipt.receipt.object_id == stat.object_id
+                && receipt.receipt.committed_version == stat.version && receipt.replica_node_id == replica)))
+        .expect("genuine returned receipt retained its original compound publication");
+    assert!(prepared.metadata_effects.iter().any(|effect| matches!(effect, DfsPreparedMetadataEffect::PutObject { object }
+        if object.object_id == stat.object_id && object.version == stat.version && object.current_locations.contains(&replica))));
+    assert_eq!(
+        prepared
+            .metadata_effects
+            .iter()
+            .any(|effect| matches!(effect, DfsPreparedMetadataEffect::PutFileSystem { .. })),
+        capture_filesystem,
+        "exercise the exact observed compound form"
+    );
+    assert!(
+        source
+            .backend_receipt_for_replica(&stat.object_id, &stat.version, &replica)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        !source
+            .metadata_backend()
+            .unwrap()
+            .get_object(&stat.object_id)
+            .unwrap()
+            .unwrap()
+            .current_locations
+            .contains(&replica)
+    );
+    let prefix = source
+        .metadata_backend()
+        .unwrap()
+        .metadata_prefix_proof(&prepared.digest.shard_id)
+        .unwrap();
+    assert!(
+        source
+            .put_metadata_receipt(
+                &stat.file_system_id,
+                &stat.object_id,
+                &stat.version,
+                &replica,
+                &crate::content_hash(b"wrong receipt bytes")
+            )
+            .is_err()
+    );
+    assert_eq!(
+        source
+            .metadata_backend()
+            .unwrap()
+            .metadata_prefix_proof(&prepared.digest.shard_id)
+            .unwrap(),
+        prefix
+    );
+    runtime.reopen_node(missing).unwrap();
+    // A different caller read-set must never be hidden by matching the receipt.
+    let mut conflicting = (*prepared.payload).clone();
+    conflicting.expected_object_versions[0].expected_version = Some(DfsVersion::generate());
+    assert!(source.publish_metadata_effect_payload(conflicting).is_err());
+    assert_eq!(
+        source
+            .metadata_backend()
+            .unwrap()
+            .metadata_prefix_proof(&prepared.digest.shard_id)
+            .unwrap(),
+        prefix
+    );
+    let proof_captures = std::iter::once(&shard.primary_node_id)
+        .chain(shard.replica_node_ids.iter())
+        .map(|node| {
+            (
+                node.clone(),
+                crate::test_support::capture_native_shard_trace(
+                    &runtime.data_dir(node).root(),
+                    prepared.digest.shard_id.clone(),
+                )
+                .unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let replay = source.put_metadata_receipt(
+        &stat.file_system_id,
+        &stat.object_id,
+        &stat.version,
+        &replica,
+        &hash,
+    );
+    if let Err(error) = &replay {
+        eprintln!("compound-receipt retry error: {error:?}");
+        let observations = runtime.rpc_observations();
+        for observation in observations.iter().rev().take(24).rev() {
+            eprintln!("compound-receipt rpc: {observation:?}");
+        }
+    }
+    for (node, capture) in proof_captures {
+        capture.close();
+        if replay.is_err() {
+            let path = runtime
+                .data_dir(&node)
+                .root()
+                .join("compound-receipt-proof.json");
+            capture
+                .export_raw(std::fs::File::create(&path).unwrap())
+                .unwrap();
+            eprintln!("compound-receipt native proof: {}", path.display());
+        }
+    }
+    assert!(replay.unwrap());
+    let terminal = source
+        .metadata_backend()
+        .unwrap()
+        .prepared_operation_record(&prepared.digest.operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(terminal.status, DfsPreparedOperationStatus::Committed);
+    assert_eq!(terminal.digest, prepared.digest);
+    assert_eq!(terminal.payload, prepared.payload);
+    let expected_receipt = prepared
+        .metadata_effects
+        .iter()
+        .find_map(|effect| match effect {
+            DfsPreparedMetadataEffect::PutReceipt { receipt } => Some(receipt),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        source
+            .backend_receipt_for_replica(&stat.object_id, &stat.version, &replica)
+            .unwrap()
+            .as_ref(),
+        Some(expected_receipt)
+    );
+    let expected_object = prepared
+        .metadata_effects
+        .iter()
+        .find_map(|effect| match effect {
+            DfsPreparedMetadataEffect::PutObject { object } => Some(object),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        source
+            .metadata_backend()
+            .unwrap()
+            .get_object(&stat.object_id)
+            .unwrap()
+            .as_ref(),
+        Some(expected_object)
+    );
+    assert_eq!(
+        runtime
+            .shared_control_plane()
+            .unwrap()
+            .with_client(|kv| DfsControlPlaneStore::new(kv.as_mut())
+                .get_file_system_config(&stat.file_system_id))
+            .unwrap()
+            .as_ref(),
+        Some(&current_configuration)
+    );
+    let after = source
+        .metadata_backend()
+        .unwrap()
+        .metadata_prefix_proof(&prepared.digest.shard_id)
+        .unwrap();
+    assert!(
+        !source
+            .put_metadata_receipt(
+                &stat.file_system_id,
+                &stat.object_id,
+                &stat.version,
+                &replica,
+                &hash
+            )
+            .unwrap()
+    );
+    assert_eq!(
+        source
+            .metadata_backend()
+            .unwrap()
+            .metadata_prefix_proof(&prepared.digest.shard_id)
+            .unwrap(),
+        after
+    );
+    // Consume the unchanged genuine reply through its actual retained claim.
+    let execution = source
+        .acquire_prepared_execution(&DfsPreparedOperationScope {
+            file_system_id: stat.file_system_id.clone(),
+            shard_id: DfsMetadataShardId::new(shard.shard_id),
+            owner_epoch: shard.epoch,
+            operation_id: intent_id.clone(),
+        })
+        .unwrap()
+        .expect("actual Core response-consumption owner");
+    let events = source
+        .process_routed_messages_with_options(vec![original], true)
+        .unwrap();
+    source.observe_repair_maintenance_events(&events);
+    drop(execution);
+    drop(projection_execution);
+    drop(source);
+    drop(queue);
+    drop(background);
+    runtime.close().unwrap();
+}
+
+#[test]
+fn compound_receipt_location_retry_preserves_original_publication() {
+    check_compound_receipt_publication_retry(false);
+}
+
+#[test]
+fn compound_receipt_filesystem_retry_preserves_original_publication() {
+    check_compound_receipt_publication_retry(true);
+}
+fn check_retained_intent_opening(
+    reconcile_only: bool,
+    restart_owner: bool,
+    receipt_completion: bool,
+) {
+    assert!(!receipt_completion || (!reconcile_only && !restart_owner));
+    let name = if receipt_completion {
+        "native-retained-opening-receipt-completion"
+    } else if reconcile_only {
+        "native-retained-opening-reconcile"
+    } else if restart_owner {
+        "native-retained-opening-restart-retry"
+    } else {
+        "native-retained-opening-exact-retry"
+    };
+    let (mut runtime, mut client, shard) =
+        crate::test_support::current_native_metadata_service(name, 3, "/").unwrap();
+    let path = "/retained-intent-opening";
+    let initial = client
+        .posix_write_file(
+            path,
+            b"visible before the interrupted opening",
+            DfsWriteOptions {
+                policy: DfsReplicationPolicy::new(1, 1).unwrap(),
+                replica_candidates: vec![shard.primary_node_id.clone()],
+                wait_for_commit: true,
+                foreground_replica_repair: false,
+            },
+        )
+        .unwrap();
+    drop(client);
+    let mut owner = runtime.metadata_primary_service(path).unwrap();
+    let stopped = shard.replica_node_ids[0].clone();
+    let content_replica = shard.replica_node_ids[1].clone();
+    // Keep both required content targets live. Only the separate metadata
+    // participant is missing, so W2 admission must not fail at replica setup.
+    let mut policy = DfsReplicationPolicy::new(2, 2).unwrap();
+    policy.required_node_ids = vec![shard.primary_node_id.clone(), content_replica.clone()];
+    let options = DfsWriteOptions {
+        policy,
+        replica_candidates: vec![shard.primary_node_id.clone(), content_replica.clone()],
+        wait_for_commit: true,
+        foreground_replica_repair: false,
+    };
+    let operation = "retained-opening-original-operation";
+    let bytes = b"exact native bytes before intent publication";
+    runtime.stop_node(&stopped).unwrap();
+    assert!(
+        owner
+            .posix_write_file_with_operation_id(path, bytes, options.clone(), operation)
+            .is_err()
+    );
+    let prepared = owner
+        .metadata_backend()
+        .unwrap()
+        .list_prepared_operations()
+        .unwrap()
+        .into_iter()
+        .find(|record| {
+            record.payload.metadata_effects.iter().any(|effect| {
+                matches!(effect, DfsPreparedMetadataEffect::PutIntent { intent }
+                if intent.operation_id.as_deref() == Some(operation))
+            })
+        })
+        .expect("actual opening prepare must survive its missing native ACK");
+    assert_eq!(prepared.status, DfsPreparedOperationStatus::Prepared);
+    assert!(
+        prepared.payload.prepared_intent.is_none(),
+        "this is the intent-opening namespace body, not a final write body"
+    );
+    let record = prepared
+        .payload
+        .metadata_effects
+        .iter()
+        .find_map(|effect| match effect {
+            DfsPreparedMetadataEffect::PutIntent { intent }
+                if intent.operation_id.as_deref() == Some(operation) =>
+            {
+                Some(intent.clone())
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(record.policy.min_commit_replicas, 2);
+    assert_eq!(record.policy.desired_replicas, 2);
+    assert!(
+        owner
+            .metadata_backend()
+            .unwrap()
+            .get_intent(&record.object_id, &record.intent_id)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        owner
+            .metadata_backend()
+            .unwrap()
+            .get_object(&initial.object_id)
+            .unwrap()
+            .unwrap()
+            .version,
+        initial.version
+    );
+    assert_eq!(
+        owner
+            .content()
+            .read_blob(&crate::content_hash(bytes))
+            .unwrap(),
+        bytes
+    );
+    assert!(
+        owner
+            .content()
+            .content_reservation_roots()
+            .unwrap()
+            .reservations
+            .iter()
+            .any(
+                |reservation| reservation.identity.object_id == record.object_id.as_str()
+                    && reservation.identity.version == record.target_version.as_str()
+                    && reservation.identity.content_hash == crate::content_hash(bytes)
+            ),
+        "the unpublished input retains its exact durable object/version/hash custody"
+    );
+    if reconcile_only {
+        let prefix = owner
+            .metadata_backend()
+            .unwrap()
+            .metadata_prefix_proof(&prepared.digest.shard_id)
+            .unwrap();
+        let outcome = owner.reconcile_stable_write_operation(
+            path,
+            &record.object_id,
+            operation,
+            &crate::content_hash(bytes),
+            bytes.len() as u64,
+        );
+        match outcome {
+            Ok(DfsStableWriteOperationReconciliation::AmbiguousOrExpired { .. }) => {}
+            Err(DfsError::MetadataRecoveryQuorumUnavailable {
+                required: 3,
+                verified: 2,
+                ..
+            }) => {}
+            other => panic!(
+                "a retained uncommitted opening is neither authoritative absence nor successful publication; only the actual missing native proof may block this read: {other:?}"
+            ),
+        }
+        let still_prepared = owner
+            .metadata_backend()
+            .unwrap()
+            .prepared_operation_record(&prepared.digest.operation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(still_prepared.digest, prepared.digest);
+        assert_eq!(still_prepared.payload, prepared.payload);
+        assert_eq!(still_prepared.status, prepared.status);
+        assert_eq!(
+            owner
+                .metadata_backend()
+                .unwrap()
+                .metadata_prefix_proof(&prepared.digest.shard_id)
+                .unwrap(),
+            prefix
+        );
+    } else {
+        let prefix = owner
+            .metadata_backend()
+            .unwrap()
+            .metadata_prefix_proof(&prepared.digest.shard_id)
+            .unwrap();
+        assert!(
+            owner
+                .posix_write_file_with_operation_id(
+                    path,
+                    b"different input",
+                    options.clone(),
+                    operation
+                )
+                .is_err()
+        );
+        assert_eq!(
+            owner
+                .metadata_backend()
+                .unwrap()
+                .metadata_prefix_proof(&prepared.digest.shard_id)
+                .unwrap(),
+            prefix
+        );
+        assert_eq!(
+            owner
+                .content()
+                .read_blob(&crate::content_hash(bytes))
+                .unwrap(),
+            bytes
+        );
+        assert!(
+            owner
+                .content()
+                .content_reservation_roots()
+                .unwrap()
+                .reservations
+                .iter()
+                .any(
+                    |reservation| reservation.identity.object_id == record.object_id.as_str()
+                        && reservation.identity.version == record.target_version.as_str()
+                        && reservation.identity.content_hash == crate::content_hash(bytes)
+                ),
+            "the unpublished input retains its exact durable object/version/hash custody"
+        );
+        runtime.reopen_node(stopped.clone()).unwrap();
+        if restart_owner {
+            drop(owner);
+            runtime.stop_node(&shard.primary_node_id).unwrap();
+            runtime.reopen_node(shard.primary_node_id.clone()).unwrap();
+            owner = runtime.metadata_primary_service(path).unwrap();
+        }
+
+        let (written_object_id, written_version) = if receipt_completion {
+            // Resume the ordinary bounded Stage producer and consume its real
+            // native reply. No client write/reconciliation retry recovers the
+            // opening on this path.
+            owner.retry_pending_repairs_bounded(1).unwrap();
+            let pending = owner.write_outcome(&record.intent_id).unwrap();
+            let completion = owner.settle_ready_write_outcome(pending, false);
+            assert_eq!(runtime.observation_dropped_count(), 0);
+            let stage_calls = runtime
+                .rpc_observations()
+                .into_iter()
+                .filter(|event| {
+                    event.source == shard.primary_node_id
+                        && event.target == content_replica
+                        && event.route == crate::DFS_DATA_STAGE_BLOB_ROUTE
+                        && event.phase == crate::test_runtime::RpcPhase::Completed
+                })
+                .map(|event| event.call_id)
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                stage_calls.len(),
+                1,
+                "one actual native Stage call owns the completion; no client write retry or replacement transfer"
+            );
+            let completed = completion.unwrap();
+            let NetworkedDfsWriteOutcome::Committed {
+                intent_id,
+                version,
+                content_hash,
+                ..
+            } = completed
+            else {
+                panic!(
+                    "ordinary receipt completion did not publish the retained original: {completed:?}"
+                );
+            };
+            assert_eq!(intent_id, record.intent_id);
+            assert_eq!(version, record.target_version);
+            assert_eq!(content_hash, crate::content_hash(bytes));
+            // The generic RPC observer does not decode streamed Stage heads.
+            // Bind that actual call to the exact persisted receipt and outcome.
+            let receipt = owner
+                .backend_receipt_for_replica(
+                    &record.object_id,
+                    &record.target_version,
+                    &content_replica,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(receipt.receipt.file_system_id, record.file_system_id);
+            assert_eq!(receipt.receipt.object_id, record.object_id);
+            assert_eq!(receipt.receipt.committed_version, record.target_version);
+            assert_eq!(receipt.replica_node_id, content_replica);
+            assert_eq!(receipt.content_hash.as_deref(), Some(content_hash.as_str()));
+            let actual = owner.posix_stat_distributed(path).unwrap();
+            (actual.object_id, actual.version)
+        } else {
+            let written = owner
+                .posix_write_file_with_operation_id(path, bytes, options.clone(), operation)
+                .unwrap();
+            (written.object_id, written.version)
+        };
+        assert_eq!(written_object_id, record.object_id);
+        assert_eq!(written_version, record.target_version);
+        let terminal = owner
+            .metadata_backend()
+            .unwrap()
+            .prepared_operation_record(&prepared.digest.operation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(terminal.status, DfsPreparedOperationStatus::Committed);
+        assert_eq!(terminal.digest, prepared.digest);
+        assert_eq!(terminal.payload, prepared.payload);
+        let prefix = owner
+            .metadata_backend()
+            .unwrap()
+            .metadata_prefix_proof(&prepared.digest.shard_id)
+            .unwrap();
+        owner
+            .posix_write_file_with_operation_id(path, bytes, options, operation)
+            .unwrap();
+        assert_eq!(
+            owner
+                .metadata_backend()
+                .unwrap()
+                .metadata_prefix_proof(&prepared.digest.shard_id)
+                .unwrap(),
+            prefix
+        );
+        assert_eq!(owner.posix_read_file(path).unwrap(), bytes);
+    }
+    drop(owner);
+    runtime.close().unwrap();
+}
+
+#[test]
+fn prepared_intent_opening_is_not_authoritative_absence() {
+    check_retained_intent_opening(true, false, false);
+}
+
+#[test]
+fn exact_retry_resumes_original_intent_opening_after_ack_failure() {
+    check_retained_intent_opening(false, false, false);
+}
+
+#[test]
+fn exact_retry_resumes_original_intent_opening_after_restart() {
+    check_retained_intent_opening(false, true, false);
+}
+
+#[test]
+fn stored_prepare_retry_observes_commit_before_its_execution_admission() {
+    let (mut runtime, requester, shard) = crate::test_support::current_native_metadata_service(
+        "native-prepared-replay-admission-race",
+        3,
+        "/",
+    )
+    .unwrap();
+    drop(requester);
+    let mut source = runtime.metadata_primary_service("/").unwrap();
+    let mut competing = runtime.metadata_primary_service("/").unwrap();
+    let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
+    let file_system = source
+        .metadata_backend()
+        .unwrap()
+        .get_file_system_on_shard(&shard_id, &shard.file_system_id)
+        .unwrap()
+        .unwrap();
+    let scope = DfsPreparedOperationScope {
+        file_system_id: shard.file_system_id.clone(),
+        shard_id: shard_id.clone(),
+        owner_epoch: shard.epoch,
+        operation_id: format!("native-admission-race:{}", sinomo_core::Id::generate()),
+    };
+    let payload = DfsPreparedOperationPayload::for_metadata_effects(
+        scope.clone(),
+        Vec::new(),
+        Vec::new(),
+        vec![DfsPreparedMetadataEffect::PutFileSystem { file_system }],
+        OffsetDateTime::now_utc(),
+    )
+    .unwrap();
+    let execution = source.acquire_prepared_execution(&scope).unwrap();
+    let digest = source
+        .prepare_payload_for_publication(payload.clone())
+        .unwrap();
+    drop(execution);
+    let original = source
+        .metadata_backend()
+        .unwrap()
+        .prepared_operation_record(&digest.operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(original.status, DfsPreparedOperationStatus::Prepared);
+    let committed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observed = Arc::clone(&committed);
+    let competing_digest = digest.clone();
+    crate::publication_guard::BEFORE_STORED_PREPARE_EXECUTION.with(|hook| {
+        assert!(hook.borrow().is_none());
+        *hook.borrow_mut() = Some(Box::new(move || {
+            // An actual second native owner projection completes the same
+            // immutable body with full participant proofs, after the caller's
+            // read and before its execution admission. No result is injected.
+            let publication = competing
+                .commit_stored_prepared_operation(&competing_digest)
+                .unwrap();
+            assert!(publication.published);
+            observed.store(true, std::sync::atomic::Ordering::SeqCst);
+        }));
+    });
+    let replay = source.commit_stored_prepared_operation(&digest).unwrap();
+    assert!(committed.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(
+        !replay.published,
+        "an observed terminal replay must not publish twice"
+    );
+    assert_eq!(replay.payload, original.payload);
+    let terminal = source
+        .metadata_backend()
+        .unwrap()
+        .prepared_operation_record(&digest.operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(terminal.status, DfsPreparedOperationStatus::Committed);
+    assert_eq!(terminal.digest, original.digest);
+    assert_eq!(terminal.payload, original.payload);
+    let prefix = source
+        .metadata_backend()
+        .unwrap()
+        .metadata_prefix_proof(&shard_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        prefix.journal_sequence,
+        digest.prepare_sequence + 1,
+        "the exact native commit is the only new journal record"
+    );
+    drop(source);
+    runtime.close().unwrap();
+}
+
+#[test]
+fn ordinary_stage_receipt_resumes_original_opening_without_client_retry() {
+    check_retained_intent_opening(false, false, true);
 }

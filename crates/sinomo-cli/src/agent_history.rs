@@ -1484,6 +1484,7 @@ mod tests {
     fn history_backend_searches_stable_chat_and_background_activity() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-visible-activity-history");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let channel_store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
         let channel_id = SessionId::generate();
         let mut channel =
@@ -1595,6 +1596,7 @@ mod tests {
     fn background_activity_retries_after_channel_scan_consumes_remaining_bytes() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-background-fresh-budget");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let channel_store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
         let channel_id = SessionId::generate();
         let mut channel =
@@ -1704,6 +1706,7 @@ mod tests {
     fn history_backend_pages_legacy_stable_chunks_and_deduplicates_immutable_records() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-legacy-visible-history");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let channel_store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
         let channel_id = SessionId::generate();
         let mut channel =
@@ -1791,6 +1794,7 @@ mod tests {
     fn legacy_chunk_retries_after_remaining_page_budget_is_exhausted() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-legacy-history-budget-retry");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let channel_store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
         let channel_id = SessionId::generate();
         let mut channel = sinomo_agent::AgentChannel::new(channel_id.clone(), "Legacy budget");
@@ -1875,6 +1879,7 @@ mod tests {
     fn legacy_partial_tail_retries_at_its_own_fresh_range() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-legacy-history-partial-tail");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let channel_store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
         let channel_id = SessionId::generate();
         let mut channel = sinomo_agent::AgentChannel::new(channel_id.clone(), "Legacy tail");
@@ -1952,6 +1957,7 @@ mod tests {
     fn immutable_record_retries_after_remaining_body_budget_is_exhausted() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-immutable-history-budget-retry");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let channel_store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
         let channel_id = SessionId::generate();
         let mut channel = sinomo_agent::AgentChannel::new(channel_id.clone(), "Immutable budget");
@@ -2059,6 +2065,7 @@ mod tests {
     fn immutable_limit_one_continuation_does_not_skip_the_next_record() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-immutable-history-limit-one");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let channel_store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
         let channel_id = SessionId::generate();
         let mut channel = sinomo_agent::AgentChannel::new(channel_id.clone(), "Immutable paging");
@@ -2119,6 +2126,7 @@ mod tests {
     fn authorized_channel_cannot_import_an_unauthorized_record_by_hardlink() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-history-cross-channel-hardlink");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let channel_store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
 
         let authorized_id = SessionId::generate();
@@ -2155,9 +2163,11 @@ mod tests {
             secret.message_id
         );
         let imported_record = format!("{authorized_records}/{}.json", secret.message_id);
+        let (sync, asynchronous) = crate::native_test_fixture::peer_transports(&data_dir).unwrap();
         let mut opened =
-            sinomo_runtime::dfs::open_mounted_sifs_service(Some(data_dir.root().to_path_buf()))
-                .expect("open SIFS service for adversarial fixture");
+            sinomo_runtime::dfs::open_mounted_sifs_service_with_peer_transports_and_default_control_plane(
+                data_dir.clone(), sync, asynchronous,
+            ).expect("open SIFS service through the actual adversarial fixture owner");
         opened
             .service
             .posix_hardlink(&private_record, &imported_record)
@@ -2189,6 +2199,7 @@ mod tests {
     fn membership_revoked_after_body_read_cannot_release_history_match() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-history-post-read-revocation");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let channel_store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
         let channel_id = SessionId::generate();
         let mut channel =

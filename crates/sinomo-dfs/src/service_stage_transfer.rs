@@ -910,6 +910,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 )?;
                 let event =
                     self.with_placement_intent_authority(&response.intent_id, |service| {
+                        service.recover_write_publications_before_receipt(
+                            &response.intent_id,
+                            content_hash,
+                        )?;
                         service.put_metadata_receipt(
                             &response.file_system_id,
                             &response.object_id,

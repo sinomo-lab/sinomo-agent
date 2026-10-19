@@ -477,10 +477,41 @@ fn native_read_fixture(
     DfsStat,
     Vec<u8>,
 ) {
+    native_read_fixture_observing_materialization(
+        name,
+        copies,
+        authoritative_reader,
+        bytes,
+        |_, _, _| {},
+        |_, _, _, _| {},
+    )
+}
+
+fn native_read_fixture_observing_materialization(
+    name: &str,
+    copies: usize,
+    authoritative_reader: bool,
+    bytes: Vec<u8>,
+    before_write: impl FnOnce(&crate::test_runtime::DfsTestRuntime, &NodeId, &DfsMetadataShardId),
+    mut on_lag: impl FnMut(
+        &crate::test_runtime::DfsTestRuntime,
+        &NodeId,
+        &DfsStat,
+        &crate::runtime_host::DfsTestMaterializationCapture,
+    ),
+) -> (
+    crate::test_runtime::DfsTestRuntime,
+    NodeId,
+    NodeId,
+    NodeId,
+    DfsStat,
+    Vec<u8>,
+) {
     assert!((1..=2).contains(&copies));
     let (runtime, service, config) =
         crate::test_support::current_native_metadata_service(name, 3, "/services").unwrap();
     let primary = config.primary_node_id;
+    let shard = DfsMetadataShardId::new(config.shard_id);
     drop(service);
     let peers = crate::test_runtime::DfsTestRuntime::ordered_node_ids(name, 3)
         .into_iter()
@@ -539,18 +570,23 @@ fn native_read_fixture(
             .collect::<BTreeSet<_>>(),
         expected_forbidden
     );
-    let stat = writer
-        .posix_write_file(
-            &path,
-            &bytes,
-            DfsWriteOptions {
-                replica_candidates: holders.clone(),
-                policy: replication,
-                wait_for_commit: true,
-                foreground_replica_repair: true,
-            },
-        )
-        .unwrap();
+    before_write(&runtime, &reader, &shard);
+    // Publication and reader readiness share the existing 45-second write
+    // window, captured before the original write; no retry gets a new budget.
+    let deadline = Instant::now() + DEFAULT_DFS_POSIX_SYNC_TIMEOUT;
+    let previous_deadline = writer.transport.set_operation_deadline(Some(deadline));
+    let written = writer.posix_write_file(
+        &path,
+        &bytes,
+        DfsWriteOptions {
+            replica_candidates: holders.clone(),
+            policy: replication,
+            wait_for_commit: true,
+            foreground_replica_repair: true,
+        },
+    );
+    writer.transport.set_operation_deadline(previous_deadline);
+    let stat = written.unwrap();
     assert_eq!(
         stat.current_locations
             .iter()
@@ -568,6 +604,67 @@ fn native_read_fixture(
         assert_eq!(Some(content_hash(&actual)), stat.content_hash);
         assert_eq!(actual, bytes);
     }
+    // A successful primary write and content ACK do not prove that the read
+    // fixture's local metadata has received/materialized the terminal commit.
+    // Capture the genuine served primary's exact published cut, then drive one
+    // normal publication turn only if needed and observe the existing owner.
+    let source = LocalSobjMetadataBackend::open_for_inspection(
+        shard.clone(),
+        default_dfs_metadata_shards_root(runtime.data_dir(&primary)).join(&shard.0),
+    )
+    .unwrap();
+    let published = source.get_object(&stat.object_id).unwrap().unwrap();
+    assert_eq!(published.version, stat.version);
+    assert_eq!(published.content_hash, stat.content_hash);
+    let snapshot = source.export_table_snapshot();
+    assert!(snapshot.prefix_proof.is_well_formed());
+    assert_eq!(
+        snapshot.prefix_proof.journal_sequence,
+        snapshot.materialized_through_sequence
+    );
+    drop(source);
+    let mut requested_publication = false;
+    crate::runtime_host::materialization_test::wait_for_existing_materialization(
+        runtime.data_dir(&reader),
+        &stat.file_system_id,
+        &shard,
+        &runtime.runtime_handle(),
+        snapshot.materialized_through_sequence,
+        deadline,
+        |observed| {
+            on_lag(&runtime, &reader, &stat, observed);
+            if !requested_publication {
+                requested_publication = true;
+                let publication = runtime
+                    .maintenance_tick(
+                        &primary,
+                        deadline.saturating_duration_since(Instant::now())
+                            .min(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT),
+                    )
+                    .unwrap();
+                assert!(publication.outcome.is_ok(), "{:?}", publication.outcome);
+                assert_eq!(publication.omitted_kv_event_count, 0);
+            }
+        },
+    )
+    .expect("reader must observe the original publication inside the unchanged write window");
+    let ready_reader = runtime.client(&reader).unwrap();
+    let visible = ready_reader
+        .current_read_object_metadata(&stat.object_id)
+        .unwrap();
+    assert_eq!(visible.object_id, stat.object_id);
+    assert_eq!(visible.version, stat.version);
+    assert_eq!(visible.content_hash, stat.content_hash);
+    assert_eq!(visible.content_size_bytes, stat.size_bytes);
+    assert_eq!(
+        visible
+            .current_locations
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        expected_holders
+    );
+    drop(ready_reader);
     drop(writer);
     (runtime, owner, replica, reader, stat, bytes)
 }

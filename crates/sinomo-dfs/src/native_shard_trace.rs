@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use tokio::sync::watch;
 
-const MAX_PACKETS: usize = 4096;
-const MAX_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_PACKETS: usize = 4096;
+pub(crate) const MAX_BYTES: usize = 64 * 1024 * 1024;
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "observation", content = "value", rename_all = "kebab-case")]
 pub enum ObservedNative<T> {

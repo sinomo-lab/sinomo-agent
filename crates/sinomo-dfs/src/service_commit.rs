@@ -340,6 +340,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         intent_id: &str,
     ) -> Result<(), DfsError> {
         if self.coordinator.is_commit_ready(intent_id)? {
+            if let (Some(intent), Some(pending)) = (
+                self.coordinator.intent(intent_id).cloned(),
+                self.writes.pending_writes.get(intent_id),
+            ) {
+                let hash = pending.content_hash.clone();
+                let size = pending.size_bytes;
+                // Retried receipt completion owns the same input as an
+                // explicit retry. Resume its sealed body before any fresh
+                // planning can change timestamps, read sets or other effects.
+                self.recover_prepared_write_for_retry(&intent, &hash, size)?;
+            }
             if let Err(error) = self.apply_committed_intent(intent_id) {
                 // A failed author attempt may have found a different immutable
                 // prepare with the same ID. It cannot authorize publication of
@@ -2016,6 +2027,188 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // ordinary recovery guard still requires the current certified owner
         // and fresh acknowledgements from every assigned metadata participant.
         self.recover_one_prepared_operation(record)?;
+        Ok(())
+    }
+
+    fn recover_prepared_intent_opening_publication(
+        &mut self,
+        intent: &DistributedWriteIntent,
+        content_hash: &str,
+    ) -> Result<Option<DfsObjectMetadata>, DfsError> {
+        if self.metadata_backend.is_none()
+            || self.transport.delegates_local_namespace_authority()
+            || !self
+                .coordinator
+                .intent(&intent.intent_id)
+                .is_some_and(|resident| resident.state == DfsWriteIntentState::AwaitingReceipts)
+        {
+            return Ok(None);
+        }
+        let object = self.current_object_for_write(&intent.object_id)?;
+        let scope = self.metadata_effect_scope_for_object(
+            &object,
+            intent
+                .operation_id
+                .clone()
+                .unwrap_or_else(|| intent.intent_id.clone()),
+        )?;
+        let observed = self
+            .metadata_backend
+            .as_ref()
+            .expect("retry backend")
+            .write_operation_admission_snapshot(
+                &scope.shard_id,
+                &intent.file_system_id,
+                &intent.object_id,
+                &intent.intent_id,
+            )?;
+        let mut opening = None;
+        for record in observed.prepared {
+            let Some(original) = crate::service_routed_write::prepared_intent_for_write(
+                &record,
+                &intent.object_id,
+                &intent.intent_id,
+            ) else {
+                continue;
+            };
+            crate::service_routed_write::validate_retained_write_opening(
+                &record,
+                original,
+                intent,
+                content_hash,
+            )?;
+            if opening.replace(record).is_some() {
+                return Err(DfsError::WriteReconciliationRequired {
+                    operation_id: intent
+                        .operation_id
+                        .clone()
+                        .unwrap_or_else(|| intent.intent_id.clone()),
+                    object_id: intent.object_id.clone(),
+                    reason: "write opening has competing prepared effects".into(),
+                });
+            }
+        }
+        let recovered = if let Some(record) = opening {
+            if !self.recover_one_prepared_operation(record)? {
+                return Err(DfsError::Metadata {
+                    message: "original opening still requires its native recovery owner".into(),
+                });
+            }
+            true
+        } else {
+            false
+        };
+        let Some(stored) = self
+            .metadata_backend
+            .as_ref()
+            .expect("retry backend")
+            .get_intent_on_shard(&scope.shard_id, &intent.object_id, &intent.intent_id)?
+        else {
+            // No successful placeholder or staging authority is invented.
+            return Ok(None);
+        };
+        let actual = crate::intent::distributed_intent_from_record(&stored);
+        let mut expected = intent.clone();
+        expected.state = actual.state.clone();
+        if expected != actual || stored.content_hash.as_deref() != Some(content_hash) {
+            return Err(DfsError::WriteOperationIdConflict {
+                operation_id: intent
+                    .operation_id
+                    .clone()
+                    .unwrap_or_else(|| intent.intent_id.clone()),
+                object_id: intent.object_id.clone(),
+            });
+        }
+        self.refresh_committed_write_projection(&intent.intent_id)?;
+        if actual.state != DfsWriteIntentState::AwaitingReceipts {
+            return Ok(None);
+        }
+        self.restore_pending_write_for_intent_if_missing(&intent.intent_id, &intent.object_id)?;
+        self.restore_backend_receipt_pages_for_intent(&stored, true)?;
+        if recovered {
+            self.record_durable_write_intent_work(&actual, &[]);
+        }
+        Ok(Some(object))
+    }
+
+    /// Resume only existing publication checkpoints before consuming a real
+    /// receipt. This phase never re-enters staging or commit readiness: those
+    /// remain the caller's normal next steps after its receipt is recorded.
+    pub(crate) fn recover_write_publications_before_receipt(
+        &mut self,
+        intent_id: &str,
+        content_hash: &str,
+    ) -> Result<(), DfsError> {
+        let Some(intent) = self
+            .coordinator
+            .intent(intent_id)
+            .cloned()
+            .filter(|intent| intent.state == DfsWriteIntentState::AwaitingReceipts)
+        else {
+            return Ok(());
+        };
+        let pending = self.writes.pending_writes.get(intent_id).ok_or_else(|| {
+            DfsError::WriteReconciliationRequired {
+                operation_id: intent
+                    .operation_id
+                    .clone()
+                    .unwrap_or_else(|| intent_id.to_owned()),
+                object_id: intent.object_id.clone(),
+                reason: "receipt completion has no original pending transfer descriptor".into(),
+            }
+        })?;
+        if pending.content_hash != content_hash {
+            return Err(DfsError::WriteOperationIdConflict {
+                operation_id: intent
+                    .operation_id
+                    .clone()
+                    .unwrap_or_else(|| intent_id.to_owned()),
+                object_id: intent.object_id.clone(),
+            });
+        }
+        let size = pending.size_bytes;
+        self.refresh_committed_write_projection(intent_id)?;
+        self.recover_prepared_write_for_retry(&intent, content_hash, size)?;
+        self.recover_prepared_intent_opening_publication(&intent, content_hash)?;
+        Ok(())
+    }
+
+    pub(crate) fn recover_prepared_intent_opening_for_retry(
+        &mut self,
+        intent: &DistributedWriteIntent,
+        content_hash: &str,
+        content_size_bytes: u64,
+    ) -> Result<(), DfsError> {
+        let Some(object) =
+            self.recover_prepared_intent_opening_publication(intent, content_hash)?
+        else {
+            return Ok(());
+        };
+        let Some(pending) = self.writes.pending_writes.get(&intent.intent_id) else {
+            return Err(DfsError::WriteReconciliationRequired {
+                operation_id: intent
+                    .operation_id
+                    .clone()
+                    .unwrap_or_else(|| intent.intent_id.clone()),
+                object_id: intent.object_id.clone(),
+                reason: "original opening has no retained transfer source".into(),
+            });
+        };
+        if pending.content_hash != content_hash || pending.size_bytes != content_size_bytes {
+            return Err(DfsError::WriteReconciliationRequired {
+                operation_id: intent
+                    .operation_id
+                    .clone()
+                    .unwrap_or_else(|| intent.intent_id.clone()),
+                object_id: intent.object_id.clone(),
+                reason: "original transfer descriptor is unavailable or differs from the retry"
+                    .into(),
+            });
+        }
+        self.try_apply_committed_intent_if_ready(&intent.intent_id)?;
+        if self.should_stage_missing_replicas_after_write(&intent.intent_id) {
+            self.stage_missing_desired_replicas_for_intent(&intent.intent_id, object)?;
+        }
         Ok(())
     }
 

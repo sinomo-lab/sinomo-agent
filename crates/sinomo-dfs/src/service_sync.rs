@@ -4122,7 +4122,21 @@ mod tests {
 
     #[test]
     fn native_successive_handoffs_reconcile_the_previous_retiring_marker() {
-        let name = "native-sync-successive-handoff";
+        successive_handoffs_observe_replica(false);
+    }
+
+    #[test]
+    fn native_successive_handoffs_wait_for_the_actual_replica_materializer() {
+        successive_handoffs_observe_replica(true);
+    }
+
+    fn successive_handoffs_observe_replica(delayed_after_reopen: bool) {
+        use crate::runtime_host::materialization_test::wait_for_existing_materialization;
+        let name = if delayed_after_reopen {
+            "native-sync-successive-handoff-materializer"
+        } else {
+            "native-sync-successive-handoff"
+        };
         let nodes = crate::test_runtime::DfsTestRuntime::ordered_node_ids(name, 3);
         let mut fixture = configured_normal_sync_fixture(name, nodes[1..].to_vec());
         fixture
@@ -4148,15 +4162,133 @@ mod tests {
         let active = fixture.runtime.root_shard().unwrap();
         assert_eq!(active.primary_node_id, nodes[0]);
         assert_eq!(active.epoch, fixture.shard.epoch + 2);
-        fixture
+        let shard = DfsMetadataShardId::new("root");
+        let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+        let observed_source = || {
+            LocalSobjMetadataBackend::open_for_inspection(
+                shard.clone(),
+                crate::default_dfs_metadata_shards_root(fixture.runtime.data_dir(&nodes[0]))
+                    .join("root"),
+            )
+            .unwrap()
+        };
+        let initial_prefix = observed_source()
+            .export_table_snapshot()
+            .materialized_through_sequence;
+        // The negative control places the next accepted append after startup,
+        // matching the reproduced durable8/materialized7 late-publication gap.
+        if delayed_after_reopen {
+            fixture.runtime.stop_node(&nodes[1]).unwrap();
+            fixture.runtime.reopen_node(nodes[1].clone()).unwrap();
+            wait_for_existing_materialization(
+                fixture.runtime.data_dir(&nodes[1]),
+                &active.file_system_id,
+                &shard,
+                &fixture.runtime.runtime_handle(),
+                initial_prefix,
+                deadline,
+                |_| {},
+            )
+            .unwrap();
+        }
+        let existing_replica =
+            delayed_after_reopen.then(|| fixture.runtime.client(&nodes[1]).unwrap());
+        let pause = delayed_after_reopen.then(|| {
+            fixture
+                .runtime
+                .pause_replica_materialization(&nodes[1], &shard)
+                .unwrap()
+        });
+        let expected = fixture
             .service
             .posix_mkdir("/native-after-two-handoffs")
             .unwrap();
-        fixture.runtime.stop_node(&nodes[1]).unwrap();
-        fixture.runtime.reopen_node(nodes[1].clone()).unwrap();
-        let mut replica = fixture.runtime.client(&nodes[1]).unwrap();
-        assert!(replica.posix_stat("/native-after-two-handoffs").is_ok());
+        // Capture the actual published source cut, not a requester cursor or an
+        // ACK. Inspecting this store cannot ingest work or grant authority.
+        let source = LocalSobjMetadataBackend::open_for_inspection(
+            shard.clone(),
+            crate::default_dfs_metadata_shards_root(fixture.runtime.data_dir(&nodes[0]))
+                .join("root"),
+        )
+        .unwrap();
+        let object = source.get_object(&expected.object_id).unwrap().unwrap();
+        assert_eq!(object.version, expected.version);
+        assert_eq!(object.content_hash, expected.content_hash);
+        let published = source.export_table_snapshot();
+        assert!(published.prefix_proof.is_well_formed());
+        assert_eq!(
+            published.prefix_proof.journal_sequence,
+            published.materialized_through_sequence
+        );
+        let target = published.materialized_through_sequence;
+        drop(source);
+        if !delayed_after_reopen {
+            fixture.runtime.stop_node(&nodes[1]).unwrap();
+            fixture.runtime.reopen_node(nodes[1].clone()).unwrap();
+        }
+        let mut replica =
+            existing_replica.unwrap_or_else(|| fixture.runtime.client(&nodes[1]).unwrap());
+        if let Some(pause) = pause.as_ref() {
+            let captured = fixture
+                .runtime
+                .wait_paused_materialization(
+                    pause,
+                    deadline.saturating_duration_since(Instant::now()),
+                )
+                .unwrap();
+            assert!(
+                captured.materialized_sequence.unwrap() < target,
+                "{captured:?}"
+            );
+            assert!(matches!(
+                replica.posix_stat("/native-after-two-handoffs"),
+                Err(DfsPosixError::NotFound { .. })
+            ));
+            assert!(
+                wait_for_existing_materialization(
+                    fixture.runtime.data_dir(&nodes[1]),
+                    &active.file_system_id,
+                    &shard,
+                    &fixture.runtime.runtime_handle(),
+                    target,
+                    Instant::now(),
+                    |_| panic!("an expired observer must not request work"),
+                )
+                .is_err()
+            );
+        }
+        let mut saw_gap = false;
+        wait_for_existing_materialization(
+            fixture.runtime.data_dir(&nodes[1]),
+            &active.file_system_id,
+            &shard,
+            &fixture.runtime.runtime_handle(),
+            target,
+            deadline,
+            |_| {
+                saw_gap = true;
+                if let Some(pause) = pause.as_ref() {
+                    pause.release();
+                }
+            },
+        )
+        .unwrap();
+        if delayed_after_reopen {
+            assert!(
+                saw_gap,
+                "the actual materializer was paused below the published cut"
+            );
+        }
+        assert_eq!(
+            replica.posix_stat("/native-after-two-handoffs").unwrap(),
+            expected
+        );
+        assert!(
+            Instant::now() < deadline,
+            "replica stat exceeded the original network deadline"
+        );
         drop(replica);
+        drop(pause);
         fixture.finish();
     }
 
