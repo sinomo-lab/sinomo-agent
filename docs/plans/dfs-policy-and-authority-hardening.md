@@ -1,7 +1,7 @@
 # DFS Policy and Authority Hardening
 
-Status: partially implemented; remaining items are proposed. Last reviewed
-2026-10-13.
+Status: remaining follow-up work under the current DFS authority contract.
+Last reviewed 2026-10-13.
 
 The current DFS architecture supports local-owned, replicated-eventual, and
 replicated-confirmed workflows with deterministic candidate selection and
@@ -10,13 +10,21 @@ not described as implemented in the [DFS architecture](../dfs-architecture.md).
 
 ## Authority During Quorum Loss
 
-Implemented. A primary publishes only after every configured metadata-shard
-replica acknowledges the exact prepare, or after the DFS recovery quorum is
-fenced by an operation-bound cluster-Raft permit; without KV quorum,
-partial-shard publication fails or waits. Shard handoff installs a durable
-retiring-primary write freeze before a successor can activate. The contract is
-defined in [Consistency Invariants](../dfs-architecture.md#consistency-invariants)
-and covered by the formal models.
+The selected contract uses existing coherent configuration projections,
+actual shard participants, and DFS-owned durable writer and handoff fences.
+Ordinary metadata publication and sync require the complete assigned
+participant proof. Missing evidence leaves the operation pending or
+unavailable without lowering counts or issuing a cluster-KV metadata permit.
+Content receipt W/N remains a separate policy.
+
+Cluster KV retains its ordinary atomic transactions for configuration and
+genuine cluster-wide guards. It does not acquire caller bindings, retry
+sessions, a DFS operation ledger, or new Raft machinery. Authority handoff
+must preserve the exact retiring prefix and durable generation exclusion;
+whole-root installation must also fence retained old backend handles.
+Conformance, restart, partition, and retained-handle tests must demonstrate
+these obligations on the final implementation. Superseded KV-assisted
+metadata fallback designs are not requirements for future work.
 
 ## Complete Reserved Object Modes
 

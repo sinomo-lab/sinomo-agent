@@ -1705,7 +1705,7 @@ class NativeOriginalKvFrontierDataTests(unittest.TestCase):
         events[key]['collection']='original_control_commits'
         dag=f['dag'](events)
         rows=copy.deepcopy(f['ROWS']);rows[0]['raw_references'].append(dict(actual_mount_label=key[0],owner_ordinal=str(key[1])))
-        with self.assertRaisesRegex(self.api.Rejected,'outside its actual fallback-permit group'):
+        with self.assertRaisesRegex(self.api.Rejected,'outside a genuine global configuration/handoff group'):
             self.helper.global_vectors(dag,f['BLUEPRINTS'],f['INITIAL'],rows)
 
     def test_unmatched_original_cannot_be_crossed_by_asof(self):
@@ -1730,7 +1730,7 @@ class NativeOriginalKvFrontierDataTests(unittest.TestCase):
     def test_extra_original_reference_cannot_mark_effect_processed(self):
         f=self.fixture;key,_=self.original_event();events=copy.deepcopy(f['EVENTS'])
         events[key]['collection']='original_control_commits';dag=f['dag'](events)
-        rows=copy.deepcopy(f['ROWS']);rows[0]['action']=dict(kind='fallback-permit')
+        rows=copy.deepcopy(f['ROWS']);rows[0]['action']=dict(kind='handoff-begin')
         ref=dict(actual_mount_label=key[0],owner_ordinal=str(key[1]))
         rows[0]['raw_references'] += [ref,copy.deepcopy(ref)]
         with self.assertRaisesRegex(self.api.Rejected,'exact original/caller source set'):
@@ -2007,6 +2007,121 @@ class NativeCommittedReplicationDataTests(unittest.TestCase):
 
     def test_foreign_group_owner_rejected(self):
         with self.assertRaises(self.api.Rejected):self.verify(group_refs=self.refs(),group_owner=self.source[0])
+
+
+
+
+class RetainedConfigurationContractTests(unittest.TestCase):
+    """Source-shaped DTO sensitivity; this is not a native execution fixture."""
+    @classmethod
+    def setUpClass(cls):
+        path = Path(__file__).with_name('assemble-shard-native-trace.py')
+        spec = importlib.util.spec_from_file_location('retained_configuration_sensitivity', path)
+        cls.api = importlib.util.module_from_spec(spec); spec.loader.exec_module(cls.api)
+
+    def setUp(self):
+        self.scope = dict(file_system_id='fs', shard_id='services')
+        self.config = dict(file_system_id='fs', shard_id='services', primary_node_id='n1',
+                           replica_node_ids=['n2'], epoch=3, assignment={}, default_policy={})
+        self.entry = dict(key='/dfs/filesystems/fs/metadata-shards/services', value=[7, 8],
+                          create_revision=3, modify_revision=7)
+        floor = dict(key='/cluster/raft/config', value=[1, 2], create_revision=1, modify_revision=2)
+        proof = dict(term=2, commit_index=4, revision=5,
+                     basis={'current-term-quorum': dict(required_quorum=1, voter_acks=1)})
+        self.cut = dict(owner_label='owner1', owner_ordinal='12', guard_context_id='guard1',
+            requested_scope_prefixes=['/dfs/filesystems/', '/dfs/services/content/', '/cluster/services/'],
+            revision='7', accepted_authority_generation='4', scopes=[[self.entry], [], []],
+            authority=[copy.deepcopy(proof) for _ in range(3)],
+            retained_projection_floor=dict(value=floor, revision=5, observed_term=2, applied_index=4))
+        self.header = dict(actual_mount_label='owner1', normal_mounted_identity=dict(configured_members=[
+            dict(node_id='n1', role='voter', state='voter')]), actual_control_decodes=[
+            dict(source_owner_ordinal='12', exact_entry=self.entry,
+                 native_type='DfsMetadataShardConfig', decoded_value=self.config)])
+
+    def validate(self, cut=None, header=None):
+        return self.api.validate_retained_configuration_cut(cut or self.cut, header or self.header,
+            self.scope, guard_id='guard1', expected=self.config)
+
+    def test_original_authority_stays_at_its_revision_after_accepted_replay(self):
+        before = copy.deepcopy(self.cut)
+        result = self.validate()
+        self.assertEqual(result['cached_revision'], '7')
+        self.assertEqual([proof['revision'] for proof in result['original_authority']], [5, 5, 5])
+        self.assertEqual(self.cut, before)
+        self.assertEqual(result['selected_keys'], [self.entry['key'],
+            '/dfs/filesystems/fs/metadata-membership-handoffs/services'])
+        self.assertEqual(result['decoded'], [self.config, None])
+
+    def test_guard_owner_scope_floor_and_quorum_mutations_fail_closed(self):
+        changes = [lambda x: x.update(owner_label='foreign'),
+            lambda x: x.update(unrecognized_permit='retired'),
+            lambda x: x.update(guard_context_id='another'),
+            lambda x: x.pop('guard_context_id'),
+            lambda x: x['requested_scope_prefixes'].pop(),
+            lambda x: x['scopes'].pop(), lambda x: x['authority'].pop(),
+            lambda x: x['authority'][0].update(term=3),
+            lambda x: x['authority'][0].update(basis='exact-committed-request'),
+            lambda x: x['authority'][0]['basis']['current-term-quorum'].update(voter_acks=0),
+            lambda x: x['retained_projection_floor'].update(value=None),
+            lambda x: x['retained_projection_floor']['value'].update(key='/foreign/config'),
+            lambda x: x['scopes'][0][0].update(modify_revision=8),
+            lambda x: x['scopes'][0].append(copy.deepcopy(x['scopes'][0][0]))]
+        for change in changes:
+            cut = copy.deepcopy(self.cut); change(cut)
+            with self.subTest(change=change), self.assertRaises((self.api.Rejected, self.api.Unavailable)):
+                self.validate(cut)
+
+    def test_same_decoder_ordinal_full_entry_type_and_config_required(self):
+        for field, value in [('source_owner_ordinal', '11'), ('native_type', 'DfsObject'),
+                             ('exact_entry', dict(self.entry, value=[9]))]:
+            header = copy.deepcopy(self.header); header['actual_control_decodes'][0][field] = value
+            with self.subTest(field=field), self.assertRaises((self.api.Rejected, self.api.Unavailable)):
+                self.validate(header=header)
+        header = copy.deepcopy(self.header)
+        header['actual_control_decodes'][0]['decoded_value']['epoch'] += 1
+        with self.assertRaises(self.api.Rejected): self.validate(header=header)
+
+    def test_missing_handoff_is_an_observed_complete_scope_absence(self):
+        cut = copy.deepcopy(self.cut); header = copy.deepcopy(self.header)
+        row = dict(self.entry, key='/dfs/filesystems/fs/metadata-membership-handoffs/services')
+        cut['scopes'][0].append(row); cut['scopes'][0].sort(key=lambda entry: entry['key'])
+        header['actual_control_decodes'].append(dict(source_owner_ordinal='12', exact_entry=row,
+            native_type='DfsMetadataShardMembershipHandoff', decoded_value={'handoff_id': 'pending'}))
+        with self.assertRaises(self.api.Rejected): self.validate(cut, header)
+
+    def test_retired_fallback_schema_and_old_guard_read_are_incompatible(self):
+        schema = checker.read_json(checker.SCHEMA_PATH)
+        self.assertNotIn('operation_floor_blob', schema['$defs']['ShardSnapshot']['properties'])
+        self.assertNotIn('raft_head_watermark_blob', schema['$defs']['ShardSnapshot']['properties'])
+        with self.assertRaises(checker.Rejected):
+            checker.validate_schema({'kind': 'fallback-permit'}, schema['$defs']['NativeActionV1'], schema)
+        guard = next(action for action in schema['$defs']['NativeActionV1']['oneOf']
+                     if action.get('properties', {}).get('kind', {}).get('const') == 'publication-guard-admitted')
+        self.assertIn('retained_configuration_cut', guard['required'])
+        self.assertNotIn('authoritative_exact_read', guard['properties'])
+
+    def test_full_assigned_guard_rejects_partial_even_for_one_native_voter(self):
+        adapter = object.__new__(projector.NativeProjectorV1)
+        adapter.profile = dict(standalone=False)
+        fact = dict(digest={'operation_id': 'op'}, expected_config={'config': True},
+            authorization_mode='full-shard', authenticated_prepare_ack_node_ids=['n1'],
+            actual_writer_lock_retained=True, raw_scoped_fence_retained=True,
+            execution_and_data_owner_retained=True, retained_config_and_missing_handoff_qualified=True,
+            admission_pending_handoff=False, admission_write_frozen=False)
+        adapter.blob = lambda ref, kind: fact
+        adapter.require_certificate = lambda fact, label: None
+        adapter.config = lambda value: (1, self.config)
+        adapter.op = lambda op: 1
+        adapter.node = lambda node: {'n1': 1, 'n2': 2}[node]
+        adapter.node_set = lambda nodes: projector.finite_set(adapter.node(node) for node in nodes)
+        with self.assertRaises(projector.Rejected): adapter.guard('fact', None)
+        fact['authenticated_prepare_ack_node_ids'] = ['n1', 'n2']
+        result = adapter.guard('fact', None)
+        self.assertEqual(result['path'], 1); self.assertEqual(result['acks'], {'$set': [1, 2]})
+        fact['authorization_mode'] = 'local'
+        with self.assertRaises(projector.Unavailable): adapter.guard('fact', None)
+        fact['authorization_mode'] = 'recovery'
+        with self.assertRaises(projector.Unavailable): adapter.guard('fact', None)
 
 
 if __name__ == '__main__':

@@ -284,7 +284,7 @@ class NativeContexts:
         expected_acks=authority.get('authenticated_acknowledged_node_ids',[])
         if fact.get('authenticated_prepare_ack_node_ids')!=expected_acks:
             raise Rejected('guard wrapper changed actual acknowledged member identities')
-        if not all(fact.get(field) is True for field in ('actual_writer_lock_retained','raw_scoped_fence_retained','execution_and_data_owner_retained','exact_config_and_missing_handoff_read')):
+        if not all(fact.get(field) is True for field in ('actual_writer_lock_retained','raw_scoped_fence_retained','execution_and_data_owner_retained','retained_config_and_missing_handoff_qualified')):
             raise Unavailable('guard wrapper omits actual retained writer/fence/execution proof')
         admitted=next(ordinal for (actor,ordinal),event in self.events.items()
             if actor==oid and event['collection']=='guard_events' and event['record'].get('guard_id')==raw['guard_id'] and event['record']['phase']=='admitted')
@@ -293,13 +293,17 @@ class NativeContexts:
             and not any(other['record'].get('phase')=='released' and other['record'].get('guard_id')==event['record']['guard_id']
                         for (peer,number),other in self.events.items() if peer==oid and number<admitted and other['collection']=='guard_events')]
         if previous:raise Unavailable('prior actual publication lease is not absent at this mint')
-        if fact.get('prior_writer_bound_epoch') is not None or fact.get('actual_prior_storage_epoch_view')!=raw['held']['writer_bound_epoch']:
+        if fact.get('actual_prior_storage_epoch_view')!=raw['held']['writer_bound_epoch']:
             raise Rejected('guard wrapper confuses the requested storage view with publication binding')
-        reads=[event['record'] for (actor,ordinal),event in self.events.items()
-               if actor==oid and ordinal<=n and event['collection']=='authoritative_reads'
-               and event['record'].get('guard_context_id')==raw['guard_id']]
-        if len(reads)!=1 or self.native(fact['same_call_native_read_blob'])!=reads[0]['read']:
-            raise Unavailable('guard has no exact same-call final authoritative read correlation')
+        cuts = [event['record'] for (actor, ordinal), event in self.events.items()
+                if actor == oid and ordinal < admitted and event['collection'] == 'configuration_cuts'
+                and event['record'].get('guard_context_id') == raw['guard_id']]
+        if len(cuts) != 1 or self.native(fact['same_call_retained_configuration_blob']) != cuts[0]:
+            raise Unavailable('guard lacks exact SAME consumed retained configuration correlation')
+        ASSEMBLER.validate_retained_configuration_cut(cuts[0], self.raw_headers[oid], self.scope,
+            guard_id=raw['guard_id'], expected=expected)
+        if authority['mode'] != 'full-shard' or set(expected_acks) != set(expected.get('replica_node_ids', []) + [expected['primary_node_id']]):
+            raise Rejected('clustered guard lacks ALL-assigned FullShard native authority')
         if active and any(event['record'].get('phase')=='released' and event['record'].get('guard_id')==raw['guard_id']
                 for (actor,ordinal),event in self.events.items() if actor==oid and ordinal<=n and event['collection']=='guard_events'):
             raise Rejected('active guard references an already released actual lease')
@@ -368,68 +372,67 @@ class NativeContexts:
         if len(rows)!=1: raise Unavailable(f'{key}: SAME normal typed decoder correlation missing')
         return rows[0]['decoded_value']
 
-    def control_at(self,oid,n,blueprint):
-        candidates=[e['record'] for (owner,ordinal),e in self.events.items()
-                    if owner==oid and ordinal<=n and e['collection']=='metadata_cache_cuts']
-        if not candidates: raise Unavailable(f'{oid}:{n}: complete already-used native control projection missing')
-        cut=max(candidates,key=lambda row:decimal(row['owner_ordinal'],'cache ordinal'))
-        folded=ASSEMBLER.validate_metadata_cache_cut(cut)
-        ASSEMBLER.validate_metadata_cache_consumer_scope(cut,
-            self.scope['file_system_id'], self.scope['shard_id'])
-        prefix=f"/dfs/filesystems/{self.scope['file_system_id']}/"
-        segment=self.scope['shard_id'].strip('/').replace('/','_')
-        kinds=[('metadata-shards/','DfsMetadataShardConfig'),('metadata-membership-handoffs/','DfsMetadataShardMembershipHandoff'),
-               ('metadata-operation-floors/','DfsMetadataShardOperationFloor'),('metadata-head-watermarks/','DfsMetadataShardHeadWatermark')]
-        keys=[prefix+family+segment for family,_ in kinds]
-        if any(not key.startswith(folded['scope_prefix']) for key in keys): raise Rejected('native complete prefix omits control scope')
-        entries={entry['key']:entry for entry in folded['entries']}
-        decoded=[self.decode_entry(oid,cut,key,entries.get(key),kind) for key,(_,kind) in zip(keys,kinds)]
-        if decoded[0] is None: raise Unavailable('actual active native configuration absent')
-        cfg=self.config(decoded[0],entries[keys[0]]['value'])
-        decodes=[row for row in self.raw_headers[oid]['actual_control_decodes']
-                 if row['source_owner_ordinal']==cut['owner_ordinal'] and row['exact_entry'] in [entries.get(key) for key in keys]]
-        ref=self.blobs.json('DfsNativeCacheControlCutEvidenceV1',self.certificate(actual_cache_cut=cut,
-            actual_typed_decodes=decodes,selected_control_keys=keys,selected_entries=[entries.get(key) for key in keys]))
-        kv=dict(requested_keys=keys,rows=[dict(key=key,entry_blob=self.blobs.json('KvEntry',entries[key]) if key in entries else None) for key in keys],
-                revision=folded['cached_revision'],applied_index=None,native_authority_evidence_blob=ref,complete=True,continuous=True)
-        read_ref=blueprint.get('actual_authoritative_read_blob')
-        read_keys=blueprint.get('actual_authoritative_read_keys')
-        guard_ref=blueprint.get('active_guard_blob') or blueprint.get('last_guard_blob')
-        if guard_ref:
-            wrapper=self.native(guard_ref)
-            if read_ref and read_ref!=wrapper.get('same_call_native_read_blob'):
-                raise Rejected('context admission read borrows another native guard call')
-            read_ref=wrapper.get('same_call_native_read_blob')
-            guards=self.guard_source(guard_ref,oid,n,active=bool(blueprint.get('active_guard_blob')))
-            read_rows=[event['record'] for (actor,ordinal),event in self.events.items()
-                if actor==oid and ordinal<=n and event['collection']=='authoritative_reads'
-                and event['record'].get('guard_context_id')==guards['guard_id']]
-            read_keys=read_rows[0]['requested_keys']
-        if read_ref:
-            read=self.native(read_ref)
-            matching=[event['record'] for (actor,ordinal),event in self.events.items()
-                if actor==oid and ordinal<=n and event['collection']=='authoritative_reads'
-                and event['record']['read']==read and event['record']['requested_keys']==read_keys]
-            if not matching or read_keys is None or len(read_keys)!=len(read['value']):
-                raise Rejected('context read lacks the exact actual requested-key/result correlation')
-            if decimal(read['authority']['revision'],'guard revision')!=decimal(folded['cached_revision'],'cache revision'):
-                raise Unavailable('actual admission read crossed retained complete control projection; SAME complete cut hook required')
-            for key,entry in zip(read_keys,read['value']):
-                if key not in keys or entries.get(key)!=entry: raise Rejected('actual guard read differs from complete native cut')
-        horizon={oid:n}
-        for reference in blueprint.get('peer_cut_refs',{}).values():
-            actor,ordinal,_,_=self.cut_refs[reference];horizon[actor]=max(horizon.get(actor,0),ordinal)
-        for (actor,ordinal),event in self.events.items():
-            if actor not in horizon or ordinal>horizon[actor]: continue
-            if event['collection']=='control_commits':
-                response=event['record']['commit']['result'].get('txn_response')
-            elif event['collection']=='original_control_commits':
-                response=event['record']['original']['committed'].get('txn_response')
+    def control_at(self, oid, n, blueprint):
+        # Active guard cuts consume the exact qualified view used at its mint.
+        # Other cuts select the latest observed view; no new read is performed.
+        active = blueprint.get('active_guard_blob')
+        raw_guard = self.guard_source(active, oid, n, active=True) if active else None
+        candidates = [event for (owner, ordinal), event in self.events.items()
+                      if owner == oid and ordinal <= n and event['collection'] in
+                      ('configuration_cuts', 'metadata_cache_cuts')]
+        if raw_guard:
+            candidates = [event for event in candidates if event['collection'] == 'configuration_cuts'
+                          and event['record'].get('guard_context_id') == raw_guard['guard_id']]
+            if len(candidates) != 1:
+                raise Unavailable('active guard needs its unique consumed retained cut')
+        if not candidates:
+            raise Unavailable('actual already-consumed complete control projection is missing')
+        event = max(candidates, key=lambda event: event['owner_ordinal'])
+        cut = event['record']
+        if event['collection'] == 'configuration_cuts':
+            folded = ASSEMBLER.validate_retained_configuration_cut(cut, self.raw_headers[oid], self.scope,
+                guard_id=raw_guard['guard_id'] if raw_guard else None,
+                expected=raw_guard['facts']['authority']['expected'] if raw_guard else None)
+            keys = folded['selected_keys']; decoded = folded['decoded']; decodes = folded['typed_decodes']
+            evidence_type = 'DfsNativeRetainedConfigurationCutEvidenceV1'
+            evidence_fields = dict(actual_configuration_cut=cut)
+        else:
+            folded = ASSEMBLER.validate_metadata_cache_cut(cut)
+            ASSEMBLER.validate_metadata_cache_consumer_scope(cut, self.scope['file_system_id'], self.scope['shard_id'])
+            prefix = '/dfs/filesystems/' + self.scope['file_system_id'] + '/'
+            segment = self.scope['shard_id'].strip('/').replace('/', '_')
+            kinds = [('metadata-shards/', 'DfsMetadataShardConfig'), ('metadata-membership-handoffs/', 'DfsMetadataShardMembershipHandoff')]
+            keys = [prefix + family + segment for family, _ in kinds]
+            if any(not key.startswith(folded['scope_prefix']) for key in keys):
+                raise Rejected('native complete prefix omits actual control scope')
+            entries = {entry['key']: entry for entry in folded['entries']}
+            decoded = [self.decode_entry(oid, cut, key, entries.get(key), kind) for key, (_, kind) in zip(keys, kinds)]
+            decodes = [row for row in self.raw_headers[oid]['actual_control_decodes']
+                       if row['source_owner_ordinal'] == cut['owner_ordinal'] and row['exact_entry'] in [entries.get(key) for key in keys]]
+            evidence_type = 'DfsNativeCacheControlCutEvidenceV1'; evidence_fields = dict(actual_cache_cut=cut)
+        entries = {entry['key']: entry for entry in folded['entries']}
+        if decoded[0] is None:
+            raise Unavailable('actual active native configuration is absent')
+        cfg = self.config(decoded[0], entries[keys[0]]['value'])
+        ref = self.blobs.json(evidence_type, self.certificate(**evidence_fields,
+            actual_typed_decodes=decodes, selected_control_keys=keys, selected_entries=[entries.get(key) for key in keys]))
+        kv = dict(requested_keys=keys, rows=[dict(key=key, entry_blob=self.blobs.json('KvEntry', entries[key]) if key in entries else None) for key in keys],
+                  revision=folded['cached_revision'], applied_index=None, native_authority_evidence_blob=ref, complete=True, continuous=True)
+        horizon = {oid: n}
+        for reference in blueprint.get('peer_cut_refs', {}).values():
+            actor, ordinal, _, _ = self.cut_refs[reference]; horizon[actor] = max(horizon.get(actor, 0), ordinal)
+        for (actor, ordinal), observed in self.events.items():
+            if actor not in horizon or ordinal > horizon[actor]: continue
+            if observed['collection'] == 'control_commits':
+                response = observed['record']['commit']['result'].get('txn_response')
+            elif observed['collection'] == 'original_control_commits':
+                response = observed['record']['original']['committed'].get('txn_response')
             else: continue
-            if response is not None and response.get('succeeded') is True and decimal(response['revision'],'observed commit revision')>decimal(folded['cached_revision'],'complete cache revision'):
-                raise Unavailable('actual committed control transaction is newer than complete retained cut; fresh SAME complete projection required')
-        self.control[oid,n]=(cut,folded,cfg,decoded,ref,kv)
-        return self.control[oid,n]
+            if response and response.get('succeeded') is True and decimal(response['revision'], 'actual commit revision') > decimal(folded['cached_revision'], 'accepted cut revision'):
+                raise Unavailable('actual global control effect is newer than retained configuration cut')
+        self.control[oid, n] = (cut, folded, cfg, decoded, ref, kv)
+        return self.control[oid, n]
+
 
     def semantic_prefix(self,oid,prefix):
         anchor=self.prefix(self.header['owner_cuts'][oid]['native_prefix'])
@@ -660,54 +663,8 @@ class NativeContexts:
             references.append(self.blobs.json('DfsNativeKvValueDecodeObservationV1',evidence))
         return references
 
-    def permit_at(self,oid,n,digest):
-        candidates=[]
-        for (owner,ordinal),event in self.events.items():
-            if owner!=oid or ordinal>n or event['collection']!='boundary_packets': continue
-            fact=event['record']['facts']
-            if fact['phase']!='recovery-permit-issued': continue
-            operation=fact['operation'];permit=fact['permit']
-            if operation.get('kind')!='prepared-operation': raise Rejected('permit boundary is not a current native prepared operation')
-            if any(operation[field]!=digest[field] for field in ('operation_id','file_system_id','shard_id','owner_epoch','prepare_sequence','payload_digest')): continue
-            if (permit['file_system_id']!=digest['file_system_id'] or permit['shard_id']!=digest['shard_id']
-                    or decimal(permit['owner_epoch'],'permit epoch')!=decimal(digest['owner_epoch'],'prepared epoch')
-                    or decimal(permit['prepare_sequence'],'permit sequence')!=decimal(digest['prepare_sequence'],'prepared slot')
-                    or permit['operation_digest']!=digest['payload_digest']):
-                raise Rejected('actual permit differs from exact captured preparation')
-            native=permit.get('native_commit')
-            if native is None: raise Unavailable('actual returned operation permit lacks native request/result')
-            calls=[(number,row['record']) for (actor,number),row in self.events.items()
-                if actor==oid and number<=ordinal and row['collection']=='control_commits'
-                and row['record']['commit']==native]
-            if len(calls)!=1: raise Unavailable('permit lacks unique SAME native control transaction receipt packet')
-            number,call=calls[0];commit=call['commit'];result=commit['result'];response=result.get('txn_response')
-            if (response is None or response.get('succeeded') is not True
-                    or commit['request']['request_id']!=result['request_id']
-                    or decimal(response['revision'],'receipt revision')!=decimal(result['authority']['revision'],'authority revision')):
-                raise Rejected('same-call permit receipt has invalid success/request/revision identity')
-            raw={(actor,n):dict(kind={'control_commits':'control-commit','original_control_commits':'original-control-commit'}.get(event['collection'],event['collection']),
-                    ordinal=n,record=event['record']) for (actor,n),event in self.events.items()}
-            module,_=ASSEMBLER.initial_native_verifiers(self.scope,list(self.owners.values()),raw)
-            voters={member['node_id'] for member in self.raw_headers[oid]['normal_mounted_identity']['configured_members']
-                if member['role']=='voter' and member['state']=='voter'}
-            original=module.original_for_replay(self.scope,self.owners[oid],self.raw_headers[oid],raw,
-                (oid,number),call,voters,required=False)
-            proof=self.certificate(owner_id=oid,actual_owner_ordinal=str(number),commit=commit,
-                refinement_boundary='verified-r0-atomic-kv')
-            if original is not None:
-                proof['original_native_commit_source']=dict(owner_id=oid,owner_ordinal=str(original[1]))
-            basis=result['authority']['basis']
-            quorum=basis.get('current-term-quorum') if isinstance(basis,dict) else None
-            if quorum is None: raise Unavailable('operation permit has no actual fresh current-term quorum basis')
-            value=self.certificate(digest=digest,permit_id=permit['permit_id'],expected_config=self.config(fact['expected']),
-                native_permit_blob=self.blobs.json('DfsMetadataOperationPermit',permit),
-                native_same_call_commit_observation_blob=self.blobs.json('DfsNativeControlCommitObservationV1',proof),
-                acknowledged_voter_count=str(decimal(quorum['voter_acks'],'native voter acknowledgements')),
-                authenticated_recovery_prefix_ack_node_ids=fact['authenticated_recovery_node_ids'],
-                kv_value_decode_evidence_blobs=self.request_value_decode_refs(oid,number,call),
-                actual_permit_boundary_source=dict(owner_id=oid,owner_ordinal=str(ordinal)))
-            candidates.append((ordinal,self.blobs.json('DfsNativeOperationPermitObservationV1',value)))
-        return max(candidates,key=lambda row:row[0])[1] if candidates else None
+
+
 
     def operations_at(self,oid,n,held,blueprint):
         result={}
@@ -809,8 +766,6 @@ class NativeContexts:
                                 raise Rejected('native prefix ACK changes the typed immutable prepared-operation tuple')
                             acknowledged.add(fact['authenticated_source_node_id'])
             value['authenticated_prepare_ack_node_ids']=sorted(acknowledged)
-            permit_ref=self.permit_at(oid,n,digest)
-            if permit_ref is not None: value['native_permit_observation_blob']=permit_ref
             result[op]=value
         return result
 
@@ -910,50 +865,30 @@ class NativeContexts:
         if basis is None:
             raise Unavailable('actual global observer basis is missing')
         for name, blueprint in basis['snapshot_blueprints'].items():
+            if any(field in blueprint for field in ('actual_authoritative_read_blob', 'actual_authoritative_read_keys', 'recovery_guard_prepare_source', 'operation_floor_prefix_attribution', 'raft_watermark_prefix_attribution')):
+                raise Rejected('archived per-operation KV authority blueprint is incompatible')
             self.snapshot_source(name, blueprint)
         dag = CAUSAL.NativeExecutionDag(ASSEMBLER, self.events, self.owners, self.scope,
                                        self.inputs['actual_request_response_correlations'], self.verified_edge, self.raw_headers)
         CAUSAL.validate_globalized(dag, self.header)
         for row in self.header['native_timeline']:
-            action=row['action'];oid=row['owner_id']
-            if action['kind']=='fallback-permit':
-                n=decimal(row['event_id'].rsplit(':',1)[1],'actual permit return ordinal');op=action['operation']['operation_id']
-                permit_ref=self.permit_at(oid,n,self.bodies[op][1])
-                if permit_ref is None:raise Unavailable('fallback action lacks SAME independently checked actual native permit')
-                action['native_quorum_result_blob']=permit_ref
-            if action['kind']=='publication-guard-admitted':
-                reference=action['authorization_blob'];value=self.native(reference)
-                if value['authorization_mode']!='recovery':continue
-                op=action['operation']['operation_id'];digest=self.bodies[op][1]
-                n=decimal(row['event_id'].rsplit(':',1)[1],'actual recovery guard ordinal')
-                permit_ref=self.permit_at(oid,n,digest)
-                source=blueprints[row['after_snapshot']].get('recovery_guard_prepare_source')
-                if permit_ref is None or source is None or source['owner_id']!=oid:raise Unavailable('recovery guard lacks exact actual permit/preparation source')
-                prepared=self.cut_refs[source['snapshot_id']][3]
-                if decimal(prepared['certified_prefix']['journal_sequence'],'actual prepared prefix')!=decimal(digest['prepare_sequence'],'actual prepared slot'):raise Rejected('recovery guard prepare prefix differs from original native slot')
-                value['native_permit_observation_blob']=permit_ref;value['prepare_owner_id']=oid
-                value['prepare_prefix']=self.prefix(prepared['certified_prefix'])
-                replacement=self.blobs.json('DfsNativePublicationGuardObservationV1',value)
-                action['authorization_blob']=replacement
-                self.header['guard_observation_blobs_by_operation'][op]=replacement
-                for blueprint in blueprints.values():
-                    for key in ('active_guard_blob','last_guard_blob'):
-                        if blueprint.get(key)==reference:blueprint[key]=replacement
+            if row['action']['kind'] == 'fallback-permit':
+                raise Rejected('retired per-operation KV fallback is incompatible with current model')
         peers_by_name={}
         for name,blueprint in blueprints.items():
             oid,n,_,held=self.cut_refs[name]; cut,folded,cfg,decoded,control_ref,kv=self.control_at(oid,n,blueprint)
             prefix,prefix_ref=self.semantic_prefix(oid,held['certified_prefix'])
             resident_ref=blueprint.get('native_resident_custody_blob')
-            actual_guard=blueprint.get('active_guard_blob')
-            bound=None
+            actual_guard=blueprint.get('active_guard_blob') or blueprint.get('last_guard_blob')
+            bound=held['backend_instance_authority_epoch']
             if 'requested_writer_epoch_view' in held:
                 request=held['requested_writer_epoch_view'];instance=held['backend_instance_authority_epoch']
                 expected=request if request is not None and request==instance else None
                 if held['writer_bound_epoch']!=expected:raise Rejected('normal epoch view does not match its actual getter argument/instance')
             if actual_guard:
-                actual=self.guard_source(actual_guard,oid,n,active=True)
+                actual=self.guard_source(actual_guard,oid,n,active=bool(blueprint.get('active_guard_blob')))
                 expected=actual['facts']['authority']['expected']['epoch'];instance=held['backend_instance_authority_epoch']
-                if instance is not None and instance!=expected:raise Rejected('actual guard lease targets another observed instance epoch')
+                if instance!=expected:raise Rejected('actual guard lease targets another observed instance epoch')
                 # An explicitly unbound store remains storage DATA. Only this
                 # actual validated native guard supplies its writer capability.
                 bound=expected
@@ -1002,7 +937,7 @@ class NativeContexts:
                 gate['initial_completed_handoff_blob']=self.blobs.json('DfsNativeInitialCompletedHandoffV1',self.certificate(actual_completed_handoff=completed_initial))
             operations=self.operations_at(oid,n,held,blueprint)
             typedrefs=[self.blobs.json(kind,value) if value is not None else None for kind,value in zip(
-                ('DfsMetadataShardConfig','DfsMetadataShardMembershipHandoff','DfsMetadataShardOperationFloor','DfsMetadataShardHeadWatermark'),decoded)]
+                ('DfsMetadataShardConfig','DfsMetadataShardMembershipHandoff'),decoded)]
             table_ref=self.blobs.json('DfsMetadataTableSnapshotTables',held['tables'])
             memory_owner,memory_n,memory_side=self.memory_sources[name]
             facts=self.certificate(snapshot_owner_id=oid,snapshot_native_prefix=prefix,visible_footprint_complete=True,
@@ -1014,7 +949,7 @@ class NativeContexts:
             self.contexts[name]=dict(owner_id=oid,scope=self.scope,active_config=cfg,committed_config=cfg,
                 local_certified_prefix=prefix,materialized_through_sequence=str(held['materialized_through_sequence']),
                 prepare_record_blobs=[],commit_record_blobs=[],complete_visible_rows_blob=table_ref,held_tables_blob=table_ref,
-                pending_handoff_blob=typedrefs[1],operation_floor_blob=typedrefs[2],raft_head_watermark_blob=typedrefs[3],
+                pending_handoff_blob=typedrefs[1],
                 retiring_fence_blob=None,local_marker_blob=gate.get('native_write_freeze_blob'),
                 local_writer_binding_blob=self.blobs.json('DfsNativeWriterBindingV1',bindings),kv_read=kv,projection_continuous=True,
                 _facts=facts)
@@ -1050,38 +985,11 @@ class NativeContexts:
                 environment=dict(origin='existential-environment-constrained-by-native-responses',online_node_ids=nodes,authenticated_response_node_ids=nodes,absence_is_offline=False,actual_receipt_observation_blobs=self.header.get('initial_content_receipt_observation_blobs',[]))
             if environment.get('absence_is_offline'): raise Rejected('missing ACK cannot certify offline node')
             fact['environment_binding']=environment
-            # Nonempty control clocks require exact physical-prefix attribution, never owner-label guessing.
-            for control_field,prefix_field,owner_field in [('operation_floor_blob','operation_floor_prefix','operation_floor_source_owner_id'),('raft_head_watermark_blob','raft_watermark_prefix','raft_watermark_source_owner_id')]:
-                if context[control_field] is not None:
-                    attribution=blueprint.get(prefix_field+'_attribution')
-                    if attribution is None: raise Unavailable(f'{prefix_field}: actual source-owner prefix attribution missing')
-                    snapshot=attribution['snapshot_id'];peer=peers_by_name[snapshot]
-                    clock=self.native(context[control_field]);source_owner,source_n,_,source_held=self.cut_refs[snapshot]
-                    horizon={context['owner_id']:self.cut_refs[name][1]}
-                    for peer_name in selection.values():
-                        actor,ordinal,_,_=self.cut_refs[peer_name];horizon[actor]=max(horizon.get(actor,0),ordinal)
-                    if source_owner not in horizon or source_n>horizon[source_owner]:
-                        raise Rejected('control clock prefix borrows a future or unselected owner cut')
-                    materialized=source_held['certified_prefix']
-                    sequence=clock['prepared_sequence'] if prefix_field=='operation_floor_prefix' else clock['journal_sequence']
-                    if decimal(materialized['journal_sequence'],'attributed prefix')!=decimal(sequence,'actual control clock'):
-                        raise Rejected('control clock differs from attributed exact native prefix')
-                    if prefix_field=='operation_floor_prefix':
-                        records=[row for row in source_held['tables'].get('prepared_operations_v7',[])
-                            if row['digest']['payload_digest']==clock['operation_digest']
-                            and decimal(row['digest']['prepare_sequence'],'prepare slot')==decimal(sequence,'floor slot')
-                            and decimal(row['digest']['owner_epoch'],'record epoch')==decimal(clock['authority_epoch'],'floor epoch')]
-                        if len(records)!=1: raise Rejected('floor does not bind the actual captured original preparation')
-                    else:
-                        if (clock['file_system_id']!=self.scope['file_system_id'] or clock['shard_id']!=self.scope['shard_id']
-                                or clock['state_fingerprint']!=materialized['digest']
-                                or self.owners[source_owner]['node_id']!=clock['primary_node_id']):
-                            raise Rejected('watermark identity/fingerprint differs from actual source owner prefix')
-                    fact[prefix_field]=self.prefix(materialized);fact[owner_field]=source_owner
-                    if prefix_field=='raft_watermark_prefix': fact['raft_watermark_certificate_blob']=peer['prefix_certificate_blob']
             if context['pending_handoff_blob'] is not None or blueprint.get('handoff_observation'):
                 observation=blueprint.get('handoff_observation')
                 if observation is None: raise Unavailable('actual pending handoff needs frozen cut/ACK/activation source references')
+                if any(key in observation for key in ('captured_operation_floor', 'captured_raft_watermark')):
+                    raise Rejected('retired global metadata clocks cannot stand in for a native handoff decision prefix')
                 source_refs=observation.get('actual_boundary_sources')
                 if not source_refs: raise Unavailable('handoff facts need exact actual freeze/ACK/activation boundary references')
                 actual=[]
@@ -1137,6 +1045,41 @@ class NativeContexts:
                             self_ack.add(self.owners[actor]['node_id'])
                 if not set(observation['authenticated_exact_prefix_ack_nodes']).issubset(observed_nodes|self_ack):
                     raise Rejected('handoff ACKs lack actual correlated source responses or owned exact retiring freeze')
+                decision = observation.get('pending_decision_source')
+                if not isinstance(decision, dict) or set(decision) != {'snapshot_id', 'control_commit_source'}:
+                    raise Unavailable('finite handoff needs actual pending-decision held prefix and successful global transaction source')
+                selected = decision['snapshot_id']; selected_owner, selected_n, _, selected_held = self.cut_refs[selected]
+                commit_source = decision['control_commit_source']
+                commit_key = (commit_source['owner_id'], decimal(commit_source['owner_ordinal'], 'pending decision commit'))
+                event = self.events.get(commit_key)
+                if event is None or event['collection'] != 'control_commits' or selected_owner != commit_key[0] or selected_n > commit_key[1]:
+                    raise Rejected('pending decision prefix borrows another owner or later held view')
+                if commit_key[0] not in horizon or commit_key[1] > horizon[commit_key[0]]:
+                    raise Rejected('pending decision global effect is outside actual observer horizon')
+                request = event['record']['commit']['request']; result = event['record']['commit']['result']
+                response = result.get('txn_response')
+                if request['request_id'] != result['request_id'] or response is None or response.get('succeeded') is not True:
+                    raise Unavailable('pending decision has no successful original global transaction receipt')
+                pending_key = '/dfs/filesystems/' + self.scope['file_system_id'] + '/metadata-membership-handoffs/' + self.scope['shard_id'].strip('/').replace('/', '_')
+                decodes = [row for row in self.raw_headers[selected_owner].get('actual_request_value_decodes', [])
+                           if decimal(row['source_owner_ordinal'], 'pending decoder ordinal') == commit_key[1]
+                           and row['request_section'] == 'success' and row['key'] == pending_key
+                           and row['native_type'] == 'DfsMetadataShardMembershipHandoff']
+                if len(decodes) != 1 or ASSEMBLER.validate_request_value_decode(self.raw_headers[selected_owner], event['record'], decodes[0]) != source_handoff:
+                    raise Rejected('pending decision transaction does not publish this exact immutable handoff')
+                for (actor, ordinal), intervening in self.events.items():
+                    if actor != selected_owner or not selected_n < ordinal < commit_key[1]: continue
+                    if intervening['collection'] == 'packets':
+                        raise Unavailable('pending-decision held prefix crosses an actual kernel boundary')
+                    after = intervening['record'].get('after_held_json')
+                    if after is not None:
+                        actual = ASSEMBLER.native_json(ASSEMBLER.byte_vector(after, 'pending-decision intervening held'), 'pending-decision intervening held')
+                        if not ASSEMBLER.native_metadata_memory_equal(actual, selected_held):
+                            raise Rejected('pending-decision held prefix crosses an actual metadata mutation')
+                if self.prefix(selected_held['certified_prefix']) != observation.get('pending_decision_local_prefix'):
+                    raise Rejected('pending-decision prefix differs from its actual held native source')
+                _, decision_certificate = self.semantic_prefix(selected_owner, selected_held['certified_prefix'])
+                observation['pending_decision_local_prefix_certificate_blob'] = decision_certificate
                 observation['cause']=source_handoff['cause']
                 fact['handoff']=observation
             context['native_operational_facts_blob']=self.blobs.json('DfsShardNativeOperationalFactsV1',fact)
@@ -1158,7 +1101,7 @@ class NativeContexts:
             pending=context['pending_handoff_blob']
             if pending:
                 desired=self.native(pending)['desired_shard'];replacement=set(desired.get('replica_node_ids',[])+[desired['primary_node_id']])
-        profile=dict(nodes=nodes,raft_voter_node_ids=voters,initial_primary_node_id=cfg['primary_node_id'],
+        profile=dict(standalone=False,nodes=nodes,raft_voter_node_ids=voters,initial_primary_node_id=cfg['primary_node_id'],
             initial_metadata_members=sorted(members),replacement_metadata_members=sorted(replacement),
             content_replica_node_ids=plan,min_commit_replicas=w,
             sealed_content_requirements={op:dict(canonical_payload_blob=ref,native_digest=digest,

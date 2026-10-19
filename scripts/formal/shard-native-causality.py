@@ -275,11 +275,11 @@ def global_vectors(dag, blueprints, initial, timeline):
         references=[(ref['actual_mount_label'],dag.number(ref['owner_ordinal'])) for ref in row['raw_references']]
         originals=[key for key in references if dag.events.get(key,{}).get('collection')=='original_control_commits']
         if originals:
-            if row.get('action',{}).get('kind')!='fallback-permit':
-                raise api.Rejected('original KV source is outside its actual fallback-permit group')
+            if row.get('action',{}).get('kind') not in ('handoff-begin','activate','kv-observation'):
+                raise api.Rejected('original KV source is outside a genuine global configuration/handoff group')
             calls=[key for key in references if dag.events.get(key,{}).get('collection')=='control_commits']
             if len(originals)!=1 or len(calls)!=1 or originals[0][0]!=terminal[0] or calls[0][0]!=terminal[0]:
-                raise api.Rejected('fallback group changes its exact original/caller source set')
+                raise api.Rejected('global configuration group changes its exact original/caller source set')
             if dag.headers is None:
                 raise api.Unavailable('original effect boundary lacks its actual source headers')
             raw={key:dict(kind={'original_control_commits':'original-control-commit','control_commits':'control-commit'}.get(event['collection'],event['collection']),
@@ -291,7 +291,7 @@ def global_vectors(dag, blueprints, initial, timeline):
             matched=module.original_for_replay(dag.scope,dag.owners[owner],header,raw,
                 calls[0],dag.events[calls[0]]['record'],voters)
             if matched!=originals[0]:
-                raise api.Rejected('fallback group changes its independently matched original boundary')
+                raise api.Rejected('global configuration group changes its independently matched original boundary')
             if matched in dag.original_effect_boundaries:
                 raise api.Rejected('actual original KV effect represented by multiple transitions')
             dag.original_effect_boundaries[matched]=terminal

@@ -15,20 +15,25 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[2]
 MODEL = Path('specs/quint/models/dfs/whole_shard.qnt')
 CHECK = Path('specs/quint/checks/dfs/whole_shard_safety.qnt')
+CONTRACT = Path('specs/quint/contracts/dfs/whole_shard_authority.qnt')
 SEED = '0x51a020261006'
 CONTROLS = {
     'content_w_without_metadata_authority': (
-        's.acks.get(op) == s.members or matchingPermit(op),', 'true,',
+        'publicationProofAllowed(s.profile.standalone, s.primary, s.members,\n        if (s.profile.standalone) Set() else s.acks.get(op)),', 'true,',
         ['stage(1, 1)', 'prepare(1)', 'admitCommit(1)', 'commit(1, digest(1, 1), false)']),
     'unilateral_handoff_activation': (
-        's.pending, s.frozen, jointProof, s.frozenHead >= s.capturedFloor,',
-        's.pending, s.frozen, s.frozenHead >= s.capturedFloor,',
+        's.pending, s.frozen, jointProof,',
+        's.pending, s.frozen,',
         ['beginHandoff(false)', 'freezeRetiring', 'acknowledgeHandoff(1)', 'activate(false)']),
-    'cached_permit_after_pending_handoff': (
-        'preparationWritable, not(s.pending), s.guardOp == 0, current(p),',
-        'preparationWritable, s.guardOp == 0, current(p),',
+    'metadata_majority_without_full_assignment': (
+        'publicationProofAllowed(s.profile.standalone, s.primary, s.members,\n        if (s.profile.standalone) Set() else s.acks.get(op)),', 'true,',
         ['stage(1, 1)', 'prepare(1)', 'changeConnectivity(Set(1, 2))', 'acknowledgePrepare(1, 2)',
-         'issuePermit(1)', 'beginHandoff(false)', 'admitCommit(1)', 'commit(1, digest(1, 1), false)']),
+         'admitCommit(1)', 'commit(1, digest(1, 1), false)']),
+    'frozen_writer_admission': (
+        'not(s.observedPending), not(s.frozen) or (s.activated and s.bound.get(s.primary) == s.epoch),',
+        'true,',
+        ['stage(1, 1)', 'prepare(1)', 'acknowledgePrepare(1, 2)', 'acknowledgePrepare(1, 3)',
+         'beginHandoff(false)', 'freezeRetiring', 'admitCommit(1)']),
     'mismatched_commit_digest': (
         'suppliedDigest == p.digest, s.guardOp == op, writable, current(p),',
         's.guardOp == op, writable, current(p),',
@@ -74,6 +79,8 @@ def main() -> int:
         scenario = scratch / 'specs/quint/scenarios/dfs/whole_shard_negative.qnt'
         scenario.parent.mkdir(parents=True)
         (scratch / CHECK).write_text(checks)
+        (scratch / CONTRACT).parent.mkdir(parents=True)
+        (scratch / CONTRACT).write_bytes((ROOT / CONTRACT).read_bytes())
         for name, (original, replacement, actions) in CONTROLS.items():
             if model.count(original) != 1:
                 raise SystemExit(f'Expected exactly one {name} mutation site; model changed')

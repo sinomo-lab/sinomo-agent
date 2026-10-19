@@ -1,11 +1,13 @@
 /// Whole logical shard target contract, bounded abstraction.
 /// Native trace replay is a separate, capture-scoped refinement check.
-/// Recovery requires the configured metadata majority and operation-bound
-/// native Raft permit observed from the implementation.
+/// Ordinary publication is positively local standalone or requires every
+/// assigned metadata participant. A partial set remains unavailable even when
+/// content W or native KV quorum is satisfied. KV authorizes global handoff only.
 /// Native Raft quorum commitment and native durable-prefix certification are
 /// explicit abstract inputs. No election, OS scheduling, timers or storage-byte
 /// model is substituted for the existing mechanisms.
 module dfs_whole_shard {
+  import dfs_whole_shard_authority.* from "../../contracts/dfs/whole_shard_authority"
   pure val Nodes = Set(1, 2, 3, 4)
   pure val Operations = Set(1, 2, 3)
   pure val Sequences = Set(1, 2, 3, 4, 5, 6)
@@ -19,15 +21,11 @@ module dfs_whole_shard {
     present: bool, op: int, digest: int, body: int, epoch: int, revision: int,
     primary: int, seq: int, base: int, target: int, receipts: Set[int], prefix: Prefix,
   }
-  type Permit = {
-    present: bool, op: int, digest: int, epoch: int, revision: int,
-    primary: int, seq: int, voters: Set[int], recovery: Set[int],
-  }
   type Commit = {
     present: bool, op: int, digest: int, body: int, epoch: int, revision: int,
     primary: int, seq: int, base: int, target: int, members: Set[int],
     admittedEpoch: int, admittedRevision: int, admittedPrimary: int, admittedFrozen: bool, admittedPending: bool,
-    receipts: Set[int], acks: Set[int], voters: Set[int], recovery: Set[int], path: int,
+    receipts: Set[int], acks: Set[int], path: int,
   }
   pure val EmptyEntry: Entry = { kind: 0, op: 0, digest: 0, body: 0, epoch: 0 }
   pure val EmptyPrefix: Prefix = Sequences.mapBy(_ => EmptyEntry)
@@ -35,26 +33,26 @@ module dfs_whole_shard {
     present: false, op: 0, digest: 0, body: 0, epoch: 0, revision: 0,
     primary: 0, seq: 0, base: 0, target: 0, receipts: Set(), prefix: EmptyPrefix,
   }
-  pure val EmptyPermit: Permit = {
-    present: false, op: 0, digest: 0, epoch: 0, revision: 0,
-    primary: 0, seq: 0, voters: Set(), recovery: Set(),
-  }
   pure val EmptyCommit: Commit = {
     present: false, op: 0, digest: 0, body: 0, epoch: 0, revision: 0,
     primary: 0, seq: 0, base: 0, target: 0, members: Set(), admittedEpoch: 0, admittedRevision: 0, admittedPrimary: 0, admittedFrozen: false, admittedPending: false,
-    receipts: Set(), acks: Set(), voters: Set(), recovery: Set(), path: 0,
+    receipts: Set(), acks: Set(), path: 0,
   }
   type Profile = {
-    nodes: Set[int], voters: Set[int], initialMembers: Set[int],
+    standalone: bool, nodes: Set[int], voters: Set[int], initialMembers: Set[int],
     replacementMembers: Set[int], contentReplicas: Set[int], requiredW: int, metadataOnlyOperations: Set[int],
   }
   pure val defaultProfile: Profile = {
-    nodes: Nodes, voters: Voters, initialMembers: InitialMembers,
+    standalone: false, nodes: Nodes, voters: Voters, initialMembers: InitialMembers,
     replacementMembers: ReplacementMembers, contentReplicas: Nodes, requiredW: W, metadataOnlyOperations: Set(),
   }
   pure def profileValid(profile: Profile): bool = all {
     profile.nodes.subseteq(Nodes), profile.nodes.size() > 0,
-    profile.voters.subseteq(profile.nodes), profile.voters.size() > 0,
+    profile.voters.subseteq(profile.nodes),
+    if (profile.standalone) all {
+      profile.nodes == Set(1), profile.voters == Set(),
+      profile.initialMembers == Set(1), profile.replacementMembers == Set(1),
+    } else profile.voters.size() > 0,
     profile.initialMembers.subseteq(profile.nodes), profile.initialMembers.contains(1),
     profile.replacementMembers.subseteq(profile.nodes), profile.replacementMembers.contains(1),
     profile.contentReplicas.subseteq(profile.nodes), profile.contentReplicas.size() > 0,
@@ -66,16 +64,15 @@ module dfs_whole_shard {
     bound: int -> int, head: int, journal: Prefix, logs: int -> Prefix,
     heads: int -> int, replicaRead: int -> int, replicaFreeze: int -> int, replicaIngestRead: int -> int,
     prepares: int -> Prepare, receipts: int -> Set[int],
-    acks: int -> Set[int], permits: int -> Permit, commits: int -> Commit,
+    acks: int -> Set[int], commits: int -> Commit,
     visible: int, visibleBodies: int -> int, pending: bool, observedPending: bool, frozen: bool,
-    desiredPrimary: int, desiredMembers: Set[int], capturedFloor: int, capturedHead: int, pendingJournalHead: int,
-    raftWatermarkHead: int, raftWatermarkPrefix: Prefix, capturedWatermarkPrefix: Prefix,
-    permitFloor: int, frozenHead: int, frozenPrefix: Prefix,
+    desiredPrimary: int, desiredMembers: Set[int], capturedHead: int, pendingJournalHead: int,
+    capturedPrefix: Prefix, frozenHead: int, frozenPrefix: Prefix,
     handoffAcks: Set[int], promotionMarker: bool, activated: bool,
     lostReply: Set[int], replayed: Set[int], changedRetryRejected: bool,
     minorityRejected: bool, staleEpochRejected: bool, partialActivationRejected: bool,
-    guardOp: int, guardPath: int, guardAcks: Set[int], guardPermit: Permit, guardPending: bool, guardPriorBound: int,
-    cachedPermitHandoffRejected: bool, wrongDigestRejected: bool, divergentPrefixRejected: bool,
+    guardOp: int, guardPath: int, guardAcks: Set[int], guardPending: bool,
+    frozenWriterRejected: bool, partialRejected: bool, wrongDigestRejected: bool, divergentPrefixRejected: bool,
     lateWriteCaptured: bool, activationReplyLost: bool, last: str,
   }
   pure val initial: State = {
@@ -84,17 +81,16 @@ module dfs_whole_shard {
     logs: Nodes.mapBy(_ => EmptyPrefix), heads: Nodes.mapBy(_ => 0),
     replicaRead: Nodes.mapBy(_ => 0), replicaFreeze: Nodes.mapBy(_ => 0), replicaIngestRead: Nodes.mapBy(_ => 0),
     prepares: Operations.mapBy(_ => EmptyPrepare), receipts: Operations.mapBy(_ => Set()),
-    acks: Operations.mapBy(_ => Set()), permits: Operations.mapBy(_ => EmptyPermit),
+    acks: Operations.mapBy(_ => Set()),
     commits: Operations.mapBy(_ => EmptyCommit), visible: 0,
     visibleBodies: Operations.mapBy(_ => 0), pending: false, observedPending: false, frozen: false,
-    desiredPrimary: 1, desiredMembers: InitialMembers, capturedFloor: 0, capturedHead: 0, pendingJournalHead: 0,
-    raftWatermarkHead: 0, raftWatermarkPrefix: EmptyPrefix, capturedWatermarkPrefix: EmptyPrefix,
-    permitFloor: 0, frozenHead: 0, frozenPrefix: EmptyPrefix,
+    desiredPrimary: 1, desiredMembers: InitialMembers, capturedHead: 0, pendingJournalHead: 0,
+    capturedPrefix: EmptyPrefix, frozenHead: 0, frozenPrefix: EmptyPrefix,
     handoffAcks: Set(), promotionMarker: false, activated: false,
     lostReply: Set(), replayed: Set(), changedRetryRejected: false,
     minorityRejected: false, staleEpochRejected: false, partialActivationRejected: false,
-    guardOp: 0, guardPath: 0, guardAcks: Set(), guardPermit: EmptyPermit, guardPending: false, guardPriorBound: 0,
-    cachedPermitHandoffRejected: false, wrongDigestRejected: false, divergentPrefixRejected: false,
+    guardOp: 0, guardPath: 0, guardAcks: Set(), guardPending: false,
+    frozenWriterRejected: false, partialRejected: false, wrongDigestRejected: false, divergentPrefixRejected: false,
     lateWriteCaptured: false, activationReplyLost: false, last: "init",
   }
   var s: State
@@ -115,29 +111,19 @@ module dfs_whole_shard {
   /// unbound backend may prepare; a retained stale binding remains fenced.
   def preparationWritable: bool = all {
     s.online.contains(s.primary), s.bound.get(s.primary) == 0 or s.bound.get(s.primary) == s.epoch,
-    not(s.observedPending), not(s.frozen) or s.activated,
+    not(s.observedPending), not(s.frozen) or (s.activated and s.bound.get(s.primary) == s.epoch),
   }
   def current(p: Prepare): bool = all {
     p.present, p.primary == s.primary, p.epoch == s.epoch, p.revision == s.revision,
     p.base == s.visible, p.target == s.visible + 1,
     p.digest == digest(p.op, p.body), samePrefix(s.journal, p.prefix, p.seq),
   }
-  def matchingPermit(op: int): bool = {
-    val p = s.prepares.get(op)
-    val permit = s.permits.get(op)
-    all {
-      permit.present, permit.op == p.op, permit.digest == p.digest,
-      permit.seq == p.seq, permit.epoch == p.epoch, permit.revision == p.revision,
-      permit.primary == p.primary, permit.voters.subseteq(s.profile.voters),
-      permit.voters.size() >= quorum(s.profile.voters), permit.recovery.subseteq(s.members),
-      permit.recovery.size() >= quorum(s.members), permit.recovery.contains(s.primary),
-    }
-  }
   def canCommit(op: int): bool = {
     val p = s.prepares.get(op)
     all {
-      preparationWritable, not(s.pending), s.guardOp == 0, current(p), contentReceiptsValid(op, p.receipts),
-      s.acks.get(op) == s.members or matchingPermit(op),
+      preparationWritable, s.guardOp == 0, current(p), contentReceiptsValid(op, p.receipts),
+      publicationProofAllowed(s.profile.standalone, s.primary, s.members,
+        if (s.profile.standalone) Set() else s.acks.get(op)),
     }
   }
   def jointProof: bool = all {
@@ -147,10 +133,21 @@ module dfs_whole_shard {
     s.handoffAcks.intersect(s.desiredMembers).size() >= quorum(s.desiredMembers),
   }
   action init = s' = initial
+  /// Local mode is an explicit positively owned profile, not absence of cluster
+  /// evidence or a one-voter cluster. Native clustered replay never selects it.
+  action initStandalone = s' = initial
+    .with("profile", defaultProfile.with("standalone", true).with("nodes", Set(1))
+      .with("voters", Set()).with("initialMembers", Set(1)).with("replacementMembers", Set(1))
+      .with("contentReplicas", Set(1)))
+    .with("members", Set(1)).with("desiredMembers", Set(1)).with("online", Set(1))
+    .with("epoch", 0).with("revision", 0).with("bound", Set(1).mapBy(_ => 0))
+    .with("logs", Set(1).mapBy(_ => EmptyPrefix)).with("heads", Set(1).mapBy(_ => 0))
+    .with("replicaRead", Set(1).mapBy(_ => 0)).with("replicaFreeze", Set(1).mapBy(_ => 0))
+    .with("replicaIngestRead", Set(1).mapBy(_ => 0))
   /// Native replay supplies a certified immutable profile, including exact voters.
   /// Node 1 names the retiring primary by an injective dictionary, not a new node.
   action initFromProfile(profile: Profile): bool = all {
-    profileValid(profile),
+    profileValid(profile), not(profile.standalone),
     s' = initial.with("profile", profile).with("members", profile.initialMembers)
       .with("desiredMembers", profile.initialMembers).with("online", profile.nodes)
       .with("bound", profile.nodes.mapBy(n => if (n == 1) 1 else 0))
@@ -164,7 +161,7 @@ module dfs_whole_shard {
   /// bindings come from the certified held cut; no prepared operation or
   /// unresolved handoff is omitted by this initialization boundary.
   action initFromCertifiedCut(profile: Profile, receipts: int -> Set[int], bound: int -> int, online: Set[int]): bool = all {
-    profileValid(profile), online.subseteq(profile.nodes), online.contains(1),
+    profileValid(profile), not(profile.standalone), online.subseteq(profile.nodes), online.contains(1),
     Operations.forall(op => receipts.get(op).subseteq(profile.contentReplicas)
       and (not(profile.metadataOnlyOperations.contains(op)) or receipts.get(op) == Set())),
     profile.nodes.forall(n => bound.get(n) == 0 or bound.get(n) == 1),
@@ -249,50 +246,27 @@ module dfs_whole_shard {
         .with("last", "prepare-prefix-ack"),
     }
   }
-  /// Abstract native Raft result: exact operation permit, never DFS election.
-  action issuePermit(op: int): bool = {
-    val p = s.prepares.get(op)
-    val recovery = s.acks.get(op).intersect(s.online)
-    val voters = s.profile.voters.intersect(s.online)
-    val permit: Permit = {
-      present: true, op: op, digest: p.digest, epoch: p.epoch, revision: p.revision,
-      primary: p.primary, seq: p.seq, voters: voters, recovery: recovery,
-    }
-    all {
-      current(p), not(s.pending), s.acks.get(op) != s.members,
-      recovery.size() >= quorum(s.members), recovery.contains(s.primary),
-      voters.size() >= quorum(s.profile.voters), p.seq >= s.permitFloor,
-      s' = s.with("permits", s.permits.set(op, permit)).with("permitFloor", p.seq)
-        .with("raftWatermarkHead", p.seq).with("raftWatermarkPrefix", p.prefix)
-        .with("last", "native-raft-permit"),
-    }
-  }
-  /// Real PublicationGuard spans authoritative exact-key admission and publication.
-  /// A pending record excludes new admission on either authority path. A pending
-  /// Raft decision may race an already admitted writer; freeze waits for release.
+  /// PublicationGuard consumes the actual all-assigned participant proof and
+  /// retained current configuration under the native writer/epoch fence.
+  /// A global pending decision is not an ordinary per-operation KV read. The
+  /// retiring durable freeze waits for the writer, then prevents further work.
   action admitCommit(op: int): bool = all {
     canCommit(op),
-    val full = s.acks.get(op) == s.members
-    s' = s.with("guardOp", op).with("guardPath", if (full) 1 else 2).with("guardPending", s.pending)
-      .with("guardPriorBound", s.bound.get(s.primary)).with("bound", s.bound.set(s.primary, s.epoch))
-      .with("guardAcks", if (full) s.acks.get(op) else Set())
-      .with("guardPermit", if (full) EmptyPermit else s.permits.get(op))
+    s' = s.with("guardOp", op).with("guardPath", if (s.profile.standalone) 0 else 1)
+      .with("guardPending", s.pending).with("bound", s.bound.set(s.primary, s.epoch))
+      .with("guardAcks", if (s.profile.standalone) Set() else s.acks.get(op))
       .with("last", "publication-guard-admitted"),
   }
   /// Digest names the exact durable hidden payload. Namespace visibility is atomic.
   action commit(op: int, suppliedDigest: int, loseReply: bool): bool = {
     val p = s.prepares.get(op)
-    val full = s.guardPath == 1
-    val permit = s.guardPermit
     val record: Commit = {
       present: true, op: op, digest: p.digest, body: p.body, epoch: p.epoch,
       revision: p.revision, primary: p.primary, seq: p.seq, base: p.base, target: p.target,
       members: s.members, receipts: p.receipts,
       admittedEpoch: s.epoch, admittedRevision: s.revision, admittedPrimary: s.primary,
       admittedFrozen: s.frozen and not(s.activated), admittedPending: s.guardPending,
-      acks: if (full) s.guardAcks else Set(),
-      voters: if (full) Set() else permit.voters,
-      recovery: if (full) Set() else permit.recovery, path: if (full) 1 else 2,
+      acks: s.guardAcks, path: s.guardPath,
     }
     val entry: Entry = { kind: 2, op: op, digest: suppliedDigest, body: 0, epoch: s.epoch }
     val prefix = s.journal.set(s.head + 1, entry)
@@ -321,7 +295,7 @@ module dfs_whole_shard {
   }
   action releasePublicationGuard(op: int): bool = all {
     s.guardOp == op,
-    s' = s.with("guardOp", 0).with("bound", s.bound.set(s.primary, s.guardPriorBound)).with("last", "publication-guard-released"),
+    s' = s.with("guardOp", 0).with("last", "publication-guard-released"),
   }
   action replay(op: int, suppliedDigest: int): bool = all {
     s.commits.get(op).present, suppliedDigest == s.commits.get(op).digest,
@@ -337,13 +311,19 @@ module dfs_whole_shard {
     not(canCommit(op)), s.acks.get(op).size() < quorum(s.members),
     s' = s.with("minorityRejected", true).with("last", "W-only-rejected"),
   }
-  /// Every cause reuses the same native decision/freeze/joint-prefix protocol.
+  action rejectPartial(op: int): bool = all {
+    not(s.profile.standalone), current(s.prepares.get(op)),
+    contentReceiptsValid(op, s.prepares.get(op).receipts),
+    s.acks.get(op) != s.members, not(canCommit(op)),
+    s' = s.with("partialRejected", true).with("last", "partial-assignment-rejected"),
+  }
+  /// Global decisions consume the native KV quorum contract; no ordinary write
+  /// operation issues or consumes a KV permit/floor/watermark.
   action beginHandoffTarget(targetPrimary: int, targetMembers: Set[int], event: str): bool = all {
-    s.epoch == 1, not(s.pending), not(s.activated),
+    not(s.profile.standalone), s.epoch == 1, not(s.pending), not(s.activated),
     targetMembers.subseteq(s.profile.nodes), targetMembers.contains(targetPrimary),
     s.profile.voters.intersect(s.online).size() >= quorum(s.profile.voters),
-    s' = s.with("pending", true).with("capturedFloor", s.permitFloor)
-      .with("capturedHead", s.raftWatermarkHead).with("capturedWatermarkPrefix", s.raftWatermarkPrefix)
+    s' = s.with("pending", true).with("capturedHead", s.head).with("capturedPrefix", s.journal)
       .with("pendingJournalHead", s.head)
       .with("desiredPrimary", targetPrimary).with("desiredMembers", targetMembers)
       .with("last", event),
@@ -386,8 +366,8 @@ module dfs_whole_shard {
     s' = s.with("partialActivationRejected", true).with("last", "joint-proof-rejected"),
   }
   action activate(loseReply: bool): bool = all {
-    s.pending, s.frozen, jointProof, s.frozenHead >= s.capturedFloor,
-    s.frozenHead >= s.capturedHead, samePrefix(s.frozenPrefix, s.capturedWatermarkPrefix, s.capturedHead),
+    s.pending, s.frozen, jointProof,
+    s.frozenHead >= s.capturedHead, samePrefix(s.frozenPrefix, s.capturedPrefix, s.capturedHead),
     s.profile.voters.intersect(s.online).size() >= quorum(s.profile.voters),
     s.handoffAcks.forall(n => all {
       s.heads.get(n) == s.frozenHead, samePrefix(s.logs.get(n), s.frozenPrefix, s.frozenHead),
@@ -405,21 +385,23 @@ module dfs_whole_shard {
     s.primary == 1 or s.promotionMarker,
     s' = s.with("bound", s.bound.set(s.primary, s.epoch)).with("last", "successor-bound"),
   }
-  action restart(node: int): bool =
+  action restart(node: int): bool = all {
+    s.profile.nodes.contains(node),
     s' = s.with("bound", s.bound.set(node, 0))
       .with("guardOp", if (node == s.primary) 0 else s.guardOp)
       .with("replicaRead", s.replicaRead.set(node, 0))
       .with("replicaFreeze", s.replicaFreeze.set(node, 0))
-      .with("replicaIngestRead", s.replicaIngestRead.set(node, 0)).with("last", "restart-unbound")
+      .with("replicaIngestRead", s.replicaIngestRead.set(node, 0)).with("last", "restart-unbound"),
+  }
   action rejectStaleEpoch(op: int): bool = all {
     s.prepares.get(op).present, s.prepares.get(op).epoch != s.epoch,
     not(s.commits.get(op).present), not(canCommit(op)),
     s' = s.with("staleEpochRejected", true).with("last", "stale-epoch-rejected"),
   }
-  action rejectCachedPermitAfterHandoff(op: int): bool = all {
-    s.pending, s.guardOp == 0, matchingPermit(op),
-    s.acks.get(op) != s.members, not(canCommit(op)),
-    s' = s.with("cachedPermitHandoffRejected", true).with("last", "cached-permit-handoff-rejected"),
+  action rejectFrozenWriter(op: int): bool = all {
+    s.pending, s.frozen, s.guardOp == 0, s.prepares.get(op).present,
+    not(canCommit(op)),
+    s' = s.with("frozenWriterRejected", true).with("last", "frozen-writer-rejected"),
   }
   action rejectWrongCommitDigest(op: int): bool = all {
     s.prepares.get(op).present, digest(op, 2) != s.prepares.get(op).digest,
@@ -448,12 +430,12 @@ module dfs_whole_shard {
       changeConnectivity(connected), stage(op, node), prepare(op),
       observeReplicaFreezeRead(node, s.replicaRead.get(node) + 1, readFreeze),
       ingestPrefix(node, through), materializeReplicaPrefix(node, through),
-      acknowledgePrepare(op, node), issuePermit(op), admitCommit(op), commit(op, digest(op, 1), flag),
+      acknowledgePrepare(op, node), admitCommit(op), commit(op, digest(op, 1), flag),
       replay(op, digest(op, 1)), observeReply(op, flag), observeActivationReply(flag),
-      releasePublicationGuard(op), rejectChangedRetry(op), rejectMinority(op),
+      releasePublicationGuard(op), rejectChangedRetry(op), rejectMinority(op), rejectPartial(op),
       beginHandoff(flag), beginStorageImport, freezeRetiring, persistPromotionMarker,
       acknowledgeHandoff(node), rejectPartialActivation, activate(flag), bindSuccessor,
-      restart(node), rejectStaleEpoch(op), rejectCachedPermitAfterHandoff(op),
+      restart(node), rejectStaleEpoch(op), rejectFrozenWriter(op),
       rejectWrongCommitDigest(op), rejectDivergentPrefix(op, node), stutter,
     }
   }

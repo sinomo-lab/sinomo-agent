@@ -1,4 +1,4 @@
-module dfs_whole_shard_cached_permit_handoff_scenario {
+module dfs_whole_shard_frozen_writer_scenario {
   import dfs_whole_shard from "../../models/dfs/whole_shard"
   import dfs_whole_shard_safety from "../../checks/dfs/whole_shard_safety"
   var phase: int
@@ -9,16 +9,16 @@ module dfs_whole_shard_cached_permit_handoff_scenario {
     } else if (phase == 1) {
       all { dfs_whole_shard::prepare(1), phase' = phase + 1 }
     } else if (phase == 2) {
-      all { dfs_whole_shard::changeConnectivity(Set(1, 2)), phase' = phase + 1 }
-    } else if (phase == 3) {
       all { dfs_whole_shard::acknowledgePrepare(1, 2), phase' = phase + 1 }
+    } else if (phase == 3) {
+      all { dfs_whole_shard::acknowledgePrepare(1, 3), phase' = phase + 1 }
     } else if (phase == 4) {
-      all { dfs_whole_shard::issuePermit(1), phase' = phase + 1 }
-    } else if (phase == 5) {
       all { dfs_whole_shard::beginHandoff(false), phase' = phase + 1 }
+    } else if (phase == 5) {
+      all { dfs_whole_shard::freezeRetiring, phase' = phase + 1 }
     } else if (phase == 6) {
-      all { dfs_whole_shard::rejectCachedPermitAfterHandoff(1), phase' = phase + 1 }
+      all { dfs_whole_shard::rejectFrozenWriter(1), phase' = phase + 1 }
     } else { all { dfs_whole_shard::stutter, phase' = phase } }
   def safety: bool = dfs_whole_shard_safety::safety
-  def terminalWitness: bool = phase == 7 and all { dfs_whole_shard_safety::witnessCachedPermitHandoffRejected }
+  def terminalWitness: bool = phase == 7 and all { dfs_whole_shard_safety::witnessFrozenWriterRejected, dfs_whole_shard::s.visible == 0 }
 }

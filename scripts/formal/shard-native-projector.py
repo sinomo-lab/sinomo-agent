@@ -158,9 +158,8 @@ def empty_prepare():
                 primary=0, seq=0, base=0, target=0, receipts=finite_set([]), prefix=finite_map(empty_prefix()))
 
 
-def empty_permit():
-    return dict(present=False, op=0, digest=0, epoch=0, revision=0,
-                primary=0, seq=0, voters=finite_set([]), recovery=finite_set([]))
+
+
 
 
 def empty_commit():
@@ -168,7 +167,7 @@ def empty_commit():
                 seq=0, base=0, target=0, members=finite_set([]), admittedEpoch=0,
                 admittedRevision=0, admittedPrimary=0, admittedFrozen=False,
                 admittedPending=False, receipts=finite_set([]), acks=finite_set([]),
-                voters=finite_set([]), recovery=finite_set([]), path=0)
+                path=0)
 
 
 def native_bytes(value, label):
@@ -524,6 +523,8 @@ class NativeProjectorV1:
         native = self.initial.get('profile')
         if native is None:
             raise Unavailable('certified actual node/voter/member/content/W profile absent')
+        if native.get('standalone') is not False:
+            raise Unavailable('native clustered profile requires explicit standalone=false; archived profile incompatible')
         if set(native['nodes']) != set(self.nodes):
             raise Rejected('profile node coverage differs')
         primary = native['initial_primary_node_id']
@@ -551,7 +552,7 @@ class NativeProjectorV1:
                 metadata.append(opid)
             elif actual['min_commit_replicas'] != required or actual['content_replica_node_ids'] != replicas:
                 raise Unavailable('content body differs from actual finite content plan')
-        return dict(nodes=self.node_set(native['nodes']), voters=self.node_set(native['raft_voter_node_ids']),
+        return dict(standalone=False, nodes=self.node_set(native['nodes']), voters=self.node_set(native['raft_voter_node_ids']),
                     initialMembers=self.node_set(native['initial_metadata_members']),
                     replacementMembers=self.node_set(native['replacement_metadata_members']),
                     contentReplicas=self.node_set(replicas), requiredW=required,
@@ -1072,14 +1073,18 @@ class NativeProjectorV1:
             native_epoch = binding['bound_epoch']
             actual_guard_ref=binding.get('actual_publication_guard_observation_blob')
             if native_epoch is not None:
-                if not actual_guard_ref:raise Unavailable('modeled writer binding lacks its actual admitted guard lease')
-                actual_guard=self.blob(actual_guard_ref,'DfsNativePublicationGuardObservationV1')
-                self.require_certificate(actual_guard,'actual writer binding lease')
-                _,expected=self.config(actual_guard['expected_config'])
-                if (actual_guard.get('actual_physical_scope',{}).get('canonical_root')!=self.owners[owner_id]['canonical_root']
-                        or native_epoch!=expected['epoch'] or expected['primary_node_id']!=node_id
-                        or binding['actual_backend_instance_authority_epoch'] not in (None,native_epoch)):
-                    raise Rejected('modeled binding borrows another actual guard/instance/configuration')
+                instance = binding['actual_backend_instance_authority_epoch']
+                if instance != native_epoch:
+                    raise Rejected('persistent binding differs from actual backend instance epoch')
+                if actual_guard_ref:
+                    actual_guard = self.blob(actual_guard_ref, 'DfsNativePublicationGuardObservationV1')
+                    self.require_certificate(actual_guard, 'observed actual writer binding')
+                    _, expected = self.config(actual_guard['expected_config'])
+                    if (actual_guard.get('actual_physical_scope', {}).get('canonical_root') != self.owners[owner_id]['canonical_root']
+                            or native_epoch != expected['epoch'] or expected['primary_node_id'] != node_id):
+                        raise Rejected('observed binding borrows another guard/configuration/root')
+                # A held instance epoch is persistent DATA, including after
+                # release. It cannot replace the live author guard at commit.
             bound[self.node(node_id)] = 0 if native_epoch is None else self.epoch_aliases.get(u64(native_epoch, 'writer epoch'), -1)
             if bound[self.node(node_id)] < 0:
                 raise Unavailable('writer epoch outside config dictionary')
@@ -1103,7 +1108,7 @@ class NativeProjectorV1:
                 or u64(primary_snapshot['materialized_through_sequence'], 'primary materialized sequence') != u64(primary_peer['prefix']['journal_sequence'], 'primary durable sequence')):
             raise Unavailable('primary visibility needs an actual fully materialized logical cut')
         prepares = {o: empty_prepare() for o in OPERATIONS}; commits = {o: empty_commit() for o in OPERATIONS}
-        receipts = {o: finite_set([]) for o in OPERATIONS}; acks = {o: finite_set([]) for o in OPERATIONS}; permits = {o: empty_permit() for o in OPERATIONS}
+        receipts = {o: finite_set([]) for o in OPERATIONS}; acks = {o: finite_set([]) for o in OPERATIONS}
         definitions = facts['operation_observations']
         if head == 0:
             self.validate_initial_receipts(tables, definitions)
@@ -1148,16 +1153,14 @@ class NativeProjectorV1:
                 raise Unavailable('native effects are not one bounded sequential visibility lane')
             prepare_receipts = self.node_set(witness['durable_content_receipt_node_ids'])
             prepares[op] = dict(present=True, op=op, digest=op*10+1, body=1, epoch=old_epoch, revision=old_revision, primary=self.node(old_config['primary_node_id']), seq=prepare_seq, base=base, target=target, receipts=prepare_receipts, prefix=prepare_prefix)
-            permit_ref = observation.get('native_permit_observation_blob')
-            if permit_ref:
-                permit = self.permit(permit_ref, digest, prepares[op])
-                permits[op] = permit
+            if observation.get('native_permit_observation_blob') is not None:
+                raise Rejected('retired per-operation KV permit is incompatible with current native model')
             if terminal:
                 admission = self.guard(observation['committed_guard_observation_blob'], digest)
                 if not chain.get('all_effect_rows_materialized'):
                     raise Rejected('native commit label with partially visible transaction rows')
                 self.validate_atomic_rows(tables, payload, observation['visibility_chain_certificate'], terminal, primary_snapshot)
-                commits[op] = dict(present=True, op=op, digest=op*10+1, body=1, epoch=old_epoch, revision=old_revision, primary=prepares[op]['primary'], seq=prepare_seq, base=base, target=target, members=admission['members'], admittedEpoch=admission['epoch'], admittedRevision=admission['revision'], admittedPrimary=admission['primary'], admittedFrozen=admission['frozen'], admittedPending=admission['pending'], receipts=prepare_receipts, acks=admission['acks'], voters=admission['permit']['voters'], recovery=admission['permit']['recovery'], path=admission['path'])
+                commits[op] = dict(present=True, op=op, digest=op*10+1, body=1, epoch=old_epoch, revision=old_revision, primary=prepares[op]['primary'], seq=prepare_seq, base=base, target=target, members=admission['members'], admittedEpoch=admission['epoch'], admittedRevision=admission['revision'], admittedPrimary=admission['primary'], admittedFrozen=admission['frozen'], admittedPending=admission['pending'], receipts=prepare_receipts, acks=admission['acks'], path=admission['path'])
         visible_commits = [c for c in commits.values() if c['present']]
         visible = max([c['target'] for c in visible_commits] or [0])
         gate = primary_facts['actual_operational_gate']
@@ -1222,12 +1225,8 @@ class NativeProjectorV1:
             raise Rejected('environment binding contradicts an authenticated response')
         if environment.get('absence_is_offline',False):
             raise Rejected('missing responses cannot certify an offline node')
-        raft_owner = facts.get('raft_watermark_source_owner_id')
-        floor_owner = facts.get('operation_floor_source_owner_id')
-        if facts.get('raft_watermark_prefix') and raft_owner not in self.owners:
-            raise Unavailable('native Raft watermark needs actual source-owner prefix attribution')
-        if facts.get('operation_floor_prefix') and floor_owner not in self.owners:
-            raise Unavailable('native operation floor needs actual prepare-source attribution')
+        if any(key in facts for key in ('operation_floor_prefix', 'raft_watermark_prefix')):
+            raise Rejected('retired ordinary KV clocks are incompatible with current native context')
         active_guard = facts.get('active_publication_guard_blob')
         admission = self.guard(active_guard, None) if active_guard else None
         retained = self.guard(facts['last_publication_guard_blob'], None) if facts.get('last_publication_guard_blob') else None
@@ -1239,9 +1238,7 @@ class NativeProjectorV1:
             # same live lease. Its separately checked prior storage view remains
             # provenance for the mint, not the current capability binding.
             bound[primary] = admission['epoch']
-        empty = empty_permit()
-        state = dict(primary=primary, epoch=epoch, revision=revision, profile=self.profile, members=self.node_set(sorted(set(config['replica_node_ids']+[config['primary_node_id']]))), online=self.node_set(facts['environment_binding']['online_node_ids']), bound=finite_map(bound), head=head, journal=journal, logs=finite_map(logs), heads=finite_map(heads), replicaRead=finite_map(replica_read), replicaFreeze=finite_map(replica_freeze), replicaIngestRead=finite_map(replica_ingest_read), prepares=finite_map(prepares), receipts=finite_map(receipts), acks=finite_map(acks), permits=finite_map(permits), commits=finite_map(commits), visible=visible, visibleBodies=finite_map({o: 1 if commits[o]['present'] else 0 for o in OPERATIONS}), pending=pending, observedPending=gate['observed_pending_handoff'], frozen=logical_frozen, desiredPrimary=desired_primary, desiredMembers=desired_members, capturedFloor=cut_field('captured_operation_floor'), capturedHead=cut_field('captured_raft_watermark'), pendingJournalHead=cut_field('pending_decision_local_prefix'), raftWatermarkHead=self.cut(raft_owner,facts['raft_watermark_prefix']) if facts.get('raft_watermark_prefix') else 0, raftWatermarkPrefix=self.native_prefix(raft_owner,facts['raft_watermark_prefix'],self.blob(facts['raft_watermark_certificate_blob'],'DfsNativeSemanticPrefixCertificateV1'))[1] if facts.get('raft_watermark_prefix') else finite_map(empty_prefix()), capturedWatermarkPrefix=prefix_field('captured_raft_watermark'), permitFloor=self.cut(floor_owner,facts['operation_floor_prefix']) if facts.get('operation_floor_prefix') else 0, frozenHead=cut_field('frozen_prefix'), frozenPrefix=prefix_field('frozen_prefix'), handoffAcks=self.node_set(handoff['authenticated_exact_prefix_ack_nodes']) if handoff else finite_set([]), promotionMarker=bool(handoff and handoff['durable_promotion_marker_validated']), activated=bool(handoff and handoff['activation_committed']), lostReply=finite_set(self.observed_flags.get('lostReply',[])), replayed=finite_set(self.observed_flags.get('replayed',[])), changedRetryRejected=self.observed_flags.get('changedRetryRejected',False), minorityRejected=self.observed_flags.get('minorityRejected',False), staleEpochRejected=self.observed_flags.get('staleEpochRejected',False), partialActivationRejected=self.observed_flags.get('partialActivationRejected',False), guardOp=admission['op'] if admission else 0, guardPath=retained['path'] if retained else 0, guardAcks=retained['acks'] if retained else finite_set([]), guardPermit=retained['permit'] if retained else empty, guardPending=retained['pending'] if retained else False, cachedPermitHandoffRejected=self.observed_flags.get('cachedPermitHandoffRejected',False), wrongDigestRejected=self.observed_flags.get('wrongDigestRejected',False), divergentPrefixRejected=self.observed_flags.get('divergentPrefixRejected',False), lateWriteCaptured=bool(handoff and handoff['late_native_writes_captured']), activationReplyLost=self.observed_flags.get('activationReplyLost', False), last=self.last)
-        state['guardPriorBound'] = retained['priorBound'] if retained else 0
+        state = dict(primary=primary, epoch=epoch, revision=revision, profile=self.profile, members=self.node_set(sorted(set(config['replica_node_ids']+[config['primary_node_id']]))), online=self.node_set(facts['environment_binding']['online_node_ids']), bound=finite_map(bound), head=head, journal=journal, logs=finite_map(logs), heads=finite_map(heads), replicaRead=finite_map(replica_read), replicaFreeze=finite_map(replica_freeze), replicaIngestRead=finite_map(replica_ingest_read), prepares=finite_map(prepares), receipts=finite_map(receipts), acks=finite_map(acks), commits=finite_map(commits), visible=visible, visibleBodies=finite_map({o: 1 if commits[o]['present'] else 0 for o in OPERATIONS}), pending=pending, observedPending=gate['observed_pending_handoff'], frozen=logical_frozen, desiredPrimary=desired_primary, desiredMembers=desired_members, capturedHead=cut_field('pending_decision_local_prefix'), pendingJournalHead=cut_field('pending_decision_local_prefix'), capturedPrefix=prefix_field('pending_decision_local_prefix'), frozenHead=cut_field('frozen_prefix'), frozenPrefix=prefix_field('frozen_prefix'), handoffAcks=self.node_set(handoff['authenticated_exact_prefix_ack_nodes']) if handoff else finite_set([]), promotionMarker=bool(handoff and handoff['durable_promotion_marker_validated']), activated=bool(handoff and handoff['activation_committed']), lostReply=finite_set(self.observed_flags.get('lostReply',[])), replayed=finite_set(self.observed_flags.get('replayed',[])), changedRetryRejected=self.observed_flags.get('changedRetryRejected',False), minorityRejected=self.observed_flags.get('minorityRejected',False), staleEpochRejected=self.observed_flags.get('staleEpochRejected',False), partialActivationRejected=self.observed_flags.get('partialActivationRejected',False), partialRejected=self.observed_flags.get('partialRejected',False), frozenWriterRejected=self.observed_flags.get('frozenWriterRejected',False), guardOp=admission['op'] if admission else 0, guardPath=retained['path'] if retained else 0, guardAcks=retained['acks'] if retained else finite_set([]), guardPending=retained['pending'] if retained else False, wrongDigestRejected=self.observed_flags.get('wrongDigestRejected',False), divergentPrefixRejected=self.observed_flags.get('divergentPrefixRejected',False), lateWriteCaptured=bool(handoff and handoff['late_native_writes_captured']), activationReplyLost=self.observed_flags.get('activationReplyLost', False), last=self.last)
         return state
 
     def validate_effect_materialization(self, witness, payload, committed_entry, canonical_reference):
@@ -1535,139 +1532,39 @@ class NativeProjectorV1:
                 return self.blob(evidence['decoded_value_blob'], native_type)
         raise Unavailable('actual native KV compare/effect decoder evidence absent')
 
-    def validate_native_permit_receipt(self, fact, digest):
-        permit = self.blob(fact.get('native_permit_blob'), 'DfsMetadataOperationPermit')
-        for field, expected in (('file_system_id',digest['file_system_id']), ('shard_id',digest['shard_id']),
-                                ('operation_digest',digest['payload_digest']), ('permit_id',fact['permit_id'])):
-            if permit.get(field) != expected:
-                raise Rejected('actual operation permit identity differs')
-        if u64(permit['owner_epoch'],'permit epoch') != u64(digest['owner_epoch'],'digest epoch') or u64(permit['prepare_sequence'],'permit sequence') != u64(digest['prepare_sequence'],'digest sequence') or not permit['permit_id']:
-            raise Rejected('actual permit epoch/sequence binding differs')
-        native = permit.get('native_commit')
-        if native is None:
-            raise Unavailable('actual native Raft request/result receipt absent')
-        request, result = native['request'], native['result']
-        response, authority = result.get('txn_response'), result['authority']
-        basis = authority['basis']
-        if not isinstance(basis,dict) or set(basis) != {'current-term-quorum'}:
-            raise Rejected('exact committed replay cannot supply fresh native quorum basis')
-        quorum = basis['current-term-quorum']
-        ack_count = u64(quorum['voter_acks'],'native voter ACK count')
-        required = u64(quorum['required_quorum'],'native required quorum')
-        configured = self.initial['profile']['raft_voter_node_ids']
-        if required != len(set(configured))//2+1 or not required <= ack_count <= len(set(configured)):
-            raise Rejected('native authority count differs from exact configured voter quorum')
-        if response is None or response.get('succeeded') is not True or u64(authority['term'],'native term') == 0 or u64(authority['commit_index'],'native commit index') == 0 or u64(response['revision'],'txn revision') != u64(authority['revision'],'authority revision') or request['request_id'] != result['request_id']:
-            raise Rejected('native quorum request/result term/index/revision/identity differs')
-        submitted = result.get('submitted_command_digest')
-        if submitted is None or native_digest_hex(submitted) != native_digest_hex(result['command_digest']):
-            raise Rejected('fresh native permit changed its submitted/committed command digest')
-        if fact.get('native_request_digest_input_blob'):
-            encoded_command = self.blob_bytes(fact['native_request_digest_input_blob'])
-            if blake3(encoded_command) != native_digest_hex(submitted):
-                raise Rejected('actual submitted native transaction digest mismatch')
-            decode = self.blob(fact.get('native_request_decode_evidence_blob'),'DfsNativeKvCommandDecodeObservationV1')
-            self.require_certificate(decode,'actual native command decode')
-            if decode['encoded_command_sha256'] != hashlib.sha256(encoded_command).hexdigest() or self.blob(decode['decoded_command_blob'],'KvCommand') != {'Txn':request['txn']}:
-                raise Rejected('native digest input differs from actual retained transaction')
-        else:
-            # Whole-shard refinement assumes the independently verified R0
-            # atomic KV boundary. It does not re-prove Raft or serialize a new
-            # digest input: this is the exact SAME ordinary call's request and
-            # current-term committed-majority result, retained by Rust.
-            call = self.blob(fact.get('native_same_call_commit_observation_blob'), 'DfsNativeControlCommitObservationV1')
-            self.require_certificate(call, 'same-call native atomic KV receipt')
-            if (call['commit'] != native or call['owner_id'] not in self.owners
-                    or not call.get('actual_owner_ordinal')
-                    or call.get('refinement_boundary') != 'verified-r0-atomic-kv'):
-                raise Rejected('native permit borrows another actual atomic KV call')
-        txn = request['txn']
-        _, config = self.config(fact['expected_config'])
-        if config['file_system_id'] != digest['file_system_id'] or config['shard_id'] != digest['shard_id'] or u64(config['epoch'],'expected native epoch') != u64(digest['owner_epoch'],'prepared epoch'):
-            raise Rejected('native transaction authorizes another complete config')
-        segment = digest['shard_id'].strip('/').replace('/','_')
-        prefix = '/dfs/filesystems/'+digest['file_system_id']+'/'
-        shard_key = prefix+'metadata-shards/'+segment
-        floor_key = prefix+'metadata-operation-floors/'+segment
-        handoff_key = prefix+'metadata-membership-handoffs/'+segment
-        barrier_key = prefix+'metadata-authority-barriers/'+segment
-        decode_refs = fact.get('kv_value_decode_evidence_blobs',[])
-        compares = txn.get('compares',[])
-        config_match = False; handoff_missing = False; matching_floor_compare = False
-        def floor_matches(value):
-            floor = self.decoded_native_kv_value(value,'DfsMetadataShardOperationFloor',decode_refs)
-            return (u64(floor['authority_epoch'],'native floor epoch') == u64(permit['owner_epoch'],'permit epoch')
-                    and u64(floor['prepared_sequence'],'native floor sequence') == u64(permit['prepare_sequence'],'permit sequence')
-                    and floor['operation_digest'] == permit['operation_digest'] and floor['permit_id'] == permit['permit_id'])
-        for compare in compares:
-            if set(compare) == {'Missing'} and compare['Missing']['key'] == handoff_key:
-                handoff_missing = True
-            if set(compare) == {'ValueEquals'}:
-                value = compare['ValueEquals']
-                if value['key'] == shard_key:
-                    config_match |= self.decoded_native_kv_value(value['value'],'DfsMetadataShardConfig',decode_refs) == config
-                if value['key'] == floor_key:
-                    matching_floor_compare |= floor_matches(value['value'])
-        success = txn.get('success',[])
-        if len(success) != 1 or set(success[0]) != {'Put'} or txn.get('failure',[]):
-            raise Rejected('native operation floor/barrier transaction shape differs')
-        effect = success[0]['Put']
-        valid_effect = effect.get('lease_id') is None and ((effect['key'] == floor_key and floor_matches(effect['value'])) or (effect['key'] == barrier_key and bool(native_bytes(effect['value'],'barrier value')) and matching_floor_compare))
-        if not config_match or not handoff_missing or not valid_effect:
-            raise Rejected('native transaction lacks exact config/missing-handoff/operation floor effect')
-        if u64(fact['acknowledged_voter_count'],'observed native ACK count') != ack_count:
-            raise Rejected('wrapper ACK count differs from real native authority receipt')
-        return ack_count
 
-    def permit(self, reference, digest, prepare):
-        fact = self.blob(reference, 'DfsNativeOperationPermitObservationV1')
-        self.require_certificate(fact, 'native permit')
-        if fact['digest'] != digest:
-            raise Rejected('permit does not bind the actual prepared digest')
-        self.validate_native_permit_receipt(fact, digest)
-        configured = self.initial['profile']['raft_voter_node_ids']
-        voters = fact.get('authenticated_acknowledged_voter_node_ids')
-        if voters is None:
-            if len(configured) == 1 and u64(fact['acknowledged_voter_count'],'voter ACK count') == 1:
-                # Actual singleton voter configuration plus current-term quorum
-                # identifies this one participant; no invented multi-voter set.
-                voters = configured
-            else:
-                raise Unavailable('numeric multi-voter Raft ACK count needs a lower-layer abstract certificate/model refinement; no invented participants')
-        if not set(voters).issubset(configured) or len(set(voters)) < len(set(configured))//2+1:
-            raise Rejected('native permit lacks configured voter quorum')
-        if u64(fact['acknowledged_voter_count'],'voter ACK count') != len(set(voters)):
-            raise Rejected('native voter identity/count evidence differs')
-        recovery = fact['authenticated_recovery_prefix_ack_node_ids']
-        return dict(present=True, op=prepare['op'], digest=prepare['digest'], epoch=prepare['epoch'], revision=prepare['revision'], primary=prepare['primary'], seq=prepare['seq'], voters=self.node_set(voters), recovery=self.node_set(recovery))
+
+
+
+
 
     def guard(self, reference, digest):
         fact = self.blob(reference, 'DfsNativePublicationGuardObservationV1')
         self.require_certificate(fact, 'publication guard')
         if digest is not None and fact['digest'] != digest:
-            raise Rejected('guard authorizes a different prepared operation')
-        if not fact['actual_writer_lock_retained'] or not fact['raw_scoped_fence_retained'] or not fact['execution_and_data_owner_retained'] or not fact['exact_config_and_missing_handoff_read']:
-            raise Unavailable('actual author/writer/fence/custody evidence incomplete')
+            raise Rejected('guard authorizes a different immutable prepared operation')
+        if not all(fact.get(key) is True for key in ('actual_writer_lock_retained',
+                'raw_scoped_fence_retained', 'execution_and_data_owner_retained',
+                'retained_config_and_missing_handoff_qualified')):
+            raise Unavailable('actual retained configuration/writer/fence/custody evidence is incomplete')
         revision, config = self.config(fact['expected_config'])
-        d = fact['digest']; op = self.op(d['operation_id'])
-        members = sorted(set(config['replica_node_ids']+[config['primary_node_id']]))
-        path = fact['authorization_mode']; permit = empty_permit()
-        if path == 'full-shard':
+        op = self.op(fact['digest']['operation_id'])
+        members = sorted(set(config['replica_node_ids'] + [config['primary_node_id']]))
+        path = fact['authorization_mode']
+        if path == 'full-shard' and self.profile['standalone'] is False:
             if set(fact['authenticated_prepare_ack_node_ids']) != set(members):
-                raise Rejected('full-shard guard lacks the complete actual metadata set')
+                raise Rejected('FullShard guard lacks ALL actual assigned participants')
             acks = self.node_set(fact['authenticated_prepare_ack_node_ids']); number = 1
-        elif path == 'recovery':
-            p = dict(op=op,digest=op*10+1,epoch=revision,revision=revision,primary=self.node(config['primary_node_id']),seq=self.cut(fact['prepare_owner_id'],fact['prepare_prefix']))
-            permit = self.permit(fact['native_permit_observation_blob'],d,p); acks=finite_set([]); number=2
+        elif path == 'local' and self.profile['standalone'] is True:
+            acks = finite_set([]); number = 0
         else:
-            raise Unavailable('sealed local-author/unknown mode has no clustered model authority action')
-        if 'prior_writer_bound_epoch' not in fact:
-            raise Unavailable('guard lacks the actual prior persistent writer binding observation')
-        prior = fact['prior_writer_bound_epoch']
-        prior_bound = 0 if prior is None else self.epoch_aliases.get(u64(prior, 'prior actual writer epoch'), -1)
-        if prior_bound < 0:
-            raise Unavailable('guard prior writer epoch is outside the full-config dictionary')
-        return dict(op=op,epoch=revision,revision=revision,primary=self.node(config['primary_node_id']),members=self.node_set(members),path=number,acks=acks,permit=permit,pending=fact['admission_pending_handoff'],frozen=fact['admission_write_frozen'],priorBound=prior_bound)
+            raise Unavailable('authority mode is incompatible with explicit Local/clustered profile')
+        if fact.get('native_permit_observation_blob') is not None:
+            raise Rejected('retired per-operation KV fallback cannot authorize a current guard')
+        return dict(op=op, epoch=revision, revision=revision, primary=self.node(config['primary_node_id']),
+                    members=self.node_set(members), path=number, acks=acks,
+                    pending=fact['admission_pending_handoff'], frozen=fact['admission_write_frozen'])
+
 
     def validate_interval(self, event):
         kind = event['action']['kind']
@@ -1700,6 +1597,8 @@ class NativeProjectorV1:
 
     def transition(self, event):
         action = event['action']; kind = action['kind']; op = None
+        if kind == 'fallback-permit':
+            raise Rejected('retired per-operation KV fallback action is incompatible')
         if 'operation' in action:
             op = self.op(action['operation']['operation_id'])
         # Kernel outcome is not reply delivery. An ambiguous source result must
@@ -1709,7 +1608,6 @@ class NativeProjectorV1:
         mapping = {
             'prepare-payload': ('prepare', [op], 'prepare-payload'),
             'publication-guard-admitted': ('admitCommit', [op], 'publication-guard-admitted'),
-            'fallback-permit': ('issuePermit', [op], 'native-raft-permit'),
             'freeze': ('freezeRetiring', [], 'retiring-prefix-frozen'),
             'activate': ('activate', [False], 'handoff-activated'),
             'rebind': ('bindSuccessor', [], 'successor-bound'),
@@ -1966,26 +1864,8 @@ def native_fragment_self_test():
     assert select_primary_held_snapshot({'primary_node_id':'node1'},peers,snapshots,owners,scope)['local_certified_prefix']['journal_sequence']=='19'
     bad_peers=copy.deepcopy(peers);bad_peers['node1']['held_snapshot_id']='replica'
     rejects(lambda:select_primary_held_snapshot({'primary_node_id':'node1'},bad_peers,snapshots,owners,scope))
-    # Real receipt fields, not wrapper booleans, decide fresh native authority.
-    adapter.initial={'profile':{'raft_voter_node_ids':['node1']}}
-    permit={'file_system_id':scope['file_system_id'],'shard_id':scope['shard_id'],
-            'owner_epoch':digest['owner_epoch'],'operation_digest':digest['payload_digest'],
-            'prepare_sequence':digest['prepare_sequence'],'permit_id':'actual-permit',
-            'native_commit':{'request':{'request_id':'request','txn':{}},
-                             'result':{'request_id':'request','txn_response':{'succeeded':True,'revision':9},
-                                       'authority':{'term':1,'commit_index':4,'revision':9,
-                                                    'basis':{'current-term-quorum':{'voter_acks':1,'required_quorum':1}}}}}}
-    fact={'native_permit_blob':'permit','permit_id':'actual-permit'}
-    for mutate in (
-            lambda x:x['native_commit']['result']['authority'].update(term=0),
-            lambda x:x['native_commit']['result']['authority'].update(basis='exact-committed-request'),
-            lambda x:x['native_commit']['result'].update(request_id='different-request'),
-            lambda x:x['native_commit']['result']['txn_response'].update(revision=10),
-            lambda x:x['native_commit']['result']['authority']['basis']['current-term-quorum'].update(voter_acks=2)):
-        bad=copy.deepcopy(permit);mutate(bad);encoded=json.dumps(bad).encode()
-        adapter.blobs['permit']={'native_type':'DfsMetadataOperationPermit','encoding':'json-utf8',
-                                 'data':encoded.decode(),'sha256':hashlib.sha256(encoded).hexdigest()}
-        rejects(lambda:adapter.validate_native_permit_receipt(fact,digest))
+    # Retired per-operation KV authority has no current projection action.
+    rejects(lambda: adapter.transition({'action': {'kind': 'fallback-permit'}}))
     # Reply delivery changes no predicted commit flag. Its observed semantics
     # are separate and the real Quint action later checks committed prestate.
     adapter.observed_flags={};adapter.last='prepare-payload'
