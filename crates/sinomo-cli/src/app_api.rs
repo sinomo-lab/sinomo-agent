@@ -11246,6 +11246,7 @@ mod tests {
     fn chat_attachment_store_writes_snapshot_bytes_without_reopening_source() {
         let root = sinomo_testdir::TestDir::new("sinomo-chat-attachment-snapshot");
         let data_dir = SinomoDataDir::new(root.join("data"));
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let chat = AgentChat::new(data_dir.clone(), false).expect("chat runtime");
         let snapshot = b"exact bytes already displayed by Files".to_vec();
         let sifs_snapshot = b"exact SIFS editor bytes".to_vec();
@@ -11840,6 +11841,7 @@ mod tests {
     fn primary_checkpoint_rejects_participant_agent_identity_drift() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-checkpoint-agent-drift");
         let data_dir = SinomoDataDir::new(root.join("data"));
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let mut chat = AgentChat::new(data_dir, false).expect("chat runtime");
         let participant = chat
             .channel
@@ -11933,6 +11935,7 @@ mod tests {
     fn app_chat_resume_explicit_channel_preserves_participant_session_id() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-chat-channel-resume");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
         let channel_id = SessionId::generate();
         let mut channel = AgentChannel::new_channel(channel_id.clone(), "Team channel");
@@ -11974,6 +11977,7 @@ mod tests {
     fn app_chat_resume_group_channel_does_not_add_or_reenable_process_default() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-chat-channel-membership-resume");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let definition =
             AgentDefinition::custom("worker-agent", AgentRole::Main, "Work with the team.");
         let definition_store = sinomo_agent::AgentDefinitionSifsStore::open(Some(data_dir.root()))
@@ -12028,6 +12032,7 @@ mod tests {
     fn app_chat_resume_group_outer_session_does_not_claim_participant_checkpoint() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-chat-channel-outer-session-resume");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
         let channel_id = SessionId::generate();
         let mut channel = AgentChannel::new_channel(channel_id.clone(), "Durable team");
@@ -12063,6 +12068,7 @@ mod tests {
     fn app_chat_group_tool_runtime_update_preserves_membership_and_session_identity() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-chat-channel-tool-runtime-identity");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let definition =
             AgentDefinition::custom("worker-agent", AgentRole::Main, "Work with the team.");
         let definition_store = sinomo_agent::AgentDefinitionSifsStore::open(Some(data_dir.root()))
@@ -12150,6 +12156,7 @@ mod tests {
         let root = sinomo_testdir::TestDir::new("sinomo-app-chat-channel-tool-runtime-empty");
         // Writable workspaces must be outside the protected Sinomo data root.
         let data_dir = SinomoDataDir::new(root.join("data"));
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
 
         for all_disabled in [false, true] {
@@ -12220,6 +12227,7 @@ mod tests {
     fn app_chat_group_controls_skip_non_member_roaming_checkpoint() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-chat-channel-control-checkpoint");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let definition =
             AgentDefinition::custom("worker-agent", AgentRole::Main, "Work with the team.");
         let definition_store = sinomo_agent::AgentDefinitionSifsStore::open(Some(data_dir.root()))
@@ -12273,6 +12281,7 @@ mod tests {
     fn accepted_control_returns_warning_when_stable_projection_fails() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-chat-control-history-warning");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let channel_store = RejectMessageChannelStore {
             inner: SifsAgentChannelStore::open(&data_dir).expect("open channel store"),
         };
@@ -12317,6 +12326,7 @@ mod tests {
     fn app_chat_group_controls_publish_exact_member_checkpoint() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-chat-channel-control-member");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let mut chat = AgentChat::new(data_dir, false).expect("chat runtime");
         chat.channel.channel_kind = AgentChannelKind::Channel;
         let participant = chat
@@ -12350,6 +12360,7 @@ mod tests {
     fn app_chat_resume_restores_canonical_projection_and_raw_history() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-chat-canonical-resume");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let session_id = SessionId::generate();
         let channel_store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
         let mut channel = AgentChannel::new(session_id.clone(), "Compacted chat");
@@ -12454,6 +12465,7 @@ mod tests {
     fn app_chat_resume_restores_exact_coding_agent_and_workspace() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-chat-coding-resume");
         let data_dir = SinomoDataDir::new(root.join("data"));
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let workspace = root.join("workspace");
         fs::create_dir_all(&workspace).expect("create coding workspace");
         let workspace = fs::canonicalize(workspace).expect("canonical coding workspace");
@@ -12504,6 +12516,7 @@ mod tests {
     fn app_chat_resume_uses_conversation_workspace_over_legacy_session_shadow() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-chat-workspace-authority");
         let data_dir = SinomoDataDir::new(root.join("data"));
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let conversation_workspace = root.join("conversation-workspace");
         let stale_session_workspace = root.join("stale-session-workspace");
         fs::create_dir_all(&conversation_workspace).expect("create conversation workspace");
@@ -12586,6 +12599,7 @@ mod tests {
     fn app_chat_resume_preserves_authoritative_empty_workspace_revocation() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-chat-empty-workspace-authority");
         let data_dir = SinomoDataDir::new(root.join("data"));
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let session_id = SessionId::generate();
         let channel_store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
         let mut channel = AgentChannel::new(session_id.clone(), "Main chat");
@@ -12638,6 +12652,7 @@ mod tests {
     fn app_chat_resume_configuration_failure_restores_previous_recall_authority() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-chat-resume-authority-rollback");
         let data_dir = SinomoDataDir::new(root.join("data"));
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let mut chat = AgentChat::new(data_dir.clone(), false).expect("chat runtime");
         let previous_interaction_session = chat.runtime.session().clone();
         let previous_channel = chat.channel.clone();
@@ -12714,6 +12729,7 @@ mod tests {
     fn app_chat_resume_validation_failure_restores_outer_and_canonical_runtime() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-chat-resume-validation-rollback");
         let data_dir = SinomoDataDir::new(root.join("data"));
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let mut chat = AgentChat::new(data_dir.clone(), false).expect("chat runtime");
         let previous_interaction_session = chat.runtime.session().clone();
         let previous_channel = chat.channel.clone();
@@ -12782,6 +12798,7 @@ mod tests {
     fn app_chat_runs_turns_after_switching_a_started_chat_between_agents() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-chat-switch-started-agent");
         let data_dir = SinomoDataDir::new(root.join("data"));
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let mut chat = AgentChat::new(data_dir.clone(), false).expect("chat runtime");
         let session_id = chat.session_id();
         chat.prepare_primary_participant()
@@ -12814,6 +12831,7 @@ mod tests {
     fn app_chat_reopens_the_enabled_agent_after_a_direct_switch() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-chat-switched-agent-resume");
         let data_dir = SinomoDataDir::new(root.join("data"));
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let workspace = root.join("plain-workspace");
         fs::create_dir_all(&workspace).expect("create generic workspace");
         let workspace = fs::canonicalize(workspace).expect("canonical generic workspace");
@@ -12854,7 +12872,9 @@ mod tests {
         let root_a = sinomo_testdir::TestDir::new("sinomo-app-chat-roaming-session-a");
         let root_b = sinomo_testdir::TestDir::new("sinomo-app-chat-roaming-session-b");
         let data_dir_a = SinomoDataDir::new(&root_a);
+        let _native_data_dir_a = crate::native_test_fixture::NativeCliFixture::start(&data_dir_a);
         let data_dir_b = SinomoDataDir::new(&root_b);
+        let _native_data_dir_b = crate::native_test_fixture::NativeCliFixture::start(&data_dir_b);
         let channel_id = SessionId::generate();
         let shared_channel_store =
             SifsAgentChannelStore::open(&data_dir_a).expect("open shared channel store");
@@ -13067,6 +13087,7 @@ mod tests {
     fn app_chat_persists_conversation_workspace_and_default_sandbox_attachment() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-chat-workspace-binding");
         let data_dir = SinomoDataDir::new(root.join("data"));
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let workspace = root.join("selected-directory");
         fs::create_dir_all(&workspace).expect("create selected directory");
         let canonical_workspace = fs::canonicalize(&workspace).expect("canonical workspace");
@@ -13132,6 +13153,7 @@ mod tests {
     fn app_chat_workspace_tools_execute_through_the_attached_simple_sandbox() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-chat-simple-sandbox-workspace");
         let data_dir = SinomoDataDir::new(root.join("data"));
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let workspace = root.join("workspace");
         fs::create_dir_all(&workspace).expect("create workspace");
         let workspace = fs::canonicalize(workspace).expect("canonical workspace");
@@ -13205,6 +13227,7 @@ mod tests {
     fn app_chat_explicit_workspace_clear_revokes_durable_and_runtime_authority() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-chat-workspace-clear");
         let data_dir = SinomoDataDir::new(root.join("data"));
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let workspace = root.join("selected-directory");
         fs::create_dir_all(&workspace).expect("create selected directory");
         let workspace = fs::canonicalize(workspace).expect("canonical workspace");
@@ -13287,6 +13310,7 @@ mod tests {
     fn app_chat_folder_selection_replaces_the_complete_workspace_grant() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-chat-workspace-replace");
         let data_dir = SinomoDataDir::new(root.join("data"));
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let first = root.join("first-workspace");
         let second = root.join("second-workspace");
         fs::create_dir_all(&first).expect("create first workspace");
@@ -13323,6 +13347,7 @@ mod tests {
     fn rejected_remote_sandbox_selection_does_not_mutate_session_or_channel_authority() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-chat-remote-sandbox-rollback");
         let data_dir = SinomoDataDir::new(root.join("data"));
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let workspace = root.join("selected-directory");
         fs::create_dir_all(&workspace).expect("create selected directory");
         let workspace = fs::canonicalize(workspace).expect("canonical workspace");
@@ -13503,6 +13528,7 @@ mod tests {
     fn sifs_channel_store_can_use_an_isolated_test_root() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-chat-channel-isolated-root");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let isolated_root = "/services/cluster-tests/runs/test-run/agent-channels";
         let isolated = SifsAgentChannelStore::from_browser_at_root(
             SifsBrowser::open(&data_dir).expect("open isolated SIFS browser"),
@@ -13547,6 +13573,7 @@ mod tests {
     fn sifs_channel_store_rejects_unsafe_roots() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-chat-channel-unsafe-root");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         for candidate in [
             "",
             "/",
@@ -13569,6 +13596,7 @@ mod tests {
     fn sifs_channel_summaries_track_snapshot_metadata_without_index_cache() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-chat-channel-summaries");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
         let channel_id = SessionId::generate();
         let mut channel = AgentChannel::new_channel(channel_id.clone(), "Team channel");
@@ -13615,6 +13643,7 @@ mod tests {
     fn sifs_channel_summaries_skip_channel_dirs_without_snapshots() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-chat-channel-missing-snapshot");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
         let channel_id = SessionId::generate();
         SifsBrowser::open(&data_dir)
@@ -13634,6 +13663,7 @@ mod tests {
     fn sifs_channel_snapshot_merge_rejects_stale_metadata_and_resurrection() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-chat-channel-stale-snapshot");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
         let channel_id = SessionId::generate();
         let base = time::OffsetDateTime::now_utc();
@@ -14021,6 +14051,7 @@ mod tests {
     fn accepted_chat_control_input_projects_idempotent_user_message() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-stable-control-input");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
         let channel_id = SessionId::generate();
         let agent_session_id = SessionId::generate();
@@ -14086,6 +14117,7 @@ mod tests {
     fn late_realtime_projection_cannot_restore_revoked_membership() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-late-realtime-revocation");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
         let channel_id = SessionId::generate();
         let mut channel = AgentChannel::with_default_title(channel_id.clone());
@@ -14180,6 +14212,7 @@ mod tests {
     fn history_message_page_uses_directory_size_and_defers_oversized_bodies() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-history-bounded-message-page");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
         let channel_id = SessionId::generate();
         let mut channel = AgentChannel::new_channel(channel_id.clone(), "History bounds");
@@ -14224,6 +14257,7 @@ mod tests {
     fn history_message_page_charges_malformed_body_bytes_to_the_scan() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-history-malformed-message");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
         let channel_id = SessionId::generate();
         let malformed_path = format!("{}/malformed.json", store.message_records_dir(&channel_id));
@@ -14247,6 +14281,7 @@ mod tests {
     fn bounded_history_metadata_ignores_snapshot_transcript_and_fails_closed() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-history-bounded-authorization");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
         let channel_id = SessionId::generate();
         let mut channel = AgentChannel::new_channel(channel_id.clone(), "Private history");
@@ -14334,6 +14369,7 @@ mod tests {
     fn compact_history_metadata_proves_current_membership_in_one_bounded_item() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-history-compact-authorization");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
         let channel_id = SessionId::generate();
         let mut channel = AgentChannel::new_channel(channel_id.clone(), "Compact history");
@@ -14391,6 +14427,7 @@ mod tests {
     fn compact_history_projection_refolds_immutable_revocation_before_publish() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-history-projection-revocation-race");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
         let channel_id = SessionId::generate();
         let mut channel = AgentChannel::new_channel(channel_id.clone(), "Concurrent revocation");
@@ -14435,6 +14472,7 @@ mod tests {
     fn shared_channel_runtime_outbox_repairs_a_crash_before_message_materialization() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-channel-turn-outbox");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let channel_id = SessionId::generate();
         let mut channel = AgentChannel::new_channel(channel_id.clone(), "Crash recovery");
         channel.ensure_user(AgentChannelUser::app_local());
@@ -14526,6 +14564,7 @@ mod tests {
     fn sifs_channel_messages_are_immutable_and_recent_snapshot_is_bounded() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-chat-channel-immutable-log");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
         let channel_id = SessionId::generate();
         let mut channel = AgentChannel::new_channel(channel_id.clone(), "Long running channel");
@@ -14699,6 +14738,7 @@ mod tests {
     fn sifs_channel_store_merges_legacy_and_immutable_records() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-chat-channel-log-migration");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
         let channel_id = SessionId::generate();
         let mut channel = AgentChannel::new_channel(channel_id.clone(), "Migrated channel");
@@ -14799,6 +14839,7 @@ mod tests {
     fn sifs_channel_store_reconciles_two_stale_store_snapshots() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-chat-channel-stale-stores");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let store_a = SifsAgentChannelStore::open(&data_dir).expect("open store A");
         let store_b = SifsAgentChannelStore::open(&data_dir).expect("open store B");
         let channel_id = SessionId::generate();
@@ -14886,6 +14927,7 @@ mod tests {
     fn sifs_channel_store_keeps_concurrent_immutable_writers() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-chat-channel-concurrent-writers");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let setup = SifsAgentChannelStore::open(&data_dir).expect("open setup store");
         let channel_id = SessionId::generate();
         let base = AgentChannel::new_channel(channel_id.clone(), "Concurrent channel");
@@ -14964,6 +15006,7 @@ mod tests {
     fn sifs_channel_metadata_records_preserve_barrier_concurrent_participant_adds() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-chat-channel-concurrent-metadata");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let setup = SifsAgentChannelStore::open(&data_dir).expect("open setup store");
         let channel_id = SessionId::generate();
         let base = AgentChannel::new_channel(channel_id.clone(), "Shared channel");
@@ -15016,6 +15059,7 @@ mod tests {
     fn sifs_channel_metadata_records_keep_tombstone_across_concurrent_rename() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-chat-channel-tombstone-rename");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let setup = SifsAgentChannelStore::open(&data_dir).expect("open setup store");
         let channel_id = SessionId::generate();
         let base = AgentChannel::new_channel(channel_id.clone(), "Original title");
@@ -15060,6 +15104,7 @@ mod tests {
     fn sifs_channel_reconciliation_discovers_backdated_record_without_rereading_bodies() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-chat-channel-discovery-cursor");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
         let channel_id = SessionId::generate();
         let mut channel = AgentChannel::new_channel(channel_id.clone(), "Long channel");
@@ -15165,6 +15210,7 @@ mod tests {
     fn app_chat_send_surfaces_missing_codex_auth() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-chat-codex-auth");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let mut chat = AgentChat::new(data_dir.clone(), false).expect("chat runtime");
         chat.set_model(
             sinomo_lm::CODEX_PROVIDER_ID,
@@ -15261,6 +15307,7 @@ mod tests {
     fn reopened_channel_recovers_a_participants_lost_detached_call() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-channel-detached-recovery");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
         let channel_id = SessionId::generate();
         let mut channel = AgentChannel::new_channel(channel_id.clone(), "Team channel");
@@ -15334,6 +15381,7 @@ mod tests {
     fn app_chat_send_to_explicit_channel_uses_channel_runtime() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-chat-channel-runtime");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
         let channel_id = SessionId::generate();
         let mut channel = AgentChannel::new_channel(channel_id.clone(), "Team channel");

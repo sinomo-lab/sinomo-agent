@@ -3556,6 +3556,7 @@ mod tests {
     fn workspace_management_commands_preserve_order_and_persist_exact_grants() {
         let root = sinomo_testdir::TestDir::new("multi-workspace-ui-commands");
         let data_dir = sinomo_runtime::local::SinomoDataDir::new(root.join("data"));
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let first = root.join("frontend");
         let second = root.join("shared");
         std::fs::create_dir_all(&first).unwrap();
@@ -4161,6 +4162,7 @@ mod tests {
         use sinomo_agent::{AgentChannelStore as _, AgentSessionStore as _};
         let root = sinomo_testdir::TestDir::new("chat-delete-lifecycle");
         let data_dir = sinomo_runtime::local::SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let store = local::SifsAgentChannelStore::open(&data_dir).unwrap();
         let sessions = sinomo_agent::FileAgentSessionStore::for_data_dir(&data_dir);
         let runtime_root = root.join("sandbox").join("runtime");

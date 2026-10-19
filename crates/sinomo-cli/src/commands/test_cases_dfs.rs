@@ -6736,6 +6736,7 @@ mod tests {
     fn scoped_sifs_test_cleanup_removes_only_the_run_tree() {
         let root = sinomo_testdir::TestDir::new("sinomo-cli-dfs-scoped-cleanup");
         let data_dir = SinomoDataDir::new(&root);
+        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let browser = SifsBrowser::open(&data_dir).expect("open local SIFS browser");
         let run_root = "/services/cluster-tests/runs/unit-run";
         let fixture = format!("{run_root}/case/fixture.txt");

@@ -16161,6 +16161,7 @@ fn main_agent_handler_registers_live_runtime_for_control_host() {
 fn app_agent_chat_exposes_first_class_runtime_control_methods() {
     let root = sinomo_testdir::TestDir::new("sinomo-cli-app-chat-control");
     let data_dir = SinomoDataDir::new(&root);
+    let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
     let chat = super::app_api::AgentChat::new(data_dir, false).expect("chat");
 
     let initial = chat.control_state().expect("initial control state");

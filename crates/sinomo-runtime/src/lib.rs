@@ -100,6 +100,8 @@ pub mod r1 {
     pub use sinomo_test as test;
     #[cfg(feature = "host")]
     pub mod vfs {
+        #[cfg(feature = "dfs-test-support")]
+        pub use sinomo_vfs_sifs::test_support as native_test_support;
         pub use sinomo_vfs::*;
         pub use sinomo_vfs_sifs::{
             DaemonSifsVfsBackend, DfsCancellationFlag, MountedSifsOpenOptions,

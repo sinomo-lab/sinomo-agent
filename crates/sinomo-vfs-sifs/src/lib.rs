@@ -24,6 +24,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[cfg(feature = "test-support")]
+pub mod test_support;
+
 pub fn mounted_sifs(data_dir: Option<PathBuf>) -> Result<VfsHandle> {
     VfsHandle::new(Arc::new(MountedSifsVfsBackend::open(data_dir)?), "/")
 }
@@ -113,6 +116,10 @@ impl MountedSifsVfsBackend {
             })?,
         };
         let cluster_paths = ClusterPaths::new(&data_dir);
+        #[cfg(feature = "test-support")]
+        if let Some(opened) = test_support::open_registered(&data_dir, options.cancellation.clone()) {
+            return opened.map(|opened| Self { opened: Mutex::new(opened) });
+        }
         let opened = if cluster_paths.state.exists() {
             let peer_transport = Arc::new(
                 sinomo_dfs::DaemonDfsPeerTransport::connect(data_dir.clone()).map_err(|source| {
