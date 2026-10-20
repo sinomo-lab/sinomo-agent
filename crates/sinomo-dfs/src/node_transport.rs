@@ -828,14 +828,15 @@ impl DfsCommitPromotionIdentity {
 
 impl DeferredDfsPeerSend {
     fn eligible_for_target_policy(&self, deferred_target_node_ids: &BTreeSet<NodeId>) -> bool {
-        // A required content fetch is protocol progress for an existing
-        // operation, even when it runs in Main's detached response owner.
-        // Advisory maintenance exclusion must not park it. The ordinary RPC
-        // still enforces its deadline, peer identity and content checks.
+        // Required content fetches and completed write replies are protocol
+        // progress for an existing operation, even in Main's detached owner.
+        // Advisory maintenance exclusion must not park them. The ordinary RPC
+        // still enforces its deadline, peer identity and payload checks.
         matches!(
             &self.routed_message.message,
             DfsNetworkMessage::FetchBlob(_)
-        ) || !deferred_target_node_ids.contains(&self.target_node_id)
+        ) || self.is_replay_safe_completed_write_response()
+            || !deferred_target_node_ids.contains(&self.target_node_id)
     }
 
     fn record_retry_failure(&mut self) -> Duration {

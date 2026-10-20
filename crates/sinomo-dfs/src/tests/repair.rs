@@ -3266,6 +3266,123 @@ fn native_write_completion_observation_waits_for_actual_response_rpc() {
 }
 
 #[test]
+fn native_completed_response_progresses_while_advisory_maintenance_is_parked() {
+    let (runtime, primary, requester, _, mut writer, request, manifest, outcome) =
+        native_routed_manifest_write(
+            "native-required-completion-policy",
+            2,
+            2,
+            true,
+            false,
+            false,
+            false,
+        );
+    assert!(matches!(outcome, NetworkedDfsWriteOutcome::Pending { .. }));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    // Retain the actual authenticated response before its original requester
+    // consumes it. No success, receipt, or metadata body is supplied by this test.
+    let response = 'capture: loop {
+        assert!(
+            Instant::now() < deadline,
+            "native completion was not produced"
+        );
+        let incoming = writer.transport.drain_incoming_messages().unwrap();
+        for message in incoming {
+            if matches!(&message.message,
+                DfsNetworkMessage::DistributedWriteResponse(response)
+                if response.object_id == request.object_id
+                && matches!(&response.result, DfsDistributedWriteResult::Outcome {
+                    outcome: NetworkedDfsWriteOutcome::Committed { version, content_hash, .. }
+                } if version == &request.target_version && content_hash == &manifest.content_hash))
+            {
+                break 'capture message;
+            }
+            writer
+                .process_routed_messages_with_options(vec![message], false)
+                .unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    assert_eq!(response.source_node_id, primary);
+    assert_eq!(response.target_node_id, requester);
+    let response_id = match &response.message {
+        DfsNetworkMessage::DistributedWriteResponse(body) => body.request_id.clone(),
+        _ => unreachable!(),
+    };
+    native_completed_write_observations(
+        &runtime,
+        &primary,
+        &requester,
+        &request,
+        &response_id,
+        deadline,
+        || {},
+    );
+    // Exercise an exact replay of that real response through the ordinary
+    // detached outbox, under the same negative advisory hint seen in Docker.
+    // The original operation, body, authority and requester remain unchanged.
+    let mut owner = runtime.metadata_primary_service("/services").unwrap();
+    owner
+        .transport
+        .send_detached_routed_message(&requester, response)
+        .unwrap();
+    let mut worker = owner.prepare_message_deferred_work();
+    worker.set_deferred_target_node_ids(BTreeSet::from([requester.clone()]));
+    let ready = worker.scheduling_snapshot().unwrap().0;
+    let before = runtime.rpc_observations().len();
+    worker.drain_exclusive().unwrap();
+    let while_excluded = runtime.rpc_observations()[before..].to_vec();
+    // Drain even the old failing control normally before asserting its result.
+    worker.set_deferred_target_node_ids(BTreeSet::new());
+    worker.drain_exclusive().unwrap();
+    let events = writer
+        .process_incoming_until_pending_routed_writes_ready(
+            deadline.saturating_duration_since(Instant::now()),
+        )
+        .unwrap();
+    let bytes = writer
+        .content()
+        .read_object_version(request.object_id.as_str(), request.target_version.as_str())
+        .unwrap()
+        .1;
+    assert_eq!(crate::content_hash(&bytes), manifest.content_hash);
+    assert_eq!(bytes.len() as u64, manifest.size_bytes);
+    let omitted = runtime.observation_dropped_count();
+    drop(worker);
+    drop(owner);
+    drop(writer);
+    runtime.close().unwrap();
+    assert_eq!(omitted, 0);
+    assert!(events.iter().any(|event| matches!(event,
+        NetworkedDfsServiceEvent::RemoteWriteCompleted { request_id, object_id, result:
+            DfsDistributedWriteResult::Outcome { outcome: NetworkedDfsWriteOutcome::Committed { version, content_hash, .. } }, .. }
+            if request_id == &response_id && object_id == &request.object_id
+            && version == &request.target_version && content_hash == &manifest.content_hash)));
+    assert!(
+        ready,
+        "required completion cannot be parked by advisory maintenance availability"
+    );
+    let decoded = while_excluded
+        .iter()
+        .find(|event| {
+            event.source == primary
+                && event.target == requester
+                && event.route == DFS_DATA_DISTRIBUTED_WRITE_RESPONSE_ROUTE
+                && event.phase == crate::test_runtime::RpcPhase::Decoded
+                && event.dfs_request_id.as_deref() == Some(&response_id)
+                && event.dfs_object_id.as_ref() == Some(&request.object_id)
+                && event.dfs_version.as_ref() == Some(&request.target_version)
+        })
+        .expect("the unchanged completion reaches the actual registered requester while excluded");
+    assert!(
+        while_excluded
+            .iter()
+            .any(|event| event.call_id == decoded.call_id
+                && event.phase == crate::test_runtime::RpcPhase::Completed)
+    );
+}
+
+#[test]
 fn background_local_fetch_crossing_w_preserves_deferred_repair_mode() {
     let (runtime, primary, requester, replica, mut writer, request, _, outcome) =
         native_routed_manifest_write(
