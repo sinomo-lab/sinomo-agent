@@ -213,10 +213,10 @@ fn exercise_remote_source_placement_progress(restart_on_ready: bool) {
         "the real metadata owner must fetch this existing remote content"
     );
     drop(owner);
-    // Deny the real claim until the controller observes and restarts its owner.
-    // A finite transport fault can be consumed before that observation, making
-    // a healthy completion bypass the intended restart boundary under load.
-    // This hook holds no DATA owner, admission permit, or successful reply.
+    // Use the existing negative before-claim hook for the restart control.
+    // It cannot manufacture a ready row or a successful reply: the control must
+    // observe actual ready custody before stopping its owner. The hook retains
+    // no DATA owner or admission permit.
     let mut before_claim = restart_on_ready.then(|| {
         native
             .deny_background_replica_before_claim(&primary)
@@ -350,7 +350,7 @@ fn exercise_remote_source_placement_progress(restart_on_ready: bool) {
     };
     let omitted_rpcs = native.observation_dropped_count();
     eprintln!(
-        "native placement job={} original_object={} version={} queue_cuts={}",
+        "native placement fixture={name} job={} original_object={} version={} queue_cuts={}",
         accepted.job_id,
         stat.object_id,
         stat.version,
@@ -361,15 +361,15 @@ fn exercise_remote_source_placement_progress(restart_on_ready: bool) {
     native.checkpoint_rpc_observation_window().unwrap();
     let closed = native.close();
     eprintln!(
-        "native placement completion={completed} failure={failure:?} drain_and_coverage={closed:?}"
+        "native placement fixture={name} completion={completed} failure={failure:?} drain_and_coverage={closed:?}"
     );
     closed.unwrap();
     assert_eq!(omitted_rpcs, 0);
+    assert!(failure.is_none(), "ordinary native repair: {failure:?}");
     assert!(
         !restart_on_ready || restarted,
         "the negative claim boundary must retain actual ready work for restart"
     );
-    assert!(failure.is_none(), "ordinary native repair: {failure:?}");
     assert!(
         completed,
         "the unchanged existing deadline expired without both actual desired receipts"

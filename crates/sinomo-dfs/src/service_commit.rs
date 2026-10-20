@@ -1155,14 +1155,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let object = self.current_object_for_write(&intent.object_id)?;
         let mut record = write_intent_record(intent, content_hash, Some(object.clone()));
         let mut intent_changed = true;
-        if let Some(existing) = self
+        let mut existing = self
             .metadata_backend
             .as_ref()
             .ok_or_else(|| DfsError::Metadata {
                 message: "intent persistence requires a current backend".into(),
             })?
-            .get_intent(&intent.object_id, &intent.intent_id)?
-        {
+            .get_intent(&intent.object_id, &intent.intent_id)?;
+        if existing.is_none() && intent.state == DfsWriteIntentState::Aborted {
+            existing = self.unpublished_write_intent_for_abort(&object, intent, content_hash)?;
+        }
+        if let Some(existing) = existing {
             record.created_at = existing.created_at;
             if intent.state == DfsWriteIntentState::Aborted {
                 if !crate::intent::write_intent_status_is_active(&existing.status)
@@ -1197,6 +1200,70 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             self.publish_object_metadata_effects(&object, effects)?;
         }
         Ok(())
+    }
+
+    fn unpublished_write_intent_for_abort(
+        &mut self,
+        object: &DfsObjectMetadata,
+        intent: &DistributedWriteIntent,
+        content_hash: Option<&str>,
+    ) -> Result<Option<DfsWriteIntentRecord>, DfsError> {
+        let scope = self.metadata_effect_scope_for_object(
+            object,
+            intent
+                .operation_id
+                .clone()
+                .unwrap_or_else(|| intent.intent_id.clone()),
+        )?;
+        let observed = self
+            .metadata_backend
+            .as_ref()
+            .expect("abort backend already checked")
+            .write_operation_admission_snapshot(
+                &scope.shard_id,
+                &intent.file_system_id,
+                &intent.object_id,
+                &intent.intent_id,
+            )?;
+        if observed.intent.is_some() {
+            return Ok(observed.intent);
+        }
+        let uncertain = |reason: &str| DfsError::WriteReconciliationRequired {
+            operation_id: intent
+                .operation_id
+                .clone()
+                .unwrap_or_else(|| intent.intent_id.clone()),
+            object_id: intent.object_id.clone(),
+            reason: reason.into(),
+        };
+        let mut original = None;
+        for prepared in observed.prepared {
+            let Some(record) = crate::service_routed_write::prepared_intent_for_write(
+                &prepared,
+                &intent.object_id,
+                &intent.intent_id,
+            ) else {
+                continue;
+            };
+            let mut expected = intent.clone();
+            expected.state = crate::intent::distributed_intent_from_record(record).state;
+            let hash = content_hash
+                .or(record.content_hash.as_deref())
+                .ok_or_else(|| {
+                    uncertain("unpublished write opening has no recorded content hash")
+                })?;
+            crate::service_routed_write::validate_retained_write_opening(
+                &prepared, record, &expected, hash,
+            )?;
+            if original.replace(record.clone()).is_some() {
+                return Err(uncertain("write abort has competing prepared openings"));
+            }
+        }
+        // This is original DATA, not an applied outcome or publication permit.
+        // The existing kernel still recovers/certifies it before terminalization.
+        // The terminal update must retain these birth fields even before the
+        // opening becomes visible in the materialized table.
+        Ok(original)
     }
 
     pub(crate) fn put_metadata_intent_and_receipts(

@@ -4325,6 +4325,237 @@ fn compound_receipt_location_retry_preserves_original_publication() {
 fn compound_receipt_filesystem_retry_preserves_original_publication() {
     check_compound_receipt_publication_retry(true);
 }
+
+#[test]
+fn routed_create_cleanup_preserves_the_original_unpublished_opening() {
+    let name = "native-routed-create-opening-cleanup";
+    let path = "/native-routed-create-opening-cleanup";
+    let operation = "native-routed-create-opening-cleanup-original";
+    let bytes = b"original native create input before its opening is published";
+    let (runtime, initial_client, shard) =
+        crate::test_support::current_native_metadata_service(name, 3, "/").unwrap();
+    drop(initial_client);
+    let primary = shard.primary_node_id.clone();
+    let metadata_peer = shard.replica_node_ids[0].clone();
+    let content_peer = shard.replica_node_ids[1].clone();
+    let mut policy = DfsReplicationPolicy::new(2, 2).unwrap();
+    policy.required_node_ids = vec![primary.clone(), content_peer.clone()];
+    let options = DfsWriteOptions {
+        policy,
+        replica_candidates: vec![primary.clone(), content_peer],
+        wait_for_commit: true,
+        foreground_replica_repair: false,
+    };
+    let mut client = runtime.client(&primary).unwrap();
+    runtime.checkpoint_rpc_observation_window().unwrap();
+    for route in [
+        DFS_METADATA_JOURNAL_BATCH_ROUTE,
+        DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE,
+    ] {
+        runtime.install_fault(crate::test_runtime::FaultRule {
+            source: Some(primary.clone()),
+            target: Some(metadata_peer.clone()),
+            route: Some(route.into()),
+            call_id: None,
+            origin: Some(crate::test_runtime::RpcOrigin::RegisteredHost),
+            remaining_hits: 1,
+            // Bind only the first actual call on each route. Recovery uses its
+            // normal later calls; exhausting a fault budget does not heal it.
+            action: crate::test_runtime::FaultAction::BudgetExhaustedForFirstCall,
+        });
+    }
+    let first = client.posix_write_file_with_operation_id(path, bytes, options.clone(), operation);
+    runtime.clear_faults();
+    let calls = runtime.rpc_observations();
+    let root =
+        crate::default_dfs_metadata_shards_root(runtime.data_dir(&primary)).join(&shard.shard_id);
+    let inspect = || {
+        LocalSobjMetadataBackend::open_for_inspection(
+            DfsMetadataShardId::new(&shard.shard_id),
+            &root,
+        )
+        .unwrap()
+        .export_table_snapshot()
+    };
+    let before = inspect();
+    let openings = before
+        .tables
+        .prepared_operations_v7
+        .iter()
+        .filter_map(|prepared| {
+            prepared
+                .payload
+                .metadata_effects
+                .iter()
+                .find_map(|effect| match effect {
+                    DfsPreparedMetadataEffect::PutIntent { intent }
+                        if intent.operation_id.as_deref() == Some(operation)
+                            && crate::intent::write_intent_status_is_active(&intent.status) =>
+                    {
+                        Some((prepared.clone(), intent.clone()))
+                    }
+                    _ => None,
+                })
+        })
+        .collect::<Vec<_>>();
+    let replay = if openings.len() == 1 {
+        Some(client.posix_write_file_with_operation_id(path, bytes, options.clone(), operation))
+    } else {
+        None
+    };
+    let changed = if openings.len() == 1 {
+        Some(client.posix_write_file_with_operation_id(
+            path,
+            b"different bytes cannot replace the original operation",
+            options,
+            operation,
+        ))
+    } else {
+        None
+    };
+    let after = inspect();
+    std::fs::write(
+        runtime
+            .data_dir(&primary)
+            .root()
+            .join("boundary-diagnostic-create-opening-cleanup.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "fixture": name,
+            "operation": operation,
+            "initial_result": format!("{first:?}"),
+            "same_operation_replay": format!("{replay:?}"),
+            "changed_body_replay": format!("{changed:?}"),
+            "before": before,
+            "after": after,
+            "original_calls": calls.iter().map(|call| format!("{call:?}")).collect::<Vec<_>>(),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    drop(client);
+    runtime.close().unwrap();
+
+    for route in [
+        DFS_METADATA_JOURNAL_BATCH_ROUTE,
+        DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE,
+    ] {
+        assert!(
+            calls.iter().any(|call| call.source == primary
+                && call.target == metadata_peer
+                && call.route == route
+                && call.phase == crate::test_runtime::RpcPhase::EndedWithoutResponse
+                && call
+                    .outcome_error
+                    .as_deref()
+                    .is_some_and(|error| { error.contains("bounded injected carrier failure") })),
+            "the original quorum must reach the real negative boundary on {route}"
+        );
+    }
+    assert!(
+        first.is_err(),
+        "the actual opening quorum must encounter the negative boundary"
+    );
+    assert_eq!(
+        openings.len(),
+        1,
+        "one real opening must retain the original input"
+    );
+    let (opening, original) = &openings[0];
+    opening.validate().unwrap();
+    assert_eq!(original.policy.min_commit_replicas, 2);
+    assert_eq!(original.policy.desired_replicas, 2);
+    assert_eq!(
+        original.content_hash.as_deref(),
+        Some(crate::content_hash(bytes).as_str())
+    );
+    let records = after
+        .tables
+        .intents
+        .iter()
+        .filter(|record| record.operation_id.as_deref() == Some(operation))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        records.len(),
+        1,
+        "replay must not allocate another original intent"
+    );
+    let terminal = records[0];
+    assert_eq!(terminal.status, DfsWriteIntentStatus::Aborted);
+    assert_eq!(terminal.created_at, original.created_at);
+    let initial_terminal = before
+        .tables
+        .intents
+        .iter()
+        .find(|record| record.intent_id == original.intent_id)
+        .expect("cleanup must publish its exact terminal before the first return");
+    assert_eq!(
+        initial_terminal, terminal,
+        "replay cannot replace the initial terminal"
+    );
+    let mut expected = original.clone();
+    expected.status = DfsWriteIntentStatus::Aborted;
+    expected.updated_at = terminal.updated_at;
+    assert_eq!(
+        terminal, &expected,
+        "only the original intent's terminal state may change"
+    );
+    assert_eq!(
+        after
+            .tables
+            .prepared_operations_v7
+            .iter()
+            .find(|record| record.digest.operation_id == opening.digest.operation_id)
+            .expect("the original opening remains recorded"),
+        opening,
+        "replay must preserve the original opening and its resolution"
+    );
+    assert!(
+        after.tables.prepared_operations_v7.iter().all(|prepared| {
+            prepared.status != DfsPreparedOperationStatus::Prepared
+                || crate::service_routed_write::prepared_intent_for_write(
+                    prepared,
+                    &original.object_id,
+                    &original.intent_id,
+                )
+                .is_none()
+        }),
+        "a terminal abort cannot leave an unresolved original preparation"
+    );
+    assert_eq!(
+        after
+            .tables
+            .prepared_operations_v7
+            .iter()
+            .filter(|prepared| {
+                prepared.status == DfsPreparedOperationStatus::Committed
+                    && prepared.payload.metadata_effects.iter().any(|effect| {
+                        matches!(effect, DfsPreparedMetadataEffect::PutIntent { intent }
+                            if intent.intent_id == original.intent_id
+                                && intent.status == DfsWriteIntentStatus::Aborted)
+                    })
+            })
+            .count(),
+        1,
+        "one actual terminal publication closes the original opening"
+    );
+    assert!(
+        replay.unwrap().is_err(),
+        "a durably aborted create cannot reopen"
+    );
+    assert!(
+        changed.unwrap().is_err(),
+        "the original identity rejects changed bytes"
+    );
+    assert!(
+        after
+            .tables
+            .objects
+            .iter()
+            .all(|object| object.path != path),
+        "a rejected create cannot publish a namespace object"
+    );
+}
+
 fn check_retained_intent_opening(
     reconcile_only: bool,
     restart_owner: bool,
