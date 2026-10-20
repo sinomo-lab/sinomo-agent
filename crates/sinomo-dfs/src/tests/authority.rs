@@ -805,6 +805,167 @@ fn native_explicit_retry_resumes_ready_intent_after_overlapping_prepare() {
 }
 
 #[test]
+fn native_new_write_recovers_current_epoch_receipt_preparation() {
+    let path = "/services/current-epoch-receipt-recovery";
+    let (mut runtime, mut requester, shard) = crate::test_support::current_native_metadata_service(
+        "native-current-epoch-receipt-recovery",
+        3,
+        path,
+    )
+    .unwrap();
+    let options = DfsWriteOptions {
+        policy: DfsReplicationPolicy::new(1, 2).unwrap(),
+        replica_candidates: vec![
+            shard.primary_node_id.clone(),
+            shard.replica_node_ids[0].clone(),
+        ],
+        wait_for_commit: true,
+        foreground_replica_repair: false,
+    };
+    let initial = requester
+        .posix_write_file(path, b"original", options.clone())
+        .unwrap();
+    requester
+        .posix_sync_file(path, DfsPosixSyncKind::File)
+        .unwrap();
+    drop(requester);
+    let mut owner = runtime.metadata_primary_service(path).unwrap();
+    let execution = owner
+        .acquire_prepared_execution(&DfsPreparedOperationScope {
+            file_system_id: shard.file_system_id.clone(),
+            shard_id: DfsMetadataShardId::new(&shard.shard_id),
+            owner_epoch: shard.epoch,
+            operation_id: "receipt-recovery-control".into(),
+        })
+        .unwrap();
+    let object = owner
+        .metadata_backend()
+        .unwrap()
+        .get_object(&initial.object_id)
+        .unwrap()
+        .unwrap();
+    let receipt = owner
+        .backend_receipt_for_replica(
+            &object.object_id,
+            &object.version,
+            &object.current_locations[0],
+        )
+        .unwrap()
+        .expect("ordinary native write supplied the actual durable receipt");
+    let unavailable = shard.replica_node_ids[1].clone();
+    for route in [
+        crate::DFS_METADATA_JOURNAL_BATCH_ROUTE,
+        crate::DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE,
+    ] {
+        runtime.install_fault(crate::test_runtime::FaultRule {
+            source: Some(shard.primary_node_id.clone()),
+            target: Some(unavailable.clone()),
+            route: Some(route.into()),
+            call_id: None,
+            origin: None,
+            remaining_hits: 32,
+            action: crate::test_runtime::FaultAction::BudgetExhausted,
+        });
+    }
+    let error = owner
+        .publish_object_metadata_effects(
+            &object,
+            vec![
+                DfsPreparedMetadataEffect::PutReceipt {
+                    receipt: receipt.clone(),
+                },
+                DfsPreparedMetadataEffect::PutObject {
+                    object: object.clone(),
+                },
+            ],
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            DfsError::MetadataRecoveryQuorumUnavailable {
+                required: 3,
+                verified: 2,
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    let originals = owner
+        .metadata_backend()
+        .unwrap()
+        .list_prepared_operations()
+        .unwrap()
+        .into_iter()
+        .filter(|record| {
+            record.status == DfsPreparedOperationStatus::Prepared
+                && record.metadata_effects.iter().any(|effect| {
+                    matches!(effect, DfsPreparedMetadataEffect::PutReceipt { receipt: actual }
+                        if actual == &receipt)
+                })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(originals.len(), 1);
+    let original = originals[0].clone();
+    original.validate().unwrap();
+    assert_eq!(original.owner_epoch, shard.epoch);
+    assert_eq!(
+        owner
+            .metadata_backend()
+            .unwrap()
+            .get_object(&object.object_id)
+            .unwrap(),
+        Some(object.clone())
+    );
+    assert_eq!(
+        runtime.remove_faults_matching(|rule| {
+            rule.source.as_ref() == Some(&shard.primary_node_id)
+                && rule.target.as_ref() == Some(&unavailable)
+                && matches!(
+                    rule.route.as_deref(),
+                    Some(
+                        crate::DFS_METADATA_JOURNAL_BATCH_ROUTE
+                            | crate::DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE
+                    )
+                )
+                && matches!(
+                    rule.action,
+                    crate::test_runtime::FaultAction::BudgetExhausted
+                )
+        }),
+        2
+    );
+    runtime.assert_fault_budgets().unwrap();
+    // No manual commit/recovery and no new identity for the interrupted body.
+    // A healthy successor must finish the exact reserved receipt publication.
+    let result = owner
+        .posix_write_file_with_operation_id(
+            path,
+            b"successor",
+            options,
+            "native-successor-after-retained-receipt",
+        )
+        .expect("healthy successor recovers the original current-epoch reservation");
+    let settled = owner
+        .metadata_backend()
+        .unwrap()
+        .prepared_operation_record(&original.operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(settled.digest, original.digest);
+    assert_eq!(settled.payload, original.payload);
+    assert_eq!(settled.status, DfsPreparedOperationStatus::Committed);
+    assert_ne!(result.version, initial.version);
+    assert_eq!(
+        owner.posix_read_file_distributed(path).unwrap(),
+        b"successor"
+    );
+    drop(execution);
+    drop(owner);
+    runtime.close().unwrap();
+}
+
+#[test]
 fn posix_create_cleans_transient_metadata_when_publication_authorization_is_unavailable() {
     use crate::test_runtime::{DfsTestRuntime, FaultAction, FaultRule, RpcPhase};
     let nodes = DfsTestRuntime::ordered_node_ids("native-create-publication-unavailable", 3);

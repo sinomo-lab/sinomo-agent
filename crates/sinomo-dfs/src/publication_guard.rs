@@ -913,15 +913,24 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
             .prepared_operation_reservations(&payload)?;
         reservations.sort_by_key(|record| record.digest.prepare_sequence);
         for record in reservations {
-            if record.owner_epoch >= payload.owner_epoch || payload.metadata_effects.iter().any(|effect|
+            if record.owner_epoch > payload.owner_epoch || payload.metadata_effects.iter().any(|effect|
                 matches!(effect, crate::DfsPreparedMetadataEffect::ResolvePreparedOperation {digest,..} if digest == &record.digest)) {
                 continue;
             }
-            // An older author was retired by the existing handoff/epoch fence.
-            // Recovery still validates the current primary, original readset,
-            // full shard proof and body; failure leaves the reservation intact.
+            // Admission serializes this producer with the previous execution,
+            // but its durable reservation survives a failed quorum or reply.
+            // Finish that exact body before preparing an overlapping successor,
+            // including when the authority epoch has not changed. The existing
+            // recovery path validates the current primary, original readset and
+            // full shard proof; it never rebases either operation's payload.
+            let original_operation_id = record.operation_id.clone();
             self.recover_one_prepared_operation(record)
-                .map_err(|error| MetadataBackendError::Serde(error.to_string()))?;
+                .map_err(|error| {
+                    MetadataBackendError::Serde(format!(
+                        "namespace prepare {} overlaps active prepare {}: original recovery failed: {error}",
+                        payload.operation_id, original_operation_id
+                    ))
+                })?;
         }
         self.rebind_prepared_publication_instance_if_frozen(&payload)
             .map_err(|error| MetadataBackendError::Serde(error.to_string()))?;
