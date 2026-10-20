@@ -1029,8 +1029,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     .and_then(|state| state.completed_transfer_request_id.clone()),
                 transfer_kind: Some(kind),
             };
-            self.repair_attempt_records
-                .insert(key.clone(), record.clone());
+            // Capturing a missing target describes scheduling work, not an
+            // observed producer. Do not install this derived snapshot as live
+            // custody: another lane may already own a named durable request.
+            // Actual producer/queue records are retained by their existing paths.
             records.insert(key, record);
         }
         records.into_values().collect()

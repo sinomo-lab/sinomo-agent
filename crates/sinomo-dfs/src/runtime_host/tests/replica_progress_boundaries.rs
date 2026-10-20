@@ -8,6 +8,238 @@ use std::sync::Condvar;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[test]
+fn remote_source_placement_preserves_repair_custody_until_actual_receipts() {
+    exercise_remote_source_placement_progress(false);
+}
+
+#[test]
+fn remote_source_placement_ready_custody_survives_native_restart() {
+    exercise_remote_source_placement_progress(true);
+}
+
+fn exercise_remote_source_placement_progress(restart_on_ready: bool) {
+    let (name, path) = if restart_on_ready {
+        (
+            "native-remote-source-placement-restart",
+            "/services/native-remote-source-placement-restart",
+        )
+    } else {
+        (
+            "native-remote-source-placement-progress",
+            "/services/native-remote-source-placement-progress",
+        )
+    };
+    let (mut native, initial, original_shard) =
+        crate::test_support::current_native_metadata_service(name, 3, path).unwrap();
+    drop(initial);
+    let target = original_shard.primary_node_id.clone();
+    let primary = original_shard.replica_node_ids[0].clone();
+    let holder = original_shard.replica_node_ids[1].clone();
+    // Match the real split: root owns placement coordination, another node
+    // owns services, and the content initially resides on a third node.
+    let shard = native
+        .reassign_metadata_shard(
+            &original_shard.file_system_id,
+            &original_shard.shard_id,
+            primary.clone(),
+            vec![target.clone(), holder.clone()],
+        )
+        .unwrap();
+    let bytes = vec![0x5a; 4096];
+    let mut writer = native.client(&holder).unwrap();
+    let mut initial_policy = crate::DfsReplicationPolicy::new(1, 1).unwrap();
+    initial_policy.required_node_ids = vec![holder.clone()];
+    let stat = writer
+        .posix_write_file(
+            path,
+            &bytes,
+            DfsWriteOptions {
+                policy: initial_policy,
+                replica_candidates: vec![holder.clone()],
+                wait_for_commit: true,
+                foreground_replica_repair: false,
+            },
+        )
+        .unwrap();
+    assert_eq!(writer.posix_read_file(path).unwrap(), bytes);
+    drop(writer);
+    let owner = native.metadata_primary_service(path).unwrap();
+    assert!(
+        owner
+            .local_object_version_manifest_size_if_matches(
+                &stat.object_id,
+                &stat.version,
+                stat.content_hash.as_ref().unwrap(),
+            )
+            .is_none(),
+        "the real metadata owner must fetch this existing remote content"
+    );
+    drop(owner);
+    // Deny the real claim until the controller observes and restarts its owner.
+    // A finite transport fault can be consumed before that observation, making
+    // a healthy completion bypass the intended restart boundary under load.
+    // This hook holds no DATA owner, admission permit, or successful reply.
+    let mut before_claim = restart_on_ready.then(|| {
+        native
+            .deny_background_replica_before_claim(&primary)
+            .unwrap()
+    });
+    let desired = vec![primary.clone(), target.clone()];
+    let mut policy =
+        crate::DfsPlacementPolicy::new(sinomo_core::DfsObjectPolicy::ReplicatedEventual, 1, 2)
+            .unwrap();
+    policy.required_node_ids = desired.clone();
+    let accepted = native
+        .apply_placement_policy(&primary, path, crate::DfsPlacementScope::SelfOnly, policy)
+        .unwrap();
+    let queue = crate::LocalDfsRepairQueueStore::new(
+        crate::default_dfs_repair_attempt_snapshot_path(native.data_dir(&primary)),
+    );
+    let root =
+        crate::default_dfs_metadata_shards_root(native.data_dir(&primary)).join(&shard.shard_id);
+    // This is the existing routed-status end-to-end bound. Each normal native
+    // owner invocation also keeps its existing network budget and retry policy.
+    let deadline = std::time::Instant::now() + Duration::from_secs(90);
+    let mut cuts = Vec::new();
+    let mut previous_head = None;
+    let mut completed = false;
+    let mut failure = None;
+    let mut restarted = false;
+    native.checkpoint_rpc_observation_window().unwrap();
+    while std::time::Instant::now() < deadline {
+        for node in [&target, &primary] {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let observed = native
+                .maintenance_tick(
+                    node,
+                    remaining.min(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT),
+                )
+                .unwrap();
+            native.checkpoint_rpc_observation_window().unwrap();
+            assert_eq!(observed.omitted_kv_event_count, 0);
+            if let Err(error) = observed.outcome {
+                failure = Some(error);
+                break;
+            }
+        }
+        if failure.is_some() {
+            break;
+        }
+        let cut = queue.view().unwrap();
+        if previous_head != Some(cut.head_sequence) {
+            previous_head = Some(cut.head_sequence);
+            cuts.push(serde_json::json!({
+                "head": cut.head_sequence,
+                "records": cut.records.iter().filter(|record| record.object_id == stat.object_id).collect::<Vec<_>>(),
+            }));
+        }
+        if restart_on_ready
+            && !restarted
+            && cut.records.iter().any(|record| {
+                record.object_id == stat.object_id
+                    && record.missing_replica_node_id == target
+                    && !record.in_flight
+                    && record.transfer_request_id.is_none()
+                    && record.completed_transfer_request_id.is_none()
+                    && record.transfer_delivery_state
+                        == Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent)
+            })
+        {
+            native.stop_node(&primary).unwrap();
+            native.checkpoint_rpc_observation_window().unwrap();
+            // A real process restart loses this rebuildable read cache. The
+            // durable original queue and every operation identity stay intact.
+            queue.reload_from_disk_on_next_access();
+            let stopped = queue.view().unwrap();
+            cuts.push(serde_json::json!({
+                "phase": "stopped",
+                "head": stopped.head_sequence,
+                "records": stopped.records,
+            }));
+            drop(before_claim.take());
+            native.reopen_node(primary.clone()).unwrap();
+            native.checkpoint_rpc_observation_window().unwrap();
+            restarted = true;
+            continue;
+        }
+        if cut.records.iter().any(|record| {
+            record.object_id == stat.object_id
+                && record
+                    .intent_id
+                    .starts_with(&format!("placement:{}:", accepted.job_id))
+                && record.transfer_request_id.is_none()
+                && record.completed_transfer_request_id.is_none()
+                && record.transfer_delivery_state.is_none()
+        }) {
+            failure =
+                Some("fresh native placement lost its known pre-dispatch custody".to_string());
+            break;
+        }
+        // Inspection reads actual materialized rows. It neither runs recovery
+        // nor grants a replacement writer or marks an unavailable replica ready.
+        let inspected = crate::LocalSobjMetadataBackend::open_for_inspection(
+            DfsMetadataShardId::new(shard.shard_id.clone()),
+            &root,
+        )
+        .unwrap();
+        let receipts = inspected
+            .receipts_for_version(&stat.object_id, &stat.version)
+            .unwrap();
+        completed = desired.iter().all(|node| {
+            receipts.iter().any(|receipt| {
+                &receipt.replica_node_id == node
+                    && receipt.receipt.file_system_id == stat.file_system_id
+                    && receipt.receipt.object_id == stat.object_id
+                    && receipt.receipt.committed_version == stat.version
+                    && receipt.content_hash.as_ref() == stat.content_hash.as_ref()
+            })
+        });
+        if completed {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let reads = if completed {
+        desired
+            .iter()
+            .map(|node| native.client(node).unwrap().posix_read_file(path).unwrap())
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let omitted_rpcs = native.observation_dropped_count();
+    eprintln!(
+        "native placement job={} original_object={} version={} queue_cuts={}",
+        accepted.job_id,
+        stat.object_id,
+        stat.version,
+        serde_json::to_string(&cuts).unwrap()
+    );
+    drop(queue);
+    drop(before_claim);
+    native.checkpoint_rpc_observation_window().unwrap();
+    let closed = native.close();
+    eprintln!(
+        "native placement completion={completed} failure={failure:?} drain_and_coverage={closed:?}"
+    );
+    closed.unwrap();
+    assert_eq!(omitted_rpcs, 0);
+    assert!(
+        !restart_on_ready || restarted,
+        "the negative claim boundary must retain actual ready work for restart"
+    );
+    assert!(failure.is_none(), "ordinary native repair: {failure:?}");
+    assert!(
+        completed,
+        "the unchanged existing deadline expired without both actual desired receipts"
+    );
+    assert!(reads.iter().all(|read| read == &bytes));
+}
+
+#[test]
 fn routed_authority_ingress_preserves_source_target_and_epoch_checks() {
     let path = "/services/native-routed-probe-identities";
     let (native, client, shard) = crate::test_support::current_native_metadata_service(
