@@ -1710,7 +1710,12 @@ set parks the worker.
 An authority-checked placement mutation hands its exact missing targets to the
 durable daemon queue and emits the repair wake. Replay repeats that handoff
 without rewriting settled metadata, rebuilding unrelated historical intents or
-resetting the queue's retry backoff. The bounded selector coalesces older
+resetting the queue's retry backoff. After primary handoff, an unchanged
+committed placement may need its first producer on the new owner even though
+no metadata commit is necessary. The current authority enrolls that producer
+through the existing durable enrollment path before capturing derived queue
+work; existing named or unknown transfer custody is preserved.
+The bounded selector coalesces older
 pending adaptive observations when a newer authoritative job covers the same
 scope. Replacement selection uses creation time independently of queue
 priority; explicit jobs and saved scan progress remain intact, and retirement
