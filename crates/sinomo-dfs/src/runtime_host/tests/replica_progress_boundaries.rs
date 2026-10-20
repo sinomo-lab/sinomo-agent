@@ -7,6 +7,144 @@ use crate::test_runtime::{FaultAction, FaultRule, RpcPhase};
 use std::sync::Condvar;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+async fn poll_queued_admission_once<F: std::future::Future>(
+    mut future: std::pin::Pin<&mut F>,
+) -> std::task::Poll<F::Output> {
+    std::future::poll_fn(|cx| {
+        std::task::Poll::Ready(std::future::Future::poll(future.as_mut(), cx))
+    })
+    .await
+}
+
+#[tokio::test]
+async fn required_replica_wait_preempts_a_later_maintenance_turn_after_shard_release() {
+    use crate::runtime_admission::{
+        DfsMutationScheduler, acquire_dfs_maintenance_admission_until_foreground_waits,
+    };
+    use std::task::Poll;
+
+    let scheduler = Arc::new(DfsMutationScheduler::new());
+    let root = DfsMessageExecutionScope::ExactShard {
+        file_system_id: crate::sifs_file_system_id(),
+        shard_id: DfsMetadataShardId::new("root"),
+    };
+    let services = DfsMessageExecutionScope::ExactShard {
+        file_system_id: crate::sifs_file_system_id(),
+        shard_id: DfsMetadataShardId::new("services"),
+    };
+    let global = DfsMessageExecutionScope::GlobalExclusive;
+    let services_owner = scheduler.admit(&services).await.unwrap();
+    let earlier_root_owner = scheduler.admit(&root).await.unwrap();
+    let earlier_turn = scheduler.begin_maintenance_interest();
+    let mut required = Box::pin(admit_daemon_dfs_message(&scheduler, &root, true));
+    assert!(
+        poll_queued_admission_once(required.as_mut())
+            .await
+            .is_pending()
+    );
+    assert!(earlier_turn.is_requested());
+    drop(earlier_turn);
+
+    // The required RPC already requested preemption but is still waiting on
+    // another root operation. A later Routine turn queues its real global writer.
+    let later_turn = scheduler.begin_maintenance_interest();
+    let mut maintenance = Box::pin(acquire_dfs_maintenance_admission_until_foreground_waits(
+        &later_turn,
+        scheduler.admit(&global),
+    ));
+    assert!(
+        poll_queued_admission_once(maintenance.as_mut())
+            .await
+            .is_pending()
+    );
+    drop(earlier_root_owner);
+    // The same RPC now reaches the global read queue behind that writer.
+    assert!(
+        poll_queued_admission_once(required.as_mut())
+            .await
+            .is_pending()
+    );
+    let maintenance_result = poll_queued_admission_once(maintenance.as_mut()).await;
+    let required_result = poll_queued_admission_once(required.as_mut()).await;
+    let yielded = matches!(&maintenance_result, Poll::Ready(Ok(None)));
+    let admitted = matches!(&required_result, Poll::Ready(Ok(owner)) if owner.is_exact());
+    let completed_request_left_no_interest = !scheduler.begin_maintenance_interest().is_requested();
+
+    // Drain actual futures and returned permits before the failing assertion.
+    // The services owner remains held until after the required RPC's observation.
+    drop(required_result);
+    drop(maintenance_result);
+    drop(required);
+    drop(maintenance);
+    drop(later_turn);
+    drop(services_owner);
+    assert!(
+        scheduler.try_admit_global().is_some(),
+        "all actual owners drained"
+    );
+    assert!(
+        yielded,
+        "a later maintenance turn missed the still-waiting required RPC"
+    );
+    assert!(
+        admitted,
+        "an independent services owner must not strand root replication"
+    );
+    assert!(completed_request_left_no_interest);
+}
+
+#[tokio::test]
+async fn cancelled_replica_wait_does_not_preempt_a_later_maintenance_turn() {
+    use crate::runtime_admission::{
+        DfsMutationScheduler, acquire_dfs_maintenance_admission_until_foreground_waits,
+    };
+    use std::task::Poll;
+
+    let scheduler = Arc::new(DfsMutationScheduler::new());
+    let root = DfsMessageExecutionScope::ExactShard {
+        file_system_id: crate::sifs_file_system_id(),
+        shard_id: DfsMetadataShardId::new("root"),
+    };
+    let global = DfsMessageExecutionScope::GlobalExclusive;
+    let root_owner = scheduler.admit(&root).await.unwrap();
+    let earlier_turn = scheduler.begin_maintenance_interest();
+    let mut required = Box::pin(admit_daemon_dfs_message(&scheduler, &root, true));
+    assert!(
+        poll_queued_admission_once(required.as_mut())
+            .await
+            .is_pending()
+    );
+    assert!(earlier_turn.is_requested());
+    drop(required);
+    drop(earlier_turn);
+
+    let later_turn = scheduler.begin_maintenance_interest();
+    assert!(!later_turn.is_requested());
+    let mut maintenance = Box::pin(acquire_dfs_maintenance_admission_until_foreground_waits(
+        &later_turn,
+        scheduler.admit(&global),
+    ));
+    assert!(
+        poll_queued_admission_once(maintenance.as_mut())
+            .await
+            .is_pending()
+    );
+    drop(root_owner);
+    let outcome = poll_queued_admission_once(maintenance.as_mut()).await;
+    let admitted = matches!(&outcome, Poll::Ready(Ok(Some(owner))) if owner.is_global());
+    drop(outcome);
+    drop(maintenance);
+    drop(later_turn);
+    assert!(
+        scheduler.try_admit_global().is_some(),
+        "cancelled waiter drained"
+    );
+    assert!(
+        admitted,
+        "cancelled RPC cannot suppress the next maintenance turn"
+    );
+}
+
 #[test]
 fn remote_source_placement_preserves_repair_custody_until_actual_receipts() {
     exercise_remote_source_placement_progress(false);

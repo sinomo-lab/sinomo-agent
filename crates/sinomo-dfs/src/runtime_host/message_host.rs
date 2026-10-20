@@ -678,10 +678,24 @@ pub(crate) async fn admit_daemon_dfs_message(
     execution_scope: &DfsMessageExecutionScope,
     preempt_maintenance: bool,
 ) -> Result<DaemonDfsMutationAdmission, DaemonError> {
-    if preempt_maintenance && !matches!(execution_scope, DfsMessageExecutionScope::ReadOnly) {
-        scheduler.request_foreground_admission();
+    if !preempt_maintenance || matches!(execution_scope, DfsMessageExecutionScope::ReadOnly) {
+        return scheduler.admit(execution_scope).await.map_err(Into::into);
     }
-    scheduler.admit(execution_scope).await.map_err(Into::into)
+    scheduler.request_foreground_admission();
+    let mut admission = std::pin::pin!(scheduler.admit(execution_scope));
+    std::future::poll_fn(|cx| {
+        let result = std::future::Future::poll(admission.as_mut(), cx);
+        if result.is_pending() {
+            // A later maintenance turn can queue its global writer while this
+            // request waits for its shard. Renew the existing notification
+            // after each actual pending admission, including that transition
+            // to the global read queue. No extra waiter or authority is retained.
+            scheduler.request_foreground_admission();
+        }
+        result
+    })
+    .await
+    .map_err(Into::into)
 }
 
 pub(crate) fn daemon_dfs_metadata_publish_lane_scheduler(
