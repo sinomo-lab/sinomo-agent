@@ -401,6 +401,13 @@ impl DfsMetadataAuthorityRuntime {
         self.state.replica_context_state(context)
     }
 
+    pub(crate) fn replica_context_lifecycle_state(
+        &self,
+        context: &DfsMetadataReplicaShardContext,
+    ) -> Result<((u64, u64), bool), DfsError> {
+        self.state.replica_context_lifecycle_state(context)
+    }
+
     pub fn current_complete_prefix(self: &Arc<Self>) -> Option<DfsAuthoritativePrefixProjection> {
         let retained = self.state.current_complete_prefix();
         if retained.is_none() {
@@ -1639,15 +1646,26 @@ impl DfsMetadataAuthorityState {
         &self,
         context: &DfsMetadataReplicaShardContext,
     ) -> Result<(u64, bool), DfsError> {
+        self.replica_context_lifecycle_state(context)
+            .map(|((generation, _), matches)| (generation, matches))
+    }
+
+    fn replica_context_lifecycle_state(
+        &self,
+        context: &DfsMetadataReplicaShardContext,
+    ) -> Result<((u64, u64), bool), DfsError> {
         let projection = self.projection.lock().map_err(|_| DfsError::Network {
             message: "DFS metadata authority projection lock poisoned".to_string(),
         })?;
+        // The exact context and physical-store generation belong to the same
+        // observed cut. A provider/proof-only change need not replace a store.
+        let generations = (self.generation(), self.storage_generation());
         if projection.revision.is_none() {
-            return Ok((self.generation(), false));
+            return Ok((generations, false));
         }
         let matches =
             metadata_replica_context_matches_authority_entries(&projection.entries, context)?;
-        Ok((self.generation(), matches))
+        Ok((generations, matches))
     }
 
     pub fn retained_complete_prefix_for_generation(

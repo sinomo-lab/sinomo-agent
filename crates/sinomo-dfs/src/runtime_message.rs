@@ -835,20 +835,28 @@ pub(crate) struct DfsRuntimeMessageCacheEntry {
 }
 
 impl DfsRuntimeMessageCacheEntry {
+    fn matches_runtime_owner(
+        &self,
+        peer_snapshot: &DfsRuntimeMessagePeerSnapshot,
+        metadata_authority_generation: &Arc<crate::DfsMetadataAuthorityRuntime>,
+    ) -> bool {
+        self.signature.cluster_id == peer_snapshot.cluster_id
+            && self.signature.local_node_id == peer_snapshot.local_node_id
+            && Arc::ptr_eq(
+                &self.metadata_authority_generation,
+                metadata_authority_generation,
+            )
+            && self.resident_metadata_initialized
+    }
+
     fn matches_authority_generation(
         &self,
         peer_snapshot: &DfsRuntimeMessagePeerSnapshot,
         metadata_authority_generation: &Arc<crate::DfsMetadataAuthorityRuntime>,
         observed_generation: u64,
     ) -> bool {
-        self.signature.cluster_id == peer_snapshot.cluster_id
-            && self.signature.local_node_id == peer_snapshot.local_node_id
+        self.matches_runtime_owner(peer_snapshot, metadata_authority_generation)
             && self.signature.metadata_authority_generation == observed_generation
-            && Arc::ptr_eq(
-                &self.metadata_authority_generation,
-                metadata_authority_generation,
-            )
-            && self.resident_metadata_initialized
     }
 
     pub fn bounded_status_resident(
@@ -936,14 +944,18 @@ impl DfsRuntimeMessageCacheEntry {
         &self,
         peer_snapshot: &DfsRuntimeMessagePeerSnapshot,
         metadata_authority_generation: &Arc<crate::DfsMetadataAuthorityRuntime>,
-        observed_generation: u64,
+        current_signature: &DfsRuntimeMessageServiceSignature,
         context: &crate::DfsMetadataReplicaShardContext,
     ) -> Result<Option<ResidentLocalMetadataShardHandle>, crate::DfsError> {
-        if !self.matches_authority_generation(
-            peer_snapshot,
-            metadata_authority_generation,
-            observed_generation,
-        ) {
+        // The caller has validated the current exact assignment/handoff.
+        // Replica ingress borrows only its physical shard, not the service
+        // shell's configuration view. Reuse the existing storage-lifecycle
+        // fence so a provider-only delta cannot queue a global upgrade behind
+        // another shard whose publication needs this acknowledgement.
+        // General service/read admission retains its authority-generation fence.
+        if !self.matches_runtime_owner(peer_snapshot, metadata_authority_generation)
+            || !self.signature.shares_metadata_storage(current_signature)
+        {
             return Ok(None);
         }
         let Some(resident) = self.resident_metadata_backend.as_ref() else {

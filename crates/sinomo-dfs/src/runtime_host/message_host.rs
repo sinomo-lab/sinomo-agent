@@ -1796,8 +1796,8 @@ pub(crate) fn daemon_dfs_message_cache_exact_admission_handle_for_replica_contex
         &peer_snapshot.local_node_id,
         Some(runtime),
     )?;
-    let (observed_generation, context_matches) =
-        metadata_authority_generation.replica_context_state(context)?;
+    let ((observed_generation, storage_generation), context_matches) =
+        metadata_authority_generation.replica_context_lifecycle_state(context)?;
     if !context_matches {
         return Ok(None);
     }
@@ -1822,7 +1822,12 @@ pub(crate) fn daemon_dfs_message_cache_exact_admission_handle_for_replica_contex
     entry.replica_admission_handle(
         peer_snapshot,
         &metadata_authority_generation,
-        observed_generation,
+        &DaemonDfsMessageServiceSignature {
+            cluster_id: peer_snapshot.cluster_id.clone(),
+            local_node_id: peer_snapshot.local_node_id.clone(),
+            metadata_authority_generation: observed_generation,
+            metadata_storage_generation: storage_generation,
+        },
         context,
     )
 }

@@ -7,6 +7,7 @@ use super::super::message_host::{
 };
 use super::*;
 
+mod replica_storage_scope;
 mod response_custody;
 
 struct RetryFixture {
