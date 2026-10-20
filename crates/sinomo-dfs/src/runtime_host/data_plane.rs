@@ -1,4 +1,5 @@
 use super::*;
+use crate::{DfsMessageResponse, DfsNetworkMessage, DfsRoutedMessage};
 
 #[derive(Clone, Debug)]
 pub(crate) struct DaemonDfsDataPlaneHost {
@@ -1172,6 +1173,75 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
         let namespace_event = daemon_dfs_visible_mutation_event(&command);
         Box::pin(async move {
             let _data_owner = data_owner?;
+            if attachment.is_none()
+                && let DfsNetworkMessage::MetadataJournalBatch(batch) =
+                    &command.routed_message.message
+                && batch.authority_probe.is_some()
+                && !batch.verify_prefix_only
+                && batch.prefix_probe.is_none()
+                && let Some(file_system_id) = batch.file_system_id.clone()
+            {
+                // The data-plane service has authenticated the routed source.
+                // A fallback authority probe is the same replica-ingress
+                // operation as its direct RPC, not a general filesystem
+                // request. Share its physical owner, admission, validation
+                // and materialization path. Promoted-primary prefix probes
+                // keep their separate handoff-marker protocol below.
+                let data_dir = Arc::new(SinomoDataDir::new(
+                    daemon_data_dir(&paths).map_err(daemon_dfs_data_plane_error)?,
+                ));
+                let context = self
+                    .retained_metadata_replica_shard_context(
+                        Arc::clone(&data_dir),
+                        file_system_id,
+                        batch.batch.shard_id.clone(),
+                    )
+                    .expect("daemon host implements retained replica context")
+                    .await?
+                    .ok_or_else(|| {
+                        DfsDataPlaneHostError::new(
+                            "authoritative metadata replica shard context is unavailable",
+                        )
+                    })?;
+                if command.routed_message.target_node_id != context.local_node_id {
+                    return Err(DfsDataPlaneHostError::new(
+                        "routed metadata authority probe targets another node",
+                    ));
+                }
+                let local_node_id = context.local_node_id.clone();
+                let DfsMessageCommand {
+                    request_id,
+                    routed_message,
+                } = command;
+                let DfsRoutedMessage {
+                    source_node_id,
+                    frame_id,
+                    message_id,
+                    message,
+                    ..
+                } = routed_message;
+                let DfsNetworkMessage::MetadataJournalBatch(batch) = message else {
+                    unreachable!("selected metadata journal command");
+                };
+                let response = self
+                    .apply_metadata_journal_batch(
+                        data_dir,
+                        source_node_id.clone(),
+                        batch,
+                        Some(context),
+                    )
+                    .await?;
+                return Ok(DfsDataPlaneResponse::value(DfsMessageResponse {
+                    request_id,
+                    outbound_messages: vec![DfsRoutedMessage {
+                        source_node_id: local_node_id,
+                        target_node_id: source_node_id,
+                        frame_id,
+                        message_id,
+                        message: DfsNetworkMessage::MetadataJournalBatchResponse(response),
+                    }],
+                }));
+            }
             let response = handle_daemon_dfs_message_with_encoded_size_async(
                 &paths,
                 command,
