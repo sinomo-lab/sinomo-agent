@@ -265,6 +265,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         let at = time::OffsetDateTime::now_utc();
         for intent in &retired {
+            // The bounded history page also reconstructs compacted receipts.
+            // Replaying a settled retirement must preserve its original evidence
+            // and retention time, rather than author another metadata operation.
+            if backend
+                .get_intent_receipt(&object.object_id, &intent.intent_id)?
+                .is_some_and(|receipt| receipt.matches_intent(intent))
+            {
+                continue;
+            }
             let receipt = DfsWriteIntentReceipt::from_intent(intent, at).ok_or_else(|| {
                 DfsError::Metadata {
                     message: "placement retirement lacks exact terminal intent evidence".into(),
@@ -275,7 +284,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let ids = retired.into_iter().map(|intent| intent.intent_id).collect();
         // One guarded commit installs the retained owner before compacting
         // executable full records into their exact terminal retry receipts.
-        self.publish_object_metadata_effects(object, effects)?;
+        if !effects.is_empty() {
+            self.publish_object_metadata_effects(object, effects)?;
+        }
         Ok((ids, page.next_cursor))
     }
     pub(crate) fn recorded_retained_repair_owner(
