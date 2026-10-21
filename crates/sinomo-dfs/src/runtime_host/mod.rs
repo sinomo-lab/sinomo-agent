@@ -357,6 +357,10 @@ pub struct DfsRuntimeHost {
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     shutting_down: crate::DfsCancellationFlag,
     shutdown_notify: tokio::sync::Notify,
+    /// Per-mounted-host configuration input for native unit fixtures. This
+    /// changes what the real advertisement producers read, never their results.
+    #[cfg(test)]
+    fixture_local_zone: Mutex<Option<String>>,
 }
 
 impl DfsRuntimeHost {
@@ -375,6 +379,8 @@ impl DfsRuntimeHost {
             tasks: Mutex::new(Vec::new()),
             shutting_down: crate::DfsCancellationFlag::new(),
             shutdown_notify: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            fixture_local_zone: Mutex::new(None),
         }
     }
 
@@ -2334,7 +2340,17 @@ fn daemon_kv_events_cover_revision_range(
             }))
 }
 
-fn daemon_dfs_local_zone() -> Option<String> {
+fn daemon_dfs_local_zone(_data_dir: &SinomoDataDir) -> Option<String> {
+    #[cfg(test)]
+    if let Ok(Some(host)) = registered_dfs_runtime_host(_data_dir)
+        && let Some(zone) = host
+            .fixture_local_zone
+            .lock()
+            .expect("native fixture zone input")
+            .clone()
+    {
+        return Some(zone);
+    }
     std::env::var(SINOMO_DFS_ZONE_ENV)
         .ok()
         .map(|zone| zone.trim().to_string())

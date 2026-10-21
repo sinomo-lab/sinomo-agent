@@ -1067,6 +1067,7 @@ async fn ensure_default_distributed_dfs_lifecycle_inner(
         let data_dir = daemon_data_dir(paths)?;
         let data_dir = SinomoDataDir::new(data_dir);
         let cluster_paths = ClusterPaths::new(&data_dir);
+        let local_zone = daemon_dfs_local_zone(&data_dir);
         // The shadow shares the data root but never owns a second device sampler.
         let local_content_advertisement = (!paths.is_shadow())
             .then(|| {
@@ -1076,7 +1077,7 @@ async fn ensure_default_distributed_dfs_lifecycle_inner(
                         cached_daemon_dfs_local_content_advertisement(
                             &data_dir,
                             &state.local_node_id,
-                            daemon_dfs_local_zone(),
+                            local_zone.clone(),
                         )
                     })
             })
@@ -1094,7 +1095,7 @@ async fn ensure_default_distributed_dfs_lifecycle_inner(
             DfsDefaultClusterBootstrapOptions {
                 publish_cluster_control,
                 materialize_local_metadata,
-                local_zone: daemon_dfs_local_zone(),
+                local_zone,
                 local_content_advertisement,
             },
         )

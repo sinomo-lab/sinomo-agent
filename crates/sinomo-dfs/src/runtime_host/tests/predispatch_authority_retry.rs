@@ -178,6 +178,7 @@ impl RetryFixture {
                             let mut advertisement =
                                 observed_provider_advertisement(preflight, &local)?;
                             advertisement.zone = Some(format!("before-fence-zone-{attempt}"));
+                            configure_native_provider_zone(&paths, &advertisement.zone)?;
                             commit_current_configuration_delta(
                                 &paths,
                                 &local,
@@ -297,6 +298,7 @@ impl RetryFixture {
                             let mut advertisement =
                                 observed_provider_advertisement(preflight, &local)?;
                             advertisement.zone = Some(format!("pre-execution-zone-{attempt}"));
+                            configure_native_provider_zone(&paths, &advertisement.zone)?;
                             // This is a real contiguous committed provider delta.
                             // Its shared subscription updates all three proven
                             // scopes; installing a DFS-only prefix would miss it.
@@ -454,6 +456,24 @@ fn test_error(message: impl Into<String>) -> sinomo_dfs::DfsError {
     sinomo_dfs::DfsError::Network {
         message: message.into(),
     }
+}
+
+fn configure_native_provider_zone(
+    paths: &ClusterPaths,
+    zone: &Option<String>,
+) -> Result<(), crate::DfsError> {
+    let data_dir = SinomoDataDir::new(
+        paths.root.parent().ok_or_else(|| test_error("native fixture DATA root"))?,
+    );
+    let host = registered_dfs_runtime_host(&data_dir)
+        .map_err(|error| test_error(error.to_string()))?
+        .ok_or_else(|| test_error("native fixture provider owner is unavailable"))?;
+    // Change the owning node's input as well as its real committed projection.
+    // Otherwise normal reconciliation correctly repairs the injected derived
+    // row back to the old zone and introduces an unintended second actor.
+    *host.fixture_local_zone.lock().unwrap() = zone.clone();
+    assert_eq!(daemon_dfs_local_zone(&data_dir), *zone);
+    Ok(())
 }
 
 fn observed_provider_advertisement(
@@ -1311,6 +1331,7 @@ fn publisher_provider_delta_before_plan(changed_attempts: usize, expire_handoff:
                     assert!(admission_held, "planning owns its actual exact admission");
                     let mut advertisement = observed_provider_advertisement(preflight, &local)?;
                     advertisement.zone = Some(format!("publication-planning-zone-{attempt}"));
+                    configure_native_provider_zone(&paths, &advertisement.zone)?;
                     commit_current_configuration_delta(
                         &paths,
                         &local,
@@ -1755,6 +1776,7 @@ fn direct_replica_preflight_provider_edge_replans_before_one_backend_invocation(
                         let storage = preflight.authority.storage_generation();
                         let mut advertisement = observed_provider_advertisement(preflight, &local)?;
                         advertisement.zone = Some("direct-preflight-provider-successor".into());
+                        configure_native_provider_zone(&cluster_paths, &advertisement.zone)?;
                         let operation = sinomo_core::kv::KvOp::put_serde(
                             crate::content_service_key(&local),
                             &advertisement,

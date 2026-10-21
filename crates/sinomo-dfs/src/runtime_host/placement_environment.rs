@@ -249,7 +249,7 @@ fn refresh_daemon_dfs_placement_snapshot_at_generation(
     let local_advertisement = cached_daemon_dfs_local_content_advertisement(
         data_dir,
         local_node_id,
-        daemon_dfs_local_zone(),
+        daemon_dfs_local_zone(data_dir),
     );
     advertisements.retain(|advertisement| advertisement.node_id != *local_node_id);
     advertisements.push(local_advertisement);
@@ -386,7 +386,7 @@ fn prepare_daemon_dfs_storage_environment_refresh(
     let desired = daemon_dfs_local_content_advertisement_with_resources(
         &data_dir,
         &state.local_node_id,
-        daemon_dfs_local_zone(),
+        daemon_dfs_local_zone(&data_dir),
         node_resources,
         sample_storage,
     );
