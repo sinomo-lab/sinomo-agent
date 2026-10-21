@@ -601,6 +601,7 @@ impl LocalSobjMetadataBackend {
             &backend.tables,
             DEFAULT_METADATA_TABLE_COMPACT_AFTER_BYTES,
             backend.table_log_offset,
+            Some(&backend.read_snapshot_cache),
         )?;
         Ok(backend)
     }
@@ -2231,6 +2232,7 @@ impl LocalSobjMetadataBackend {
 
     fn table_materialization_state(&mut self) -> TableMaterializationState<'_> {
         TableMaterializationState {
+            read_snapshot_cache: Some(&self.read_snapshot_cache),
             tables: &mut self.tables,
             table_log_offset: &mut self.table_log_offset,
 

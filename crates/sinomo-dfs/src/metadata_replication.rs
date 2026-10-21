@@ -9478,7 +9478,7 @@ pub(crate) fn committed_payloads_for_batch(
         let payload = match inline {
             Some(payload) => payload,
             None => {
-                let stored = backend.prepared_operation_payload(&digest.operation_id)?;
+                let stored = backend.prepared_operation_payload_for_digest(digest)?;
                 if let Some(payload) = stored {
                     payload
                 } else {

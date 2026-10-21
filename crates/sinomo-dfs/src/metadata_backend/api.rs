@@ -184,6 +184,35 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             .map(|record| record.map(|record| record.payload))
     }
 
+    fn prepared_operation_payload_for_digest(
+        &self,
+        digest: &DfsPreparedOperationDigest,
+    ) -> Result<Option<Arc<DfsPreparedOperationPayload>>> {
+        if digest.shard_id != self.shard_id {
+            return Err(MetadataBackendError::Serde(
+                "immutable prepared body names a foreign physical shard".into(),
+            ));
+        }
+        // Commit classification needs the already validated immutable body,
+        // not a new current-table cut. Exact digest equality binds filesystem,
+        // epoch, operation, prepare slot and content. No live status is inferred.
+        if let Some(record) = self.tables.prepared_operations_v7.get(&digest.operation_id)
+            && record.digest == *digest
+        {
+            record.validate()?;
+            return Ok(Some(Arc::clone(&record.payload)));
+        }
+        let Some(record) = self.current_prepared_operation_record(&digest.operation_id)? else {
+            return Ok(None);
+        };
+        if record.digest != *digest {
+            return Err(MetadataBackendError::Serde(
+                "immutable prepared body differs from the requested durable identity".into(),
+            ));
+        }
+        Ok(Some(record.payload))
+    }
+
     fn committed_prepared_operation(
         &self,
         digest: &crate::metadata_records::DfsPreparedOperationDigest,

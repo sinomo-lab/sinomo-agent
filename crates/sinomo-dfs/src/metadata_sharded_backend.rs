@@ -3690,6 +3690,15 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
             .prepared_operation_payload(operation_id)
     }
 
+    fn prepared_operation_payload_for_digest(
+        &self,
+        digest: &DfsPreparedOperationDigest,
+    ) -> Result<Option<Arc<DfsPreparedOperationPayload>>> {
+        self.require_prepared_operation_shard(&digest.file_system_id, &digest.shard_id)?;
+        self.shard_backend(&digest.shard_id)?
+            .prepared_operation_payload_for_digest(digest)
+    }
+
     fn committed_prepared_operation(
         &self,
         digest: &DfsPreparedOperationDigest,

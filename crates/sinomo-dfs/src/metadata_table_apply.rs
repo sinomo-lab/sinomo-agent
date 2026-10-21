@@ -10,7 +10,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use fs2::FileExt;
@@ -37,7 +37,8 @@ use crate::metadata_table_store::{
     rotate_metadata_table_log_for_checkpoint_at_replay_boundary,
 };
 use crate::metadata_tables::{
-    DfsMetadataTableRollback, DfsMetadataTables, MetadataTableSnapshotFingerprint,
+    DfsMetadataTableRollback, DfsMetadataTables, MetadataTableReadSnapshotCache,
+    MetadataTableSnapshotFingerprint,
 };
 
 static METADATA_TABLE_CHECKPOINT_WORKERS: OnceLock<MetadataTableCheckpointWorkerRegistry> =
@@ -200,8 +201,11 @@ impl MetadataTableCheckpointTrigger {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct MetadataTableCheckpointWorkerState {
+    // Reuse the current backend's existing read image. A weak reference owns
+    // neither the backend, DATA custody nor any publication/admission permit.
+    read_snapshot_cache: Option<Weak<Mutex<Option<MetadataTableReadSnapshotCache>>>>,
     revision: u64,
     requested_at: Instant,
     last_activity_at: Instant,
@@ -550,6 +554,7 @@ fn preserve_metadata_table_logical_checkpoint_deadline(
 }
 
 pub(crate) struct TableMaterializationState<'a> {
+    pub(crate) read_snapshot_cache: Option<&'a Arc<Mutex<Option<MetadataTableReadSnapshotCache>>>>,
     pub(crate) tables: &'a mut DfsMetadataTables,
     pub(crate) table_log_offset: &'a mut u64,
 
@@ -647,6 +652,7 @@ pub(crate) fn schedule_metadata_table_checkpoint_if_needed(
     tables: &DfsMetadataTables,
     max_log_bytes: u64,
     table_log_offset: u64,
+    read_snapshot_cache: Option<&Arc<Mutex<Option<MetadataTableReadSnapshotCache>>>>,
 ) -> Result<()> {
     let logical_pressure =
         metadata_table_logical_checkpoint_pressure(table_log_offset, max_log_bytes);
@@ -685,6 +691,9 @@ pub(crate) fn schedule_metadata_table_checkpoint_if_needed(
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some(worker) = workers.get_mut(root) {
+                if let Some(cache) = read_snapshot_cache {
+                    worker.read_snapshot_cache = Some(Arc::downgrade(cache));
+                }
                 worker.revision = worker.revision.saturating_add(1);
                 worker.last_activity_at = Instant::now();
                 worker.has_pending_prepared_operations = has_pending_prepared_operations;
@@ -702,6 +711,9 @@ pub(crate) fn schedule_metadata_table_checkpoint_if_needed(
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(worker) = workers.get_mut(&root) {
+            if let Some(cache) = read_snapshot_cache {
+                worker.read_snapshot_cache = Some(Arc::downgrade(cache));
+            }
             let now = Instant::now();
             let was_physical_checkpoint_required = worker.physical_checkpoint_required;
             worker.revision = worker.revision.saturating_add(1);
@@ -759,6 +771,7 @@ pub(crate) fn schedule_metadata_table_checkpoint_if_needed(
         let initial_physical_checkpoint_required =
             checkpoint_generation_present || physical_checkpoint_required;
         let mut worker = MetadataTableCheckpointWorkerState {
+            read_snapshot_cache: read_snapshot_cache.map(Arc::downgrade),
             revision: 1,
             requested_at,
             last_activity_at: requested_at,
@@ -984,7 +997,7 @@ fn next_metadata_table_checkpoint_worker_request(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     loop {
-        let worker = *workers.get(root)?;
+        let worker = workers.get(root)?;
         if worker.physical_checkpoint_required {
             let now = Instant::now();
             if now >= worker.physical_checkpoint_not_before {
@@ -1614,7 +1627,6 @@ fn run_metadata_table_checkpoint_worker(
     let journal_admission =
         crate::metadata_journal::admission::capture_owned_checkpoint_admission(root)?;
     staged.install(root)?;
-    drop(tables);
     remove_metadata_table_checkpoint_log(root)?;
     advance_activated_handoff_rebind_checkpoint(root, &prefix_proof)?;
     // The installed snapshot and newer table-log suffix are durable before
@@ -1624,6 +1636,54 @@ fn run_metadata_table_checkpoint_worker(
     prune_segmented_journal_before_checkpoint(root, checkpoint_sequence)?;
     if let Some(admission) = journal_admission {
         admission.record_installed(&prefix_proof)?;
+    }
+    // The checkpoint just decoded and validated this image. Hand that same
+    // owned image to the existing reader cache instead of making the next
+    // replica RPC decode the replacement snapshot while holding admission.
+    // Extend through the actual active suffix using the ordinary checked reader;
+    // publication, journal pruning and physical writer custody remain unchanged.
+    let read_snapshot_cache = METADATA_TABLE_CHECKPOINT_WORKERS
+        .get()
+        .and_then(|registry| {
+            registry
+                .workers
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .get(root)
+                .and_then(|worker| worker.read_snapshot_cache.as_ref())
+                .and_then(Weak::upgrade)
+        });
+    if let Some(cache) = read_snapshot_cache {
+        let mut tables = tables;
+        let mut offset = 0;
+        let mut sequence = checkpoint_sequence;
+        let mut fingerprint = metadata_table_snapshot_fingerprint(root)?;
+        let mut prefix = Some(prefix_proof.clone());
+        crate::metadata_read_snapshot::refresh_metadata_tables(
+            root,
+            &mut tables,
+            &mut offset,
+            &mut sequence,
+            &mut fingerprint,
+            &mut prefix,
+        )?;
+        let generation = crate::metadata_table_store::metadata_table_storage_generation(root)?;
+        if let Ok(mut cached) = cache.lock() {
+            *cached = Some(MetadataTableReadSnapshotCache {
+                storage_generation: Some(generation),
+                snapshot_fingerprint: fingerprint,
+                checkpoint_fingerprint: None,
+                table_log_offset: offset,
+                materialized_through_sequence: Some(sequence),
+                snapshot_format_version: Some(
+                    crate::metadata_table_store::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
+                ),
+                prefix_proof: prefix,
+                tables: Arc::new(tables),
+            });
+        }
+    } else {
+        drop(tables);
     }
     let publish_ms = publish_started.elapsed().as_millis();
     Ok(MetadataTableCheckpointRun {
@@ -1939,6 +1999,7 @@ fn append_table_batch(
         state.tables,
         max_log_bytes,
         *state.table_log_offset,
+        state.read_snapshot_cache,
     )
 }
 
@@ -2122,6 +2183,7 @@ mod tests {
         max_log_bytes: u64,
     ) -> MetadataTableCheckpointWorkerState {
         let mut worker = MetadataTableCheckpointWorkerState {
+            read_snapshot_cache: None,
             revision: 1,
             requested_at,
             last_activity_at: requested_at,
@@ -2199,7 +2261,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(root.path())
-            .copied()
+            .cloned()
             .expect("newer append request remains registered");
         assert_eq!(worker.revision, appended_revision);
         assert_eq!(worker.replay_cost_bytes, 301);
@@ -2739,6 +2801,7 @@ mod tests {
         append_and_apply_table_ops(
             root.path(),
             TableMaterializationState {
+                read_snapshot_cache: None,
                 tables: &mut tables,
                 table_log_offset: &mut table_log_offset,
 
@@ -2900,6 +2963,7 @@ mod tests {
             .insert(
                 root.path().to_path_buf(),
                 MetadataTableCheckpointWorkerState {
+                    read_snapshot_cache: None,
                     revision: 1,
                     requested_at,
                     last_activity_at: requested_at,
@@ -2953,6 +3017,7 @@ mod tests {
         append_and_apply_table_ops(
             root.path(),
             TableMaterializationState {
+                read_snapshot_cache: None,
                 tables: &mut tables,
                 table_log_offset: &mut table_log_offset,
 
@@ -2974,7 +3039,7 @@ mod tests {
             .get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        schedule_metadata_table_checkpoint_if_needed(root.path(), &tables, u64::MAX, 0)
+        schedule_metadata_table_checkpoint_if_needed(root.path(), &tables, u64::MAX, 0, None)
             .expect("schedule crash-resumed checkpoint");
         let registry = METADATA_TABLE_CHECKPOINT_WORKERS
             .get()
@@ -3028,6 +3093,7 @@ mod tests {
         let error = append_table_batch(
             root.path(),
             TableMaterializationState {
+                read_snapshot_cache: None,
                 tables: &mut tables,
                 table_log_offset: &mut table_log_offset,
 
@@ -3068,6 +3134,7 @@ mod tests {
         let error = append_preapplied_table_ops(
             root.path(),
             TableMaterializationState {
+                read_snapshot_cache: None,
                 tables: &mut tables,
                 table_log_offset: &mut table_log_offset,
 
@@ -3113,6 +3180,7 @@ mod tests {
         append_preapplied_table_ops(
             &blocked_root,
             TableMaterializationState {
+                read_snapshot_cache: None,
                 tables: &mut tables,
                 table_log_offset: &mut table_log_offset,
 
@@ -3148,6 +3216,7 @@ mod tests {
         append_and_apply_table_ops(
             root.path(),
             TableMaterializationState {
+                read_snapshot_cache: None,
                 tables: &mut tables,
                 table_log_offset: &mut table_log_offset,
 
@@ -3207,6 +3276,7 @@ mod tests {
         append_and_apply_table_ops(
             root.path(),
             TableMaterializationState {
+                read_snapshot_cache: None,
                 tables: &mut tables,
                 table_log_offset: &mut table_log_offset,
 
@@ -3312,6 +3382,7 @@ mod tests {
             append_and_apply_table_ops(
                 root,
                 TableMaterializationState {
+                    read_snapshot_cache: None,
                     tables: &mut tables,
                     table_log_offset: &mut table_log_offset,
 
@@ -3349,6 +3420,7 @@ mod tests {
             &first_tables,
             first_offset.saturating_sub(1),
             first_offset,
+            None,
         )
         .expect("schedule physical fold");
         schedule_metadata_table_checkpoint_if_needed(
@@ -3358,6 +3430,7 @@ mod tests {
             // genuine pressure instead of an obsolete inflated replay price.
             second_offset.saturating_sub(1),
             second_offset,
+            None,
         )
         .expect("schedule second physical fold");
         let registry = METADATA_TABLE_CHECKPOINT_WORKERS
@@ -3401,6 +3474,7 @@ mod tests {
         append_and_apply_table_ops(
             root.path(),
             TableMaterializationState {
+                read_snapshot_cache: None,
                 tables: &mut tables,
                 table_log_offset: &mut table_log_offset,
 
@@ -3430,6 +3504,7 @@ mod tests {
         append_and_apply_table_ops(
             root.path(),
             TableMaterializationState {
+                read_snapshot_cache: None,
                 tables: &mut tables,
                 table_log_offset: &mut table_log_offset,
 
