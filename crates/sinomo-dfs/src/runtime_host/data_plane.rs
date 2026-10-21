@@ -122,13 +122,11 @@ where
         });
     }
     let mut metadata_authority_preflight =
-        warm_daemon_dfs_metadata_authority_for_peer_snapshot_before(
+        warm_daemon_dfs_replica_authority_for_peer_snapshot_before(
             &cluster_paths,
             &peer_snapshot,
             runtime,
             peer_deadline,
-            #[cfg(test)]
-            None,
         )
         .await?;
     let file_system_id = expected_context.shard.file_system_id.clone();
@@ -265,10 +263,13 @@ where
                 )?;
             }
             metadata_authority_preflight =
-                warm_daemon_dfs_metadata_authority_for_peer_snapshot_async(
+                warm_daemon_dfs_metadata_authority_for_peer_snapshot_before(
                     &cluster_paths,
                     &peer_snapshot,
                     runtime,
+                    peer_deadline,
+                    #[cfg(test)]
+                    None,
                 )
                 .await?;
             let projection = metadata_authority_preflight
@@ -411,10 +412,13 @@ where
                         stale,
                     )?;
                     metadata_authority_preflight =
-                        warm_daemon_dfs_metadata_authority_for_peer_snapshot_async(
+                        warm_daemon_dfs_metadata_authority_for_peer_snapshot_before(
                             &cluster_paths,
                             &peer_snapshot,
                             runtime,
+                            peer_deadline,
+                            #[cfg(test)]
+                            None,
                         )
                         .await?;
                     continue;
@@ -838,13 +842,11 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
             else {
                 return Ok(None);
             };
-            let preflight = warm_daemon_dfs_metadata_authority_for_peer_snapshot_before(
+            let preflight = warm_daemon_dfs_replica_authority_for_peer_snapshot_before(
                 &cluster_paths,
                 &peer_snapshot,
                 &runtime,
                 peer_deadline,
-                #[cfg(test)]
-                None,
             )
             .await
             .map_err(|source| DfsDataPlaneHostError::new(source.to_string()))?;

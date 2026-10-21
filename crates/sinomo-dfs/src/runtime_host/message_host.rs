@@ -2143,6 +2143,22 @@ pub(crate) async fn warm_daemon_dfs_metadata_authority_before_deadline(
     deadline: tokio::time::Instant,
     #[cfg(test)] native_read_observer: Option<&(dyn Fn(&'static str) + Send + Sync)>,
 ) -> Result<DaemonDfsMetadataAuthorityPreflight, sinomo_dfs::DfsError> {
+    warm_daemon_dfs_metadata_projection_before_deadline(
+        authority_generation,
+        deadline,
+        true,
+        #[cfg(test)]
+        native_read_observer,
+    )
+    .await
+}
+
+async fn warm_daemon_dfs_metadata_projection_before_deadline(
+    authority_generation: Arc<DaemonDfsMetadataAuthorityGeneration>,
+    deadline: tokio::time::Instant,
+    require_write_configuration: bool,
+    #[cfg(test)] native_read_observer: Option<&(dyn Fn(&'static str) + Send + Sync)>,
+) -> Result<DaemonDfsMetadataAuthorityPreflight, sinomo_dfs::DfsError> {
     let timeout_authority = Arc::clone(&authority_generation);
     let expected_generation = authority_generation.generation();
     tokio::time::timeout_at(deadline, async move {
@@ -2153,7 +2169,7 @@ pub(crate) async fn warm_daemon_dfs_metadata_authority_before_deadline(
     #[cfg(test)] native_read_observer,
 )
             .await;
-        if proof.is_some() {
+        if proof.is_some() && require_write_configuration {
             // The shared refresh publishes its filesystem prefix before the
             // complete configuration bundle. Join that same owner before
             // handing a supposedly ready service to synchronous execution.
@@ -2183,6 +2199,32 @@ pub(crate) async fn warm_daemon_dfs_metadata_authority_before_deadline(
                 message: format!("DFS metadata authority preflight projection deadline elapsed (expected_generation={expected_generation} current_generation={current_generation} current_ready={current_ready})"),
         }
     })?
+}
+
+/// Replica ingestion consumes the exact current filesystem/shard proof, not
+/// placement-provider configuration used to author new writes. Its existing
+/// physical-store/context checks remain mandatory. Cold initialization still
+/// uses the general retained-authority check and full preflight on typed retry.
+pub(super) async fn warm_daemon_dfs_replica_authority_for_peer_snapshot_before(
+    cluster_paths: &ClusterPaths,
+    peer_snapshot: &DaemonDfsMessagePeerSnapshot,
+    runtime: &tokio::runtime::Handle,
+    deadline: tokio::time::Instant,
+) -> Result<DaemonDfsMetadataAuthorityPreflight, sinomo_dfs::DfsError> {
+    let authority = daemon_dfs_metadata_authority_generation_for_identity(
+        cluster_paths,
+        &peer_snapshot.cluster_id,
+        &peer_snapshot.local_node_id,
+        Some(runtime),
+    )?;
+    warm_daemon_dfs_metadata_projection_before_deadline(
+        authority,
+        deadline,
+        false,
+        #[cfg(test)]
+        None,
+    )
+    .await
 }
 
 pub(crate) async fn warm_daemon_dfs_metadata_authority_for_peer_snapshot_async(

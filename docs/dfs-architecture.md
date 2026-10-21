@@ -188,6 +188,14 @@ leaves the operation pending or unavailable. Content receipt threshold `W`
 cannot substitute for metadata evidence, and cluster KV cannot mint a
 metadata recovery permit.
 
+Replica ingestion uses the complete current filesystem/shard proof and the
+exact resident store's physical generation. It does not join an unrelated
+writer-configuration rebuild before acknowledging the same validated prepare.
+This grants no authoring authority: ordinary writes and cold resident
+initialization still require the full configuration view. A cold or changed
+context releases admission before joining that existing refresh owner, within
+the original deadline and retry bound.
+
 KV access on DFS operation paths is explicit. Namespace routing and policy reads
 reuse the existing retained configuration projections; peer routing and connection
 health remain owned by the network layer. Current protocol support is checked
