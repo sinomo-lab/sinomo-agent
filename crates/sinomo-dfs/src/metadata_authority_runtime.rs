@@ -906,11 +906,36 @@ impl DfsMetadataAuthorityRuntime {
         self: &Arc<Self>,
         #[cfg(test)] pending_observer: Option<&(dyn Fn() + Send + Sync)>,
     ) -> Result<(), DfsError> {
+        self.ready_write_configuration_with_pending_observer(
+            #[cfg(test)]
+            pending_observer,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Return the very cut whose native floor passed readiness. Borrowing it
+    /// again after this wait would race a later publication/refresh transition.
+    /// This immutable configuration is read input, not publication authority.
+    pub(crate) async fn ready_write_configuration_projection_async(
+        self: &Arc<Self>,
+    ) -> Result<Option<Arc<crate::DfsWriteConfigurationProjection>>, DfsError> {
+        self.ready_write_configuration_with_pending_observer(
+            #[cfg(test)]
+            None,
+        )
+        .await
+    }
+
+    async fn ready_write_configuration_with_pending_observer(
+        self: &Arc<Self>,
+        #[cfg(test)] pending_observer: Option<&(dyn Fn() + Send + Sync)>,
+    ) -> Result<Option<Arc<crate::DfsWriteConfigurationProjection>>, DfsError> {
         let mut completion = self.refresh_completion.subscribe();
         let mut joined_owner = false;
         loop {
             let error = match self.read_write_configuration() {
-                Ok(_) => return Ok(()),
+                Ok(view) => return Ok(view),
                 Err(DfsWriteConfigurationReadError::Pending(error)) => error,
                 Err(DfsWriteConfigurationReadError::Unavailable(error)) => return Err(error),
             };
@@ -952,7 +977,7 @@ impl DfsMetadataAuthorityRuntime {
                 self.request_authoritative_refresh();
                 if !self.refresh_in_flight.load(Ordering::Acquire) {
                     // A promptly completed owner may publish before this load.
-                    return self.write_configuration_projection().map(|_| ());
+                    return self.write_configuration_projection();
                 }
             }
             if completion.changed().await.is_err() {
