@@ -8266,10 +8266,12 @@ fn native_browser_fresh_repair_custody_reaches_n2_after_healing() {
     assert_eq!(observation.omitted_kv_event_count, 0);
     let mut continue_owner = matches!(
         &observation.outcome,
-        Ok(crate::DfsMaintenanceTickOutcome::Completed {
-            reached_limit: true
-        })
+        Ok(crate::DfsMaintenanceTickOutcome::Continued
+            | crate::DfsMaintenanceTickOutcome::Completed { reached_limit: true })
     );
+    let mut retained_continuations = usize::from(matches!(
+        &observation.outcome, Ok(crate::DfsMaintenanceTickOutcome::Continued)
+    ));
     let mut continuation_passes = 0;
     // The ordinary tick checkpoints custody before its detached carrier runs.
     // Its exact terminal record can remain until ordinary queue retirement.
@@ -8360,11 +8362,13 @@ fn native_browser_fresh_repair_custody_reaches_n2_after_healing() {
             );
             assert_eq!(continued.omitted_kv_event_count, 0);
             continuation_passes += 1;
+            retained_continuations += usize::from(matches!(
+                &continued.outcome, Ok(crate::DfsMaintenanceTickOutcome::Continued)
+            ));
             continue_owner = matches!(
                 &continued.outcome,
-                Ok(crate::DfsMaintenanceTickOutcome::Completed {
-                    reached_limit: true
-                })
+                Ok(crate::DfsMaintenanceTickOutcome::Continued
+                    | crate::DfsMaintenanceTickOutcome::Completed { reached_limit: true })
             );
         }
         std::thread::yield_now();
@@ -8416,7 +8420,8 @@ fn native_browser_fresh_repair_custody_reaches_n2_after_healing() {
         "the same completion window includes close"
     );
     eprintln!(
-        "native Browser repair completed with {continuation_passes} declared continuation passes inside the original five-second window"
+        "native Browser repair completed with {continuation_passes} declared continuation passes ({retained_continuations} retained Continued outcomes; first={:?}) inside the original five-second window",
+        observation.outcome,
     );
 }
 

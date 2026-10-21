@@ -2713,7 +2713,20 @@ fn replica_stage_and_commit_do_not_append_authoritative_metadata() {
 
 #[test]
 fn commit_version_rejects_manifest_without_content_bytes() {
-    let name = "native-commit-rejects-lost-actual-bytes";
+    native_missing_commit_content_case(false);
+}
+
+#[test]
+fn rejected_commit_observes_the_real_publication_after_delayed_replica_materialization() {
+    native_missing_commit_content_case(true);
+}
+
+fn native_missing_commit_content_case(delay_materialization: bool) {
+    let name = if delay_materialization {
+        "native-commit-rejects-lost-bytes-after-delayed-replay"
+    } else {
+        "native-commit-rejects-lost-actual-bytes"
+    };
     let (mut runtime, initial, config) =
         crate::test_support::current_native_metadata_service(name, 2, "/services").unwrap();
     let owner = config.primary_node_id;
@@ -2753,6 +2766,13 @@ fn commit_version_rejects_manifest_without_content_bytes() {
     };
     let mut policy = DfsReplicationPolicy::new(2, 2).unwrap();
     policy.required_node_ids = nodes.clone();
+    let shard = DfsMetadataShardId::new("services");
+    let paused = delay_materialization.then(|| {
+        runtime
+            .pause_replica_materialization(&replica, &shard)
+            .unwrap()
+    });
+    let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
     let outcome = writer
         .write_distributed_reader_with_candidates(
             request.clone(),
@@ -2776,6 +2796,129 @@ fn commit_version_rejects_manifest_without_content_bytes() {
         writer.write_outcome(&intent_id).unwrap(),
         NetworkedDfsWriteOutcome::Committed { .. }
     ));
+    let committed = writer
+        .metadata_backend()
+        .unwrap()
+        .prepared_operation_record(&format!("write:{intent_id}"))
+        .unwrap()
+        .unwrap();
+    committed.validate().unwrap();
+    let published_sequence = committed.committed_entry.as_ref().unwrap().sequence;
+    let mut delayed_view = None;
+    if paused.is_some() {
+        let observed = crate::runtime_host::materialization_test::observe_existing_materialization(
+            runtime.data_dir(&replica), &request.file_system_id, &shard, &runtime.runtime_handle(),
+        ).unwrap().expect("actual pre-publication replica");
+        assert!(observed.durable_sequence.unwrap() < published_sequence, "the controlled original commit has not been sent yet: {observed:?}");
+        let target = runtime.client(&replica).unwrap();
+        let old = target.metadata_backend().unwrap().get_object(&request.object_id).unwrap().unwrap();
+        assert_ne!(old.version, version, "the primary committed while this actual replica still has the earlier cut");
+        delayed_view = Some(serde_json::json!({"object": old, "before_original_publication": format!("{observed:?}")}));
+    }
+    // Settle the actual primary's already committed journal through the normal
+    // authenticated replica route. The queued negative CommitVersion remains
+    // untouched; no new logical mutation or replacement write identity is made.
+    let backend = writer.metadata_backend().unwrap();
+    let batch = backend
+        .journal_batch_for_shard_since_limited(
+            &shard,
+            0,
+            crate::DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
+            crate::DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT,
+        )
+        .unwrap()
+        .unwrap();
+    assert!(batch.next_after_sequence >= published_sequence);
+    let publication = crate::metadata_replication::dfs_metadata_durable_journal_batch_command(
+        &owner,
+        &replica,
+        &request.file_system_id,
+        committed.digest.owner_epoch,
+        crate::metadata_replication::prepare_dfs_metadata_journal_frame_batch(backend, &batch)
+            .unwrap(),
+        false,
+    );
+    let response: crate::DfsMetadataJournalBatchResponse = runtime
+        .rpc_request(
+            &owner,
+            &replica,
+            sinomo_core::network::ObjectRpcRequest::encode_body(
+                "/dfs/metadata/journal-batch",
+                crate::DFS_RPC_CATEGORY,
+                &publication,
+            )
+            .unwrap(),
+            deadline.saturating_duration_since(Instant::now()),
+        )
+        .unwrap()
+        .decode_body()
+        .unwrap();
+    assert_eq!(
+        response.result,
+        crate::DfsMetadataJournalBatchResult::Applied
+    );
+    assert_eq!(response.request_id, publication.request_id);
+    assert_eq!(response.next_after_sequence, batch.next_after_sequence);
+    std::fs::write(
+        runtime
+            .data_dir(&owner)
+            .root()
+            .join("boundary-diagnostic-negative-commit-publication.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "original_prepare": committed.digest,
+            "original_commit_sequence": published_sequence,
+            "normal_replica_publication": publication,
+            "actual_response": response,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    if let Some(pause) = paused {
+        // Hold only the ordinary scheduled materializer, before admission.
+        // Actual ingress must durably receive the original commit; no ACK,
+        // current view or replacement authority is supplied by this control.
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "original commit did not reach its actual replica"
+            );
+            if let Some(observed) =
+                crate::runtime_host::materialization_test::observe_existing_materialization(
+                    runtime.data_dir(&replica),
+                    &request.file_system_id,
+                    &shard,
+                    &runtime.runtime_handle(),
+                )
+                .unwrap()
+                && observed.durable_sequence.unwrap() >= published_sequence
+            {
+                assert!(
+                    observed.materialized_sequence.unwrap() < published_sequence,
+                    "controlled materializer must still be pending: {observed:?}"
+                );
+                delayed_view.as_mut().unwrap()["after_original_publication"] =
+                    serde_json::json!(format!("{observed:?}"));
+                break;
+            }
+            std::thread::yield_now();
+        }
+        pause.release();
+        drop(pause);
+    }
+    // W2 commits the primary journal before the queued CommitVersion RPC.
+    // Observe that SAME original commit's actual replica materialization before
+    // capturing a negative operation's precondition. This never ingests a
+    // journal through the caller or gives the rejected command publication credit.
+    let ready = crate::runtime_host::materialization_test::wait_for_existing_materialization(
+        runtime.data_dir(&replica),
+        &request.file_system_id,
+        &shard,
+        &runtime.runtime_handle(),
+        published_sequence,
+        deadline,
+        |_| {},
+    )
+    .unwrap();
     let target = runtime.client(&replica).unwrap();
     let before = target
         .metadata_backend()
@@ -2783,6 +2926,17 @@ fn commit_version_rejects_manifest_without_content_bytes() {
         .get_object(&request.object_id)
         .unwrap()
         .unwrap();
+    assert_eq!(before.version, version);
+    std::fs::write(
+        runtime.data_dir(&replica).root().join("boundary-diagnostic-negative-commit-readiness.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "original_intent": intent_id, "original_prepare": committed.digest,
+            "original_commit_sequence": published_sequence,
+            "delayed_view_before_any_negative_command": delayed_view,
+            "ready": format!("{ready:?}"), "before_rejected_command": before,
+            "qualification": "Actual original metadata publication completes before content removal and the negative CommitVersion. Original rejection and unchanged-view assertions follow."
+        })).unwrap(),
+    ).unwrap();
     let manifest = target
         .content()
         .read_manifest(request.object_id.as_str(), version.as_str())
