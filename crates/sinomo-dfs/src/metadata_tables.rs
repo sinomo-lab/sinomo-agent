@@ -398,7 +398,11 @@ pub(crate) struct MetadataTableReadSnapshotCache {
 
 pub(crate) enum DfsMetadataTablesSnapshot<'a> {
     Borrowed(&'a DfsMetadataTables),
-    Shared(Arc<DfsMetadataTables>),
+    Shared {
+        tables: Arc<DfsMetadataTables>,
+        prefix_proof: Option<DfsMetadataPrefixProof>,
+        materialized_through_sequence: Option<u64>,
+    },
 }
 
 impl Deref for DfsMetadataTablesSnapshot<'_> {
@@ -407,7 +411,7 @@ impl Deref for DfsMetadataTablesSnapshot<'_> {
     fn deref(&self) -> &Self::Target {
         match self {
             Self::Borrowed(tables) => tables,
-            Self::Shared(tables) => tables,
+            Self::Shared { tables, .. } => tables,
         }
     }
 }
