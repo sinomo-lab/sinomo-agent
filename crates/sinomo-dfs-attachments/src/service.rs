@@ -577,6 +577,49 @@ fn namespace_subscription() -> sinomo_module::ComponentEventSubscription {
         DFS_EVENT_SCHEMA_VERSION,
     )
 }
+// Both foreground feature routes and this background borrower use the same
+// resident core browser. Keep the feature and component custody in the work.
+async fn run_attachment_cleanup_pass(
+    data: Arc<SinomoDataDir>,
+    runtime: tokio::runtime::Handle,
+    operation_owner: Arc<dyn Send + Sync>,
+    permit: crate::attachment_admission::AttachmentPermit,
+) -> Result<DfsAttachmentMaintenanceReport, ServiceError> {
+    run_blocking_browser_task(
+        Arc::clone(&data),
+        "attachment-cleanup",
+        "attachment cleanup",
+        move || {
+            let _owner = operation_owner;
+            let _permit = permit;
+            let backend = DfsBrowserBackend::for_component_data_dir(Arc::clone(&data), &runtime)?;
+            backend.with_mutation_service(|service| {
+                #[cfg(test)]
+                cleanup_admission_tests::pause_if_registered(&data);
+                let shards = service
+                    .metadata_authorities(&sifs_file_system_id())
+                    .map_err(dfs_browser_service_error)?;
+                if service.is_distributed()
+                    && !shards
+                        .iter()
+                        .any(|shard| &shard.primary_node_id == service.node_id())
+                {
+                    crate::attachment_maintenance::defer_without_authority(&data);
+                    return Ok(DfsAttachmentMaintenanceReport::default());
+                }
+                service
+                    .maintain_file_attachments_bounded(
+                        &crate::attachment_maintenance::checkpoint_path(&data),
+                        &shards,
+                        8,
+                    )
+                    .map_err(dfs_browser_service_error)
+            })
+        },
+    )
+    .await
+}
+
 fn mount_attachment_maintenance(
     scope: &mut sinomo_module::ComponentScope,
     data_dir: Arc<SinomoDataDir>,
@@ -608,19 +651,7 @@ fn mount_attachment_maintenance(
                     let operation_owner = host.operation_guard()?.ok_or_else(|| dfs_browser_service_error("DFS owner unavailable"))?;
                     let limits = attachment_work_limits(Arc::clone(&data), runtime.clone(), Arc::clone(&host), "maintenance".into()).await?;
                     let permit = feature_runtime.admission.acquire("maintenance".into(), "attachment-cleanup".into(), 0, &limits).await.map_err(dfs_browser_service_error)?;
-                    run_blocking_service_task("attachment-cleanup", "attachment cleanup", move || {
-                        let _owner = operation_owner;
-                        let _permit = permit;
-                        let backend = DfsBrowserBackend::for_component_data_dir(Arc::clone(&data), &runtime)?;
-                        backend.with_mutation_service(|service| {
-                            let shards = service.metadata_authorities(&sifs_file_system_id()).map_err(dfs_browser_service_error)?;
-                            if service.is_distributed() && !shards.iter().any(|shard| &shard.primary_node_id == service.node_id()) {
-                                crate::attachment_maintenance::defer_without_authority(&data);
-                                return Ok(DfsAttachmentMaintenanceReport::default());
-                            }
-                            service.maintain_file_attachments_bounded(&crate::attachment_maintenance::checkpoint_path(&data), &shards, 8).map_err(dfs_browser_service_error)
-                        })
-                    }).await
+                    run_attachment_cleanup_pass(data, runtime, operation_owner, permit).await
                 };
                 tokio::select! {
                     _ = shutdown.changed() => break,
@@ -698,5 +729,175 @@ mod attachment_identity_tests {
             attachment_actor(&context, true).unwrap(),
             "component:example.extractor"
         );
+    }
+}
+
+#[cfg(test)]
+mod cleanup_admission_tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::{Mutex, OnceLock, mpsc};
+
+    struct Pause {
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: mpsc::Receiver<()>,
+    }
+    static PAUSES: OnceLock<Mutex<HashMap<PathBuf, Pause>>> = OnceLock::new();
+
+    pub(super) fn pause_if_registered(data: &SinomoDataDir) {
+        let pause = PAUSES
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .remove(&data.root());
+        if let Some(pause) = pause {
+            // This barrier only delays the actual native borrower. It supplies
+            // no data, authority, readiness or successful operation result.
+            pause.entered.send(()).unwrap();
+            pause.release.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+    }
+
+    #[test]
+    fn native_cleanup_shares_browser_admission_through_caller_cancellation() {
+        let root = sinomo_testdir::TestDir::new("attachment-cleanup-browser-admission");
+        let data = Arc::new(SinomoDataDir::new(root.path()));
+        let (native, node) =
+            sinomo_dfs::test_support::DfsTestRuntime::start_single_node_in_data_dir(
+                "attachment-cleanup-browser-admission",
+                (*data).clone(),
+            )
+            .unwrap();
+        let runtime = native.runtime_handle();
+        let host = dfs_browser_component_host(&data).unwrap();
+        let backend = DfsBrowserBackend::for_component_data_dir(data.clone(), &runtime).unwrap();
+        backend
+            .with_mutation_service(|service| {
+                service
+                    .posix_write_file(
+                        "/cleanup-admission.txt",
+                        b"original committed bytes",
+                        DfsWriteOptions::replicated_eventual(vec![node.clone()]),
+                    )
+                    .map_err(dfs_browser_service_error)
+            })
+            .unwrap();
+        let admission = Arc::new(crate::attachment_admission::AttachmentAdmission::default());
+        let results = runtime.block_on(async {
+            let mut results = Vec::new();
+            for cancel_waiter in [false, true] {
+                let (entered, seen) = tokio::sync::oneshot::channel();
+                let (release, released) = mpsc::channel();
+                assert!(
+                    PAUSES
+                        .get_or_init(Default::default)
+                        .lock()
+                        .unwrap()
+                        .insert(
+                            data.root(),
+                            Pause {
+                                entered,
+                                release: released
+                            }
+                        )
+                        .is_none()
+                );
+                let owner = host.operation_guard().unwrap().unwrap();
+                let permit = admission
+                    .acquire(
+                        "maintenance".into(),
+                        "attachment-cleanup".into(),
+                        0,
+                        &crate::attachment_admission::AttachmentWorkLimits::default(),
+                    )
+                    .await
+                    .unwrap();
+                let cleanup = tokio::spawn(run_attachment_cleanup_pass(
+                    data.clone(),
+                    runtime.clone(),
+                    owner,
+                    permit,
+                ));
+                tokio::time::timeout(Duration::from_secs(5), seen)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if cancel_waiter {
+                    cleanup.abort();
+                }
+                // Direct callers keep the existing 100-ms fail-closed bound.
+                let direct = backend.clone();
+                let rejected =
+                    tokio::task::spawn_blocking(move || direct.with_read_service(|_| Ok(())))
+                        .await
+                        .unwrap()
+                        .unwrap_err();
+                assert!(
+                    rejected.to_string().contains("busy after waiting 100ms"),
+                    "{rejected}"
+                );
+                let reader = backend.clone();
+                let mut queued = tokio::spawn(run_blocking_browser_task(
+                    data.clone(),
+                    "test-hosted-read",
+                    "native queued read",
+                    move || {
+                        reader.with_read_service(|service| {
+                            service
+                                .posix_read_file_distributed("/cleanup-admission.txt")
+                                .map_err(dfs_browser_service_error)
+                        })
+                    },
+                ));
+                let observed = tokio::time::timeout(Duration::from_millis(150), &mut queued).await;
+                let was_queued = observed.is_err();
+                release.send(()).unwrap();
+                let bytes = match observed {
+                    Ok(result) => result.unwrap(),
+                    Err(_) => tokio::time::timeout(Duration::from_secs(5), queued)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                };
+                let finished = cleanup.await;
+                if cancel_waiter {
+                    assert!(finished.unwrap_err().is_cancelled());
+                } else {
+                    finished.unwrap().unwrap();
+                }
+                // Reacquiring the same producer identity proves its original
+                // permit drained even when the async waiter was cancelled.
+                let drained = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    admission.acquire(
+                        "maintenance".into(),
+                        "attachment-cleanup".into(),
+                        0,
+                        &crate::attachment_admission::AttachmentWorkLimits::default(),
+                    ),
+                )
+                .await
+                .unwrap();
+                drop(drained.unwrap());
+                results.push((cancel_waiter, was_queued, bytes));
+                // Drain the first failed control before reporting it; a later
+                // cancellation cannot clarify an already rejected read.
+                if !was_queued {
+                    break;
+                }
+            }
+            results
+        });
+        drop(backend);
+        drop(host);
+        native.close().unwrap();
+        for (cancelled, was_queued, bytes) in results {
+            assert!(
+                was_queued,
+                "hosted read bypassed cleanup custody (cancelled={cancelled}): {bytes:?}"
+            );
+            assert_eq!(bytes.unwrap(), b"original committed bytes");
+        }
     }
 }
