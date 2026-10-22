@@ -769,6 +769,7 @@ pub(crate) fn plan_replicas_with_placement_snapshot(
         snapshot,
         current_replica_node_ids,
         pinned_replica_node_ids,
+        OffsetDateTime::now_utc(),
     )
     .map(|selected| selected.plan)
 }
@@ -778,10 +779,10 @@ fn select_snapshot_replicas<'a>(
     snapshot: &DfsPlacementSnapshot,
     current_replica_node_ids: &'a [NodeId],
     pinned_replica_node_ids: &'a [NodeId],
+    now: OffsetDateTime,
 ) -> Result<SnapshotReplicaPlan<'a>, DfsDistributedError> {
     request.policy.validate()?;
     crate::distributed::validate_candidate_set(&request.candidates, &request.policy)?;
-    let now = OffsetDateTime::now_utc();
     let current = current_replica_node_ids.iter().collect::<BTreeSet<_>>();
     let pinned = pinned_replica_node_ids.iter().collect::<BTreeSet<_>>();
     let mut eligible = request
@@ -913,6 +914,24 @@ pub fn explain_replicas_with_placement_snapshot(
     current_replica_node_ids: &[NodeId],
     pinned_replica_node_ids: &[NodeId],
 ) -> Result<DfsReplicaPlacementExplanation, DfsDistributedError> {
+    explain_replicas_with_placement_snapshot_at(
+        request,
+        snapshot,
+        current_replica_node_ids,
+        pinned_replica_node_ids,
+        OffsetDateTime::now_utc(),
+    )
+}
+
+/// Evaluate one already captured planning cut. Callers still own all current
+/// policy, pin, publication and physical storage checks; telemetry is not authority.
+pub(crate) fn explain_replicas_with_placement_snapshot_at(
+    request: &DfsReplicaPlacementRequest,
+    snapshot: &DfsPlacementSnapshot,
+    current_replica_node_ids: &[NodeId],
+    pinned_replica_node_ids: &[NodeId],
+    now: OffsetDateTime,
+) -> Result<DfsReplicaPlacementExplanation, DfsDistributedError> {
     let SnapshotReplicaPlan {
         plan,
         represented_zone_count,
@@ -924,6 +943,7 @@ pub fn explain_replicas_with_placement_snapshot(
         snapshot,
         current_replica_node_ids,
         pinned_replica_node_ids,
+        now,
     )?;
     let decisions = request
         .candidates

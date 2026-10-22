@@ -1389,6 +1389,7 @@ fn analyze_object_placement(
             &resolved.policy.consistency,
             snapshot,
             pinned_node_ids,
+            time::OffsetDateTime::now_utc(),
         )?
     } else {
         explain_replicas_best_effort(&request)?
@@ -3644,6 +3645,13 @@ fn reconciliation_placement_for_object_with_pins(
         &resolved.policy.consistency,
         job.placement_snapshot.as_ref(),
         pinned_node_ids,
+        // The accepted job and its captured telemetry define one plan. Aging
+        // those same observations during retry used to change the target set
+        // of an already committed, immutable placement intent.
+        time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(job.created_at_unix_nanos))
+            .map_err(|error| DfsError::Metadata {
+                message: format!("invalid placement job creation timestamp: {error}"),
+            })?,
     )
     .map_err(placement_reconciliation_policy_error)?;
     Ok((resolved, replication, placement))
@@ -3655,6 +3663,7 @@ fn explain_object_placement(
     consistency: &DfsObjectPolicy,
     snapshot: Option<&crate::DfsPlacementSnapshot>,
     pinned_node_ids: &[NodeId],
+    planning_time: time::OffsetDateTime,
 ) -> Result<DfsReplicaPlacementExplanation, DfsDistributedError> {
     if matches!(
         consistency,
@@ -3679,12 +3688,15 @@ fn explain_object_placement(
         });
     }
     match snapshot {
-        Some(snapshot) => explain_replicas_with_placement_snapshot(
-            request,
-            snapshot,
-            &object.current_locations,
-            pinned_node_ids,
-        ),
+        Some(snapshot) => {
+            crate::placement_environment::explain_replicas_with_placement_snapshot_at(
+                request,
+                snapshot,
+                &object.current_locations,
+                pinned_node_ids,
+                planning_time,
+            )
+        }
         None => explain_replicas(request),
     }
 }
@@ -5188,6 +5200,104 @@ mod tests {
             created_by_event_id: None,
             last_modified_by_event_id: None,
         }
+    }
+
+    #[test]
+    fn accepted_placement_keeps_its_snapshot_cut_after_path_evidence_expires() {
+        let accepted_at = time::OffsetDateTime::now_utc() - time::Duration::hours(1);
+        let candidates = vec![
+            advertisement("node-a", "east"),
+            advertisement("node-b", "east"),
+            advertisement("node-c", "east"),
+        ];
+        let config = placement_config_with_override(
+            &placement_config(node("node-a")),
+            "/services",
+            DfsPlacementScope::Subtree,
+            Some(DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 2).unwrap()),
+        )
+        .unwrap();
+        let object = placement_object(
+            "accepted-snapshot-cut",
+            "/services/accepted.bin",
+            DfsObjectKind::File,
+            node("node-c"),
+            vec![node("node-c")],
+            Some(4096),
+        );
+        let snapshot = crate::DfsPlacementSnapshot {
+            schema_version: crate::DFS_PLACEMENT_SNAPSHOT_SCHEMA_VERSION,
+            generation: 3,
+            primary_node_id: node("node-a"),
+            observed_at: accepted_at,
+            expires_at: accepted_at + time::Duration::minutes(5),
+            nodes: Vec::new(),
+            paths: [
+                ("node-b", crate::DfsPlacementPathState::Healthy),
+                ("node-c", crate::DfsPlacementPathState::Degraded),
+            ]
+            .into_iter()
+            .map(|(target, state)| crate::DfsPlacementPathObservation {
+                source_node_id: node("node-a"),
+                target_node_id: node(target),
+                state,
+                latency_micros: None,
+                delivered_bytes_per_second: None,
+                metering: crate::DfsNetworkMetering::Unknown,
+                observed_at: accepted_at,
+                expires_at: accepted_at + time::Duration::minutes(15),
+            })
+            .collect(),
+        };
+        let mut job = reconciliation_job("/services", DfsPlacementScope::Subtree, BTreeSet::new());
+        job.accepted_config = config.clone();
+        job.candidate_snapshot = candidates.clone();
+        job.placement_snapshot = Some(snapshot.clone());
+        job.created_at_unix_nanos = u64::try_from(accepted_at.unix_timestamp_nanos()).unwrap();
+        // A new preview still evaluates freshness now and retains the existing
+        // copy when both old path observations have expired.
+        let preview = preview_placement_with_snapshot_and_unavailable_nodes(
+            &config,
+            &object.path,
+            object.object_id.clone(),
+            object.version.clone(),
+            object.policy.clone(),
+            node("node-a"),
+            object.current_locations.clone(),
+            candidates,
+            None,
+            DfsPlacementScope::SelfOnly,
+            Some(&snapshot),
+            &[],
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            preview.placement.plan.desired_replica_nodes,
+            vec![node("node-a"), node("node-c")]
+        );
+        let (_, policy, accepted) =
+            reconciliation_placement_for_object(&config, &job, &object).unwrap();
+        assert_eq!(
+            (policy.min_commit_replicas, policy.desired_replicas),
+            (1, 2)
+        );
+        assert_eq!(
+            accepted.plan.desired_replica_nodes,
+            vec![node("node-a"), node("node-b")],
+            "an accepted job must not silently choose a different immutable repair body as its captured path telemetry ages"
+        );
+        let (_, _, pinned) = reconciliation_placement_for_object_with_pins(
+            &config,
+            &job,
+            &object,
+            &[node("node-c")],
+        )
+        .unwrap();
+        assert!(
+            pinned.plan.desired_replica_nodes.contains(&node("node-c")),
+            "current pin constraints still apply"
+        );
     }
 
     fn preview_with(
