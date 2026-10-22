@@ -1075,6 +1075,83 @@ fn authoritative_stat_outsider_counts_link_and_unlink_without_local_replay() {
 }
 
 #[test]
+fn browser_exact_parent_hint_without_replica_cannot_recreate_a_deleted_parent() {
+    let mut cluster = sifs_outsider_cluster("browser-exact-parent-outsider");
+    let parent = "/users/browser-exact-parent-outsider/parent";
+    let child = format!("{parent}/child");
+    cluster.writer.posix_mkdir_all(parent).unwrap();
+    let old_parent = {
+        let owner = cluster._runtime.metadata_primary_service(parent).unwrap();
+        owner.metadata_backend().unwrap()
+            .get_object_by_path(&sifs_file_system_id(), parent).unwrap().unwrap()
+    };
+    assert_eq!(old_parent.kind, DfsObjectKind::Directory);
+    cluster.writer.posix_rmdir(parent).unwrap();
+    let tombstone = {
+        let owner = cluster._runtime.metadata_primary_service(parent).unwrap();
+        let row = owner.metadata_backend().unwrap().get_object(&old_parent.object_id).unwrap().unwrap();
+        assert_eq!(row.kind, DfsObjectKind::Tombstone);
+        row
+    };
+    assert!(cluster._runtime.metadata_shards().unwrap().iter().all(|shard| {
+        shard.primary_node_id != cluster.observer_node
+            && !shard.replica_node_ids.contains(&cluster.observer_node)
+    }));
+    cluster.observer.add_transient_object_metadata(old_parent.clone()).unwrap();
+    assert_eq!(cluster.observer.metadata().object(&old_parent.object_id), Some(&old_parent));
+    let before = cluster.observer.metadata_backend().unwrap().metadata_shard_statuses().unwrap();
+    let capture = cluster._runtime.capture_served_work(&cluster.primary_node, 32).unwrap();
+    crate::browser_service::prepare_sifs_browser_write_parent(&mut cluster.observer, &child).unwrap();
+    let reports = capture.records();
+    let implicit_creates = reports.iter().filter(|work| {
+        work.command.routed_message.source_node_id == cluster.observer_node
+            && matches!(&work.command.routed_message.message,
+                DfsNetworkMessage::NamespaceRequest(request)
+                    if matches!(&request.operation, DfsNamespaceOperation::MkdirAll { path } if path == parent))
+    }).count();
+    let after = {
+        let owner = cluster._runtime.metadata_primary_service(parent).unwrap();
+        owner.metadata_backend().unwrap().get_object(&old_parent.object_id).unwrap().unwrap()
+    };
+    std::fs::write(
+        cluster._runtime.data_dir(&cluster.observer_node).root().join("boundary-diagnostic-outsider-parent-hint.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "caller": cluster.observer_node, "primary": cluster.primary_node,
+            "old_hint": old_parent, "tombstone": tombstone, "after_preparation": after,
+            "implicit_mkdir_all_calls": implicit_creates,
+            "actual_invocations": reports.iter().map(|work| serde_json::json!({
+                "command": work.command.routed_message,
+                "publish_metadata": work.committed_work.publish_metadata,
+                "semantic_changes": work.committed_work.semantic_changes,
+                "succeeded": work.succeeded,
+            })).collect::<Vec<_>>(),
+            "qualification": "Normal authenticated member removed from metadata assignment through native handoff, with a genuinely observed old parent row as advisory DATA. Original Main metadata never removed or replaced."
+        })).unwrap(),
+    ).unwrap();
+    assert_eq!(implicit_creates, 0, "an exact parent hint must not cause an implicit Main recreation");
+    assert_eq!(after, tombstone);
+    assert_eq!(before, cluster.observer.metadata_backend().unwrap().metadata_shard_statuses().unwrap());
+    let create = cluster.observer.posix_write_file(
+        &child, b"must remain absent",
+        DfsWriteOptions::replicated_eventual(vec![cluster.observer_node.clone()]),
+    );
+    match create {
+        Err(DfsPosixError::MissingParent { path }) | Err(DfsPosixError::NotFound { path }) => {
+            assert!(path == parent || path == child);
+        }
+        other => panic!("the actual Main must reject the missing parent: {other:?}"),
+    }
+    let owner = cluster._runtime.metadata_primary_service(parent).unwrap();
+    assert_eq!(owner.metadata_backend().unwrap().get_object(&old_parent.object_id).unwrap(), Some(tombstone));
+    assert!(owner.metadata_backend().unwrap().get_object_by_path(&sifs_file_system_id(), &child).unwrap().is_none());
+    drop(owner);
+    drop(capture);
+    let SifsPosixCluster { primary, writer, observer, _runtime, .. } = cluster;
+    drop((primary, writer, observer));
+    _runtime.close().unwrap();
+}
+
+#[test]
 fn authoritative_stat_counts_cross_shard_alias_and_fails_closed_on_outage() {
     let mut cluster = sifs_two_primary_cluster("stat-cross-shard-outage");
     let path = "/users/stat-cross-target";
