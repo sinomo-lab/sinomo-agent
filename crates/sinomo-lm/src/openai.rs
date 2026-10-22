@@ -843,6 +843,12 @@ fn openai_responses_input_item(
     tools: &[LanguageModelToolSpec],
 ) -> Option<serde_json::Value> {
     match item {
+        LanguageModelRequestItem::Image {
+            media_type,
+            data_base64,
+        } => Some(serde_json::json!({
+            "type":"message", "role":"user", "content":[{"type":"input_image", "image_url":format!("data:{media_type};base64,{data_base64}"), "detail":"high"}]
+        })),
         LanguageModelRequestItem::ProviderContinuation { .. } => None,
         LanguageModelRequestItem::Message { role, content } => {
             if *role == LanguageModelRole::System || content.trim().is_empty() {

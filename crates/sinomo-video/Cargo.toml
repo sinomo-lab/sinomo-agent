@@ -16,6 +16,8 @@ default = []
 native-devices = ["sinomo-runtime/native-devices"]
 
 [dependencies]
+sinomo-lm.workspace = true
+tokio.workspace = true
 image = { workspace = true, features = ["jpeg"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

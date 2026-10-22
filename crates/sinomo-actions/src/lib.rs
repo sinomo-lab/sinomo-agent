@@ -1,5 +1,7 @@
 //! Sandbox-aware action execution skeleton.
 
+pub mod desktop;
+
 use serde::{Deserialize, Serialize};
 use sinomo_runtime::core::{
     ActionRequest, Confidence, EventEnvelope, EventKind, Id, LatencyClass, PrivacyClass,

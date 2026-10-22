@@ -7,6 +7,14 @@ pub(crate) fn messages(request: &LanguageModelRequest, model: &str) -> Vec<Value
     let mut messages = Vec::new();
     for item in items {
         match item {
+            LanguageModelRequestItem::Image {
+                media_type,
+                data_base64,
+            } => append(
+                &mut messages,
+                "user",
+                json!({"type":"image", "source":{"type":"base64", "media_type":media_type, "data":data_base64}}),
+            ),
             LanguageModelRequestItem::ProviderContinuation { continuation } => {
                 messages.extend(continuation.items)
             }

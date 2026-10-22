@@ -1943,9 +1943,23 @@ pub fn product_module_tool_projection(
         sinomo_product_profile::ProductComponentProfile::main(cluster_initialized),
     )
     .map_err(|error| error.to_string())?;
-    Ok(AgentModuleToolProjection::from_registry(
-        components.modules(),
-    ))
+    let mut projection = AgentModuleToolProjection::from_registry(components.modules());
+    // Catalog registrations retain installed metadata and skills when a linked
+    // component is disabled. Only active component routes are callable tools.
+    let inactive = components
+        .native_rust_control_targets()
+        .into_iter()
+        .filter(|target| !target.active)
+        .filter_map(|target| {
+            sinomo_runtime::module::ModuleId::from_legacy_named(target.legacy_id).ok()
+        })
+        .collect::<Vec<_>>();
+    for registration in &mut projection.registrations {
+        if inactive.contains(registration.module_id()) {
+            registration.surfaces.object_rpc_routes.clear();
+        }
+    }
+    Ok(projection)
 }
 
 #[derive(Clone, Debug, Error)]

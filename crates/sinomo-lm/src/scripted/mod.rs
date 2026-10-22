@@ -830,6 +830,7 @@ fn request_texts(request: &LanguageModelRequest) -> impl Iterator<Item = String>
         .iter()
         .map(|message| message.content.clone());
     let items = request.items.iter().filter_map(|item| match item {
+        LanguageModelRequestItem::Image { media_type, .. } => Some(format!("[image:{media_type}]")),
         LanguageModelRequestItem::Message { content, .. }
         | LanguageModelRequestItem::Context { content, .. } => Some(content.clone()),
         LanguageModelRequestItem::ToolCall { input, .. } => Some(input.to_string()),

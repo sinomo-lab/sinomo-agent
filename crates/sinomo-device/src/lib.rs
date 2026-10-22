@@ -1,6 +1,7 @@
 //! Device profile, permission, and capability metadata, plus the process-local
 //! resource conditions published by native application hosts.
 
+pub mod desktop;
 mod native;
 mod runtime_resources;
 

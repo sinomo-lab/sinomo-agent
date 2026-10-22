@@ -6,14 +6,24 @@ authors = ["Infinity_X <Infinity_X@sinomo.net>"]
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-include = ["**/*.rs", "Cargo.toml"]
+include = ["**/*.rs", "skills/**/*.md", "Cargo.toml"]
 
 [package.metadata.sinomo]
 ring = "r2"
 
 [dependencies]
+sinomo-video.workspace = true
+sinomo-lm.workspace = true
+tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 time.workspace = true
 sinomo-runtime = { path = "../sinomo-runtime" }
+
+[dev-dependencies]
+sinomo-testdir.workspace = true
+sinomo-runtime = { workspace = true, features = ["network-test-support"] }
+
+[target.'cfg(target_os = "windows")'.dev-dependencies]
+windows = { workspace = true, features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_HiDpi"] }

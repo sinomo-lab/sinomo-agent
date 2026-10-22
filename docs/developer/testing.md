@@ -171,6 +171,69 @@ continuation state are dropped, but review every recording before keeping any
 of it. Recordings expect only the outputs of the previous reply's tool calls;
 tighten their checks by hand.
 
+## Live Desktop Agent Verification (Windows)
+
+Build the opt-in fixture host, then run the real agent against owned test windows:
+
+```powershell
+cargo build -p sinomo --features desktop-e2e
+.\scripts\test-desktop-agent.ps1 -Model gpt-6.1-sol -UseInteractiveDesktop
+# Run just one case:
+.\scripts\test-desktop-agent.ps1 -Model gpt-6.1-sol -UseInteractiveDesktop -Case agent.desktop.app-drag-resize
+```
+
+The launcher requires `ffmpeg` and `ffprobe` on PATH and an existing Sinomo Codex
+credential. `-Credentials` can select another stored credential file. It reads
+the token without copying it into the result bundle, checks expiry before each
+model request, disables credential refresh, and stops the suite on missing,
+expired or rejected credentials. The requested model is sent unchanged; absence
+from a provider's menu does not trigger model substitution.
+
+Each case creates a fresh data directory, local resource grants, a component
+host with only its desktop module, and a real `AgentSessionRuntime`. The normal
+module tool projection and service dispatch handle actual model tool calls.
+Local object-RPC uses production body framing and ownership through the network
+test-support adapter. No daemon, cluster, operator workspace or distributed
+settings are required or changed. This exercises the local agent-to-device
+path; it does not establish cross-node routing behavior.
+
+The agent receives native image inputs sampled from the continuous, shared
+Sinomo media stream. Each new observation waits for a frame captured after the
+preceding tool completion. This is a visual tool loop with a recorded video,
+not evidence of a realtime provider's native video API. The separate
+`sinomo voice call --computer-stream/--app-stream` path supplies such consumers.
+
+| Case | Independent acceptance condition |
+|---|---|
+| `agent.desktop.app-form` | Submit a fresh code, set counter to 3 and toggle ON while another window retains focus and the pointer stays unchanged |
+| `agent.desktop.app-drag-resize` | Resize, drag into a target, scroll exactly three ticks and submit the code in an occluded background window |
+| `agent.desktop.computer-form` | Complete the form through raw input while the owned full-screen fixture retains foreground |
+| `agent.desktop.gamepad-capability` | Attempt native neutral gamepad injection and close the input lease; unsupported hosts are explicitly skipped |
+| `agent.desktop.gamepad-state` | Observe A, stick and trigger values through XInput or Windows.Gaming.Input, then observe neutral before closing the lease; unsupported hosts are explicitly skipped |
+
+`-UseInteractiveDesktop` explicitly allows the owned windows on the current
+desktop. Setup may click an owned, hit-tested window to establish foreground,
+restoring the pointer before measurements begin. Raw tests occupy the primary
+display and move the pointer. Avoid user input during the run. Foreground and desktop checks stop raw input and frame
+forwarding when ownership changes; a hidden watchdog stops only the exact owned
+child on timeout or launcher failure and restores the previous desktop, pointer
+and foreground. These guards are test isolation, not a security sandbox.
+Without that flag, the launcher uses a separate Win32 desktop. On the verified
+Windows host, WGC returned a zero-sized capture item there even after painting
+and activating the window; interactive fixture mode was required. The harness
+does not silently switch modes. `-FixtureOnly` records a short setup diagnostic
+and returns **skipped**, explicitly stating that no model ran.
+
+Results go into a new `benchmark-results/desktop-agent-*` directory. Each case
+retains its MP4, frame timeline, exact model observations, agent trace, RPC
+receipts, independent application-state assertions and `ffprobe` validation.
+The report attaches files with MIME type, size and BLAKE3 digest, including on
+failure. `source.json` records the binary hash, Git revision and dirty-source
+hashes. MP4 recording uses FFmpeg only as an artifact sink after Sinomo's shared
+encoder and media transport; repeated latest frames preserve recording time
+and are declared in its metadata. Failed runs are retained, and reusing an
+existing run directory is rejected.
+
 ## Formal Verification
 
 The Quint harness pins Quint 0.32.0 and Apalache 0.56.1. It classifies models

@@ -15,6 +15,7 @@ ring = "application"
 default = ["sandbox", "dfs-fuse"]
 dfs-fuse = ["dep:sinomo-dfs-fuse", "sinomo-dfs-fuse/fuse"]
 native-models = ["dep:candle-core", "dep:sinomo-models", "dep:tokenizers"]
+desktop-e2e = ["dep:windows", "sinomo-runtime/network-test-support"]
 # Selectable `scripted` model provider for end-to-end tests. Never in releases.
 scripted-provider = ["sinomo-lm/scripted-provider"]
 native-devices = [
@@ -27,6 +28,7 @@ native-devices = [
 sandbox = ["sinomo-runtime/sandbox"]
 
 [dependencies]
+sinomo-actions.workspace = true
 base64.workspace = true
 blake3.workspace = true
 candle-core = { version = "0.11.0", optional = true }
@@ -59,3 +61,6 @@ fs2.workspace = true
 sinomo-runtime = { workspace = true, features = ["cluster-test-support", "network-test-support", "dfs-test-support"] }
 sinomo-testdir = { path = "../sinomo-testdir" }
 wat = "1.253.0"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { workspace = true, optional = true, features = ["Gaming_Input", "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_System_StationsAndDesktops", "Win32_System_Threading", "Win32_System_WinRT", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Input_XboxController", "Win32_UI_WindowsAndMessaging"] }

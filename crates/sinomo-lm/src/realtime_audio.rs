@@ -1985,7 +1985,9 @@ pub fn minicpm_input_audio_append_payload(chunk: &RealtimeAudioInputChunk) -> se
     payload
 }
 
-fn encode_realtime_video_frame(
+/// Shared media encoder for realtime sessions and routed video sources.
+/// Call on a media/blocking worker, never on a render or async executor thread.
+pub fn encode_realtime_video_frame(
     frame: &RealtimeVideoFrameInput,
     config: &RealtimeVideoInputConfig,
 ) -> Result<RealtimeEncodedVideoFrameInput, RealtimeAudioError> {

@@ -16,6 +16,7 @@ default = ["sandbox", "dfs-fuse"]
 sandbox = ["sinomo-cli/sandbox"]
 dfs-fuse = ["sinomo-cli/dfs-fuse"]
 native-devices = ["sinomo-cli/native-devices"]
+desktop-e2e = ["sinomo-cli/desktop-e2e"]
 # Selectable `scripted` model provider for end-to-end tests. Never in releases.
 scripted-provider = ["sinomo-cli/scripted-provider"]
 # Build the in-process model runtimes. Off by default: they pull in Candle and a
