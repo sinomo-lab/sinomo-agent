@@ -152,7 +152,6 @@ enum ManagedRepairPreparation {
 }
 
 struct PreparedManagedRepairBatch {
-    retired_intents: Vec<DfsRepairAttemptRecord>,
     error: Option<DfsError>,
     processed: BTreeSet<(String, NodeId)>,
     dispatches: Vec<(
@@ -836,10 +835,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if candidates.is_empty() {
             return Ok(None);
         }
-        let obsolete_identities = candidates
-            .iter()
-            .map(|(job, _, pending, _)| retired_repair_identity(job, pending))
-            .collect::<Vec<_>>();
         let obsolete = candidates
             .iter()
             .map(|(_, intent, _, _)| intent.clone())
@@ -851,7 +846,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             candidates.len(),
             |service, job, config| {
                 let mut stale = Vec::new();
-                let mut retired_intents = Vec::new();
                 let mut error = None;
                 let mut recheck_current = false;
                 let mut dispatches = Vec::new();
@@ -892,7 +886,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                 target.missing_replica_node_id.clone(),
                             ));
                         }
-                        retired_intents.push(retired_repair_identity(&repair, &pending));
                         stale.push(intent);
                         continue;
                     }
@@ -947,7 +940,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 service.retire_stale_placement_intents(&stale)?;
                 Ok((
                     PreparedManagedRepairBatch {
-                        retired_intents,
                         error,
                         dispatches,
                         processed,
@@ -959,12 +951,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if let Some(((mut batch, recheck_current), release)) = result {
             if let Err(error) = release {
                 batch.dispatches.clear();
-                batch.processed.retain(|(id, _)| {
-                    batch
-                        .retired_intents
-                        .iter()
-                        .any(|record| &record.intent_id == id)
-                });
+                batch.processed.clear();
                 batch.error = Some(error);
             }
             if batch.processed.is_empty() && batch.error.is_none() {
@@ -992,7 +979,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .collect();
         Ok(Some(ManagedRepairPreparation::Prepared(
             PreparedManagedRepairBatch {
-                retired_intents: obsolete_identities,
                 error: None,
                 dispatches: Vec::new(),
                 processed,
@@ -2092,7 +2078,6 @@ where
                 let reserved = budget.reserve(batch.target_count());
                 debug_assert_eq!(reserved, batch.target_count());
                 error = batch.error;
-                retired_intents.extend(batch.retired_intents);
                 let mut dispatches = batch.dispatches.into_iter();
                 while let Some((prepared, fanout_jobs)) = dispatches.next() {
                     for (candidate, _) in &fanout_jobs {
@@ -2124,20 +2109,11 @@ where
             // A parked or non-local target performs no effect and needs no
             // distributed placement permit. Validate only eligible retries;
             // receipts independently retain their effect-time authority check.
-            let mut retired = false;
-            let authority =
-                self.placement_intent_remains_authoritative_recording(&job.intent_id, &mut retired);
-            if retired {
-                retired_intents.push(retired_repair_identity(&job, &pending));
-            }
-            match authority {
+            match self.placement_intent_remains_authoritative(&job.intent_id) {
                 Ok(true) => {}
                 Ok(false) => break,
                 Err(failed) => {
-                    if !retired {
-                        examined
-                            .remove(&(job.intent_id.clone(), job.missing_replica_node_id.clone()));
-                    }
+                    examined.remove(&(job.intent_id.clone(), job.missing_replica_node_id.clone()));
                     error = Some(failed);
                     break;
                 }
@@ -2884,6 +2860,23 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             false
         });
+    }
+
+    /// Losing a placement plan's execution eligibility does not settle the
+    /// committed content obligation. Keep its actual producer DATA parked in
+    /// the existing queue until authoritative replacement or completion.
+    pub(crate) fn park_committed_repairs(&mut self, intent_ids: &BTreeSet<String>) {
+        let preserved = self
+            .repair_attempt_records
+            .iter()
+            .filter(|((id, _), _)| intent_ids.contains(id))
+            .map(|(key, record)| (key.clone(), record.clone()))
+            .collect::<Vec<_>>();
+        self.retire_committed_repairs(intent_ids);
+        for (key, mut record) in preserved {
+            record.next_retry_unix_nanos = u64::MAX;
+            self.repair_attempt_records.insert(key, record);
+        }
     }
 
     /// Resolve only the outgoing identities affected by this publication.

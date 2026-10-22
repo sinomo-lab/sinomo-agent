@@ -4087,14 +4087,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         intent_id: &str,
     ) -> Result<PlacementIntentAuthority, DfsError> {
-        self.placement_intent_authority_recording(intent_id, &mut false)
-    }
-
-    fn placement_intent_authority_recording(
-        &mut self,
-        intent_id: &str,
-        retired: &mut bool,
-    ) -> Result<PlacementIntentAuthority, DfsError> {
         let Some(intent) = self.coordinator.intent(intent_id).cloned() else {
             return Ok(PlacementIntentAuthority::Stale);
         };
@@ -4141,9 +4133,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let mut held_permit = authority.map(|(_, _, permit)| permit);
 
         let abort_result = self.retire_stale_placement_intents(std::slice::from_ref(&intent));
-        if abort_result.is_ok() && intent.state == DfsWriteIntentState::Committed {
-            *retired = true;
-        }
         let release_result = held_permit
             .as_mut()
             .map(|permit| self.release_placement_authority_permit(permit))
@@ -4157,7 +4146,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     /// Shared scalar/group stale semantics. A committed publication is never
-    /// rewritten as Aborted; only its derived execution ownership is retired.
+    /// rewritten as Aborted; its execution is withdrawn and actual producer
+    /// DATA is parked. Stale plan eligibility is not terminal repair evidence.
     /// The caller retains any exact placement permit through these transitions.
     pub(crate) fn retire_stale_placement_intents(
         &mut self,
@@ -4185,7 +4175,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             self.coordinator.restore_intent(aborted)?;
             self.remove_pending_write_state(&intent.intent_id);
         }
-        self.retire_committed_repairs(&committed);
+        self.park_committed_repairs(&committed);
         Ok(())
     }
 
@@ -4248,15 +4238,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         intent_id: &str,
     ) -> Result<bool, DfsError> {
-        self.placement_intent_remains_authoritative_recording(intent_id, &mut false)
-    }
-
-    pub(crate) fn placement_intent_remains_authoritative_recording(
-        &mut self,
-        intent_id: &str,
-        retired: &mut bool,
-    ) -> Result<bool, DfsError> {
-        match self.placement_intent_authority_recording(intent_id, retired)? {
+        match self.placement_intent_authority(intent_id)? {
             PlacementIntentAuthority::Ordinary => Ok(true),
             PlacementIntentAuthority::Stale => Ok(false),
             PlacementIntentAuthority::Managed(mut permit) => {
