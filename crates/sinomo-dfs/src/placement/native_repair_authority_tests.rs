@@ -6,11 +6,22 @@ use std::time::Duration;
 
 #[test]
 fn native_stale_placement_plan_preserves_original_unsent_repair_custody() {
-    let (runtime, nodes, jobs, gate, _events, subscription, admission, authority, control) =
-        native_managed_setup(
-            "native-stale-plan-repair-custody",
-            &[("/", DfsPlacementScope::Subtree)],
-        );
+    native_stale_placement_custody(false);
+}
+
+#[test]
+fn native_stale_placement_custody_survives_restart_and_authoritative_successor() {
+    native_stale_placement_custody(true);
+}
+
+fn native_stale_placement_custody(recover: bool) {
+    let name = if recover {
+        "native-stale-plan-repair-recovery"
+    } else {
+        "native-stale-plan-repair-custody"
+    };
+    let (mut runtime, nodes, jobs, gate, _events, subscription, admission, authority, control) =
+        native_managed_setup(name, &[("/", DfsPlacementScope::Subtree)]);
     let observed = authority.reader();
     let job_id = jobs[0].clone();
     let blocked = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -130,11 +141,129 @@ fn native_stale_placement_plan_preserves_original_unsent_repair_custody() {
     drop(control);
     drop(subscription);
     drop(authority);
-    runtime.close().unwrap();
-    assert!(
-        retained,
-        "stale placement eligibility cannot erase live original unsent custody"
+    if !recover || !retained {
+        runtime.close().unwrap();
+        assert!(
+            retained,
+            "stale placement eligibility cannot erase live original unsent custody"
+        );
+        return;
+    }
+    drop(store);
+    drop(scheduler);
+    runtime.stop_node(&nodes[0]).unwrap();
+    runtime.reopen_node(nodes[0].clone()).unwrap();
+    let store = crate::LocalDfsRepairQueueStore::new(
+        crate::default_dfs_repair_attempt_snapshot_path(runtime.data_dir(&nodes[0])),
     );
+    let reopened = store.view().unwrap();
+    for record in &after.records {
+        assert_eq!(
+            reopened.records.iter().find(|row| {
+                row.intent_id == record.intent_id
+                    && row.missing_replica_node_id == record.missing_replica_node_id
+            }),
+            Some(record),
+            "actual Main restart keeps the parked original producer record exactly"
+        );
+    }
+
+    // A fresh accepted plan supplies actual successor authority. This is not
+    // a retry of a historical write under a different operation identity.
+    let candidates = {
+        let mut client = runtime.client(&nodes[0]).unwrap();
+        client.placement_content_candidates().unwrap()
+    };
+    let control = runtime.shared_control_plane().unwrap();
+    let successor = control.with_client(|kv| {
+        let mut store = DfsControlPlaneStore::new(kv.as_mut());
+        let fs = &runtime.file_system().file_system_id;
+        let current = store.get_file_system_config(fs).unwrap().unwrap();
+        let successor = crate::control_plane::build_placement_reconciliation_job(
+            sinomo_core::Id::generate().to_string(),
+            &current,
+            "/".into(),
+            DfsPlacementScope::Subtree,
+            Default::default(),
+            candidates,
+            None,
+            dfs_now_unix_nanos(),
+        )
+        .unwrap();
+        assert!(
+            store
+                .compare_and_put_placement_update(&current, &current, &successor)
+                .unwrap()
+        );
+        successor
+    });
+    let deadline = std::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    for _ in 0..8 {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        assert!(!remaining.is_zero(), "existing native repair deadline");
+        runtime
+            .maintenance_tick(&nodes[0], remaining)
+            .unwrap()
+            .outcome
+            .unwrap();
+        let started = store
+            .view()
+            .unwrap()
+            .records
+            .into_iter()
+            .filter_map(|row| {
+                row.transfer_request_id
+                    .map(|id| (row.intent_id, row.missing_replica_node_id, id))
+            })
+            .collect::<BTreeSet<_>>();
+        while store.view().unwrap().records.iter().any(|row| {
+            row.in_flight
+                && row.transfer_request_id.as_ref().is_some_and(|id| {
+                    started.contains(&(
+                        row.intent_id.clone(),
+                        row.missing_replica_node_id.clone(),
+                        id.clone(),
+                    ))
+                })
+        }) {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        if store.view().unwrap().records.is_empty() {
+            break;
+        }
+    }
+    let final_queue = store.view().unwrap();
+    std::fs::write(
+        runtime.data_dir(&nodes[0]).root().join("boundary-diagnostic-stale-plan-recovery.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "original": after.records, "reopened": reopened.records,
+            "successor": successor.job_id, "final": final_queue.records,
+            "qualification": "Actual Main stop/reopen and a new accepted placement plan; original content identities unchanged."
+        })).unwrap(),
+    ).unwrap();
+    assert!(
+        final_queue.records.is_empty(),
+        "authoritative successor completes and settles the original parked custody"
+    );
+    for node in &nodes {
+        let mut client = runtime.client(node).unwrap();
+        for index in 0..4 {
+            let path = format!("/native-managed-{index}");
+            assert_eq!(
+                client.posix_read_file(&path).unwrap(),
+                vec![index as u8; 64]
+            );
+            let current = client.posix_stat_distributed(&path).unwrap();
+            assert!(before.records.iter().any(|record| {
+                record.object_id == current.object_id
+                    && record.version == current.version
+                    && Some(record.content_hash.as_str()) == current.content_hash.as_deref()
+            }));
+        }
+    }
+    drop(control);
+    runtime.close().unwrap();
 }
 
 const NATIVE_GROUP_SCAN_GATE: &str =
