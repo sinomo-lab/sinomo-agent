@@ -845,12 +845,22 @@ fn native_placement_replay_after_handoff_preserves_original_committed_obligation
 
 #[test]
 fn native_unfinished_placement_repair_survives_primary_handoff() {
-    native_unfinished_placement_repair(true);
+    native_unfinished_placement_repair(true, true, false);
+}
+
+#[test]
+fn native_unfinished_placement_handoff_recovers_without_request_replay() {
+    native_unfinished_placement_repair(true, false, false);
+}
+
+#[test]
+fn native_unfinished_placement_handoff_explicit_recovery_control() {
+    native_unfinished_placement_repair(true, false, true);
 }
 
 #[test]
 fn native_unfinished_placement_repair_progresses_with_same_primary() {
-    native_unfinished_placement_repair(false);
+    native_unfinished_placement_repair(false, true, false);
 }
 
 #[test]
@@ -984,8 +994,12 @@ fn native_unfinished_placement_replay_keeps_retired_receipt_and_journal() {
     assert_eq!(after.2.head_sequence, before.2.head_sequence);
 }
 
-fn native_unfinished_placement_repair(handoff: bool) {
-    let label = if handoff {
+fn native_unfinished_placement_repair(handoff: bool, replay_request: bool, explicit_recovery: bool) {
+    let label = if explicit_recovery {
+        "native-unfinished-placement-handoff-explicit-recovery"
+    } else if handoff && !replay_request {
+        "native-unfinished-placement-handoff-no-replay"
+    } else if handoff {
         "native-unfinished-placement-handoff"
     } else {
         "native-unfinished-placement-same-owner"
@@ -1064,6 +1078,21 @@ fn native_unfinished_placement_repair(handoff: bool) {
         );
         record
     };
+    let promoted_paths = crate::runtime_host::DfsRuntimePaths::new(case.runtime.data_dir(&promoted));
+    let reconciliation_generation = || {
+        crate::runtime_host::daemon_dfs_maintenance_reconciliation_generation(&promoted_paths)
+    };
+    if handoff && !replay_request {
+        // Startup reconciliation may otherwise accidentally supply the later
+        // handoff wake. Drain this actual Main's pre-existing request first.
+        let drain_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+        while reconciliation_generation().is_some() {
+            let remaining = drain_deadline.checked_duration_since(Instant::now())
+                .expect("ordinary initial recovery drains within its native budget");
+            case.runtime.maintenance_tick(&promoted, remaining).unwrap().outcome.unwrap();
+        }
+    }
+    let reconciliation_before_handoff = reconciliation_generation();
     if handoff {
         case.runtime
             .reassign_metadata_shard(
@@ -1074,11 +1103,16 @@ fn native_unfinished_placement_repair(handoff: bool) {
             )
             .unwrap();
     }
+    let reconciliation_after_handoff = reconciliation_generation();
+    let explicit_recovery_generation = explicit_recovery.then(|| {
+        case.runtime.request_repair_reconciliation(&promoted).unwrap()
+    });
     drop(held);
     case.service.refresh_control_plane_latest().unwrap();
-    let replay = case
-        .service
-        .route_namespace_operation(promoted.clone(), operation);
+    let replay = replay_request.then(|| {
+        case.service
+            .route_namespace_operation(promoted.clone(), operation)
+    });
     let after = {
         let owner = case.runtime.metadata_primary_service(&object.path).unwrap();
         assert_eq!(owner.node_id(), &promoted);
@@ -1092,7 +1126,7 @@ fn native_unfinished_placement_repair(handoff: bool) {
     let deadline = Instant::now() + crate::DEFAULT_DFS_POSIX_SYNC_TIMEOUT;
     let mut completed = false;
     let mut maintenance = Vec::new();
-    while replay.is_ok() && Instant::now() < deadline {
+    while replay.as_ref().is_none_or(Result::is_ok) && Instant::now() < deadline {
         // The native fixture exposes the registered Main's ordinary bounded
         // maintenance call explicitly. Observational reads do not drive it.
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
@@ -1101,6 +1135,7 @@ fn native_unfinished_placement_repair(handoff: bool) {
         let remaining = remaining.min(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT);
         let observation = case.runtime.maintenance_tick(&promoted, remaining).unwrap();
         maintenance.push(serde_json::json!({
+            "reconciliation_generation": reconciliation_generation(),
             "outcome": format!("{:?}", observation.outcome),
             "queue_before": format!("{:?}", observation.queue_before),
             "queue_after": format!("{:?}", observation.queue_after),
@@ -1152,6 +1187,10 @@ fn native_unfinished_placement_repair(handoff: bool) {
         serde_json::to_vec_pretty(&serde_json::json!({
             "original": original_record, "after": after, "replay": format!("{replay:?}"),
             "old_primary": old_primary, "new_primary": promoted, "replica": replica, "handoff": handoff,
+            "request_replayed": replay_request,
+            "reconciliation_before_handoff": reconciliation_before_handoff,
+            "reconciliation_after_handoff": reconciliation_after_handoff,
+            "explicit_recovery_generation": explicit_recovery_generation,
             "completed": completed, "maintenance": maintenance,
             "all_rpc_observation_count": calls.len(), "selected_dfs_rpc_observations": selected,
             "qualification": "Actual fresh native fixture; selected DFS RPCs only. Full call count states omitted other routes. No supplied success, receipt or replacement authority."
@@ -1163,7 +1202,9 @@ fn native_unfinished_placement_repair(handoff: bool) {
         "unfinished-placement-handoff original={original_record:?} replay={replay:?} after={after:?} completed={completed} maintenance={maintenance:?}"
     );
     case.close();
-    replay.expect("the new actual primary must resume the exact unfinished placement");
+    if let Some(replay) = replay {
+        replay.expect("the new actual primary must resume the exact unfinished placement");
+    }
     assert_eq!(
         after, original_record,
         "handoff cannot rewrite the committed placement identity or captured body"

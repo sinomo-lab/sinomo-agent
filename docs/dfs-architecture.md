@@ -1145,6 +1145,21 @@ configuration under the normal placement mutation permit, then records the
 terminal receipt before retiring volatile repair state. Missing or stale
 evidence does not authorize suppression of a repair.
 
+An accepted placement job evaluates its captured storage/path telemetry at the
+job's durable creation time. Re-evaluating that same snapshot against a later
+wall clock could silently change the target set of an immutable committed
+intent when an observation expired. Fresh previews still evaluate freshness
+at the current time. Existing job/configuration, current pin, primary/epoch,
+publication and physical storage checks remain required for effects; an old
+telemetry snapshot does not supply authority. This uses existing job fields
+and changes neither the wire nor persistence format.
+
+A content Fetch read keeps its request identity in the existing fetch state
+and its durable in-flight backoff. That scheduling flag does not by itself
+identify a Stage/Repair mutation. Physical transfer kind, request identity and
+typed delivery evidence still determine mutation custody; a read cannot settle
+an unknown or possibly-applied mutation.
+
 The serial metadata portion of one hot shard is expected to occupy roughly one
 core because its primary orders that shard's namespace and version decisions.
 When initial placement distributes root, services, and users across three
