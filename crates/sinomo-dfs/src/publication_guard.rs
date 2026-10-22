@@ -214,10 +214,9 @@ impl DfsPublicationExecutionProvider {
                 "initial epoch owner/storage generation changed".into(),
             ));
         }
-        let generation = self.authority.projection_generation();
-        let (shards, filesystem) = self
+        let (generation, shards, filesystem) = self
             .authority
-            .cached_publication_configuration(&digest.file_system_id, generation)
+            .cached_current_publication_configuration(&digest.file_system_id)
             .map_err(|error| MetadataBackendError::Serde(error.to_string()))?
             .ok_or_else(|| {
                 MetadataBackendError::Serde("initial epoch configuration is unavailable".into())
@@ -261,10 +260,9 @@ impl DfsPublicationExecutionProvider {
             &self.data_owner,
             scope,
         );
-        let projection_generation = self.authority.projection_generation();
-        let (shards, filesystem_config) = self
+        let (_, shards, filesystem_config) = self
             .authority
-            .cached_publication_configuration(&scope.file_system_id, projection_generation)?
+            .cached_current_publication_configuration(&scope.file_system_id)?
             .ok_or_else(|| crate::DfsError::Metadata {
                 message: "publication configuration is not current".into(),
             })?;
@@ -305,14 +303,13 @@ impl DfsPublicationExecutionProvider {
         // Rebind to one actual current cache cut, preserving every semantic
         // configuration row selected before the wait. A missing cut cannot
         // authorize work, and structural changes still require reopening.
-        let current_projection = self.authority.projection_generation();
         let current = self
             .authority
-            .cached_publication_configuration(&scope.file_system_id, current_projection)?;
+            .cached_current_publication_configuration(&scope.file_system_id)?;
         if self.authority.storage_generation() != self.storage_generation
             || current
                 .as_ref()
-                .is_none_or(|(current_shards, current_filesystem)| {
+                .is_none_or(|(_, current_shards, current_filesystem)| {
                     current_shards
                         .iter()
                         .find(|current| current.shard_id == scope.shard_id.0)

@@ -21,6 +21,56 @@ use std::sync::{
 
 pub const DFS_METADATA_AUTHORITY_PREFIX: &str = "/dfs/filesystems/";
 
+#[cfg(test)]
+std::thread_local! {
+    static PUBLICATION_CONFIGURATION_BEFORE_LOCK:
+        std::cell::RefCell<Option<(usize, Box<dyn FnOnce()>)>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct PublicationConfigurationBeforeLockGuard;
+
+#[cfg(test)]
+impl Drop for PublicationConfigurationBeforeLockGuard {
+    fn drop(&mut self) {
+        PUBLICATION_CONFIGURATION_BEFORE_LOCK.with(|slot| {
+            slot.borrow_mut().take();
+        });
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn install_publication_configuration_before_lock_hook(
+    skip_calls: usize,
+    hook: impl FnOnce() + 'static,
+) -> PublicationConfigurationBeforeLockGuard {
+    PUBLICATION_CONFIGURATION_BEFORE_LOCK.with(|slot| {
+        assert!(
+            slot.borrow_mut()
+                .replace((skip_calls, Box::new(hook)))
+                .is_none()
+        );
+    });
+    PublicationConfigurationBeforeLockGuard
+}
+
+#[cfg(test)]
+fn run_publication_configuration_before_lock_hook() {
+    let hook = PUBLICATION_CONFIGURATION_BEFORE_LOCK.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if let Some((skip, _)) = slot.as_mut() {
+            if *skip > 0 {
+                *skip -= 1;
+                return None;
+            }
+        }
+        slot.take().map(|(_, hook)| hook)
+    });
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 pub type DfsMetadataAuthorityReadFuture<'a> = Pin<
     Box<
         dyn Future<Output = Result<sinomo_core::kv::KvAuthoritativeRead<Vec<KvEntry>>, DfsError>>
@@ -362,21 +412,21 @@ impl DfsMetadataAuthorityRuntime {
             .cached_metadata_shards(file_system_id, expected_projection_generation)
     }
 
-    /// One cache-only cut for effect admission. Proof updates may advance the
-    /// projection while preserving these complete configuration rows.
-    pub(crate) fn cached_publication_configuration(
+    /// Capture a current cache-only cut and its generation under the same
+    /// lock. Callers retain their later semantic and storage revalidation.
+    pub(crate) fn cached_current_publication_configuration(
         &self,
         file_system_id: &DfsFileSystemId,
-        expected_projection_generation: u64,
     ) -> Result<
         Option<(
+            u64,
             Vec<DfsMetadataShardConfig>,
             Option<crate::DfsFileSystemConfig>,
         )>,
         sinomo_core::kv::KvError,
     > {
         self.state
-            .cached_publication_configuration(file_system_id, expected_projection_generation)
+            .cached_current_publication_configuration(file_system_id)
     }
 
     pub fn shard_projection_state(
@@ -1562,17 +1612,19 @@ impl DfsMetadataAuthorityState {
         }
     }
 
-    fn cached_publication_configuration(
+    fn cached_current_publication_configuration(
         &self,
         file_system_id: &DfsFileSystemId,
-        expected_projection_generation: u64,
     ) -> Result<
         Option<(
+            u64,
             Vec<DfsMetadataShardConfig>,
             Option<crate::DfsFileSystemConfig>,
         )>,
         sinomo_core::kv::KvError,
     > {
+        #[cfg(test)]
+        run_publication_configuration_before_lock_hook();
         let projection =
             self.projection
                 .lock()
@@ -1580,19 +1632,11 @@ impl DfsMetadataAuthorityState {
                     detail: "DFS metadata authority projection lock poisoned".into(),
                 })?;
         let current_projection_generation = self.projection_generation();
-        if projection.revision.is_none()
-            || current_projection_generation != expected_projection_generation
-        {
+        if projection.revision.is_none() {
             #[cfg(test)]
             eprintln!(
-                "NATIVE_PUBLICATION_CONFIGURATION_NOT_CURRENT branch={} filesystem={} expected_generation={} current_generation={} revision={:?} required_revision={:?} thread={:?}",
-                if projection.revision.is_none() {
-                    "projection_unavailable"
-                } else {
-                    "generation_changed"
-                },
+                "NATIVE_PUBLICATION_CONFIGURATION_NOT_CURRENT branch=projection_unavailable filesystem={} current_generation={} revision={:?} required_revision={:?} thread={:?}",
                 file_system_id,
-                expected_projection_generation,
                 current_projection_generation,
                 projection.revision,
                 projection.required_revision,
@@ -1621,14 +1665,14 @@ impl DfsMetadataAuthorityState {
             .transpose()?;
         #[cfg(any(test, feature = "test-support"))]
         crate::native_shard_trace::record_metadata_cache_cut(
-            expected_projection_generation,
+            current_projection_generation,
             projection.revision,
             projection.required_revision,
             &projection.entries,
             projection.native_evidence.as_ref(),
             projection.native_evidence_loss_count,
         );
-        Ok(Some((shards, config)))
+        Ok(Some((current_projection_generation, shards, config)))
     }
 
     pub fn shard_projection_state(
