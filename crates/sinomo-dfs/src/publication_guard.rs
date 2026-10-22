@@ -221,17 +221,37 @@ impl DfsPublicationExecutionProvider {
             .ok_or_else(|| {
                 MetadataBackendError::Serde("initial epoch configuration is unavailable".into())
             })?;
-        if filesystem
+        let mismatch = if filesystem
             .as_ref()
             .is_none_or(|filesystem| filesystem.file_system_id != digest.file_system_id)
-            || !scope.matches(digest)
-            || expected.file_system_id != digest.file_system_id
-            || expected.shard_id != digest.shard_id.0
-            || expected.epoch != digest.owner_epoch
-            || !shards.iter().any(|shard| shard == expected)
-            || self.authority.storage_generation() != self.storage_generation
-            || self.authority.projection_generation() != generation
         {
+            Some("filesystem")
+        } else if !scope.matches(digest) {
+            Some("physical-scope")
+        } else if expected.file_system_id != digest.file_system_id {
+            Some("filesystem-id")
+        } else if expected.shard_id != digest.shard_id.0 {
+            Some("shard-id")
+        } else if expected.epoch != digest.owner_epoch {
+            Some("owner-epoch")
+        } else if !shards.iter().any(|shard| shard == expected) {
+            Some("selected-shard")
+        } else if self.authority.storage_generation() != self.storage_generation {
+            Some("storage-generation")
+        } else if self.authority.projection_generation() != generation {
+            Some("projection-generation")
+        } else {
+            None
+        };
+        if let Some(reason) = mismatch {
+            #[cfg(any(test, feature = "test-support"))]
+            eprintln!(
+                "NATIVE_INITIAL_EPOCH_BINDING_REJECTED branch={reason} root={:?} digest={digest:?} expected={expected:?} cached_shards={shards:?} sampled_projection={generation} projection_at_log={} expected_storage={} storage_at_log={}",
+                scope.root(), self.authority.projection_generation(),
+                self.storage_generation, self.authority.storage_generation(),
+            );
+            #[cfg(not(any(test, feature = "test-support")))]
+            let _ = reason;
             return Err(MetadataBackendError::Serde(
                 "initial epoch differs from the coherent configuration".into(),
             ));
