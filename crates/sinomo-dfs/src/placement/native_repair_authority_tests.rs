@@ -5,6 +5,95 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 #[test]
+fn native_repair_eligibility_is_observational_but_receipt_effect_keeps_its_permit() {
+    let (runtime, nodes, jobs, gate, _events, _calls) = native_managed_work(
+        "native-repair-eligibility-observation",
+        &[("/", DfsPlacementScope::Subtree)],
+    );
+    let scheduler =
+        crate::runtime_host::daemon_dfs_mutation_scheduler(runtime.data_dir(&nodes[0])).unwrap();
+    let admission = crate::test_runtime::executor()
+        .block_on(scheduler.admit(&crate::DfsMessageExecutionScope::GlobalExclusive))
+        .unwrap();
+    let store = crate::LocalDfsRepairQueueStore::new(
+        crate::default_dfs_repair_attempt_snapshot_path(runtime.data_dir(&nodes[0])),
+    );
+    let before = store.view().unwrap();
+    assert_eq!(before.records.len(), 8);
+    let original = before.records[0].clone();
+    assert_eq!(
+        placement_reconciliation_job_id_from_intent_id(&original.intent_id),
+        Some(jobs[0].as_str())
+    );
+    let mut core = runtime.metadata_primary_service("/native-managed-0").unwrap();
+    core.restore_pending_write_for_intent_if_missing(&original.intent_id, &original.object_id)
+        .unwrap();
+    let object = core.current_read_object_metadata(&original.object_id).unwrap();
+    assert_eq!(object.version, original.version);
+    assert_eq!(object.content_hash.as_ref(), Some(&original.content_hash));
+
+    // Observe actual native KV requests while the real owner's global
+    // admission excludes competing maintenance. The hook only records; it
+    // neither rejects a request nor supplies a reply or authority.
+    let phase = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+    let observed_phase = Arc::clone(&phase);
+    let mutations = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&mutations);
+    let hook = runtime.native_kv_request_hook(&nodes[0], move |request| {
+        let phase = observed_phase.load(std::sync::atomic::Ordering::SeqCst);
+        if phase == 0 {
+            return Ok(());
+        }
+        for operation in &request.txn.success {
+            let (kind, key) = match operation {
+                sinomo_core::kv::KvOp::Put { key, .. } => ("put", key),
+                sinomo_core::kv::KvOp::Delete { key } => ("delete", key),
+                _ => continue,
+            };
+            if key.ends_with("/placement-authority-permit-v1") {
+                let mut captured = captured.lock().unwrap();
+                assert!(captured.len() < 64, "bounded native permit observation");
+                captured.push((phase, kind, key.clone()));
+            }
+        }
+        Ok(())
+    }).unwrap();
+    assert!(core.placement_intent_remains_authoritative(&original.intent_id).unwrap());
+    assert_eq!(store.view().unwrap().records, before.records);
+    assert_eq!(core.current_read_object_metadata(&original.object_id).unwrap(), object);
+
+    // Use the real exact local-content receipt path, including its deduplicated
+    // receipt case. Eligibility must not replace this effect-time authority.
+    phase.store(2, std::sync::atomic::Ordering::SeqCst);
+    core.record_local_pending_write_receipt_if_desired(
+        &original.intent_id,
+        &original.object_id,
+        &original.version,
+        &original.content_hash,
+    ).unwrap();
+    phase.store(0, std::sync::atomic::Ordering::SeqCst);
+    let mutations = mutations.lock().unwrap().clone();
+    std::fs::write(
+        runtime.data_dir(&nodes[0]).root().join("boundary-diagnostic-repair-eligibility.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "original": original, "object": object, "queue": before.records,
+            "actual_permit_mutations": mutations,
+            "phases": {"1": "eligibility", "2": "actual-local-receipt-handler"},
+            "qualification": "Real native host, current managed job and original queue custody. No fabricated authority or successful response. Receiver transfers remain a separate existing regression."
+        })).unwrap(),
+    ).unwrap();
+    drop(hook);
+    drop(core);
+    drop(admission);
+    gate.add_permits(64);
+    runtime.close().unwrap();
+    assert!(mutations.iter().all(|(phase, _, _)| *phase != 1),
+        "eligibility must not acquire and release a mutation permit: {mutations:?}");
+    assert!(mutations.iter().any(|(phase, kind, _)| *phase == 2 && *kind == "put"));
+    assert!(mutations.iter().any(|(phase, kind, _)| *phase == 2 && *kind == "delete"));
+}
+
+#[test]
 fn native_stale_placement_plan_preserves_original_unsent_repair_custody() {
     native_stale_placement_custody(false);
 }

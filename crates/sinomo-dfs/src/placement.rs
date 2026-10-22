@@ -3895,6 +3895,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.acquire_authoritative_placement_reconciliation(file_system_id, job_id, Some(path))
     }
 
+    /// sinomo:kv-configuration: Read the existing native host/process identity; this performs no KV request and grants no placement permit.
+    fn current_placement_process_identity(
+        &self,
+        job_id: &str,
+    ) -> Result<crate::DfsPlacementAuthorityProcessIdentity, DfsError> {
+        self.control_plane
+            .as_ref()
+            .and_then(|control| control.placement_authority_process_identity())
+            .ok_or_else(|| DfsError::Distributed {
+                message: format!(
+                    "cannot acquire placement reconciliation job {job_id}: this control-plane host has no daemon placement-authority session"
+                ),
+            })
+    }
+
     /// sinomo:kv-consistency: Fence an existing placement reconciliation against concurrent policy Apply before granting its mutation permit.
     pub(crate) fn acquire_authoritative_placement_reconciliation(
         &mut self,
@@ -3923,6 +3938,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             else {
                 return Ok(None);
             };
+            let holder_process = self.current_placement_process_identity(job_id)?;
             let permit = {
                 let Some(control_plane) = self.control_plane.as_mut() else {
                     return Err(DfsError::Distributed {
@@ -3931,13 +3947,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         ),
                     });
                 };
-                let holder_process = control_plane
-                    .placement_authority_process_identity()
-                    .ok_or_else(|| DfsError::Distributed {
-                        message: format!(
-                            "cannot acquire placement reconciliation job {job_id}: this control-plane host has no daemon placement-authority session"
-                        ),
-                    })?;
                 DfsControlPlaneStore::new(control_plane.as_mut())
                     .try_acquire_placement_authority_permit(
                         &job,
@@ -4179,8 +4188,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(())
     }
 
-    /// Validate one intent while the caller owns the existing exact job permit.
-    /// Scalar checks and bounded repair batches share these payload/pin rules.
+    /// Validate an intent against the exact job/configuration cut. Eligibility
+    /// checks and permit-held effects share these payload/pin rules; this
+    /// comparison alone never grants mutation authority.
     #[tracing::instrument(target = "sinomo.perf", level = "trace",
         name = "dfs.repair.authority.validate", skip_all,
         fields(stage = "dfs.repair.authority.validate", intent_id = %intent.intent_id,
@@ -4230,22 +4240,53 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(matches)
     }
 
-    /// Fence delayed receipts and repair retries belonging to a managed
-    /// placement job. Placement intent ids already durably encode their job id
-    /// (`placement:<job-id>:...`), including across metadata-shard migration,
-    /// so this is backward-compatible with existing intent records.
+    /// Check committed repair eligibility against the existing job/config view.
+    /// This boolean lends no mutation authority: receipt/effect paths retain
+    /// their own permit. An already-released permit cannot fence later work.
+    /// Uncommitted intents keep the original permit-held retirement path.
     pub(crate) fn placement_intent_remains_authoritative(
         &mut self,
         intent_id: &str,
     ) -> Result<bool, DfsError> {
-        match self.placement_intent_authority(intent_id)? {
-            PlacementIntentAuthority::Ordinary => Ok(true),
-            PlacementIntentAuthority::Stale => Ok(false),
-            PlacementIntentAuthority::Managed(mut permit) => {
-                self.release_placement_authority_permit(&mut permit)?;
-                Ok(true)
-            }
+        let Some(intent) = self.coordinator.intent(intent_id).cloned() else {
+            return Ok(false);
+        };
+        if intent.state != DfsWriteIntentState::Committed {
+            return match self.placement_intent_authority(intent_id)? {
+                PlacementIntentAuthority::Ordinary => Ok(true),
+                PlacementIntentAuthority::Stale => Ok(false),
+                PlacementIntentAuthority::Managed(mut permit) => {
+                    self.release_placement_authority_permit(&mut permit)?;
+                    Ok(true)
+                }
+            };
         }
+        let Some(job_id) = placement_reconciliation_job_id_from_intent_id(intent_id) else {
+            if intent_id.starts_with("placement:") {
+                return Err(DfsError::Distributed {
+                    message: format!("malformed reserved placement intent id: {intent_id}"),
+                });
+            }
+            return Ok(true);
+        };
+        let object = self.current_read_object_metadata(&intent.object_id)?;
+        let context = self.authoritative_placement_reconciliation_for_path(
+            &intent.file_system_id,
+            job_id,
+            Some(&object.path),
+        )?;
+        let eligible = if let Some((job, config, _)) = context {
+            // Retain the native host/process requirement of the permit path;
+            // a configuration reader alone cannot become a repair producer.
+            self.current_placement_process_identity(job_id)?;
+            self.managed_placement_intent_matches_job(&intent, &object, &job, &config)?
+        } else {
+            false
+        };
+        if !eligible {
+            self.retire_stale_placement_intents(std::slice::from_ref(&intent))?;
+        }
+        Ok(eligible)
     }
 
     /// Run one bounded placement-derived mutation while holding the exact v1
