@@ -2596,6 +2596,17 @@ pub(crate) struct DfsPreparedMetadataJournalTargetPublish {
     cursor_durability_inconsistency: Option<DfsMetadataCursorDurabilityInconsistency>,
 }
 
+impl DfsPreparedMetadataJournalTargetPublish {
+    /// Required durable work must reach the ordinary bounded transport even
+    /// when an advisory reachability view is stale. This permits an attempt,
+    /// never an ACK or cursor advance; receiver authority and prefix checks
+    /// remain the completion boundary. Idle verification still respects hints.
+    fn has_required_replication_work(&self) -> bool {
+        self.after_sequence < self.prepared_source_head
+            || self.cursor_durability_inconsistency.is_some()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct DfsMetadataCursorDurabilityInconsistency {
     cursor_after_sequence: u64,
@@ -2778,6 +2789,154 @@ mod metadata_publish_membership_tests {
         drop(handle);
         drop(resident);
         runtime.close().unwrap();
+    }
+
+    #[test]
+    fn native_required_journal_suffix_is_not_parked_by_an_execution_hint() {
+        check_required_publication_hint("native-required-publication-hint", false);
+    }
+
+    #[test]
+    fn native_required_journal_suffix_is_not_parked_by_stale_connectivity() {
+        check_required_publication_hint("native-required-publication-connectivity", true);
+    }
+
+    fn check_required_publication_hint(name: &str, connectivity_hint: bool) {
+        let nodes = crate::test_runtime::DfsTestRuntime::ordered_node_ids(name, 3);
+        let mut runtime = crate::test_runtime::DfsTestRuntime::new(name, nodes[0].clone()).unwrap();
+        for node in &nodes[1..] {
+            runtime.define_node(node.clone()).unwrap();
+        }
+        runtime.start_nodes().unwrap();
+        let shard = runtime.root_shard().unwrap();
+        let primary = shard.primary_node_id.clone();
+        let target = shard.replica_node_ids[0].clone();
+        let data = runtime.data_dir(&primary).clone();
+        let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
+        let mut writer = runtime.client(&primary).unwrap();
+        writer
+            .posix_write_file(
+                "/required-publication.bin",
+                b"original committed bytes",
+                crate::DfsWriteOptions {
+                    policy: crate::DfsReplicationPolicy::new(1, 1).unwrap(),
+                    replica_candidates: vec![primary.clone()],
+                    wait_for_commit: true,
+                    foreground_replica_repair: false,
+                },
+            )
+            .unwrap();
+        drop(writer);
+        let resident = {
+            let slot = crate::runtime_host::daemon_dfs_message_service_cache()
+                .root(&data.root())
+                .unwrap();
+            let cache = slot.lock().unwrap();
+            cache
+                .as_ref()
+                .unwrap()
+                .bounded_status_resident_current()
+                .unwrap()
+        };
+        let handle = resident
+            .scope_shard(&shard.file_system_id, &shard_id)
+            .unwrap();
+        let mut lease = handle.checkout().unwrap();
+        let head = lease.journal_last_sequence();
+        let cursor = lease
+            .metadata_replication_cursor(&target, &shard_id)
+            .unwrap();
+        assert!(
+            cursor < head,
+            "the fixture must expose an actual unsent suffix, not fabricate a stale cursor: {cursor}/{head}"
+        );
+        let before = lease.export_table_snapshot();
+        let exclusions = if connectivity_hint {
+            DfsMaintenanceExecutionExclusions::default()
+        } else {
+            DfsMaintenanceExecutionExclusions::new([target.clone()])
+        };
+        let mut plan = prepare_cluster_dfs_metadata_shard_publish_with_backend_and_authority(
+            &data,
+            &primary,
+            shard.replica_node_ids.clone(),
+            shard.file_system_id.clone(),
+            shard_id.clone(),
+            Some(shard.clone()),
+            &mut lease,
+            &exclusions,
+            DfsMetadataJournalReplicationOptions {
+                probe_caught_up_replicas: true,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            lease.export_table_snapshot(),
+            before,
+            "planning cannot author state"
+        );
+        drop(lease);
+        if connectivity_hint {
+            let cluster =
+                sinomo_core::cluster::read_cluster_state_without_kv(&ClusterPaths::new(&data))
+                    .unwrap();
+            let (graph, endpoints) =
+                super::explicitly_unreachable_target_tests::stale_hint_for_native_target(
+                    &cluster.cluster_id,
+                    &primary,
+                    &target,
+                );
+            defer_explicitly_unreachable_dfs_metadata_targets_with_connectivity(
+                &mut plan, &graph, &endpoints,
+            );
+        }
+        let planned = plan.targets.iter().any(|row| {
+            row.target_node_id == target
+                && !row.caught_up_probe
+                && row.after_sequence == cursor
+                && row.prepared_source_head == head
+        });
+        let (_, peer) = runtime.peer_transports(&primary).unwrap();
+        let transport = AsyncDfsMetadataNodeTransport::new(
+            shard.replica_node_ids.clone(),
+            async_dfs_metadata_journal_batch_sender_from_peer_transport(&data, Arc::clone(&peer)),
+            async_dfs_metadata_snapshot_install_sender_from_peer_transport(peer),
+        );
+        let report = runtime
+            .runtime_handle()
+            .block_on(execute_prepared_dfs_metadata_journal_publish_async(
+                plan,
+                &transport,
+                DfsMetadataJournalReplicationOptions::default(),
+            ))
+            .unwrap();
+        let accepted = report.outcomes.iter().any(|outcome| matches!(outcome,
+            DfsMetadataJournalReplicationOutcome::Applied { target_node_id, next_after_sequence, .. }
+                if target_node_id == &target && *next_after_sequence == head));
+        let actual_cursor = metadata_cursor::metadata_replication_cursor(
+            &local_dfs_metadata_shard_path(&data, &shard_id),
+            &target,
+            &shard_id,
+        )
+        .unwrap();
+        eprintln!(
+            "REQUIRED_PUBLICATION_HINT connectivity_hint={connectivity_hint} target={target} original_cursor={cursor} head={head} planned={planned} report={report:?} actual_cursor={actual_cursor}"
+        );
+        drop(transport);
+        drop(handle);
+        drop(resident);
+        runtime.close().unwrap();
+        assert!(
+            planned,
+            "an advisory exclusion must not park actual required journal entries"
+        );
+        assert!(
+            accepted,
+            "only the actual receiver's validated ACK establishes completion"
+        );
+        assert_eq!(actual_cursor, head);
     }
 
     #[test]
@@ -3512,7 +3671,24 @@ fn prepare_dfs_metadata_journal_publish_for_primary_shard(
             continue;
         }
         let after_sequence = replication_cursor(backend, &target_node_id, &shard_id)?;
-        if execution_exclusions.contains(&target_node_id) {
+        let prepared = prepare_dfs_metadata_journal_target_publish(
+            backend,
+            local_node_id,
+            target_node_id.clone(),
+            shard.file_system_id.clone(),
+            shard_id.clone(),
+            shard.epoch,
+            after_sequence,
+            options,
+            &mut payloads_by_after_sequence,
+        )?;
+        let required_work = match &prepared {
+            DfsPreparedMetadataJournalTargetPublishResult::NoChanges { .. } => false,
+            DfsPreparedMetadataJournalTargetPublishResult::Publish { target } => {
+                target.has_required_replication_work()
+            }
+        };
+        if execution_exclusions.contains(&target_node_id) && !required_work {
             tracing::trace!(target: "sinomo.dfs.perf", node = %local_node_id,
                 target = %target_node_id, shard = %shard_id.0, epoch = shard.epoch,
                 after_sequence, disposition = "execution-excluded",
@@ -3524,17 +3700,7 @@ fn prepare_dfs_metadata_journal_publish_for_primary_shard(
             });
             continue;
         }
-        match prepare_dfs_metadata_journal_target_publish(
-            backend,
-            local_node_id,
-            target_node_id,
-            shard.file_system_id.clone(),
-            shard_id.clone(),
-            shard.epoch,
-            after_sequence,
-            options,
-            &mut payloads_by_after_sequence,
-        )? {
+        match prepared {
             DfsPreparedMetadataJournalTargetPublishResult::NoChanges { outcome } => {
                 tracing::trace!(target: "sinomo.dfs.perf", node = %local_node_id,
                     shard = %shard_id.0, epoch = shard.epoch, disposition = "no-dispatch",
@@ -3546,7 +3712,9 @@ fn prepare_dfs_metadata_journal_publish_for_primary_shard(
                     target = %target.target_node_id, shard = %shard_id.0, epoch = shard.epoch,
                     after_sequence = target.after_sequence,
                     source_head = target.prepared_source_head, caught_up_probe = target.caught_up_probe,
-                    commands = target.commands.len(), disposition = "dispatch",
+                    commands = target.commands.len(), required_work,
+                    execution_hint_excluded = execution_exclusions.contains(&target.target_node_id),
+                    disposition = "dispatch",
                     "metadata-publish-target-decision");
                 targets.push(target);
             }
@@ -4087,7 +4255,11 @@ fn dfs_metadata_target_is_explicitly_unreachable(
 fn defer_explicitly_unreachable_dfs_metadata_targets(
     plan: &mut DfsPreparedClusterMetadataJournalPublish,
 ) {
-    if plan.targets.is_empty() {
+    if plan
+        .targets
+        .iter()
+        .all(|target| target.has_required_replication_work())
+    {
         return;
     }
     let cluster_paths = ClusterPaths::new(&plan.data_dir);
@@ -4130,6 +4302,7 @@ fn defer_explicitly_unreachable_dfs_metadata_targets_with_connectivity(
     let target_node_ids = plan
         .targets
         .iter()
+        .filter(|target| !target.has_required_replication_work())
         .map(|target| target.target_node_id.clone())
         .collect::<BTreeSet<_>>();
     let deferred_node_ids = target_node_ids
@@ -4149,7 +4322,9 @@ fn defer_explicitly_unreachable_dfs_metadata_targets_with_connectivity(
 
     let mut deferred_outcomes = Vec::new();
     plan.targets.retain(|target| {
-        if !deferred_node_ids.contains(&target.target_node_id) {
+        if target.has_required_replication_work()
+            || !deferred_node_ids.contains(&target.target_node_id)
+        {
             return true;
         }
         deferred_outcomes.push(DfsMetadataJournalReplicationOutcome::MissingRoute {
@@ -4223,6 +4398,33 @@ mod explicitly_unreachable_target_tests {
         records: impl IntoIterator<Item = ClusterConnectivityRecord>,
     ) -> ClusterConnectivityGraph {
         ClusterConnectivityGraph::from_records(local_node_id.clone(), records)
+    }
+
+    pub(super) fn stale_hint_for_native_target(
+        cluster_id: &ClusterId,
+        primary: &NodeId,
+        target: &NodeId,
+    ) -> (ClusterConnectivityGraph, Vec<ClusterEndpointRecord>) {
+        // Negative-only advisory input. It is never installed in a directory
+        // or used for transport: dispatch still uses the real native owners,
+        // actual identities, immutable frames and ordinary authenticated route.
+        let endpoint = test_endpoint(
+            "native-stale-route-hint",
+            target,
+            ClusterTransportKind::LanTcp,
+            "127.0.0.1:1",
+            ClusterEndpointSource::KvMembership,
+        );
+        let graph = graph(
+            primary,
+            [connectivity_record(
+                cluster_id,
+                primary,
+                &endpoint,
+                ClusterConnectivityState::Unreachable,
+            )],
+        );
+        (graph, vec![endpoint])
     }
 
     #[test]
