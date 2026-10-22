@@ -224,6 +224,101 @@ impl NativePlacementFixture {
     }
 }
 
+fn reconcile_fixture_placement(
+    service: &mut NetworkedDfsService<crate::DfsNodeTransport>,
+    primary: &NodeId,
+    config: &DfsFileSystemConfig,
+    job: &DfsPlacementReconciliationJob,
+    object: &DfsObjectMetadata,
+) -> Result<(), DfsError> {
+    let (resolved, replication, placement) =
+        reconciliation_placement_for_object(config, job, object).unwrap();
+    // This is a browser fixture. The ordinary authenticated Main route owns
+    // admission and effect execution; a direct local effect races maintenance.
+    let reply = service.route_namespace_operation_to_metadata_primary_with_timeout_and_options(
+        object.file_system_id.clone(),
+        primary.clone(),
+        DfsNamespaceOperation::ReconcilePlacement {
+            job_id: job.job_id.clone(),
+            path: object.path.clone(),
+            object_id: object.object_id.clone(),
+            expected_version: object.version.clone(),
+            object_policy: resolved.policy.consistency,
+            replication_policy: replication,
+            desired_replica_node_ids: placement.plan.desired_replica_nodes,
+        },
+        sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+        false,
+        false,
+    )?;
+    assert_eq!(reply.result, crate::DfsNamespaceResult::Applied);
+    Ok(())
+}
+
+#[test]
+fn native_placement_fixture_queues_behind_the_actual_admission_and_permit_owner() {
+    let mut case = NativePlacementFixture::with_nodes_and_initial_job(
+        "native-placement-fixture-admission", false, 1, 1, false,
+    );
+    let scheduler = crate::runtime_host::daemon_dfs_mutation_scheduler(
+        case.runtime.data_dir(&case.primary),
+    ).unwrap();
+    let admission = crate::test_runtime::executor().block_on(
+        scheduler.admit(&crate::DfsMessageExecutionScope::GlobalExclusive),
+    ).unwrap();
+    assert!(case.control.with_client(|kv| {
+        DfsControlPlaneStore::new(kv.as_mut()).compare_and_put_placement_update(
+            &case.job.accepted_config, &case.job.accepted_config, &case.job,
+        ).unwrap()
+    }));
+    let object = case.objects[0].clone();
+    let mut owner = case.runtime.metadata_primary_service(&object.path).unwrap();
+    let (_, _, mut permit) = owner.acquire_authoritative_placement_reconciliation(
+        &object.file_system_id, &case.job.job_id, Some(&object.path),
+    ).unwrap().expect("actual current Main host granted the held permit");
+    let before = case.runtime.rpc_observations().len();
+    let deadline = std::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    let runtime = &case.runtime;
+    let primary = case.primary.clone();
+    let job = case.job.clone();
+    let service = &mut case.service;
+    let (observed_dispatch, release, outcome) = std::thread::scope(|scope| {
+        let request = scope.spawn(|| reconcile_fixture_placement(
+            service, &primary, &job.accepted_config, &job, &object,
+        ));
+        let observed_dispatch = loop {
+            let observed = runtime.rpc_observations().into_iter().skip(before).any(|call| {
+                call.target == primary && call.route == crate::DFS_DATA_NAMESPACE_ROUTE
+                    && call.phase == RpcPhase::BeforeDispatch
+            });
+            if observed || request.is_finished() || std::time::Instant::now() >= deadline {
+                break observed;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        let release = owner.release_placement_authority_permit(&mut permit);
+        drop(owner);
+        drop(admission);
+        (observed_dispatch, release, request.join().unwrap())
+    });
+    let within_deadline = std::time::Instant::now() < deadline;
+    std::fs::write(
+        case.runtime.data_dir(&case.primary).root().join("boundary-diagnostic-placement-fixture-admission.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "primary": case.primary, "job": case.job, "object": object,
+            "observed_native_dispatch_while_owner_held": observed_dispatch,
+            "release": format!("{release:?}"), "outcome": format!("{outcome:?}"),
+            "within_original_network_deadline": within_deadline,
+            "qualification": "Actual Main admission and native KV permit, released normally before join. No supplied reply, fabricated authority or historical write replay."
+        })).unwrap(),
+    ).unwrap();
+    case.close();
+    release.unwrap();
+    assert!(observed_dispatch, "fixture effect must enter the actual Main admission path: {outcome:?}");
+    outcome.unwrap();
+    assert!(within_deadline);
+}
+
 #[test]
 fn native_placement_keeps_accepted_candidates_and_fences_later_policy() {
     let mut case =
@@ -1202,18 +1297,7 @@ fn native_placement_retirement(retain: bool, replay_after_handoff: bool) {
             .unwrap()
     }));
     case.service.refresh_control_plane_latest().unwrap();
-    let (resolved, replication, placement) =
-        reconciliation_placement_for_object(&one_copy, &job, &object).unwrap();
-    case.service
-        .reconcile_object_placement_local(
-            &job.job_id,
-            &object.path,
-            &object.object_id,
-            &object.version,
-            resolved.policy.consistency,
-            replication,
-            &placement.plan.desired_replica_nodes,
-        )
+    reconcile_fixture_placement(&mut case.service, &case.primary, &one_copy, &job, &object)
         .unwrap();
     if replay_after_handoff {
         let intent_id = format!(
