@@ -848,12 +848,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 ),
             ] {
                 if state.is_some_and(|state| {
+                    // Like the physical-row check above, mutation custody is
+                    // identified by request/delivery facts. `inflight` can be
+                    // a source Fetch's backoff and does not imply a mutation.
                     state.unresolved_custody_without_request
                         || (request.is_none()
-                            && (state.inflight
-                                || (state.transfer_delivery_state
-                                    != Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent)
-                                    && state.completed_transfer_request_id.is_none())))
+                            && state.transfer_delivery_state
+                                != Some(
+                                    sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent,
+                                )
+                            && state.completed_transfer_request_id.is_none())
                 }) {
                     // Unidentified custody belongs to this exact target. It
                     // cannot grant a request or stall another target's owner.

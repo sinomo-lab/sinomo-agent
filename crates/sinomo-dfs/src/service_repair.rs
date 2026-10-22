@@ -5172,10 +5172,14 @@ pub(crate) fn repair_transfer_custody_unresolved(record: &DfsRepairAttemptRecord
 
 /// Negative custody DATA only; this predicate grants no request or dispatch.
 pub(crate) fn repair_record_has_unidentified_producer(record: &DfsRepairAttemptRecord) -> bool {
-    repair_transfer_custody_unresolved(record)
-        && (record.transfer_kind.is_none()
-            || (record.transfer_request_id.is_none()
-                && record.completed_transfer_request_id.is_none()))
+    // `in_flight` also retains read-only Fetch backoff. That row still owns
+    // scheduling DATA, but typed NotSent is not an unidentified mutation.
+    // Unknown kind/delivery and PossiblyApplied remain parked without an ID.
+    record.transfer_kind.is_none()
+        || (record.transfer_request_id.is_none()
+            && record.completed_transfer_request_id.is_none()
+            && record.transfer_delivery_state
+                != Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent))
 }
 
 pub(crate) fn join_transfer_delivery(
