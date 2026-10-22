@@ -2018,6 +2018,78 @@ fn native_owned_recovery_starts_at_exact_tables_despite_a_lagging_cursor_hint() 
 }
 
 #[test]
+fn initial_epoch_binding_accepts_a_coherent_cut_before_an_unrelated_refresh() {
+    let (runtime, mut service, config) = native_case("initial-binding-current-cut", 1);
+    let current = directory(&mut service, "/services/initial-binding-current-cut");
+    let mut changed = current.clone();
+    changed.version = DfsVersion::generate();
+    changed.mode = 0o600;
+    let payload = namespace_payload(&config, &current, changed.clone(), "initial-binding-current-cut");
+    let execution_guard = service.acquire_prepared_execution(&crate::DfsPreparedOperationScope {
+        file_system_id: payload.file_system_id.clone(), shard_id: payload.shard_id.clone(),
+        owner_epoch: payload.owner_epoch, operation_id: payload.operation_id.clone(),
+    }).unwrap();
+    let digest = service.metadata_backend_mut().unwrap().prepare_operation(payload, None).unwrap();
+    let scope = service.metadata_backend().unwrap()
+        .publication_owner_scope(&digest.file_system_id, &digest.shard_id).unwrap();
+    let execution = service.publication_execution.current().expect("actual native effect admission");
+    let authority = crate::runtime_host::daemon_dfs_metadata_authority_generation(
+        &sinomo_core::network::ClusterPaths::new(runtime.data_dir(&config.primary_node_id)),
+        &runtime.runtime_handle(),
+    ).unwrap();
+    let control = runtime.shared_control_plane().unwrap();
+    let update = std::sync::Arc::clone(&authority);
+    let observed = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let recorded = std::sync::Arc::clone(&observed);
+    let fs = config.file_system_id.clone();
+    crate::publication_guard::INITIAL_BINDING_AFTER_CUT.with(|slot| {
+        assert!(slot.borrow_mut().replace(Box::new(move || {
+            let before = update.projection_generation();
+            let storage = update.storage_generation();
+            control.with_client(|kv| {
+                let mut store = DfsControlPlaneStore::new(kv.as_mut());
+                let mut config = store.get_file_system_config(&fs).unwrap().unwrap();
+                config.display_name.push_str("-real-binding-refresh");
+                store.put_file_system_config(&config).unwrap();
+            });
+            crate::test_runtime::executor().block_on(async {
+                tokio::time::timeout(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+                    update.ensure_write_configuration_ready_async()).await.unwrap().unwrap();
+            });
+            let after = update.projection_generation();
+            assert!(after > before);
+            assert_eq!(update.storage_generation(), storage);
+            *recorded.lock().unwrap() = Some((before, after, storage));
+        })).is_none());
+    });
+    let binding = service.publication_provider.validate_initial_binding_from_retained_provider(
+        &scope, &digest, &execution, &config,
+    );
+    crate::publication_guard::INITIAL_BINDING_AFTER_CUT.with(|slot| slot.borrow_mut().take());
+    let advanced = *observed.lock().unwrap();
+    // Finish only the same genuine prepared body through the normal kernel.
+    // This fixture drain does not turn a rejected read qualification into PASS.
+    let completion = commit_kernel(&mut service, &digest);
+    std::fs::write(
+        runtime.data_dir(&config.primary_node_id).root().join("boundary-diagnostic-initial-binding-cut.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "digest": digest, "expected_shard": config, "actual_generation_advance": advanced,
+            "binding_result": format!("{binding:?}"), "same_digest_completion": format!("{completion:?}"),
+            "qualification": "Actual retained provider and execution owner. Real configuration transaction and shared native refresh; no injected cache value, fabricated authority or replacement operation identity."
+        })).unwrap(),
+    ).unwrap();
+    let after = service.metadata_backend().unwrap().get_object(&current.object_id).unwrap();
+    drop(execution);
+    drop(execution_guard);
+    drop(service);
+    runtime.close().unwrap();
+    assert!(advanced.is_some(), "the actual update boundary must be exercised");
+    assert!(binding.is_ok(), "coherent initial binding cut: {binding:?}");
+    assert!(completion.unwrap().published);
+    assert_eq!(after, Some(changed));
+}
+
+#[test]
 fn prepared_v7_initial_epoch_requires_the_real_host_provider() {
     let (mut runtime, mut service, config) = native_case("v7-initial-host-bind", 1);
     let shard = DfsMetadataShardId::new(config.shard_id.clone());

@@ -425,8 +425,19 @@ impl DfsMetadataAuthorityRuntime {
         )>,
         sinomo_core::kv::KvError,
     > {
-        self.state
-            .cached_current_publication_configuration(file_system_id)
+        self.with_current_publication_configuration(file_system_id, |generation, shards, config| {
+            (generation, shards, config)
+        })
+    }
+
+    /// Validate a cache-only configuration cut before its existing lock is
+    /// released. The callback must not wait or reenter the projection cache.
+    pub(crate) fn with_current_publication_configuration<R>(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        read: impl FnOnce(u64, Vec<DfsMetadataShardConfig>, Option<crate::DfsFileSystemConfig>) -> R,
+    ) -> Result<Option<R>, sinomo_core::kv::KvError> {
+        self.state.with_current_publication_configuration(file_system_id, read)
     }
 
     pub fn shard_projection_state(
@@ -1612,17 +1623,11 @@ impl DfsMetadataAuthorityState {
         }
     }
 
-    fn cached_current_publication_configuration(
+    fn with_current_publication_configuration<R>(
         &self,
         file_system_id: &DfsFileSystemId,
-    ) -> Result<
-        Option<(
-            u64,
-            Vec<DfsMetadataShardConfig>,
-            Option<crate::DfsFileSystemConfig>,
-        )>,
-        sinomo_core::kv::KvError,
-    > {
+        read: impl FnOnce(u64, Vec<DfsMetadataShardConfig>, Option<crate::DfsFileSystemConfig>) -> R,
+    ) -> Result<Option<R>, sinomo_core::kv::KvError> {
         #[cfg(test)]
         run_publication_configuration_before_lock_hook();
         let projection =
@@ -1672,7 +1677,7 @@ impl DfsMetadataAuthorityState {
             projection.native_evidence.as_ref(),
             projection.native_evidence_loss_count,
         );
-        Ok(Some((current_projection_generation, shards, config)))
+        Ok(Some(read(current_projection_generation, shards, config)))
     }
 
     pub fn shard_projection_state(
