@@ -479,7 +479,7 @@ pub(super) async fn daemon_dfs_metadata_publish_discovery_lanes_async(
 /// from every shard placement can retain its startup generation forever:
 /// neither a primary publisher nor replica ingress exists to take the global
 /// admission that replaces the stale cache entry.
-async fn ensure_daemon_dfs_idle_resident_generation_after_preflight(
+pub(super) async fn ensure_daemon_dfs_idle_resident_generation_after_preflight(
     data_dir: SinomoDataDir,
     cluster_paths: ClusterPaths,
     peer_snapshot: DaemonDfsMessagePeerSnapshot,
@@ -517,8 +517,17 @@ async fn ensure_daemon_dfs_idle_resident_generation_after_preflight(
     })?;
     let mutation_scheduler =
         daemon_dfs_mutation_scheduler(&data_dir).map_err(|error| error.to_string())?;
+    let task_owner = registered_dfs_runtime_host(&data_dir)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| {
+            "DFS metadata idle-generation rollover lacks its live task owner".to_string()
+        })?;
     let mut preflight = preflight;
     for replan in 0..=2 {
+        #[cfg(test)]
+        if let Some(hook) = daemon_dfs_pre_dispatch_test_hook(&data_dir) {
+            hook(super::message_host::DaemonDfsPreDispatchTestPoint::PublishGenerationAdmissionRequested { owner: "idle", caller_task: tokio::task::try_id() }, None, Some(&preflight)).map_err(|error|error.to_string())?;
+        }
         let admission = admit_daemon_dfs_background_generation_refresh(&mutation_scheduler).await?;
         let initialize_data_dir = data_dir.clone();
         let initialize_cluster_paths = cluster_paths.clone();
@@ -526,9 +535,17 @@ async fn ensure_daemon_dfs_idle_resident_generation_after_preflight(
         let initialize_preflight = preflight.clone();
         let initialize_runtime = runtime.clone();
         let initialize_owner = Arc::clone(&data_owner_lock);
-        let initialized = tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let caller_task = tokio::task::try_id();
+        let initialized = crate::runtime_publish::run_owned_metadata_publish_blocking(&task_owner, move || {
             let _admission = admission;
             let _data_owner_lock = initialize_owner;
+            #[cfg(test)]
+            if let Some(hook) = daemon_dfs_pre_dispatch_test_hook(&initialize_data_dir) {
+                hook(super::message_host::DaemonDfsPreDispatchTestPoint::PublishGenerationWorkerStarted {
+                    owner: "idle", caller_task, global_admission: _admission.is_global(), data_owner_token: Arc::as_ptr(&_data_owner_lock) as usize,
+                }, None, Some(&initialize_preflight))?;
+            }
             try_daemon_dfs_resident_metadata_backend_after_preflight(
                 &initialize_data_dir,
                 &initialize_cluster_paths,
@@ -903,6 +920,11 @@ async fn ensure_daemon_dfs_metadata_publish_resident_generation_before_deadline(
             .await
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "DFS metadata publish lacks a cluster peer snapshot".to_string())?;
+    let task_owner = registered_dfs_runtime_host(&data_dir)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| {
+            "DFS metadata resident initialization lacks its live task owner".to_string()
+        })?;
     for replan in 0..=2 {
         let authority = daemon_dfs_metadata_authority_generation_for_identity(
             &cluster_paths,
@@ -948,6 +970,10 @@ async fn ensure_daemon_dfs_metadata_publish_resident_generation_before_deadline(
 
         // Authority can advance while global admission waits. Only a typed
         // retained-proof rejection before any publication replans this owner.
+        #[cfg(test)]
+        if let Some(hook) = daemon_dfs_pre_dispatch_test_hook(&data_dir) {
+            hook(super::message_host::DaemonDfsPreDispatchTestPoint::PublishGenerationAdmissionRequested { owner: "lane", caller_task: tokio::task::try_id() }, None, Some(&metadata_authority_preflight)).map_err(|error|error.to_string())?;
+        }
         let admission = admit_daemon_dfs_background_generation_refresh(&mutation_scheduler).await?;
         let initialize_data_dir = data_dir.clone();
         let initialize_cluster_paths = cluster_paths.clone();
@@ -959,9 +985,17 @@ async fn ensure_daemon_dfs_metadata_publish_resident_generation_before_deadline(
             authority: Arc::clone(&metadata_authority_preflight.authority),
             generation: metadata_authority_preflight.generation,
         };
-        let initialized = tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let caller_task = tokio::task::try_id();
+        let initialized = crate::runtime_publish::run_owned_metadata_publish_blocking(&task_owner, move || {
             let _admission = admission;
             let _data_owner_lock = initialize_owner;
+            #[cfg(test)]
+            if let Some(hook) = daemon_dfs_pre_dispatch_test_hook(&initialize_data_dir) {
+                hook(super::message_host::DaemonDfsPreDispatchTestPoint::PublishGenerationWorkerStarted {
+                    owner: "lane", caller_task, global_admission: _admission.is_global(), data_owner_token: Arc::as_ptr(&_data_owner_lock) as usize,
+                }, None, Some(&initialize_preflight))?;
+            }
             let resident = try_daemon_dfs_resident_metadata_backend_after_preflight(
                 &initialize_data_dir,
                 &initialize_cluster_paths,
