@@ -422,6 +422,136 @@ fn content_reference_release_replay_survives_two_moves_between_disjoint_authorit
 }
 
 #[test]
+fn content_reference_remains_fenced_by_an_actual_pending_move() {
+    let mut cluster = sifs_two_primary_cluster("native-reference-current-move-fence");
+    let from = "/users/reference-moving";
+    let to = "/services/reference-moved";
+    let bytes = b"reference remains protected during the actual move";
+    let stat = cluster
+        .replica
+        .posix_write_file(
+            from,
+            bytes,
+            DfsWriteOptions::replicated_eventual(vec![cluster.users_primary_node.clone()]),
+        )
+        .unwrap();
+    let capture = DfsContentReferenceRequest {
+        namespace: "org.example.reference-fence".into(),
+        path: from.into(),
+        identity: DfsRevisionReference {
+            file_system_id: stat.file_system_id.clone(),
+            object_id: stat.object_id.clone(),
+            version: stat.version.clone(),
+        },
+        operation: DfsContentReferenceOperation::CaptureCurrent {
+            reference_id: "capture-root".into(),
+            metadata: None,
+        },
+        operation_id: sinomo_core::Id::generate().to_string(),
+    };
+    cluster
+        .replica
+        .retain_content_revision(capture.clone())
+        .unwrap();
+    let retain = DfsContentReferenceRequest {
+        operation: DfsContentReferenceOperation::Retain {
+            reference_id: "during-move".into(),
+        },
+        operation_id: sinomo_core::Id::generate().to_string(),
+        ..capture
+    };
+    assert!(!cluster.replica.content_reference_present(&retain).unwrap());
+    let move_id = sinomo_core::Id::generate().to_string();
+    cluster
+        ._runtime
+        .install_fault(crate::test_runtime::FaultRule {
+            source: Some(cluster.users_primary_node.clone()),
+            target: Some(cluster.services_primary_node.clone()),
+            route: Some(DFS_DATA_NAMESPACE_ROUTE.into()),
+            call_id: None,
+            origin: Some(crate::test_runtime::RpcOrigin::RegisteredHost),
+            remaining_hits: 32,
+            action: crate::test_runtime::FaultAction::BudgetExhausted,
+        });
+    // Use the existing native carrier-failure choreography: the real owner
+    // persists its job and returns admission, while the target remains blocked.
+    let moved = cluster
+        .users_primary
+        .posix_rename_with_operation_id(from, to, &move_id);
+    assert!(
+        moved.is_err(),
+        "the actual target carrier is unavailable: {moved:?}"
+    );
+    let parked = cluster
+        .users_primary
+        .metadata_backend()
+        .unwrap()
+        .list_namespace_jobs()
+        .unwrap()
+        .into_iter()
+        .find(|job| job.root_path == from && job.target_path.as_deref() == Some(to))
+        .expect("the actual durable move retains its reservation");
+    assert_eq!(parked.status, DfsNamespaceJobStatus::Running);
+    // Observe from the independent native caller: the targeted source-to-target
+    // carrier fault must not also intercept this caller's identity lookup.
+    let root = cluster
+        ._runtime
+        .data_dir(&cluster.users_primary_node)
+        .root();
+    let observation = crate::native_boundary_diagnostics::capture(root.clone());
+    let denied = cluster.replica.retain_content_revision(retain.clone());
+    observation.dump(
+        "reference-current-guard",
+        serde_json::json!({
+            "original_move": move_id, "job": parked, "reference": retain,
+            "result": format!("{denied:?}"),
+        }),
+    );
+    let observed: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(root.join("boundary-diagnostic-reference-current-guard.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(observed["dropped"], 0);
+    assert!(
+        observed["events"].as_array().unwrap().iter().any(|event| {
+            event["kind"] == "metadata-query-path-blocked"
+                && event["facts"]["node"] == serde_json::json!(cluster.users_primary_node)
+                && event["facts"]["path"] == from
+                && event["facts"]["locks"]
+                    .as_str()
+                    .is_some_and(|locks| locks.contains(&parked.job_id))
+        }),
+        "the exact live Main reservation must actually reject the read"
+    );
+    // Metadata-query rejection uses the existing string-bearing wire error.
+    // The observed actor/job above establishes the cause independently of it.
+    let busy = DfsPosixError::Dfs(DfsError::Busy { path: from.into() }).to_string();
+    assert!(
+        matches!(&denied, Err(DfsError::Metadata { message }) if message == &busy),
+        "preserve the current authenticated-query rejection: {denied:?}"
+    );
+    drop(observation);
+    cluster._runtime.clear_faults();
+    let moved = cluster
+        .users_primary
+        .posix_rename_with_operation_id(from, to, &move_id)
+        .expect("resume the same original move after restoring the actual carrier");
+    assert_eq!(moved.object_id, stat.object_id);
+    assert!(!cluster.replica.content_reference_present(&retain).unwrap());
+    cluster
+        .replica
+        .retain_content_revision(retain.clone())
+        .unwrap();
+    assert!(cluster.replica.content_reference_present(&retain).unwrap());
+    assert_eq!(
+        cluster.replica.posix_read_file_distributed(to).unwrap(),
+        bytes
+    );
+    cluster._runtime.assert_fault_budgets().unwrap();
+    cluster.close();
+}
+
+#[test]
 fn content_reference_noop_release_replay_survives_two_moves_between_disjoint_authorities() {
     reference_release_replay_after_two_moves(true);
 }
