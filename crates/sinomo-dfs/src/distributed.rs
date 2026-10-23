@@ -342,6 +342,45 @@ pub struct DistributedRepairJob {
     pub missing_replica_node_id: NodeId,
 }
 
+/// Content availability for one exact intent, without changing its durable plan.
+///
+/// The intent retains desired N, W, identity and hard placement constraints.
+/// Receipt deficits come only from the coordinator's accepted receipt records;
+/// observations can filter execution/read candidates but never erase a receipt
+/// or a missing-copy obligation. All node lists retain desired-plan order.
+///
+/// This is a process-local projection, not a publication or read authorization
+/// certificate. A reachable receipt holder is only a fetch candidate: callers
+/// still validate visibility/retention, policy and exact content identity at the
+/// serving boundary. Missing receipts for historical or terminal intents do not
+/// independently authorize repair. Existing authority/root and queue-custody
+/// checks continue to govern effects.
+///
+/// Receipts are those already admitted by the owning DFS publication/hydration
+/// boundary. This projection does not independently verify their content hash,
+/// storage binding or durability. Missing receipts and executable repair work
+/// differ: a historical intent may be inactive, while an unsettled location can
+/// require repair even when its receipt is durable.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DfsIntentReplicaAvailability {
+    pub intent: DistributedWriteIntent,
+    pub durable_replica_node_ids: Vec<NodeId>,
+    pub missing_receipt_node_ids: Vec<NodeId>,
+    pub observed_writable_replica_node_ids: Vec<NodeId>,
+    pub reachable_durable_replica_node_ids: Vec<NodeId>,
+}
+
+impl DfsIntentReplicaAvailability {
+    /// Missing content receipts toward W, independently of current reachability.
+    /// Zero is not metadata commit evidence and does not reopen a terminal intent.
+    pub fn missing_commit_receipts(&self) -> usize {
+        self.intent
+            .policy
+            .min_commit_replicas
+            .saturating_sub(self.durable_replica_node_ids.len())
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct DistributedEventualCoordinator {
     next_intent_id: u64,
@@ -982,6 +1021,60 @@ impl DistributedEventualCoordinator {
             .flat_map(|receipts| receipts.values())
             .filter(|receipt| receipt.state == DfsReplicaReceiptState::Durable)
             .count()
+    }
+
+    /// Inspect one intent using caller-owned, already captured observations.
+    ///
+    /// `observed_writable_node_ids` describes current target admission, while
+    /// `observed_reachable_node_ids` describes possible fetch routes. A node can
+    /// serve existing bytes without accepting new content. Neither input proves
+    /// a durable receipt, network delivery or authority; unknown freshness must
+    /// be handled by the observation owner. Duplicates and nodes outside the
+    /// original desired set cannot widen this plan. This read performs no KV,
+    /// storage, network, repair scheduling or mutation.
+    pub fn replica_availability(
+        &self,
+        intent_id: &str,
+        observed_writable_node_ids: &[NodeId],
+        observed_reachable_node_ids: &[NodeId],
+    ) -> Result<DfsIntentReplicaAvailability, DfsDistributedError> {
+        let intent =
+            self.intents
+                .get(intent_id)
+                .ok_or_else(|| DfsDistributedError::UnknownIntent {
+                    intent_id: intent_id.to_string(),
+                })?;
+        let durable = self
+            .receipts_for_intent(intent_id)
+            .into_iter()
+            .filter(|receipt| {
+                receipt.state == DfsReplicaReceiptState::Durable
+                    && receipt.intent_id == intent.intent_id
+                    && receipt.file_system_id == intent.file_system_id
+                    && receipt.object_id == intent.object_id
+                    && receipt.version == intent.target_version
+            })
+            .map(|receipt| &receipt.replica_node_id)
+            .collect::<BTreeSet<_>>();
+        let writable = observed_writable_node_ids.iter().collect::<BTreeSet<_>>();
+        let reachable = observed_reachable_node_ids.iter().collect::<BTreeSet<_>>();
+        let nodes = |predicate: &dyn Fn(&NodeId) -> bool| {
+            intent
+                .desired_replica_nodes
+                .iter()
+                .filter(|node| predicate(node))
+                .cloned()
+                .collect()
+        };
+        Ok(DfsIntentReplicaAvailability {
+            intent: intent.clone(),
+            durable_replica_node_ids: nodes(&|node| durable.contains(node)),
+            missing_receipt_node_ids: nodes(&|node| !durable.contains(node)),
+            observed_writable_replica_node_ids: nodes(&|node| writable.contains(node)),
+            reachable_durable_replica_node_ids: nodes(&|node| {
+                durable.contains(node) && reachable.contains(node)
+            }),
+        })
     }
 
     pub fn is_commit_ready(&self, intent_id: &str) -> Result<bool, DfsDistributedError> {
@@ -2377,6 +2470,61 @@ mod tests {
                 && pending_target_version == version("version_2")
                 && requested_target_version == version("version_3")
         ));
+    }
+
+    #[test]
+    fn availability_projection_does_not_reactivate_historical_repair() {
+        let mut coordinator = DistributedEventualCoordinator::new();
+        let intent = create_intent(&mut coordinator, policy(2, 3));
+        for target in [node("node_a"), node("node_b")] {
+            coordinator
+                .record_durable_receipt(&intent.intent_id, target)
+                .unwrap();
+        }
+        coordinator.commit_intent(&intent.intent_id).unwrap();
+        coordinator.set_committed_repair_active(&intent.intent_id, false);
+        let projected = coordinator
+            .replica_availability(&intent.intent_id, &[node("node_c")], &[node("node_a")])
+            .unwrap();
+        assert_eq!(projected.missing_receipt_node_ids, vec![node("node_c")]);
+        assert!(coordinator.repair_jobs().is_empty());
+        assert!(
+            coordinator
+                .inactive_repair_intent_ids
+                .contains(&intent.intent_id)
+        );
+    }
+
+    #[test]
+    fn availability_receipt_deficits_do_not_hide_unsettled_location_work() {
+        let mut coordinator = DistributedEventualCoordinator::new();
+        let intent = create_intent(&mut coordinator, policy(2, 3));
+        for target in [node("node_a"), node("node_b")] {
+            coordinator
+                .record_durable_receipt(&intent.intent_id, target)
+                .unwrap();
+        }
+        coordinator.commit_intent(&intent.intent_id).unwrap();
+        coordinator.restore_receipt_location_settlement(&intent.intent_id, &node("node_a"), true);
+        coordinator.rebuild_repair_jobs();
+        let jobs = coordinator.repair_jobs().to_vec();
+        assert!(
+            jobs.iter()
+                .any(|job| job.missing_replica_node_id == node("node_a"))
+        );
+        assert!(
+            jobs.iter()
+                .any(|job| job.missing_replica_node_id == node("node_c"))
+        );
+        let projected = coordinator
+            .replica_availability(&intent.intent_id, &[node("node_b")], &[node("node_b")])
+            .unwrap();
+        assert_eq!(
+            projected.durable_replica_node_ids,
+            vec![node("node_a"), node("node_b")]
+        );
+        assert_eq!(projected.missing_receipt_node_ids, vec![node("node_c")]);
+        assert_eq!(coordinator.repair_jobs(), jobs);
     }
 
     #[test]

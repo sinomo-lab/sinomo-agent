@@ -392,9 +392,9 @@ pub use discovery::{
     metadata_service_key, metadata_services_prefix,
 };
 pub use distributed::{
-    DfsDistributedError, DfsReplicaCandidate, DfsReplicaPlacementDecision,
-    DfsReplicaPlacementExplanation, DfsReplicaPlacementPlan, DfsReplicaPlacementRequest,
-    DfsReplicaReceiptState, DfsReplicationPolicy, DfsWriteIntentState,
+    DfsDistributedError, DfsIntentReplicaAvailability, DfsReplicaCandidate,
+    DfsReplicaPlacementDecision, DfsReplicaPlacementExplanation, DfsReplicaPlacementPlan,
+    DfsReplicaPlacementRequest, DfsReplicaReceiptState, DfsReplicationPolicy, DfsWriteIntentState,
     DistributedEventualCoordinator, DistributedRepairJob, DistributedReplicaReceipt,
     DistributedWriteIntent, explain_replicas, plan_replicas, validate_replication_plan,
 };
